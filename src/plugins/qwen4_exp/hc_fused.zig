@@ -23,15 +23,9 @@ const HcWeights = @import("weights.zig").HcWeights;
 // geometry keeps the unfused chain.
 var hc_fused_eps: ?mlx.mlx_array = null;
 var hc_fused_eps_val: f32 = 0;
-var hc_fused_env: ?bool = null;
 
 pub fn hcFusedEnabled() bool {
-    if (transformer.hc_fused_override) |v| return v;
-    if (hc_fused_env) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_HC_FUSED");
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    hc_fused_env = enabled;
-    return enabled;
+    return transformer.hc_fused_override orelse true;
 }
 
 pub const HcFusedOut = struct { mixed: mlx.mlx_array, inj: mlx.mlx_array, stream: mlx.mlx_array };
@@ -594,7 +588,7 @@ test "hc prefill: pending write, normalized streams, native inject reduction and
         defer _ = mlx.mlx_array_free(w);
         const iw = try attn256RandBf16(rnd, &.{ width, hc }, s);
         defer _ = mlx.mlx_array_free(iw);
-        try testing.expectEqual(hp.enabled(), hp.eligible(b, seq, xfm.config.hc_count, xfm.config.hidden_size, iw, .bfloat16));
+        try testing.expect(hp.eligible(b, seq, xfm.config.hc_count, xfm.config.hidden_size, iw, .bfloat16));
         const ones = try standinOnes(&.{hidden}, s);
         defer _ = mlx.mlx_array_free(ones);
         const x = try attn256RandBf16(rnd, &.{ b, seq, hc, hidden }, s);
@@ -706,7 +700,7 @@ test "hc prefill: unsupported configuration and coalesced chunk bounds decline" 
     const hp = @import("../../sdk/blocks/hc/hc_prefill.zig");
     const inject = mlx.mlx_array_new_data(&[_]u16{0}, &.{1}, 1, .bfloat16);
     defer _ = mlx.mlx_array_free(inject);
-    try testing.expectEqual(hp.enabled(), hp.eligible(2, 4351, 4, 128, inject, .bfloat16));
+    try testing.expect(hp.eligible(2, 4351, 4, 128, inject, .bfloat16));
     try testing.expect(!hp.eligible(2, 4352, 4, 128, inject, .bfloat16));
     for ([_][4]u32{ .{ 0, 17, 4, 2560 }, .{ 3, 17, 4, 2560 }, .{ 1, 16, 4, 2560 }, .{ 1, 8704, 4, 2560 }, .{ 1, 17, 0, 2560 }, .{ 1, 17, 9, 2560 }, .{ 1, 17, 4, 64 }, .{ 1, 17, 4, 4097 }, .{ 1, 17, 4, 129 } }) |shape| {
         try testing.expect(!hp.eligible(@intCast(shape[0]), @intCast(shape[1]), shape[2], shape[3], inject, .bfloat16));
@@ -716,7 +710,6 @@ test "hc prefill: unsupported configuration and coalesced chunk bounds decline" 
 
 test "hc prefill: incompatible read writes immediately" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const hp = @import("../../sdk/blocks/hc/hc_prefill.zig");
     const s = mlx.gpuStream();
     var cache = try KVCache.init(testing.allocator, 0);
     defer cache.deinit();
@@ -747,7 +740,7 @@ test "hc prefill: incompatible read writes immediately" {
             var pending: ?HcPending = null;
             defer if (pending) |*p| p.deinit();
             try xfm.hcWriteOrDefer(&h, out, inj, 1, 17, iw, &pending);
-            const can_defer = hp.enabled() and dtype == .bfloat16 and inject_dtype == .bfloat16;
+            const can_defer = dtype == .bfloat16 and inject_dtype == .bfloat16;
             try testing.expectEqual(can_defer, pending != null);
             try xfm.hcFlush(&h, 1, 17, &pending);
             const expected = try xfm.hcWrite(try standinRef(h0), out, inj, 1, 17);

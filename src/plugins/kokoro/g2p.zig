@@ -21,6 +21,7 @@
 //! known, bounded quality gap, not a correctness bug — see `resolveEntry`.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const log = @import("../../host/log.zig");
 
 pub const Phonemizer = struct {
@@ -673,7 +674,7 @@ test "kokoro-g2p: letter-to-sound covers every ASCII letter without panicking" {
 // ── Live (env-gated) ────────────────────────────────────────────────────
 
 fn liveModelDir() ?[]const u8 {
-    const p = std.c.getenv("KOKORO_TEST_MODEL") orelse return null;
+    const p = env.get(.KOKORO_TEST_MODEL) orelse return null;
     return std.mem.span(p);
 }
 

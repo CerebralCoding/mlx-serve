@@ -58,8 +58,7 @@ pub const ResidualTail = struct {
     }
 };
 
-/// `add_norm.addNorm` at widths up to `add_norm_max_rows`; the middle seam then tries the one-dispatch
-/// `fusedAddRmsNorm`: the layered decoder's (Qwen 3.5) and Nemotron-H's seams.
+/// `add_norm.addNorm` at widths up to `add_norm_max_rows`: the layered decoder's (Qwen 3.5) and Nemotron-H's seams.
 pub const AddNorm = struct {
     pub const kind: block.Kind = .seam;
     pub const supports_batched_rows = true;
@@ -85,10 +84,6 @@ pub const AddNorm = struct {
             const t = try take2(c.g, r.h, r.normed);
             return .{ .h = t[0], .normed = t[1] };
         }
-        if (w) |raw| if (try residual_norm.fusedAddRmsNorm(c.stream(), h, delta, raw, c.shared.eps_arr)) |r| {
-            const t = try take2(c.g, r.sum, r.normed);
-            return .{ .h = t[0], .normed = t[1] };
-        };
         const sum = try c.g.add(h, delta);
         return .{ .h = sum, .normed = try Norm.forward(nw, c, sum) };
     }

@@ -480,35 +480,18 @@ fn dequantizeAffine(weight: mlx.mlx_array, scales: mlx.mlx_array, biases: mlx.ml
 /// the steel GEMM instead of `quantized_matmul`. Media DiTs run EVERY forward at
 /// prefill-like widths (H3 at 480p is ~9K rows), where stock qmm_t sits in the
 /// same tile dead zone `prefillDqGemm` exists for on the text side. Opt-in per
-/// backend A/B (the prefill-perf-kernel rule): `MLX_SERVE_MF_DQ_GEMM=1` enables
-/// at the 2048-row floor, `=N` sets an explicit floor, unset/`0` = off.
+/// backend A/B (the prefill-perf-kernel rule): a backend that measured it sets `mf_dq_gemm_override` around its
+/// denoise (H3, Qwen-Image Q4); null = off.
 const OptFloor = ?usize;
-/// Test seam: `some(null)` forces off, `some(f)` forces floor `f`.
+/// `some(null)` forces off, `some(f)` sets floor `f`.
 pub var mf_dq_gemm_override: ?OptFloor = null;
-var mf_dq_gemm_env_done: bool = false;
-var mf_dq_gemm_env_val: OptFloor = null;
 /// Engagement is COUNTED, never inferred from output equality (a rejected
 /// guard is a silent no-op that is output-identical to the fallback).
 pub var mf_dq_gemm_engaged: u64 = 0;
 var mf_dq_gemm_logged: bool = false;
 
-const MF_DQ_GEMM_DEFAULT_MIN_M: usize = 2048;
-
-fn mfDqGemmFloorFrom(raw: ?[]const u8) ?usize {
-    const v = raw orelse return null;
-    if (v.len == 0 or std.mem.eql(u8, v, "0")) return null;
-    if (std.mem.eql(u8, v, "1")) return MF_DQ_GEMM_DEFAULT_MIN_M;
-    return std.fmt.parseInt(usize, v, 10) catch null;
-}
-
 fn mfDqGemmFloor() ?usize {
-    if (mf_dq_gemm_override) |v| return v;
-    if (!mf_dq_gemm_env_done) {
-        const raw = std.c.getenv("MLX_SERVE_MF_DQ_GEMM");
-        mf_dq_gemm_env_val = mfDqGemmFloorFrom(if (raw) |r| std.mem.sliceTo(r, 0) else null);
-        mf_dq_gemm_env_done = true;
-    }
-    return mf_dq_gemm_env_val;
+    return mf_dq_gemm_override orelse null;
 }
 
 pub const MfLinear = struct {
@@ -4609,17 +4592,6 @@ fn retainedBytes(
     var after: usize = 0;
     try mlx.check(mlx.mlx_get_active_memory(&after));
     return if (after > before) after - before else 0;
-}
-
-test "MfLinear dq-gemm: floor parsing is opt-in with a 2048 default" {
-    // Unset and "0" mean OFF — the wide-M route is opt-in until each backend
-    // has its own A/B (the prefill-perf-kernel rule). "1" opts in at the
-    // shared 2048 floor; an explicit integer sets its own floor; junk is off.
-    try testing.expectEqual(@as(?usize, null), mfDqGemmFloorFrom(null));
-    try testing.expectEqual(@as(?usize, null), mfDqGemmFloorFrom("0"));
-    try testing.expectEqual(@as(?usize, 2048), mfDqGemmFloorFrom("1"));
-    try testing.expectEqual(@as(?usize, 4096), mfDqGemmFloorFrom("4096"));
-    try testing.expectEqual(@as(?usize, null), mfDqGemmFloorFrom("junk"));
 }
 
 test "MfLinear wide-M dq-gemm: engages and is no worse than qmm vs fp32 ground truth" {

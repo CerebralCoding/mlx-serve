@@ -26,6 +26,7 @@
 //! streaming arrives block-wise on every HTTP surface.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../host/log.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
@@ -431,7 +432,7 @@ pub const Runner = struct {
             canvas = new_canvas;
             try mlx.check(mlx.mlx_array_eval(canvas));
 
-            if (std.c.getenv("MLX_SERVE_DIFFUSION_TRACE") != null) {
+            if (env.get(.MLX_SERVE_DIFFUSION_TRACE) != null) {
                 const me = try meanScalar(entropy, self.xfm.s);
                 var mask_i32 = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(mask_i32);

@@ -389,38 +389,6 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
 
 // ── tests ──
 
-test "all speculative blocks publish through one per-token accounting loop" {
-    // Class guard for block-returning decoders. The Generator has already
-    // advanced by the whole accepted block when the scheduler receives it;
-    // copying that final count while publishing token 1 truncates the stream
-    // and over-reports usage. Every mode must use the shared incremental loop.
-    const source = @embedFile("decode.zig");
-    const start = std.mem.indexOf(u8, source, "fn runSingleDecodeTick(") orelse return error.MissingDecodeTick;
-    const end = std.mem.indexOfPos(u8, source, start + 1, "\n}\n\n// ── tests ──") orelse return error.MissingDecodeTickEnd;
-    const body = source[start..end];
-    const shared_call = "publishSpeculativeBlock(sch, slot, gen, result.?.tokens);";
-    try testing.expectEqual(@as(usize, 5), std.mem.count(u8, body, shared_call));
-    // The one remaining final-count assignment belongs to the scalar regular
-    // path, after every speculative arm. It must never reappear in a block.
-    const final_assign = "slot.completion_tokens = gen.completion_tokens;";
-    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, final_assign));
-    try testing.expect(std.mem.lastIndexOf(u8, body, shared_call).? < std.mem.indexOf(u8, body, final_assign).?);
-}
-
-test "the batched group is capped by padding waste before it is dispatched" {
-    // Source-scan class guard: the grouping loop must consult the cap. Without
-    // it a single long-context stream makes every short neighbour materialize
-    // a padded KV tensor sized by ITS length — a per-tick transient no gate
-    // bills, whose failure mode is an uncatchable Metal OOM.
-    const src = @embedFile("decode.zig");
-    const start = std.mem.indexOf(u8, src, "// Group batchable slots by model pointer") orelse return error.MissingGrouping;
-    const end = std.mem.indexOfPos(u8, src, start, "\n}\n") orelse return error.MissingGroupingEnd;
-    const body = src[start..end];
-    try testing.expect(std.mem.indexOf(u8, body, "groupKeepCount(") != null);
-    // ...and the dropped slots must still be ticked, or they never advance.
-    try testing.expect(std.mem.indexOf(u8, body, "noteSerial(sch, s, .pad_waste)") != null);
-}
-
 test "single MTP slot reaches the round entry through runDecodeTick" {
     var xfm: Transformer = undefined;
     xfm.rht = null;

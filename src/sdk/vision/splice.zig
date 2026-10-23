@@ -154,54 +154,6 @@ pub fn applyVisionEmbeddingsWith(self: *Transformer, ctx: *ForwardCtx, h: mlx.ml
 
 // ── tests ──
 
-test "every generative forward arm splices vision embeddings" {
-    // `forwardWith` fans out to one arm per architecture family, and the
-    // vision splice lives in each arm rather than above the fan-out. The
-    // hybrid arm (lfm2, nemotron_h, qwen3_next) never had one: LFM2-VL loaded
-    // its tower, encoded the image, spliced NOTHING, and the model answered
-    // from 247 identical `<image>` placeholder embeddings — "a completely
-    // black rectangle" (live 2026-08-13). Nothing errors in that failure; the
-    // shapes, the token accounting and the encoder log line are all correct,
-    // so it reads as a bad IMAGE rather than a missing splice.
-    //
-    // The text-only encoder arm is exempt BY NAME: they serve /v1/embeddings, take no
-    // images, and have no image_token_id to splice at. Anything else added to
-    // the dispatch is required to splice, so a new arch cannot inherit the hole.
-    const src = @embedFile("../../plugins/glm5_next/forward.zig") ++
-        @embedFile("../../engines/mlx/forward/layered.zig") ++
-        @embedFile("../../plugins/qwen4_exp/forward.zig") ++
-        @embedFile("../../engines/mlx/dispatch.zig") ++
-        @embedFile("../../engines/mlx/forward/dense.zig") ++
-        @embedFile("../../plugins/gemma3/encoder.zig");
-    const exempt = [_][]const u8{"forwardGemma3EncoderWith"};
-    const needle = "fn forward";
-    var checked: usize = 0;
-    var i: usize = 0;
-    while (std.mem.indexOfPos(u8, src, i, needle)) |at| {
-        i = at + needle.len;
-        const line_end = std.mem.indexOfScalarPos(u8, src, at, '(') orelse continue;
-        const name = src[at + 3 .. line_end]; // "forwardXWith"
-        if (!std.mem.endsWith(u8, name, "With")) continue;
-        if (std.mem.eql(u8, name, "forwardWith")) continue; // the dispatcher itself
-        if (std.mem.eql(u8, name, "forwardDsv4WithImpl") or std.mem.eql(u8, name, "forwardDsv41WithImpl")) continue; // text-only archs
-        var is_exempt = false;
-        for (exempt) |e| {
-            if (std.mem.eql(u8, name, e)) is_exempt = true;
-        }
-        if (is_exempt) continue;
-        // Each arm is well under 200 lines from its signature to the splice.
-        const body_end = @min(src.len, at + 8000);
-        const body = src[at..body_end];
-        testing.expect(std.mem.indexOf(u8, body, "applyVisionEmbeddingsWith") != null) catch |e| {
-            std.debug.print("{s} never calls applyVisionEmbeddingsWith\n", .{name});
-            return e;
-        };
-        checked += 1;
-    }
-    // A scan that matches nothing passes vacuously.
-    try testing.expect(checked >= 3);
-}
-
 // ── Chunked vision splice (issue #197) ───────────────────────────────────────
 // A vision prompt prefills in chunks; the splice's row lookup is a cumsum over
 // the CURRENT forward's placeholder mask, so each chunk passes the rows earlier

@@ -792,39 +792,6 @@ pub const DrafterStepOut = struct {
     h_prev_next: mlx.mlx_array,
 };
 
-/// Lookup the embedding for a single token id from a quantized weight.
-/// Mirrors `Transformer.embedding` but produces a `[1, 1, hidden]` bf16 array
-/// for a single token (the drafter only ever embeds one token per step).
-fn embedSingleToken(
-    embed_w: mlx.mlx_array,
-    quant_group_size: u32,
-    quant_bits: u32,
-    token_id: u32,
-    target_hidden_size: u32,
-    s: mlx.mlx_stream,
-) !mlx.mlx_array {
-    const id_i32: i32 = @intCast(token_id);
-    const id_shape = [_]c_int{1};
-    const id_arr = mlx.mlx_array_new_data(&id_i32, &id_shape, 1, .int32);
-    defer _ = mlx.mlx_array_free(id_arr);
-
-    var taken = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(taken);
-    try mlx.check(mlx.mlx_take_axis(&taken, embed_w, id_arr, 0, s));
-
-    // Reshape to [1, 1, H]. If embed_w was bf16 (drafter checkpoint), `taken`
-    // is already `[1, H]` bf16. If embed_w is quantized (target's emb_w), we
-    // can't just reshape — we need to dequantize. The path used here is for
-    // the drafter's *own* embed_w, which is bf16, so the reshape suffices.
-    _ = quant_group_size;
-    _ = quant_bits;
-
-    var out = mlx.mlx_array_new();
-    const out_shape = [_]c_int{ 1, 1, @intCast(target_hidden_size) };
-    try mlx.check(mlx.mlx_reshape(&out, taken, &out_shape, 3, s));
-    return out;
-}
-
 /// Embed a single token using the *target's* possibly-quantized embed_w.
 /// Returns shape `[1, 1, target.hidden_size]` in bf16.
 fn embedTargetToken(

@@ -27,9 +27,7 @@ const cachedScalarInt = @import("verify_qmm.zig").cachedScalarInt;
 const mixedNaxShapeEnabled = @import("verify_qmm.zig").mixedNaxShapeEnabled;
 const mixedPlainEnabled = @import("verify_qmm.zig").mixedPlainEnabled;
 const verifyQmmEnabled = @import("verify_qmm.zig").verifyQmmEnabled;
-const naxLaneEnvEnabled = @import("verify_qmm_nax.zig").naxLaneEnvEnabled;
 const naxMinMForBits = @import("verify_qmm_nax.zig").naxMinMForBits;
-const naxMixedBitsEnvEnabled = @import("verify_qmm_nax.zig").naxMixedBitsEnvEnabled;
 const verifyQmmNaxAvailable = @import("verify_qmm_nax.zig").verifyQmmNaxAvailable;
 
 pub const SingleVerifyFeature = enum { routing, down_reduce };
@@ -310,7 +308,7 @@ fn verifyJoinedProjection(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array,
     var total: c_int = 0;
     for (widths) |width| {
         if (width < 2 or width > (if (wide) @as(c_int, 6) else 7)) return null;
-        if (wide and verifyQmmEnabled() and naxLaneEnvEnabled() and naxMixedBitsEnvEnabled() and
+        if (wide and verifyQmmEnabled() and
             mixedNaxShapeEnabled(qp.bits, qp.group_size, n, width) and width >= naxMinMForBits(qp.bits) and @mod(k, 256) == 0) return null;
         total += width;
     }

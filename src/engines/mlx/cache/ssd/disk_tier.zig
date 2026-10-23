@@ -313,10 +313,6 @@ pub const PersistOutcome = enum {
     /// Nothing was written and nothing is promised.
     skipped,
 
-    /// "Nothing more for the caller to write", the old bool's meaning.
-    pub fn nothingPending(self: PersistOutcome) bool {
-        return self != .partial;
-    }
 };
 
 /// The KV extent one commit would persist, in tokens: clamped to the token record (the cache
@@ -2843,7 +2839,7 @@ pub const DiskTier = struct {
 
     /// The resident entry whose leading chunk files a new entry for `tokens` may hard-link:
     /// same tool flag and kv-quant config, most whole chunks below the common prefix. Null on
-    /// a synchronous RAM-first tier or under `MLX_SERVE_SSD_CHUNK_SHARE=0`.
+    /// a synchronous RAM-first tier or with chunk sharing off.
     fn chunkShareDonor(self: *DiskTier, tokens: []const u32, kv_target: u32, has_tools: bool, config: kv_quant.KVQuantConfig, media: []const MediaSpan) ?ChunkDonor {
         if (!(self.ssd_first or self.writer != null) or !chunkShareEnabled()) return null;
         // `media` (v9): chunks may only be linked below the point where the two
@@ -3668,19 +3664,11 @@ pub fn commonPrefixLen(a: []const u32, b: []const u32) usize {
     return i;
 }
 
-var chunk_share_env_cached: ?bool = null;
 pub var chunk_share_override: ?bool = null;
 
-/// `MLX_SERVE_SSD_CHUNK_SHARE=0` restores the write-everything commit (SSD-first arm only).
+/// The test seam's false restores the write-everything commit (SSD-first arm only).
 pub fn chunkShareEnabled() bool {
-    if (chunk_share_override) |v| return v;
-    if (chunk_share_env_cached) |v| return v;
-    const v = blk: {
-        const raw = env.get(.MLX_SERVE_SSD_CHUNK_SHARE) orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    chunk_share_env_cached = v;
-    return v;
+    return chunk_share_override orelse true;
 }
 
 fn statFile(io: std.Io, abs_path: []const u8) ?std.Io.File.Stat {

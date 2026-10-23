@@ -124,6 +124,13 @@ class PinsForksRatchets(unittest.TestCase):
         self.assertEqual(count("pin-unmatched", {"src/host/x.zig": HDR + "// needle_here\n"}, pins), 0)
         self.assertEqual(count("pin-unmatched", {"src/host/x.zig": HDR}, "src/host/*.zig\n"), 1)  # malformed
 
+    def test_forbid_pins(self):
+        # A `!` needle forbids: the pin fails when any file matching the glob holds the rest.
+        pins = "src/host/*.zig\t!cache.step +=\tone step mover\n"
+        self.assertEqual(count("pin-unmatched", {"src/host/x.zig": HDR}, pins), 0)
+        self.assertEqual(count("pin-unmatched", {"src/host/x.zig": HDR + "cache.step += 1;\n"}, pins), 1)
+        self.assertEqual(count("pin-unmatched", {"src/engines/x.zig": HDR + "cache.step += 1;\n"}, pins), 0)
+
     def test_file_over_cap(self):
         prod = HDR + "const a = 1;\n" * lint.SOFT_CAP
         self.assertEqual(count("file-over-cap", {"src/host/x.zig": prod}), 1)

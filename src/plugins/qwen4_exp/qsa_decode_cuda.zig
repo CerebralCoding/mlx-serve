@@ -5,6 +5,7 @@
 //! the value sum stay in f32. Not MLX's summation order: held to no more error than the masked SDPA
 //! against an f64 truth.
 const std = @import("std");
+const env = @import("../../env.zig");
 const kernelSource = @import("../../mlx/kernels.zig").source;
 const mlx = @import("../../mlx/ffi.zig");
 
@@ -33,7 +34,7 @@ pub var override: ?bool = null;
 pub fn enabled() bool {
     if (override) |v| return v;
     if (env_enabled) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_QSA_DEC_KERNEL");
+    const raw = env.get(.MLX_SERVE_QSA_DEC_KERNEL);
     env_enabled = raw == null or raw.?[0] != '0';
     return env_enabled.?;
 }

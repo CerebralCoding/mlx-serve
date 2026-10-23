@@ -1,6 +1,5 @@
 //! DeepSeek-V4's kernel contract: the hyper-connection kernels (Sinkhorn split, its fused collapse, the hc_post
-//! mix), the decode attention's sink softmax and its fused rope / quantizer chain, the compressor's window
-//! emission, and the MoE gate+up GEMV. Listed in `kernel_contract/registry.zig`; findings are in AGENTS.md.
+//! mix), the decode attention's fused rope / quantizer chain and the compressor's window emission. Listed in `kernel_contract/registry.zig`; findings are in AGENTS.md.
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
@@ -224,61 +223,6 @@ const SinkhornY = struct {
 };
 
 // ── sink softmax: y = exp(s scale - m) / (sum exp(s scale - m) + exp(sink - m)), m over the row and the sink ──
-
-const SinkSoftmax = struct {
-    pub const Params = struct {};
-
-    fn groupFor(tk: usize) usize {
-        return @min(256, std.math.ceilPowerOfTwoAssert(usize, @max(tk, 2)));
-    }
-
-    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
-        if (s.k == 0 or s.rows == 0 or s.rows > 65535) return null;
-        const tg = groupFor(s.k);
-        var g = metal.Geometry{ .grid = .{ ci(tg), ci(s.rows), 1 }, .tg = .{ ci(tg), 1, 1 } };
-        g.out(&.{ ci(s.rows), ci(s.k) }, .float32);
-        g.int("H", s.rows);
-        g.int("TG", tg);
-        return g;
-    }
-
-    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
-        const H = k.shape.rows;
-        const TK = k.shape.k;
-        const sc = try k.add(.float32, &.{ H, TK });
-        const sink = try k.add(.float32, &.{ H, 1 });
-        const scale = try k.add(.float32, &.{1});
-        const tk = try k.add(.int32, &.{1});
-        kit.uniform(rng, sc, -20, 20);
-        kit.uniform(rng, sink, -3, 3);
-        scale[0] = 1.0 / @sqrt(512.0);
-        tk[0] = @floatFromInt(TK);
-        if (f == .nonfinite) kit.plantRows(sc, H, TK);
-    }
-
-    pub fn count(_: Params, s: Shape) usize {
-        return s.rows * s.k;
-    }
-
-    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
-        const TK = k.shape.k;
-        const e = try k.scratch().alloc(f64, TK);
-        defer k.scratch().free(e);
-        const scale = spec.roundTo(.f32, k.in(2)[0]);
-        for (0..k.shape.rows) |h| {
-            const row = k.in(0)[h * TK ..][0..TK];
-            const sk = k.in(1)[h];
-            var m = sk;
-            for (row) |v| m = kit.maxN(m, v * scale);
-            for (e, row) |*x, v| x.* = @exp(v * scale - m);
-            const den = sum.of(e) + @exp(sk - m);
-            for (e, 0..) |x, j| {
-                out[h * TK + j] = x / den;
-                mag[h * TK + j] = @abs(x / den);
-            }
-        }
-    }
-};
 
 // ── the fp8 / fp4 activation simulation both the decode chain and the window emission end in ──
 
@@ -818,166 +762,6 @@ fn emitTg(d: usize, rotate: bool) u32 {
 
 // ── MoE gate+up: one token's routed gate and up GEMVs over affine banks, the clipped SwiGLU from a sigmoid table ──
 
-const MoeGateUp = struct {
-    pub const Params = struct { bits: u32, gs: u32, experts: usize = 8, limit: f64 = 10 };
-
-    pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
-        if (p.bits != 2 and p.bits != 4 and p.bits != 8) return null;
-        if (p.gs % (32 / p.bits) != 0 or s.k % p.gs != 0 or s.n % 8 != 0 or s.n == 0 or s.rows == 0) return null;
-        var g = metal.Geometry{ .grid = .{ 32, ci(s.n), ci(s.rows) }, .tg = .{ 32, 8, 1 } };
-        g.out(&.{ ci(s.rows), ci(s.n) }, .bfloat16);
-        g.dtype("T", .bfloat16);
-        g.int("GS", p.gs);
-        g.int("BITS", p.bits);
-        g.int("KS", s.k);
-        g.int("NS", s.n);
-        return g;
-    }
-
-    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
-        const p = k.p;
-        const N = k.shape.n;
-        const K = k.shape.k;
-        const E = p.experts;
-        const words = K * p.bits / 32;
-        const x = try k.add(.bfloat16, &.{K});
-        var banks: [6][]f64 = undefined;
-        for (0..2) |b| {
-            banks[3 * b] = try k.add(.uint32, &.{ E, N, words });
-            banks[3 * b + 1] = try k.add(.bfloat16, &.{ E, N, K / p.gs });
-            banks[3 * b + 2] = try k.add(.bfloat16, &.{ E, N, K / p.gs });
-        }
-        const inds = try k.add(.int32, &.{k.shape.rows});
-        const sigtab = try k.add(.float32, &.{65536});
-        const lim = try k.add(.float32, &.{1});
-        kit.uniform(rng, x, -2, 2);
-        const levels: u32 = @as(u32, 1) << @intCast(p.bits);
-        for (0..2) |b| {
-            for (banks[3 * b]) |*wd| {
-                var word: u64 = 0;
-                for (0..32 / p.bits) |i| word |= @as(u64, rng.uintLessThan(u32, levels)) << @intCast(i * p.bits);
-                wd.* = @floatFromInt(word);
-            }
-            for (banks[3 * b + 1], banks[3 * b + 2]) |*sc, *bi| {
-                sc.* = (0.5 + rng.float(f64)) * 0.04 / @as(f64, @floatFromInt(levels));
-                bi.* = -sc.* * @as(f64, @floatFromInt(levels / 2));
-            }
-        }
-        // Distinct experts, as the router picks them.
-        var used: [64]bool = @splat(false);
-        for (inds) |*v| {
-            var e = rng.uintLessThan(usize, E);
-            while (used[e]) e = (e + 1) % E;
-            used[e] = true;
-            v.* = @floatFromInt(e);
-        }
-        for (sigtab, 0..) |*sv, i| {
-            const g: f64 = spec.fromBf16(@intCast(i));
-            sv.* = 1 / (1 + @exp(-g));
-        }
-        lim[0] = p.limit;
-        switch (f) {
-            .random => {},
-            // A NaN or infinite group scale in one row of slots 0-3 (gate, gate, up, both); the rest stay finite.
-            .nonfinite => {
-                const G = K / p.gs;
-                const put = [_][3]f64{ .{ 0, nan, 0 }, .{ 1, inf, 0 }, .{ 2, 0, -inf }, .{ 3, inf, -inf } };
-                for (put) |q| {
-                    const e: usize = @intFromFloat(q[0]);
-                    if (e >= inds.len) continue;
-                    const row = @as(usize, @intFromFloat(inds[e])) * N + e % N;
-                    if (q[1] != 0) banks[1][row * G] = q[1];
-                    if (q[2] != 0) banks[4][row * G] = q[2];
-                }
-            },
-            .stress => {
-                // Weights q - 2^(bits-1) (scale 1, bias -2^(bits-1), at most 31), positive on the first half and
-                // mirrored onto a shuffle of the second (so no summation order cancels its own roundings); x's halves
-                // (integers to 256, exact in bf16) equal but for 8 entries one apart: partial sums past fp16's range
-                // and bf16's resolution and below 2^24, a small exact integer at the end, every other stage exact.
-                const h = K / 2;
-                const mid: f64 = @floatFromInt(levels / 2);
-                const perm = try k.scratch().alloc(usize, h);
-                defer k.scratch().free(perm);
-                for (perm, 0..) |*q, i| q.* = i;
-                rng.shuffle(usize, perm);
-                for (0..h) |i| {
-                    x[i] = @floatFromInt(rng.intRangeAtMost(i32, 1, if (i < 8) 128 else 256));
-                    x[h + perm[i]] = x[i] + @as(f64, if (i < 8) 1 else 0);
-                }
-                for (0..2) |b| {
-                    @memset(banks[3 * b + 1], 1);
-                    @memset(banks[3 * b + 2], -mid);
-                    const vpw = 32 / p.bits;
-                    for (0..E * N) |row| {
-                        var codes: [8192]u32 = undefined;
-                        for (0..h) |i| {
-                            const top: i32 = @min(@as(i32, @intCast(levels / 2 - 1)), 31);
-                            const c = rng.intRangeAtMost(i32, 1, if (i < 8) @min(top, 3) else top);
-                            codes[i] = @intCast(c + @as(i32, @intCast(levels / 2)));
-                            codes[h + perm[i]] = @intCast(-c + @as(i32, @intCast(levels / 2)));
-                        }
-                        for (0..K / vpw) |wi| {
-                            var word: u64 = 0;
-                            for (0..vpw) |i| word |= @as(u64, codes[wi * vpw + i]) << @intCast(i * p.bits);
-                            banks[3 * b][row * (K / vpw) + wi] = @floatFromInt(word);
-                        }
-                    }
-                }
-            },
-        }
-    }
-
-    pub fn count(_: Params, s: Shape) usize {
-        return s.rows * s.n;
-    }
-
-    fn code(word: f64, i: usize, bits: u32) f64 {
-        const w: u64 = @intFromFloat(word);
-        return @floatFromInt((w >> @intCast(i * bits)) & ((@as(u64, 1) << @intCast(bits)) - 1));
-    }
-
-    /// Slot `e`'s row `n` of bank `b` (0 gate, 1 up) dotted with x: the sum, and its terms' magnitude.
-    fn dot(k: anytype, b: usize, e: usize, n: usize, sum: Sum) ![2]f64 {
-        const p = k.p;
-        const K = k.shape.k;
-        const N = k.shape.n;
-        const vpw = 32 / p.bits;
-        const eid: usize = @intFromFloat(k.in(7)[e]);
-        const wq = k.in(1 + 3 * b);
-        const sc = k.in(2 + 3 * b);
-        const bi = k.in(3 + 3 * b);
-        const t = try k.scratch().alloc(f64, K);
-        defer k.scratch().free(t);
-        var mag: f64 = 0;
-        for (0..K) |kk| {
-            const row = eid * N + n;
-            const w = code(wq[row * (K / vpw) + kk / vpw], kk % vpw, p.bits) * sc[row * (K / p.gs) + kk / p.gs] + bi[row * (K / p.gs) + kk / p.gs];
-            t[kk] = k.in(0)[kk] * w;
-            mag += @abs(t[kk]);
-        }
-        return .{ sum.of(t), mag };
-    }
-
-    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
-        const N = k.shape.n;
-        const lim = k.in(9)[0];
-        const sigtab = k.in(8);
-        for (0..k.shape.rows) |e| for (0..N) |n| {
-            const g = try dot(k, 0, e, n, sum);
-            const up = try dot(k, 1, e, n, sum);
-            const gt = spec.roundTo(.bf16, g[0]);
-            const ut = spec.roundTo(.bf16, up[0]);
-            const gc = kit.minN(gt, lim);
-            const uc = if (std.math.isNan(ut)) nan else std.math.clamp(ut, -lim, lim);
-            const sig = if (std.math.isNan(gc)) nan else sigtab[spec.toBf16(@floatCast(gc))];
-            out[e * N + n] = gc * sig * uc;
-            // Each sum's error reaches y scaled by y's slope in it.
-            mag[e * N + n] = g[1] * @abs(sig * uc) * 2 + up[1] * @abs(gc * sig);
-        };
-    }
-};
-
 // ── registrations ──
 
 fn depthK(s: Shape) usize {
@@ -985,9 +769,6 @@ fn depthK(s: Shape) usize {
 }
 fn depthK1(s: Shape) usize {
     return s.k + 1;
-}
-fn depthK2(s: Shape) usize {
-    return s.k + 2;
 }
 /// The collapse's sum carries pre's own error (a sigmoid of an argument up to 6) as 40 more roundings.
 fn depthHcY(s: Shape) usize {
@@ -1000,7 +781,6 @@ fn depthNone(_: Shape) usize {
 const hcpost_launch = metal.Launch{ .name = "dsv4_hc_post", .inputs = &.{ "pk", "stream_in", "out_v" }, .outputs = &.{"ns"}, .source = dsv4.HCPOST_KERNEL_SOURCE, .tg_bytes = 0, .m1 = 1024, .m2 = 1024 };
 const sinkhorn_launch = metal.Launch{ .name = "dsv4_sinkhorn", .inputs = &.{ "mixes", "ssq", "scale", "base", "consts" }, .outputs = &.{"out"}, .source = dsv4.SINKHORN_KERNEL_SOURCE, .tg_bytes = 0, .m1 = 704, .m2 = 704 };
 const sinkhorn_y_launch = metal.Launch{ .name = "dsv4_sinkhorn_y", .inputs = &.{ "mixes", "ssq", "scale", "base", "consts", "stream_in" }, .outputs = &.{ "out", "y" }, .source = dsv4.SINKHORN_Y_KERNEL_SOURCE, .tg_bytes = 4 * HC, .m1 = 640, .m2 = 640 };
-const sink_softmax_launch = metal.Launch{ .name = "dsv4_sink_softmax", .inputs = &.{ "scores", "sink", "consts", "tk_size" }, .outputs = &.{"y"}, .source = dsv4.SINK_SOFTMAX_KERNEL_SOURCE, .tg_bytes = 4 * 256, .m1 = 1024, .m2 = 1024 };
 const dec_chain_in: []const [*:0]const u8 = &.{ "x", "w", "cosr", "sinr", "hada", "consts" };
 fn decChainLaunch(comptime d: usize, comptime post: u8) metal.Launch {
     return .{ .name = "dsv4_dec_chain", .inputs = dec_chain_in, .outputs = &.{"y_out"}, .source = dsv4.DEC_CHAIN_KERNEL_SOURCE, .tg_bytes = decChainTg(d, post), .m1 = 1024, .m2 = 1024 };
@@ -1016,13 +796,6 @@ fn emitLaunch(comptime d: usize, comptime rotate: bool) metal.Launch {
 const emit_kv4 = emitLaunch(512, false);
 const emit_kv128 = emitLaunch(512, false);
 const emit_idx = emitLaunch(128, true);
-const moe_in: []const [*:0]const u8 = &.{ "x", "wg_q", "g_scales", "g_biases", "wu_q", "u_scales", "u_biases", "inds", "sigtab", "consts" };
-fn moeLaunch() metal.Launch {
-    return .{ .name = "dsv4_moe_gateup", .inputs = moe_in, .outputs = &.{"y"}, .source = dsv4.MOE_GATEUP_KERNEL_SOURCE, .tg_bytes = 0, .m1 = 928, .m2 = 928 };
-}
-const moe_2 = moeLaunch();
-const moe_4 = moeLaunch();
-const moe_8 = moeLaunch();
 
 fn hcShapes(comptime k: usize) [hc_rows.len]Shape {
     var out: [hc_rows.len]Shape = undefined;
@@ -1031,9 +804,6 @@ fn hcShapes(comptime k: usize) [hc_rows.len]Shape {
 }
 const hc_shapes = hcShapes(HC);
 
-/// Decode attention: 64 heads over the window (128) plus up to the indexer's 512 picks; the oracle miniature's 4.
-const sink_shapes: []const Shape = &.{ .{ .rows = 64, .n = 1, .k = 128 }, .{ .rows = 64, .n = 1, .k = 640 }, .{ .rows = 64, .n = 1, .k = 129 }, .{ .rows = 4, .n = 1, .k = 33 } };
-const softmax_sums: spec.Sums = .{ .f16 = 0, .bf16 = 0, .exact = false, .why = "positive exp terms: the sum cannot cancel" };
 
 pub fn register(set: *kc.Set) !void {
     try kit.add(set, HcPost, &hcpost_launch, .{}, .{
@@ -1065,16 +835,6 @@ pub fn register(set: *kc.Set) !void {
         .tiles = .{ .{}, .{ .size = 256 }, .{} },
         .served = &hc_shapes,
         .sums = short_sums,
-    });
-    try kit.add(set, SinkSoftmax, &sink_softmax_launch, .{}, .{
-        .name = "dsv4 sink_softmax",
-        .accum = .f32,
-        .depth = depthK,
-        .ops = 12,
-        .out = .f32,
-        .tiles = .{ .{}, .{}, .{ .size = 256 } },
-        .served = sink_shapes,
-        .sums = softmax_sums,
     });
     const squares: spec.Sums = .{ .f16 = 0, .bf16 = 0, .why = "a sum of squares cannot cancel" };
     const quant_nan: spec.Nan = .{ .stated = "classes as float64 gives them; quantized entries within the quantizer's envelope of their bounds" };
@@ -1142,24 +902,6 @@ pub fn register(set: *kc.Set) !void {
         .known = nan_code,
         .served = &.{ .{ .rows = 1, .n = 128, .k = 4 }, .{ .rows = 128, .n = 128, .k = 4 } },
     });
-    // 64 of the 2048 bank rows: each row is the same GEMV at its own index; the reduction (4096) stays the release's.
-    const moe_shapes: []const Shape = &.{ .{ .rows = 6, .n = 64, .k = 4096 }, .{ .rows = 2, .n = 64, .k = 64 } };
-    inline for (.{ .{ &moe_2, 2, 64 }, .{ &moe_4, 4, 64 }, .{ &moe_8, 8, 64 } }) |b| {
-        try kit.add(set, MoeGateUp, b[0], .{ .bits = b[1], .gs = b[2] }, .{
-            .name = std.fmt.comptimePrint("dsv4 moe_gateup {d}-bit g{d}", .{ b[1], b[2] }),
-            .accum = .f32,
-            .depth = depthK2,
-            // The activation's two f32 products; a bf16 round of the gate or up sum one ulp apart moves y by up to
-            // two ulps each, and the table's value by one more.
-            .ops = 2,
-            .mids = 6,
-            .out = .bf16,
-            .tiles = .{ .{}, .{ .size = 8, .step = 8, .min = 8 }, .{} },
-            .served = moe_shapes,
-            .sums = .{ .f16 = 30, .bf16 = 30, .why = "a wrong sum's activation tends to 0, so a miss tops out near 1 / the bound (36x)" },
-            .known = .{ .gate = .nonfinite, .finding = "a NaN gate sum becomes the clip limit: metal::min drops NaN where MLX's minimum (the composed chain) propagates it" },
-        });
-    }
 }
 
 
@@ -1203,11 +945,6 @@ fn wrapperBytes(comptime D: type, c: *kit.Case(D)) !?[]const u8 {
             const r = try dsv4.applySinkhornY(&sk, cfg, x[0], x[1], x[2], x[3], x[4], x[5], s);
             outs = .{ r.pk, r.y };
         },
-        SinkSoftmax => {
-            dsv4.sinkSoftmaxSetForTest(true);
-            defer dsv4.sinkSoftmaxSetForTest(null);
-            outs[0] = (try dsv4.sinkSoftmaxKernel(&m, x[0], x[1], S, c.shape.k, @floatCast(c.in(2)[0]))) orelse return error.Declined;
-        },
         DecChain => {
             dsv4.decChainSetForTest(true);
             defer dsv4.decChainSetForTest(null);
@@ -1215,15 +952,6 @@ fn wrapperBytes(comptime D: type, c: *kit.Case(D)) !?[]const u8 {
             m.hada_g = if (c.p.post == 2) x[4] else null;
             const rr: dsv4.RopeRows = .{ .cos = x[2], .sin = x[3] };
             outs[0] = (try dsv4.decChainKernel(&m, x[0], S, c.shape.n, c.p.rd, if (c.p.rms) x[1] else null, c.p.post, c.p.inv, &rr)) orelse return error.Declined;
-        },
-        MoeGateUp => {
-            dsv4.moeGateUpSetForTest(true);
-            defer dsv4.moeGateUpSetForTest(null);
-            m.swiglu_limit = @floatCast(c.in(9)[0]);
-            const p = c.p;
-            const gate: dsv4.Q = .{ .w = x[1], .s = x[2], .b = x[3], .qp = .{ .bits = p.bits, .group_size = p.gs } };
-            const up: dsv4.Q = .{ .w = x[4], .s = x[5], .b = x[6], .qp = .{ .bits = p.bits, .group_size = p.gs } };
-            outs[0] = (try dsv4.moeGateUpFused(&m, x[0], &gate, &up, x[7], S)) orelse return error.Declined;
         },
         else => return null,
     }
@@ -1247,10 +975,8 @@ test "kernel contract dsv4: each declared launch is the shipped wrapper's, byte 
     try expectWrapper(HcPost, &hcpost_launch, .{}, .{ .rows = 2, .n = 300, .k = HC });
     try expectWrapper(Sinkhorn, &sinkhorn_launch, .{}, .{ .rows = 3, .n = DIM, .k = HC });
     try expectWrapper(SinkhornY, &sinkhorn_y_launch, .{}, .{ .rows = 2, .n = 300, .k = HC });
-    try expectWrapper(SinkSoftmax, &sink_softmax_launch, .{}, .{ .rows = 4, .n = 1, .k = 33 });
     try expectWrapper(DecChain, &dec_q, .{ .rms = true, .post = 0, .inv = false }, .{ .rows = 4, .n = 512, .k = 512 });
     try expectWrapper(DecChain, &dec_kv, .{ .rms = true, .post = 1, .inv = false }, .{ .rows = 1, .n = 512, .k = 512 });
     try expectWrapper(DecChain, &dec_idx, .{ .rms = false, .post = 2, .inv = false }, .{ .rows = 4, .n = 128, .k = 128 });
     try expectWrapper(DecChain, &dec_o, .{ .rms = false, .post = 0, .inv = true }, .{ .rows = 4, .n = 512, .k = 512 });
-    try expectWrapper(MoeGateUp, &moe_4, .{ .bits = 4, .gs = 64 }, .{ .rows = 2, .n = 64, .k = 128 });
 }

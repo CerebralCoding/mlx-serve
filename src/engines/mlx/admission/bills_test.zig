@@ -1346,7 +1346,7 @@ test "the warm KV credit fires ONLY where the restore checked its entry out" {
         (CheckoutCase{ .shared = 700_000 }).warm(matched, capacity),
         // (3) a non-qwen4 arch: a checkout can never be taken there.
         (CheckoutCase{ .ssd_first = false }).warm(matched, capacity),
-        // (4) `MLX_SERVE_RESTORE_MOVE=0`: the refcount share.
+        // (4) restore by move off: the refcount share.
         (CheckoutCase{ .move_enabled = false }).warm(matched, capacity),
         // (5) a pending disk record shares the same buffers.
         (CheckoutCase{ .pending_disk = true }).warm(matched, capacity),
@@ -1547,7 +1547,7 @@ test "prefillAdmissionBill: every arch carries the evict-to-admit credits (#492)
     for ([_][]const u8{ "qwen3_5", "qwen3_5_moe", "llama", "gemma4", "qwen4_exp" }) |mt| {
         var cfg = qwen4ExpOomConfig();
         cfg.model_type = mt;
-        const bill = prefillAdmissionBill(&cfg, 100_000, 2048, null, false, null, .{});
+        const bill = prefillAdmissionBill(&cfg, 100_000, 2048, null, null, .{});
         try t.expectEqual(9000 * MB, bill.evictable);
         try t.expectEqual(8000 * MB, bill.reclaimable);
     }

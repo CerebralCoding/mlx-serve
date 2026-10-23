@@ -2,6 +2,7 @@
 //! dylib, and the install into `~/.mlx-serve/plugins/` with its receipt (the hash the loader checks).
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const builtin = @import("builtin");
 const dylib_abi = @import("../../abi/dylib.zig");
 const sdk_dylib = @import("../../sdk/dylib.zig");
@@ -49,7 +50,7 @@ pub fn cmdPlugin(gpa: Allocator, io: std.Io, args: []const []const u8) !void {
                 parent = args[i];
             } else return fail("plugin new: unknown argument '{s}'\n{s}", .{ args[i], usage });
         }
-        const kit_dir = kit orelse if (std.c.getenv("MLX_SERVE_KIT")) |k| std.mem.span(k) else try loader.homePath(a, "kit");
+        const kit_dir = kit orelse if (env.get(.MLX_SERVE_KIT)) |k| std.mem.span(k) else try loader.homePath(a, "kit");
         const dest = new(io, a, args[1], kind, kit_dir, parent) catch |e| return fail("plugin new: {s}", .{newError(e)});
         try out(io, "created {s}: `zig build` there writes zig-out/lib/lib{s}.dylib; `mlx-serve plugin check {s}` tests it\n", .{ dest, args[1], dest });
     } else if (std.mem.eql(u8, cmd, "check")) {

@@ -45,7 +45,7 @@ Batched verify rows (`batched_rows`, rows > 1) are refused by name: the engine k
 - A prefix-cache HIT is not bit-identical on a hybrid: low-margin tokens move >1 nat with chunk width (numerics).
 
 ## Known issues
-- With `MLX_SERVE_MTP_DRAFT_RERANK=0` (or a vocab under 16384 rows) the engine's served-head readout builds a 3-bit
+- With a vocab under 16384 rows the engine's served-head readout builds a 3-bit
   draft head the legacy GLM head never built (drafts only, never output): needs a `SpecFacts` fact.
 - Kernel contracts for the 20 `kernels/*.metal` rows are not registered.
 - No `[dtype-trace]`, `MLX_SERVE_GLM_PROFILE` or layer-cap diagnostics on the table forward.

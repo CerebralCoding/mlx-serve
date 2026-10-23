@@ -24,9 +24,6 @@ const naxArchIsG17 = @import("../../../mlx/device.zig").naxArchIsG17;
 const KernelCfgCache = @import("../../../mlx/kernel_cache.zig").KernelCfgCache;
 const testRandWeightBf16 = @import("../../testing/parity.zig").testRandWeightBf16;
 const naxMinMForBits = @import("verify_qmm_nax.zig").naxMinMForBits;
-const naxMinMForBitsFrom = @import("verify_qmm_nax.zig").naxMinMForBitsFrom;
-const naxMinMFrom = @import("verify_qmm_nax.zig").naxMinMFrom;
-const naxMixedBitsEnvEnabled = @import("verify_qmm_nax.zig").naxMixedBitsEnvEnabled;
 const naxPadRows = @import("verify_qmm_nax.zig").naxPadRows;
 const naxSliceRows = @import("verify_qmm_nax.zig").naxSliceRows;
 const runVerifyQmmNax = @import("verify_qmm_nax.zig").runVerifyQmmNax;
@@ -54,7 +51,6 @@ const verifyQmmTile = @import("verify_qmm_nax.zig").verifyQmmTile;
 // else falls through to stock qmm. Numerics: fp32 accumulate in a different
 // order than stock → bf16 tail-ULP class differences (same accepted class
 // as every fused kernel here); parity pinned by the verifyQmm test.
-// Kill switch: MLX_SERVE_VERIFY_QMM=0.
 //
 // NAX lane (M5-class machines): on "applegpu_g17" GPUs under macOS >= 26.2
 // a fixed 16x32x16 tensor-ops tile (MetalPerformancePrimitives matmul2d on
@@ -68,13 +64,10 @@ const verifyQmmTile = @import("verify_qmm_nax.zig").verifyQmmTile;
 // availability probes) → us (plan: todo-m5-nax.md). The kernel object is
 // NEVER built — not just never dispatched — where the probe is false:
 // matmul2d<.., execution_simdgroup> pipeline creation can fail on non-G17
-// hardware. Switches: MLX_SERVE_VERIFY_QMM_NAX=0 kills the lane;
-// MLX_SERVE_FORCE_GPU_FAMILY_
-// FALLBACK=1 pretends the units are absent (QA rehearsal of the exact
-// M1-M4 path on an M5); MLX_SERVE_VERIFY_QMM_NAX_MIN_M lowers the NAX
-// takeover width (default 8) for the M5-day A/B of routing M 5..7 to NAX
-// (their dispatcher keeps plain SIMD through M=6; our SIMD lanes differ —
-// measure, don't inherit).
+// hardware. MLX_SERVE_FORCE_GPU_FAMILY_FALLBACK=1 pretends the units are
+// absent (QA rehearsal of the exact M1-M4 path on an M5). The takeover width
+// is 8 (7 at 8-bit); their dispatcher keeps plain SIMD through M=6, but our
+// SIMD lanes differ — measure, don't inherit.
 /// Comptime codegen of the per-M split-K kernel body. The row loads, weight
 /// loads, and dequant+FMA chains are emitted as NAMED SCALARS with LITERAL
 /// accumulator indices — the ledger's load-bearing constraint: array-indexed
@@ -247,107 +240,6 @@ fn getVerifyQmmMsgKernel(m: c_int) !mlx.mlx_fast_metal_kernel {
     return kernel;
 }
 
-/// Crossrow M 8-9 kernel body (4-bit g64 only): port of the
-/// qwen-3.8-mtp-challenge `qmv_fast_crossrow_affine4_g64` (see NOTICE) — a
-/// qmv-shaped tile where ONE packed-weight read serves TWO input rows, so
-/// the M 8/9 widths past the split-K register cliff keep qmv-class weight
-/// traffic. Grid: tgp.x = input pair (ceil(M/2) groups, M baked), tgp.y =
-/// 8-row output tile (2 simdgroups x 4 rows); 32 lanes x 16 values = one
-/// 512-wide k-block per iteration; each 4-lane cluster shares one g64
-/// scale group. Activations pre-scale /1,/16,/256,/4096 so the nibble dot
-/// runs on MASKED (unshifted) weights; the raw-x sum carries the affine
-/// bias term. Every loop bound is a literal constant (fully unrolled — the
-/// named-scalar rule is satisfied the way their C++ template satisfies it).
-/// Deviation from theirs: the odd-M tail group loads a ZEROED second row
-/// instead of a separate single-row dot — identical output, the unused
-/// half rides arithmetic the weight-bound kernel has free.
-fn verifyQmmCrossrowSource(comptime m: usize) [:0]const u8 {
-    comptime {
-        @setEvalBranchQuota(400_000);
-        return std.fmt.comptimePrint(kernelSource("kernels/linear/vqmm_crossrow.fmt.metal"), .{m});
-    }
-}
-
-pub const VQMM_XR_SOURCES = blk: {
-    @setEvalBranchQuota(20_000_000);
-    break :blk [2][:0]const u8{ verifyQmmCrossrowSource(8), verifyQmmCrossrowSource(9) };
-};
-const VQMM_XR_NAMES = [2][*:0]const u8{ "mlxserve_vqmm_xr_m8", "mlxserve_vqmm_xr_m9" };
-
-var vqmm_xr_kernels: [2]?mlx.mlx_fast_metal_kernel = @splat(null);
-
-fn getVerifyQmmCrossrowKernel(m: c_int) !mlx.mlx_fast_metal_kernel {
-    if (m < 8 or m > 9) return error.UnsupportedShape;
-    const idx: usize = @intCast(m - 8);
-    if (vqmm_xr_kernels[idx]) |k| return k;
-    const input_names = [_][*:0]const u8{ "x", "w_q", "scales", "biases", "K_size", "N_size" };
-    const output_names = [_][*:0]const u8{"y"};
-    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
-    defer _ = mlx.mlx_vector_string_free(in_vec);
-    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
-    defer _ = mlx.mlx_vector_string_free(out_vec);
-    const kernel = mlx.mlx_fast_metal_kernel_new(
-        VQMM_XR_NAMES[idx],
-        in_vec,
-        out_vec,
-        VQMM_XR_SOURCES[idx],
-        "",
-        true,
-        false,
-    );
-    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
-    vqmm_xr_kernels[idx] = kernel;
-    return kernel;
-}
-
-pub fn runVerifyQmmCrossrow(
-    s: mlx.mlx_stream,
-    x: mlx.mlx_array,
-    w: mlx.mlx_array,
-    sc: mlx.mlx_array,
-    bi: mlx.mlx_array,
-    m: c_int,
-    K: c_int,
-    N: c_int,
-    xd: mlx.mlx_dtype,
-    xsh: []const c_int,
-) !?mlx.mlx_array {
-    const K_arr = cachedScalarInt(K);
-    const N_arr = cachedScalarInt(N);
-
-    const config = mlx.mlx_fast_metal_kernel_config_new();
-    defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
-    const y_shape = [_]c_int{ m, N };
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &y_shape, 2, xd));
-    const n_pairs: c_int = @divTrunc(m + 1, 2);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 64 * n_pairs, @divExact(N, 8), 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 64, 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", xd));
-
-    const inputs_arr = [_]mlx.mlx_array{ x, w, sc, bi, K_arr, N_arr };
-    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
-    defer _ = mlx.mlx_vector_array_free(inputs_vec);
-
-    const kernel = try getVerifyQmmCrossrowKernel(m);
-    var outputs_vec = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(outputs_vec);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, config, s));
-    if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
-    var y2 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(y2);
-    try mlx.check(mlx.mlx_vector_array_get(&y2, outputs_vec, 0));
-
-    var out_shape_buf: [8]c_int = undefined;
-    const ndim = xsh.len;
-    if (ndim > out_shape_buf.len) return error.UnsupportedShape;
-    for (xsh[0 .. ndim - 1], 0..) |d, i| out_shape_buf[i] = d;
-    out_shape_buf[ndim - 1] = N;
-    var y = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(y);
-    try mlx.check(mlx.mlx_reshape(&y, y2, out_shape_buf[0..ndim].ptr, @intCast(ndim), s));
-    return y;
-}
-
 /// Column-tile width per M. A threadgroup owns `bn` output columns and
 /// streams ALL M activation rows over its K partition, so the x traffic is
 /// `N/bn * K * M * 2` bytes against `N * K * bits/8` of weight — at M=5,
@@ -357,23 +249,8 @@ pub fn runVerifyQmmCrossrow(
 /// divisibility by bn. Measured per (M, bn) by the width-sweep µbench.
 pub const VQMM_BN_CHOICES = [_]c_int{ 2, 4, 8 };
 
-/// Forced column tile for A/Bs (`MLX_SERVE_VQMM_BN`), 0 = per-M default.
-/// Test seam: the parity test drives every tile without touching the env.
+/// Test seam: the parity test drives every column tile (0 = per-M default).
 pub var vqmm_bn_test_override: ?c_int = null;
-var vqmm_bn_override_cache: ?c_int = null;
-fn vqmmBnOverride() c_int {
-    if (vqmm_bn_test_override) |v| return v;
-    if (vqmm_bn_override_cache) |v| return v;
-    var v: c_int = 0;
-    if (env.get(.MLX_SERVE_VQMM_BN)) |p| {
-        const parsed = std.fmt.parseInt(c_int, std.mem.span(p), 10) catch 0;
-        for (VQMM_BN_CHOICES) |c| {
-            if (c == parsed) v = parsed;
-        }
-    }
-    vqmm_bn_override_cache = v;
-    return v;
-}
 
 /// Column tile per M: 4 columns through M=6 (24 accumulators, the measured
 /// register ceiling), 2 for M=7 (14) — one deep-verify width past MTPLX's
@@ -385,34 +262,21 @@ fn vqmmBnOverride() c_int {
 /// 4-bit trunk shapes it is 5-8% SLOWER at every width (M=5: 45.9 ms vs 43.0
 /// whole-forward, same direction at M 2/3/4). The x rows are 66 KB and stay
 /// cache-resident, so the "traffic" was never leaving the cache — the extra
-/// accumulators just cost occupancy. `MLX_SERVE_VQMM_BN` keeps the sweep
-/// available for other shapes; the ceiling below admits the 8-column tile
-/// only under that override.
+/// accumulators just cost occupancy. The ceiling below admits the 8-column tile
+/// only under the test seam.
 pub const VQMM_MAX_ACC: c_int = 40;
 
 /// Simdgroups per threadgroup, each owning a K partition. Wide-N shapes
 /// already emit N/bn threadgroups, so the grid does not need more
 /// parallelism there — 2 keeps the reduction cheap, and the sweep agrees:
 /// on the Muse trunk shapes at M=5 the whole-forward estimate is 42.4 ms at
-/// 2, 42.5 at 1, 44.5 at 4, 49.0 at 8. `MLX_SERVE_VQMM_KPARTS` (1..8) forces
-/// a value for that sweep.
-var vqmm_kparts_override_cache: ?c_int = null;
+/// 2, 42.5 at 1, 44.5 at 4, 49.0 at 8.
 fn vqmmKParts(N: c_int) c_int {
-    const forced = vqmm_kparts_override_cache orelse blk: {
-        var v: c_int = 0;
-        if (env.get(.MLX_SERVE_VQMM_KPARTS)) |p| {
-            const parsed = std.fmt.parseInt(c_int, std.mem.span(p), 10) catch 0;
-            if (parsed >= 1 and parsed <= 8) v = parsed;
-        }
-        vqmm_kparts_override_cache = v;
-        break :blk v;
-    };
-    if (forced != 0) return forced;
     return if (N >= 4096) 2 else 4;
 }
 
 pub fn vqmmBnFor(m: c_int, N: c_int) c_int {
-    const forced = vqmmBnOverride();
+    const forced = vqmm_bn_test_override orelse 0;
     if (forced != 0 and @mod(N, forced) == 0 and forced * m <= VQMM_MAX_ACC) return forced;
     const want: c_int = if (m <= 6) 4 else 2;
     return if (@mod(N, want) == 0) want else 0;
@@ -537,41 +401,13 @@ pub fn cachedScalarInt(v: c_int) mlx.mlx_array {
     return arr;
 }
 
-var verify_qmm_enabled_cache: ?bool = null;
 pub var verify_qmm_override: ?bool = null;
 pub fn verifyQmmEnabled() bool {
-    if (verify_qmm_override) |v| return v;
-    if (verify_qmm_enabled_cache) |v| return v;
-    var on = true;
-    if (env.get(.MLX_SERVE_VERIFY_QMM)) |p| {
-        const val = std.mem.span(p);
-        if (val.len > 0 and val[0] == '0') on = false;
-    }
-    verify_qmm_enabled_cache = on;
-    return on;
+    return verify_qmm_override orelse true;
 }
 
-pub const VqmmLane = enum { none, splitk, msg, nax, crossrow };
+pub const VqmmLane = enum { none, splitk, msg, nax };
 
-/// Crossrow M 8-9 lane (plain-SIMD machines, 4-bit g64 only): OPT-IN via
-/// MLX_SERVE_VERIFY_QMM_CROSSROW=1 until its A/B wins. Port of the
-/// qwen-3.8-mtp-challenge `qmv_fast_crossrow_affine4_g64` (see NOTICE):
-/// one weight read serves TWO input rows, so the M 8/9 widths that
-/// stack-spill the split-K tile (the measured register cliff) ride a
-/// qmv-shaped kernel instead of stock. Test seam: `vqmm_crossrow_override`.
-pub var vqmm_crossrow_override: ?bool = null;
-var vqmm_crossrow_env_cached: ?bool = null;
-fn crossrowEnvEnabled() bool {
-    if (vqmm_crossrow_override) |v| return v;
-    if (vqmm_crossrow_env_cached) |v| return v;
-    const v = blk: {
-        const raw = env.get(.MLX_SERVE_VERIFY_QMM_CROSSROW) orelse break :blk false;
-        break :blk std.mem.eql(u8, std.mem.sliceTo(raw, 0), "1");
-    };
-    vqmm_crossrow_env_cached = v;
-    return v;
-}
-var vqmm_crossrow_engaged = false;
 pub var vqmm_nax_engaged = false;
 
 /// The byte-unpack NAX tile is profitable for wide q5/q6/q8 projections, but
@@ -595,7 +431,7 @@ pub fn mixedNaxShapeEnabled(bits: u32, group_size: u32, n: c_int, m: c_int) bool
 /// the byte-addressed unpack does strictly more ALU per value than the 4-bit
 /// nibble path, so the shapes where it beats stock differ from the NAX tile's
 /// (`mixedNaxShapeEnabled` exists because that tile LOSES on the 1024-wide K/V
-/// projections). `MLX_SERVE_VERIFY_QMM_MIXED_PLAIN=0|1` forces the A/B arms.
+/// projections).
 ///
 /// MEASURED, Qwen3.8-27B on an M4 Max (no NAX lane, so the plain-SIMD tiles are
 /// all this machine has), MTP on, decode tok/s from the server's own timings,
@@ -635,20 +471,6 @@ pub fn mixedPlainShapeEnabled(bits: u32, group_size: u32, n: c_int) bool {
 /// K/V projections), and the reason force-all-shapes gives back most of the win.
 pub const MIXED_PLAIN_MIN_N: c_int = 2560;
 
-var vqmm_mixed_plain_env_cache: ?u8 = null;
-/// 0 = forced off, 1 = forced on, 2 = follow `mixedPlainShapeEnabled`.
-fn mixedPlainEnvMode() u8 {
-    if (vqmm_mixed_plain_env_cache) |v| return v;
-    var mode: u8 = 2;
-    if (env.get(.MLX_SERVE_VERIFY_QMM_MIXED_PLAIN)) |p| {
-        const val = std.mem.span(p);
-        if (val.len > 0 and val[0] == '0') mode = 0;
-        if (val.len > 0 and val[0] == '1') mode = 1;
-    }
-    vqmm_mixed_plain_env_cache = mode;
-    return mode;
-}
-
 var vqmm_mixed_plain_engaged: bool = false;
 
 /// Test seam: the parity test drives the plain-SIMD mixed-width arms without
@@ -659,11 +481,7 @@ pub var vqmm_mixed_nax_test_force: ?bool = null;
 
 pub fn mixedPlainEnabled(bits: u32, group_size: u32, n: c_int) bool {
     if (vqmm_mixed_plain_test_force) |v| return v;
-    return switch (mixedPlainEnvMode()) {
-        0 => false,
-        1 => bits == 5 or bits == 6 or bits == 8 or bits == 4,
-        else => mixedPlainShapeEnabled(bits, group_size, n),
-    };
+    return mixedPlainShapeEnabled(bits, group_size, n);
 }
 
 /// Pure lane selection for the verify-qmm family (hermetically pinned by
@@ -671,15 +489,15 @@ pub fn mixedPlainEnabled(bits: u32, group_size: u32, n: c_int) bool {
 /// projections — GDN ba proj, MoE routers — gain nothing over stock qmv
 /// while the per-call kernel-node build ~10us is real; ~50 such calls ride
 /// every verify round). Lanes:
-/// - nax: M >= nax_min_m (default 8, MLX_SERVE_VERIFY_QMM_NAX_MIN_M) when
+/// - nax: M >= nax_min_m (8; 7 at 8-bit) when
 ///   the M5-class probe is live AND the m16 tile's stricter geometry holds
 ///   (K % 256 == 0, N % 32 == 0) — the lm_head N=151936 qualifies natively,
 ///   so no msg variant is needed past M=7.
 /// - splitk/msg: the plain-SIMD M 2..7 lanes (K % 64 == 0, N % 4 == 0),
 ///   byte-identical to the pre-NAX dispatch; msg takes N >= 100000.
 /// - none: stock mlx_quantized_matmul.
-pub fn vqmmLaneFor(m: c_int, K: c_int, N: c_int, nax_on: bool, nax_min_m: c_int, crossrow_on: bool) VqmmLane {
-    return vqmmLaneForTile(m, K, N, if (nax_on) .nax else .off, nax_min_m, crossrow_on);
+pub fn vqmmLaneFor(m: c_int, K: c_int, N: c_int, nax_on: bool, nax_min_m: c_int) VqmmLane {
+    return vqmmLaneForTile(m, K, N, if (nax_on) .nax else .off, nax_min_m);
 }
 
 /// Which matmul2d tile this machine runs: the M5 matrix units (`nax`, one 16-row tile,
@@ -702,20 +520,13 @@ pub fn vqmmTileRows(tile: VqmmTile, m: c_int) c_int {
     return if (tile == .shader) @divTrunc(m + 7, 8) * 8 else 16;
 }
 
-pub fn vqmmLaneForTile(m: c_int, K: c_int, N: c_int, tile: VqmmTile, nax_min_m: c_int, crossrow_on: bool) VqmmLane {
+pub fn vqmmLaneForTile(m: c_int, K: c_int, N: c_int, tile: VqmmTile, nax_min_m: c_int) VqmmLane {
     const max_m: c_int = if (tile == .shader) SHADER_TILE_MAX_M else 16;
     if (m < 2 or m > max_m) return .none;
     if (N < 512) return .none;
     const tile_min_m: c_int = if (tile == .shader) 8 else nax_min_m;
     if (tile != .off and m >= tile_min_m and @mod(K, 256) == 0 and @mod(N, 32) == 0) return .nax;
-    if (m > 16) return .none;
-    if (m > 7) {
-        // crossrow (opt-in, non-NAX): M 8..9 past the plain-SIMD register
-        // cliff. Its k-loop covers exactly 512 inputs per iteration and its
-        // row tiles are unguarded 8s; their host gate keeps out_vec >= 1024.
-        if (crossrow_on and m <= 9 and @mod(K, 512) == 0 and @mod(N, 8) == 0 and N >= 1024) return .crossrow;
-        return .none;
-    }
+    if (m > 7) return .none;
     if (@mod(K, 64) != 0 or @mod(N, 4) != 0) return .none;
     return if (N >= 100000) .msg else .splitk;
 }
@@ -756,15 +567,11 @@ pub fn verifyQmm(
     // values (5/6-bit rows are byte-packed but still exposed as uint32 arrays).
     if (@as(i64, wsh[1]) * 32 != @as(i64, K) * @as(i64, bits)) return null;
     const tile = verifyQmmTile();
-    const lane = vqmmLaneForTile(m, K, N, tile, naxMinMForBits(bits), crossrowEnvEnabled());
+    const lane = vqmmLaneForTile(m, K, N, tile, naxMinMForBits(bits));
     // The shader tile is measured at 4-bit only; other widths stay on stock.
     if (lane == .nax and tile == .shader and bits != 4) return null;
-    // The crossrow kernel is a strict 4-bit/g64 specialization (masked-nibble
-    // dot with /16-prescaled activations) — other widths fall to stock.
-    if (lane == .crossrow and (bits != 4 or group_size != 64)) return null;
     if (bits != 4) switch (lane) {
-        .crossrow => return null, // unreachable after the gate above; explicit
-        .nax => if (!naxMixedBitsEnvEnabled() or !(vqmm_mixed_nax_test_force orelse mixedNaxShapeEnabled(bits, group_size, N, m))) return null,
+        .nax => if (!(vqmm_mixed_nax_test_force orelse mixedNaxShapeEnabled(bits, group_size, N, m))) return null,
         // The plain-SIMD tiles now carry the same byte-addressed unpack the
         // NAX tile validated, so 5/6/8-bit no longer fall through to stock on
         // every M1-M4 machine — but adoption is per-shape and measured.
@@ -775,21 +582,13 @@ pub fn verifyQmm(
             // log rather than from the env it was launched with.
             if (!vqmm_mixed_plain_engaged) {
                 vqmm_mixed_plain_engaged = true;
-                log.info("[vqmm] plain-SIMD verify lane engaged at {d}-bit: lane={s} M={d} K={d} N={d} gs={d} (MLX_SERVE_VERIFY_QMM_MIXED_PLAIN=0 restores stock)\n", .{ bits, @tagName(lane), m, K, N, group_size });
+                log.info("[vqmm] plain-SIMD verify lane engaged at {d}-bit: lane={s} M={d} K={d} N={d} gs={d}\n", .{ bits, @tagName(lane), m, K, N, group_size });
             }
         },
         .none => return null,
     };
     switch (lane) {
         .none => return null,
-        // Crossrow M 8/9 (opt-in): one weight read serves two input rows.
-        .crossrow => {
-            if (!vqmm_crossrow_engaged) {
-                vqmm_crossrow_engaged = true;
-                log.info("[vqmm] crossrow verify lane engaged: M={d} K={d} N={d} (MLX_SERVE_VERIFY_QMM_CROSSROW=0 restores stock)\n", .{ m, K, N });
-            }
-            return try runVerifyQmmCrossrow(s, x, w, sc, bi, m, K, N, xd, xsh);
-        },
         // NAX m16 tile (M5-class): M 8..16 by default — past the plain-SIMD
         // register cliff. Construction stays strictly behind the probe.
         .nax => return try runVerifyQmmNax(s, x, w, sc, bi, bits, group_size, m, vqmmTileRows(tile, m), K, N, xd, xsh),
@@ -1388,9 +1187,7 @@ test "verifyQmm: split-K + msg + NAX verify-width kernels match stock qmm (4-bit
             try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
 
             // Kernel path — must ENGAGE for every listed M, at EVERY column
-            // tile the sweep can force. `MLX_SERVE_VQMM_BN` is an A/B lever,
-            // so a tile that silently computed the wrong thing would only
-            // show up mid-measurement; null forces the shipped per-M default.
+            // tile the test seam can force; null is the shipped per-M default.
             for ([_]?c_int{null} ++ [_]?c_int{ 2, 4, 8 }) |bn_force| {
                 if (bn_force) |bn| {
                     // The NAX tile ignores bn; only the split-K rows sweep.
@@ -1620,54 +1417,41 @@ test "vqmmLaneFor: NAX dispatch table (M 8..16 route to the m16 tile only when t
 
     // Plain-SIMD machine (probe false): the table is byte-identical to the
     // pre-NAX dispatch — M 8..16 fall through to stock.
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(1, 5120, 17408, nax_off, 8, false));
-    try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(2, 5120, 17408, nax_off, 8, false));
-    try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(7, 5120, 17408, nax_off, 8, false));
-    try testing.expectEqual(VqmmLane.msg, vqmmLaneFor(4, 5120, 151936, nax_off, 8, false));
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5120, 17408, nax_off, 8, false));
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(16, 5120, 17408, nax_off, 8, false));
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(1, 5120, 17408, nax_off, 8));
+    try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(2, 5120, 17408, nax_off, 8));
+    try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(7, 5120, 17408, nax_off, 8));
+    try testing.expectEqual(VqmmLane.msg, vqmmLaneFor(4, 5120, 151936, nax_off, 8));
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5120, 17408, nax_off, 8));
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(16, 5120, 17408, nax_off, 8));
     // Geometry floors shared by every lane.
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(4, 5120, 256, nax_off, 8, false)); // N < 512
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(4, 100, 17408, nax_off, 8, false)); // K % 64 != 0
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(4, 5120, 17409, nax_off, 8, false)); // N % 4 != 0
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(4, 5120, 256, nax_off, 8)); // N < 512
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(4, 100, 17408, nax_off, 8)); // K % 64 != 0
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(4, 5120, 17409, nax_off, 8)); // N % 4 != 0
 
     // M5 (probe true), default takeover width 8: M 2..7 KEEP the plain-SIMD
     // lanes (MTPLX's own dispatcher keeps SIMD through M=6 with NAX lit —
     // 16-row padding waste makes SIMD competitive at small M).
-    try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(7, 5120, 17408, nax_on, 8, false));
-    try testing.expectEqual(VqmmLane.msg, vqmmLaneFor(7, 5120, 151936, nax_on, 8, false));
+    try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(7, 5120, 17408, nax_on, 8));
+    try testing.expectEqual(VqmmLane.msg, vqmmLaneFor(7, 5120, 151936, nax_on, 8));
     // M 8..16 route to the NAX tile when its stricter geometry holds…
-    try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(8, 5120, 17408, nax_on, 8, false));
-    try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(16, 5120, 17408, nax_on, 8, false));
+    try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(8, 5120, 17408, nax_on, 8));
+    try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(16, 5120, 17408, nax_on, 8));
     // …including the lm_head class natively (N=151936 % 32 == 0 — no msg
     // variant needed past M=7).
-    try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(9, 5120, 151936, nax_on, 8, false));
+    try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(9, 5120, 151936, nax_on, 8));
     // Tile-ineligible geometry at M 8..16 stays stock: K % 256, N % 32.
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5184, 17408, nax_on, 8, false)); // 5184 % 256 == 64
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5120, 17412, nax_on, 8, false)); // 17412 % 32 == 4
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(17, 5120, 17408, nax_on, 8, false)); // past every lane
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(1, 5120, 17408, nax_on, 8, false)); // M=1 stays qmv
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5120, 480, nax_on, 8, false)); // tiny-N floor holds for NAX too
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5184, 17408, nax_on, 8)); // 5184 % 256 == 64
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5120, 17412, nax_on, 8)); // 17412 % 32 == 4
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(17, 5120, 17408, nax_on, 8)); // past every lane
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(1, 5120, 17408, nax_on, 8)); // M=1 stays qmv
+    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5120, 480, nax_on, 8)); // tiny-N floor holds for NAX too
 
-    // The M5-day A/B knob (MLX_SERVE_VERIFY_QMM_NAX_MIN_M=5): M 5..7 route
-    // to NAX, M 4 keeps split-K, and the tile geometry is still required —
+    // A lowered takeover width (5): M 5..7 route to NAX, M 4 keeps split-K, and the tile geometry is still required —
     // a lowered width never bypasses it, it falls back to the SIMD lanes.
-    try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(5, 5120, 17408, nax_on, 5, false));
-    try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(7, 5120, 151936, nax_on, 5, false));
-    try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(4, 5120, 17408, nax_on, 5, false));
-    try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(5, 5184, 17408, nax_on, 5, false)); // K % 256 fails, % 64 holds
-
-    // Crossrow (opt-in): M 8..9 on plain-SIMD machines at its own geometry
-    // (K % 512, N % 8, N >= 1024); NAX outranks it, 2..7 stays split-K, and
-    // with the opt-in off the M 8..16 fall-through is unchanged.
-    try testing.expectEqual(VqmmLane.crossrow, vqmmLaneFor(8, 5120, 17408, nax_off, 8, true));
-    try testing.expectEqual(VqmmLane.crossrow, vqmmLaneFor(9, 5120, 17408, nax_off, 8, true));
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(10, 5120, 17408, nax_off, 8, true)); // past the pair tile
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5184, 17408, nax_off, 8, true)); // K % 512 != 0
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5120, 17412, nax_off, 8, true)); // N % 8 != 0
-    try testing.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5120, 1016, nax_off, 8, true)); // their host gate: N >= 1024
-    try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(8, 5120, 17408, nax_on, 8, true)); // NAX outranks
-    try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(7, 5120, 17408, nax_off, 8, true));
+    try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(5, 5120, 17408, nax_on, 5));
+    try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(7, 5120, 151936, nax_on, 5));
+    try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(4, 5120, 17408, nax_on, 5));
+    try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(5, 5184, 17408, nax_on, 5)); // K % 256 fails, % 64 holds
 }
 
 test "verifyQmm lane table: the M4 shader tile serves M 8..24 in 8-row steps" {
@@ -1677,110 +1461,17 @@ test "verifyQmm lane table: the M4 shader tile serves M 8..24 in 8-row steps" {
     try testing.expectEqual(VqmmTile.off, vqmmTileFrom(false, "applegpu_g16p", "26.5")); // phone: unmeasured
     try testing.expectEqual(VqmmTile.nax, vqmmTileFrom(true, "applegpu_g17s", "26.5"));
 
-    try testing.expectEqual(VqmmLane.splitk, vqmmLaneForTile(7, 5120, 17408, .shader, 8, false));
-    for ([_]c_int{ 8, 12, 16, 17, 24 }) |m| try testing.expectEqual(VqmmLane.nax, vqmmLaneForTile(m, 5120, 17408, .shader, 8, false));
-    try testing.expectEqual(VqmmLane.none, vqmmLaneForTile(25, 5120, 17408, .shader, 8, false));
-    try testing.expectEqual(VqmmLane.none, vqmmLaneForTile(12, 5184, 17408, .shader, 8, false)); // K % 256
+    try testing.expectEqual(VqmmLane.splitk, vqmmLaneForTile(7, 5120, 17408, .shader, 8));
+    for ([_]c_int{ 8, 12, 16, 17, 24 }) |m| try testing.expectEqual(VqmmLane.nax, vqmmLaneForTile(m, 5120, 17408, .shader, 8));
+    try testing.expectEqual(VqmmLane.none, vqmmLaneForTile(25, 5120, 17408, .shader, 8));
+    try testing.expectEqual(VqmmLane.none, vqmmLaneForTile(12, 5184, 17408, .shader, 8)); // K % 256
     // The M5 tile keeps its 16-row ceiling.
-    try testing.expectEqual(VqmmLane.none, vqmmLaneForTile(17, 5120, 17408, .nax, 8, false));
+    try testing.expectEqual(VqmmLane.none, vqmmLaneForTile(17, 5120, 17408, .nax, 8));
 
     try testing.expectEqual(@as(c_int, 8), vqmmTileRows(.shader, 8));
     try testing.expectEqual(@as(c_int, 16), vqmmTileRows(.shader, 9));
     try testing.expectEqual(@as(c_int, 24), vqmmTileRows(.shader, 17));
     try testing.expectEqual(@as(c_int, 16), vqmmTileRows(.nax, 8));
-}
-
-test "verifyQmm: crossrow M 8/9 lane matches stock qmm (4-bit g64, opt-in)" {
-    // Same bar as the split-K/msg/NAX parity test: no worse than stock
-    // against the fp32 dequant ground truth (reduction order differs, so
-    // agreement-with-stock is not the bar — the verify-lane rule).
-    const s = mlx.gpuStream();
-    const allocator = testing.allocator;
-    var prng = std.Random.DefaultPrng.init(0xC805);
-    const rnd = prng.random();
-
-    vqmm_crossrow_override = true;
-    defer vqmm_crossrow_override = null;
-    transformer.vqmm_nax_probe_override = false; // pin the plain-SIMD dispatch on an M5 too
-    defer transformer.vqmm_nax_probe_override = null;
-
-    const cases = [_]struct { k: c_int, n: c_int }{
-        .{ .k = 5120, .n = 2048 }, // trunk-projection class
-        .{ .k = 1536, .n = 17408 }, // MLP-width class, K = 3 x 512
-    };
-    for (cases) |cs| {
-        const wb = try testRandWeightBf16(rnd, &[_]c_int{ cs.n, cs.k }, s);
-        defer _ = mlx.mlx_array_free(wb);
-        var triple = mlx.mlx_vector_array_new();
-        defer _ = mlx.mlx_vector_array_free(triple);
-        try mlx.check(mlx.mlx_quantize(&triple, wb, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, s));
-        var wq = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(wq);
-        var wsc = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(wsc);
-        var wbi = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(wbi);
-        try mlx.check(mlx.mlx_vector_array_get(&wq, triple, 0));
-        try mlx.check(mlx.mlx_vector_array_get(&wsc, triple, 1));
-        try mlx.check(mlx.mlx_vector_array_get(&wbi, triple, 2));
-
-        var wdq = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(wdq);
-        try mlx.check(mlx.mlx_dequantize(&wdq, wq, wsc, wbi, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{ .ctx = null }, mlx.mlx_optional_dtype{ .has_value = true, .value = .float32 }, s));
-        var wdq_t = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(wdq_t);
-        const t_axes = [_]c_int{ 1, 0 };
-        try mlx.check(mlx.mlx_transpose_axes(&wdq_t, wdq, &t_axes, 2, s));
-
-        // M=8 exercises the all-pairs path, M=9 the zeroed-tail single arm.
-        for ([_]c_int{ 8, 9 }) |m| {
-            const xn: usize = @intCast(m * cs.k);
-            const xbuf = try allocator.alloc(f32, xn);
-            defer allocator.free(xbuf);
-            for (xbuf) |*v| v.* = rnd.float(f32) - 0.5;
-            const xshape = [_]c_int{ 1, m, cs.k };
-            const x32 = mlx.mlx_array_new_data(xbuf.ptr, &xshape, 3, .float32);
-            defer _ = mlx.mlx_array_free(x32);
-            var x = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(x);
-            try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
-
-            const got = (try verifyQmm(s, x, wq, wsc, wbi, 4, 64)) orelse return error.CrossrowDeclined;
-            defer _ = mlx.mlx_array_free(got);
-            const gsh = mlx.getShape(got);
-            try testing.expectEqual(@as(c_int, 1), gsh[0]);
-            try testing.expectEqual(m, gsh[1]);
-            try testing.expectEqual(cs.n, gsh[2]);
-            try expectVerifyQmmNoWorseThanStock(s, x, wq, wsc, wbi, 4, 64, wdq_t, got, "crossrow");
-        }
-
-        // gs 32 must not enter the 4/g64 specialization even with the
-        // opt-in on (falls to stock = null at these M).
-        {
-            var t32 = mlx.mlx_vector_array_new();
-            defer _ = mlx.mlx_vector_array_free(t32);
-            try mlx.check(mlx.mlx_quantize(&t32, wb, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(4), "affine", .{}, s));
-            var wq32 = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(wq32);
-            var ws32 = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(ws32);
-            var wb32 = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(wb32);
-            try mlx.check(mlx.mlx_vector_array_get(&wq32, t32, 0));
-            try mlx.check(mlx.mlx_vector_array_get(&ws32, t32, 1));
-            try mlx.check(mlx.mlx_vector_array_get(&wb32, t32, 2));
-            const xbuf = try allocator.alloc(f32, @intCast(8 * cs.k));
-            defer allocator.free(xbuf);
-            for (xbuf) |*v| v.* = 0.1;
-            const xshape = [_]c_int{ 1, 8, cs.k };
-            const x32b = mlx.mlx_array_new_data(xbuf.ptr, &xshape, 3, .float32);
-            defer _ = mlx.mlx_array_free(x32b);
-            var x8 = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(x8);
-            try mlx.check(mlx.mlx_astype(&x8, x32b, .bfloat16, s));
-            try testing.expectEqual(@as(?mlx.mlx_array, null), try verifyQmm(s, x8, wq32, ws32, wb32, 4, 32));
-        }
-    }
 }
 
 test "mixedNaxShapeEnabled keeps measured q5/q6/q8 wins and rejects narrow regressions" {
@@ -1823,24 +1514,23 @@ test "verifyQmmNaxEnabledForMFrom mirrors flags, min-M, and dispatch geometry" {
     const K: c_int = 5120;
     const N: c_int = 151936;
 
-    try testing.expect(verifyQmmNaxEnabledForMFrom(8, K, N, true, true, true, 8));
-    try testing.expect(verifyQmmNaxEnabledForMFrom(9, K, N, true, true, true, 8));
-    try testing.expect(!verifyQmmNaxEnabledForMFrom(8, K, N, false, true, true, 8));
-    try testing.expect(!verifyQmmNaxEnabledForMFrom(8, K, N, true, false, true, 8));
-    try testing.expect(!verifyQmmNaxEnabledForMFrom(8, K, N, true, true, false, 8));
+    try testing.expect(verifyQmmNaxEnabledForMFrom(8, K, N, true, true, 8));
+    try testing.expect(verifyQmmNaxEnabledForMFrom(9, K, N, true, true, 8));
+    try testing.expect(!verifyQmmNaxEnabledForMFrom(8, K, N, false, true, 8));
+    try testing.expect(!verifyQmmNaxEnabledForMFrom(8, K, N, true, false, 8));
 
     // The takeover knob is part of controller readiness, not just kernel
     // dispatch: min-M 9 leaves M=8 on stock even though M=9 is NAX.
-    try testing.expect(!verifyQmmNaxEnabledForMFrom(8, K, N, true, true, true, 9));
-    try testing.expect(verifyQmmNaxEnabledForMFrom(9, K, N, true, true, true, 9));
-    try testing.expect(!verifyQmmNaxEnabledForMFrom(9, K, N, true, true, true, 10));
-    try testing.expect(verifyQmmNaxEnabledForMFrom(8, K, N, true, true, true, 5));
+    try testing.expect(!verifyQmmNaxEnabledForMFrom(8, K, N, true, true, 9));
+    try testing.expect(verifyQmmNaxEnabledForMFrom(9, K, N, true, true, 9));
+    try testing.expect(!verifyQmmNaxEnabledForMFrom(9, K, N, true, true, 10));
+    try testing.expect(verifyQmmNaxEnabledForMFrom(8, K, N, true, true, 5));
 
-    try testing.expect(!verifyQmmNaxEnabledForMFrom(8, 5184, N, true, true, true, 8));
-    try testing.expect(!verifyQmmNaxEnabledForMFrom(8, K, 151940, true, true, true, 8));
-    try testing.expect(!verifyQmmNaxEnabledForMFrom(8, K, 480, true, true, true, 8));
-    try testing.expect(!verifyQmmNaxEnabledForMFrom(1, K, N, true, true, true, 8));
-    try testing.expect(!verifyQmmNaxEnabledForMFrom(17, K, N, true, true, true, 8));
+    try testing.expect(!verifyQmmNaxEnabledForMFrom(8, 5184, N, true, true, 8));
+    try testing.expect(!verifyQmmNaxEnabledForMFrom(8, K, 151940, true, true, 8));
+    try testing.expect(!verifyQmmNaxEnabledForMFrom(8, K, 480, true, true, 8));
+    try testing.expect(!verifyQmmNaxEnabledForMFrom(1, K, N, true, true, 8));
+    try testing.expect(!verifyQmmNaxEnabledForMFrom(17, K, N, true, true, 8));
 }
 
 test "verifyQmmNaxAvailable: false on every non-G17 device (kernel is never built here)" {
@@ -1863,24 +1553,10 @@ test "verifyQmmNaxAvailable: false on every non-G17 device (kernel is never buil
     }
 }
 
-test "naxMinMFrom: default 8, clamped to [2,16], garbage ignored" {
-    try testing.expectEqual(@as(c_int, 8), naxMinMFrom(null));
-    try testing.expectEqual(@as(c_int, 5), naxMinMFrom("5"));
-    try testing.expectEqual(@as(c_int, 16), naxMinMFrom("16"));
-    try testing.expectEqual(@as(c_int, 2), naxMinMFrom("1"));
-    try testing.expectEqual(@as(c_int, 2), naxMinMFrom("0"));
-    try testing.expectEqual(@as(c_int, 16), naxMinMFrom("99"));
-    try testing.expectEqual(@as(c_int, 8), naxMinMFrom("abc"));
-    try testing.expectEqual(@as(c_int, 8), naxMinMFrom(""));
-}
-
-test "naxMinMForBitsFrom: q8 defaults to measured M7 and explicit override wins" {
-    try testing.expectEqual(@as(c_int, 8), naxMinMForBitsFrom(4, null));
-    try testing.expectEqual(@as(c_int, 8), naxMinMForBitsFrom(6, null));
-    try testing.expectEqual(@as(c_int, 7), naxMinMForBitsFrom(8, null));
-    try testing.expectEqual(@as(c_int, 8), naxMinMForBitsFrom(8, "8"));
-    try testing.expectEqual(@as(c_int, 6), naxMinMForBitsFrom(8, "6"));
-    try testing.expectEqual(@as(c_int, 7), naxMinMForBitsFrom(8, "garbage"));
+test "naxMinMForBits: q8 takes over at its measured M7, the rest at M8" {
+    try testing.expectEqual(@as(c_int, 8), naxMinMForBits(4));
+    try testing.expectEqual(@as(c_int, 8), naxMinMForBits(6));
+    try testing.expectEqual(@as(c_int, 7), naxMinMForBits(8));
 }
 
 test "NAX host scaffolding: zero-pad to 16 rows + slice-back are exact (runs off-M5)" {

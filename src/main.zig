@@ -240,7 +240,7 @@ fn printUsage(io: std.Io) void {
         \\  --ane-prefill       Offload a share of each prefill chunk's dense
         \\                        MLP rows to the Neural Engine (qwen3_5-family
         \\                        only; int8/fp16, lossy; needs >= 96 GB RAM).
-        \\                        MLX_SERVE_ANE_SPLIT tunes the share (0.40).
+        \\                        The share is measured per silicon.
         \\  --int8-qk           Run the hd-256 prefill attention of dense Qwen
         \\                        models with int8 Q/K (NAX GPUs, lossy, wins
         \\                        from ~32k tokens). Also MLX_SERVE_INT8_QK=1.
@@ -270,7 +270,7 @@ fn printUsage(io: std.Io) void {
         \\                        packs half). On by default only on an M5-class
         \\                        GPU with 64 GiB of RAM; --w8a8 opts in below that.
         \\  --ane-split <f>     Force the media offload's ANE share (0..1) instead
-        \\                        of calibrating it per model (MLX_SERVE_ANE_SPLIT is the same).
+        \\                        of calibrating it per model.
         \\  --mtp               Draft with a loaded MTP head, dense or MoE. The default
         \\                        on Metal and CUDA; Vulkan needs it (--no-mtp turns it off).
         \\  --mtp-head-kv-quant Quantize the qwen4 MTP head's own KV with
@@ -297,10 +297,8 @@ fn printUsage(io: std.Io) void {
         \\                      LOSSY: a real requantization, applied to
         \\                      decode/verify steps only; prefill keeps the
         \\                      dense weights. Default ON; --no-… restores
-        \\                      exact dense decode. Env tuning:
-        \\                      MLX_SERVE_DECODE_ATTN_QUANT_NVFP4_FROM=<layer>
-        \\                      moves the 4-bit boundary, =off keeps the whole
-        \\                      stack INT8.
+        \\                      exact dense decode. The last fifth of the
+        \\                      layers reads 4-bit, the rest INT8.
         \\  --mtp-min-depth <n> Fewest tokens an MTP round drafts, 1..8
         \\                        (default 1). Every depth the planner picks
         \\                        stays inside --mtp-min-depth..--mtp-max-depth;
@@ -309,9 +307,7 @@ fn printUsage(io: std.Io) void {
         \\                        adaptive — the EV controller plans depth
         \\                        per round up to 8 on eligible M5 NAX targets,
         \\                        otherwise 6, lower on silicon with a measured
-        \\                        verify-width cliff; MLX_SERVE_MTP_ADAPTIVE=0
-        \\                        reverts to the fixed windowed controller,
-        \\                        cap 3). A --mtp-min-depth above that default
+        \\                        verify-width cliff). A --mtp-min-depth above that default
         \\                        lifts it. --mtp-depth is the old spelling.
         \\                        Each machine finds its own range.
         \\  --mtp-typical <d>  Opt-in lossy typical MTP acceptance (d > 0).
@@ -550,9 +546,6 @@ pub fn main(init: std.process.Init) !void {
     server_mod.applyGpuCeilingEnv();
     mlx.exportCudaHome();
     mlx.exportPtxCacheDir(@import("mlx_stamp").bytes);
-    // Resolve lazily-cached env reads on the main thread before other threads exist.
-    @import("engines/mlx/transformer.zig").warmQsaEnvCaches();
-    @import("engines/mlx/cache/prefix_cache.zig").warmEnvCaches();
 
     // mlx-c's default handler exits the process; latch MLX failures instead (#353).
     mlx.installErrorHandler();
@@ -691,8 +684,8 @@ pub fn main(init: std.process.Init) !void {
     var enable_mtp = true; // Qwen native MTP head (auto when sidecar present; --no-mtp to disable)
     var mtp_forced = false;
     var mtp_head_kv_quant = false;
-    var mtp_typical_raw: ?[]const u8 = env.span(.MLX_SERVE_MTP_TYPICAL);
-    var mtp_tokenv3_raw: ?[]const u8 = env.span(.MLX_SERVE_MTP_TOKENV3);
+    var mtp_typical_raw: ?[]const u8 = null;
+    var mtp_tokenv3_raw: ?[]const u8 = null;
     // Plan 04 Phase 1: pre-fault weights and pre-compile kernels at boot.
     // Default ON in serve mode — small boot-time cost, big cold-prefill win.
     // --no-warmup-eager opts out for benchmarking / minimal-footprint deployments.
@@ -906,8 +899,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--ane-prefill")) {
             // ANE prefill-MLP offload (perf-plan-aug-17 P5): opt-in, lossy
             // by design (int8 fp16 datapath). Eligibility + machine gates
-            // are named [ane] log lines at load; MLX_SERVE_ANE_SPLIT tunes
-            // the row share.
+            // are named [ane] log lines at load.
             ane_prefill = true;
         } else if (std.mem.eql(u8, args[i], "--ane")) {
             ane_serve = true;
@@ -1200,7 +1192,6 @@ pub fn main(init: std.process.Init) !void {
 
     // One value for the three media seams (they run under gen.zig with no
     // server config in reach); the env stays the benching override.
-    if (ane_media.share == null) ane_media.share = ane_mod.explicitShareEnv();
     ane_mod.media_offload = ane_media;
 
     const decode_share_env: ?[]const u8 = env.span(.MLX_SERVE_PREFILL_DECODE_SHARE);
@@ -1219,7 +1210,6 @@ pub fn main(init: std.process.Init) !void {
         log.err("--mtp-min-depth {d} is above --mtp-max-depth {d}\n", .{ depth_bounds.active.min, depth_bounds.active.max });
         std.process.exit(1);
     };
-    if (env.get(.MLX_SERVE_MTP_FORCE_DEPTH) != null) log.warn("MLX_SERVE_MTP_FORCE_DEPTH no longer does anything: pin a depth with --mtp-min-depth n --mtp-max-depth n\n", .{});
 
     // Subcommand plumbing: `run <model>` supplies the model dir + serve
     // mode; `run`/`serve` default the discovery root to ~/.mlx-serve/models

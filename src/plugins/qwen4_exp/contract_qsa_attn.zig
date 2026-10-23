@@ -151,7 +151,6 @@ const Split = struct {
             g.int("GS", GS);
         }
         g.int("NSPLIT", @as(c_int, NS));
-        g.int("BALANCED", 0);
         return g;
     }
 
@@ -588,7 +587,6 @@ const Slots = struct {
         g.int("BITS", bitsOf(self.kv));
         g.int("GS", GS);
         g.int("NSPLIT", @as(c_int, NS));
-        g.int("BALANCED", 0);
         return g;
     }
 

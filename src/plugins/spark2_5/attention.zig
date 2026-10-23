@@ -92,7 +92,7 @@ pub const Attention = struct {
 
         const window = w.window;
         const total_kv = offset + s;
-        const sv = sliding.view(window, geo.head_dim, false, total_kv, s);
+        const sv = sliding.view(window, geo.head_dim, total_kv, s);
         var view = try kv.append(c, k_rope, v_t, if (window > 0) sv.span else 0);
         defer kv.release(c, &view);
         const dv = kv.dense(view);

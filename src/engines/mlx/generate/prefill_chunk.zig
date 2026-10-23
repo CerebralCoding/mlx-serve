@@ -20,11 +20,6 @@ pub fn mtpGreedyTailFor(override: ?bool) bool {
     return override orelse generate_mod.mtp_greedy_tail_default;
 }
 
-/// The width `MLX_SERVE_PREFILL_CHUNK` asked for, or 0. A pinned width also turns the per-chunk adaptive width off.
-pub fn envPrefillChunk() usize {
-    return env.int(.MLX_SERVE_PREFILL_CHUNK, usize, 0);
-}
-
 /// Per-prefill state for the adaptive width; lives on `runPrefill`'s stack. The policy is
 /// `server.adaptivePrefillWidth`.
 /// The one place a chosen width becomes the running width.
@@ -139,7 +134,7 @@ pub fn boundedPrefillChunk(base_chunk: usize, score_head_dim: u32, n_heads: u32,
         // (+8% prefill for +3 GB peak here); every other MoE keeps the measured 4096 cap.
         return @min(base_chunk, if (is_moe and !long_ctx_gated) @as(usize, 4096) else @as(usize, 8192));
     }
-    // Composed-causal fallback (MLX_SERVE_FUSED_256_CAUSAL=0): SMALL chunks
+    // Composed-causal fallback (no fused causal kernel): SMALL chunks
     // measured strictly faster AND lighter on the 27B (2026-07-12 ladder,
     // M4 Max): 8K 225 -> 235.8 tok/s and peak 28.9 -> 19.8 GB at chunk
     // 2048; 32K 205.4 -> 209.3. Chunk boundaries ARE block-level causal
@@ -159,14 +154,11 @@ pub fn boundedPrefillChunk(base_chunk: usize, score_head_dim: u32, n_heads: u32,
 }
 
 /// The prefill chunk `initWithOptions` will actually use for a request:
-/// MLX_SERVE_PREFILL_CHUNK env (explicit tuning knob — honored verbatim,
-/// never safety-capped) > --prefill-chunk / default, capped by
+/// --prefill-chunk / default, capped by
 /// boundedPrefillChunk. Exported so server.zig's admission guard
 /// (checkAttentionMemory) models the SAME chunk the prefill will run with —
 /// the guard and the real prefill must not drift.
 pub fn effectivePrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, sliding_band_arch: bool, is_moe: bool, long_ctx_gated: bool, pinned_chunk: usize) usize {
-    const env_chunk = env.int(.MLX_SERVE_PREFILL_CHUNK, usize, 0);
-    if (env_chunk > 0) return env_chunk;
     // `pinned_chunk` is the machine-sized cap frozen at load
     // (`ModelConfig.pinned_prefill_chunk`, from `server.resolvePrefillChunk`):
     // the widest chunk whose one-off transient reserve still leaves this box a
@@ -363,8 +355,7 @@ pub fn effectiveSsmCheckpointStride(base: usize, prefill_chunk: usize) usize {
 
 /// Tokens of KV capacity this prefill reserves up front (#353). A multi-chunk prompt reserves
 /// itself plus one chunk of slack on every arch, since each chunk-by-chunk grow copies the whole
-/// cache; generation headroom is pre-bought only under `longCtxGated`. `MLX_SERVE_KV_RESERVE=0`
-/// turns it off.
+/// cache; generation headroom is pre-bought only under `longCtxGated`.
 pub fn reservedPrefillTokens(
     config: *const model_mod.ModelConfig,
     seq: u64,
@@ -376,36 +367,10 @@ pub fn reservedPrefillTokens(
     return @max(prompt, transformer_mod.KVCache.reservedTokens(seq, max_tokens, chunk, config.max_position_embeddings));
 }
 
-/// SSM checkpoints exist to feed prefix-cache reuse, and image-bearing
-/// prompts are excluded from prefix reuse (equal placeholder IDs do not imply
-/// equal images) — so vision prefills skip checkpointing even now that they
-/// chunk (the splice scatter itself is chunk-safe via vision_splice_offset).
-/// A vision prompt checkpoints like text once it chunks like text (#197):
+/// A prompt checkpoints SSM state at its chunk boundaries, a vision prompt included (it chunks like text, #197):
 /// without a checkpoint a hybrid's image turn is a guaranteed hot-cache miss.
-pub fn shouldCheckpointSsmPrefill(stride: u32, has_ssm: bool, has_vision: bool) bool {
-    return stride > 0 and has_ssm and (!has_vision or visionChunkedPrefillEnabled());
-}
-
-/// Chunked vision prefill (issue #197). Default ON: the splice resumes its
-/// row index across chunk boundaries via `ForwardCtx.vision_splice_offset`,
-/// so an image-bearing prompt prefills under the same chunk-bounded memory
-/// envelope as text. MLX_SERVE_VISION_CHUNKED=0 restores the whole-prompt
-/// single forward (and the memory guard's full-width bill with it).
-var vision_chunked_cached: ?bool = null;
-pub fn visionChunkedPrefillEnabled() bool {
-    if (vision_chunked_cached) |v| return v;
-    const raw = env.get(.MLX_SERVE_VISION_CHUNKED);
-    const on = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    vision_chunked_cached = on;
-    return on;
-}
-
-/// What the memory guard should bill a prefill at: full width only for a
-/// vision prompt with chunking killed. The guard and this loop must agree or
-/// admission either over-refuses (bills seq for a chunked prefill) or
-/// under-bills (uncatchable Metal OOM).
-pub fn visionPrefillUnchunked(has_vision: bool) bool {
-    return has_vision and !visionChunkedPrefillEnabled();
+pub fn shouldCheckpointSsmPrefill(stride: u32, has_ssm: bool) bool {
+    return stride > 0 and has_ssm;
 }
 
 /// Placeholder tokens (vision + audio soft tokens) in `ids` — the number of
@@ -488,13 +453,6 @@ test "decodeShareCapped: the share cap narrows an explicit and an env width" {
     try std.testing.expectEqual(@as(usize, 8192), explicit);
     try std.testing.expectEqual(@as(usize, 1024), decodeShareCapped(explicit, 1024));
     try std.testing.expectEqual(@as(usize, 8192), decodeShareCapped(explicit, 0));
-
-    env.set(.MLX_SERVE_PREFILL_CHUNK, "8192");
-    defer env.unset(.MLX_SERVE_PREFILL_CHUNK);
-    generate_mod.prefill_chunk_explicit = false;
-    const from_env = effectivePrefillChunk(128, 8, 1024, false, false, false, 2048);
-    try std.testing.expectEqual(@as(usize, 8192), from_env);
-    try std.testing.expectEqual(@as(usize, 1024), decodeShareCapped(from_env, 1024));
 }
 
 test "effectivePrefillChunk: the machine cap bounds every auto width, an explicit width passes" {
@@ -953,8 +911,8 @@ test "boundedPrefillChunk: a long-context-gated MoE hd-256 arch offers the 8192 
     try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 24, 140_000, false, false, true));
 }
 
-test "boundedPrefillChunk: composed-causal (kill switch) keeps the 2048 cap + score formula" {
-    // MLX_SERVE_FUSED_256_CAUSAL=0 restores composed causal, where SMALLER
+test "boundedPrefillChunk: composed-causal keeps the 2048 cap + score formula" {
+    // Composed causal, where SMALLER
     // chunks measured faster on the 27B ladder (2026-07-12, M4 Max): 8K
     // prompt 225 -> 235.8 tok/s at chunk 2048 (peak 28.9 -> 19.8 GB).
     // Chunking IS block-level causal skipping for composed attention, and
@@ -1010,29 +968,14 @@ test "effectiveSsmCheckpointStride: checkpointing never sub-divides the prefill 
     try testing.expectEqual(@as(usize, 2), prefillChunkCount(8238, 4096, true, effectiveSsmCheckpointStride(256, PREFILL_CHUNK), 0, false, false));
 }
 
-test "vision prefill checkpoints SSM state only when it chunks like text" {
+test "a vision prefill checkpoints SSM state like text" {
     const prefix_len: usize = 1587;
     const checkpoint_stride: u32 = 256;
-
-    // Chunked vision (the default) checkpoints like text — a hybrid's image
-    // turn is otherwise a guaranteed hot-cache miss (no checkpoint <= match).
-    vision_chunked_cached = true;
-    defer vision_chunked_cached = null;
-    try testing.expect(shouldCheckpointSsmPrefill(checkpoint_stride, true, true));
-    // The whole-prompt kill-switch arm has no chunk boundaries to snapshot at.
-    vision_chunked_cached = false;
-    const vision_checkpoints = shouldCheckpointSsmPrefill(checkpoint_stride, true, true);
-    try testing.expect(!vision_checkpoints);
-    try testing.expectEqual(
-        prefix_len,
-        nextChunkEnd(0, prefix_len, prefix_len, vision_checkpoints, @intCast(checkpoint_stride), 0, false, false),
-    );
-
-    const text_checkpoints = shouldCheckpointSsmPrefill(checkpoint_stride, true, false);
-    try testing.expect(text_checkpoints);
+    try testing.expect(shouldCheckpointSsmPrefill(checkpoint_stride, true));
+    try testing.expect(!shouldCheckpointSsmPrefill(0, true));
     try testing.expectEqual(
         @as(usize, checkpoint_stride),
-        nextChunkEnd(0, prefix_len, prefix_len, text_checkpoints, @intCast(checkpoint_stride), 0, false, false),
+        nextChunkEnd(0, prefix_len, prefix_len, true, @intCast(checkpoint_stride), 0, false, false),
     );
 }
 
@@ -1090,22 +1033,6 @@ test "the allocator pool is returned at the prefill/decode handover, long-contex
     }
 }
 
-test "prefill chunk loop yields to the interleave hook between chunks, never after the last" {
-    // The scheduler runs decode ticks for active streams at this seam so a
-    // long prefill cannot stall them for its whole duration. The final
-    // boundary is excluded: the post-prefill decode tick covers it.
-    const src = @embedFile("init.zig");
-    const progress = "if (options.prefill_progress) |p| p.store(@intCast(pos), .monotonic);";
-    const at = std.mem.indexOf(u8, src, progress) orelse return error.ProgressPublishMissing;
-    const guard = "if (pos < loop_end) {";
-    const guard_at = std.mem.indexOfPos(u8, src, at, guard) orelse return error.InterleaveGuardMissing;
-    const call = "if (options.interleave" ++ "_hook) |hk| hk.call(hk.ctx);";
-    const call_at = std.mem.indexOfPos(u8, src, guard_at, call) orelse return error.InterleaveCallMissing;
-    // The call sits INSIDE the guard (same statement block, before the loop
-    // re-tests `pos`), not somewhere later in the file.
-    try std.testing.expect(call_at - guard_at < 200);
-}
-
 test "countSpliceRows counts image, audio and video placeholders, extras only when declared" {
     const ids = [_]i32{ 7, 99, 99, 8, 88, 9, 77 };
     try testing.expectEqual(@as(usize, 2), countSpliceRows(&ids, 99, 0, 0));
@@ -1114,19 +1041,6 @@ test "countSpliceRows counts image, audio and video placeholders, extras only wh
     try testing.expectEqual(@as(usize, 0), countSpliceRows(ids[0..1], 99, 88, 77));
     // An audio-only model declares no image token: token 0 is text.
     try testing.expectEqual(@as(usize, 1), countSpliceRows(&[_]i32{ 0, 88, 0 }, 0, 88, 0));
-}
-
-test "vision prefill chunks by default and the splice offset feeds every prefill forward" {
-    // Source scan: the chunk-size pick keys on the kill switch (not bare
-    // has_vision), the chunk loop and the final-span forward both set
-    // ctx.vision_splice_offset, and the loop advances the consumed-row count.
-    const src = @embedFile("init.zig");
-    const marker = "const default_chunk = if (has_vision and !vision" ++ "_chunked) loop_end else PREFILL_CHUNK;";
-    try testing.expect(std.mem.indexOf(u8, src, marker) != null);
-    const set_off = "ctx.vision_splice" ++ "_offset = vision_rows_consumed;";
-    const first = std.mem.indexOf(u8, src, set_off) orelse return error.ChunkOffsetMissing;
-    try testing.expect(std.mem.indexOfPos(u8, src, first + 1, set_off) != null); // final-span site too
-    try testing.expect(std.mem.indexOf(u8, src, "vision_rows_consumed += countSplice" ++ "Rows(") != null);
 }
 
 test "reservedPrefillTokens: every arch reserves its prompt; only qwen4_exp pre-buys generation headroom" {

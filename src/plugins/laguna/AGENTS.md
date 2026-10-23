@@ -37,8 +37,8 @@ In `served.zig`, on the legacy parse's `ModelConfig`, whose sliding and MoE fiel
 legacy forward is deleted with flint's and kolibri1's (`served.legacy_removed`: a pack the plugin declines is refused
 by name): `lagunaAttnWith`, the laguna arms of `forward/layered.zig` and `load/layers_layered.zig`, the laguna
 batching line, the `proj_bench` rung that called it, and its bases proofs (these plugins cover them). Proofs replay
-tapes recorded from it (`fixtures/*.tape`, `engines/mlx/plugin/tape.zig`). Not ported: the opt-in fused-QKV lever
-(`MLX_SERVE_FUSED_QKV`, default off).
+tapes recorded from it (`fixtures/*.tape`, `engines/mlx/plugin/tape.zig`). Not ported: the opt-in fused QKV, which
+never won.
 
 ## Rules moved from the root AGENTS.md
 

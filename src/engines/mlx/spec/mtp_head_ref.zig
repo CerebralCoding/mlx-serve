@@ -286,22 +286,6 @@ pub const MtpHeadRef = union(enum) {
     }
 };
 
-/// `MLX_SERVE_MTP_HEAD_PERSIST=0`: the qwen4_exp head's committed history is neither
-/// snapshotted into a prefix-cache entry nor restored from one.
-var mtp_head_persist_env: ?bool = null;
-/// Only a literal "0" turns persistence off.
-pub fn mtpHeadPersistFromEnv(raw: ?[]const u8) bool {
-    const v = raw orelse return true;
-    return !std.mem.eql(u8, v, "0");
-}
-pub fn mtpHeadPersistEnabled() bool {
-    if (mtp_head_persist_env) |v| return v;
-    const raw = env.get(.MLX_SERVE_MTP_HEAD_PERSIST);
-    const on = mtpHeadPersistFromEnv(if (raw) |r| std.mem.sliceTo(r, 0) else null);
-    mtp_head_persist_env = on;
-    return on;
-}
-
 /// The head's committed-history cache.
 pub const MtpCacheRef = union(enum) {
     qwen: KVCache,
@@ -382,7 +366,7 @@ pub const MtpCacheRef = union(enum) {
             .plugin => |*r| if (r.ssm.len > 1) null else &r.kv,
             .qwen4 => |r| blk: {
                 r.t.qwen4MtpActivate(r.st);
-                break :blk if (mtpHeadPersistEnabled()) &r.t.qwen4_mtp.?.cache else null;
+                break :blk &r.t.qwen4_mtp.?.cache;
             },
             // The heads only ever read the last window of rows, rebuilt from the uncached tail.
         };
@@ -394,7 +378,7 @@ pub const MtpCacheRef = union(enum) {
             .qwen, .glm, .plugin => null,
             .qwen4 => |r| blk: {
                 r.t.qwen4MtpActivate(r.st);
-                break :blk if (mtpHeadPersistEnabled()) r.t else null;
+                break :blk r.t;
             },
         };
     }
@@ -444,15 +428,6 @@ pub const MtpCacheRef = union(enum) {
 /// absolute target position its index 0 represents.
 pub const MtpRestored = struct { cache: MtpCacheRef, base: usize };
 
-// ── tests ──
-
-
-test "MTP head persistence kill switch: only a literal 0 turns it off" {
-    try testing.expect(mtpHeadPersistFromEnv(null));
-    try testing.expect(mtpHeadPersistFromEnv(""));
-    try testing.expect(mtpHeadPersistFromEnv("1"));
-    try testing.expect(!mtpHeadPersistFromEnv("0"));
-}
 
 test "MTP plugin head cache: each head's recurrent entry keeps what its handle sets, freed with the cache" {
     const abi = @import("../../../abi/plugin.zig");

@@ -8,21 +8,11 @@ const testing = std.testing;
 const Generator = @import("../generate/generator.zig").Generator;
 
 /// Number of attempts before the runtime gate considers disabling.
-/// Below this we trust the prompt-time gate.
-///
-/// Override at runtime via `SPEC_GATE_WARMUP` env var (parsed in `runtimeGateWarmup()`
-/// once per request). Lower values make the gate trip sooner,
+/// Below this we trust the prompt-time gate. Lower values make the gate trip sooner,
 /// reducing regression-tail damage at the cost of fewer chances for slow-warmup
 /// workloads to amortize spec overhead.
 pub const RUNTIME_GATE_WARMUP: u64 = 5;
 
-/// Read the warmup threshold for this call. Env-overridable so we can A/B
-/// without rebuilding. Anything outside `[1, 64]` falls back to the default.
-pub fn runtimeGateWarmup() u64 {
-    const n = env.int(.SPEC_GATE_WARMUP, usize, @intCast(RUNTIME_GATE_WARMUP));
-    if (n < 1 or n > 64) return RUNTIME_GATE_WARMUP;
-    return @intCast(n);
-}
 /// Minimum per-draft acceptance probability. Below this after warmup,
 /// speculation is disabled for the rest of the request.
 ///
@@ -50,7 +40,7 @@ pub const RUNTIME_GATE_MIN_PER_DRAFT_RATE: f32 = 0.50;
 /// per round" → never trip (defensive — current callers always pass
 /// >= 1).
 pub fn runtimeGateShouldDisable(attempted: u64, accepted: u64, drafts_per_round: u32) bool {
-    if (attempted < runtimeGateWarmup()) return false;
+    if (attempted < RUNTIME_GATE_WARMUP) return false;
     if (drafts_per_round == 0) return false;
     const drafts_proposed = attempted * @as(u64, drafts_per_round);
     const rate = @as(f32, @floatFromInt(accepted)) /
@@ -78,17 +68,6 @@ pub const DFLASH_THINKING_GATE_MIN_ACCEPTED_PER_ROUND: f32 = 1.0;
 /// break-even acceptance is several times a dense trunk's.
 pub const DFLASH_MOE_GATE_MIN_ACCEPTED_PER_ROUND: f32 = 1.8;
 
-/// Width chooser — OPT-IN (MLX_SERVE_DFLASH_CHOOSER=1) until measured on
-/// the five peer cells; default is the fixed block + sticky yield gate.
-var dflash_chooser_cache: ?bool = null;
-pub fn dflashChooserEnabled() bool {
-    if (dflash_chooser_cache) |v| return v;
-    const raw = env.get(.MLX_SERVE_DFLASH_CHOOSER);
-    const on = raw != null and std.mem.eql(u8, std.mem.span(raw.?), "1");
-    dflash_chooser_cache = on;
-    return on;
-}
-
 /// The round policy (`dflash_policy.zig`) drives DFlash on a sparse target whose verify rows cost
 /// (GLM-5.3); every other arch keeps the fixed block until it is A/B'd on its own.
 /// `MLX_SERVE_DFLASH_POLICY=0` restores the fixed block and the sticky yield gate.
@@ -98,14 +77,8 @@ pub fn dflashPolicyFor(config: *const model_mod.ModelConfig) bool {
     return !std.mem.eql(u8, std.mem.span(raw), "0");
 }
 
-pub fn dflashGateWarmup() u64 {
-    const n = env.int(.DFLASH_GATE_WARMUP, usize, @intCast(DFLASH_GATE_WARMUP));
-    if (n < 1 or n > 64) return DFLASH_GATE_WARMUP;
-    return @intCast(n);
-}
-
 pub fn dflashGateShouldDisable(attempted: u64, accepted: u64, min_avg: f32) bool {
-    if (attempted < dflashGateWarmup()) return false;
+    if (attempted < DFLASH_GATE_WARMUP) return false;
     const avg = @as(f32, @floatFromInt(accepted)) /
         @as(f32, @floatFromInt(attempted));
     return avg < min_avg;
@@ -124,30 +97,16 @@ pub fn dflashGateShouldDisable(attempted: u64, accepted: u64, min_avg: f32) bool
 // Warmup 32 (not higher): the re-enable check bounds the cost of a
 // premature trip to ≤SPEC_REENABLE_INTERVAL pipelined-fallback steps,
 // so we can gate early and recover the pipeline sooner on novel content.
-/// Steps of enabled-mode PLD before the yield gate may trip. See the
-/// `yield-gate warmup is 8` test for the sweep this was picked from and
-/// why it moved from 32.
+/// Steps of enabled-mode PLD before the yield gate may trip. Every warmup step pays PLD's UNPIPELINED cold
+/// forward (plus a synchronous host read of the sampled token) against `next()`'s async-pipelined step, so the
+/// tax is a fraction of the AR step cost; 32 was calibrated before the Laguna mscale fix made that step ~3x
+/// cheaper. See the `yield-gate warmup is 8` test for the sweep.
 pub const YIELD_GATE_WARMUP: u64 = 8;
 pub const YIELD_GATE_MIN_YIELD: f32 = 0.25;
 
-/// Read the yield-gate warmup for this call. Env-overridable
-/// (`SPEC_YIELD_WARMUP`) so the threshold can be swept without a rebuild,
-/// exactly like `runtimeGateWarmup`. Outside `[1, 256]` falls back.
-///
-/// This number is pure economics, and the economics moved: every warmup
-/// step pays PLD's UNPIPELINED cold forward (plus a synchronous host read
-/// of the sampled token) against `next()`'s async-pipelined step, so the
-/// tax is a fraction of the AR step cost — and the AR step got ~3x cheaper
-/// when the Laguna mscale promotion was fixed, which makes the same
-/// absolute tax a ~3x larger share. 32 was calibrated before that.
-pub fn yieldGateWarmup() u64 {
-    const n = env.int(.SPEC_YIELD_WARMUP, usize, @intCast(YIELD_GATE_WARMUP));
-    if (n < 1 or n > 256) return YIELD_GATE_WARMUP;
-    return @intCast(n);
-}
 
 pub fn yieldGateShouldDisable(steps_total: u64, accepted: u64) bool {
-    if (steps_total < yieldGateWarmup()) return false;
+    if (steps_total < YIELD_GATE_WARMUP) return false;
     const yield_rate = @as(f32, @floatFromInt(accepted)) /
         @as(f32, @floatFromInt(steps_total));
     return yield_rate < YIELD_GATE_MIN_YIELD;
@@ -357,7 +316,7 @@ test "yield-gate warmup is 8 — the cold-path tax tripled when the AR step got 
 
     // Sweepable without a rebuild, same contract as `runtimeGateWarmup`:
     // out-of-range values fall back rather than silently disabling the gate.
-    try testing.expectEqual(Generator.YIELD_GATE_WARMUP, Generator.yieldGateWarmup());
+    try testing.expectEqual(Generator.YIELD_GATE_WARMUP, YIELD_GATE_WARMUP);
 }
 
 test "Generator.specShouldReenable gates mid-request PLD re-activation" {

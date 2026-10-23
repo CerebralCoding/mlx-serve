@@ -4,6 +4,7 @@
 //! does. The final norm is optional.
 
 const std = @import("std");
+const mlx = @import("../../mlx/ffi.zig");
 const ops = @import("../../mlx/ops.zig");
 const abi = @import("../../abi/plugin.zig");
 const block = @import("block.zig");
@@ -67,6 +68,7 @@ pub fn Hybrid(comptime spec: anytype) type {
             c.memo = &memo;
             var h = try run.splice(g, try Embed.forward(&w.embed, &c, ids), ids);
             if (@hasDecl(Hooks, "afterEmbed")) h = try Hooks.afterEmbed(&w.extra, &c, h);
+            var dt = mlx.DtypeTrace.begin("hybrid", h, null);
 
             var carried: ?Array = null;
             for (w.layers, 0..) |*L, i| {
@@ -85,9 +87,11 @@ pub fn Hybrid(comptime spec: anytype) type {
                 g.drop(old_h);
                 if (carried) |old| g.drop(old);
                 carried = if (end.normed) |n| try g.keep(n) else null;
+                dt.layer(h, i);
                 try run.capture(g, @intCast(i), h);
                 try run.cadence(i, w.layers.len, h);
             }
+            dt.end(h);
             c.g = g;
             var final = if (w.final_norm) |*f| (carried orelse try Norm.forward(f, &c, h)) else h;
             if (@hasDecl(Hooks, "beforeHead")) final = try Hooks.beforeHead(&w.extra, &c, final);

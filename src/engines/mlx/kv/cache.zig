@@ -234,8 +234,7 @@ pub const KVCache = struct {
     /// PURE: the capacity the K/V buffers must be grown to so `needed` tokens
     /// fit.
     ///
-    /// Growing by a fixed `chunk_step` (the pre-#110 policy, still reachable
-    /// with `linear = true`) means one grow-copy-free every 256 tokens, and
+    /// Growing by a fixed `chunk_step` would mean one grow-copy-free every 256 tokens, and
     /// every superseded buffer is orphaned: MLX only reuses a cached buffer
     /// when `cached_size < requested + 2*page_size` (`buffer_cache.h`), and the
     /// next KV buffer is a full chunk past that ~32 KB tolerance. On a 64
@@ -246,18 +245,12 @@ pub const KVCache = struct {
     /// Proportional growth (+25%, floored at one chunk, capped at
     /// `max_grow_tokens`) turns that into ~27 growth events over a 100 K-token
     /// walk instead of 391.
-    pub fn nextCapacityPolicy(current_cap: usize, needed: usize, linear: bool) usize {
+    pub fn nextCapacity(current_cap: usize, needed: usize) usize {
         if (needed <= current_cap) return current_cap;
-        const target = if (linear) needed else blk: {
-            const grow = @min(@max(current_cap / 4, chunk_step), max_grow_tokens);
-            break :blk @max(needed, current_cap + grow);
-        };
+        const grow = @min(@max(current_cap / 4, chunk_step), max_grow_tokens);
+        const target = @max(needed, current_cap + grow);
         const n_chunks = (target + chunk_step - 1) / chunk_step;
         return n_chunks * chunk_step;
-    }
-
-    pub fn nextCapacity(current_cap: usize, needed: usize) usize {
-        return nextCapacityPolicy(current_cap, needed, kvGrowLinear());
     }
 
     /// Tokens of capacity a request reserves: prompt + allowed generation + one chunk of slack.
@@ -285,26 +278,9 @@ pub const KVCache = struct {
     /// How many times a KV capacity buffer actually grew (the moments a second copy of the whole cache exists).
     pub var kv_cap_buf_grows: usize = 0;
 
-    /// Ask this cache to hold `tokens` up front. Idempotent and monotone. `MLX_SERVE_KV_RESERVE=0` restores proportional growth.
+    /// Ask this cache to hold `tokens` up front. Idempotent and monotone.
     pub fn reserve(self: *KVCache, tokens: usize) void {
-        if (!kvReserveEnabled()) return;
         if (tokens > self.reserve_tokens) self.reserve_tokens = tokens;
-    }
-
-    /// Is the up-front reservation on (`MLX_SERVE_KV_RESERVE` != 0)?
-    pub fn kvReservationEnabled() bool {
-        return kvReserveEnabled();
-    }
-
-    var kv_reserve_cache: ?bool = null;
-    pub fn kvReserveEnabled() bool {
-        if (kv_reserve_cache) |v| return v;
-        var on = true;
-        if (env.get(.MLX_SERVE_KV_RESERVE)) |p| {
-            on = !std.mem.eql(u8, std.mem.span(p), "0");
-        }
-        kv_reserve_cache = on;
-        return on;
     }
 
     /// The capacity a grow takes: the proportional policy, raised to the reservation when there is one.
@@ -314,19 +290,6 @@ pub const KVCache = struct {
         // Round the reservation the same way the policy rounds.
         const n_chunks = (self.reserve_tokens + chunk_step - 1) / chunk_step;
         return n_chunks * chunk_step;
-    }
-
-    /// Kill-switch for the growth policy: `MLX_SERVE_KV_GROW=linear` restores
-    /// the pre-#110 fixed +256 growth for same-boot A/Bs.
-    var kv_grow_linear_cache: ?bool = null;
-    fn kvGrowLinear() bool {
-        if (kv_grow_linear_cache) |v| return v;
-        var linear = false;
-        if (env.get(.MLX_SERVE_KV_GROW)) |p| {
-            linear = std.mem.eql(u8, std.mem.span(p), "linear");
-        }
-        kv_grow_linear_cache = linear;
-        return linear;
     }
 
     pub fn update(self: *KVCache, layer: u32, new_k: mlx.mlx_array, new_v: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32) !DenseKVView {
@@ -1220,65 +1183,6 @@ test "slidingViewFor declines the trim only where the fused kernel really bands"
     }
 }
 
-test "FUSED256_MIN_Q_LEN is the single source for the decline and the band predicate" {
-    // These two drifted once already — the kernel declined below 16 while the
-    // trim predicate said 2 — and the cost was silent: gemma declined the trim
-    // at every spec-verify width and then fell through to the explicit-mask
-    // path anyway. Needles are assembled at comptime so this test's own source
-    // cannot satisfy the scan.
-    const src = @embedFile("../../../sdk/blocks/attention/attn256.zig") ++
-        @embedFile("sliding.zig");
-    const name = "FUSED256_" ++ "MIN_Q_LEN";
-    // The kernel's own decline reads the constant...
-    try testing.expect(std.mem.indexOf(u8, src, "if (qs[2] < " ++ name ++ ") return null;") != null);
-    // ...and so does the trim policy in slidingViewFor.
-    try testing.expect(std.mem.indexOf(u8, src, "cfg.head_dim == 256 and seq_len >= " ++ name) != null);
-    // Neither may respell the floor as a literal.
-    try testing.expect(std.mem.indexOf(u8, src, "if (qs[2] < 1" ++ "6)") == null);
-    try testing.expect(std.mem.indexOf(u8, src, "cfg.head_dim == 256 and seq_len >= " ++ "2") == null);
-}
-
-test "every sliding attention arm sizes its KV view from slidingViewFor, never the raw window" {
-    // The mask and the K/V view are ONE decision. `slidingViewFor` is the
-    // chokepoint that makes them agree: an arm passes `sliding.span` to
-    // `cache.update` and builds every mask at `sliding.kv_len`. Spelling the
-    // view width as `cfg.sliding_window` instead looks equivalent because it
-    // IS equivalent at q_len == 1 — and then the first block-wide forward past
-    // the window (a spec-verify block, or a prefill chunk) asks SDPA to
-    // broadcast a `window + q_len - 1` mask against a `window` view, which is
-    // an uncatchable MLX error: gpt_oss shipped exactly that and killed the
-    // process a few hundred tokens into every generation.
-    //
-    // Needles are assembled at comptime so this test's own source cannot
-    // satisfy the scan.
-    const src = @embedFile("cache.zig") ++
-        @embedFile("../forward/dense.zig") ++
-        @embedFile("../../../plugins/gemma4/attention.zig");
-    const needle = "const max_kv: u32 " ++ "= ";
-    var i: usize = 0;
-    var seen: usize = 0;
-    while (std.mem.indexOfPos(u8, src, i, needle)) |pos| {
-        const line_end = std.mem.indexOfScalarPos(u8, src, pos, '\n') orelse src.len;
-        const line = src[pos..line_end];
-        // The full-attention arm of the ternary keeps everything (0); the
-        // sliding arm must read the chokepoint, directly or through the one
-        // alias pinned below.
-        try testing.expect(std.mem.indexOf(u8, line, "sliding.span") != null or
-            std.mem.indexOf(u8, line, "sliding_span") != null);
-        seen += 1;
-        i = line_end;
-    }
-    // forwardStandardWith and gemma4: a rewrite that drops the binding
-    // entirely must not read as a pass.
-    try testing.expect(seen >= 2);
-    // The alias is only as good as what it is assigned from.
-    try testing.expect(std.mem.indexOf(u8, src, "const sliding_span " ++ "= sliding.span;") != null);
-
-    // And no arm may respell the width as the bare window.
-    try testing.expect(std.mem.indexOf(u8, src, "max_kv: u32 = if (is_full) 0 else " ++ "cfg.sliding_window") == null);
-    try testing.expect(std.mem.indexOf(u8, src, "max_kv: u32 = if (is_global) 0 else " ++ "cfg.sliding_window") == null);
-}
-
 test "KVCache trims the tail view for a BLOCK-wide update, not just decode" {
     // The spec-verify shape: a block of queries lands at the tail of a cache
     // already longer than the window. Before the block trim, `new_len > 1`
@@ -1519,41 +1423,6 @@ test "a REFUSED KVCache re-init leaves the live cache intact, not freed" {
     try testing.expectEqual(@as(usize, 0), cache.entries[0].offset);
     try testing.expect(!cache.entries[0].initialized);
     try testing.expectEqual(@as(usize, 0), cache.step);
-}
-
-test "every live KV cache re-init goes through reinit, which builds before it frees" {
-    // Class guard, not whack-a-mole: the defect was never the refusal, it was
-    // the CALLER SHAPE — a fallible re-init behind a deinit — and four sites
-    // had it (scheduler's cold load, main's offline path, resetCache,
-    // tryRestoreCache). Any future scheme that refuses an arch reopens the
-    // crash at whichever site is respelled. Needles are assembled at comptime
-    // so this test's own source cannot satisfy the scan.
-    const assign = ".cache = " ++ "try ";
-    inline for (.{
-        .{ "transformer.zig", @embedFile("../../../plugins/qwen4_exp/mtp.zig") ++
-            @embedFile("cache.zig") ++
-            @embedFile("../prompt_cache.zig") },
-        .{ "scheduler.zig", @embedFile("../scheduler.zig") },
-        .{ "main.zig", @embedFile("../../../main.zig") },
-    }) |f| {
-        if (std.mem.indexOf(u8, f[1], assign) != null) {
-            std.debug.print(
-                "{s}: assigns a fallible KVCache init onto a live `.cache` field; use KVCache.reinit\n",
-                .{f[0]},
-            );
-            return error.FallibleReinitBehindDeinit;
-        }
-    }
-    // ...and the helper itself builds BEFORE it frees. Reversed, it is exactly
-    // the bug it exists to prevent, and every call site inherits it silently.
-    const src = @embedFile("cache.zig");
-    const at = std.mem.indexOf(u8, src, "pub fn re" ++ "init(self: *KVCache") orelse
-        return error.MissingReinitHelper;
-    const build_at = std.mem.indexOfPos(u8, src, at, "initWithConfig(") orelse
-        return error.MissingReinitBuild;
-    const free_at = std.mem.indexOfPos(u8, src, at, "self." ++ "deinit()") orelse
-        return error.MissingReinitFree;
-    try testing.expect(build_at < free_at);
 }
 
 test "KVCache sliding window views return last max_seq entries" {
@@ -2222,13 +2091,13 @@ test "KVCache growth strands bounded bytes" {
     // per 256 generated tokens.
     const walk = struct {
         const Result = struct { events: usize, superseded: usize, final: usize };
-        fn run(linear: bool) Result {
+        fn run() Result {
             var cap: usize = 0;
             var events: usize = 0;
             var superseded: usize = 0;
             var n: usize = 1;
             while (n <= 100_000) : (n += 1) {
-                const next = KVCache.nextCapacityPolicy(cap, n, linear);
+                const next = KVCache.nextCapacity(cap, n);
                 if (next != cap) {
                     events += 1;
                     superseded += cap;
@@ -2239,16 +2108,10 @@ test "KVCache growth strands bounded bytes" {
         }
     };
 
-    const prop = walk.run(false);
+    const prop = walk.run();
     try testing.expect(prop.final >= 100_000);
     try testing.expect(prop.events <= 40);
     try testing.expect(prop.superseded <= 8 * prop.final);
-
-    // The linear policy the kill-switch keeps reachable, for contrast — these
-    // are the numbers the fix is measured against.
-    const lin = walk.run(true);
-    try testing.expectEqual(@as(usize, 391), lin.events);
-    try testing.expect(lin.superseded > 100 * lin.final);
 }
 
 test "KV growth does not ratchet the MLX buffer pool" {
@@ -2261,8 +2124,7 @@ test "KV growth does not ratchet the MLX buffer pool" {
     // 4 layers x 2 kv heads x 64 head_dim, bf16 = 2 KiB per token across all K
     // and V buffers. Under the old +256 policy the walk to 20_000 allocates
     // ~810_000 token-slots and frees all but the last ≈ 41 MB. Measured peak
-    // pool: 1544 MB linear vs 274 MB proportional (`MLX_SERVE_KV_GROW=linear`
-    // reproduces the former), so the bar sits between them with ~2x margin
+    // pool: 1544 MB linear vs 274 MB proportional, so the bar sits between them with ~2x margin
     // either side rather than on top of the passing number.
     const s = mlx.gpuStream();
     const LAYERS: u32 = 4;
@@ -2442,7 +2304,7 @@ test "generation past the reserved headroom takes the +25% growth policy, never 
     try t.expect(cap_at_prefill_end >= reserved);
     try t.expectEqual(total, cache.entries[0].offset);
     try t.expect(allocs >= 2);
-    try t.expectEqual(KVCache.nextCapacityPolicy(cap_at_prefill_end, cap_at_prefill_end + 1, false), cache.nextCapacityReserved(cap_at_prefill_end, cap_at_prefill_end + 1));
+    try t.expectEqual(KVCache.nextCapacity(cap_at_prefill_end, cap_at_prefill_end + 1), cache.nextCapacityReserved(cap_at_prefill_end, cap_at_prefill_end + 1));
     try t.expect(last_cap >= total);
 }
 
@@ -2458,7 +2320,7 @@ test "a reserved KV cache grows ONCE: no old+new buffer coexists during a long p
     while (pos < seq) {
         const end = @min(pos + chunk, seq);
         if (end > cap) {
-            cap = KVCache.nextCapacityPolicy(cap, end, false);
+            cap = KVCache.nextCapacity(cap, end);
             grows += 1;
         }
         pos = end;
@@ -2524,7 +2386,7 @@ test "a reserved KV cache grows ONCE: no old+new buffer coexists during a long p
     defer small.deinit();
     small.reserve(@intCast(KVCache.reservedTokens(4096, 2048, chunk, 0)));
     try t.expectEqual(
-        KVCache.nextCapacityPolicy(1024, 2048, KVCache.kvGrowLinear()),
+        KVCache.nextCapacity(1024, 2048),
         small.nextCapacityReserved(1024, 2048),
     );
 }

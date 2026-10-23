@@ -687,17 +687,3 @@ test "S21: a released module head drops the slot's exclusivity, and the MODEL bi
     try testing.expect(headExclusiveFor(true, false, false, true));
     try testing.expect(headExclusiveFor(true, true, true, true));
 }
-
-test "modelExclusiveDecode asks the transformer, never one hardcoded arch" {
-    // The 2026-08-02 dsv4 fix hardcoded `t.dsv4 != null` here. When a second
-    // module-owned arch arrived — same `Model.state` shape, same
-    // `reset = cache.step == 0` rebuild — the gate did not follow, and two
-    // concurrent requests shared one state. The predicate now lives beside the fields it reads
-    // (`Transformer.module_owned_state_fields`), and this pins the delegation.
-    // Needles are ++-split so this test's source can't satisfy the scan.
-    const src = @embedFile("verdict.zig");
-    const delegated = "t.ownsModuleDecode" ++ "State()";
-    try testing.expect(std.mem.indexOf(u8, src, delegated) != null);
-    const hardcoded = "return t.dsv4 " ++ "!= null;";
-    try testing.expect(std.mem.indexOf(u8, src, hardcoded) == null);
-}

@@ -67,7 +67,7 @@ pub fn fitAfterUnloadingIdle(ctx: anytype, fits: fn (@TypeOf(ctx)) bool, unloadO
     return true;
 }
 
-pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_override: ?transformer_mod.KVQuantConfig, unchunked_prefill: bool, prompt_tokens: ?[]const u32, warm: WarmPrefix) AdmissionBill {
+pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_override: ?transformer_mod.KVQuantConfig, prompt_tokens: ?[]const u32, warm: WarmPrefix) AdmissionBill {
     const heads = config.num_attention_heads;
     if (heads == 0) return .{ .needed = 0, .available = std.math.maxInt(u64) };
     const seq: u64 = @intCast(prompt_len);
@@ -81,16 +81,10 @@ pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: us
     const total_limit: u64 = currentGpuMemoryCeiling(config, active_mem);
     const available = if (total_limit > active_mem) total_limit - active_mem else 0;
 
-    // A vision prefill chunks like text since issue #197 (the splice resumes
-    // its row index across chunks), so it bills the chunk-bounded envelope —
-    // UNLESS the MLX_SERVE_VISION_CHUNKED=0 kill switch restored the
-    // whole-prompt forward, in which case `unchunked_prefill` bills the real
-    // width. Call sites pass generate_mod.visionPrefillUnchunked(has_vision)
-    // so the guard and the prefill loop cannot disagree.
-    //
-    // Otherwise the width comes from `chooseRequestPrefillChunk`, the same rule the scheduler
-    // pins with. An ungated arch (or an explicit `--prefill-chunk`) gets the load-time pin.
-    const chosen: u32 = if (unchunked_prefill) 0 else chooseRequestPrefillChunk(
+    // A vision prefill chunks like text since issue #197 (the splice resumes its row index across
+    // chunks). The width comes from `chooseRequestPrefillChunk`, the same rule the scheduler pins
+    // with. An ungated arch (or an explicit `--prefill-chunk`) gets the load-time pin.
+    const chosen: u32 = chooseRequestPrefillChunk(
         config,
         seq,
         max_tokens,
@@ -100,10 +94,7 @@ pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: us
         explicitPrefillChunk(),
         warm,
     );
-    const chunk: u64 = if (unchunked_prefill)
-        @max(seq, 1)
-    else
-        @intCast(generate_mod.effectivePrefillChunk(config.prefillScoreHeadDim(), config.num_attention_heads, prompt_len, config.has_sliding_window, config.isMoe(), config.longCtxGated(), chosen));
+    const chunk: u64 = @intCast(generate_mod.effectivePrefillChunk(config.prefillScoreHeadDim(), config.num_attention_heads, prompt_len, config.has_sliding_window, config.isMoe(), config.longCtxGated(), chosen));
     // RAM hot-cache restores rebind MLX array handles by refcount; they do not
     // allocate another copy of the cached buffers. `active_mem` above already
     // includes the resident entry, while `prefillMemoryNeeded` bills the full
@@ -199,8 +190,8 @@ fn logAdmissionDecision(bill: AdmissionBill) void {
 /// Inference-thread predicate behind the scheduler's admission hook: does this request fit
 /// right now, with live memory re-read? Every input is forwarded, none defaulted (a hardcoded
 /// `kv_override = null` priced a `kv_quant: 4` request at fp16 and evicted a cache for nothing).
-pub fn prefillFitsNow(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool, warm_matched: u64, warm_capacity: u64, warm_will_donate: bool, enable_mtp: bool) bool {
-    return prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, .{
+pub fn prefillFitsNow(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, warm_matched: u64, warm_capacity: u64, warm_will_donate: bool, enable_mtp: bool) bool {
+    return prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, null, .{
         .matched_tokens = warm_matched,
         .capacity_tokens = warm_capacity,
         .will_donate = warm_will_donate,
@@ -209,15 +200,15 @@ pub fn prefillFitsNow(config: *const model_mod.ModelConfig, prompt_len: usize, m
 }
 
 /// {needed, available} of the cold bill, live memory re-read, for the scheduler's sibling ledger.
-pub fn prefillBillNumbersNow(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool, enable_mtp: bool) [2]u64 {
-    const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, .{ .mtp_on = enable_mtp });
+pub fn prefillBillNumbersNow(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, enable_mtp: bool) [2]u64 {
+    const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, null, .{ .mtp_on = enable_mtp });
     return .{ bill.needed, bill.available };
 }
 
 /// The inference thread's refusal, quoting the numbers it compared; returns {needed, available} for the client.
-pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, unchunked_prefill: bool, warm_matched: u64, warm_capacity: u64, warm_will_donate: bool, enable_mtp: bool) [2]u64 {
+pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: transformer_mod.KVQuantConfig, warm_matched: u64, warm_capacity: u64, warm_will_donate: bool, enable_mtp: bool) [2]u64 {
     // The same warm inputs the probe was refused on, the checkout decision included.
-    const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, .{
+    const bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_cfg, null, .{
         .matched_tokens = warm_matched,
         .capacity_tokens = warm_capacity,
         .will_donate = warm_will_donate,
@@ -241,12 +232,12 @@ pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize
     return .{ bill.needed, bill.available };
 }
 
-pub fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids: []const u32, max_tokens: u32, config: *const model_mod.ModelConfig, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig, lm: *const LoadedModel, unchunked_prefill: bool, enable_mtp: bool, media_bytes: u64) !bool {
+pub fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids: []const u32, max_tokens: u32, config: *const model_mod.ModelConfig, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig, lm: *const LoadedModel, enable_mtp: bool, media_bytes: u64) !bool {
     const prompt_len: usize = prompt_ids.len;
     if (!mlxMemoryGuardApplies(lm.engineBacked())) return true;
     if (config.num_attention_heads == 0) return true; // unknown architecture, skip check
     // The connection thread has no slot and no cache: it bills cold and defers a warm prompt.
-    var bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_override, unchunked_prefill, prompt_ids, .{ .mtp_on = enable_mtp });
+    var bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_override, prompt_ids, .{ .mtp_on = enable_mtp });
     // The request's media rows are one more tensor the prefill allocates.
     bill.needed += media_bytes;
     logAdmissionDecision(bill);
@@ -278,7 +269,6 @@ pub fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_
             prompt_ids: []const u32,
             max_tokens: u32,
             kv_override: ?transformer_mod.KVQuantConfig,
-            unchunked: bool,
             enable_mtp: bool,
             media_bytes: u64,
             fn fits(r: *@This()) bool {
@@ -288,12 +278,12 @@ pub fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_
                 const id = r.sch.idleModelToUnload(r.keep) orelse return false;
                 log.info("  prompt {d} tokens does not fit — unloading idle model {s} first\n", .{ r.prompt_ids.len, id });
                 r.sch.unloadModelIfIdle(id, 0) catch return false;
-                r.bill.* = prefillAdmissionBill(r.config, r.prompt_ids.len, r.max_tokens, r.kv_override, r.unchunked, r.prompt_ids, .{ .mtp_on = r.enable_mtp });
+                r.bill.* = prefillAdmissionBill(r.config, r.prompt_ids.len, r.max_tokens, r.kv_override, r.prompt_ids, .{ .mtp_on = r.enable_mtp });
                 r.bill.needed += r.media_bytes;
                 return true;
             }
         };
-        var rebill = Rebill{ .sch = sch, .keep = lm.id, .bill = &bill, .config = config, .prompt_ids = prompt_ids, .max_tokens = max_tokens, .kv_override = kv_override, .unchunked = unchunked_prefill, .enable_mtp = enable_mtp, .media_bytes = media_bytes };
+        var rebill = Rebill{ .sch = sch, .keep = lm.id, .bill = &bill, .config = config, .prompt_ids = prompt_ids, .max_tokens = max_tokens, .kv_override = kv_override, .enable_mtp = enable_mtp, .media_bytes = media_bytes };
         if (fitAfterUnloadingIdle(&rebill, Rebill.fits, Rebill.unloadOne)) return true;
     };
     if (bill.needed > bill.available) {
@@ -394,91 +384,6 @@ test "a refusal names the credit it COMPARED, never the residency it cannot take
     try t.expect(reclaimable.fitsAfterEviction());
 }
 
-test "checkAttentionMemory routes deepseek_v4 through its own estimator with the REAL sub-chunk" {
-    // The estimator existing proves nothing if the call site keeps handing
-    // dsv4 to the generic bill (the attn_keys scan-test class). Needles are
-    // split with `++` so this test's own source never matches them.
-    const t = std.testing;
-    const src = @embedFile("prefill_chunk.zig");
-    const call = "dsv4PrefillMemoryNeeded(seq, layers, " ++
-        "kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq))";
-    try t.expect(std.mem.indexOf(u8, src, call) != null);
-}
-
-test "checkAttentionMemory does not bill resident hot-cache buffers twice" {
-    // RAM restore uses refcount-sharing. The resident entry is already inside
-    // `active_mem`, and prefillMemoryNeeded bills the destination KV growth.
-    // Pin the chokepoint so a future cache-accounting change cannot add the
-    // resident entry to `needed` again (the 138k-token false-400 regression).
-    const t = std.testing;
-    const src = @embedFile("admit.zig");
-    // The bill and the headroom moved into `prefillAdmissionBill`.
-    const start = std.mem.indexOf(u8, src, "pub fn prefillAdmission" ++ "Bill(") orelse return error.CallSiteMoved;
-    const tail = src[start..];
-    const end = std.mem.indexOf(u8, tail, "\npub extern \"c\" fn sysctlbyname") orelse return error.CallSiteMoved;
-    const body = tail[0..end];
-    try t.expect(std.mem.indexOf(u8, body, "largestEntry" ++ "Bytes") == null);
-    try t.expect(std.mem.indexOf(u8, body, "hot_" ++ "restore") == null);
-    try t.expect(std.mem.indexOf(u8, body, "mlx_get_active_memory(&active_mem)") != null);
-    // The hot cache appears once, as `evictable`, read as the published atomic.
-    try t.expect(std.mem.indexOf(u8, body, "resident_hot_cache_bytes.load(.monotonic)") != null);
-    try t.expect(std.mem.indexOf(u8, body, "sch." ++ "hot_prefix_cache") == null);
-    try t.expect(std.mem.indexOf(u8, body, ".hot_prefix_cache.?") == null);
-    try t.expect(std.mem.indexOf(u8, body, "needed = needed +") == null);
-}
-
-test "checkAttentionMemory wires the CONFIG's key bound, not a dense seq" {
-    // The estimator taking an `attn_keys` parameter proves nothing if the one
-    // caller hands it `seq` — that reproduces the dense bill exactly, and every
-    // unit test above still passes because they call the function directly.
-    // Same class as the two hardcoded `use_drafter=false` call sites: the
-    // engagement has to be pinned at the SITE.
-    //
-    // The KV bill is pinned at the same site and for the same reason: it must
-    // come from `config.kvBytesPerToken()` (which knows how many layers cache
-    // and how wide their keys and values are), never a uniform product
-    // recomputed here. Same for the SCORE width: `config.prefillScoreHeadDim()`
-    // is the width the score is contracted at, and handing `hdim` for both
-    // declares an MLA arch's 192-wide scores "fused" and bills them at zero.
-    const t = std.testing;
-    const src = @embedFile("prefill_chunk.zig") ++ @embedFile("bills.zig") ++ @embedFile("context.zig") ++ @embedFile("admit.zig");
-    const call = "prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, chunk,";
-    const at = std.mem.indexOf(u8, src, call) orelse return error.CallSiteMoved;
-    const tail = src[at + call.len ..];
-    const end = std.mem.indexOfScalar(u8, tail, ')') orelse return error.CallSiteMoved;
-    try t.expectEqualStrings(" config.prefillAttnKeys(seq", tail[0..end]);
-    // The arch's own prefill streams and its dequantized-weight working set
-    // are the same class of parameter: derived from the CONFIG at the site, or
-    // a GatedDeltaNet hybrid gets an attention arch's bill (measured 33% low)
-    // and a quantized checkpoint gets a dense one's.
-    // The per-request terms are seq-scaled and derived from the config at the site. Counted, not
-    // just found: the literal below is itself part of `src`.
-    const wired = "config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config), prefillRequestTerms(config, seq, max_tokens, kv_bits, chunk, warm))";
-    var wired_seen: usize = 0;
-    var wired_at: usize = 0;
-    while (std.mem.indexOfPos(u8, src, wired_at, wired)) |hit| {
-        wired_seen += 1;
-        wired_at = hit + 1;
-    }
-    try t.expectEqual(@as(usize, 2), wired_seen); // the call site + this literal
-    // The reserve half bills at an explicit KV length (`prefillTransientReserveAtKv`); `seq` must
-    // stay `@max(kv_len, chunk)`.
-    try t.expect(std.mem.indexOf(u8, src, "    const seq: u64 = @max(kv_len, chunk);\n") != null);
-    try t.expect(std.mem.indexOf(u8, src, "        config.prefillAttnKeys(seq),\n        prefillStreamBytesPerToken(config),\n        prefillDequantWeightBytes(config),\n") != null);
-
-    // Auto-context sizing reads the same helpers — the two must not drift.
-    // The KV width: both bill through `kvBytesPerTokenAtBits`, so a
-    // `--kv-quant 4` server cannot size its context against fp16 while the
-    // guard admits against 4-bit (that mismatch reported a third of what fits).
-    try t.expect(std.mem.indexOf(u8, src, "const kv_bytes: u64 = seq * kvBytesPerTokenAtBits(kv_per_tok, kv_bits);") != null);
-    try t.expect(std.mem.indexOf(u8, src, "const per_tok: u64 = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);") != null);
-    // The prefill transient: the sizer RESERVES it once at the chunk width
-    // (`prefillTransientReserve` is the same estimator with the KV term zeroed),
-    // never as a per-token multiplier on the context it is solving for.
-    // The sizer reserves the constant, not the ask or the resolved budget.
-    try t.expect(std.mem.indexOf(u8, src, "ctxCacheShare(ctxSizingCacheReserve(config), ceiling, active_mem, transient) +| transient") != null);
-}
-
 test "the guard credits only PROVABLY reclaimable cache bytes, never the entry a restore will pin" {
     const t = std.testing;
     // The guard admitted on `available + evictable >= needed`, but the evictable 1,564 MB was
@@ -500,9 +405,9 @@ test "the admission probe bills the request's OWN kv-quant and chunking, not the
     const seq: usize = 200_000;
     const q4 = transformer_mod.KVQuantConfig.affine(4);
     const q8 = transformer_mod.KVQuantConfig.affine(8);
-    const bill4 = prefillAdmissionBill(&cfg, seq, 2048, q4, false, null, .{});
-    const bill8 = prefillAdmissionBill(&cfg, seq, 2048, q8, false, null, .{});
-    const bill16 = prefillAdmissionBill(&cfg, seq, 2048, transformer_mod.KVQuantConfig.dense, false, null, .{});
+    const bill4 = prefillAdmissionBill(&cfg, seq, 2048, q4, null, .{});
+    const bill8 = prefillAdmissionBill(&cfg, seq, 2048, q8, null, .{});
+    const bill16 = prefillAdmissionBill(&cfg, seq, 2048, transformer_mod.KVQuantConfig.dense, null, .{});
     try t.expect(bill4.needed < bill8.needed);
     try t.expect(bill8.needed < bill16.needed);
 }

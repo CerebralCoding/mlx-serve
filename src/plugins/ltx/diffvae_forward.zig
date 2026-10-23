@@ -67,23 +67,12 @@ pub fn tileTokensForMemory(available: u64) u64 {
 
 var tile_budget_cached: ?u64 = null;
 
-/// The effective per-tile token budget. `MLX_SERVE_DIFFVAE_TILE_TOKENS` pins it
-/// (the A/B lever); otherwise it follows free memory.
+/// The effective per-tile token budget: it follows free memory.
 pub fn tileTokenBudget() u64 {
     if (tile_budget_cached) |v| return v;
-    const v = tileTokenBudgetFor(status.getAvailableMemBytes());
+    const v = tileTokensForMemory(status.getAvailableMemBytes());
     tile_budget_cached = v;
     return v;
-}
-
-/// `tileTokenBudget` for `available` bytes read by the caller.
-pub fn tileTokenBudgetFor(available: u64) u64 {
-    if (env.get(.MLX_SERVE_DIFFVAE_TILE_TOKENS)) |raw| {
-        if (std.fmt.parseInt(u64, std.mem.sliceTo(raw, 0), 10)) |parsed| {
-            if (parsed > 0) return parsed;
-        } else |_| {}
-    }
-    return tileTokensForMemory(available);
 }
 
 /// SwiGLU token tile. Mathematically an identity — at the diffusion stage the
@@ -868,27 +857,11 @@ pub const Sampler = struct {
 
     pub const default = Sampler{};
 
-    /// `MLX_SERVE_DIFFVAE_{OUTPUT,STEPS,TSCALE}` override it, one field each.
-    pub fn resolved() Sampler {
-        var out = Sampler.default;
-        if (std.c.getenv("MLX_SERVE_DIFFVAE_OUTPUT")) |raw| {
-            out.predict_x0 = std.mem.eql(u8, std.mem.sliceTo(raw, 0), "x0");
-        }
-        if (std.c.getenv("MLX_SERVE_DIFFVAE_STEPS")) |raw| {
-            if (std.fmt.parseInt(u32, std.mem.sliceTo(raw, 0), 10)) |v| {
-                if (v > 0) out.num_steps = v;
-            } else |_| {}
-        }
-        if (std.c.getenv("MLX_SERVE_DIFFVAE_TSCALE")) |raw| {
-            out.timestep_scale = std.fmt.parseFloat(f32, std.mem.sliceTo(raw, 0)) catch out.timestep_scale;
-        }
-        return out;
-    }
 };
 
 pub const Options = struct {
     seed: u64 = 0,
-    num_steps: u32 = 0, // 0 → `Sampler.resolved()`
+    num_steps: u32 = 0, // 0 → `Sampler.default`
     /// 0 → `tileTokenBudget()`.
     tile_tokens: u64 = 0,
     sampler: Sampler = Sampler.default,
@@ -906,7 +879,7 @@ pub fn decode(
     s: S,
 ) !mlx.mlx_array {
     var c_opts = opts;
-    c_opts.sampler = Sampler.resolved();
+    c_opts.sampler = Sampler.default;
     const c = Ctx{ .comp = comp, .cfg = cfg, .alloc = allocator, .s = s };
     const lsh = mlx.getShape(latent_bcfhw);
     if (lsh.len != 5) return error.DiffVaeBadLatentRank;
@@ -1620,7 +1593,6 @@ test "diffvae tiled decode agrees with the whole-volume decode, seams included" 
 // What the decode actually PEAKS at, at a production canvas. The residency bill
 // promises a bound (`gen.ltxDiffVaeDecodeBytes`); this is the measurement that
 // bound is set from, and the assertion that the tile budget still holds it.
-// `MLX_SERVE_DIFFVAE_TILE_TOKENS` is the lever both read.
 //   LTX_DIFFVAE_MODEL = a pack dir; ~768x512x97, minutes.
 test "diffvae decode peak stays inside the budget the residency bill promises" {
     const dir = std.mem.span(std.c.getenv("LTX_DIFFVAE_MODEL") orelse return error.SkipZigTest);

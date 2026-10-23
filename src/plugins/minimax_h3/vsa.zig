@@ -8,6 +8,7 @@
 //! q.k. Every row then adds the trained `to_gate_compress` branch: softmax over all pooled tile
 //! scores times the pooled values, scaled per row by the gate projection.
 const std = @import("std");
+const env = @import("../../env.zig");
 const kernelSource = @import("../../mlx/kernels.zig").source;
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../host/log.zig");
@@ -22,7 +23,7 @@ const TILE_SHAPE = [3]u32{ 4, 4, 8 };
 
 /// `MINIMAX_H3_VSA=0` runs a VSA pack with dense attention and no gate branch (the A/B arm).
 pub fn enabled() bool {
-    const raw = std.c.getenv("MINIMAX_H3_VSA") orelse return true;
+    const raw = env.get(.MINIMAX_H3_VSA) orelse return true;
     return !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
 }
 

@@ -410,13 +410,6 @@ pub const Tokenizer = struct {
         return m.get(opener_id);
     }
 
-    /// Reserved-output ids for this tokenizer: `reservedOutputIds` over the
-    /// `special: true` added tokens recorded at load. See that function for
-    /// the derivation rules.
-    pub fn reservedIds(self: *const Tokenizer, allocator: std.mem.Allocator, template_source: []const u8, exempt_ids: []const u32) ![]u32 {
-        return reservedOutputIds(allocator, self.flagged_specials, template_source, exempt_ids);
-    }
-
     /// Highest DEFINED id + 1 — the real vocabulary, which is not the config's
     /// `vocab_size`: checkpoints pad the embedding/lm_head rows out to a
     /// friendly multiple (qwen4_exp: 248044 base + 33 added = 248077 defined

@@ -33,9 +33,8 @@ const naxSdpaPreferred = @import("sdpa.zig").naxSdpaPreferred;
 // bottom-right alignment (query row r sits at absolute KV position
 // kL - qL + r, matching MLX "causal" and createSlidingWindowMask semantics).
 // K/V may be non-contiguous cache views (strides used; innermost dim must be
-// contiguous — guaranteed for slices along T). Kill switch:
-// MLX_SERVE_FUSED_256=0 restores the composed path AND the old guard
-// budgeting (one shared predicate, so guards and dispatch cannot drift).
+// contiguous — guaranteed for slices along T). Guards and dispatch read one
+// shared predicate, so they cannot drift.
 pub const ATTN256_KERNEL_HEADER = kernelSource("kernels/attention/attn256_header.metal");
 
 // v2 tile geometry (2026-07-12 micro-bench sweep on the M4 Max, Qwen 24q/4kv
@@ -79,16 +78,9 @@ fn getAttn256Kernel() !mlx.mlx_fast_metal_kernel {
     return kernel;
 }
 
-var fused256_env_cached: ?bool = null;
-var fused256_causal_env_cached: ?Fused256CausalMode = null;
 
 pub fn fused256Enabled() bool {
-    if (transformer.fused256_override) |v| return v;
-    if (fused256_env_cached) |v| return v;
-    const raw = env.get(.MLX_SERVE_FUSED_256);
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    fused256_env_cached = enabled;
-    return enabled;
+    return transformer.fused256_override orelse true;
 }
 
 /// Plain-CAUSAL dispatch mode. Default `.all` since the kv-chunk dispatch
@@ -101,8 +93,6 @@ pub fn fused256Enabled() bool {
 /// key axis split into budget-sized dispatches (see
 /// FUSED256_DEFAULT_DISPATCH_BUDGET) the causal arm WINS the same
 /// same-session A/B on the 27B: +2.9%/+2.3%/+4.6% at 8K/16K/32K.
-/// MLX_SERVE_FUSED_256_CAUSAL=0 restores composed causal (and the old
-/// OOM-guard score billing via prefillHeadDimFused).
 /// The SLIDING-BAND arm (window > 0) has no such competition — composed
 /// computes full-width scores + a GB-scale mask while the kernel
 /// block-skips outside the band (gemma-26B 99K: 317 -> 712 tok/s) — so it
@@ -120,24 +110,15 @@ pub const Fused256CausalMode = enum { all, off };
 // (fp32 m/l/O buffers chained between dispatches — bit-identical to the
 // single-dispatch result). The band arm never chunks: its in-kernel block
 // skip already bounds per-dispatch work by the window.
-// MLX_SERVE_FUSED_256_BUDGET overrides (0 = single-dispatch, pre-budget
-// behavior); default mirrors oMLX's 250M fallback (~23 ms/dispatch on the
+// The budget mirrors oMLX's 250M fallback (~23 ms/dispatch on the
 // M4 Max at the kernel's measured ~1.1e10 work-units/s).
 pub const FUSED256_DEFAULT_DISPATCH_BUDGET: i64 = 250_000_000;
 
 /// Test seam: forces the budget without the environment.
 pub var fused256_budget_override: ?i64 = null;
-var fused256_budget_env_cached: ?i64 = null;
 
 pub fn fused256DispatchBudget() i64 {
-    if (fused256_budget_override) |v| return v;
-    if (fused256_budget_env_cached) |v| return v;
-    const v: i64 = blk: {
-        const raw = env.get(.MLX_SERVE_FUSED_256_BUDGET) orelse break :blk FUSED256_DEFAULT_DISPATCH_BUDGET;
-        break :blk std.fmt.parseInt(i64, std.mem.sliceTo(raw, 0), 10) catch FUSED256_DEFAULT_DISPATCH_BUDGET;
-    };
-    fused256_budget_env_cached = v;
-    return v;
+    return fused256_budget_override orelse FUSED256_DEFAULT_DISPATCH_BUDGET;
 }
 
 /// kv-axis chunk length for the budgeted causal dispatch: the largest
@@ -159,15 +140,7 @@ pub var fused256_last_dispatch_count: u32 = 0;
 
 pub fn fused256CausalMode() Fused256CausalMode {
     if (transformer.fused256_override) |v| return if (v) .all else .off;
-    if (!fused256Enabled()) return .off;
-    if (fused256_causal_env_cached) |v| return v;
-    const mode: Fused256CausalMode = blk: {
-        const raw = env.get(.MLX_SERVE_FUSED_256_CAUSAL) orelse break :blk .all;
-        if (std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0")) break :blk .off;
-        break :blk .all;
-    };
-    fused256_causal_env_cached = mode;
-    return mode;
+    return if (fused256Enabled()) .all else .off;
 }
 
 /// ONE predicate consumed by the three prefill OOM guards AND the dispatch
@@ -175,9 +148,8 @@ pub fn fused256CausalMode() Fused256CausalMode {
 /// the composed [heads, chunk, total_kv] score tensor — either MLX's own
 /// fused kernel covers it (<= 128) or our hd-256 kernel does for EVERY arm.
 /// Keyed on causal mode: at `.all` (the default since the budgeted-dispatch
-/// flip) no hd-256 score tensor materializes; MLX_SERVE_FUSED_256_CAUSAL=0
-/// restores composed causal AND the guards' score billing together. Guards
-/// and dispatch must never drift (the effectivePrefillChunk rule).
+/// flip) no hd-256 score tensor materializes; the test seam's composed causal
+/// moves the guards' score billing with it. Guards and dispatch must never drift (the effectivePrefillChunk rule).
 pub fn prefillHeadDimFused(head_dim: u32) bool {
     return head_dim <= 128 or (head_dim == 256 and fused256CausalMode() == .all);
 }
@@ -247,21 +219,13 @@ pub fn attn256Base16Aligned(a: mlx.mlx_array) bool {
     return @intFromPtr(p) % 16 == 0;
 }
 
-var qsa_fused_env_cached: ?bool = null;
 pub var qsa_fused_override: ?bool = null;
 
-/// MLX_SERVE_QSA_FUSED=0 restores the stock array-mask sdpa (the unfused
+/// The test seam's false runs the stock array-mask sdpa (the unfused
 /// hd-256 fallback on every silicon: `use_fallback` has no fused arm for an
 /// array mask at hd 256).
 pub fn qsaFusedEnabled() bool {
-    if (qsa_fused_override) |v| return v;
-    if (qsa_fused_env_cached) |v| return v;
-    const v = blk: {
-        const raw = env.get(.MLX_SERVE_QSA_FUSED) orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    qsa_fused_env_cached = v;
-    return v;
+    return qsa_fused_override orelse true;
 }
 
 var qsa_fused_logged = false;
@@ -287,7 +251,7 @@ pub fn fusedSdpa256Masked(
     const out = try fusedSdpa256Impl(s, q, k, v, scale, 0, mask, null);
     if (out != null and !qsa_fused_logged) {
         qsa_fused_logged = true;
-        log.info("[qsa-fused] engaged: msv_attn_p256 mask arm qL={d} kL={d} Hq={d} Hkv={d} (MLX_SERVE_QSA_FUSED=0 restores stock sdpa)\n", .{ qs[2], ks[2], qs[1], ks[1] });
+        log.info("[qsa-fused] engaged: msv_attn_p256 mask arm qL={d} kL={d} Hq={d} Hkv={d}\n", .{ qs[2], ks[2], qs[1], ks[1] });
     }
     return out;
 }
@@ -911,7 +875,6 @@ test "fusedSdpa256Prefill: both arms FUSED off NAX, causal yields to stock ON NA
     // preemption class — with the kv-chunk dispatch budget it wins live
     // (2026-07-22 same-session A/B: +2.9%/+2.3%/+4.6% at 8K/16K/32K on the
     // 27B), so causal is default-on now.
-    // MLX_SERVE_FUSED_256_CAUSAL=0 restores composed causal.
     std.debug.assert(transformer.fused256_override == null);
     const q_shape = [_]c_int{ 1, 6, 64, 256 };
     const q = try attn256RandBf16(rnd, &q_shape, s);

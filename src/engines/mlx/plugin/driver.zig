@@ -97,7 +97,7 @@ fn loadSplit(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, config: *M
 
 /// The lossy load setting a served pack has on that the plugin path does not run yet, by its settings name.
 fn lossyUnserved(config: *const ModelConfig) ?[]const u8 {
-    if ((config.int8_prefill_override orelse qmm_int8.enabled()) and mlx.metalKernelsAvailable()) return "int8_prefill";
+    if ((config.int8_prefill_override orelse false) and mlx.metalKernelsAvailable()) return "int8_prefill";
     if (lmHeadMxfp8On(config.lm_head_mxfp8_override, transformer_mod.lm_head_mxfp8_cli, mlx.cudaIntegrated(), false, config.quant_bits)) return "lm_head_mxfp8";
     return null;
 }
@@ -268,7 +268,6 @@ fn unservedFeature(xfm: *const Transformer, ctx: *const ForwardCtx) ?[]const u8 
     if (ctx.capture_stream_all != null) return "the hyper-connection stream";
     if (ctx.head_place != null) return "an MTP head placement";
     if (ctx.batch_slots != null) return "a batched GDN tick";
-    if (xfm.compiled_forward != null) return "the compiled forward";
     return null;
 }
 

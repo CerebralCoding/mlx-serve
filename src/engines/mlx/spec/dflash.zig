@@ -1,6 +1,7 @@
 //! DFlash block-drafter rounds: verify, copy, plain/pipelined policy rounds, parked taps.
 const std = @import("std");
 const env = @import("../../../env.zig");
+const DFLASH_GATE_WARMUP = @import("gates.zig").DFLASH_GATE_WARMUP;
 const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
 const tokenizer_mod = @import("../../../host/tokenizer/tokenizer.zig");
@@ -25,10 +26,6 @@ const Generator = @import("../generate/generator.zig").Generator;
 const MTP_EV_EMA_BETA = @import("mtp/depth.zig").MTP_EV_EMA_BETA;
 const SamplingParams = @import("../sampling/params.zig").SamplingParams;
 const capAcceptedForTokenBudget = @import("verify.zig").capAcceptedForTokenBudget;
-const dflashGateWarmup = @import("gates.zig").dflashGateWarmup;
-const dflashMarkovEnabled = @import("mtp/trace.zig").dflashMarkovEnabled;
-const dflashSampledDraftsEnabled = @import("mtp/trace.zig").dflashSampledDraftsEnabled;
-const dflashSelectorEnabled = @import("mtp/trace.zig").dflashSelectorEnabled;
 const dflashTraceEnabled = @import("mtp/trace.zig").dflashTraceEnabled;
 const dflashTreeNodes = @import("dflash_tree.zig").dflashTreeNodes;
 const filteredProbsBlock = @import("../sampling/spec_sampling.zig").filteredProbsBlock;
@@ -116,14 +113,13 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
     const dflash_gen_before = self.generated_ids.items.len;
     self.dflash_round_width = 0;
     self.dflash_unobserved = false;
-    const dflash_rounds_before: u64 = if (self.dflash_chooser) |ch| ch.rounds else self.dflash_attempted + self.dflash_plain;
+    const dflash_rounds_before: u64 = self.dflash_attempted + self.dflash_plain;
     defer {
         const ms = @as(f32, @floatFromInt(dflash_kv_watch.read())) / @as(f32, std.time.ns_per_ms);
         const emitted = self.generated_ids.items.len - dflash_gen_before;
-        const post_warmup = dflash_rounds_before >= dflashGateWarmup();
+        const post_warmup = dflash_rounds_before >= DFLASH_GATE_WARMUP;
         const wall = if (post_warmup) self.mtpRegimeWallMs(ms) else ms;
         self.specObserveRound(self.dflash_round_width, wall, @floatFromInt(emitted), post_warmup and emitted > 0 and !self.dflash_unobserved, false);
-        if (self.dflash_chooser) |*ch| ch.note(self.dflash_round_width);
     }
     if (self.done) return null;
     std.debug.assert(self.dflash != null);
@@ -153,32 +149,8 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
         if (self.has_pending_logits or self.has_pending_token) return try self.dflashLeavePipeline(allocator);
     }
 
-    // Per-round width: the chooser's argmax over measured tokens/ms
-    // (serial = width 0 is a candidate, so "serial wins" is the gate),
-    // the fixed block until it has data.
     var round_width: u32 = @max(self.dflash_block_size, 2) - 1;
-    if (self.dflash_chooser) |*ch| {
-        if (ch.rounds >= dflashGateWarmup()) {
-            const d = if (mtpDepthPolicy() == .accept) self.dflashAcceptChoose(ch) else ch.choose(&self.xfm.round_cost, self.mtpKvLen(), ch.rounds);
-            round_width = d.width;
-            // Serial is sticky: a plain decode round does not extend the
-            // assistant context, so there is no way back this request.
-            if (round_width == 0) self.spec_disabled_runtime = true;
-            if (ch.logged != ch.current) {
-                if (self.xfm.round_cost.bucketToRead(self.mtpKvLen())) |b| {
-                    ch.logged = ch.current;
-                    var buf: [256]u8 = undefined;
-                    log.info("[dflash] width chooser: standing w{d} ({s}) from {s} {s} (ms/tok)\n", .{
-                        ch.current,
-                        if (ch.current == 0) "serial" else "block",
-                        round_cost.bucketName(self.xfm.round_cost.layout, b),
-                        self.xfm.round_cost.formatBucket(b, &buf),
-                    });
-                }
-            }
-        }
-    }
-    // The round policy replaces the chooser and the serial fallback: a round with no drafts is the verify
+    // The round policy replaces the serial fallback: a round with no drafts is the verify
     // forward at one row, so DFlash resumes whenever drafting pays again.
     if (self.dflash_pol != null and !policy_draft) round_width = 0;
     self.dflash_round_width = round_width;
@@ -246,15 +218,14 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
     // selector draft only survives verify if it IS the trunk argmax);
     // stochastic requests sample the selector's own candidate softmax and
     // accept through min(1, p/q) with q read off the traced path —
-    // exact by construction. `MLX_SERVE_DFLASH_SELECTOR=0` forces the v1
-    // arms for A/Bs.
-    const use_selector = model.selector != null and dflashSelectorEnabled();
+    // exact by construction.
+    const use_selector = model.selector != null;
     // DSpark: the block's base logits are position-parallel, but each
     // position's draft is picked from logits CORRECTED by the token
     // drafted at the previous one (the Markov bigram bias). Chaining it
     // is what the head is for — dropping it drafts every position from
     // an uncorrected distribution the sidecar was never trained to emit.
-    const use_markov = model.markov != null and dflashMarkovEnabled();
+    const use_markov = model.markov != null;
     const tree_round = use_selector and !use_markov and (serial or !stochastic) and xfm.specTreeSupported() and self.dflash_pol == null;
     // A continuation the context backs long enough to fill the tree is
     // verified as the round's chain, with no assistant forward.
@@ -357,7 +328,6 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
         const strides = [_]c_int{ 1, 1, 1 };
         try mlx.check(mlx.mlx_slice(&draft_logits, draft_logits_all, &start, 3, &stop, 3, &strides, 3, s));
     }
-    const sample_drafts = stochastic and !use_selector and !use_markov and dflashSampledDraftsEnabled();
     if (tree_round) {
         return try self.dflashTreeRound(allocator, model, dctx, blk_hidden, draft_logits, t1, m, anchor_pos, kv_step_snap, serial, &.{});
     }
@@ -471,21 +441,6 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
         const host_arr = mlx.mlx_array_new_data(ids_i32.ptr, &row_shape, 2, .int32);
         defer _ = mlx.mlx_array_free(host_arr);
         try mlx.check(mlx.mlx_array_set(&draft_ids, host_arr));
-    } else if (sample_drafts) {
-        draft_q = try filteredProbsBlock(draft_logits, self.sampling, s);
-        var logq = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(logq);
-        try mlx.check(mlx.mlx_log(&logq, draft_q, s));
-        const null_key = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(null_key);
-        var sampled = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(sampled);
-        try mlx.check(mlx.mlx_random_categorical(&sampled, logq, -1, null_key, s));
-        var as_i32 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(as_i32);
-        try mlx.check(mlx.mlx_astype(&as_i32, sampled, .int32, s));
-        const row_shape = [_]c_int{ 1, @as(c_int, @intCast(m)) };
-        try mlx.check(mlx.mlx_reshape(&draft_ids, as_i32, &row_shape, 2, s));
     } else {
         var draft_amax = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(draft_amax);
@@ -811,7 +766,6 @@ pub fn dflashVerify(self: *Generator, allocator: std.mem.Allocator, r: VerifyIn)
     self.dflash_accepted_tokens += accepted;
     self.next_token_id = next_pending;
     self.advanceStep(@intCast(n_commit));
-    if (self.dflash_chooser) |*ch| ch.observe(m, accepted, MTP_EV_EMA_BETA);
     self.dflash_stats.record(m, accepted);
     if (self.dflash_pol) |*pol| {
         if (sel_path) |sp| {

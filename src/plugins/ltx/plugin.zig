@@ -241,7 +241,7 @@ fn run(p: *Plugin, req: *const abi.Request, progress: *const abi.Progress) !Verd
 
     // The DiffVAE is LTX's own decoder; its tile budget follows the memory free when this request began.
     const machine = req.machine orelse &abi.Machine{};
-    var vae_choice = ltx.VaeChoice{ .conv = &e.vae, .seed = seed +% 0x5DEC0DE, .tile_tokens = diffvae_fwd.tileTokenBudgetFor(machine.ram_available) };
+    var vae_choice = ltx.VaeChoice{ .conv = &e.vae, .seed = seed +% 0x5DEC0DE, .tile_tokens = diffvae_fwd.tileTokensForMemory(machine.ram_available) };
     if (b.str("decoder")) |dec| {
         if (std.mem.eql(u8, dec, "diffusion")) {
             if (dir.fileBytes(diffvae_fwd.FILE_NAME) == 0) return bad("'decoder':\"diffusion\" requires vae_diffusion_decoder.safetensors — the 8-bit LTX-2.5 pack ships it, the 4-bit pack does not");

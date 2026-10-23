@@ -1,6 +1,7 @@
 //! The QSA block score sheet: the fused NAX kernel (`msv_qsa_score`), its layouts and arms, and the composed chain.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const crt = @import("../../../sdk/util/crt.zig");
 const mlx = @import("../../../mlx/ffi.zig");
@@ -33,7 +34,6 @@ const qsaVisibleBoundsHost = @import("select.zig").qsaVisibleBoundsHost;
 pub const QsaScoreLayout = enum(u8) { base = 0, h4 = 1 };
 
 pub var qsa_score_probe_flip_override: bool = false;
-var qsa_score_fused_env: ?bool = null;
 pub var qsa_score_layout_override: ?QsaScoreLayout = null;
 pub var qsa_score_tf32_override: ?bool = null;
 var qsa_score_tf32_env: ?bool = null;
@@ -44,14 +44,7 @@ var qsa_dump_blocks_cached: ?[]const u8 = null;
 var qsa_dump_blocks_read: bool = false;
 
 pub fn qsaScoreFusedEnabled() bool {
-    if (transformer.qsa_score_fused_override) |v| return v;
-    if (qsa_score_fused_env) |v| return v;
-    const v = blk: {
-        const raw = std.c.getenv("MLX_SERVE_QSA_SCORE_FUSED") orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    qsa_score_fused_env = v;
-    return v;
+    return transformer.qsa_score_fused_override orelse true;
 }
 
 pub fn qsaScoreFusedActive() bool {
@@ -105,7 +98,7 @@ fn qsaScoreTf32Enabled() bool {
     if (qsa_score_tf32_override) |v| return v;
     if (qsa_score_tf32_env) |v| return v;
     const v = blk: {
-        const raw = std.c.getenv("MLX_ENABLE_TF32") orelse break :blk true;
+        const raw = env.get(.MLX_ENABLE_TF32) orelse break :blk true;
         break :blk qsaScoreTf32ValueOn(std.mem.sliceTo(raw, 0));
     };
     qsa_score_tf32_env = v;
@@ -271,7 +264,7 @@ fn qsaScoreFusedDispatch(s: mlx.mlx_stream, q: mlx.mlx_array, pooled: mlx.mlx_ar
     try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
     if (qsa_score_engaged_bits.take(qsaWidthBucket(rows))) {
         log.info(
-            "[qsa-score] engaged (S={d} nb={d} layout={s} nsg={d} nsh={d}) — MLX_SERVE_QSA_SCORE_FUSED=0 restores the composed chain\n",
+            "[qsa-score] engaged (S={d} nb={d} layout={s} nsg={d} nsh={d})\n",
             .{ rows, nb, if (layout == .h4) "h4" else "base", nsg, nsh },
         );
     }
@@ -344,7 +337,7 @@ fn qsaDumpBlocksPath() ?[]const u8 {
     }
     if (qsa_dump_blocks_read) return qsa_dump_blocks_cached;
     qsa_dump_blocks_read = true;
-    const raw = std.c.getenv("QWEN4_DUMP_QSA_BLOCKS") orelse return null;
+    const raw = env.get(.QWEN4_DUMP_QSA_BLOCKS) orelse return null;
     if (!diagEnvValueOn(raw)) return null;
     const s = std.mem.sliceTo(raw, 0);
     qsa_dump_blocks_cached = s;
@@ -446,41 +439,20 @@ pub fn qsaSelectComposedOps(s: mlx.mlx_stream, scores: mlx.mlx_array, vis3: mlx.
 /// prefill selection runs in row chunks so 4096 rows x 64k blocks x 4 heads
 /// (4.3 GB at 256k) never materializes at once.
 ///
-/// A lever because at long context it decides the prefill's row chunk: at kv 383k (nb ~95.8k)
-/// 256 MB leaves room for ~171 rows, so a 4096-token chunk is re-split into 24 indexer passes.
-/// `MLX_SERVE_QSA_SCORE_SHEET_MB` moves it; the forward and the memory bill both read it
+/// At long context it decides the prefill's row chunk: at kv 383k (nb ~95.8k) 256 MB leaves room
+/// for ~171 rows, so a 4096-token chunk is re-split into 24 indexer passes. The forward and the
+/// memory bill both read it
 /// through `qsaScoreRowsPerChunk`, so a wider sheet is billed, never just spent.
 pub const QSA_SCORE_SHEET_BUDGET_MB_DEFAULT: u64 = 256;
 
 /// Upper bound on the lever: a fat-fingered value must become a named 400, not a Metal OOM.
-pub const QSA_SCORE_SHEET_BUDGET_MB_MAX: u64 = 4096;
 
-var qsa_score_sheet_mb_cached: ?u64 = null;
-/// Test seam: bypass the env read entirely.
+/// Test seam: the sheet budget in MB.
 pub var qsa_score_sheet_mb_override: ?u64 = null;
-var qsa_score_sheet_logged: bool = false;
 
-/// Resolve the raw env value to a megabyte count: absent/0 = default, above the cap clamps.
-pub fn qsaScoreSheetMbFrom(raw: ?[]const u8) u64 {
-    const text = raw orelse return QSA_SCORE_SHEET_BUDGET_MB_DEFAULT;
-    if (text.len == 0) return QSA_SCORE_SHEET_BUDGET_MB_DEFAULT;
-    const parsed = std.fmt.parseInt(u64, text, 10) catch return QSA_SCORE_SHEET_BUDGET_MB_DEFAULT;
-    if (parsed == 0) return QSA_SCORE_SHEET_BUDGET_MB_DEFAULT;
-    return @min(parsed, QSA_SCORE_SHEET_BUDGET_MB_MAX);
-}
-
-/// The live sheet budget in bytes. Read once, logged once when not the default.
+/// The live sheet budget in bytes.
 pub fn qsaScoreSheetBudget() u64 {
-    if (qsa_score_sheet_mb_override) |mb| return mb << 20;
-    if (qsa_score_sheet_mb_cached) |mb| return mb << 20;
-    const raw = std.c.getenv("MLX_SERVE_QSA_SCORE_SHEET_MB");
-    const mb = qsaScoreSheetMbFrom(if (raw) |r| std.mem.sliceTo(r, 0) else null);
-    qsa_score_sheet_mb_cached = mb;
-    if (mb != QSA_SCORE_SHEET_BUDGET_MB_DEFAULT and !qsa_score_sheet_logged) {
-        qsa_score_sheet_logged = true;
-        log.info("[qsa] score sheet budget: {d} MB (MLX_SERVE_QSA_SCORE_SHEET_MB; default {d})\n", .{ mb, QSA_SCORE_SHEET_BUDGET_MB_DEFAULT });
-    }
-    return mb << 20;
+    return (qsa_score_sheet_mb_override orelse QSA_SCORE_SHEET_BUDGET_MB_DEFAULT) << 20;
 }
 
 pub fn qsaScoreRowsPerChunkFor(per_row: u64, rows: u64) u64 {
@@ -586,16 +558,10 @@ test "qsa score bank: incremental column append matches a from-scratch rebuild" 
     try testing.expect(history.qsa_score_incremental_appends > before);
 }
 
-test "qsa score sheet budget: the env parser, and the row chunk it buys at nb 95k" {
+test "qsa score sheet budget: the row chunk it buys at nb 95k" {
     const t = std.testing;
     transformer.qsa_score_fused_override = false;
     defer transformer.qsa_score_fused_override = null;
-    try t.expectEqual(QSA_SCORE_SHEET_BUDGET_MB_DEFAULT, qsaScoreSheetMbFrom(null));
-    try t.expectEqual(QSA_SCORE_SHEET_BUDGET_MB_DEFAULT, qsaScoreSheetMbFrom(""));
-    try t.expectEqual(QSA_SCORE_SHEET_BUDGET_MB_DEFAULT, qsaScoreSheetMbFrom("wide"));
-    try t.expectEqual(QSA_SCORE_SHEET_BUDGET_MB_DEFAULT, qsaScoreSheetMbFrom("0"));
-    try t.expectEqual(@as(u64, 1024), qsaScoreSheetMbFrom("1024"));
-    try t.expectEqual(QSA_SCORE_SHEET_BUDGET_MB_MAX, qsaScoreSheetMbFrom("999999"));
 
     // Flash-Next at the 374k rung: nb 95801, n_idx 4, chunk 4096. At 256 MB the sheet fits
     // ~175 rows, so one chunk is 24 indexer passes; at 1024 MB it is 6.
@@ -844,11 +810,9 @@ test "qsa score fused: a probe mismatch latches the composed arm" {
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     const saved_override = transformer.qsa_score_fused_override;
     const saved_flip = qsa_score_probe_flip_override;
-    const saved_env = qsa_score_fused_env;
     defer {
         transformer.qsa_score_fused_override = saved_override;
         qsa_score_probe_flip_override = saved_flip;
-        qsa_score_fused_env = saved_env;
         qsaScoreFusedProbeReset();
     }
     transformer.qsa_score_fused_override = true;
@@ -892,17 +856,12 @@ test "qsa score fused: probe passes on this machine" {
     try testing.expect(qsaScoreFusedActive());
 }
 
-test "qsa score fused: default on engages, =0 declines" {
+test "qsa score fused: default on engages, the seam declines" {
     const saved_override = transformer.qsa_score_fused_override;
-    const saved_env = qsa_score_fused_env;
-    defer {
-        transformer.qsa_score_fused_override = saved_override;
-        qsa_score_fused_env = saved_env;
-    }
+    defer transformer.qsa_score_fused_override = saved_override;
     transformer.qsa_score_fused_override = null;
-    qsa_score_fused_env = null;
     try testing.expect(qsaScoreFusedEnabled());
-    qsa_score_fused_env = false;
+    transformer.qsa_score_fused_override = false;
     try testing.expect(!qsaScoreFusedEnabled());
     if (mlx.noGpuBackend()) return;
     const s = mlx.gpuStream();
@@ -913,7 +872,6 @@ test "qsa score fused: default on engages, =0 declines" {
     defer _ = mlx.mlx_array_free(pooled);
     try mlx.check(mlx.mlx_array_eval(pooled));
     try testing.expect((try qsaScoreFused(s, q, pooled)) == null);
-    qsa_score_fused_env = null;
     transformer.qsa_score_fused_override = true;
     if (verifyQmmNaxAvailable() and qsaScoreTf32Enabled()) {
         const got = (try qsaScoreFused(s, q, pooled)) orelse return error.ScoreKernelDeclined;

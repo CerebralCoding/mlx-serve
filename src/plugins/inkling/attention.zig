@@ -341,7 +341,7 @@ pub const Attention = struct {
         const k = try g.transpose(try g.rmsNorm(try g.reshape(ks[0], &.{ 1, s, w.kv_heads, hd }), w.k_norm, c.shared.eps), &perm);
         const v = try g.transpose(try g.reshape(vs[0], &.{ 1, s, w.kv_heads, hd }), &perm);
 
-        const sv = band.view(w.window, hd, false, total, s);
+        const sv = band.view(w.window, hd, total, s);
         var view = try kv.append(c, k, v, if (w.window > 0) sv.span else 0);
         defer kv.release(c, &view);
         const dv = kv.dense(view);

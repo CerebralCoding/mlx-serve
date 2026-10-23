@@ -7,7 +7,6 @@ const mlx = @import("../../mlx/ffi.zig");
 const slots_mod = @import("../glm5_next/slots.zig");
 const mla = @import("mla.zig");
 const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
-const fusedAddRmsNorm = @import("../../sdk/blocks/norms/residual_norm.zig").fusedAddRmsNorm;
 
 const Array = mlx.mlx_array;
 
@@ -64,11 +63,6 @@ pub fn hidden(xfm: *Transformer, st: *const Step, token_ids: Array) !Array {
         } else if (try xfm.narrowAddNorm(h, attn_out, lw.post_attn_norm)) |fused| {
             _ = mlx.mlx_array_free(h);
             h = fused.h;
-            _ = mlx.mlx_array_free(ff_normed);
-            ff_normed = fused.normed;
-        } else if (try fusedAddRmsNorm(xfm.s, h, attn_out, lw.post_attn_norm, xfm.rms_eps_arr)) |fused| {
-            _ = mlx.mlx_array_free(h);
-            h = fused.sum;
             _ = mlx.mlx_array_free(ff_normed);
             ff_normed = fused.normed;
         } else {

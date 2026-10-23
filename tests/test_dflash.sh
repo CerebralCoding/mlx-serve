@@ -156,8 +156,7 @@ fi
 # block-wide `qmm` where serial decode runs `qmv`, and at 4 bits a near-tie
 # argmax flips between them — the sanctioned INT4 divergence class. Measured on
 # Muse-Glimmer-30B: the 8-bit build is byte-identical 6/6, the 4-bit build
-# diverges reproducibly while each arm stays perfectly self-consistent, and the
-# divergence is unchanged with MLX_SERVE_SLIDING_BLOCK_TRIM=0.
+# diverges reproducibly while each arm stays perfectly self-consistent.
 #
 # So: byte-equality at 8-bit or wider; at narrower widths assert what must still
 # hold — each arm REPRODUCIBLE (a broken verify or rollback shows as run-to-run

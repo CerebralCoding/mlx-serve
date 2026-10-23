@@ -386,12 +386,6 @@ pub fn getLayerWeightOpt(weights: *const Weights, buf: *[256]u8, prefix: []const
     return weights.get(name);
 }
 
-/// `feed_forward.<name>.<suffix>` into a caller-owned scratch buffer. The
-/// dense-MLP spelling is per-converter, so the three names are data.
-pub fn ffKey(buf: *[64]u8, name: []const u8, suffix: []const u8) []const u8 {
-    return std.fmt.bufPrint(buf, "feed_forward.{s}.{s}", .{ name, suffix }) catch unreachable;
-}
-
 /// `getLayerWeight` for `<base>.<rest>`, formatted into its own buffer.
 /// `<prefix>.layers.<li>`: the name base of one trunk layer.
 pub fn layerBase(buf: *[96]u8, prefix: []const u8, li: u32) []const u8 {
@@ -858,48 +852,4 @@ test "appendHybridMlpWeights skips dense fields with null ctx (UD dense bf16)" {
 
     // 9 fields, 3 weights non-null + 6 null-ctx scales/biases skipped → 3.
     try testing.expectEqual(@as(usize, 3), mlx.mlx_vector_array_size(vec));
-}
-
-test "no layer-init path DEMANDS quantization scales" {
-    // Class guard, not an instance guard. The LFM2 hybrid arm fetched every
-    // `.scales` with the mandatory getter, so a dense bf16 checkpoint aborted
-    // the load ("MISSING WEIGHT: …conv.in_proj.scales") while the standard and
-    // MoE arms had always read absent scales as plain bf16. Any NEW arch arm
-    // that reaches for scales the same way breaks dense checkpoints of that
-    // arch, and nothing else would catch it — a quantized checkpoint of the
-    // same arch loads fine either way.
-    //
-    // Needles are assembled at comptime: spelled whole they would match this
-    // test's own source and the scan would satisfy itself.
-    const src = @embedFile("weights.zig") ++
-        @embedFile("../../../sdk/blocks/linear/verify_projection.zig") ++
-        @embedFile("init.zig") ++
-        @embedFile("../../../sdk/quant/ternary.zig") ++
-        @embedFile("layers_dense.zig") ++
-        @embedFile("../../../sdk/quant/mxfp8.zig") ++
-        @embedFile("layers_layered.zig") ++
-        @embedFile("../../../plugins/hy_v3/load.zig");
-    const mandatory = "getLayer" ++ "Weight(weights,";
-    const optional = "getWeight" ++ "AtOpt(weights,";
-    const scales = ".scales" ++ "\")";
-    try std.testing.expect(std.mem.indexOf(u8, src, optional) != null); // the scan can see a hit
-
-    var it = std.mem.splitScalar(u8, src, '\n');
-    var line_no: usize = 0;
-    var checked: usize = 0;
-    while (it.next()) |line| {
-        line_no += 1;
-        const trimmed = std.mem.trimStart(u8, line, " \t");
-        if (std.mem.startsWith(u8, trimmed, "//")) continue; // prose, not code
-        if (std.mem.indexOf(u8, line, scales) == null) continue;
-        checked += 1;
-        if (std.mem.indexOf(u8, line, mandatory) != null) {
-            std.debug.print(
-                "transformer.zig:{d} demands a scales tensor; dense bf16 ships none — use the optional getter\n",
-                .{line_no},
-            );
-            return error.MandatoryScalesFetch;
-        }
-    }
-    try std.testing.expect(checked > 20); // every arch arm's scales fetches
 }

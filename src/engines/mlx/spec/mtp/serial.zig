@@ -7,36 +7,18 @@ const io_util = @import("../../../../sdk/util/io_util.zig");
 const DrafterStepResult = @import("../drafter.zig").DrafterStepResult;
 const Generator = @import("../../generate/generator.zig").Generator;
 const MTP_ADAPTIVE_PROBE_WARM = @import("adaptive.zig").MTP_ADAPTIVE_PROBE_WARM;
+const MTP_ADAPTIVE_MIN_KV = @import("adaptive.zig").MTP_ADAPTIVE_MIN_KV;
 const MTP_GROUP_ROWS_MAX = @import("round.zig").MTP_GROUP_ROWS_MAX;
 const MtpPreDraft = @import("chain.zig").MtpPreDraft;
 const SubLap = @import("trace.zig").SubLap;
 const isEosId = @import("../../generate/stops.zig").isEosId;
 const mtpAdaptiveKvEligible = @import("adaptive.zig").mtpAdaptiveKvEligible;
-const mtpAdaptiveMinKv = @import("adaptive.zig").mtpAdaptiveMinKv;
-const mtpAdaptiveSerialEnabled = @import("adaptive.zig").mtpAdaptiveSerialEnabled;
 const mtpChainBuildBatched = @import("chain_build.zig").mtpChainBuildBatched;
 const mtpChainDispatch = @import("chain_build.zig").mtpChainDispatch;
 const mtpChainDispatchBatched = @import("chain_build.zig").mtpChainDispatchBatched;
-const mtpCostTableEnabled = @import("ev_plan.zig").mtpCostTableEnabled;
 const mtpPredraftEnabled = @import("trace.zig").mtpPredraftEnabled;
 const mtpTraceEnabled = @import("trace.zig").mtpTraceEnabled;
 
-
-/// Batched-corrections kill switch — MLX_SERVE_MTP_BATCH_CORR=0
-/// restores the per-position accept/correction graphs for A/Bs.
-var mtp_batch_corr_cache: ?bool = null;
-pub fn mtpBatchCorrEnabledFromEnv(raw: ?[]const u8) bool {
-    const value = raw orelse return true;
-    return value.len == 0 or value[0] != '0';
-}
-
-pub fn mtpBatchCorrEnabled() bool {
-    if (mtp_batch_corr_cache) |v| return v;
-    const raw: ?[]const u8 = env.span(.MLX_SERVE_MTP_BATCH_CORR);
-    const on = mtpBatchCorrEnabledFromEnv(raw);
-    mtp_batch_corr_cache = on;
-    return on;
-}
 
 /// Cross-round pre-draft (round pipelining): at the round's tail — the
 /// accept decision made, trunk committed/rolled back, EV updated,
@@ -179,11 +161,10 @@ pub fn mtpAdaptiveModelOk(self: *const Generator) bool {
 /// Will anyone read a serial cell for this model? Gated on the model, not the request: a
 /// per-request `enable_mtp:false` on a calibrated checkpoint is the cleanest serial sample.
 pub fn serialCellWanted(self: *const Generator) bool {
-    if (!mtpAdaptiveSerialEnabled() or !mtpCostTableEnabled()) return false;
     if (!self.mtpAdaptiveModelOk()) return false;
     // Not `xfm.qwen4_mtp != null`: the weights load with the trunk even under `--no-mtp`.
     if (!self.model_has_mtp) return false;
-    return mtpAdaptiveKvEligible(self.mtpKvLen(), mtpAdaptiveMinKv());
+    return mtpAdaptiveKvEligible(self.mtpKvLen(), MTP_ADAPTIVE_MIN_KV);
 }
 
 /// Drop the serial cell's pending interval: something ran between two decode ticks that

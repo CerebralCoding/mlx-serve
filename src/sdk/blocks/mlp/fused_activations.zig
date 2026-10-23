@@ -35,8 +35,7 @@ const gptOssSwiGLU = @import("activations.zig").gptOssSwiGLU;
 // compiled elementwise fusion does not reproduce the chain's intermediate
 // rounding. This kernel does: MLX's `Sigmoid` (the two-sided form) evaluated
 // and ROUNDED TO T, then two `Multiply`s each promoting to float and rounding
-// back, exactly as the three op kernels do. Kill switch:
-// MLX_SERVE_SWIGLU_FUSED=0.
+// back, exactly as the three op kernels do.
 // The sigmoid is a TABLE LOOKUP, not a recomputation, and that is the whole
 // trick. Writing MLX's `Sigmoid` source verbatim is not enough to reproduce it:
 // MLX's own kernels live in a metallib built with a different Metal math mode
@@ -90,15 +89,9 @@ pub fn swigluSigTable(s: mlx.mlx_stream, dt: mlx.mlx_dtype, allocator: std.mem.A
 
 var swiglu_engaged: bool = false;
 pub var swiglu_fused_override: ?bool = null;
-var swiglu_fused_env: ?bool = null;
 
 pub fn swigluFusedEnabled() bool {
-    if (swiglu_fused_override) |v| return v;
-    if (swiglu_fused_env) |v| return v;
-    const raw = env.get(.MLX_SERVE_SWIGLU_FUSED);
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    swiglu_fused_env = enabled;
-    return enabled;
+    return swiglu_fused_override orelse true;
 }
 
 /// `table[gate] * up`: an activation that is unary in x, tabulated over every

@@ -761,7 +761,7 @@ pub fn handleAnthropicMessages(
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
 
     // Check if attention computation would exceed GPU memory.
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, true, kv_quant_override, lm, generate_mod.visionPrefillUnchunked(mm.embeddings != null), enable_mtp, mm.bytes(config))) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, true, kv_quant_override, lm, enable_mtp, mm.bytes(config))) return;
 
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
 

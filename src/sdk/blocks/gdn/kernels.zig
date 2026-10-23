@@ -401,23 +401,16 @@ pub fn getGdnKernelSeq(vector_gate: bool) !mlx.mlx_fast_metal_kernel {
 // (8 threads x 16-wide fragments), Dv % 32 == 0 (DB=32 dv rows per
 // threadgroup). Anything else — and decode (T==1), PLD/MTP verify, and the
 // per-position-state capture path — stays on the stock kernels.
-// Kill switch: MLX_SERVE_GDN_BLOCKED=0; block size: MLX_SERVE_GDN_BLOCK_T
-// (16|32|48, default 32 for bf16 — Metal's 32 KiB threadgroup limit governs,
+// Block size 32 for bf16 (Metal's 32 KiB threadgroup limit governs,
 // and it is a function of the INPUT WIDTH, not a constant: fp32 activations
 // stage twice the bytes and clamp to 16 via gdnBlockTFor. GDN inputs are NOT
 // always bf16 — an f16 checkpoint promotes its activations to f32).
 
-/// Test seam: forces the blocked-prefill route on/off without the environment.
+/// Test seam: forces the blocked-prefill route on/off.
 pub var gdn_blocked_override: ?bool = null;
-var gdn_blocked_env_cached: ?bool = null;
 
 pub fn gdnBlockedEnabled() bool {
-    if (gdn_blocked_override) |v| return v;
-    if (gdn_blocked_env_cached) |v| return v;
-    const raw = env.get(.MLX_SERVE_GDN_BLOCKED);
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    gdn_blocked_env_cached = enabled;
-    return enabled;
+    return gdn_blocked_override orelse true;
 }
 
 /// Prefill-width floor for the blocked kernel (mirrors oMLX's OMLX_GDN_MIN_T
@@ -470,21 +463,8 @@ pub fn gdnBlockTFor(requested: u32, dk: c_int, in_elem_size: usize) ?u32 {
 
 const GDN_BLOCKED_TBS = [_]u32{ 16, 32, 48 };
 var gdn_blocked_cached: [GDN_BLOCKED_TBS.len]?mlx.mlx_fast_metal_kernel = @splat(null);
-var gdn_block_t_cached: ?u32 = null;
-
-pub fn gdnBlockT() u32 {
-    if (gdn_block_t_cached) |v| return v;
-    const v: u32 = blk: {
-        const raw = env.get(.MLX_SERVE_GDN_BLOCK_T) orelse break :blk 32;
-        const parsed = std.fmt.parseInt(u32, std.mem.sliceTo(raw, 0), 10) catch break :blk 32;
-        for (GDN_BLOCKED_TBS) |cand| {
-            if (cand == parsed) break :blk parsed;
-        }
-        break :blk 32;
-    };
-    gdn_block_t_cached = v;
-    return v;
-}
+/// The blocked kernel's time block.
+pub const GDN_BLOCK_T: u32 = 32;
 
 // Body of the blocked-seq kernel; the `constexpr int TB = N;` line is
 // prepended per block size by gdnBlockedSource (one cached kernel per TB,
@@ -533,7 +513,6 @@ pub const GdnRoute = enum { stock, blocked, pipelined };
 
 var gdn_pipelined_cached: ?mlx.mlx_fast_metal_kernel = null;
 pub var gdn_pipelined_override: ?bool = null; // test seam
-var gdn_pipelined_env: ??[]const u8 = null; // MLX_SERVE_GDN_PIPELINED, read once
 
 /// Archs whose prefill was A/B'd against the blocked kernel on an M5 Ultra: Flash Next
 /// (`qwen4_exp`, +2.6%) and dense Qwen3.8-27B (`qwen3_5`, +1.1 to 1.5%), both 48 value heads.
@@ -543,10 +522,8 @@ const GDN_PIPELINED_MEASURED = [_][]const u8{ "qwen4_exp", "qwen3_5" };
 
 /// Whether a GDN prefill takes the pipelined kernel. It sums the recurrence's two 128-wide
 /// dots in another fp32 order than the blocked one, so greedy text can move.
-/// `MLX_SERVE_GDN_PIPELINED=1` forces it on for any arch and chip, `=0` keeps the blocked
-/// kernel; unset, only a measured arch on an M5-class GPU takes it.
-pub fn gdnPipelinedFor(raw: ?[]const u8, model_type: []const u8, nax: bool) bool {
-    if (raw) |v| return !std.mem.eql(u8, v, "0");
+/// Only a measured arch on an M5-class GPU takes it.
+pub fn gdnPipelinedFor(model_type: []const u8, nax: bool) bool {
     if (!nax) return false;
     for (GDN_PIPELINED_MEASURED) |t| {
         if (std.mem.eql(u8, t, model_type)) return true;
@@ -554,15 +531,10 @@ pub fn gdnPipelinedFor(raw: ?[]const u8, model_type: []const u8, nax: bool) bool
     return false;
 }
 
-/// Decided per call, since the registry serves several model types in one process; only
-/// the env read is cached.
+/// Decided per call, since the registry serves several model types in one process.
 pub fn gdnPipelinedEnabled(model_type: []const u8) bool {
     if (gdn_pipelined_override) |v| return v;
-    if (gdn_pipelined_env == null) {
-        const raw: ?[]const u8 = env.span(.MLX_SERVE_GDN_PIPELINED);
-        gdn_pipelined_env = raw;
-    }
-    return gdnPipelinedFor(gdn_pipelined_env.?, model_type, naxAvailable());
+    return gdnPipelinedFor(model_type, naxAvailable());
 }
 
 fn getGdnKernelPipelined() !mlx.mlx_fast_metal_kernel {
@@ -1407,14 +1379,12 @@ fn gdnBlockedParityCase(case: GdnCase, s: mlx.mlx_stream) !void {
     }
 }
 
-test "GDN pipelined route: measured archs on NAX by default, the env forces either way" {
-    try testing.expect(gdnPipelinedFor(null, "qwen4_exp", true));
-    try testing.expect(gdnPipelinedFor(null, "qwen3_5", true));
-    try testing.expect(!gdnPipelinedFor(null, "qwen4_exp", false)); // unmeasured chip
-    try testing.expect(!gdnPipelinedFor(null, "qwen3_5_moe", true)); // unmeasured arch
-    try testing.expect(!gdnPipelinedFor(null, "prism_hadamard_qwen35", true));
-    try testing.expect(gdnPipelinedFor("1", "prism_hadamard_qwen35", false));
-    try testing.expect(!gdnPipelinedFor("0", "qwen4_exp", true));
+test "GDN pipelined route: measured archs on NAX only" {
+    try testing.expect(gdnPipelinedFor("qwen4_exp", true));
+    try testing.expect(gdnPipelinedFor("qwen3_5", true));
+    try testing.expect(!gdnPipelinedFor("qwen4_exp", false)); // unmeasured chip
+    try testing.expect(!gdnPipelinedFor("qwen3_5_moe", true)); // unmeasured arch
+    try testing.expect(!gdnPipelinedFor("prism_hadamard_qwen35", true));
 }
 
 test "GDN pipelined route: each model type gets its own verdict in one process" {
@@ -1424,7 +1394,7 @@ test "GDN pipelined route: each model type gets its own verdict in one process" 
         _ = gdnPipelinedEnabled(t);
     }
     for (order) |t| {
-        try testing.expectEqual(gdnPipelinedFor(gdn_pipelined_env.?, t, naxAvailable()), gdnPipelinedEnabled(t));
+        try testing.expectEqual(gdnPipelinedFor(t, naxAvailable()), gdnPipelinedEnabled(t));
     }
 }
 

@@ -62,12 +62,6 @@ pub fn step(st: []Val, k: []const Val, q: []const Val, v: Val, g: []const Val, b
     return .{ .v = if (acc) |ac| spec.sumIn(ac, order, terms) else host.sum(terms), .e = e + spec.gamma(depth, U) * m };
 }
 
-fn exacts(a: std.mem.Allocator, x: []const f64) ![]Val {
-    const out = try a.alloc(Val, x.len);
-    for (out, x) |*o, v| o.* = .exact(v);
-    return out;
-}
-
 // ── the recurrence kernels: stock, blocked, pipelined ──
 
 const Route = enum { stock, stock_vec, blocked, pipelined };
@@ -676,13 +670,6 @@ const Dec = struct {
             g.unread |= @as(u8, 1) << @intCast(i);
         };
         return g;
-    }
-
-    fn usesConv(self: *const Dec) bool {
-        return switch (self.cfg.kind) {
-            .prework, .k1, .k1s, .fold, .k1p => true,
-            else => false,
-        };
     }
 
     pub fn prepare(self: *Dec, shape: Shape, fill: spec.Fill, seed: u64) !bool {

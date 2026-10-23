@@ -14,6 +14,7 @@
 //! see the same voxel sets and share one `Plan`.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../host/log.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
@@ -764,8 +765,8 @@ test "trellis2 sparse: a null weight and bias is the non-affine LayerNorm" {
 const OracleEnv = struct { ckpts: []const u8, fixtures: []const u8 };
 
 fn oracleEnv() !OracleEnv {
-    const w = std.c.getenv("TRELLIS2_WEIGHTS") orelse return error.SkipZigTest;
-    const f = std.c.getenv("TRELLIS2_FIXTURES") orelse return error.SkipZigTest;
+    const w = env.get(.TRELLIS2_WEIGHTS) orelse return error.SkipZigTest;
+    const f = env.get(.TRELLIS2_FIXTURES) orelse return error.SkipZigTest;
     return .{ .ckpts = std.fmt.allocPrint(testing.allocator, "{s}/ckpts", .{std.mem.span(w)}) catch return error.OutOfMemory, .fixtures = std.mem.span(f) };
 }
 
@@ -802,12 +803,12 @@ fn expectClose(label: []const u8, sc: *Scope, got: A, want: A, min_cos: f64, tol
 
 test "trellis2 oracle: the shape decoder predicts the reference's subdivisions and its per-voxel outputs (TRELLIS2_WEIGHTS, TRELLIS2_FIXTURES)" {
     const gpa = testing.allocator;
-    const env = try oracleEnv();
-    defer gpa.free(env.ckpts);
+    const oracle = try oracleEnv();
+    defer gpa.free(oracle.ckpts);
     const io = std.Io.Threaded.global_single_threaded.io();
-    var fx = try model_mod.loadWeightsFile(gpa, env.fixtures, "shape_dec.safetensors");
+    var fx = try model_mod.loadWeightsFile(gpa, oracle.fixtures, "shape_dec.safetensors");
     defer fx.deinit();
-    var dec = try openDecoder(io, gpa, env.ckpts, "shape_dec_next_dc_f16c32_fp16", .float32);
+    var dec = try openDecoder(io, gpa, oracle.ckpts, "shape_dec_next_dc_f16c32_fp16", .float32);
     defer dec.deinit();
 
     const s = mlx.gpuStream();
@@ -839,9 +840,9 @@ test "trellis2 oracle: the shape decoder predicts the reference's subdivisions a
     try expectClose("shape decoder raw", &sc, out, fx.get("raw").?, 0.9999, 1e-3);
 
     // The texture decoder follows the same plan.
-    var tfx = try model_mod.loadWeightsFile(gpa, env.fixtures, "tex_dec.safetensors");
+    var tfx = try model_mod.loadWeightsFile(gpa, oracle.fixtures, "tex_dec.safetensors");
     defer tfx.deinit();
-    var tdec = try openDecoder(io, gpa, env.ckpts, "tex_dec_next_dc_f16c32_fp16", .float32);
+    var tdec = try openDecoder(io, gpa, oracle.ckpts, "tex_dec_next_dc_f16c32_fp16", .float32);
     defer tdec.deinit();
     const tex = try tdec.dec.decodeGuided(&sc, tfx.get("slat").?, &plan);
     try expectClose("texture decoder raw", &sc, tex, tfx.get("raw").?, 0.9999, 1e-3);
@@ -849,12 +850,12 @@ test "trellis2 oracle: the shape decoder predicts the reference's subdivisions a
 
 test "trellis2 oracle: the decoders in their published f16 stay within half-precision of the reference (TRELLIS2_WEIGHTS, TRELLIS2_FIXTURES)" {
     const gpa = testing.allocator;
-    const env = try oracleEnv();
-    defer gpa.free(env.ckpts);
+    const oracle = try oracleEnv();
+    defer gpa.free(oracle.ckpts);
     const io = std.Io.Threaded.global_single_threaded.io();
-    var fx = try model_mod.loadWeightsFile(gpa, env.fixtures, "shape_dec.safetensors");
+    var fx = try model_mod.loadWeightsFile(gpa, oracle.fixtures, "shape_dec.safetensors");
     defer fx.deinit();
-    var dec = try openDecoder(io, gpa, env.ckpts, "shape_dec_next_dc_f16c32_fp16", .float16);
+    var dec = try openDecoder(io, gpa, oracle.ckpts, "shape_dec_next_dc_f16c32_fp16", .float16);
     defer dec.deinit();
     const s = mlx.gpuStream();
     defer _ = mlx.mlx_stream_free(s);

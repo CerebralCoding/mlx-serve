@@ -27,7 +27,7 @@ const gdnPrefillFusedFor = @import("decode_fused.zig").gdnPrefillFusedFor;
 const gdnPreworkFused = @import("decode_fused.zig").gdnPreworkFused;
 const gdnVerifyFoldEnabled = @import("decode_fused.zig").gdnVerifyFoldEnabled;
 const GdnRoute = @import("kernels.zig").GdnRoute;
-const gdnBlockT = @import("kernels.zig").gdnBlockT;
+const GDN_BLOCK_T = @import("kernels.zig").GDN_BLOCK_T;
 const gdnBlockTFor = @import("kernels.zig").gdnBlockTFor;
 const gdnBlockedEligible = @import("kernels.zig").gdnBlockedEligible;
 const gdnBlockedEnabled = @import("kernels.zig").gdnBlockedEnabled;
@@ -796,7 +796,7 @@ pub fn gatedDeltaNetProjected(
         // gate is a different indexing contract, so it declines outright
         // rather than silently reading the wrong element.
         const blocked_tb: ?u32 = if (!vector_gate and gdnBlockedEnabled() and gdnBlockedEligible(seq_len, dk, dv, num_k_heads, num_v_heads))
-            gdnBlockTFor(gdnBlockT(), dk, gdn_in_itemsize)
+            gdnBlockTFor(GDN_BLOCK_T, dk, gdn_in_itemsize)
         else
             null;
         const route: GdnRoute = if (blocked_tb == null) .stock else if (gdnPipelinedEnabled(cfg.model_type)) .pipelined else .blocked;

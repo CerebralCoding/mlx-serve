@@ -3,13 +3,14 @@
 //! Unset, the test skips. Run once on the old code, port, run again.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const ops = @import("../../mlx/ops.zig");
 
 pub const Named = struct { name: [:0]const u8, array: mlx.mlx_array };
 
 pub fn expect(comptime name: []const u8, arrays: []const Named) !void {
-    const dir = std.mem.span(std.c.getenv("MLX_SERVE_GOLDEN_DIR") orelse return error.SkipZigTest);
+    const dir = std.mem.span(env.get(.MLX_SERVE_GOLDEN_DIR) orelse return error.SkipZigTest);
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrintSentinel(&buf, "{s}/" ++ name ++ ".safetensors", .{dir}, 0);
     const s = mlx.mlx_default_cpu_stream_new();

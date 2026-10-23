@@ -56,7 +56,6 @@ pub fn logQsaArms(self: *Generator) void {
 pub fn logSpecStats(self: *const Generator) void {
     StepTrace.report();
     var table_buf: [256]u8 = undefined;
-    var hist_buf: [256]u8 = undefined;
     var acc_buf: [128]u8 = undefined;
     var rows_buf: [160]u8 = undefined;
     var lookup_buf: [256]u8 = undefined;
@@ -147,23 +146,21 @@ pub fn logSpecStats(self: *const Generator) void {
         const avg_per_round: f64 = @as(f64, @floatFromInt(self.dflash_accepted_tokens)) /
             @as(f64, @floatFromInt(@max(self.dflash_attempted, 1)));
         const drafts_per_round: u32 = if (self.dflash_block_size >= 1) self.dflash_block_size - 1 else 0;
-        // Under the chooser the width varies per round: drafts proposed
-        // is the histogram's sum, not attempts x a fixed block.
-        const drafts_proposed: u64 = if (self.dflash_chooser) |ch| ch.draftsProposed() else self.dflash_attempted * @as(u64, drafts_per_round);
+        const drafts_proposed: u64 = self.dflash_attempted * @as(u64, drafts_per_round);
         const per_draft_pct: f64 = if (drafts_proposed > 0)
             100.0 * @as(f64, @floatFromInt(self.dflash_accepted_tokens)) /
                 @as(f64, @floatFromInt(drafts_proposed))
         else
             0.0;
         log.info(
-            "  [spec-stats] mode=dflash attempts={d} accepts={d} avg_per_round={d:.2} gate_min={d:.2} per_draft_pct={d:.1}% block_size={d} partial_rounds={d} runtime_disabled={s} table={s}:{s} table_drops=t{d}/c{d}/b{d}/i{d} block_avg={d:.2} block_hist={s} chooser_trials={d} plain={d} skipped={d} probes={d} copies={d}/{d}/{d} acc_pos={s} rows_hist={s}\n",
+            "  [spec-stats] mode=dflash attempts={d} accepts={d} avg_per_round={d:.2} gate_min={d:.2} per_draft_pct={d:.1}% block_size={d} partial_rounds={d} runtime_disabled={s} table={s}:{s} table_drops=t{d}/c{d}/b{d}/i{d} plain={d} skipped={d} probes={d} copies={d}/{d}/{d} acc_pos={s} rows_hist={s}\n",
             .{
                 self.dflash_attempted,
                 self.dflash_accepted_tokens,
                 avg_per_round,
                 self.dflash_min_accepted_per_round,
                 per_draft_pct,
-                if (self.dflash_chooser) |ch| ch.current + 1 else self.dflash_block_size,
+                self.dflash_block_size,
                 self.partial_rounds,
                 if (self.spec_disabled_runtime) "true" else "false",
                 round_cost.bucketName(self.xfm.round_cost.layout, table_bucket),
@@ -172,9 +169,6 @@ pub fn logSpecStats(self: *const Generator) void {
                 self.xfm.round_cost.dropped_contended,
                 self.xfm.round_cost.dropped_bad,
                 self.xfm.round_cost.dropped_implausible,
-                if (self.dflash_chooser) |ch| ch.avgWidth() else @as(f32, @floatFromInt(drafts_per_round)),
-                if (self.dflash_chooser) |*ch| ch.formatHist(&hist_buf) else "",
-                if (self.dflash_chooser) |ch| ch.trial.trials else 0,
                 self.dflash_plain,
                 if (self.dflash_pol) |pol| pol.drafting.skipped else 0,
                 if (self.dflash_pol) |pol| pol.drafting.probes else 0,

@@ -319,7 +319,7 @@ pub fn handleCompletions(
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
 
     // Check if attention computation would exceed GPU memory.
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, null, lm, false, enable_mtp, 0)) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, null, lm, enable_mtp, 0)) return;
 
     // Adaptive spec-decode gate (mirrors chat-completions): novel prompts
     // (low 3-gram repetition) skip PLD/drafter unless explicitly requested.

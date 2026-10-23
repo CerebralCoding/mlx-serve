@@ -24,6 +24,7 @@
 //! follow-up.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../host/log.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
@@ -85,9 +86,6 @@ pub const TtsConfig = struct {
     top_k: u32 = 50,
     seed: u64 = 0,
 
-    pub fn qheadDim(self: TtsConfig) u32 {
-        return self.t_head_dim;
-    }
 };
 
 /// Parse the talker dims + ids from `config.json`. Falls back to the struct
@@ -207,8 +205,7 @@ inline fn silu(x: mlx.mlx_array, s: S) !mlx.mlx_array {
 
 /// SwiGLU: silu(gate) * up. Tries the shared fused kernel first (bit-exact —
 /// its sigmoid is a full 16-bit table; declines f32 and odd shapes), keeping
-/// the 3-dispatch chain as the fallback and the kill-switch path
-/// (MLX_SERVE_SWIGLU_FUSED=0).
+/// the 3-dispatch chain as the fallback.
 inline fn swiglu(gate: mlx.mlx_array, up: mlx.mlx_array, s: S) !mlx.mlx_array {
     if (try transformer_mod.fusedSwiGLU(s, gate, up)) |fused| return fused;
     return swigluPlain(gate, up, s);
@@ -295,50 +292,29 @@ fn embedIdArr(table: mlx.mlx_array, id_arr: mlx.mlx_array, s: S) !mlx.mlx_array 
 // of actual compute. The chain keeps every sample on the GPU (sampling is
 // already pure mlx ops keyed by a host counter, so laziness changes NOTHING
 // about the draw) and reads all 16 codes back in ONE sync at frame end.
-// Kill switch: MLX_SERVE_TTS_GPU_PREDICT=0 restores the host loop.
-var gpu_predict_env: ?bool = null;
 var gpu_predict_override: ?bool = null; // tests only
 var gpu_predict_engaged: bool = false;
 fn gpuPredictEnabled() bool {
-    if (gpu_predict_override) |v| return v;
-    if (gpu_predict_env) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_TTS_GPU_PREDICT");
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    gpu_predict_env = enabled;
-    return enabled;
+    return gpu_predict_override orelse true;
 }
 
-// Compiled predictor chain (default ON; MLX_SERVE_TTS_COMPILE=0 kills): the
+// Compiled predictor chain: the
 // frame loop is CPU-bound in mlx per-node eval overhead, so the 15-step chain
 // is traced ONCE by mlx_compile (fixed signature: hidden, code0, 15 keys) and
 // replayed per frame. NOT bit-identical to the lazy chain — compile's
 // elementwise fusion changes intermediate rounding (the documented silu-geglu
-// class) — so its guards are BANDS, and the kill switch restores the
-// byte-identical lazy chain.
-var cp_compile_env: ?bool = null;
+// class) — so its guards are BANDS.
 var cp_compile_override: ?bool = null; // tests only
 fn cpCompileEnabled() bool {
-    if (cp_compile_override) |v| return v;
-    if (cp_compile_env) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_TTS_COMPILE");
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    cp_compile_env = enabled;
-    return enabled;
+    return cp_compile_override orelse true;
 }
 
-// KV-cached predictor steps (default ON; MLX_SERVE_TTS_CP_CACHE=0 restores
-// the full re-forward). Takes precedence over the compiled full-re-forward
+// KV-cached predictor steps. Take precedence over the compiled full-re-forward
 // chain — fewer nodes beats replayed nodes in a per-node CPU-bound loop.
-var cp_cache_env: ?bool = null;
 var cp_cache_override: ?bool = null; // tests only
 var cp_cache_engaged: bool = false;
 fn cpCacheEnabled() bool {
-    if (cp_cache_override) |v| return v;
-    if (cp_cache_env) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_TTS_CP_CACHE");
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    cp_cache_env = enabled;
-    return enabled;
+    return cp_cache_override orelse true;
 }
 
 /// Dispatch a built subgraph without waiting (encode/execute overlap: the GPU
@@ -354,17 +330,8 @@ fn asyncKick(arr: mlx.mlx_array) void {
 /// Predictor-chain async-eval stride: kick the GPU every N sampled codebooks
 /// (0 = never, build the whole frame then eval once). The frame graph is
 /// ~1800 tiny serial kernels, so with a single eval per frame the CPU encode
-/// serializes with GPU execution; measured stride sweep picked the default.
-var async_stride_env: ?u32 = null;
-fn ttsAsyncStride() u32 {
-    if (async_stride_env) |v| return v;
-    const v: u32 = if (std.c.getenv("MLX_SERVE_TTS_ASYNC_STRIDE")) |raw|
-        std.fmt.parseInt(u32, std.mem.sliceTo(raw, 0), 10) catch 1
-    else
-        1;
-    async_stride_env = v;
-    return v;
-}
+/// serializes with GPU execution; measured stride sweep picked 1.
+const TTS_ASYNC_STRIDE: u32 = 1;
 
 /// Linear with bias: matmul(x, w_t) + bias.
 fn linearBias(x: mlx.mlx_array, w_t: mlx.mlx_array, bias: mlx.mlx_array, s: S) !mlx.mlx_array {
@@ -554,23 +521,11 @@ const QwenDims = struct {
     plain_kernels: bool = false,
 };
 
-// tts-side lever for the shared fused residual+RMSNorm kernel: default ON
-// here (the frame loop is per-node CPU-bound; laguna's opt-in default stays
-// untouched). Kill switch: MLX_SERVE_TTS_ADD_RMSNORM=0.
-var tts_add_rms_env: ?bool = null;
-fn ttsAddRmsEnabled() bool {
-    if (tts_add_rms_env) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_TTS_ADD_RMSNORM");
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    tts_add_rms_env = enabled;
-    return enabled;
-}
-
 /// Residual add + post-norm: ONE node when the fused kernel takes it
 /// (bit-identical), the composed pair otherwise. Caller frees both fields.
 fn addRmsNorm(x: mlx.mlx_array, o: mlx.mlx_array, norm_w: mlx.mlx_array, d: QwenDims, s: S) !transformer_mod.AddNormResult {
-    if (!d.plain_kernels and ttsAddRmsEnabled() and d.eps_arr.ctx != null) {
-        if (try transformer_mod.fusedAddRmsNormUngated(s, x, o, norm_w, d.eps_arr)) |r| return r;
+    if (!d.plain_kernels and d.eps_arr.ctx != null) {
+        if (try transformer_mod.fusedAddRmsNorm(s, x, o, norm_w, d.eps_arr)) |r| return r;
     }
     const sum = try addA(x, o, s);
     errdefer _ = mlx.mlx_array_free(sum);
@@ -1075,7 +1030,7 @@ pub const TtsModel = struct {
                 };
                 code_arrs[0] = try self.sampleCode0Lazy(logits0, suppress_mask, code0_hist.items, &rng);
                 // Start the talker executing while the predictor chain encodes.
-                if (ttsAsyncStride() > 0) asyncKick(code_arrs[0]);
+                asyncKick(code_arrs[0]);
 
                 // Predictor: KV-cached steps first (fewest nodes), then the
                 // compiled full-re-forward chain, then the lazy full
@@ -1138,7 +1093,7 @@ pub const TtsModel = struct {
                         _ = mlx.mlx_array_free(codes16);
                         return e;
                     };
-                } else if (ttsAsyncStride() > 0) asyncKick(codes16);
+                } else asyncKick(codes16);
                 defer _ = mlx.mlx_array_free(codes16);
                 defer _ = mlx.mlx_array_free(codec_sum);
 
@@ -1172,7 +1127,7 @@ pub const TtsModel = struct {
                     gpu_predict_engaged = true;
                     log.info("[tts] GPU-chained code predictor engaged (1 sync/frame)\n", .{});
                 }
-                if (std.c.getenv("TTS_TRACE") != null and frame < 60) std.debug.print("{d} ", .{frame_codes[0]});
+                if (env.get(.TTS_TRACE) != null and frame < 60) std.debug.print("{d} ", .{frame_codes[0]});
                 if (frame_codes[0] == @as(u32, @intCast(cfg.codec_eos))) {
                     _ = mlx.mlx_array_free(next_input);
                     break;
@@ -1190,7 +1145,7 @@ pub const TtsModel = struct {
             const code0 = try self.sampleCode0(logits0, suppress_mask, code0_hist.items, &rng);
             talker_ns += @intCast(pt0.untilNow(io_prof, .boot).nanoseconds);
 
-            if (std.c.getenv("TTS_TRACE") != null and frame < 60) std.debug.print("{d} ", .{code0});
+            if (env.get(.TTS_TRACE) != null and frame < 60) std.debug.print("{d} ", .{code0});
             if (code0 == @as(u32, @intCast(cfg.codec_eos))) break;
 
             // Track unique code0 for the next step's repetition penalty.
@@ -1400,7 +1355,7 @@ pub const TtsModel = struct {
             const logits = try self.cp_lm_head[step].forward(last, s);
             defer _ = mlx.mlx_array_free(logits);
             code_arrs[step + 1] = try sampleTokenLazy(logits, cfg.temperature, cfg.top_k, rng, s);
-            const stride = ttsAsyncStride();
+            const stride = TTS_ASYNC_STRIDE;
             if (stride > 0 and (step + 1) % stride == 0) asyncKick(code_arrs[step + 1]);
 
             if (step + 1 < n_steps) {
@@ -1414,8 +1369,7 @@ pub const TtsModel = struct {
     /// stack — L==1, where the fused QK-norm+RoPE and residual+norm kernels
     /// engage and per-step node count drops ~30%. Positions, causal scope and
     /// rope offsets match the full re-forward exactly; kernel/reduction order
-    /// differ (the banded class — MLX_SERVE_TTS_CP_CACHE=0 restores the
-    /// bit-exact full re-forward).
+    /// differ (the banded class).
     fn predictCodesCachedLazy(self: *const TtsModel, talker_hidden_last: mlx.mlx_array, code_arrs: *[16]mlx.mlx_array, rng: *u64) !void {
         const s = self.s;
         const cfg = self.cfg;
@@ -1443,7 +1397,7 @@ pub const TtsModel = struct {
             const logits = try self.cp_lm_head[0].forward(last, s);
             defer _ = mlx.mlx_array_free(logits);
             code_arrs[1] = try sampleTokenLazy(logits, cfg.temperature, cfg.top_k, rng, s);
-            if (ttsAsyncStride() > 0) asyncKick(code_arrs[1]);
+            asyncKick(code_arrs[1]);
         }
         var step: u32 = 1;
         while (step < n_steps) : (step += 1) {
@@ -1456,7 +1410,7 @@ pub const TtsModel = struct {
             const logits = try self.cp_lm_head[step].forward(hid, s); // [1,1,V] — hid is the one new position
             defer _ = mlx.mlx_array_free(logits);
             code_arrs[step + 1] = try sampleTokenLazy(logits, cfg.temperature, cfg.top_k, rng, s);
-            const stride = ttsAsyncStride();
+            const stride = TTS_ASYNC_STRIDE;
             if (stride > 0 and (step + 1) % stride == 0) asyncKick(code_arrs[step + 1]);
         }
     }
@@ -1814,7 +1768,6 @@ const SPK_N_MELS: usize = 128;
 const SPK_N_FREQS: usize = SPK_N_FFT / 2 + 1; // 513
 const SPK_F_MAX: f64 = 12000.0;
 const SPK_SR: f64 = 24000.0;
-const SPK_ENC_DIM: usize = 1024;
 // enc_channels [512,512,512,512,1536]; kernels [5,3,3,3,1]; dilations [1,2,3,4,1].
 const SPK_RES2NET_SCALE: usize = 8;
 
@@ -2336,7 +2289,6 @@ fn freeSpkMap(map: *SpkMap) void {
 // the caller frees like any freshly-embedded array, so `synthesize`'s existing
 // defer stays correct on hit, miss, and cache-off paths alike. Touched only on
 // the inference thread (synthesize runs via the gen queue) — no locking.
-// Kill switch: MLX_SERVE_TTS_SPK_CACHE=0 restores the uncached path.
 const SpkEmbCache = struct {
     const CAP = 4;
     const Entry = struct { hash: u64, emb: mlx.mlx_array, last_use: u64 };
@@ -2399,15 +2351,6 @@ const SpkEmbCache = struct {
         }
     }
 };
-
-var spk_cache_env: ?bool = null;
-fn spkCacheEnabled() bool {
-    if (spk_cache_env) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_TTS_SPK_CACHE");
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    spk_cache_env = enabled;
-    return enabled;
-}
 
 /// The cached clone path: hash the clip samples, serve a prior embedding on a
 /// hit, otherwise embed + materialize + eval + insert. Always returns an OWNED
@@ -2494,13 +2437,10 @@ pub const Synthesizer = struct {
     /// (docs/qwentts-cache.md "pre-warm" — the only lever for the FIRST
     /// sentence: the app fires this when voice mode starts / a clone-voiced
     /// agent is selected, so sentence 1 skips the cold ECAPA forward).
-    /// Returns true when the clip was already cached. With the cache
-    /// disabled (MLX_SERVE_TTS_SPK_CACHE=0) there is nothing to warm INTO —
-    /// returns false without embedding. Errors when the checkpoint cannot
+    /// Returns true when the clip was already cached. Errors when the checkpoint cannot
     /// clone (the caller turns that into a named 400, never a silent no-op).
     pub fn warmSpeaker(self: *Synthesizer, ref: []const f32) !bool {
         const sp = if (self.model.speaker) |*s_| s_ else return error.NoSpeakerEncoder;
-        if (!spkCacheEnabled()) return false;
         const hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(ref));
         if (self.spk_cache.get(hash)) |hit| {
             _ = mlx.mlx_array_free(hit); // get() hands back a +1 ref
@@ -2525,10 +2465,7 @@ pub const Synthesizer = struct {
         if (ref_audio) |ref| {
             if (self.model.speaker) |*sp| {
                 if (progress) |p| p.emit("Encoding reference voice", 0, 0);
-                spk_emb = if (spkCacheEnabled())
-                    try resolveSpeakerEmbedding(sp, &self.spk_cache, ref)
-                else
-                    try sp.embed(ref);
+                spk_emb = try resolveSpeakerEmbedding(sp, &self.spk_cache, ref);
             }
         }
         const t1 = std.Io.Timestamp.now(io_t, .boot);
@@ -3686,8 +3623,8 @@ test "8-bit checkpoint parity vs bf16 (greedy, cloned voice)" {
     defer allocator.free(ref);
     for (ref, 0..) |*x, i| {
         const t = @as(f32, @floatFromInt(i)) / 24000.0;
-        const env = 0.5 + 0.5 * @sin(2.0 * std.math.pi * 3.0 * t);
-        x.* = env * (0.30 * @sin(2.0 * std.math.pi * 160.0 * t) + 0.15 * @sin(2.0 * std.math.pi * 320.0 * t) + 0.08 * @sin(2.0 * std.math.pi * 480.0 * t));
+        const amp = 0.5 + 0.5 * @sin(2.0 * std.math.pi * 3.0 * t);
+        x.* = amp * (0.30 * @sin(2.0 * std.math.pi * 160.0 * t) + 0.15 * @sin(2.0 * std.math.pi * 320.0 * t) + 0.08 * @sin(2.0 * std.math.pi * 480.0 * t));
     }
 
     const Result = struct { frames: usize, peak: f32, rms: f64, code0: [16]u32 };

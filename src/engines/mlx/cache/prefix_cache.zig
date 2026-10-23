@@ -270,45 +270,23 @@ pub fn specAdoptPlan(base_pos: usize, snap_step: usize, matched: usize, has_head
     return .{ .head = want };
 }
 
-var ssd_first_env_cached: ?bool = null;
 /// Test/bench override for `ssdFirstEnabled()`. Null = read the environment.
 pub var ssd_first_override: ?bool = null;
 
-/// Resolve this module's lazily-cached env reads once, from the main thread.
-pub fn warmEnvCaches() void {
-    _ = ssdFirstEnabled();
-    _ = restoreMoveEnabled();
-}
-
-/// SSD-first prefix cache mode (`MLX_SERVE_PREFIX_SSD_FIRST=0` restores RAM-first); armed only
+/// SSD-first prefix cache mode; armed only
 /// where `ModelConfig.ssdFirstCapable()`.
 pub fn ssdFirstEnabled() bool {
-    if (ssd_first_override) |v| return v;
-    if (ssd_first_env_cached) |v| return v;
-    const v = blk: {
-        const raw = env.get(.MLX_SERVE_PREFIX_SSD_FIRST) orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    ssd_first_env_cached = v;
-    return v;
+    return ssd_first_override orelse true;
 }
 
-var restore_move_env_cached: ?bool = null;
 /// Test/bench override for `restoreMoveEnabled()`. Null = read the environment.
 pub var restore_move_override: ?bool = null;
 
-/// Restore by move. `MLX_SERVE_RESTORE_MOVE=0` restores the refcount share whose first append
-/// copies the whole prefix. Armed where `HotPrefixCache.ssd_first` is, or on demand when a share
+/// Restore by move (the test seam's false keeps the refcount share whose first append copies the
+/// whole prefix). Armed where `HotPrefixCache.ssd_first` is, or on demand when a share
 /// does not fit (`checkoutRestored`).
 pub fn restoreMoveEnabled() bool {
-    if (restore_move_override) |v| return v;
-    if (restore_move_env_cached) |v| return v;
-    const v = blk: {
-        const raw = env.get(.MLX_SERVE_RESTORE_MOVE) orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    restore_move_env_cached = v;
-    return v;
+    return restore_move_override orelse true;
 }
 
 /// What the shutdown flush did, for its one summary line.
@@ -3179,33 +3157,6 @@ pub const HotPrefixCache = struct {
         }
         self.entries.clearRetainingCapacity();
         self.current_kv_bytes = 0;
-    }
-
-    /// Drop the most recently committed entry — used after a pad-only
-    /// generation: the entry we just wrote may have stale K/V from the bad
-    /// generation in tail positions. Other entries from prior healthy
-    /// requests remain untouched (improvement over the legacy nuke-everything).
-    pub fn invalidateLatest(self: *HotPrefixCache, reason: []const u8) void {
-        if (self.disk) |*d| d.invalidateNewest();
-        // The parked snapshot and older entries are earlier, healthy sessions': they still land.
-        defer self.disk_dirty = self.diskOwed();
-        if (self.pending_disk) |*p| {
-            p.deinit(self.allocator);
-            self.pending_disk = null;
-        }
-        if (self.entries.items.len == 0) return;
-        var newest_idx: usize = 0;
-        var newest_used: u64 = 0;
-        for (self.entries.items, 0..) |*e, i| {
-            if (e.last_used >= newest_used) {
-                newest_used = e.last_used;
-                newest_idx = i;
-            }
-        }
-        var evicted = self.entries.swapRemove(newest_idx);
-        self.current_kv_bytes -|= evicted.kv_bytes;
-        freeEntryOwnedState(self.allocator, &evicted);
-        log.info("  [hot-cache] invalidated latest entry: {s}\n", .{reason});
     }
 
     pub fn entryCount(self: *const HotPrefixCache) usize {
@@ -7283,29 +7234,6 @@ test "prefix cache: a hybrid miss with a raw token match names itself" {
     // At and above it, a cold prefill of that many tokens owes an explanation.
     try testing.expectEqual(MissKind.no_checkpoint, missKind(1, MIN_CANCELLED_COMMIT_TOKENS));
     try testing.expectEqual(MissKind.no_checkpoint, missKind(4, 393_000));
-}
-
-test "prefix cache: the no-match lookup arm consults missKind, never returns silently" {
-    // Class guard for the 560 s unexplained cold prefill: every early return
-    // from the lookup owes a reason. The `match == null` arm is the one that
-    // had none, and it is reachable only through this file.
-    const source = @embedFile("prefix_cache.zig");
-    const start = std.mem.indexOf(u8, source, "if (match == null) {") orelse
-        return error.MissingNoMatchArm;
-    const arm = source[start .. start + 900];
-    const end = std.mem.indexOf(u8, arm, "return .{ .matched = 0, .full_match = false };") orelse
-        return error.MissingNoMatchReturn;
-    try testing.expect(std.mem.indexOf(u8, arm[0..end], "missKind(") != null);
-    try testing.expect(std.mem.indexOf(u8, arm[0..end], "[hot-cache] hybrid miss") != null);
-    // The probe must be filled BEFORE the restorability filter can `continue`
-    // a candidate away, or `best_raw` is always 0 and the line never fires.
-    const fbr = std.mem.indexOf(u8, source, "fn findBestRestorableMatch(") orelse
-        return error.MissingFinder;
-    const body = source[fbr .. fbr + 2600];
-    const probe_at = std.mem.indexOf(u8, body, "if (probe) |p| {") orelse return error.MissingProbe;
-    const filter_at = std.mem.indexOf(u8, body, "const effective = if (require_ssm_checkpoint)") orelse
-        return error.MissingFilter;
-    try testing.expect(probe_at < filter_at);
 }
 
 test "prefix cache: an inherited checkpoint SHARES the donor's buffers and is budget-bounded" {

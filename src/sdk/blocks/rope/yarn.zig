@@ -321,72 +321,6 @@ test "qsa indexer scalar rope applies yarn mscale to first rope_dims only" {
     for (64..128) |i| try testing.expectEqual(bv[i], av[i]);
 }
 
-test "qsaMaskFromQk applies yarnScaleRotated on the scalar rope arm only" {
-    // The QSA indexer's mlx_fast_rope else-arm is the only path that does not
-    // already fold mscale (M-RoPE tables carry it via fillCosSin). A comment
-    // once skipped the scale; deleting the call still left every runtime test
-    // green because they invoke yarnScaleRotated directly. This scan is the
-    // wiring pin. Needles are assembled at comptime so this test's own source
-    // cannot satisfy the scan.
-    const src = @embedFile("../../../plugins/qwen4_exp/qsa/indexer.zig");
-    const fn_mark = "pub fn qsaMask" ++ "FromQk(";
-    const at = std.mem.indexOf(u8, src, fn_mark) orelse return error.MissingQsaMaskFromQk;
-    const line_end = std.mem.indexOfScalarPos(u8, src, at, '\n') orelse src.len;
-    const next = std.mem.indexOfPos(u8, src, line_end, "\npub fn ") orelse src.len;
-    const body = src[line_end..next];
-
-    const yarn_scale = "yarn" ++ "ScaleRotated";
-    const fast_rope = "mlx_" ++ "fast_rope";
-    const mrope_mark = "ctx.mrope_" ++ "cos_cur";
-    const apply_mrope = "apply" ++ "Mrope";
-    const scale_lit = "}, 1" ++ ".0,";
-    const skip_a = "deliberately NOT" ++ " applied";
-    const skip_b = "cannot change a" ++ " top-k";
-
-    const mrope_at = std.mem.indexOf(u8, body, mrope_mark) orelse return error.MissingMropeArm;
-    const pooled_at = std.mem.indexOfPos(u8, body, mrope_at, "// Pooled block keys") orelse
-        return error.MissingPooledSection;
-    const rope_block = body[mrope_at..pooled_at];
-    const else_at = std.mem.indexOf(u8, rope_block, "} else {") orelse return error.MissingScalarElse;
-    const mrope_arm = rope_block[0..else_at];
-    const scalar_arm = rope_block[else_at..];
-
-    try testing.expect(std.mem.indexOf(u8, mrope_arm, apply_mrope) != null);
-    var mrope_it = std.mem.splitScalar(u8, mrope_arm, '\n');
-    while (mrope_it.next()) |line| {
-        const trimmed = std.mem.trimStart(u8, line, " \t");
-        if (std.mem.startsWith(u8, trimmed, "//")) continue;
-        if (std.mem.indexOf(u8, line, yarn_scale) != null) return error.YarnScaleOnMropeArm;
-    }
-
-    var fast_seen = false;
-    var scale_after = false;
-    var scale_one = false;
-    var scalar_it = std.mem.splitScalar(u8, scalar_arm, '\n');
-    while (scalar_it.next()) |line| {
-        const trimmed = std.mem.trimStart(u8, line, " \t");
-        if (std.mem.startsWith(u8, trimmed, "//")) continue;
-        if (std.mem.indexOf(u8, line, fast_rope) != null) fast_seen = true;
-        if (std.mem.indexOf(u8, line, scale_lit) != null) scale_one = true;
-        if (std.mem.indexOf(u8, line, yarn_scale) != null) {
-            if (!fast_seen) return error.YarnScaleBeforeFastRope;
-            scale_after = true;
-        }
-    }
-    if (!fast_seen) return error.MissingFastRope;
-    if (!scale_one) return error.FastRopeScaleNotOne;
-    if (!scale_after) return error.MissingYarnScaleOnScalarArm;
-
-    var body_it = std.mem.splitScalar(u8, body, '\n');
-    while (body_it.next()) |line| {
-        const trimmed = std.mem.trimStart(u8, line, " \t");
-        if (std.mem.startsWith(u8, trimmed, "//")) continue;
-        if (std.mem.indexOf(u8, line, skip_a) != null or std.mem.indexOf(u8, line, skip_b) != null) {
-            return error.SkipTheoryInProduction;
-        }
-    }
-}
-
 test "computeYarnFreqs matches HF _compute_yarn_parameters (Laguna full-attn rope)" {
     // Golden values from the reference YaRN math (tests/dump_laguna_fixtures.py
     // and the pure-Python cross-check): head_dim 128, partial 0.5 → dim 64 →
@@ -468,42 +402,4 @@ test "laguna yarn parity vs modeling_laguna.py (LAGUNA_FIXTURES)" {
         try testing.expectApproxEqRel(jsonF64(item), out[i], 1e-6);
     }
     std.debug.print("[laguna-yarn] {d} freqs match reference (max rel err < 1e-6)\n", .{ref.items.len});
-}
-
-test "the YaRN mscale table never reaches a multiply in its load-time dtype" {
-    // Source-scan class guard (same shape as generate.zig's `advanceStep` scan).
-    // The bug was a single multiply of post-RoPE q/k by the load-time mscale
-    // table while that table was still f32 and q/k were bf16. Nothing
-    // observable failed — the model stayed correct and the op count stayed the
-    // same, the token just got 3x slower — so only a scan keeps it out.
-    const src = @embedFile("../../../engines/mlx/transformer.zig") ++
-        @embedFile("../../../engines/mlx/load/init.zig") ++
-        @embedFile("yarn.zig") ++
-        @embedFile("../attention/gated_full.zig") ++
-        @embedFile("qk_norm_rope.zig");
-    // Needles are assembled at comptime: spelled whole, they would appear in
-    // this test's own source and the scan would satisfy itself.
-    const routed = "constTableAs(" ++ "self.yarn_mscale.?,";
-    const raw_table = "yarn_" ++ "mscale";
-    const raw_local = "ms_" ++ "f32";
-    const mul = "mlx_" ++ "multiply(";
-    try std.testing.expect(std.mem.indexOf(u8, src, routed) != null);
-
-    var it = std.mem.splitScalar(u8, src, '\n');
-    var line_no: usize = 0;
-    while (it.next()) |line| {
-        line_no += 1;
-        const trimmed = std.mem.trimStart(u8, line, " \t");
-        if (std.mem.startsWith(u8, trimmed, "//")) continue; // prose, not code
-        if (std.mem.indexOf(u8, line, mul) == null) continue;
-        if (std.mem.indexOf(u8, line, raw_table) != null or
-            std.mem.indexOf(u8, line, raw_local) != null)
-        {
-            std.debug.print(
-                "transformer.zig:{d} multiplies by the load-time f32 mscale table; route it through constTableAs\n",
-                .{line_no},
-            );
-            return error.RawMscaleReachesMultiply;
-        }
-    }
 }

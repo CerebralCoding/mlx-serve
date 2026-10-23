@@ -31,6 +31,7 @@
 //! `ACESTEP_*` cos oracles fed by tests/dump_acestep_fixtures.py.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../host/log.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
@@ -1300,7 +1301,6 @@ fn applyDcwDouble(x_next: mlx.mlx_array, denoised: mlx.mlx_array, t_curr: f32, s
 // ════════════════════════════════════════════════════════════════════════
 
 const VAE_STRIDES_DOWN = [_]u32{ 2, 4, 4, 6, 10 };
-const VAE_CM = [_]u32{ 1, 1, 2, 4, 8, 16 }; // [1] ++ channel_multiples
 
 /// Snake with log-stored α/β (sdk's `snakeBetaLog`), computed f32 (exp headroom) and cast back to x's dtype. α/β
 /// stored [C] f32 by the converter.
@@ -2102,7 +2102,7 @@ pub const Engine = struct {
         const s = self.s;
         const hidden = self.cfg.hidden;
         const ffn = self.cfg.intermediate;
-        const eng = try ane.AnePrefill.init(a, self.io, self.cfg.layers, hidden, k, rows, rows, 0, 0, .channel, units);
+        const eng = try ane.AnePrefill.init(a, self.io, self.cfg.layers, hidden, k, rows, rows, 0, 0, units);
         errdefer eng.deinit();
         const rests = try a.alloc(AceRest, n);
         errdefer a.free(rests);
@@ -2643,7 +2643,7 @@ fn arrayCosine(arr: mlx.mlx_array, ref: []const f32, s: S) !f64 {
 }
 
 fn testEngine(io: std.Io, a: std.mem.Allocator) !*Engine {
-    const model_dir = std.mem.span(std.c.getenv("ACESTEP_TEST_MODEL") orelse return error.SkipZigTest);
+    const model_dir = std.mem.span(env.get(.ACESTEP_TEST_MODEL) orelse return error.SkipZigTest);
     return Engine.load(io, a, model_dir, false);
 }
 

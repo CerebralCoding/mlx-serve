@@ -21,11 +21,10 @@ pub const View = struct {
     band_in_kernel: bool,
 };
 
-/// The view of a layer of `window` (0 = not sliding) after `q_len` new rows land on `total_kv`. A ring holds only the
-/// tail, so it always trims.
-pub fn view(window: u32, head_dim: c_int, ring: bool, total_kv: c_int, q_len: c_int) View {
+/// The view of a layer of `window` (0 = not sliding) after `q_len` new rows land on `total_kv`.
+pub fn view(window: u32, head_dim: c_int, total_kv: c_int, q_len: c_int) View {
     const band = attn256.fused256Enabled() and head_dim == 256 and q_len >= attn256.FUSED256_MIN_Q_LEN;
-    const width: usize = if (band or (!legacy.slidingBlockTrimEnabled() and !ring)) 1 else legacy.SLIDING_TRIM_UNBOUNDED;
+    const width: usize = if (band) 1 else legacy.SLIDING_TRIM_UNBOUNDED;
     const span = legacy.slidingTailSpan(window, @intCast(q_len), width);
     const kv_len: c_int = if (span > 0) @min(total_kv, @as(c_int, @intCast(span))) else total_kv;
     return .{ .span = span, .kv_len = kv_len, .band_in_kernel = band };

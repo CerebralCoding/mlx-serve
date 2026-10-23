@@ -61,7 +61,6 @@ pub const Geometry = geometry.Geometry;
 pub const SpeedConfig = geometry.SpeedConfig;
 pub const resolveSpeed = geometry.resolveSpeed;
 pub const envStr = geometry.envStr;
-pub const adalnPrecomputeOn = geometry.adalnPrecomputeOn;
 
 const Weights = model_mod.Weights;
 const S = mlx.mlx_stream;
@@ -1261,8 +1260,8 @@ const AdalnW = struct {
     modalities: u32,
     /// Turbo delta on the projection. Input is silu(t_emb) — exactly what the
     /// reference node re-injects on pruned bases — so hooking `forward` covers
-    /// BOTH the precompute path and the per-step MINIMAX_H3_ADALN_PRECOMPUTE=0
-    /// path, and the pair is freed with the weight after precompute.
+    /// BOTH the precompute path and the per-step path a resident DiT takes,
+    /// and the pair is freed with the weight after precompute.
     lora: lora_mod.Slot = .{},
 
     fn load(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, cfg: Config, expand: u32, modalities: u32, dt: mlx.mlx_dtype, s: S) !AdalnW {
@@ -1451,114 +1450,6 @@ pub fn applyRopePub(x: mlx.mlx_array, rope: RopeTables, half: c_int, head_dim: c
     return g.escape(try rope_blk.ropeSplitHalf(&g, x, rope.cos, rope.sin, half));
 }
 
-/// Sparse attention core over post-rope [1, H, S, hd] q/k/v.
-///
-/// Strip queries (rows [0, video_start)) keep FULL attention; video queries
-/// attend to their pattern's video keys PLUS the strip, via batched SDPA with
-/// the frame/stripe axis folded into the batch dim. Key order inside a
-/// subset differs from the dense order — softmax is permutation-invariant
-/// over keys up to fp rounding, which is inside the sanctioned class.
-fn sparseAttend(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, spec: SparseSpec, scale: f32, s: S) !mlx.mlx_array {
-    const shp = mlx.getShape(q);
-    const nh = shp[1];
-    const seq = shp[2];
-    const hd = shp[3];
-    const g: c_int = @intCast(spec.video_start);
-    const t: c_int = @intCast(spec.t);
-    const f: c_int = @intCast(spec.f);
-    std.debug.assert(g + t * f == seq);
-    const null_a = mlx.mlx_array{ .ctx = null };
-
-    // Strip queries: full attention over every key.
-    const qg = try sliceAxis4(q, 2, 0, g, s);
-    defer _ = mlx.mlx_array_free(qg);
-    var og = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(og);
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&og, qg, k, v, scale, "", null_a, null_a, false, s));
-
-    // Video split + strip keys.
-    const qv = try sliceAxis4(q, 2, g, seq, s);
-    defer _ = mlx.mlx_array_free(qv);
-    const kv = try sliceAxis4(k, 2, g, seq, s);
-    defer _ = mlx.mlx_array_free(kv);
-    const vv = try sliceAxis4(v, 2, g, seq, s);
-    defer _ = mlx.mlx_array_free(vv);
-    const kg = try sliceAxis4(k, 2, 0, g, s);
-    defer _ = mlx.mlx_array_free(kg);
-    const vg = try sliceAxis4(v, 2, 0, g, s);
-    defer _ = mlx.mlx_array_free(vg);
-
-    // [1,H,Sv,hd] -> [B, H, L, hd] with the pattern axis folded into batch:
-    // spatial B=t, L=f (perm keeps (t) outermost); temporal B=f, L=t.
-    const fold = struct {
-        fn go(x: mlx.mlx_array, nh_: c_int, t_: c_int, f_: c_int, hd_: c_int, mode: SparseMode, s_: S) !mlx.mlx_array {
-            const r = try reshape(x, &[_]c_int{ nh_, t_, f_, hd_ }, s_);
-            defer _ = mlx.mlx_array_free(r);
-            const perm: [4]c_int = if (mode == .spatial) .{ 1, 0, 2, 3 } else .{ 2, 0, 1, 3 };
-            const tr = try transpose(r, &perm, s_);
-            defer _ = mlx.mlx_array_free(tr);
-            return contig(tr, s_);
-        }
-    }.go;
-    const qb = try fold(qv, nh, t, f, hd, spec.mode, s);
-    defer _ = mlx.mlx_array_free(qb);
-    const kb = try fold(kv, nh, t, f, hd, spec.mode, s);
-    defer _ = mlx.mlx_array_free(kb);
-    const vb = try fold(vv, nh, t, f, hd, spec.mode, s);
-    defer _ = mlx.mlx_array_free(vb);
-
-    // Strip keys broadcast to every batch element and appended to the keys.
-    const nb: c_int = if (spec.mode == .spatial) t else f;
-    const bshape = [_]c_int{ nb, nh, g, hd };
-    const bc = struct {
-        fn go(x: mlx.mlx_array, shape: []const c_int, s_: S) !mlx.mlx_array {
-            const r3 = try reshape(x, &[_]c_int{ 1, shape[1], shape[2], shape[3] }, s_);
-            defer _ = mlx.mlx_array_free(r3);
-            var b = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(b);
-            try mlx.check(mlx.mlx_broadcast_to(&b, r3, shape.ptr, shape.len, s_));
-            return contig(b, s_);
-        }
-    }.go;
-    const kgb = try bc(kg, &bshape, s);
-    defer _ = mlx.mlx_array_free(kgb);
-    const vgb = try bc(vg, &bshape, s);
-    defer _ = mlx.mlx_array_free(vgb);
-    const kcat = try concat(&[_]mlx.mlx_array{ kb, kgb }, 2, s);
-    defer _ = mlx.mlx_array_free(kcat);
-    const vcat = try concat(&[_]mlx.mlx_array{ vb, vgb }, 2, s);
-    defer _ = mlx.mlx_array_free(vcat);
-
-    var ob = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(ob);
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&ob, qb, kcat, vcat, scale, "", null_a, null_a, false, s));
-
-    // Unfold back to [1, H, Sv, hd] in packed row order.
-    const inv_perm: [4]c_int = if (spec.mode == .spatial) .{ 1, 0, 2, 3 } else .{ 1, 2, 0, 3 };
-    const otr = try transpose(ob, &inv_perm, s);
-    defer _ = mlx.mlx_array_free(otr);
-    const oc = try contig(otr, s);
-    defer _ = mlx.mlx_array_free(oc);
-    const ov = try reshape(oc, &[_]c_int{ 1, nh, t * f, hd }, s);
-    defer _ = mlx.mlx_array_free(ov);
-
-    return concat(&[_]mlx.mlx_array{ og, ov }, 2, s);
-}
-
-/// sliceAxis for the fixed 4-D case (keeps the [1,H,·,hd] shape).
-fn sliceAxis4(x: mlx.mlx_array, axis: usize, lo: c_int, hi: c_int, s: S) !mlx.mlx_array {
-    const shp = mlx.getShape(x);
-    var start = [_]c_int{ 0, 0, 0, 0 };
-    var stop = [_]c_int{ shp[0], shp[1], shp[2], shp[3] };
-    const step = [_]c_int{ 1, 1, 1, 1 };
-    start[axis] = lo;
-    stop[axis] = hi;
-    var o = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(o);
-    try mlx.check(mlx.mlx_slice(&o, x, &start, 4, &stop, 4, &step, 4, s));
-    return contig(o, s);
-}
-
 /// qkv [S, 3*inner] -> q, k, v as [1, H, S, hd] for SDPA: per-head RMSNorm over head_dim, THEN rope
 /// (the reference's fused-kernel order; swapping it changes the result), then the head-major
 /// transpose. One fused dispatch when `h3_glue` serves the shape; this chain is its oracle.
@@ -1624,10 +1515,8 @@ fn qkvHeadMajor(aw: *const AttnW, qkv: mlx.mlx_array, cfg: Config, rope: ?RopeTa
 ///
 /// `ablate` is `.none` everywhere except the profile ladder; `.sdpa` passes v
 /// through in place of the attention output (same shape, projections intact).
-/// A non-dense attention arm: a training-free pattern, or a VSA student's trained one.
-const AttnSparsity = union(enum) { pattern: SparseSpec, vsa: *const h3_vsa.Plan };
-
-fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTables, ablate: Ablate, sparse: ?AttnSparsity, split: ?*const h3_split.RowSplit, s: S) !mlx.mlx_array {
+/// `vsa`: a VSA student's trained sparse attention, else dense.
+fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTables, ablate: Ablate, vsa: ?*const h3_vsa.Plan, split: ?*const h3_split.RowSplit, s: S) !mlx.mlx_array {
     const n: c_int = @intCast(mlx.getShape(x)[0]);
     const h: c_int = @intCast(cfg.num_attention_heads);
     const hd: c_int = @intCast(cfg.attention_head_dim);
@@ -1648,16 +1537,15 @@ fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTable
     }
 
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.attention_head_dim)));
-    const dense = sparse == null or (sparse.? == .pattern and sparse.?.pattern.mode == .dense);
-    if (w8a8.enabled and dense and ablate == .none) if (try int8_attn.attention(t[0], t[1], t[2], scale, s)) |flat8| {
+    if (w8a8.enabled and vsa == null and ablate == .none) if (try int8_attn.attention(t[0], t[1], t[2], scale, s)) |flat8| {
         defer _ = mlx.mlx_array_free(flat8);
         const out8 = try aw.out.forward(flat8, null, s);
         return lora_mod.addSlot(out8, flat8, &aw.out_lora, s);
     };
-    if (sparse != null and sparse.? == .vsa) {
+    if (vsa) |plan| {
         const g = try (aw.gate orelse return error.VsaGateMissing).forward(x, null, s);
         defer _ = mlx.mlx_array_free(g);
-        const flat_v = try h3_vsa.attend(sparse.?.vsa, t[0], t[1], t[2], g, scale, s);
+        const flat_v = try h3_vsa.attend(plan, t[0], t[1], t[2], g, scale, s);
         defer _ = mlx.mlx_array_free(flat_v);
         const out_v = try aw.out.forward(flat_v, null, s);
         return lora_mod.addSlot(out_v, flat_v, &aw.out_lora, s);
@@ -1673,8 +1561,6 @@ fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTable
         const third = try scalarLike(1.0 / 3.0, sum3, s);
         defer _ = mlx.mlx_array_free(third);
         attn = try mulA(sum3, third, s);
-    } else if (!dense) {
-        attn = try sparseAttend(t[0], t[1], t[2], sparse.?.pattern, scale, s);
     } else {
         var o = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(o);
@@ -2069,61 +1955,6 @@ pub fn collectScheduleTs(
     return out;
 }
 
-// ── Sparse video attention (training-free, SVG/STA-style) ───────────────────
-//
-// Full attention over the packed sequence is O(S²) and ~70% of a 768p step.
-// Video-DiT attention mass concentrates in two patterns: SPATIAL (within the
-// same frame) and TEMPORAL (same patch across frames). Each video query can
-// attend to its pattern's keys plus the GLOBAL STRIP (text/cond/audio rows —
-// they are few and carry the conditioning), while strip queries keep full
-// attention. Softmax is over the reduced key set — a training-free
-// approximation whose quality is judged by clips, not asserted.
-//
-// Layer policy (`MINIMAX_H3_SPARSE_ATTN`): "mix" alternates spatial/temporal
-// per layer with dense anchor layers at the ends and middle; "spatial"/
-// "temporal" force one pattern everywhere (debug); unset/"" = off.
-
-pub const SparseMode = enum { dense, spatial, temporal };
-
-pub const SparsePolicy = enum { off, mix, spatial, temporal };
-
-pub fn sparsePolicyFrom(raw: ?[]const u8) SparsePolicy {
-    const v = raw orelse return .off;
-    if (v.len == 0 or std.mem.eql(u8, v, "0")) return .off;
-    if (std.mem.eql(u8, v, "mix")) return .mix;
-    if (std.mem.eql(u8, v, "spatial")) return .spatial;
-    if (std.mem.eql(u8, v, "temporal")) return .temporal;
-    return .off;
-}
-
-/// Which pattern a layer runs under a policy. Anchor layers (first two,
-/// middle two, last two) stay DENSE under "mix" — they re-integrate global
-/// structure the sparse layers cannot see.
-pub fn sparseModeForLayer(layer: usize, n_layers: usize, policy: SparsePolicy) SparseMode {
-    switch (policy) {
-        .off => return .dense,
-        .spatial => return .spatial,
-        .temporal => return .temporal,
-        .mix => {
-            const mid = n_layers / 2;
-            if (layer < 2 or layer + 2 >= n_layers or layer == mid or layer == mid + 1) return .dense;
-            return if (layer % 2 == 0) .spatial else .temporal;
-        },
-    }
-}
-
-/// Geometry the sparse core needs: the video segment is the LAST `t*f` rows
-/// of the packed sequence; everything before it is the global strip.
-pub const SparseSpec = struct {
-    mode: SparseMode,
-    /// Latent frames.
-    t: u32,
-    /// Rows per frame (h/2 * w/2).
-    f: u32,
-    /// First video row == strip length.
-    video_start: u32,
-};
-
 // ── Attention broadcast (PAB-style) ─────────────────────────────────────────
 //
 // Video-DiT attention outputs drift SLOWLY across adjacent mid-schedule steps
@@ -2225,9 +2056,6 @@ pub const Model = struct {
     /// Profiling arm for the NEXT forward; `.none` in production (the field is
     /// only ever set by the profile ladder in `generate`).
     ablate: Ablate,
-    /// Sparse-attention layer policy (`MINIMAX_H3_SPARSE_ATTN`); `.off` until
-    /// `generate` opts in.
-    sparse_policy: SparsePolicy,
     /// Set for a job whose steps are split with a cluster worker (`h3_split`).
     split: ?*const h3_split.RowSplit = null,
     /// A VSA student's tile plan for the current run (`h3_vsa`).
@@ -2272,7 +2100,6 @@ pub const Model = struct {
         m.cfg = cfg;
         m.dtype = dt;
         m.ablate = .none;
-        m.sparse_policy = .off;
         m.ane_eng = null;
         m.ane_rest = &.{};
 
@@ -2374,7 +2201,7 @@ pub const Model = struct {
         const a = self.allocator;
         const hidden = self.cfg.hidden_size;
         const ffn = self.cfg.ffn_hidden_size;
-        const eng = try ane.AnePrefill.init(a, io, self.blocks.len, hidden, k, rows, rows, 0, 0, .channel, units);
+        const eng = try ane.AnePrefill.init(a, io, self.blocks.len, hidden, k, rows, rows, 0, 0, units);
         errdefer eng.deinit();
         const rests = try a.alloc(AneRestMlp, n);
         errdefer a.free(rests);
@@ -2574,7 +2401,7 @@ pub const Model = struct {
     ///
     /// NOT bit-identical to per-step modulation: the AdaLN GEMM runs at
     /// M = n_ts instead of M = 2-3, and kernel selection differs by shape
-    /// (the sanctioned qmv-vs-qmm class). Kill: MINIMAX_H3_ADALN_PRECOMPUTE=0.
+    /// (the sanctioned qmv-vs-qmm class).
     pub fn precomputeAdaln(self: *Model, ts: []const f64, s: S) !void {
         std.debug.assert(self.adaln_tables == null);
         const a = self.allocator;
@@ -2913,15 +2740,7 @@ pub const Model = struct {
                 defer _ = mlx.mlx_array_free(m1);
                 // A row split's attention reads gathered keys, so it stays dense.
                 const lay = if (self.split == null) layout else null;
-                const smode = if (self.ablate == .none and lay != null) sparseModeForLayer(bi, self.blocks.len, self.sparse_policy) else SparseMode.dense;
-                const spec: ?AttnSparsity = if (self.vsa != null and lay != null and self.ablate == .none)
-                    .{ .vsa = self.vsa.? }
-                else if (smode == .dense) null else .{ .pattern = .{
-                    .mode = smode,
-                    .t = lay.?.latent_t,
-                    .f = (lay.?.latent_h / PATCH_H) * (lay.?.latent_w / PATCH_W),
-                    .video_start = lay.?.videoSegment().start,
-                } };
+                const spec: ?*const h3_vsa.Plan = if (self.vsa != null and lay != null and self.ablate == .none) self.vsa.? else null;
                 at = if (self.ablate == .attn) try contig(m1, s) else try attnForward(&b.attn, m1, cfg, rope, self.ablate, spec, self.split, s);
                 if (cacheable) {
                     if (attn_bcast.?.blocks[bi].ctx != null) _ = mlx.mlx_array_free(attn_bcast.?.blocks[bi]);
@@ -3006,14 +2825,6 @@ const TeLayerW = struct {
         inline for (.{ self.input_ln, self.post_ln, self.q_norm, self.k_norm }) |f| _ = mlx.mlx_array_free(f);
     }
 };
-
-/// `MINIMAX_H3_VISION_DEEPSTACK=0` drops the DeepStack taps — a BISECT arm for
-/// the vision conditioning, since the taps are the one part of it that writes
-/// into the LM's own residual stream rather than into its input.
-fn deepstackEnabled() bool {
-    const raw = std.c.getenv("MINIMAX_H3_VISION_DEEPSTACK") orelse return true;
-    return !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-}
 
 /// One 2-frame patch block entering the ViT. A still image repeats itself to
 /// fill the temporal patch and a video pair carries two distinct frames — the
@@ -3226,14 +3037,7 @@ pub const TextEncoder = struct {
         errdefer _ = mlx.mlx_array_free(x);
 
         // 3. Positions: plain 1-D when text-only, interleaved mRoPE otherwise.
-        //    `MINIMAX_H3_VISION_MROPE=0` forces plain 1-D even with vision
-        //    blocks present — a BISECT arm, since the mRoPE switch changes the
-        //    conditioning of the WHOLE prompt, not just the vision rows.
-        const mrope_on = blk2: {
-            const raw = std.c.getenv("MINIMAX_H3_VISION_MROPE") orelse break :blk2 true;
-            break :blk2 !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-        };
-        const positions = if (mrope_on) try h3v.mropePositions(allocator, seq_u, spans.items) else null;
+        const positions = try h3v.mropePositions(allocator, seq_u, spans.items);
         defer if (positions) |p| allocator.free(p);
         var rope = try self.buildRopeFrom(seq, positions, s);
         defer rope.deinit();
@@ -3245,7 +3049,7 @@ pub const TextEncoder = struct {
             const nx = try self.layerForward(layer, x, mask, rope, seq, s);
             _ = mlx.mlx_array_free(x);
             x = nx;
-            if (li < 3 and spans.items.len > 0 and deepstackEnabled()) {
+            if (li < 3 and spans.items.len > 0) {
                 const pad = try self.deepstackPadded(allocator, seq_u, spans.items, ds_blocks.items, li, s);
                 defer _ = mlx.mlx_array_free(pad);
                 const summed = try addA(x, pad, s);
@@ -3607,13 +3411,6 @@ fn fuseRows(bank: mlx.mlx_array, wv: mlx.mlx_array, g: c_int, lo: c_int, n: c_in
 pub const Keyframe = struct {
     anchor: KeyframeAnchor,
     pixels: mlx.mlx_array,
-    /// The SAME image at the Qwen vision canvas (`h3v.fitCanvas` of the target),
-    /// `[1, 3, 1, qh, qw]` in [-1, 1], for the `<Picture i>` block spliced into
-    /// the conditioning. Optional only because the two canvases are identical
-    /// whenever the target is a /32 multiple above the 3136-pixel floor, which
-    /// every servable canvas is; below it they diverge and `pixels` cannot
-    /// stand in, so `generate` rejects rather than patchifying the wrong shape.
-    vision: ?mlx.mlx_array = null,
 };
 
 /// One decoded ref2va reference, paired with the resolution the CALLER made.
@@ -3661,7 +3458,7 @@ pub const GenRequest = struct {
     shift_audio: f64 = SIGMA_SHIFT_AUDIO,
     /// The recipe `resolveSpeed` picked from the request's `fast`, `turbo` and the env; the
     /// caller bills its attention cache before the run, so both read one answer.
-    speed: SpeedConfig = resolveSpeed(null, false, null, null),
+    speed: SpeedConfig = resolveSpeed(null, false),
     /// Turbo distillation LoRA (larryvrh/MiniMax-H3-Turbo-Lora): 4-8 step
     /// sampling instead of ~30. Requires `paths.turbo_lora`; forces the fast
     /// recipe OFF (its slow-drift premise is false at giant steps) and switches
@@ -3695,9 +3492,8 @@ pub const GenRequest = struct {
     /// latents as cond rows.
     ///
     /// The reference ALSO splices each into the Qwen encoding as a
-    /// `<Picture i>: <vision block>`. That path is built and parity-tested but
-    /// DEFAULT-OFF here: it measured worse on this checkpoint (see the A/B
-    /// table in `generate`). `MINIMAX_H3_VISION_BLOCKS=1` turns it on.
+    /// `<Picture i>: <vision block>`. We do not: it measured worse on this
+    /// checkpoint.
     keyframes: []const Keyframe = &.{},
     /// ref2va references in `resolveRefs` order, already decoded at the
     /// canvases it resolved. Unlike the fl2va keyframes these DO carry vision
@@ -4106,12 +3902,9 @@ fn generateOne(
 
     // H3's DiT runs EVERY forward at prefill width (~9K rows at 480p), where
     // the wide-M dequant+GEMM route measured −13%/step on the 8-bit pack
-    // (2/2 adjacent pairs, 2026-08-03). Default it ON for THIS backend only —
-    // MageFlow keeps its own default until it has its own A/B — and let the
-    // env always win (MLX_SERVE_MF_DQ_GEMM=0 kills, =N sets the floor).
+    // (2/2 adjacent pairs, 2026-08-03): on for THIS backend only.
     const dq_override_prev = mage_flow.mf_dq_gemm_override;
-    if (std.c.getenv("MLX_SERVE_MF_DQ_GEMM") == null)
-        mage_flow.mf_dq_gemm_override = @as(?usize, 2048);
+    mage_flow.mf_dq_gemm_override = @as(?usize, 2048);
     defer mage_flow.mf_dq_gemm_override = dq_override_prev;
 
     // ── 1. tokenize (raw ids, NO special tokens and no chat template) ──
@@ -4283,50 +4076,13 @@ fn generateOne(
             try items.append(a, .{ .text = buf });
         }
     }.f;
-    // Splicing keyframes into the Qwen encoding is the REFERENCE presentation
-    // (`<Picture i>: <vision block>`), and it is DEFAULT-OFF for fl2va because
-    // it measured WORSE on this checkpoint. Same-seed 256px A/B, frame-0
-    // left/right means against a 20/235 split keyframe:
-    //
-    //   vision blocks OFF                 16.1 / 231.4   delta +215  <- shipped
-    //   ON, plain 1-D rope                43.0 / 119.5   delta  +77
-    //   ON, mRoPE, no DeepStack           48.5 / 105.2   delta  +57
-    //   ON, mRoPE + DeepStack             150.6 / 53.0   delta  -98 (INVERTED)
-    //
-    // The port is not the problem: the tower reproduces the reference in both
-    // direction AND magnitude (cos 0.999987, rms_ratio 1.0000 — see the vision
-    // tower parity test, which asserts the ratio precisely because a cosine
-    // cannot see a 40x scale error). What the numbers say is that on the FL2VA
-    // checkpoint the VAE cond rows already carry the keyframe, and adding a
-    // second conditioning path 41x the norm of a token embedding competes with
-    // them rather than reinforcing them.
-    //
-    // ref2va is different by construction — a reference image has no keyframe
-    // cond row to compete with, and the prompt ADDRESSES it as `<Picture i>`,
-    // so the tower is the whole mechanism there and stays on.
-    // `MINIMAX_H3_VISION_BLOCKS=1` re-enables it for fl2va A/Bs.
-    const vision_blocks_on = blk: {
-        const raw = std.c.getenv("MINIMAX_H3_VISION_BLOCKS") orelse break :blk false;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
+    // Keyframes are NOT spliced into the Qwen encoding as `<Picture i>` vision blocks (the reference presentation):
+    // on the FL2VA checkpoint the VAE cond rows already carry the keyframe, and a second conditioning path 41x the
+    // norm of a token embedding competes with them (same-seed A/B: the keyframe's left/right delta +215 off, +57
+    // to -98 on). The tower reproduces the reference (cos 0.999987, rms_ratio 1.0000); ref2va keeps it below.
     var label_buf: [32]u8 = undefined;
-    for (req.keyframes, 0..) |kf, ki| {
-        if (!vision_blocks_on) break;
-        const src = kf.vision orelse kf.pixels;
-        const shp = mlx.getShape(src);
-        const ph: u32 = @intCast(shp[shp.len - 2]);
-        const pw: u32 = @intCast(shp[shp.len - 1]);
-        const fit = h3v.fitCanvas(ph, pw);
-        // A canvas the vision policy would resize cannot be patchified as-is:
-        // the grid and the pixels would describe different images.
-        if (fit.h != ph or fit.w != pw) return error.KeyframeCanvasNotVisionReady;
-        try addLabel(allocator, &tok, &present, &label_ids, try h3v.labelFor(&label_buf, .image, @intCast(ki + 1)));
-        try pairs.append(allocator, try stillAsFramePair(src, s));
-        try present.append(allocator, .{ .vision = .{ .frames = pairs.items[pairs.items.len - 1], .grid = h3v.gridFor(ph, pw) } });
-    }
 
-    // ref2va references, in `resolveRefs` order. Unlike the keyframes above the
-    // vision blocks are unconditional here — see the comment on that switch.
+    // ref2va references, in `resolveRefs` order.
     for (req.refs) |m| {
         switch (m.ref.kind) {
             .audio => try addLabel(allocator, &tok, &present, &label_ids, try h3v.labelFor(&label_buf, .audio, m.ref.ordinal)),
@@ -4506,7 +4262,7 @@ fn generateOne(
         // AdaLN precompute must run while the trunk is still lazy — see
         // precomputeAdaln. Default ON: it is what keeps the DiT residency at
         // ~22 GB instead of ~35 on the 8-bit pack.
-        if (adalnPrecomputeOn() and req.resident == null) {
+        if (req.resident == null) {
             const ts = try collectScheduleTs(allocator, &layout, sigmas[0..req.steps], req.shift_video, req.shift_audio, .{ .max_t = max_t });
             defer allocator.free(ts);
             try model.precomputeAdaln(ts, s);
@@ -4531,13 +4287,8 @@ fn generateOne(
         try mlx.check(mlx.mlx_array_eval(refined));
         log.info("[minimax-h3] dit loaded in {d} ms, text refined in {d} ms\n", .{ load_ms, phase_timer.lapMs() });
 
-        // ── sparse attention (OPT-IN) ──
-        model.sparse_policy = sparsePolicyFrom(envStr("MINIMAX_H3_SPARSE_ATTN"));
-        if (model.sparse_policy != .off)
-            log.info("[minimax-h3] sparse attention policy: {s}\n", .{@tagName(model.sparse_policy)});
-
-        // ── attention broadcast (PAB-style, OPT-IN) ──
-        // MINIMAX_H3_ATTN_BCAST=<k> recomputes every block's attention branch
+        // ── attention broadcast (PAB-style, the fast recipe) ──
+        // `speed.bcast_k` = k recomputes every block's attention branch
         // only on every k-th mid-schedule step and reuses the cached output
         // between — the branch is ~70% of a 768p step. Cache cost: one
         // [S, hidden] bf16 per block (~20 GB at 768p, ~1.4 GB at 256px).
@@ -4578,8 +4329,7 @@ fn generateOne(
         // under the threshold, reuse the previous velocity instead of running
         // the 50-block DiT. The audio velocity is re-scaled to the current
         // sigma's slope so the reuse stays on the audio stream's true ODE.
-        // MINIMAX_H3_STEP_CACHE=<thresh> opts in (0.08 is a sane start);
-        // never skips the first two or the last step, caps consecutive skips.
+        // `speed.step_cache` is the threshold; never skips the first two or the last step, caps consecutive skips.
         const sc_thresh: f64 = speed.step_cache;
         var sc_v_video: ?mlx.mlx_array = null;
         defer if (sc_v_video) |x| {
@@ -5002,7 +4752,7 @@ fn generateChain(
                 nk += 1;
             }
         } else {
-            kfs[nk] = .{ .anchor = .first, .pixels = prev_last.?, .vision = null };
+            kfs[nk] = .{ .anchor = .first, .pixels = prev_last.? };
             nk += 1;
         }
         if (w == n - 1) {
@@ -5284,7 +5034,7 @@ test "minimax h3 live: generates a clip" {
 }
 
 
-fn envU32(name: [:0]const u8, dflt: u32) u32 {
+fn envU32(comptime name: []const u8, dflt: u32) u32 {
     const v = envStr(name) orelse return dflt;
     return std.fmt.parseInt(u32, v, 10) catch dflt;
 }
@@ -6943,77 +6693,6 @@ test "minimax h3 live: sdpa shape ubench" {
     }
 }
 
-test "minimax h3 live: sparse attention ubench" {
-    // Prices `sparseAttend` against dense SDPA at the two REAL packed shapes.
-    //
-    // The geometry says sparse should be 17-32x cheaper in key-visits (5.6%/3.1%
-    // of dense at 1344x768/124f; 5.7%/5.0% at 960x544/362f), so any wall-clock
-    // short of that is OVERHEAD — and the overhead is visible in the shapes:
-    // the strip keys are BROADCAST into every batch element, so temporal mode
-    // (nb = f, the rows per frame) materializes an 8.8-10.8 GB kcat where
-    // spatial (nb = t, the latent frames) needs 0.8-2.9 GB. Fewer FLOPs, far
-    // more bytes. This test is what turns that reading into a number.
-    if (std.c.getenv("MINIMAX_H3_SPARSE_UBENCH") == null) return error.SkipZigTest;
-    log.enableStderr();
-    const s = mlx.gpuStream();
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const nh: c_int = 56;
-    const hd: c_int = 128;
-    const scale: f32 = 1.0 / @sqrt(@as(f32, 128.0));
-    const null_a = mlx.mlx_array{ .ctx = null };
-
-    const cfgs = [_]struct { n: []const u8, t: u32, f: u32, g: u32 }{
-        .{ .n = "1344x768/124f", .t = 37, .f = 1008, .g = 573 },
-        .{ .n = " 960x544/362f", .t = 107, .f = 510, .g = 1365 },
-    };
-    for (cfgs) |c| {
-        const seq: c_int = @intCast(c.g + c.t * c.f);
-        const q = try randomNormal(&[_]c_int{ 1, nh, seq, hd }, 1, mlx.mlx_dtype.bfloat16, s);
-        defer _ = mlx.mlx_array_free(q);
-        const k = try randomNormal(&[_]c_int{ 1, nh, seq, hd }, 2, mlx.mlx_dtype.bfloat16, s);
-        defer _ = mlx.mlx_array_free(k);
-        const v = try randomNormal(&[_]c_int{ 1, nh, seq, hd }, 3, mlx.mlx_dtype.bfloat16, s);
-        defer _ = mlx.mlx_array_free(v);
-        try mlx.check(mlx.mlx_array_eval(q));
-        try mlx.check(mlx.mlx_array_eval(k));
-        try mlx.check(mlx.mlx_array_eval(v));
-
-        var dense_ms: u64 = std.math.maxInt(u64);
-        for (0..3) |_| {
-            var cl = LapClock.init(io);
-            var o = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, q, k, v, scale, "", null_a, null_a, false, s));
-            try mlx.check(mlx.mlx_array_eval(o));
-            _ = mlx.mlx_array_free(o);
-            dense_ms = @min(dense_ms, cl.lapMs());
-        }
-        const fseq: f64 = @floatFromInt(seq);
-        log.info("[sparse-ubench] {s} S={d}  dense {d} ms\n", .{ c.n, seq, dense_ms });
-
-        inline for (.{ SparseMode.spatial, SparseMode.temporal }) |mode| {
-            const spec = SparseSpec{ .mode = mode, .t = c.t, .f = c.f, .video_start = c.g };
-            var best: u64 = std.math.maxInt(u64);
-            for (0..3) |_| {
-                var cl = LapClock.init(io);
-                const o = try sparseAttend(q, k, v, spec, scale, s);
-                try mlx.check(mlx.mlx_array_eval(o));
-                _ = mlx.mlx_array_free(o);
-                best = @min(best, cl.lapMs());
-            }
-            // Key-visits per head, the honest FLOP proxy for a reduced softmax.
-            const gs: f64 = @floatFromInt(c.g);
-            const tf: f64 = @floatFromInt(c.t * c.f);
-            const grp: f64 = if (mode == .spatial) @floatFromInt(c.f) else @floatFromInt(c.t);
-            const visits = gs * fseq + tf * (grp + gs);
-            const flop_pct = 100.0 * visits / (fseq * fseq);
-            const speedup = @as(f64, @floatFromInt(dense_ms)) / @as(f64, @floatFromInt(@max(best, 1)));
-            log.info("[sparse-ubench] {s} {s:<8} {d} ms  speedup {d:.2}x  (FLOPs {d:.2}% of dense => ceiling {d:.1}x)\n", .{ c.n, @tagName(mode), best, speedup, flop_pct, 100.0 / flop_pct });
-            _ = mlx.mlx_clear_cache();
-        }
-        _ = mlx.mlx_clear_cache();
-    }
-}
-
 test "minimax h3 live: projection gemm ubench" {
     // The companion to the SDPA ubench. That one measured attention at 11.2-13.0
     // TFLOPS (78-90% of this box's GEMM rate), which leaves the LINEARS as the
@@ -7177,114 +6856,25 @@ test "minimax h3: the step-cache warmup scales the same way" {
     }
 }
 
-test "minimax h3: sparse-attention layer policy" {
-    try testing.expectEqual(SparsePolicy.off, sparsePolicyFrom(null));
-    try testing.expectEqual(SparsePolicy.off, sparsePolicyFrom(""));
-    try testing.expectEqual(SparsePolicy.off, sparsePolicyFrom("junk"));
-    try testing.expectEqual(SparsePolicy.mix, sparsePolicyFrom("mix"));
-    // mix on 50 layers: dense anchors at 0,1,25,26,48,49; even=spatial,
-    // odd=temporal elsewhere.
-    for ([_]usize{ 0, 1, 25, 26, 48, 49 }) |l|
-        try testing.expectEqual(SparseMode.dense, sparseModeForLayer(l, 50, .mix));
-    try testing.expectEqual(SparseMode.spatial, sparseModeForLayer(2, 50, .mix));
-    try testing.expectEqual(SparseMode.temporal, sparseModeForLayer(3, 50, .mix));
-    try testing.expectEqual(SparseMode.spatial, sparseModeForLayer(24, 50, .mix));
-    try testing.expectEqual(SparseMode.temporal, sparseModeForLayer(47, 50, .mix));
-    // forced policies ignore anchors
-    try testing.expectEqual(SparseMode.spatial, sparseModeForLayer(0, 50, .spatial));
-    try testing.expectEqual(SparseMode.temporal, sparseModeForLayer(49, 50, .temporal));
-    // off = dense everywhere
-    for (0..50) |l| try testing.expectEqual(SparseMode.dense, sparseModeForLayer(l, 50, .off));
-}
-
-test "minimax h3: sparseAttend attends exactly its subset (uniform-score closed form)" {
-    // q = k = 0 makes every score 0, so softmax is UNIFORM over each row's
-    // key subset and the output row is the MEAN of v over that subset — a
-    // wrong subset is a wrong mean, exactly. T=2 frames, F=3 rows/frame,
-    // G=2 strip rows, H=1, hd=4, v[row] = row (all dims), f32 so the small
-    // integer means are exact.
-    const s = mlx.gpuStream();
-    const seq: usize = 8;
-    var zeros_buf: [seq * 4]f32 = @splat(0);
-    var v_buf: [seq * 4]f32 = undefined;
-    for (0..seq) |r| for (0..4) |d| {
-        v_buf[r * 4 + d] = @floatFromInt(r);
-    };
-    const shape = [_]c_int{ 1, 1, seq, 4 };
-    const q = mlx.mlx_array_new_data(&zeros_buf, &shape, 4, mlx.mlx_dtype.float32);
-    defer _ = mlx.mlx_array_free(q);
-    const k = mlx.mlx_array_new_data(&zeros_buf, &shape, 4, mlx.mlx_dtype.float32);
-    defer _ = mlx.mlx_array_free(k);
-    const v = mlx.mlx_array_new_data(&v_buf, &shape, 4, mlx.mlx_dtype.float32);
-    defer _ = mlx.mlx_array_free(v);
-
-    const cases = [_]struct { mode: SparseMode, want: [8]f32 }{
-        // spatial: strip rows (0,1) see all 8 -> 3.5; frame0 rows {2,3,4}+strip
-        // -> 2.0; frame1 rows {5,6,7}+strip -> 3.8.
-        .{ .mode = .spatial, .want = .{ 3.5, 3.5, 2.0, 2.0, 2.0, 3.8, 3.8, 3.8 } },
-        // temporal: stripe fi = {2+fi, 5+fi}+strip -> (2+5+0+1)/4=2.0,
-        // (3+6+0+1)/4=2.5, (4+7+0+1)/4=3.0 for both frames.
-        .{ .mode = .temporal, .want = .{ 3.5, 3.5, 2.0, 2.5, 3.0, 2.0, 2.5, 3.0 } },
-    };
-    for (cases) |case| {
-        const spec = SparseSpec{ .mode = case.mode, .t = 2, .f = 3, .video_start = 2 };
-        const out = try sparseAttend(q, k, v, spec, 0.5, s);
-        defer _ = mlx.mlx_array_free(out);
-        const of = try astype(out, mlx.mlx_dtype.float32, s);
-        defer _ = mlx.mlx_array_free(of);
-        try mlx.check(mlx.mlx_array_eval(of));
-        const data = mlx.mlx_array_data_float32(of).?;
-        // Tolerance 2e-3: the closed form is exact only in exact arithmetic —
-        // sdpa's softmax/accumulation runs at fp16 scale on some machines'
-        // dispatch arms (M5 measured 1.9995117 vs 2, PR #223). A wrong SUBSET
-        // is off by >= 0.1 here, so the widened bar still convicts it.
-        for (0..seq) |r| {
-            try testing.expectApproxEqAbs(case.want[r], data[r * 4], 2e-3);
-            try testing.expectApproxEqAbs(case.want[r], data[r * 4 + 3], 2e-3);
-        }
-    }
-}
-
-test "minimax h3: resolveSpeed — fast default on, request off-switch, env strongest" {
-    // Defaults: fast recipe on.
-    var c = resolveSpeed(null, false, null, null);
+test "minimax h3: resolveSpeed — fast default on, the request turns it off" {
+    var c = resolveSpeed(null, false);
     try testing.expectEqual(@as(f64, 0.05), c.step_cache);
     try testing.expectEqual(@as(u32, 2), c.bcast_k);
-    c = resolveSpeed(true, false, null, null);
+    c = resolveSpeed(true, false);
     try testing.expectEqual(@as(u32, 2), c.bcast_k);
-    // "fast": false is the user's off switch.
-    c = resolveSpeed(false, false, null, null);
+    c = resolveSpeed(false, false);
     try testing.expectEqual(@as(f64, 0), c.step_cache);
     try testing.expectEqual(@as(u32, 0), c.bcast_k);
-    // Env set means SET — including "0" (the A/B harness arms), and it beats
-    // the request field in BOTH directions.
-    c = resolveSpeed(null, false, "0", "0");
-    try testing.expectEqual(@as(f64, 0), c.step_cache);
-    try testing.expectEqual(@as(u32, 0), c.bcast_k);
-    c = resolveSpeed(false, false, "0.1", "3");
-    try testing.expectEqual(@as(f64, 0.1), c.step_cache);
-    try testing.expectEqual(@as(u32, 3), c.bcast_k);
-    // Junk env falls back to the resolved default, never to a surprise arm.
-    c = resolveSpeed(null, false, "junk", "junk");
-    try testing.expectEqual(@as(f64, 0.05), c.step_cache);
-    try testing.expectEqual(@as(u32, 2), c.bcast_k);
 }
 
-test "minimax h3: resolveSpeed — turbo forces the recipe off, env still strongest" {
-    // Turbo and the fast recipe are alternatives: turbo wins even over an
-    // explicit "fast": true (the recipe's slow-drift premise is false at
-    // giant steps, and serving it anyway would be the silent-flag-eater
-    // class — logged as engaged while doing nothing useful).
-    var c = resolveSpeed(null, true, null, null);
+test "minimax h3: resolveSpeed — turbo forces the recipe off" {
+    // Turbo and the fast recipe are alternatives: turbo wins even over an explicit "fast": true.
+    var c = resolveSpeed(null, true);
     try testing.expectEqual(@as(f64, 0), c.step_cache);
     try testing.expectEqual(@as(u32, 0), c.bcast_k);
-    c = resolveSpeed(true, true, null, null);
+    c = resolveSpeed(true, true);
     try testing.expectEqual(@as(f64, 0), c.step_cache);
     try testing.expectEqual(@as(u32, 0), c.bcast_k);
-    // Env stays the strongest knob in both directions, turbo included.
-    c = resolveSpeed(null, true, "0.05", "2");
-    try testing.expectEqual(@as(f64, 0.05), c.step_cache);
-    try testing.expectEqual(@as(u32, 2), c.bcast_k);
 }
 
 test "minimax h3: a Turbo file is held to the modules it ships, not to one exporter's list" {

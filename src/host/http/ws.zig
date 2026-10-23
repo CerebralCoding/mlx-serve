@@ -105,10 +105,6 @@ pub fn WsConn(comptime ConnT: type) type {
             try writeFrame(self.conn, .text, true, payload);
         }
 
-        pub fn writePing(self: *Self, payload: []const u8) !void {
-            try writeFrame(self.conn, .ping, true, payload);
-        }
-
         pub fn writePong(self: *Self, payload: []const u8) !void {
             try writeFrame(self.conn, .pong, true, payload);
         }

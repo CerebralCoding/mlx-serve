@@ -40,35 +40,19 @@ pub const DsparkArm = enum { off, greedy, stochastic };
 /// filtered target probs) unless `stoch_enabled` is false — the
 /// MLX_SERVE_DSV4_DSPARK_STOCH=0 kill switch, which restores greedy-only
 /// gating.
-pub fn dsparkArmFor(sampling: SamplingParams, logprobs_n: u32, stoch_enabled: bool) DsparkArm {
+pub fn dsparkArmFor(sampling: SamplingParams, logprobs_n: u32) DsparkArm {
     const clean = !sampling.penalized() and
         sampling.constraint == null and
         logprobs_n == 0;
     if (!clean) return .off;
     const greedy = sampling.temperature < 0.01 or sampling.top_k == 1;
     if (greedy) return .greedy;
-    return if (stoch_enabled) .stochastic else .off;
+    return .stochastic;
 }
 
 /// Shared by dispatch and /props; this disables drafting, not resident stages.
 pub fn dsparkEnabled() bool {
     return if (env.get(.MLX_SERVE_DSV4_DSPARK)) |v| v[0] != '0' else true;
-}
-
-/// Stochastic-DSpark kill switch — MLX_SERVE_DSV4_DSPARK_STOCH=0
-/// restores the greedy-only chokepoint gate for A/Bs.
-var dspark_stoch_cache: ?bool = null;
-pub fn dsparkStochEnabledFromEnv(raw: ?[]const u8) bool {
-    const value = raw orelse return true;
-    return value.len == 0 or value[0] != '0';
-}
-
-pub fn dsparkStochEnabled() bool {
-    if (dspark_stoch_cache) |v| return v;
-    const raw: ?[]const u8 = env.span(.MLX_SERVE_DSV4_DSPARK_STOCH);
-    const on = dsparkStochEnabledFromEnv(raw);
-    dspark_stoch_cache = on;
-    return on;
 }
 
 /// `MLX_SERVE_DSV4_DSPARK_POLICY=0` verifies the whole block every stage round (the A/B arm of `dspark_pol`).
@@ -533,30 +517,21 @@ test "nextDraw: each stochastic DSpark round takes a fresh draw of the request's
     try testing.expectEqual(@as(u64, 7), gen.sampling.draw);
 }
 
-test "dsparkArmFor: greedy and stochastic arms gate on clean sampling, kill switch restores greedy-only" {
-    // Greedy clean → the argmax-equality arm (temp 0 or top_k 1), with or
-    // without the stochastic arm enabled.
-    try testing.expectEqual(Generator.DsparkArm.greedy, Generator.dsparkArmFor(.{ .temperature = 0.0 }, 0, true));
-    try testing.expectEqual(Generator.DsparkArm.greedy, Generator.dsparkArmFor(.{ .temperature = 0.6, .top_k = 1 }, 0, true));
-    try testing.expectEqual(Generator.DsparkArm.greedy, Generator.dsparkArmFor(.{ .temperature = 0.0 }, 0, false));
+test "dsparkArmFor: greedy and stochastic arms gate on clean sampling" {
+    // Greedy clean → the argmax-equality arm (temp 0 or top_k 1).
+    try testing.expectEqual(Generator.DsparkArm.greedy, Generator.dsparkArmFor(.{ .temperature = 0.0 }, 0));
+    try testing.expectEqual(Generator.DsparkArm.greedy, Generator.dsparkArmFor(.{ .temperature = 0.6, .top_k = 1 }, 0));
     // Sampled clean → stochastic (the checkpoint-default temp 0.6 agent
     // shape: pi and friends omit temperature, generation_config fills 0.6).
-    try testing.expectEqual(Generator.DsparkArm.stochastic, Generator.dsparkArmFor(.{ .temperature = 0.6, .top_p = 0.95 }, 0, true));
-    try testing.expectEqual(Generator.DsparkArm.stochastic, Generator.dsparkArmFor(.{ .temperature = 1.0, .top_k = 40 }, 0, true));
-    // Kill switch: sampled requests fall back to serial-only.
-    try testing.expectEqual(Generator.DsparkArm.off, Generator.dsparkArmFor(.{ .temperature = 0.6, .top_p = 0.95 }, 0, false));
+    try testing.expectEqual(Generator.DsparkArm.stochastic, Generator.dsparkArmFor(.{ .temperature = 0.6, .top_p = 0.95 }, 0));
+    try testing.expectEqual(Generator.DsparkArm.stochastic, Generator.dsparkArmFor(.{ .temperature = 1.0, .top_k = 40 }, 0));
     // Penalties / grammar / logprobs stay serial on BOTH arms — the
     // pre-stochastic contract, unchanged.
-    try testing.expectEqual(Generator.DsparkArm.off, Generator.dsparkArmFor(.{ .temperature = 0.0, .repeat_penalty = 1.1 }, 0, true));
-    try testing.expectEqual(Generator.DsparkArm.off, Generator.dsparkArmFor(.{ .temperature = 0.6, .presence_penalty = 0.5 }, 0, true));
-    try testing.expectEqual(Generator.DsparkArm.off, Generator.dsparkArmFor(.{ .temperature = 0.6 }, 5, true));
+    try testing.expectEqual(Generator.DsparkArm.off, Generator.dsparkArmFor(.{ .temperature = 0.0, .repeat_penalty = 1.1 }, 0));
+    try testing.expectEqual(Generator.DsparkArm.off, Generator.dsparkArmFor(.{ .temperature = 0.6, .presence_penalty = 0.5 }, 0));
+    try testing.expectEqual(Generator.DsparkArm.off, Generator.dsparkArmFor(.{ .temperature = 0.6 }, 5));
     var c: Constraint = undefined;
-    try testing.expectEqual(Generator.DsparkArm.off, Generator.dsparkArmFor(.{ .temperature = 0.6, .constraint = &c }, 0, true));
-    // Env parser: unset/empty/anything-but-0 → on, "0" → off.
-    try testing.expect(Generator.dsparkStochEnabledFromEnv(null));
-    try testing.expect(Generator.dsparkStochEnabledFromEnv(""));
-    try testing.expect(Generator.dsparkStochEnabledFromEnv("1"));
-    try testing.expect(!Generator.dsparkStochEnabledFromEnv("0"));
+    try testing.expectEqual(Generator.DsparkArm.off, Generator.dsparkArmFor(.{ .temperature = 0.6, .constraint = &c }, 0));
 }
 
 test "dsv4: stochastic dspark engages at sampled temperature and keeps the exit invariant (DSV4_MINI)" {
@@ -583,13 +558,6 @@ test "dsv4: stochastic dspark engages at sampled temperature and keeps the exit 
     // The agent-default request shape, seeded so the run is reproducible.
     const sampled = SamplingParams{ .temperature = 0.6, .top_p = 0.95, .seed = 0xD54A };
 
-    // The kill-switch cache is process-global (set at first chokepoint use),
-    // so honor whatever env this test binary was LAUNCHED with and assert
-    // the matching behavior — that makes the `MLX_SERVE_DSV4_DSPARK_STOCH=0`
-    // run a real test of the fallback, not a skip.
-    const stoch_raw: ?[]const u8 = env.span(.MLX_SERVE_DSV4_DSPARK_STOCH);
-    const stoch_on = Generator.dsparkStochEnabledFromEnv(stoch_raw);
-
     var xfm_cfg: model_mod.ModelConfig = undefined;
     var xfm = try servedMini(io, allocator, path, &xfm_cfg);
     defer xfm_cfg.deinit(allocator);
@@ -601,17 +569,6 @@ test "dsv4: stochastic dspark engages at sampled temperature and keeps the exit 
         .lookup_prompt = &prompt,
     });
     defer gen.deinit(allocator);
-
-    if (!stoch_on) {
-        // Kill-switch arm: the chokepoint declines the sampled request and
-        // nextDspark serves the defensive serial step.
-        try testing.expect(!gen.dspark_enabled);
-        const r = (try gen.nextDspark(allocator)) orelse return error.TestExpectedResult;
-        defer allocator.free(r.tokens);
-        try testing.expectEqual(@as(usize, 1), r.tokens.len);
-        try testing.expectEqual(@as(u64, 0), gen.dspark_attempted);
-        return;
-    }
 
     try testing.expect(gen.dspark_enabled);
     try testing.expect(gen.dspark_stochastic);
@@ -647,14 +604,12 @@ test "dsv4: stochastic dspark engages at sampled temperature and keeps the exit 
     // b==0 arm: an over-threshold confidence gate submits NOTHING — the round
     // verifies t1 alone, commits it, and samples the next trunk token from
     // row 0's filtered probs (the stochastic sibling of the greedy
-    // confidence-gate test). The env is read at initModel, so this needs a
-    // fresh Transformer; unset after — test order must not inherit the gate.
-    env.set(.MLX_SERVE_DSV4_DSPARK_CONF, "999999");
-    defer env.unset(.MLX_SERVE_DSV4_DSPARK_CONF);
+    // confidence-gate test), on a fresh Transformer whose gate is set past any confidence.
     var xfm2_cfg: model_mod.ModelConfig = undefined;
     var xfm2 = try servedMini(io, allocator, path, &xfm2_cfg);
     defer xfm2_cfg.deinit(allocator);
     defer xfm2.deinit();
+    intree.dsv4(&xfm2).?.ds_conf_thr = 999999;
     var gen2 = try Generator.initWithOptions(io, allocator, &xfm2, &tok_dummy, &prompt, 64, sampled, &.{}, .{
         .pld_enabled = true,
         .mtp_enabled = true,

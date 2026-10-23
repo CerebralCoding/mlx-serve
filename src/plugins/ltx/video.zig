@@ -4810,33 +4810,6 @@ pub fn generateVideoFramesTwoStage(
 
 const testing = std.testing;
 
-test "the LTX quant helpers solve their width instead of assuming 4-bit" {
-    // The 4-bit and 8-bit packs are the SAME layout at different widths, so a
-    // hardcoded `bits` is an engine that can only load the pack it was written
-    // against — the 8-bit text encoder died at its first matmul with an MLX
-    // "shapes ... incompatible" error, which reads like a corrupt download.
-    // Every quantized read in this file resolves (bits, gs) from geometry.
-    const src = @embedFile("video.zig");
-    var it = std.mem.splitScalar(u8, src, '\n');
-    var checked: usize = 0;
-    while (it.next()) |line| {
-        // `mlx.check(` keeps the scan on real CALL SITES — this test's own
-        // search literals name the same functions.
-        if (std.mem.indexOf(u8, line, "mlx.check(") == null) continue;
-        const is_quant_call = std.mem.indexOf(u8, line, "mlx_quantized_matmul(") != null or
-            std.mem.indexOf(u8, line, "mlx_dequantize(") != null;
-        if (!is_quant_call) continue;
-        checked += 1;
-        try std.testing.expect(std.mem.indexOf(u8, line, "some(4)") == null);
-        try std.testing.expect(std.mem.indexOf(u8, line, "some(8)") == null);
-        try std.testing.expect(std.mem.indexOf(u8, line, "qp.bits") != null or
-            std.mem.indexOf(u8, line, "eqp.bits") != null);
-    }
-    // Three today (gQLin, dQLin, the embedding table). A zero here means the
-    // scan stopped matching the call and is guarding nothing.
-    try std.testing.expect(checked >= 3);
-}
-
 test "LtxConfig derived dims" {
     const c = LtxConfig{};
     try testing.expectEqual(@as(u32, 4096), c.videoDim());

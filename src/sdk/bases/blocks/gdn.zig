@@ -356,7 +356,7 @@ fn mix(w: *const Gdn.Weights, c: *Ctx, x: Array) !Array {
         try state.put(c, .ssm, outs[2]);
     } else {
         const tb: ?u32 = if (kernels.gdnBlockedEnabled() and kernels.gdnBlockedEligible(seq, geo.dk, geo.dv, geo.hk, geo.hv))
-            kernels.gdnBlockTFor(kernels.gdnBlockT(), geo.dk, mlx.mlx_array_itemsize(q_scaled))
+            kernels.gdnBlockTFor(kernels.GDN_BLOCK_T, geo.dk, mlx.mlx_array_itemsize(q_scaled))
         else
             null;
         const route: kernels.GdnRoute = if (tb == null) .stock else if (kernels.gdnPipelinedEnabled(geo.arch)) .pipelined else .blocked;

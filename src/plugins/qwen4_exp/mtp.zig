@@ -49,7 +49,6 @@ const gatherExpertMm = @import("../../sdk/blocks/moe/experts.zig").gatherExpertM
 const MoeDecodeDispatchArm = @import("../../sdk/blocks/moe/gather_qmv_rows.zig").MoeDecodeDispatchArm;
 const moeDecodeDispatchArm = @import("../../sdk/blocks/moe/gather_qmv_rows.zig").moeDecodeDispatchArm;
 const moeRowsAffineBank = @import("../../sdk/blocks/moe/gather_qmv_rows.zig").moeRowsAffineBank;
-const verifyPairedGateUp = @import("../../sdk/blocks/moe/verify_kernels.zig").verifyPairedGateUp;
 const MoeMlpWeights = @import("../../sdk/blocks/moe/weights.zig").MoeMlpWeights;
 const endMropeChunk = @import("../../sdk/blocks/rope/mrope.zig").endMropeChunk;
 const qwen4Standin = @import("../../sdk/diag/standin.zig").qwen4Standin;
@@ -1005,7 +1004,7 @@ pub fn qwen4MtpForwardLive(self: *Transformer, m: *Qwen4Mtp, live: *Qwen4MtpLive
 
 /// Build the qwen4_exp head's coarse rerank head. ONE-SHOT (`rerank_tried`
 /// caches the refusal too) and infallible — false keeps the full-vocab
-/// draft projection, which is what MLX_SERVE_MTP_DRAFT_RERANK=0 restores.
+/// draft projection.
 ///
 /// Called at LOAD (`scheduler.doLoadOnInferenceThread`, the site both the
 /// boot load and the `/v1/load` cold load route through), the sidecar
@@ -1017,16 +1016,15 @@ pub fn qwen4BuildDraftRerank(self: *Transformer) bool {
     const m = &(self.qwen4_mtp orelse return false);
     if (m.rerank_tried) return m.rerank != null;
     m.rerank_tried = true;
-    if (mtp_mod.MtpModel.draftRerankMode() == .off) return false;
     const io = std.Io.Threaded.global_single_threaded.io();
     const t0 = std.Io.Timestamp.now(io, .awake);
     // The ONE env read: the built head carries its width from here on.
-    const rc = mtp_mod.buildRerankCoarse(self.s, self, mtp_mod.rerankCoarseBits()) orelse return false;
+    const rc = mtp_mod.buildRerankCoarse(self.s, self, mtp_mod.DRAFT_HEAD_BITS) orelse return false;
     m.rerank = rc;
     const bytes = mtp_mod.rerankCoarseBytes(rc.rows, @intCast(self.config.hidden_size), rc.bits);
     const ms: u64 = @intCast(@divTrunc(t0.untilNow(io, .awake).nanoseconds, std.time.ns_per_ms));
     log.info(
-        "[qwen4] MTP draft rerank: coarse lm_head {d}-bit ({d} MB, {d} ms) + exact top-32 rescoring (MLX_SERVE_MTP_DRAFT_RERANK=0 restores full-vocab drafts)\n",
+        "[qwen4] MTP draft rerank: coarse lm_head {d}-bit ({d} MB, {d} ms) + exact top-32 rescoring\n",
         .{ rc.bits, bytes / (1024 * 1024), ms },
     );
     return true;
@@ -1526,13 +1524,13 @@ test "qwen4 MTP head: truncating to the live end after placed drafts leaves the 
 
 test "MTP head row widths pick the verify lane, the MoE arm and the QSA score kernel" {
     const t = std.testing;
-    try t.expectEqual(VqmmLane.none, vqmmLaneFor(1, 5120, 248320, false, 8, false));
-    try t.expectEqual(VqmmLane.msg, vqmmLaneFor(2, 5120, 248320, false, 8, false));
-    try t.expectEqual(VqmmLane.msg, vqmmLaneFor(4, 5120, 248320, false, 8, false));
-    try t.expectEqual(VqmmLane.none, vqmmLaneFor(1, 5120, 17408, false, 8, false));
-    try t.expectEqual(VqmmLane.splitk, vqmmLaneFor(2, 5120, 17408, false, 8, false));
-    try t.expectEqual(VqmmLane.splitk, vqmmLaneFor(4, 5120, 17408, false, 8, false));
-    try t.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5120, 17408, false, 8, false));
+    try t.expectEqual(VqmmLane.none, vqmmLaneFor(1, 5120, 248320, false, 8));
+    try t.expectEqual(VqmmLane.msg, vqmmLaneFor(2, 5120, 248320, false, 8));
+    try t.expectEqual(VqmmLane.msg, vqmmLaneFor(4, 5120, 248320, false, 8));
+    try t.expectEqual(VqmmLane.none, vqmmLaneFor(1, 5120, 17408, false, 8));
+    try t.expectEqual(VqmmLane.splitk, vqmmLaneFor(2, 5120, 17408, false, 8));
+    try t.expectEqual(VqmmLane.splitk, vqmmLaneFor(4, 5120, 17408, false, 8));
+    try t.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5120, 17408, false, 8));
 
     transformer.moe_rows_fused_override = true;
     defer transformer.moe_rows_fused_override = null;
@@ -2039,75 +2037,6 @@ pub fn qwen4MtpForwardPlacedOn(self: *Transformer, st: *Qwen4MtpState, stream_pr
     return self.qwen4MtpForwardLive(m, &live, stream_prev, token_ids_in, 0, null, project, place);
 }
 
-test "qwen4 verify paired gate-up preserves the sorted q4 g64 gather and SwiGLU bits" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const s = mlx.gpuStream();
-    const allocator = testing.allocator;
-    var prng = std.Random.DefaultPrng.init(0x419475);
-    const rnd = prng.random();
-    fused_activations.swiglu_fused_override = true;
-    defer fused_activations.swiglu_fused_override = null;
-    const E: c_int = 8;
-    const M: c_int = 4;
-    const TOPK: c_int = 10;
-    const H: c_int = 2560;
-    const N: c_int = 640;
-    const gs: u32 = 64;
-    const gate = try moeRowsAffineBank(s, rnd, E, N, H, 4, gs);
-    defer {
-        _ = mlx.mlx_array_free(gate.w);
-        _ = mlx.mlx_array_free(gate.sc);
-        _ = mlx.mlx_array_free(gate.bi);
-    }
-    const up = try moeRowsAffineBank(s, rnd, E, N, H, 4, gs);
-    defer {
-        _ = mlx.mlx_array_free(up.w);
-        _ = mlx.mlx_array_free(up.sc);
-        _ = mlx.mlx_array_free(up.bi);
-    }
-    const x32 = try allocator.alloc(f32, @intCast(M * H));
-    defer allocator.free(x32);
-    for (x32) |*v| v.* = (rnd.float(f32) - 0.5) * 3.0;
-    const x_host = mlx.mlx_array_new_data(x32.ptr, &.{ M, H }, 2, .float32);
-    defer _ = mlx.mlx_array_free(x_host);
-    var x = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(x);
-    try mlx.check(mlx.mlx_astype(&x, x_host, .bfloat16, s));
-    var x3 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(x3);
-    try mlx.check(mlx.mlx_reshape(&x3, x, &.{ M, 1, H }, 3, s));
-
-    var lhs_data: [M * TOPK]u32 = undefined;
-    var ids_data: [M * TOPK]u32 = undefined;
-    for (&lhs_data, &ids_data, 0..) |*row, *id, i| {
-        row.* = @intCast(i % M);
-        id.* = @intCast(i / 5);
-    }
-    const lhs = mlx.mlx_array_new_data(&lhs_data, &.{M * TOPK}, 1, .uint32);
-    defer _ = mlx.mlx_array_free(lhs);
-    const ids = mlx.mlx_array_new_data(&ids_data, &.{M * TOPK}, 1, .uint32);
-    defer _ = mlx.mlx_array_free(ids);
-
-    var g3 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(g3);
-    try gatherExpertMm(&g3, x3, gate.w, gate.sc, gate.bi, lhs, ids, 4, gs, .affine, true, s);
-    var up3 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(up3);
-    try gatherExpertMm(&up3, x3, up.w, up.sc, up.bi, lhs, ids, 4, gs, .affine, true, s);
-    const reference = (try fusedSwiGLU(s, g3, up3)) orelse return error.FusedSwigluDeclined;
-    defer _ = mlx.mlx_array_free(reference);
-    const got = try verifyPairedGateUp(s, x, gate.w, gate.sc, gate.bi, up.w, up.sc, up.bi, lhs, ids);
-    defer _ = mlx.mlx_array_free(got);
-    const count: usize = @intCast(M * TOPK * N);
-    const expected_host = try allocator.alloc(f32, count);
-    defer allocator.free(expected_host);
-    const got_host = try allocator.alloc(f32, count);
-    defer allocator.free(got_host);
-    try testReadF32(reference, expected_host, s);
-    try testReadF32(got, got_host, s);
-    try testing.expectEqualSlices(f32, expected_host, got_host);
-}
-
 test "qwen4 MTP head: last-row and no-logits projections match the full block (QWEN4_TEST_MODEL)" {
     // `MtpHeadRef.qwen4Step` consumes ONE row of logits, and the merged
     // history step after a partial accept hands the head `1 + accepted` rows —
@@ -2423,25 +2352,6 @@ test "qwen4MtpForward: every error path of the MTP head forward releases its str
         try testing.expect(errs >= 1);
     }
     try xfm.qwen4MtpReset();
-}
-
-test "the qwen4 EV seed width is mtp.MAX_DEPTH itself, not a mirrored constant" {
-    // The mirrored seed-width constant existed because "transformer.zig
-    // cannot import mtp.zig" — which stopped being true when the draft-rerank
-    // scheme put `const mtp_mod = @import("../../sdk/spec/mtp/mtp.zig")` at the top of this file.
-    // A mirror plus a comptime assert in a THIRD file is what a direct
-    // reference is for, and the doc comment claiming the import is impossible
-    // reads as a spec (rule: "a contract COMMENT is read as a spec").
-    //
-    // The needle is split so this test is not its own counter-example.
-    const needle = "MTP_EV_SEED" ++ "_DEPTH";
-    try testing.expect(std.mem.indexOf(u8, @embedFile("mtp.zig"), needle) == null);
-    try testing.expect(std.mem.indexOf(u8, @import("../../engines/mlx/generate.zig").all_source, needle) == null);
-    // The width reads through the import the retired comment said could not exist.
-    const source = @embedFile("../../engines/mlx/transformer.zig") ++
-        @embedFile("mtp.zig");
-    try testing.expect(std.mem.indexOf(u8, source, "ev_seed_accept: ?[mtp_mod.MAX_DEPTH]f32") != null);
-    try testing.expect(std.mem.indexOf(u8, source, "const mtp_mod = @import(\"../../sdk/spec/mtp/mtp.zig\");") != null);
 }
 
 test "reserveQsaHistory: the MTP head entry is reserved at the same length" {

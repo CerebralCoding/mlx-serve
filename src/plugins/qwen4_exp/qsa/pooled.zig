@@ -117,18 +117,10 @@ pub fn markQsaPooledRopeStale(self: *Transformer) void {
 
 // ── Fused QSA pooled-key upkeep ──
 pub var qsa_idx_rope_fused_override: ?bool = null;
-var qsa_idx_rope_fused_env: ?bool = null;
 
-/// `MLX_SERVE_QSA_IDX_ROPE_FUSED=0` restores the composed pooled-key chain.
+/// The test seam's false runs the composed pooled-key chain.
 pub fn qsaIdxRopeFusedEnabled() bool {
-    if (qsa_idx_rope_fused_override) |v| return v;
-    if (qsa_idx_rope_fused_env) |v| return v;
-    const v = blk: {
-        const raw = std.c.getenv("MLX_SERVE_QSA_IDX_ROPE_FUSED") orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    qsa_idx_rope_fused_env = v;
-    return v;
+    return qsa_idx_rope_fused_override orelse true;
 }
 
 // Mirrors each rounding of the composed chain it replaces, so it is bit-identical:
@@ -257,7 +249,7 @@ pub fn qsaPoolNormRopeFused(
     try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
     if (!qsa_pool_rope_engaged) {
         qsa_pool_rope_engaged = true;
-        log.info("[qsa] fused pooled-key upkeep engaged (blocks={d} ratio={d} rope={d}) — MLX_SERVE_QSA_IDX_ROPE_FUSED=0 restores the composed chain\n", .{ ksh[1], ksh[2], rope_dims });
+        log.info("[qsa] fused pooled-key upkeep engaged (blocks={d} ratio={d} rope={d})\n", .{ ksh[1], ksh[2], rope_dims });
     }
     return out;
 }

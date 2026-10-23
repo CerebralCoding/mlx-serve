@@ -170,27 +170,20 @@ const Keyframes = struct {
     fn deinit(k: *Keyframes) void {
         for (k.buf[0..k.n]) |kf| {
             _ = mlx.mlx_array_free(kf.pixels);
-            if (kf.vision) |v| _ = mlx.mlx_array_free(v);
         }
     }
 };
 
-/// FL2VA keyframes: first = the geometry anchor (bf16), last = f32, both cover-cropped to the canvas; a second copy
-/// at the vision canvas when it differs. NOT graceful: the user asked for THIS frame.
+/// FL2VA keyframes: first = the geometry anchor (bf16), last = f32, both cover-cropped to the canvas. NOT graceful:
+/// the user asked for THIS frame.
 fn keyframes(b: *const job.Body, width: u32, height: u32, s: mlx.mlx_stream, out: *Keyframes) ?Verdict {
-    const vfit = h3.h3v.fitCanvas(height, width);
-    const vision_differs = vfit.h != height or vfit.w != width;
     inline for (.{ .{ "first_frame_image", h3.KeyframeAnchor.first, mlx.mlx_dtype.bfloat16 }, .{ "last_frame_image", h3.KeyframeAnchor.last, mlx.mlx_dtype.float32 } }) |k| {
         if (b.str(k[0])) |b64| if (b64.len > 0) {
             const bytes = job.imageUpload(gpa, b64) catch return bad("keyframe image is not valid base64");
             defer gpa.free(bytes);
             const undecodable = bad("keyframe image could not be decoded (PNG/JPEG expected)");
             const pixels = pm1Frame(bytes, height, width, k[2], s) orelse return undecodable;
-            const vision: ?A = if (!vision_differs) null else pm1Frame(bytes, vfit.h, vfit.w, k[2], s) orelse {
-                _ = mlx.mlx_array_free(pixels);
-                return undecodable;
-            };
-            out.buf[out.n] = .{ .anchor = k[1], .pixels = pixels, .vision = vision };
+            out.buf[out.n] = .{ .anchor = k[1], .pixels = pixels };
             out.n += 1;
         };
     }
@@ -413,14 +406,14 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     // here, before any stage loads, since a Metal OOM mid-step is uncatchable.
     const distilled = turbo or pdd_steps != null;
     const fast: ?bool = if (b.get("fast")) |v| (if (v == .bool) v.bool else null) else null;
-    const speed = h3.resolveSpeed(fast, distilled, h3.envStr("MINIMAX_H3_STEP_CACHE"), h3.envStr("MINIMAX_H3_ATTN_BCAST"));
+    const speed = h3.resolveSpeed(fast, distilled);
     const bcast_row: u64 = if (speed.bcast_k > 0) @as(u64, e.geometry.dit.num_layers) * e.geometry.dit.hidden_size * 2 else 0;
     const rows = config.requestRows(width, height, shape.frame_count, @intCast(kfs.n));
     const activations = config.activationBytes(rows, bcast_row);
     const mem = memNow(req);
     const plan = residentFor(e, dir, activations, mem);
     if (plan == null) {
-        const dit = config.ditResidentBytes(config.ditFileBytes(dir, &e.machine), h3.adalnPrecomputeOn()) + (if (turbo) dir.fileBytes("turbo_lora.safetensors") else 0);
+        const dit = config.ditResidentBytes(config.ditFileBytes(dir, &e.machine), true) + (if (turbo) dir.fileBytes("turbo_lora.safetensors") else 0);
         const bill = config.canvasBill(dit, activations, mem.host_avail, mem.gpu_limit, mem.gpu_active, mlx.cudaAvailable());
         if (dit > 0 and bill.avail > 0 and bill.need > bill.avail) {
             const gb = 1024.0 * 1024.0 * 1024.0;

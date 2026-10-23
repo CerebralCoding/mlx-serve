@@ -105,7 +105,7 @@ pub fn aneGateHeadroom(config: *const model_mod.ModelConfig, chunk: u32) u64 {
 ///   - scores: the composed-SDPA scratch [heads, chunk, seq] — materialized
 ///     only for head_dims no fused kernel covers (transformer.
 ///     prefillHeadDimFused: <= 128 via MLX, 256 via msv_attn_p256 — unfused
-///     only under the MLX_SERVE_FUSED_256=0 kill switch or an exotic dim).
+///     only for an exotic dim).
 ///     Bounded to ~one layer by the adaptive eval cadence
 ///     (transformer.prefillEvalCadence).
 ///   - dequant: dense-fp16 rebuild of the FULL quantized cache each layer
@@ -290,8 +290,8 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64,
     const envelope: u64 = @max(3 * mlp, mlp + fwd * stream_per_tok);
     // The dequant+GEMM prefill route (transformer.prefillDqGemm) materializes
     // a bf16 copy of the weight it is about to multiply plus its transpose,
-    // and only at forwards wide enough to take that route. Kill-switch A/B
-    // (MLX_SERVE_PREFILL_DQ_GEMM=0): +0.51 GB on the qwen3_5 27B at chunk
+    // and only at forwards wide enough to take that route. Measured
+    // against the stock route: +0.51 GB on the qwen3_5 27B at chunk
     // 2048, +0.17-0.21 on the lfm2 2.6B, ~0 at chunk 8192 where the envelope
     // already dominates.
     const dq_weights: u64 = if (fwd >= req.dq_min_rows) dequant_weights else 0;
@@ -401,13 +401,12 @@ pub fn mlxMemoryGuardApplies(engine_backed: bool) bool {
 /// entirely (see `mlxMemoryGuardApplies`) — this is the single chokepoint, so
 /// every current and future call site is covered without per-site gating.
 /// Per-token bytes of the arch's out-of-cache request state as billed: the QSA indexer history
-/// at the copies a live slot holds (one by default; two with `MLX_SERVE_QSA_HISTORY_SHARE=0`
-/// or `MLX_SERVE_KV_RESERVE=0`), plus the f32 block-score bank the two-copy slack used to
+/// at the copies a live slot holds (one; two without history sharing), plus the f32 block-score bank the two-copy slack used to
 /// hide. One helper because the auto-context sizer and the admission guard must agree.
 pub fn statePerTokenBilled(config: *const model_mod.ModelConfig) u64 {
     const one = config.qsaHistoryBytesPerToken();
     if (one == 0) return 0;
-    const copies: u64 = if (transformer_mod.qsaHistoryShareEnabled() and transformer_mod.KVCache.kvReservationEnabled()) 1 else 2;
+    const copies: u64 = if (transformer_mod.qsaHistoryShareEnabled()) 1 else 2;
     return one * copies + config.qsaScoreBankBytesPerToken();
 }
 

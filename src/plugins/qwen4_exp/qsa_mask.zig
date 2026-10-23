@@ -3,6 +3,7 @@
 //! launches per attention layer; the mask is just "this token's block is in the sorted selection, or
 //! the token is in the incomplete tail" (every key of a one-row step is causal-visible).
 const std = @import("std");
+const env = @import("../../env.zig");
 const kernelSource = @import("../../mlx/kernels.zig").source;
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../host/log.zig");
@@ -20,7 +21,7 @@ pub var override: ?bool = null;
 fn enabled() bool {
     if (override) |v| return v;
     if (env_enabled) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_QSA_MASK_KERNEL");
+    const raw = env.get(.MLX_SERVE_QSA_MASK_KERNEL);
     env_enabled = raw == null or raw.?[0] != '0';
     return env_enabled.?;
 }

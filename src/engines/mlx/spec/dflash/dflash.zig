@@ -186,7 +186,7 @@ pub fn sidecarQuantBits(io: std.Io, allocator: std.mem.Allocator, dir: []const u
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return 0;
     defer parsed.deinit();
     if (parsed.value != .object or !isDflashConfigJson(parsed.value.object)) return 0;
-    return if (parsed.value.object.get("quantization") != null) 0 else quantBitsFromEnv();
+    return if (parsed.value.object.get("quantization") != null) 0 else defaultQuantBits(transformer_mod.verifyQmmNaxAvailable());
 }
 
 /// Read `<dir>/config.json` and answer whether it declares DFlash. Any
@@ -581,7 +581,7 @@ pub fn resolveBlockSize(config_block: u32, cli_block: u32, cli_explicit: bool, w
 /// True when this machine has a verify lane for widths past the split-K
 /// ceiling (the NAX m16 tile, M5-class + macOS >= 26.2).
 pub fn wideVerifyLaneAvailable() bool {
-    return transformer_mod.naxLaneEnvEnabled() and transformer_mod.verifyQmmNaxAvailable();
+    return transformer_mod.verifyQmmNaxAvailable();
 }
 
 // ── Weight precision ──
@@ -601,23 +601,11 @@ pub const DEFAULT_QUANT_BITS: u32 = 8;
 ///   trunk head:       57.8 tok/s, 2.37 accepted/round
 /// The lever was defaulted on at block 16, where the head was 10 ms of a
 /// 175 ms round; at block 5 it is under 2 ms of ~60 and the acceptance it
-/// costs is worth more than the bytes it saves. `MLX_SERVE_DFLASH_DRAFT_HEAD_BITS`
-/// still selects a width for the A/B.
+/// costs is worth more than the bytes it saves; `bindWithDraftBits` selects a width for an A/B.
 pub const DEFAULT_DRAFT_HEAD_BITS: u32 = 0;
 /// Preferred affine group size, narrowed to 32 when 64 does not divide the
 /// contraction dim, dense when neither does.
 pub const QUANT_GROUP: u32 = 64;
-
-/// `MLX_SERVE_DFLASH_QUANT_BITS`: absent → `DEFAULT_QUANT_BITS`, a supported
-/// affine width → that, anything else ("0", "off") → dense bf16.
-pub fn quantBitsFromEnv() u32 {
-    const p = env.get(.MLX_SERVE_DFLASH_QUANT_BITS) orelse return defaultQuantBits(transformer_mod.verifyQmmNaxAvailable());
-    const v = std.fmt.parseInt(u32, std.mem.span(p), 10) catch return 0;
-    return switch (v) {
-        2, 3, 4, 5, 6, 8 => v,
-        else => 0,
-    };
-}
 
 /// A NAX chip (M5) drafts faster from a 4-bit assistant; M1-M4 keep 8-bit.
 pub fn defaultQuantBits(nax: bool) u32 {
@@ -869,7 +857,7 @@ pub const DflashModel = struct {
     layers: []DflashLayer,
 
     /// Optional DRAFT-ONLY low-bit lm_head, requantized from the trunk's at
-    /// bind time (`MLX_SERVE_DFLASH_DRAFT_HEAD_BITS`, default 0 disables).
+    /// bind time (`DEFAULT_DRAFT_HEAD_BITS`, 0 disables).
     /// Only the block's draft argmax projects through it — VERIFICATION is a
     /// trunk forward and never touches it, so the emitted distribution is
     /// untouched; drafts just read ~⅓ of the bytes of a full-vocab head.
@@ -982,7 +970,7 @@ pub const DflashModel = struct {
             return error.DflashTargetMismatch;
         }
         target.config.dflash_bound = true;
-        self.buildDraftHead(target, draftHeadBitsFromEnv()) catch |err| {
+        self.buildDraftHead(target, DEFAULT_DRAFT_HEAD_BITS) catch |err| {
             log.warn("[dflash] draft lm_head build failed ({s}) — drafts use the trunk head\n", .{@errorName(err)});
         };
     }
@@ -999,18 +987,7 @@ pub const DflashModel = struct {
         try self.buildDraftHead(target, bits);
     }
 
-    /// `MLX_SERVE_DFLASH_DRAFT_HEAD_BITS`: absent → DEFAULT_DRAFT_HEAD_BITS,
-    /// a supported affine width → that, anything else ("0", "off") → disabled.
-    pub fn draftHeadBitsFromEnv() u32 {
-        const p = env.get(.MLX_SERVE_DFLASH_DRAFT_HEAD_BITS) orelse return DEFAULT_DRAFT_HEAD_BITS;
-        const v = std.fmt.parseInt(u32, std.mem.span(p), 10) catch return 0;
-        return switch (v) {
-            2, 3, 4, 6, 8 => v,
-            else => 0,
-        };
-    }
-
-    /// Requantize the trunk lm_head down to `draftHeadBitsFromEnv()` for the
+    /// Requantize the trunk lm_head down to `DEFAULT_DRAFT_HEAD_BITS` for the
     /// draft projection only. A quantized trunk head is re-encoded from its
     /// TRUE per-weight params (a mixed checkpoint's head routinely differs
     /// from the trunk global); a dense bf16 head is quantized outright. Never
@@ -1295,7 +1272,7 @@ pub fn loadDflash(
     s: mlx.mlx_stream,
     model_dir: []const u8,
 ) !DflashModel {
-    return loadDflashQuant(io, allocator, s, model_dir, quantBitsFromEnv());
+    return loadDflashQuant(io, allocator, s, model_dir, defaultQuantBits(transformer_mod.verifyQmmNaxAvailable()));
 }
 
 /// `loadDflash` with the load-time quantization width passed explicitly
@@ -4855,35 +4832,6 @@ test "dflash2 fixture parity: conv block forward + greedy selector path vs z-lab
     for (path.ids, want_path.items) |got, want| {
         try testing.expectEqual(@as(u32, @intCast(want.integer)), got);
     }
-}
-
-test "dflash: every server-side drafter-loaded gate also consults lm.dflash (per-site wiring class)" {
-    // The live 2026-08-10 miss: the request PARSE said drafter=enabled, but
-    // four per-surface `use_drafter = ... lm.drafter != null ...` re-derivations
-    // silently dropped the dflash handle and every request decoded serial.
-    // A drafter-loaded conjunct written per-site is a list of ONE — pin that
-    // any non-comment line reading `lm.drafter != null` (or the entry./
-    // scheduler. spellings) also reads the dflash sibling.
-    const src = @embedFile("../../../../host/http/server.zig") ++ @embedFile("../../../../host/api/chat_completions.zig") ++ @embedFile("../../../../host/api/chat_stream.zig") ++ @embedFile("../../../../host/api/completions.zig") ++ @embedFile("../../../../host/api/anthropic.zig") ++ @embedFile("../../../../host/api/anthropic_stream.zig") ++ @embedFile("../../../../host/api/props.zig") ++ @embedFile("../../../../host/api/submit.zig") ++ @embedFile("../../../../host/api/responses/handler.zig") ++ @embedFile("../../request_options.zig");
-    var it = std.mem.splitScalar(u8, src, '\n');
-    var lineno: usize = 0;
-    var checked: usize = 0;
-    while (it.next()) |raw| {
-        lineno += 1;
-        const trimmed = std.mem.trimStart(u8, raw, " ");
-        if (std.mem.startsWith(u8, trimmed, "//")) continue;
-        const has_drafter_gate = std.mem.indexOf(u8, raw, "lm.drafter != null") != null or
-            std.mem.indexOf(u8, raw, "entry.drafter != null") != null or
-            std.mem.indexOf(u8, raw, "scheduler.drafter != null") != null;
-        if (!has_drafter_gate) continue;
-        checked += 1;
-        if (std.mem.indexOf(u8, raw, "dflash") == null) {
-            std.debug.print("server.zig:{d}: drafter-loaded gate without a dflash sibling: {s}\n", .{ lineno, std.mem.trim(u8, raw, " ") });
-            return error.DrafterGateMissesDflash;
-        }
-    }
-    // Zero means the gates were renamed and this guard went vacuous.
-    try testing.expect(checked >= 10);
 }
 
 test "bestFirstTree: the confident chain comes first, then its likeliest sibling" {

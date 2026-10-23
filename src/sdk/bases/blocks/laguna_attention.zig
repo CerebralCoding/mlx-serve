@@ -130,7 +130,7 @@ pub fn LagunaAttention(comptime opts: Options) type {
             const s = c.rows;
             const window = w.window;
             const total: c_int = @as(c_int, @intCast(c.offset())) + s;
-            const sv = sliding.view(window, geo.head_dim, w.ring > 0, total, s);
+            const sv = sliding.view(window, geo.head_dim, total, s);
             var view = try append(w, c, c.cache(), k, v, if (window > 0) sv.span else 0);
             defer kv.release(c, &view);
             const dv = kv.dense(view);
@@ -171,7 +171,7 @@ pub fn LagunaAttention(comptime opts: Options) type {
             for (c.caches, 0..) |h, i| {
                 const at: c_int = @intCast(i);
                 const offset: c_int = @intCast(o.len(h, c.layer));
-                const sv = sliding.view(w.window, geo.head_dim, w.ring > 0, offset + s, s);
+                const sv = sliding.view(w.window, geo.head_dim, offset + s, s);
                 var view = try append(w, c, h, try g.sliceAxis(k, 0, at, at + 1), try g.sliceAxis(v, 0, at, at + 1), if (w.window > 0) sv.span else 0);
                 defer kv.release(c, &view);
                 outs[i] = try core(w, c, try g.sliceAxis(q, 0, at, at + 1), kv.dense(view), offset, sv.kv_len);
@@ -220,7 +220,6 @@ pub fn LagunaAttention(comptime opts: Options) type {
             const g = &sc;
             const geo = &w.geo;
             const logits = try w.gate.forward(g, x);
-            if (try gates.fusedAttnGate(g.s, flat, logits, geo.heads, geo.head_dim)) |y| return parent.keep(try g.adopt(y));
             const sp = try g.call(mlx.mlx_logaddexp, .{ try g.scalar(0, .float32), try g.astype(logits, .float32) });
             const sh = ops.shape(flat);
             const gate4 = try g.reshape(try g.astype(sp, .bfloat16), &.{ sh[0], sh[1], geo.heads, 1 });

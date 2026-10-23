@@ -1,4 +1,5 @@
 const std = @import("std");
+const env = @import("../../env.zig");
 const V = std.json.Value;
 const a = std.testing.allocator;
 var max_reference_error: f64 = 0;
@@ -35,7 +36,7 @@ pub fn compare(expected: V, actual: V) !void {
 }
 
 pub fn oraclePath() []const u8 {
-    return if (std.c.getenv("CLEF_TEST_EXPECTED")) |path| std.mem.span(path) else "tests/fixtures/clef/expected.json";
+    return if (env.get(.CLEF_TEST_EXPECTED)) |path| std.mem.span(path) else "tests/fixtures/clef/expected.json";
 }
 
 fn compareWithin(expected: V, actual: V, tolerance: f64) !void {

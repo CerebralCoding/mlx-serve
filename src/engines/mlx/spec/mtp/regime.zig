@@ -84,22 +84,6 @@ pub fn mtpExtDryAllows(dry_streak: *u32, cooldown: *u32, threshold: u32) bool {
     return true;
 }
 
-/// Dry-spell gate kill switch — MLX_SERVE_MTP_EXT_DRY=0 restores
-/// unconditional extension consideration for same-boot A/Bs.
-var mtp_ext_dry_cache: ?bool = null;
-pub fn mtpExtDryEnabledFromEnv(raw: ?[]const u8) bool {
-    const value = raw orelse return true;
-    return value.len == 0 or value[0] != '0';
-}
-
-pub fn mtpExtDryEnabled() bool {
-    if (mtp_ext_dry_cache) |v| return v;
-    const raw: ?[]const u8 = env.span(.MLX_SERVE_MTP_EXT_DRY);
-    const on = mtpExtDryEnabledFromEnv(raw);
-    mtp_ext_dry_cache = on;
-    return on;
-}
-
 /// EMA weight for the live round/sync cost EMAs. Slower than the
 /// acceptance EMA (cost drifts with context/thermal, not content) and
 /// paired with the seed-on-first-sample rule so warmup fills them cleanly.
@@ -289,34 +273,6 @@ pub fn mtpRegimeForceAt(r: *MtpRegime, round_idx: u32) ?bool {
         return minority;
     }
     return majority;
-}
-
-/// Regime gate kill switch — MLX_SERVE_MTP_REGIME=0 leaves every
-/// two-chunk plan as the EV horizon wrote it (same-boot A/B control arm).
-var mtp_regime_cache: ?bool = null;
-pub fn mtpRegimeGateEnabled() bool {
-    if (mtp_regime_cache) |v| return v;
-    const raw: ?[]const u8 = env.span(.MLX_SERVE_MTP_REGIME);
-    const on = mtpLiveCostEnabledFromEnv(raw);
-    mtp_regime_cache = on;
-    return on;
-}
-
-/// Live-cost throttle kill switch — MLX_SERVE_MTP_LIVECOST=0 reverts the
-/// dry-exploration threshold to the fixed MTP_EXT_DRY_ROUNDS (the
-/// pre-live-cost cadence) for same-boot A/Bs.
-var mtp_livecost_cache: ?bool = null;
-pub fn mtpLiveCostEnabledFromEnv(raw: ?[]const u8) bool {
-    const value = raw orelse return true;
-    return value.len == 0 or value[0] != '0';
-}
-
-pub fn mtpLiveCostEnabled() bool {
-    if (mtp_livecost_cache) |v| return v;
-    const raw: ?[]const u8 = env.span(.MLX_SERVE_MTP_LIVECOST);
-    const on = mtpLiveCostEnabledFromEnv(raw);
-    mtp_livecost_cache = on;
-    return on;
 }
 
 /// Per-round draft plan. Fixed mode (and EV warmup): today's adaptive
@@ -547,8 +503,4 @@ test "mtpEmaMs: seeds on the first sample then folds nanoseconds into a ms EMA" 
     // A subsequent sample folds at MTP_EV_COST_BETA toward the new value.
     const folded = D.mtpEmaMs(45.0, 40_000_000); // 40 ms sample
     try testing.expectApproxEqAbs(45.0 + D.MTP_EV_COST_BETA * (40.0 - 45.0), folded, 1e-3);
-    // Env parse: default on, "0" off, "" on.
-    try testing.expect(D.mtpLiveCostEnabledFromEnv(null));
-    try testing.expect(!D.mtpLiveCostEnabledFromEnv("0"));
-    try testing.expect(D.mtpLiveCostEnabledFromEnv(""));
 }

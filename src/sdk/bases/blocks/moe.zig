@@ -17,7 +17,6 @@ const compiled = @import("compiled.zig");
 const QuantParams = @import("../../quant/params.zig").QuantParams;
 const quant_abi = @import("../../../abi/quant.zig");
 const model = @import("../../../engines/mlx/model.zig");
-const envFlagCached = @import("../../../engines/mlx/env_transformer.zig").envFlagCached;
 const routing = @import("../../blocks/moe/routing.zig");
 const router_kernel = @import("../../blocks/moe/router_kernel.zig");
 const moe_decode = @import("../../blocks/moe/decode.zig");
@@ -297,9 +296,7 @@ fn routedExperts(w: *const Moe.Weights, g: *Graph, x: Array, r: Routed, shared_d
         reduced = s.reduced;
     } else if (B * S == 1 and useGatherQmv(w) and w.gate.s.ctx != null and w.up.s.ctx != null and w.down.s.ctx != null and
         try gatherQmvDecode(w, g, &out, &reduced, x, r, D, K, B, S))
-    {} else if (B * S == 1 and batchedForced() and w.gate.s.ctx != null and w.up.s.ctx != null and w.down.s.ctx != null) {
-        out = try batchedTake(w, g, x, r, B, S, D, K);
-    } else {
+    {} else {
         const x5 = try g.reshape(x, &.{ B, S, 1, 1, D });
         const gate = try g.call(mlx.mlx_squeeze, .{try expertMm(g, x5, &w.gate, .{ .ctx = null }, r.inds, false)});
         const up = try g.call(mlx.mlx_squeeze, .{try expertMm(g, x5, &w.up, .{ .ctx = null }, r.inds, false)});
@@ -341,17 +338,7 @@ fn ungatedA4(w: *const Moe.Weights, group_size: u32) ?moe_affine4.Ungated {
     };
 }
 
-var batched_force_env: ?bool = null;
-
-/// `MLX_SERVE_MOE_BATCHED_DECODE=1` (an A/B lever no arch defaults to), beaten by `MLX_SERVE_MOE_GATHER_DECODE=1`.
-fn batchedForced() bool {
-    if (moe_decode.gatherDecodeForcedStock()) return false;
-    return envFlagCached(&batched_force_env, "MLX_SERVE_MOE_BATCHED_DECODE");
-}
-
 fn useGatherQmv(w: *const Moe.Weights) bool {
-    if (moe_decode.gatherDecodeForcedStock()) return false;
-    if (batchedForced()) return true;
     if (w.gate.qp.mode == .gguf) return false;
     if (w.clamp == null) return false;
     if (!gather_qmv.gatherQmvGateUpEnabled()) return false;
@@ -477,30 +464,6 @@ fn gatherQmvDecode(w: *const Moe.Weights, g: *Graph, out: *Array, reduced: *bool
         log.info("[moe] gather-qmv kernel engaged: E_topk={d} inter={d} hidden={d} bits={d} gs={d}\n", .{ K, inter, hidden, gq.bits, gq.group_size });
     }
     return true;
-}
-
-/// The env-forced decode arm (`MLX_SERVE_MOE_BATCHED_DECODE`): the top-k experts taken, one batched matmul each.
-fn batchedTake(w: *const Moe.Weights, parent: *Graph, x: Array, r: Routed, B: c_int, S: c_int, D: c_int, K: c_int) !Array {
-    var t = parent.scope();
-    defer t.deinit();
-    const g = &t;
-    const flat = try g.reshape(r.inds, &.{K});
-    const x_bc = try g.broadcast(try g.reshape(x, &.{ 1, 1, D }), &.{ K, 1, D });
-    const gate = try takeMm(g, x_bc, &w.gate, flat);
-    const up = try takeMm(g, x_bc, &w.up, flat);
-    const down = try takeMm(g, try geglu(w, g, gate, up), &w.down, flat);
-    const sh = ops.shape(down);
-    return parent.keep(try g.reshape(down, &.{ B, S, K, sh[sh.len - 1] }));
-}
-
-fn takeMm(parent: *Graph, x: Array, bank: *const Bank, flat: Array) !Array {
-    var t = parent.scope();
-    defer t.deinit();
-    const g = &t;
-    const wk = try g.take(bank.w, flat, 0);
-    const sk = try g.take(bank.s, flat, 0);
-    const bk: Array = if (bank.b.ctx != null) try g.take(bank.b, flat, 0) else .{ .ctx = null };
-    return parent.keep(try g.call(mlx.mlx_quantized_matmul, .{ x, wk, sk, bk, true, mlx.mlx_optional_int.some(@intCast(bank.qp.group_size)), mlx.mlx_optional_int.some(@intCast(bank.qp.bits)), bank.qp.mode.cstr() }));
 }
 
 /// `w`'s per-expert scale on `y`'s rows (by `sel`), as `scaleExperts`.
@@ -670,7 +633,7 @@ fn streamedRouted(w: *const Moe.Weights, st: *const Streamed, g: *Graph, x: Arra
             down_reduce.gatherQmvDownReduceRowsEligible(model.HiddenAct.silu, gq, uq, dq, D));
     if (one_bank_kernels) return error.StreamedArmUnsupported;
     if (B * S > 1 or B * S * K >= 64) return sortedSlots(w, g, x, r, &sl, B, S, D, K);
-    if ((useGatherQmv(w) and (gq.mode == .affine or gq.mode == .nvfp4)) or batchedForced()) return error.StreamedArmUnsupported;
+    if (useGatherQmv(w) and (gq.mode == .affine or gq.mode == .nvfp4)) return error.StreamedArmUnsupported;
     return unsortedSlots(w, g, x, &sl, B, S, D, K);
 }
 

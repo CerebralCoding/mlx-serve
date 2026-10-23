@@ -121,7 +121,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 - `test_multi_model_{basic,concurrent,lru,load_failure,eviction_with_active_request}.sh` multi-model routing and eviction
 
 **KV and prefix cache**
-- `test_kv_cache_poison.sh` pad-only gens · `test_kv_cache_sliding_window.sh` sliding reuse · `test_sliding_window_trim.sh` **E** block trim
+- `test_kv_cache_poison.sh` pad-only gens · `test_kv_cache_sliding_window.sh` sliding reuse
 - `test_kv_quant_equivalence.sh`, `test_kv_quant_per_request.sh`, `test_kv_quant_fused_equivalence.sh` quantized KV · `measure_fused_kv.sh`
 - `test_prefix_cache_{hot,mem,disk,disabled,workloads,budget_revisit}.sh` RAM + SSD tiers · `test_prefix_inherit_qsa.sh`
 - `test_cache_reuses_generated_tokens.sh`, `test_hybrid_reuse_equivalence.sh`, `test_mid_system_cache.sh` reuse across turns
@@ -152,10 +152,10 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 **Media generation**
 - `test_unified_gen.sh` load/gen/unload · `test_gen_chat_interleave.sh` chat during media · `test_gen_chat_mix.sh` release battery
 - `test_image_gen.sh` FLUX.2 · `test_image_cancel.sh` · `test_flux_lowmem.sh` · `test_krea_gen.sh` · `test_mageflow_edit.sh`
-- `test_qwen_image_gen.sh` · `test_qwen_image_lora.sh` (+ `qwen_image_lora_metrics.py`) · `test_qwen_image_edit_cache.py` · `test_moss_image_gen.sh`
+- `test_qwen_image_gen.sh` · `test_qwen_image_lora.sh` (+ `qwen_image_lora_metrics.py`) · `test_moss_image_gen.sh`
 - `test_multi_lora.sh` stacked LoRAs · `test_real_loras.sh` Hub LoRAs (+ `lora_noise.py`) · `test_media_gen_memory.sh` · `test_media_eviction_gate.sh` **H**
 - `test_video_gen.sh` LTX · `test_video_preview.sh` (part **H**) · `test_minimax_h3.sh`, `test_h3_resident.sh`, `test_fasth3_omni.sh` H3
-- `test_tts.sh`, `test_tts_quant.sh`, `test_tts_clone_cache.sh`, `test_tts_fastpath_equivalence.sh` Qwen3-TTS · `test_kokoro_tts.sh`
+- `test_tts.sh`, `test_tts_quant.sh`, `test_tts_clone_cache.sh` Qwen3-TTS · `test_kokoro_tts.sh`
 - `test_music_gen.sh` ACE-Step · `test_music3_gen.sh` · `test_yue2_gen.sh` · `test_sound_gen.sh` Stable Audio 3
 - `test_3d_gen.sh`, `test_3d_paint.sh` Hunyuan3D · `test_trellis2_3d.sh` · `test_pixal3d_3d.sh` · `film_skill.test.mjs` **H**
 
@@ -165,7 +165,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 
 **Benchmarks and diagnostics** (measurements, not pass/fail; method in the `/bench` skill)
 - `bench.sh` THE bench · `bench_versions.sh` (+ `bench_csv.py`, `plot_version_ab.py`) two builds · `bench_chart.py` PR charts
-- `bench_concurrency_ladder.sh`, `bench_batched_spec.sh`, `bench_batched_qsa_gather.sh`, `bench_laguna_xs.sh`
+- `bench_concurrency_ladder.sh`, `bench_batched_spec.sh`, `bench_laguna_xs.sh`
 - `fwd_ubench.sh` ms/forward · `greedy_ab.sh` output-preservation bar · `prefill_ab.sh` · `qwen4_ab.sh` · `qwen4_engagement.sh`
 - `MLX_SERVE_VQMM_FN_UBENCH=1 zig build test -Doptimize=ReleaseFast -Dtest-filter="Flash Next shapes µbench"` verify-lane prices
 

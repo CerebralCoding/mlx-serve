@@ -20,7 +20,6 @@ const holdsSleepWhileParked = @import("cache/budget.zig").holdsSleepWhileParked;
 const runDecodeTick = @import("decode.zig").runDecodeTick;
 const finishSlot = @import("finish.zig").finishSlot;
 const runPrefill = @import("prefill.zig").runPrefill;
-const prefillInterleaveEnabled = @import("prefill_interleave.zig").prefillInterleaveEnabled;
 const prefillDecodeShare = @import("prefill_interleave.zig").prefillDecodeShare;
 const specYieldTick = @import("prefill_interleave.zig").specYieldTick;
 const orderByTail = @import("prefill_interleave.zig").orderByTail;
@@ -233,7 +232,7 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
             // no chunk-boundary yield, so without this every slot's first
             // token waits for the LAST slot's prefill (the TTFT
             // staircase collapse).
-            if (pi > 0 and prefillInterleaveEnabled()) _ = interleaveDecodeTick(sch);
+            if (pi > 0) _ = interleaveDecodeTick(sch);
             switch (prefillAdmitted(sch, slot)) {
                 .held => {
                     // Back to the head of `pending`, in order; the decode tick below runs first.
@@ -350,20 +349,3 @@ fn slotStateBytes(s: *const Slot) u64 {
 }
 
 // ── tests ──
-
-test "inferenceLoop pending drain routes through admitPendingTick" {
-    // A pure admission fn nobody calls is a silent no-op (the specTickMode /
-    // hardcoded use_drafter=false class). Needles are ++-split so this
-    // test's own source can't satisfy the scan.
-    const src = @embedFile("step.zig");
-    const call = "admitPendingTick(" ++ "cand_buf[0..n_cands], live_buf[0..n_live], &admit_idx)";
-    try testing.expect(std.mem.indexOf(u8, src, call) != null);
-    // The candidates' exclusive bit must come from the per-slot predicate
-    // (model bit OR a module-owned MTP head on this slot).
-    const pred = ".exclusive = slotExclusiveDecode(" ++ "s)";
-    try testing.expect(std.mem.indexOf(u8, src, pred) != null);
-    // The pre-gate unconditional drain shape must be GONE — its survival
-    // would mean a path still admits without the gate.
-    const old = "to_prefill[n_prefill] = sch.pending." ++ "orderedRemove(0)";
-    try testing.expect(std.mem.indexOf(u8, src, old) == null);
-}

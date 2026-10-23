@@ -49,7 +49,7 @@ RULES = [
     ("history-comment", "a comment carrying \"PR #\", an ISO date, a P1 move marker or \"this/it/we/code used to\""),
     ("source-scan-test", "a test that @embedFile's a .zig file, directly or through a const"),
     ("graph-scope", "a fn taking *Graph and returning an Array without a scope()"),
-    ("pin-unmatched", "a scripts/lint_pins.txt line no file matches"),
+    ("pin-unmatched", "a scripts/lint_pins.txt line no file matches (a `!` line: one some file holds)"),
     ("file-over-cap", f"a file over {SOFT_CAP} production lines"),
 ]
 RULE_IDS = [r for r, _ in RULES]
@@ -414,11 +414,18 @@ def read_pins(text):
 
 
 def check_pins(pins, files):
-    """(pin line, message) for each pin whose glob matches no file holding its needle; files: path → text."""
+    """(pin line, message) for each pin whose glob matches no file holding its needle, or, for a `!needle`, some file
+    that holds it; files: path → text."""
     for n, pat, needle, rule in pins:
+        forbid = needle.startswith("!")
+        needle = needle[1:] if forbid else needle
         if not pat or not needle:
             yield n, f"malformed pin (want glob<TAB>needle<TAB>rule): {pat!r}"
-        elif not any(fnmatch.fnmatch(p, pat) and needle in t for p, t in files.items()):
+            continue
+        hits = [p for p, t in files.items() if fnmatch.fnmatch(p, pat) and needle in t]
+        if forbid and hits:
+            yield n, f"{hits[0]}: {needle!r} is forbidden ({rule or 'no rule'})"
+        elif not forbid and not hits:
             yield n, f"{pat}: {needle!r} not found ({rule or 'no rule'})"
 
 

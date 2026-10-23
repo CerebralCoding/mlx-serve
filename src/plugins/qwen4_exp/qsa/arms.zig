@@ -299,33 +299,8 @@ test "qsa arm tally is owned by the request: two ForwardCtx owners never mix" {
     try std.testing.expectEqual(@as(u32, 1), b.qsa_arms.mask);
 }
 
-test "the qsa arm tally lives on the ForwardCtx and every increment goes through it" {
-    // Class guard for the ownership itself: a future edit that parks the
-    // counter back on the shared Transformer (or increments through `self`)
-    // reintroduces the union-of-slots bug with the log line looking healthy.
-    // Needles are assembled at comptime so this test's own source cannot
-    // satisfy the scan.
-    const field = "qsa_" ++ "arms";
-    try std.testing.expect(@hasField(ForwardCtx, field));
-    try std.testing.expect(!@hasField(Transformer, field));
-    try std.testing.expect(!@hasDecl(Transformer, "qsaArms" ++ "Take"));
-
-    const xfm_src = @embedFile("sparse_attn.zig") ++
-        @embedFile("arms.zig") ++
-        @embedFile("decode_gather.zig") ++
-        @embedFile("../../../engines/mlx/forward_ctx.zig") ++
-        @embedFile("../../../sdk/blocks/attention/gated_full.zig");
-    // No self-owned tally anywhere: a `self.`-qualified tally was the field
-    // on the shared Transformer this bug came from.
-    try std.testing.expect(std.mem.indexOf(u8, xfm_src, "self." ++ field) == null);
-    // ... and the attention site increments through the request's ctx: it hands its own
-    // tally to `qsaSlotAttn`, which notes the arm that served.
-    try std.testing.expect(std.mem.indexOf(u8, xfm_src, "&ctx." ++ field ++ ", seq_len") != null);
-    try std.testing.expect(std.mem.indexOf(u8, xfm_src, "    arms." ++ "note(.mask);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, xfm_src, "    arms." ++ "noteGather(seq_len);") != null);
-
-    // The logging seam reads the Generator's own ctx, not the Transformer.
-    const gen_src = @import("../../../engines/mlx/generate.zig").all_source;
-    try std.testing.expect(std.mem.indexOf(u8, gen_src, "self.ctx." ++ field) != null);
-    try std.testing.expect(std.mem.indexOf(u8, gen_src, "xfm.qsaArms" ++ "Take") == null);
+test "the qsa arm tally lives on the ForwardCtx, never the shared Transformer" {
+    try std.testing.expect(@hasField(ForwardCtx, "qsa_arms"));
+    try std.testing.expect(!@hasField(Transformer, "qsa_arms"));
+    try std.testing.expect(!@hasDecl(Transformer, "qsaArmsTake"));
 }

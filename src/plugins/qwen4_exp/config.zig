@@ -3,6 +3,7 @@
 //! `ModelConfig` names, so `model_config.zig` hands the trunk module its config one to one.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/plugin.zig");
 const generation = @import("../../sdk/config/generation.zig");
@@ -524,7 +525,7 @@ var gdn_state_f32_env: ?bool = null;
 /// The reference keeps the GDN state f32 whatever `mamba_ssm_dtype` says; `MLX_SERVE_GDN_STATE_F32=0` = bf16.
 fn gdnStateF32() bool {
     if (gdn_state_f32_env) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_GDN_STATE_F32");
+    const raw = env.get(.MLX_SERVE_GDN_STATE_F32);
     const on = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
     gdn_state_f32_env = on;
     return on;

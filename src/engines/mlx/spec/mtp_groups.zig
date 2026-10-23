@@ -54,7 +54,6 @@ pub fn batchedTickAction(cancelled: bool) BatchedTickAction {
 /// Per-request head (never qwen4's module-owned one), a GDN trunk with per-slot state
 /// the batched path merges, and a round that is actually speculating this tick.
 pub fn slotMtpGroupable(slot: *const Slot) bool {
-    if (!mtpGroupEnabled()) return false;
     const gen = if (slot.legacy_gen) |*g| g else return false;
     if (!slot.enable_mtp or gen.mtp == null or gen.mtp_cache == null or !gen.has_last_hidden) return false;
     if (gen.mtp.?.moduleOwned()) return false;
@@ -454,27 +453,6 @@ pub fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!bool {
     return true;
 }
 
-var mtp_group_env: ?bool = null;
-fn mtpGroupEnabled() bool {
-    if (mtp_group_env) |v| return v;
-    const on = if (env.get(.MLX_SERVE_MTP_BATCHED)) |p| !std.mem.eql(u8, std.mem.span(p), "0") else true;
-    mtp_group_env = on;
-    return on;
-}
-
-/// qwen4_exp verify rows are expert bytes, so a batched verify measured no better than
-/// solo rounds: its MTP rounds stay solo unless opted in; two interleave, three go plain.
-var mtp_batched_qwen4_env: ?bool = null;
-fn mtpBatchedQwen4Enabled() bool {
-    if (mtp_batched_qwen4_env) |v| return v;
-    const on = if (env.get(.MLX_SERVE_MTP_BATCHED_QWEN4)) |p| !std.mem.eql(u8, std.mem.span(p), "0") else false;
-    mtp_batched_qwen4_env = on;
-    return on;
-}
-
-fn mtpQwen4StaySolo(has_qwen4: bool, env_on: bool) bool {
-    return has_qwen4 and !env_on;
-}
 
 /// Why this group cannot take the merged `[N, S]` verify forward, or null for a shape that
 /// may: a qwen4 trunk's batched sub-paths are decode-shaped and uncertified past width 1.
@@ -491,15 +469,14 @@ pub fn verifyShapeFor(rows: usize, has_qwen4: bool, width: u32) VerifyShape {
     return .merged;
 }
 
-var merged_verify_decline_logged: bool = false;
-
 fn mtpRoundsStaySolo(slot: *const Slot) bool {
     const t = slot.model.transformer orelse return true;
     // A stateless trunk (MiMo) has no grouped verify: its MTP rounds run alone.
     if (!t.hasRecurrentLayers()) return true;
     // GLM-5-Next likewise: its head drafts one slot at a time.
     if (t.config.isGlm5()) return true;
-    return mtpQwen4StaySolo(t.qwen4Host().qwen4 != null, mtpBatchedQwen4Enabled());
+    // qwen4_exp verify rows are expert bytes: a batched verify measured no better than solo rounds.
+    return t.qwen4Host().qwen4 != null;
 }
 
 pub fn mtpCrowdThresholdFor(slot: *const Slot) usize {
@@ -1017,13 +994,6 @@ fn publishMtpResult(sch: *Scheduler, slot: *Slot, gen: *Generator, result: ?Gene
 }
 
 // ── tests ──
-
-test "mtpQwen4StaySolo is opt-in" {
-    try testing.expect(mtpQwen4StaySolo(true, false));
-    try testing.expect(!mtpQwen4StaySolo(true, true));
-    try testing.expect(!mtpQwen4StaySolo(false, false));
-    try testing.expect(!mtpQwen4StaySolo(false, true));
-}
 
 test "a cancel mid batched tick keeps generated_ids level with the KV rows" {
     // Bar: kv rows == full_prompt + generated_ids even when the slot cancels mid tick.

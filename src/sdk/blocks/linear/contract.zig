@@ -1,11 +1,11 @@
 //! The linear area's kernel contract: the affine-quantized GEMVs of the verify and MTP paths. Three replace MLX bit for
 //! bit (the row-axis qmv per row, the paired 3-bit coarse head against the row kernel, the wide dense verify tile against
-//! `quantized_matmul`); the verify lanes (split-K, the wide multi-simdgroup tile, crossrow, the NAX m16 tile) are held
+//! `quantized_matmul`); the verify lanes (split-K, the wide multi-simdgroup tile, the NAX m16 tile) are held
 //! to float64. Listed in `kernel_contract/registry.zig`.
 //! Shapes: the row kernels' rows are input rows; the lanes that compile M into their source count rows in output
 //! column tiles (N = rows x the lane's column granule), M fixed per registration. N is a runtime argument except for
 //! the wide tile, so huge-N heads (the 248320-row lm head) run at N 4096 here: the host-built weights fit a Debug test.
-//! The MLX qmv family (the row kernels, crossrow) factors each group's scale and bias out of the dot
+//! The MLX qmv family (the row kernels) factors each group's scale and bias out of the dot
 //! (s * sum(x q) + b * sum(x)), so their float64 reference does too; it differs from q * s + b per term only in NaN
 //! classes (0 * Inf). Known issues: none.
 
@@ -24,7 +24,7 @@ const metal = kc.metal;
 const hostq = kc.hostq;
 const Shape = spec.Shape;
 
-const Lane = enum { rows, coarse, wide, splitk, msg, crossrow, nax };
+const Lane = enum { rows, coarse, wide, splitk, msg, nax };
 
 const qmv_inputs: []const [*:0]const u8 = &.{ "x", "w_q", "scales", "biases", "K_size", "N_size" };
 
@@ -57,10 +57,6 @@ const msg_launches = blk: {
     for (2..8) |m| out[m - 2] = .{ .name = std.fmt.comptimePrint("mlxserve_vqmm_msg_m{d}", .{m}), .inputs = qmv_inputs, .outputs = &.{"y"}, .source = vq.VQMM_MSG_SOURCES[m - 2], .tg_bytes = 0, .m1 = msg_m1m2[m - 2], .m2 = msg_m1m2[m - 2] };
     break :blk out;
 };
-const crossrow_launches = [2]metal.Launch{
-    .{ .name = "mlxserve_vqmm_xr_m8", .inputs = qmv_inputs, .outputs = &.{"y"}, .source = vq.VQMM_XR_SOURCES[0], .tg_bytes = 0, .m1 = 576, .m2 = 576 },
-    .{ .name = "mlxserve_vqmm_xr_m9", .inputs = qmv_inputs, .outputs = &.{"y"}, .source = vq.VQMM_XR_SOURCES[1], .tg_bytes = 0, .m1 = 576, .m2 = 576 },
-};
 /// `B_tile[8][16 * 32]` T and `partial[8][BMT * 32]` floats, at the largest tile (24 rows: exactly 32 KiB).
 const nax_launch = metal.Launch{ .name = "mlxserve_vqmm_nax_m16", .inputs = &.{ "x", "w_q", "scales", "biases", "N_size" }, .outputs = &.{"y"}, .source = vqn.VQMM_NAX_SOURCE, .header = vqn.VQMM_NAX_HEADER, .tg_bytes = 8 * 16 * 32 * 2 + 8 * 24 * 32 * 4, .m1 = 1024, .m2 = 1024, .offline = false, .min_gen = 16 };
 
@@ -72,7 +68,7 @@ const Qmm = struct {
     bits: u32,
     gs: usize,
     dt: mlx.mlx_dtype = .bfloat16,
-    /// The baked input rows (split-K, msg, crossrow, wide: 12) or the NAX tile's rows.
+    /// The baked input rows (split-K, msg, wide: 12) or the NAX tile's rows.
     m: usize = 0,
     /// The wide tile's rows per threadgroup column.
     nv: usize = 6,
@@ -109,7 +105,7 @@ const Qmm = struct {
         return switch (self.lane) {
             .rows, .coarse => 1,
             .splitk, .msg => 4,
-            .crossrow, .wide => 8,
+            .wide => 8,
             .nax => 32,
         };
     }
@@ -183,12 +179,6 @@ const Qmm = struct {
                 g.int("GS", self.gs);
                 g.int("BITS", self.bits);
                 g.int("NSG", 8);
-            },
-            .crossrow => {
-                if (d.n % 8 != 0 or d.k % 512 != 0) return null;
-                g = .{ .grid = .{ 64 * @divTrunc(m + 1, 2), @divExact(n, 8), 1 }, .tg = .{ 64, 1, 1 } };
-                g.out(&.{ m, n }, self.dt);
-                g.dtype("T", self.dt);
             },
             .nax => {
                 if (d.n % 32 != 0 or d.k % 256 != 0) return null;
@@ -281,7 +271,7 @@ const Qmm = struct {
     }
 
     fn factored(self: *const Qmm) bool {
-        return self.lane == .rows or self.lane == .coarse or self.lane == .crossrow;
+        return self.lane == .rows or self.lane == .coarse;
     }
 
     /// Output (m, n) in float64 and its terms' magnitude: per term (q * s + b, rounded to T where the NAX tile
@@ -431,7 +421,6 @@ const Qmm = struct {
                 break :blk try vq.verifyQmm(s, x[0], x[1], x[2], x[3], self.bits, @intCast(self.gs));
             },
             .msg => try vq.runVerifyQmmMsg(s, x[0], x[1], x[2], x[3], self.bits, @intCast(self.gs), m, k, n, self.dt, xsh),
-            .crossrow => try vq.runVerifyQmmCrossrow(s, x[0], x[1], x[2], x[3], m, k, n, self.dt, xsh),
             .nax => try vqn.runVerifyQmmNax(s, x[0], x[1], x[2], x[3], self.bits, @intCast(self.gs), m, m, k, n, self.dt, xsh),
         } orelse return error.Declined;
         defer _ = mlx.mlx_array_free(y);
@@ -457,7 +446,6 @@ fn qmmSpec(comptime name: []const u8, q: Qmm, served: []const Shape, replaces: ?
         // Column tiles in rows; k: 32 lanes of 8 values.
         .splitk, .msg => .{ .{ .size = 8 }, .{}, .{ .size = 256, .step = 64, .min = 64 } },
         .wide => .{ .{ .size = 2 }, .{}, .{ .size = 512, .step = 64, .min = 64 } },
-        .crossrow => .{ .{ .size = 2 }, .{}, .{ .size = 512, .step = 512, .min = 512 } },
         .nax => .{ .{ .size = 2 }, .{}, .{ .size = 256, .step = 256, .min = 256 } },
     };
     return .{
@@ -519,11 +507,6 @@ pub fn register(set: *kc.Set) !void {
     {
         const q = Qmm.init(a, &msg_launches[6 - 2], .msg, 6, 64, 6);
         try set.add(Qmm, q, qmmSpec("vqmm msg bf16 (M 6, 6-bit g64)", q, &.{.{ .rows = 512, .n = 0, .k = 2560 }}, null), null);
-    }
-    // Crossrow (opt-in) at M 8 and 9, 4-bit g64.
-    inline for (.{ 8, 9 }) |m| {
-        const q = Qmm.init(a, &crossrow_launches[m - 8], .crossrow, 4, 64, m);
-        try set.add(Qmm, q, qmmSpec(std.fmt.comptimePrint("vqmm crossrow bf16 (M {d}, 4-bit g64)", .{m}), q, &.{ .{ .rows = 64, .n = 0, .k = 2560 }, .{ .rows = 32, .n = 0, .k = 5120 } }, null), null);
     }
     // The NAX m16 tile (and the M4 shader tile's 8 and 24 rows): 4-bit at every group, the mixed widths at g64.
     const nax_served: []const Shape = &.{ .{ .rows = 16, .n = 0, .k = 2560 }, .{ .rows = 8, .n = 0, .k = 5120 } };

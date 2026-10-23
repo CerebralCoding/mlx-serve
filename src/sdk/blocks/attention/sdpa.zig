@@ -15,26 +15,16 @@ const attn256Reference = @import("attn256.zig").attn256Reference;
 
 var nax_sdpa_avail_cache: ?bool = null;
 pub var nax_sdpa_override: ?bool = null; // test seam
-var nax_sdpa_env: ?bool = null;
 
-/// mlx >= 0.32.2 serves hd-256 attention on NAX with a fused full-attention
-/// kernel (`sdpa_full_self_attention_nax`), auto only at >= 1024 causal rows
-/// and reachable below that through `force_fused`. Default ON where NAX is
-/// available; MLX_SERVE_NAX_SDPA=0 restores msv_attn_p256 + the split/vector
-/// path, =1 forces the stock full kernel on a non-NAX GPU (A/B lever).
-pub fn naxSdpaPreferredFrom(nax_available: bool, raw: ?[]const u8) bool {
-    if (raw) |v| return !std.mem.eql(u8, v, "0");
-    return nax_available;
-}
 
+/// mlx >= 0.32.2 serves hd-256 attention on NAX with a fused full-attention kernel (`sdpa_full_self_attention_nax`),
+/// auto only at >= 1024 causal rows and reachable below that through `force_fused`: preferred wherever NAX is.
 pub fn naxSdpaPreferred() bool {
     if (nax_sdpa_override) |v| return v;
-    if (nax_sdpa_env) |v| return v;
-    if (nax_sdpa_avail_cache == null) nax_sdpa_avail_cache = computeNaxAvailable();
-    const raw = env.get(.MLX_SERVE_NAX_SDPA);
-    const on = naxSdpaPreferredFrom(nax_sdpa_avail_cache.?, if (raw) |v| std.mem.sliceTo(v, 0) else null);
-    nax_sdpa_env = on;
-    if (on) log.info("[nax-sdpa] engaged: stock fused sdpa (force_fused) serves hd-256 causal prefill and verify blocks > 8 rows; msv_attn_p256 causal arm declined (MLX_SERVE_NAX_SDPA=0 restores)\n", .{});
+    if (nax_sdpa_avail_cache) |v| return v;
+    const on = computeNaxAvailable();
+    nax_sdpa_avail_cache = on;
+    if (on) log.info("[nax-sdpa] engaged: stock fused sdpa (force_fused) serves hd-256 causal prefill and verify blocks > 8 rows; msv_attn_p256 causal arm declined\n", .{});
     return on;
 }
 
@@ -60,19 +50,10 @@ pub fn sdpaForceFused(q: mlx.mlx_array, k: mlx.mlx_array) bool {
 }
 var nax_sdpa_dispatch_logged = false;
 
-/// Kill switch (MLX_SERVE_SDPA_SPLIT=0). Test seam: `sdpa_split_override`
-/// forces the arm on/off without the environment.
+/// Test seam: `sdpa_split_override` forces the arm on/off.
 pub var sdpa_split_override: ?bool = null;
-var sdpa_split_env_cached: ?bool = null;
 fn sdpaSplitEnabled() bool {
-    if (sdpa_split_override) |v| return v;
-    if (sdpa_split_env_cached) |v| return v;
-    const v = blk: {
-        const raw = env.get(.MLX_SERVE_SDPA_SPLIT) orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    sdpa_split_env_cached = v;
-    return v;
+    return sdpa_split_override orelse true;
 }
 
 /// One engagement log per width (2..15): the first engagement is usually the
@@ -169,7 +150,7 @@ pub fn splitCausalSdpa(
     const log_idx: usize = @intCast(qL);
     if (!sdpa_split_logged[log_idx]) {
         sdpa_split_logged[log_idx] = true;
-        log.info("[sdpa-split] engaged: qL={d} kL={d} Hq={d} Hkv={d} rows/group={d} (MLX_SERVE_SDPA_SPLIT=0 restores the single dispatch)\n", .{ qL, kL, qs[1], ks[1], group });
+        log.info("[sdpa-split] engaged: qL={d} kL={d} Hq={d} Hkv={d} rows/group={d}\n", .{ qL, kL, qs[1], ks[1], group });
     }
     return out;
 }
@@ -180,7 +161,7 @@ var sdpa_mask_split_logged = false;
 /// vector kernel serves `qL * gqa <= 32` rows, anything wider (S >= 3 at
 /// gqa 12) and every array-masked qL 9..15 is the unfused fallback. Rows are
 /// independent under a per-row mask, so slice the block into vector-sized row
-/// groups. Kill switch shared with the causal split (MLX_SERVE_SDPA_SPLIT=0).
+/// groups. The test seam is shared with the causal split.
 pub fn splitMaskedSdpa256(
     s: mlx.mlx_stream,
     q: mlx.mlx_array,
@@ -229,7 +210,7 @@ pub fn splitMaskedSdpa256(
     try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 2, s));
     if (!sdpa_mask_split_logged) {
         sdpa_mask_split_logged = true;
-        log.info("[sdpa-split] masked arm engaged: qL={d} kL={d} gqa={d} rows/group={d} (MLX_SERVE_SDPA_SPLIT=0 restores the single dispatch)\n", .{ qL, ks[2], gqa, group });
+        log.info("[sdpa-split] masked arm engaged: qL={d} kL={d} gqa={d} rows/group={d}\n", .{ qL, ks[2], gqa, group });
     }
     return out;
 }
@@ -544,13 +525,6 @@ test "splitCausalSdpa: yields to the fused NAX sdpa at hd 256 past 8 rows, still
     };
     const split = (try splitCausalSdpa(s, arrs[0], arrs[1], arrs[2], 1.0)) orelse return error.SplitDeclined;
     _ = mlx.mlx_array_free(split);
-}
-
-test "naxSdpaPreferredFrom: default follows NAX availability, MLX_SERVE_NAX_SDPA overrides both ways" {
-    try testing.expect(naxSdpaPreferredFrom(true, null));
-    try testing.expect(!naxSdpaPreferredFrom(false, null));
-    try testing.expect(!naxSdpaPreferredFrom(true, "0"));
-    try testing.expect(naxSdpaPreferredFrom(false, "1"));
 }
 
 test "sdpaForceFusedFor: only shapes MLX has a fused kernel for (hd 256, > 8 rows, q <= k)" {

@@ -183,13 +183,13 @@ test {
 /// arguments are the restored rows, their capacity, and whether the restore checked the
 /// entry out (the only restore whose rows the request will not allocate).
 /// {needed, available} of the same cold bill, for the sibling ledger.
-pub var prefill_admission_numbers: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, bool) [2]u64 = null;
+pub var prefill_admission_numbers: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool) [2]u64 = null;
 
-pub var prefill_admission_fits: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool) bool = null;
+pub var prefill_admission_fits: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, u64, u64, bool, bool) bool = null;
 
 /// The prefill width this request should run at, chosen against live post-eviction memory
 /// (`server.requestPrefillChunkNow`). Null keeps the model's load-time pin.
-pub var prefill_request_chunk: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool) u32 = null;
+pub var prefill_request_chunk: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, u64, u64, bool, bool) u32 = null;
 
 /// Asked by the prefill loop: the width of the next chunk, re-priced at every chunk boundary
 /// (`server.adaptivePrefillWidthNow`). Null keeps the admitted width.
@@ -217,7 +217,7 @@ pub var prefill_chunk_widen_ok: ?*const fn (
 ) bool = null;
 
 /// Logs the numbers the estimator compared on a refusal and returns them, {needed, available} bytes.
-pub var prefill_admission_refused_log: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool) [2]u64 = null;
+pub var prefill_admission_refused_log: ?*const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, u64, u64, bool, bool) [2]u64 = null;
 
 /// Invalidate the published hot-cache budget on unload/switch (`server.clearResolvedPrefixCacheMem`).
 pub var hot_cache_budget_invalidate: ?*const fn () void = null;
@@ -1430,58 +1430,12 @@ pub var gen_yield_enabled = true;
 /// Target fraction of wall time the decoding streams get while another slot prefills,
 /// set once by `main` from `--prefill-decode-share` or MLX_SERVE_PREFILL_DECODE_SHARE
 /// (`resolveDecodeShare`). 0 = one boundary's `interleaveTicksFor` ticks and the company
-/// width, as before. Reads 0 under the MLX_SERVE_PREFILL_INTERLEAVE=0 kill switch: no
-/// hook, nothing to share.
+/// width, as before.
 pub var prefill_decode_share: f32 = 0;
 
 const testing = std.testing;
 
-test "a spec_disabled_runtime slot is batchable, and that is the documented trade" {
-    // `slotTicksRegular` admits a generator whose speculation turned itself off
-    // at runtime. That is what recovered the throughput (9.6 -> 12.4 tok/s per
-    // stream on 4 concurrent 5.5k prompts), and it costs something real: the
-    // batched tick does not call `nextPld`, so its periodic re-enable check
-    // cannot run while the slot is batched. Both halves are load-bearing, so
-    // both are stated here — if the re-enable check ever moves onto the batched
-    // path, or the clause is dropped, this is the note to revisit.
-    const src = @embedFile("scheduler.zig");
-    const hs = std.mem.indexOf(u8, src, "fn slotTicksRegular(") orelse return error.MissingHelper;
-    const he = std.mem.indexOfPos(u8, src, hs + 1, "\n    }\n") orelse return error.MissingHelperEnd;
-    const hbody = src[hs..he];
-    // The clause that admits it...
-    try testing.expect(std.mem.indexOf(u8, hbody, "gen.spec_disabled_runtime or") != null);
-    // ...and the trade it makes, written down where it is made.
-    try testing.expect(std.mem.indexOf(u8, hbody, "re-enable check") != null);
-    try testing.expect(std.mem.indexOf(u8, hbody, "SOLO slot never reaches the batched path") != null);
-}
-
-test "the batched gate reads DISPATCH, not the armed spec flags" {
-    // A prompt that merely n-gram-scores high enough to ARM PLD used to veto
-    // batched decode forever, even after PLD's own yield gate disabled itself
-    // at runtime: neither speculation nor batching (9.7 vs 14.3 tok/s per
-    // stream, 4 concurrent 4232-token prompts on Qwen3.5-4B). The armed flags
-    // are the REQUEST's wish; specTickMode is what the tick actually
-    // dispatches, and spec_disabled_runtime is what recovered the throughput.
-    const src = @embedFile("scheduler.zig");
-    const start = std.mem.indexOf(u8, src, "fn batchVerdict(self: *const Scheduler") orelse return error.MissingBatchable;
-    const end = std.mem.indexOfPos(u8, src, start + 1, "\n    }\n") orelse return error.MissingBatchableEnd;
-    const body = src[start..end];
-    try testing.expect(std.mem.indexOf(u8, body, "slotTicksRegular(slot)") != null);
-    // No armed-flag read may come back into the gate.
-    try testing.expect(std.mem.indexOf(u8, body, "slot.enable_pld") == null);
-    try testing.expect(std.mem.indexOf(u8, body, "slot.enable_drafter") == null);
-    try testing.expect(std.mem.indexOf(u8, body, "slot.enable_mtp") == null);
-
-    // ...and the helper answers from BOTH: the generator's runtime kill and
-    // the authoritative dispatch decision.
-    const hs = std.mem.indexOf(u8, src, "fn slotTicksRegular(") orelse return error.MissingHelper;
-    const he = std.mem.indexOfPos(u8, src, hs + 1, "\n    }\n") orelse return error.MissingHelperEnd;
-    const hbody = src[hs..he];
-    try testing.expect(std.mem.indexOf(u8, hbody, "gen.spec_disabled_runtime") != null);
-    try testing.expect(std.mem.indexOf(u8, hbody, "slotSpecMode(") != null);
-
-    // The dispatch answer itself: a live MTP slot never ticks regular, an
-    // unarmed one always does.
+test "a live MTP slot never ticks regular, an unarmed one always does" {
     try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, false, false, true, true, false));
     try testing.expectEqual(SpecTickMode.regular, specTickMode(true, false, true, false, false, true, false, false));
 }

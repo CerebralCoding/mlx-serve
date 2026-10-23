@@ -66,17 +66,6 @@ fn loopRecoveryAction(tb: ?*generate_mod.ThinkBound, ids: []const u32, completio
     return .close_thought;
 }
 
-var loop_trim_env: ?bool = null;
-/// `MLX_SERVE_LOOP_TRIM=0` keeps the whole degenerate tail in the response —
-/// the A/B arm, and the escape hatch for anyone who needs to see exactly what
-/// the model emitted. The cut itself is unaffected either way.
-pub fn loopTrimEnabled() bool {
-    if (loop_trim_env) |v| return v;
-    const raw = env.get(.MLX_SERVE_LOOP_TRIM);
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    loop_trim_env = enabled;
-    return enabled;
-}
 
 /// Every single-slot decode tick funnels through here, so a decode-time MLX failure is
 /// attributed to the slot whose forward raised it instead of the next request's prefill.
@@ -124,7 +113,7 @@ pub fn loopGuardTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
             @tagName(stop.tier),         stop.trim_start,
         });
         slot.finish_details = stop.finish_details;
-        if (loopTrimEnabled()) slot.loop_trim_start = stop.trim_start;
+        slot.loop_trim_start = stop.trim_start;
         finishSlot(sch, slot, stop.finish_reason);
         return true;
     }

@@ -30,23 +30,19 @@ const chunkNeedsMtpHistory = @import("prefill_chunk.zig").chunkNeedsMtpHistory;
 const commitAdaptiveWidth = @import("prefill_chunk.zig").commitAdaptiveWidth;
 const countSpliceRows = @import("prefill_chunk.zig").countSpliceRows;
 const decodeShareCapped = @import("prefill_chunk.zig").decodeShareCapped;
-const dflashChooserEnabled = @import("../spec/gates.zig").dflashChooserEnabled;
 const dsparkArmFor = @import("../spec/dspark.zig").dsparkArmFor;
 const dsparkEnabled = @import("../spec/dspark.zig").dsparkEnabled;
 const dsparkPolicyEnabled = @import("../spec/dspark.zig").dsparkPolicyEnabled;
-const dsparkStochEnabled = @import("../spec/dspark.zig").dsparkStochEnabled;
 const effectiveMtpHistoryWindow = @import("prefill_chunk.zig").effectiveMtpHistoryWindow;
 const effectivePrefillChunk = @import("prefill_chunk.zig").effectivePrefillChunk;
 const effectiveSsmCheckpointStride = @import("prefill_chunk.zig").effectiveSsmCheckpointStride;
 const firstTokenLogprobs = @import("../sampling/logprobs.zig").firstTokenLogprobs;
 const lazyForward = @import("step.zig").lazyForward;
-const mtpBatchCorrEnabled = @import("../spec/mtp/serial.zig").mtpBatchCorrEnabled;
 const mtpBatchedExactGraph = @import("../spec/mtp/batched_graph.zig").mtpBatchedExactGraph;
 const mtpBatchedTokenV3Graph = @import("../spec/mtp/batched_graph.zig").mtpBatchedTokenV3Graph;
 const mtpBatchedTypicalGraph = @import("../spec/mtp/batched_graph.zig").mtpBatchedTypicalGraph;
 const mtpDepthCapFree = @import("../spec/mtp/ev_plan.zig").mtpDepthCapFree;
 const mtpDraftGreedyFor = @import("../spec/mtp/depth.zig").mtpDraftGreedyFor;
-const mtpDraftProposalEnv = @import("../spec/mtp/depth.zig").mtpDraftProposalEnv;
 const mtpEvCosts = @import("../spec/mtp/ev_costs.zig").mtpEvCosts;
 const nextChunkEnd = @import("prefill_chunk.zig").nextChunkEnd;
 const pickLookupPromptSource = @import("../spec/pld.zig").pickLookupPromptSource;
@@ -57,7 +53,6 @@ const sampleTokenLazy = @import("../sampling/lazy.zig").sampleTokenLazy;
 const shouldCheckpointSsmPrefill = @import("prefill_chunk.zig").shouldCheckpointSsmPrefill;
 const ssmCapturePos = @import("prefill_chunk.zig").ssmCapturePos;
 const ssmSnapshotBackoff = @import("prefill_chunk.zig").ssmSnapshotBackoff;
-const visionChunkedPrefillEnabled = @import("prefill_chunk.zig").visionChunkedPrefillEnabled;
 const intree = @import("../plugin/intree.zig");
 
 
@@ -109,8 +104,7 @@ pub fn initWithOptions(
         // the raw argmax-equality accept; sampled requests get the
         // stochastic arm (MTP one-hot Leviathan acceptance over the
         // request's own filtered probs — the agent-default temp 0.6
-        // traffic that otherwise always ran serial), env-killable via
-        // MLX_SERVE_DSV4_DSPARK_STOCH=0. PLD / drafter / qwen-MTP
+        // traffic that otherwise always ran serial). PLD / drafter / qwen-MTP
         // remain hard-off regardless: their verify forwards go through
         // machinery this arch cannot roll back.
         const ds_block = if (intree.dsv4(xfm)) |d| d.ds_block else if (intree.dsv41(xfm)) |d| d.ds_block else mlx_stream.blockSize(xfm.mlx_stream_ext.?);
@@ -118,7 +112,7 @@ pub fn initWithOptions(
         const arm = if (!options.mtp_enabled or xfm.config.mtp_override == false)
             DsparkArm.off
         else
-            dsparkArmFor(sampling, options.logprobs_n, dsparkStochEnabled());
+            dsparkArmFor(sampling, options.logprobs_n);
         // mlx-stream's lane samples a sampled request itself, from the request's own settings.
         const lane_sampling: ?mlx_stream.SamplingParams = if (dspark_env_off or arm == .off) null else .{
             .temperature = sampling.temperature,
@@ -184,12 +178,9 @@ pub fn initWithOptions(
     // positions, gets eval'd, and intermediates are freed before the next chunk.
     // Without chunking, Gemma-4 MoE's 2 MLPs × 4 stacked layers can spike to
     // ~20 GB of activations alone on a 50k-token prompt, causing Metal OOM.
-    // Vision requests skip chunking since image token positions must be visible
-    // in a single forward pass for spliceVisionEmbeddings to work correctly.
-    // PREFILL_CHUNK overridable via env MLX_SERVE_PREFILL_CHUNK for tuning,
-    // or via the module-level `prefill_chunk_override` (set by --prefill-chunk
-    // CLI flag in main.zig). Env var wins if both are set (and skips the
-    // safety cap below — it's the explicit escape hatch).
+    // Vision requests chunk too: the splice resumes its row index across
+    // chunks (#197). An explicit `--prefill-chunk` outranks the machine pin;
+    // the safety cap below still applies.
     //
     // Safety cap: on unfused head dims (>128 — every Gemma-4/Qwen3.5/3.6)
     // the composed SDPA materializes [heads, chunk, total_kv] scores per
@@ -235,7 +226,6 @@ pub fn initWithOptions(
     const want_ssm_cp = shouldCheckpointSsmPrefill(
         options.ssm_checkpoint_stride,
         ctx.ssm_entries != null and ctx.ssm_entries.?.len > 0,
-        has_vision,
     );
     // The snapshot backoff: a checkpoint AT the prompt end is
     // unreachable next turn.
@@ -283,14 +273,13 @@ pub fn initWithOptions(
         .tokenv3 => |alpha| .{ .graph = mtpBatchedTokenV3Graph, .prefix = mtp_acceptance.tokenV3Prefix, .param = alpha },
     };
     if (mtp_active and std.meta.activeTag(options.mtp_acceptance) != .exact) {
-        if (!mtpBatchCorrEnabled()) return error.MtpLossyRequiresBatchedCorrections;
         switch (options.mtp_acceptance) {
             .typical => |cfg| log.info("  [mtp-accept] typical delta={d:.3} eps={d:.3} NOT distribution-exact\n", .{ cfg.delta, cfg.eps }),
             .tokenv3 => |alpha| log.info("  [mtp-accept] TokenV3 alpha={d:.3} NOT distribution-exact\n", .{alpha}),
             .exact => unreachable,
         }
     }
-    if (mtp_active and options.mtp_greedy_tail and sampling.temperature > 0.01 and !mtpDraftGreedyFor(sampling, mtpDraftProposalEnv()))
+    if (mtp_active and options.mtp_greedy_tail and sampling.temperature > 0.01 and !mtpDraftGreedyFor(sampling))
         log.info("  [mtp-draft] greedy tail engaged: depth 0 samples, later depths take the head's argmax\n", .{});
     var mtp_cache: ?MtpCacheRef = null;
     var mtp_position_base: usize = ssm_cp_offset;
@@ -342,9 +331,7 @@ pub fn initWithOptions(
     var final_start: usize = if (xfm.prefillsWholePrompt()) 0 else prompt_ids.len - 1;
     // Chunked vision prefill (issue #197): placeholder rows consumed by
     // completed chunks, fed to ctx.vision_splice_offset per forward
-    // (chunk loop AND final-span forward). Stays 0 on the kill-switch arm
-    // so that path is byte-identical to the old whole-prompt behavior.
-    const vision_chunked = has_vision and visionChunkedPrefillEnabled();
+    // (chunk loop AND final-span forward).
     var vision_rows_consumed: usize = options.vision_rows_before;
     var adapt_state: AdaptiveWidthState = .{
         .width_min = @intCast(PREFILL_CHUNK),
@@ -356,18 +343,13 @@ pub fn initWithOptions(
         const snapshot_backoff = ssmSnapshotBackoff(want_state_cp, prefix_len, ssm_cp_offset > 0);
         const loop_end = prefix_len - snapshot_backoff;
         final_start = loop_end;
-        // Vision prompts chunk like text (issue #197) — the splice offset
-        // below keeps the row scatter chunk-exact. Kill switch restores
-        // the whole-prompt forward.
-        const default_chunk = if (has_vision and !vision_chunked) loop_end else PREFILL_CHUNK;
         // Per-chunk adaptive width: the first chunk runs the admitted width; every boundary
         // after it re-asks the same estimator. `cap_adapt` is the widest this arch forwards
         // for this prompt, never wider than `ssm_cp_stride`.
-        const adapt_chunked = !(has_vision and !vision_chunked);
         // The scaled tail-merge bound reads the arch predicate, never `chunk_width_hook != null`
         // (installed process-wide).
-        const width_is_adaptive = adapt_chunked and options.adaptive_chunk_width;
-        const cap_adapt: u32 = if (!adapt_chunked) 0 else @intCast(effectivePrefillChunk(
+        const width_is_adaptive = options.adaptive_chunk_width;
+        const cap_adapt: u32 = @intCast(effectivePrefillChunk(
             xfm.config.prefillScoreHeadDim(),
             xfm.config.num_attention_heads,
             total_ctx_for_chunk,
@@ -376,9 +358,9 @@ pub fn initWithOptions(
             xfm.config.longCtxGated(),
             0,
         ));
-        adapt_state.width_min = @intCast(default_chunk);
-        adapt_state.width_max = @intCast(default_chunk);
-        var cur_chunk: usize = default_chunk;
+        adapt_state.width_min = @intCast(PREFILL_CHUNK);
+        adapt_state.width_max = @intCast(PREFILL_CHUNK);
+        var cur_chunk: usize = PREFILL_CHUNK;
         // Last-window MTP history: chunks entirely before the window skip
         // the full-hidden capture AND the head forward (see
         // mtp.SUGGESTED_HISTORY_WINDOW). 0 = capture every chunk.
@@ -396,7 +378,7 @@ pub fn initWithOptions(
             &xfm.config,
             total_ctx_for_chunk,
             max_tokens,
-            default_chunk,
+            PREFILL_CHUNK,
         );
         ctx.cache.reserve(@intCast(reserved_tokens));
         // The arch's own per-request buffers reserve at the same length.
@@ -460,27 +442,7 @@ pub fn initWithOptions(
             defer _ = mlx.mlx_array_free(chunk_input);
 
             const chunk_start_ns = if (trace_enabled) prefill_sw.read() else 0;
-            // Phase 2 experiment: when MLX_SERVE_COMPILE_FORWARD=1 wired a
-            // compiled closure at load time, route this chunk through it.
-            // The compiled closure uses xfm.defaultCtx (xfm.cache + xfm.ssm_entries),
-            // which matches the prefill `ctx` when the scheduler has swapped
-            // the slot's cache onto the Transformer (the single-slot legacy
-            // and Phase-2-swapped path both satisfy this). Hidden-capture
-            // and vision splice paths don't pass through this chunk loop
-            // (they take the last_input branch), so they're already safe.
-            // Optional-slice equality: same-ness here means both null or
-            // both point at the same backing memory. We accept ssm_entries
-            // null↔null too because plain-attn models legitimately have
-            // both ctx and xfm carry null.
-            const ssm_match = blk: {
-                if (ctx.ssm_entries == null and xfm.ssm_entries == null) break :blk true;
-                if (ctx.ssm_entries == null or xfm.ssm_entries == null) break :blk false;
-                break :blk ctx.ssm_entries.?.ptr == xfm.ssm_entries.?.ptr and
-                    ctx.ssm_entries.?.len == xfm.ssm_entries.?.len;
-            };
-            // History windowing: a chunk before the window needs no
-            // capture, which ALSO re-qualifies it for the compiled
-            // trunk forward (capture is what disqualifies MTP chunks).
+            // History windowing: a chunk before the window needs no capture.
             const mtp_capture = mtp_active and chunkNeedsMtpHistory(pos, end, prefix_len, mtp_hist_window);
             var chunk_hidden_all = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(chunk_hidden_all);
@@ -491,15 +453,7 @@ pub fn initWithOptions(
             errdefer if (dflash_active) {
                 for (dfl_out_buf) |a| _ = mlx.mlx_array_free(a);
             };
-            const chunk_logits = if (xfm.compiled_forward != null and
-                !mtp_capture and
-                !dflash_active and
-                ctx.cache == &xfm.cache and
-                ssm_match and
-                ctx.capture_hidden == null and
-                ctx.vision_embeddings == null)
-                try xfm.forwardCompiled(chunk_input)
-            else if (mtp_capture) blk: {
+            const chunk_logits = if (mtp_capture) blk: {
                 var last_unused = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(last_unused);
                 break :blk try xfm.forwardWithCaptureAll(&ctx, chunk_input, &last_unused, &chunk_hidden_all);
@@ -631,7 +585,7 @@ pub fn initWithOptions(
                 }
             }
 
-            if (vision_chunked) {
+            if (has_vision) {
                 vision_rows_consumed += countSpliceRows(
                     ids_i32[pos..end],
                     xfm.config.image_token_id,
@@ -654,7 +608,7 @@ pub fn initWithOptions(
             var pending_widen: u32 = 0;
             var widen_confirm: ?*const fn (*anyopaque, usize, u32) bool = null;
             var widen_ctx: ?*anyopaque = null;
-            if (adapt_chunked and pos < loop_end) {
+            if (pos < loop_end) {
                 if (options.chunk_width_hook) |hk| {
                     const next_w = hk.call(hk.ctx, ssm_cp_offset + pos, @intCast(cur_chunk), cap_adapt, &adapt_state);
                     if (next_w != 0 and next_w != cur_chunk) {
@@ -768,7 +722,7 @@ pub fn initWithOptions(
     // silent-no-op class; tests grep for it per arm.
     if (has_vision) {
         ctx.vision_splice_offset = vision_rows_consumed;
-        if (vision_chunked and n_chunks > 1) log.debug("[vision] chunked prefill: {d} chunks, {d} placeholder rows consumed\n", .{ n_chunks, vision_rows_consumed });
+        if (has_vision and n_chunks > 1) log.debug("[vision] chunked prefill: {d} chunks, {d} placeholder rows consumed\n", .{ n_chunks, vision_rows_consumed });
     }
 
     // Process the final span — the last token, plus (under SSM
@@ -1014,10 +968,6 @@ pub fn initWithOptions(
             .dflash_ctx = dflash_ctx,
             .dflash_block_size = dflash_bs,
             .dflash_pol = if (dflash_active and options.dflash_policy) .{ .pin_rows = @intCast(@min(env.int(.MLX_SERVE_DFLASH_ROWS, usize, 0), dflash_policy.MAX_ROWS)) } else null,
-            .dflash_chooser = if (dflash_active and dflashChooserEnabled() and !options.dflash_policy)
-                round_cost.WidthChooser.init(@max(dflash_bs, 2) - 1, options.dflash.?.config.block_size -| 1)
-            else
-                null,
             .dflash_min_accepted_per_round = options.dflash_min_accepted_per_round,
             .mtp = if (mtp_active) options.mtp else null,
             .mtp_accept_graph = accept_route.graph,

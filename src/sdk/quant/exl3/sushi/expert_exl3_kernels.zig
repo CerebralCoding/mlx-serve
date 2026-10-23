@@ -604,39 +604,17 @@ const GEMM_WINDOW_ROWS: c_int = 32;
 /// Maximum run supported by all sorted-GEMM bodies; larger runs leave tail rows unwritten.
 const GEMM_WINDOW_MAX_ROWS: c_int = 32;
 
-var gemm_win_cached: ?c_int = null;
-var gemm_align_cached: ?bool = null;
+/// Test seams.
+var gemm_win_override: ?c_int = null;
+var gemm_align_override: ?bool = null;
 
 /// null = not a window these kernels run, so the default stands.
-fn resolveGemmWindowRows(raw: ?[]const u8) ?c_int {
-    const v = raw orelse return null;
-    const n = std.fmt.parseInt(c_int, v, 10) catch return null;
-    if (n < 1 or n > GEMM_WINDOW_MAX_ROWS) return null;
-    return n;
-}
-
 pub fn gemmWindowRows() c_int {
-    if (gemm_win_cached) |v| return v;
-    const v = blk: {
-        const p = host_env.get(.SUSHI_EXL3_GEMM_WIN) orelse break :blk GEMM_WINDOW_ROWS;
-        const raw = std.mem.span(p);
-        if (resolveGemmWindowRows(raw)) |n| break :blk n;
-        log.warn("[exl3] SUSHI_EXL3_GEMM_WIN={s} is not a window in 1..{d}; keeping {d}\n", .{ raw, GEMM_WINDOW_MAX_ROWS, GEMM_WINDOW_ROWS });
-        break :blk GEMM_WINDOW_ROWS;
-    };
-    gemm_win_cached = v;
-    return v;
+    return gemm_win_override orelse GEMM_WINDOW_ROWS;
 }
 
 pub fn gemmWindowAligned() bool {
-    if (gemm_align_cached) |v| return v;
-    var on = true;
-    if (host_env.get(.SUSHI_EXL3_WIN_ALIGN)) |p| {
-        const v = std.mem.span(p);
-        if (v.len > 0 and v[0] == '0') on = false;
-    }
-    gemm_align_cached = on;
-    return on;
+    return gemm_align_override orelse true;
 }
 var indexed_coop_cfgs: CfgCache(IndexedKey, 8) = .{};
 var prepare_cfgs: CfgCache(UnaryKey, 8) = .{};
@@ -703,14 +681,11 @@ fn gpuArch(buf: []u8) ?[]const u8 {
     return buf[0..arch.len];
 }
 
-var force_fallback_cached: ?bool = null;
 
-// Tests flip the env between calls; a served process reads it once.
+/// Test seam: forces the SIMD fallback where the NAX arm would run.
+var force_family_fallback: bool = false;
 fn forceFamilyFallback() bool {
-    if (!@import("builtin").is_test) if (force_fallback_cached) |v| return v;
-    const v = if (host_env.get(.SUSHI_FORCE_GPU_FAMILY_FALLBACK)) |p| p[0] == '1' else false;
-    force_fallback_cached = v;
-    return v;
+    return force_family_fallback;
 }
 
 fn gemmNaxOn() bool {
@@ -4025,8 +4000,8 @@ test "exl3 sorted GEMM matches host MUL1 with the NAX arm forced off" {
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     if (!gemmNaxOn()) return error.SkipZigTest;
-    host_env.set(.SUSHI_FORCE_GPU_FAMILY_FALLBACK, "1");
-    defer host_env.unset(.SUSHI_FORCE_GPU_FAMILY_FALLBACK);
+    force_family_fallback = true;
+    defer force_family_fallback = false;
     try t.expect(!gemmNaxOn());
     const fixture = exl3.fixtures.k4;
     var arena = std.heap.ArenaAllocator.init(t.allocator);
@@ -5243,8 +5218,8 @@ test "exl3 sorted GEMM matches the host tile decode at a fractional rate with th
     const t = std.testing;
     if (!mlx.streamIsGpu(mlx.gpuStream())) return error.SkipZigTest;
     if (!gemmNaxOn()) return error.SkipZigTest;
-    host_env.set(.SUSHI_FORCE_GPU_FAMILY_FALLBACK, "1");
-    defer host_env.unset(.SUSHI_FORCE_GPU_FAMILY_FALLBACK);
+    force_family_fallback = true;
+    defer force_family_fallback = false;
     try t.expect(!gemmNaxOn());
     for (0..PARITY_SEEDS) |i| {
         try sortedGemmParity(.{ .n = 40 }, .mcg, 32, 401 + i);
@@ -5279,8 +5254,8 @@ test "exl3 sorted GEMM matches the host tile decode at a narrowed window with th
     const t = std.testing;
     if (!mlx.streamIsGpu(mlx.gpuStream())) return error.SkipZigTest;
     if (!gemmNaxOn()) return error.SkipZigTest;
-    host_env.set(.SUSHI_FORCE_GPU_FAMILY_FALLBACK, "1");
-    defer host_env.unset(.SUSHI_FORCE_GPU_FAMILY_FALLBACK);
+    force_family_fallback = true;
+    defer force_family_fallback = false;
     try t.expect(!gemmNaxOn());
     for (0..PARITY_SEEDS) |i| {
         try sortedGemmParity(.{ .n = 40 }, .{ .codebook = .mcg, .window = .w12 }, 32, 1001 + i);
@@ -5897,21 +5872,16 @@ test "mimo_v2 EXL3 prefill rows match the fused decode arm at the served hidden 
     }
 }
 
-/// The window geometry the production code resolves, through the levers it
-/// reads: the cached answer is dropped so the env is what decides.
-fn withGemmWindow(win: ?[*:0]const u8, aligned: bool, c: MimoMoeCase) !void {
-    const prev_win = gemm_win_cached;
-    const prev_align = gemm_align_cached;
+/// The window geometry the production code resolves, set through its seams.
+fn withGemmWindow(win: ?c_int, aligned: bool, c: MimoMoeCase) !void {
+    const prev_win = gemm_win_override;
+    const prev_align = gemm_align_override;
     defer {
-        gemm_win_cached = prev_win;
-        gemm_align_cached = prev_align;
-        host_env.unset(.SUSHI_EXL3_GEMM_WIN);
-        host_env.unset(.SUSHI_EXL3_WIN_ALIGN);
+        gemm_win_override = prev_win;
+        gemm_align_override = prev_align;
     }
-    gemm_win_cached = null;
-    gemm_align_cached = null;
-    if (win) |w| host_env.set(.SUSHI_EXL3_GEMM_WIN, w) else host_env.unset(.SUSHI_EXL3_GEMM_WIN);
-    host_env.set(.SUSHI_EXL3_WIN_ALIGN, if (aligned) "1" else "0");
+    gemm_win_override = win;
+    gemm_align_override = aligned;
     try mimoArmsAgree(c);
 }
 
@@ -5929,12 +5899,10 @@ test "mimo_v2 EXL3 prefill rows match the fused decode arm on every GEMM arm" {
     for ([_]bool{ true, false }) |nax_off| {
         if (nax_off) {
             if (!gemmNaxOn()) continue;
-            host_env.set(.SUSHI_FORCE_GPU_FAMILY_FALLBACK, "1");
+            force_family_fallback = true;
         }
-        defer if (nax_off) {
-            host_env.unset(.SUSHI_FORCE_GPU_FAMILY_FALLBACK);
-        };
-        for ([_]?[*:0]const u8{ null, "16" }) |win| {
+        defer force_family_fallback = false;
+        for ([_]?c_int{ null, 16 }) |win| {
             for ([_]bool{ true, false }) |aligned| try withGemmWindow(win, aligned, base);
         }
     }
@@ -6022,19 +5990,6 @@ test "exl3 a window wider than the kernel row capacity refuses" {
     const ok = try innerGemmSortedWin(s, x_arr, tr_arr, eid_a, 32);
     defer _ = mlx.mlx_array_free(ok);
     try t.expectEqual(@as(c_int, n), mlx.getShape(ok)[0]);
-}
-
-test "exl3 the GEMM window selector answers the window it was asked for" {
-    const t = std.testing;
-    try t.expectEqual(@as(?c_int, 4), resolveGemmWindowRows("4"));
-    try t.expectEqual(@as(?c_int, 8), resolveGemmWindowRows("8"));
-    try t.expectEqual(@as(?c_int, 16), resolveGemmWindowRows("16"));
-    try t.expectEqual(@as(?c_int, 32), resolveGemmWindowRows("32"));
-    try t.expectEqual(@as(?c_int, null), resolveGemmWindowRows(null));
-    try t.expectEqual(@as(?c_int, null), resolveGemmWindowRows(""));
-    try t.expectEqual(@as(?c_int, null), resolveGemmWindowRows("0"));
-    try t.expectEqual(@as(?c_int, null), resolveGemmWindowRows("64"));
-    try t.expectEqual(@as(?c_int, null), resolveGemmWindowRows("16x"));
 }
 
 test "exl3 prepareIndexed refuses a row count that is not the slot count" {
@@ -6321,23 +6276,15 @@ test "exl3 a novel row count does not compile another sorted GEMM" {
     }
 }
 
-
-/// Forces the non-NAX arms for one test and puts back whatever the caller's environment held.
+/// Forces the non-NAX arms for one test and puts back the prior setting.
 const FallbackEnv = struct {
-    prior: [64:0]u8 = @splat(0),
-    had: bool = false,
+    prior: bool = false,
     fn force(self: *FallbackEnv) void {
-        if (host_env.get(.SUSHI_FORCE_GPU_FAMILY_FALLBACK)) |p| {
-            const v = std.mem.span(p);
-            if (v.len > self.prior.len) @panic("SUSHI_FORCE_GPU_FAMILY_FALLBACK is too long to restore");
-            @memcpy(self.prior[0..v.len], v);
-            self.prior[v.len] = 0;
-            self.had = true;
-        }
-        host_env.set(.SUSHI_FORCE_GPU_FAMILY_FALLBACK, "1");
+        self.prior = force_family_fallback;
+        force_family_fallback = true;
     }
     fn restore(self: *FallbackEnv) void {
-        if (self.had) host_env.set(.SUSHI_FORCE_GPU_FAMILY_FALLBACK, &self.prior) else host_env.unset(.SUSHI_FORCE_GPU_FAMILY_FALLBACK);
+        force_family_fallback = self.prior;
     }
 };
 
@@ -6551,9 +6498,9 @@ fn bf16TruthCaseAnyArm(c: MimoMoeCase, win: c_int, decode: bool) !void {
     const seed = c.seed;
     setDecodeParams(c.dec);
     defer setDecodeParams(.mul1);
-    const saved_win = gemm_win_cached;
-    gemm_win_cached = win;
-    defer gemm_win_cached = saved_win;
+    const saved_win = gemm_win_override;
+    gemm_win_override = win;
+    defer gemm_win_override = saved_win;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -9097,9 +9044,9 @@ fn clampedGpuWindowBytes(hidden: usize, inter: usize, n: u32) !void {
 }
 
 fn clampedWindowBytes(hidden: usize, inter: usize, n: u32, aligned: bool) !void {
-    const prior = gemm_align_cached;
-    gemm_align_cached = aligned;
-    defer gemm_align_cached = prior;
+    const prior = gemm_align_override;
+    gemm_align_override = aligned;
+    defer gemm_align_override = prior;
     const s = mlx.gpuStream();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

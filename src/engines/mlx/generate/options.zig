@@ -223,8 +223,7 @@ pub const InitOptions = struct {
     /// scheduler runs decode ticks for the streams already decoding at
     /// this seam, so a long cold prefill stalls them for at most one
     /// chunk-forward instead of its whole duration. Null = the prefill
-    /// runs atomically (pre-interleave behavior, and the
-    /// MLX_SERVE_PREFILL_INTERLEAVE=0 kill switch).
+    /// runs atomically.
     interleave_hook: ?InterleaveHook = null,
     /// SSD-first write-through (qwen4_exp only; see `WriteThroughHook`).
     write_through_hook: ?WriteThroughHook = null,

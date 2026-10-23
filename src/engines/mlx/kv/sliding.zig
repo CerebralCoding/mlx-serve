@@ -34,18 +34,6 @@ pub fn slidingTailSpan(window: u32, q_len: usize, max_width: usize) u32 {
     return window + @as(u32, @intCast(q_len)) - 1;
 }
 
-/// Kill switch for the block-width half of the trim (MLX_SERVE_SLIDING_BLOCK_TRIM=0
-/// pins every multi-token forward back to the untrimmed view). Decode-width
-/// trimming is unconditional and predates this.
-var sliding_block_trim_cached: ?bool = null;
-pub fn slidingBlockTrimEnabled() bool {
-    if (sliding_block_trim_cached) |v| return v;
-    const raw = env.get(.MLX_SERVE_SLIDING_BLOCK_TRIM);
-    const on = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    sliding_block_trim_cached = on;
-    return on;
-}
-
 var sliding_block_trim_logged: bool = false; // one-shot log guard
 
 /// Test seam: the full-buffer reference arm of the sliding-ring equivalence test.
@@ -60,7 +48,7 @@ pub fn slidingViewFor(cfg: *const ModelConfig, total_kv: c_int, seq_len: c_int) 
     // nothing from the trim at all.
     const band = fused256Enabled() and cfg.head_dim == 256 and seq_len >= FUSED256_MIN_Q_LEN;
     // A sliding ring holds only the tail, so it always trims.
-    const width: usize = if (band or (!slidingBlockTrimEnabled() and !cfg.slidingRing())) 1 else SLIDING_TRIM_UNBOUNDED;
+    const width: usize = if (band) 1 else SLIDING_TRIM_UNBOUNDED;
     const span: u32 = if (cfg.has_sliding_window)
         slidingTailSpan(cfg.sliding_window, @intCast(seq_len), width)
     else
@@ -71,7 +59,7 @@ pub fn slidingViewFor(cfg: *const ModelConfig, total_kv: c_int, seq_len: c_int) 
     // trim did something — decode has always trimmed to the window.
     if (!sliding_block_trim_logged and span > cfg.sliding_window and kv_len < total_kv) {
         sliding_block_trim_logged = true;
-        log.info("[sliding] block trim engaged: window={d} q_len={d} span={d} kv={d} of {d} (MLX_SERVE_SLIDING_BLOCK_TRIM=0 restores the untrimmed view)\n", .{ cfg.sliding_window, seq_len, span, kv_len, total_kv });
+        log.info("[sliding] block trim engaged: window={d} q_len={d} span={d} kv={d} of {d}\n", .{ cfg.sliding_window, seq_len, span, kv_len, total_kv });
     }
     return .{ .span = span, .kv_len = kv_len, .band_in_kernel = band };
 }

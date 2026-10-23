@@ -1,5 +1,4 @@
-//! The attention area's kernel contract. The output gates (Laguna's softplus per head, the sigmoid gate by
-//! channel or by head, the strided sigmoid gate over a transposed output and a split projection) are each bit-equal
+//! The attention area's kernel contract. The output gates (the sigmoid gate by channel or by head, the strided sigmoid gate over a transposed output and a split projection) are each bit-equal
 //! to the MLX op chain they replace. The attention kernels meet the float64 bound of an online softmax simulated
 //! block by block as each kernel walks its keys (`online`: fast-math exp, the rescales, P rounded where the kernel
 //! rounds it): msv_attn_p256 (causal, band, QSA mask, MiMo's 192/128 with sinks, and the carried-state chunk
@@ -31,20 +30,10 @@ const Shape = spec.Shape;
 
 // ── output gates ──
 
-const GateKind = enum { softplus, table, strided };
+const GateKind = enum { table, strided };
 
 /// One gate instantiation: `heads` x `hd` channels a token; `headwise` gates a head by one value.
 const GateCfg = struct { kind: GateKind, dt: mlx.mlx_dtype = .bfloat16, heads: usize, hd: usize, headwise: bool = false };
-
-const softplus_launch = metal.Launch{
-    .name = "mlxserve_attn_out_gate",
-    .inputs = &.{ "attn", "glogits" },
-    .outputs = &.{"y"},
-    .source = gates.ATTN_GATE_SOURCE,
-    .tg_bytes = 0,
-    .m1 = 1024,
-    .m2 = 1024,
-};
 
 const table_launch = metal.Launch{
     .name = "mlxserve_sigmoid_gate_mul",
@@ -109,9 +98,9 @@ const Gate = struct {
         return self.cfg.heads * self.cfg.hd;
     }
 
-    /// Gate values a token: one per head (softplus, headwise) or one per channel.
+    /// Gate values a token: one per head (headwise) or one per channel.
     fn gateWidth(self: *const Gate) usize {
-        return if (self.cfg.kind == .softplus or self.cfg.headwise) self.cfg.heads else self.width();
+        return if (self.cfg.headwise) self.cfg.heads else self.width();
     }
 
     pub fn geometry(self: *const Gate, shape: Shape) ?metal.Geometry {
@@ -119,17 +108,6 @@ const Gate = struct {
         const s: c_int = @intCast(shape.rows);
         const w: c_int = @intCast(self.width());
         switch (c.kind) {
-            .softplus => {
-                const tg: c_int = @min(256, @max(32, @divTrunc(w + 31, 32) * 32));
-                if (@rem(w, tg) != 0) return null;
-                var g = metal.Geometry{ .grid = .{ w, s, 1 }, .tg = .{ tg, 1, 1 } };
-                g.out(&.{ 1, s, w }, c.dt);
-                g.dtype("T", c.dt);
-                g.int("NH", c.heads);
-                g.int("HD", c.hd);
-                g.int("TG", tg);
-                return g;
-            },
             .table, .strided => {
                 const n = s * w;
                 const tg: c_int = if (c.kind == .table) @min(256, @max(32, @divTrunc(n + 31, 32) * 32)) else @min(256, @divTrunc(n + 31, 32) * 32);
@@ -157,7 +135,7 @@ const Gate = struct {
         const rng = prng.random();
         const c = self.cfg;
         const rows = shape.rows;
-        // Gate logits past both of softplus's branches and sigmoid's saturation.
+        // Gate logits past sigmoid's saturation.
         self.x = try host.uniform(a, rng, rows * self.width(), -3, 3, c.dt);
         self.g = try host.uniform(a, rng, rows * self.gateWidth(), -40, 40, c.dt);
         if (fill == .nonfinite) {
@@ -171,10 +149,6 @@ const Gate = struct {
         const d: c_int = @intCast(c.hd);
         const w: c_int = @intCast(self.width());
         switch (c.kind) {
-            .softplus => {
-                self.args[0] = try rig.input(c.dt, &.{ 1, s, w }, self.x);
-                self.args[1] = try rig.input(c.dt, &.{ 1, s, h }, self.g);
-            },
             .table => {
                 self.args[0] = try rig.input(c.dt, &.{ 1, s, w }, self.x);
                 self.args[1] = try rig.input(c.dt, &.{ 1, s, @intCast(self.gateWidth()) }, self.g);
@@ -198,20 +172,14 @@ const Gate = struct {
                 self.args[1] = self.views[1];
             },
         }
-        if (c.kind != .softplus) {
-            // MLX's own sigmoid over every 16-bit pattern, as the wrapper binds it.
-            self.args[2] = try fused_activations.swigluSigTable(rig.stream(), c.dt, std.heap.c_allocator);
-            self.args[3] = try host.intScalar(rig, s * w);
-        }
+        // MLX's own sigmoid over every 16-bit pattern, as the wrapper binds it.
+        self.args[2] = try fused_activations.swigluSigTable(rig.stream(), c.dt, std.heap.c_allocator);
+        self.args[3] = try host.intScalar(rig, s * w);
         return true;
     }
 
-    fn nargs(self: *const Gate) usize {
-        return if (self.cfg.kind == .softplus) 2 else 4;
-    }
-
     pub fn run(self: *Gate) !void {
-        try self.rig.launch(self.launch, self.geometry(self.shape).?, self.args[0..self.nargs()]);
+        try self.rig.launch(self.launch, self.geometry(self.shape).?, self.args[0..4]);
     }
 
     pub fn count(self: *const Gate) usize {
@@ -224,10 +192,7 @@ const Gate = struct {
         const per: usize = if (gw == self.width()) 1 else c.hd;
         for (want, mag, 0..) |*o, *m, i| {
             const g = self.g[(i / self.width()) * gw + (i % self.width()) / per];
-            const f = switch (c.kind) {
-                .softplus => softplus(g),
-                .table, .strided => 1 / (1 + @exp(-g)),
-            };
+            const f = 1 / (1 + @exp(-g));
             o.* = host.rt(c.dt, self.x[i] * host.rt(c.dt, f));
             m.* = @abs(o.*);
         }
@@ -243,12 +208,6 @@ const Gate = struct {
         const h: c_int = @intCast(c.heads);
         const d: c_int = @intCast(c.hd);
         const out = switch (c.kind) {
-            .softplus => blk: {
-                const g32 = try g.astype(x[1], .float32);
-                const sp = try g.call(mlx.mlx_logaddexp, .{ try g.scalar(0, .float32), g32 });
-                const gr = try g.reshape(try g.astype(sp, c.dt), &.{ 1, s, h, 1 });
-                break :blk try g.mul(try g.reshape(x[0], &.{ 1, s, h, d }), gr);
-            },
             .table => if (c.headwise)
                 try g.mul(try g.reshape(x[0], &.{ 1, s, h, d }), try g.reshape(try g.sigmoid(x[1]), &.{ 1, s, h, 1 }))
             else
@@ -264,7 +223,6 @@ const Gate = struct {
         const x = self.args;
         const st = self.rig.stream();
         const got = switch (c.kind) {
-            .softplus => try gates.fusedAttnGate(st, x[0], x[1], @intCast(c.heads), @intCast(c.hd)),
             .table => try gates.fusedSigmoidGateMul(st, x[0], x[1], if (c.headwise) @intCast(c.heads) else 0),
             .strided => try gates.stridedSigmoidGateMul(st, x[0], x[1]),
         } orelse return error.Declined;
@@ -273,13 +231,6 @@ const Gate = struct {
     }
 };
 
-/// MLX's LogAddExp(0, g): max + log1p(exp(min - max)), an infinite max short-circuited.
-fn softplus(g: f64) f64 {
-    if (std.math.isNan(g)) return g;
-    const mx = @max(0, g);
-    if (std.math.isInf(mx)) return mx;
-    return mx + std.math.log1p(@exp(@min(0, g) - mx));
-}
 
 fn tokens(comptime list: []const usize, comptime n: usize) []const Shape {
     comptime var out: [list.len]Shape = undefined;
@@ -297,7 +248,6 @@ fn gateSpec(comptime name: []const u8, cfg: GateCfg, served: []const Shape) spec
         .mids = 1,
         .out = host.elemOf(cfg.dt),
         .replaces = switch (cfg.kind) {
-            .softplus => "astype -> logaddexp -> astype -> broadcast multiply",
             .table => if (cfg.headwise) "sigmoid -> broadcast multiply" else "sigmoid -> multiply",
             .strided => "sigmoid -> multiply (strided views)",
         },
@@ -305,10 +255,9 @@ fn gateSpec(comptime name: []const u8, cfg: GateCfg, served: []const Shape) spec
     };
 }
 
-/// Laguna (48 x 128, opt-in), Muse-Glimmer (32 x 128 by channel), Spark-X2.5 (16 x 256 by head), the qwen3_5 full
+/// Muse-Glimmer (32 x 128 by channel), Spark-X2.5 (16 x 256 by head), the qwen3_5 full
 /// layers' gate (24 x 256; f16 on Bonsai's packs) up to the add-norm row cap.
 const gate_registrations = .{
-    .{ "attn_out_gate bf16 (softplus, 48 x 128)", GateCfg{ .kind = .softplus, .heads = 48, .hd = 128 }, tokens(&.{ 1, 7, 64 }, 6144), &softplus_launch },
     .{ "sigmoid_gate_mul bf16 (by channel, 32 x 128)", GateCfg{ .kind = .table, .heads = 32, .hd = 128 }, tokens(&.{ 1, 5, 64 }, 4096), &table_launch },
     .{ "sigmoid_gate_mul bf16 (by head, 16 x 256)", GateCfg{ .kind = .table, .heads = 16, .hd = 256, .headwise = true }, tokens(&.{ 1, 5, 64 }, 4096), &table_launch },
     .{ "strided_sigmoid_gate_mul bf16 (24 x 256)", GateCfg{ .kind = .strided, .heads = 24, .hd = 256 }, tokens(&.{ 1, 3, 16 }, 6144), &strided_launch },
@@ -2761,8 +2710,6 @@ pub fn register(set: *kc.Set) !void {
 test "kernel contract attention: each declared launch is the shipped wrapper's, byte for byte" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const a = std.testing.allocator;
-    gates.attn_gate_fused_override = true;
-    defer gates.attn_gate_fused_override = null;
     fused_activations.swiglu_fused_override = true;
     defer fused_activations.swiglu_fused_override = null;
     var set = kc.Set.init(a);

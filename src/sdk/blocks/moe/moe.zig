@@ -28,7 +28,6 @@ const verifyQmmNaxAvailable = @import("../linear/verify_qmm_nax.zig").verifyQmmN
 const swigluClampLimit = @import("../mlp/activations.zig").swigluClampLimit;
 const swigluFusedEnabled = @import("../mlp/fused_activations.zig").swigluFusedEnabled;
 const moeFp4DecodeEligible = @import("decode.zig").moeFp4DecodeEligible;
-const useBatchedExpertDecode = @import("decode.zig").useBatchedExpertDecode;
 const useGatherQmvDecode = @import("decode.zig").useGatherQmvDecode;
 const gatherExpertMm = @import("experts.zig").gatherExpertMm;
 const moeCudaFormat = @import("gather_qmv_rows.zig").moeCudaFormat;
@@ -40,7 +39,6 @@ const moePrefillRoutePack = @import("verify_kernels.zig").moePrefillRoutePack;
 const verifyExpertReduce = @import("verify_kernels.zig").verifyExpertReduce;
 const verifyExpertReuse = @import("verify_kernels.zig").verifyExpertReuse;
 const verifyIndexedExpertInput = @import("verify_kernels.zig").verifyIndexedExpertInput;
-const verifyPairedGateUp = @import("verify_kernels.zig").verifyPairedGateUp;
 const verifyRoutePack = @import("verify_kernels.zig").verifyRoutePack;
 const MoeMlpWeights = @import("weights.zig").MoeMlpWeights;
 
@@ -667,10 +665,7 @@ pub fn moeMLP2WithRouter(self: *Transformer, router_x: mlx.mlx_array, expert_x_i
             }
         }
 
-        const expert_act = if (fused_act) |act| act else if (!has_gate_scale and self.verify_paired_gu_installed and B == 1 and S == 4 and
-            self.verifyFeatureEnabled(.routing, skip_shared, B, S))
-            try verifyPairedGateUp(self.s, x_flat, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, lhs_idx, sorted_inds)
-        else blk: {
+        const expert_act = if (fused_act) |act| act else blk: {
             const use_mapped_gate = mapped_gate != null;
             var gate_out_3d = mapped_gate orelse mlx.mlx_array_new();
             mapped_gate = null;
@@ -765,42 +760,7 @@ pub fn moeMLP2WithRouter(self: *Transformer, router_x: mlx.mlx_array, expert_x_i
         // (µbench at Laguna's 201 MB bank: 37 us vs batched 72 vs stock
         // gather_qmm 349). Everything is done inside the predicate; a null
         // return (unsupported quant mode or width) falls through to the
-        // batched take path below with no behaviour change.
-    } else if (B * S == 1 and useBatchedExpertDecode(self) and mw.switch_gate_s.ctx != null and mw.switch_up_s.ctx != null and mw.switch_down_s.ctx != null) {
-        // ── Decode fast path: take experts + batched quantized_matmul ──
-        // Dodges our libmlx's serialized decode gather_qmm. A per-arch
-        // VALIDATED opt-in (laguna by default) — NOT default-on-for-all-MoE:
-        // on small-expert MoEs (gemma4/qwen3.6) the take-materialization is a
-        // net loss vs gather. See `useBatchedExpertDecode` / the policy test.
-        // Quantized experts only (dense bf16 has null scales → gather path).
-        var inds_flat = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(inds_flat);
-        const kshape = [_]c_int{K};
-        try mlx.check(mlx.mlx_reshape(&inds_flat, inds, &kshape, 1, self.s));
-
-        // x_bc: expert_x [B,S,D] → [1,1,D] → broadcast [K,1,D]
-        var x_1d = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(x_1d);
-        const x1_shape = [_]c_int{ 1, 1, D };
-        try mlx.check(mlx.mlx_reshape(&x_1d, expert_x, &x1_shape, 3, self.s));
-        var x_bc = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(x_bc);
-        const bc_shape = [_]c_int{ K, 1, D };
-        try mlx.check(mlx.mlx_broadcast_to(&x_bc, x_1d, &bc_shape, 3, self.s));
-
-        const gate_out = try self.batchedExpertMm(x_bc, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, inds_flat, gate_qp.bits, gate_qp.group_size, gate_qp.mode); // [K,1,inter]
-        defer _ = mlx.mlx_array_free(gate_out);
-        const up_out = try self.batchedExpertMm(x_bc, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, inds_flat, up_qp.bits, up_qp.group_size, up_qp.mode); // [K,1,inter]
-        defer _ = mlx.mlx_array_free(up_out);
-
-        const expert_act = try self.computeGeglu(gate_out, up_out); // [K,1,inter]
-        defer _ = mlx.mlx_array_free(expert_act);
-
-        const down = try self.batchedExpertMm(expert_act, mw.switch_down_w, mw.switch_down_s, mw.switch_down_b, inds_flat, down_qp.bits, down_qp.group_size, down_qp.mode); // [K,1,hidden]
-        defer _ = mlx.mlx_array_free(down);
-        const hidden = mlx.getShape(down)[mlx.getShape(down).len - 1];
-        const bskh_shape = [_]c_int{ B, S, K, hidden };
-        try mlx.check(mlx.mlx_reshape(&down_out, down, &bskh_shape, 4, self.s)); // [B,S,K,hidden]
+        // stock gather below with no behaviour change.
     } else {
         // ── Decode / small-prefill path (gather_qmm) ──
         const exp_shape = [_]c_int{ B, S, 1, 1, D };

@@ -160,69 +160,13 @@ fn qsaSourceHoldsRowsAt(src: *const SSMCheckpoint, pos: c_int, want: c_int) bool
     return any;
 }
 
-/// One QSA layer's history onto `dst_aux`/`dst_pooled`, sliced to `take` rows
-/// (pooled to `take/ratio` blocks). `materialize` = a fresh buffer (a trim must free the snap
-/// it drops); false = refcount-share the source (a full-length share is the same handle, a
-/// sliced one an `mlx_slice` view). `take <= 0` leaves the destination empty.
-fn copyQsaHistorySliced(dst_aux: *mlx.mlx_array, dst_pooled: *mlx.mlx_array, src_aux: mlx.mlx_array, src_pooled: mlx.mlx_array, ratio: c_int, src_hist: c_int, take: c_int, materialize: bool, s: mlx.mlx_stream) !void {
-    if (dst_aux.ctx != null) _ = mlx.mlx_array_free(dst_aux.*);
-    dst_aux.* = .{ .ctx = null };
-    if (dst_pooled.ctx != null) _ = mlx.mlx_array_free(dst_pooled.*);
-    dst_pooled.* = .{ .ctx = null };
-    if (take <= 0) return;
-    if (src_pooled.ctx != null) {
-        if (materialize) {
-            dst_pooled.* = try materializedOwnedCopy(s, src_pooled);
-        } else {
-            dst_pooled.* = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_array_set(dst_pooled, src_pooled));
-        }
-        try truncatePooled(dst_pooled, take, ratio, s, materialize);
-    }
-    if (src_aux.ctx == null) return;
-    const ks = mlx.getShape(src_aux);
-    if (ks.len < 2) return;
-    const src_ring: c_int = ks[1];
-    const hist: c_int = if (src_hist > 0) src_hist else src_ring;
-    const dest_take: c_int = @min(take, hist);
-    const src_start: c_int = hist - src_ring;
-    const want_start: c_int = if (dest_take > QSA_RING_ROWS) dest_take - QSA_RING_ROWS else 0;
-    const ov_start = @max(src_start, want_start);
-    const ov_end = @min(hist, dest_take);
-    if (ov_end <= ov_start) return;
-    const phys_from = ov_start - src_start;
-    const phys_to = ov_end - src_start;
-    const full = phys_from == 0 and phys_to == src_ring;
-    if (full and !materialize) {
-        dst_aux.* = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_array_set(dst_aux, src_aux));
-    } else if (full) {
-        dst_aux.* = try materializedOwnedCopy(s, src_aux);
-    } else {
-        const start = [_]c_int{ 0, phys_from, 0 };
-        const stop = [_]c_int{ ks[0], phys_to, ks[2] };
-        const strides = [_]c_int{ 1, 1, 1 };
-        var view = mlx.mlx_array_new();
-        mlx.check(mlx.mlx_slice(&view, src_aux, &start, 3, &stop, 3, &strides, 3, s)) catch |err| {
-            _ = mlx.mlx_array_free(view);
-            return err;
-        };
-        if (materialize) {
-            defer _ = mlx.mlx_array_free(view);
-            dst_aux.* = try materializedOwnedCopy(s, view);
-        } else {
-            dst_aux.* = view;
-        }
-    }
-}
-
 /// Copy QSA aux/pooled from the live entries onto the LATEST checkpoint —
 /// ONE materialized copy, sliced to that checkpoint's position (a cancel
 /// handoff attaches while the live history is ahead of the last stride
 /// snap). Older snaps in `cps` drop any history they carried. No-op when
 /// `cps` is empty or no layer holds QSA history.
 ///
-/// The `MLX_SERVE_QSA_HISTORY_SHARE=0` arm: the copy coexists with the live buffer for the whole decode.
+/// The copy arm: the copy coexists with the live buffer for the whole decode.
 pub fn attachQsaHistoryToLatest(cps: []SSMCheckpoint, live: []const SSMCacheEntry, s: mlx.mlx_stream) !void {
     return attachQsaHistoryToLatestMode(cps, live, s, .copy);
 }

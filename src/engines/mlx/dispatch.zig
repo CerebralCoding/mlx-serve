@@ -180,42 +180,20 @@ test "ownsModuleDecodeState covers every module-owned arch" {
     try testing.expect(t.ownsModuleDecodeState());
 }
 
-test "every optional arch-module pointer on Transformer is a declared module-owned arch" {
-    // Class guard, not an instance guard: a THIRD arch declared the same way
-    // as the two above is module-owned by construction, and forgetting it in
-    // the list is SILENT — serial decode still "works" until two clients
-    // arrive at once. Needles are built at runtime so this test's own source
-    // cannot satisfy its own scan.
-    const src = @embedFile("transformer.zig");
-    const opt_ptr = "?" ++ "*";
-    const mod_dot = "_mod" ++ ".";
-    var i: usize = 0;
-    var found: usize = 0;
-    while (std.mem.indexOfPos(u8, src, i, opt_ptr)) |p| {
-        i = p + opt_ptr.len;
-        // Shape: `    <name>: ?*<x>_mod.<Y> = null,` — the module type must
-        // follow immediately, with a bare identifier in between.
-        const rest = src[i..];
-        const mod_at = std.mem.indexOf(u8, rest[0..@min(rest.len, 40)], mod_dot) orelse continue;
-        if (std.mem.indexOfAny(u8, rest[0..mod_at], " ,)!*\"<`") != null) continue;
-        const line_start = if (std.mem.lastIndexOfScalar(u8, src[0..p], '\n')) |nl| nl + 1 else 0;
-        const decl = std.mem.trim(u8, src[line_start..p], " ");
-        if (!std.mem.endsWith(u8, decl, ":")) continue;
-        const name = decl[0 .. decl.len - 1];
-        if (name.len == 0 or std.mem.indexOfAny(u8, name, " /(\"`") != null) continue;
-        found += 1;
-        var listed = false;
-        for (Transformer.module_owned_state_fields) |f| {
-            if (std.mem.eql(u8, f, name)) listed = true;
-        }
-        for (Transformer.module_shared_readonly_fields) |f| {
-            if (std.mem.eql(u8, f, name)) listed = true;
-        }
-        if (!listed) {
-            std.debug.print("module arch field declared in neither list: {s}\n", .{name});
-            return error.UndeclaredModuleOwnedArch;
+test "every optional pointer on Transformer is declared module-owned, shared read-only or engine-owned" {
+    // A third arch declared like the module-owned ones is exclusive by construction only if it lands in a list:
+    // forgetting it is silent until two clients arrive at once.
+    const engine_owned = [_][]const u8{ "ane_prefill", "plugin", "qwen4_mtp_owner", "rht", "int8_cache", "capture_hidden", "spec_tree" };
+    const info = @typeInfo(Transformer).@"struct";
+    inline for (info.field_names, info.field_types) |name, T| {
+        const ti = @typeInfo(T);
+        if (ti == .optional and @typeInfo(ti.optional.child) == .pointer and @typeInfo(ti.optional.child).pointer.size == .one) {
+            var listed = false;
+            for (module_owned_state_fields ++ module_shared_readonly_fields ++ engine_owned) |l| {
+                if (std.mem.eql(u8, l, name)) listed = true;
+            }
+            if (!listed) std.debug.print("Transformer.{s}: an optional pointer in no list\n", .{name});
+            try testing.expect(listed);
         }
     }
-    // A scan that matches nothing passes vacuously — pin the known count.
-    try testing.expectEqual(Transformer.module_owned_state_fields.len + Transformer.module_shared_readonly_fields.len, found);
 }

@@ -147,14 +147,13 @@ fn edit(e: *Engine, j: *const image_request.Job, sp: anytype) Verdict {
     const prefix = config.editPrefixBytes(@intCast(n), j.ref_resolution, cfg.layers, cfg.hidden(), if (j.guidance_scale != 1) 2 else 1);
     const steps = qi.resolveSteps(null, j.steps);
     const room = job.gpuHeadroom();
-    const cache_enabled = qi.prefixCacheEnabled(std.c.getenv("MLX_SERVE_QWEN_IMAGE_KV_CACHE"));
-    const cache = config.editPlan(steps, cache_enabled, base, prefix, room) orelse {
+    const cache = config.editPlan(steps, base, prefix, room) orelse {
         log.info("[image] edit bill refused: {d} refs at refres {d} + {d}x{d} target needs {d} MB over the reserve, headroom {d} MB\n", .{
             n, j.ref_resolution, dims.w, dims.h, (base -| config.EDIT_TRANSIENT_BYTES) >> 20, room >> 20,
         });
         return Verdict.refuse(.unsupported, "this edit's working set (references + target) needs more GPU memory than is free — lower 'ref_resolution' or the reference count, or shrink 'size'");
     };
-    if (cache_enabled and steps > 1 and !cache) log.info("[image] edit prefix cache does not fit; using uncached forward (cached bill {d} MB over reserve, headroom {d} MB)\n", .{
+    if (steps > 1 and !cache) log.info("[image] edit prefix cache does not fit; using uncached forward (cached bill {d} MB over reserve, headroom {d} MB)\n", .{
         ((base +| prefix) -| config.EDIT_TRANSIENT_BYTES) >> 20, room >> 20,
     });
     const img = e.m.editImage(gpa, j.prompt, refs[0..n], dims.w, dims.h, j.seed, steps, .{

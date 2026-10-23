@@ -184,8 +184,8 @@ pub const Head = struct {
     }
 
     pub fn bindRerank(self: *Head, target: *Transformer) void {
-        if (mtp_mod.MtpModel.draftRerankMode() == .off or target.lm_head_s.ctx == null) return;
-        self.rerank_coarse = mtp_mod.buildRerankCoarse(self.s, target, mtp_mod.rerankCoarseBits());
+        if (target.lm_head_s.ctx == null) return;
+        self.rerank_coarse = mtp_mod.buildRerankCoarse(self.s, target, mtp_mod.DRAFT_HEAD_BITS);
     }
 
     pub fn canRerankDrafts(self: *const Head) bool {

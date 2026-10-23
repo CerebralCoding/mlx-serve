@@ -10,7 +10,6 @@ const HcWeights = @import("../../../plugins/qwen4_exp/weights.zig").HcWeights;
 const PleWeights = @import("../../../plugins/qwen4_exp/weights.zig").PleWeights;
 const LinearAttnWeights = @import("../../../sdk/blocks/gdn/gated_delta_net.zig").LinearAttnWeights;
 const DenseMlpWeights = @import("../../../sdk/blocks/mlp/dense.zig").DenseMlpWeights;
-const fusedAddRmsNorm = @import("../../../sdk/blocks/norms/residual_norm.zig").fusedAddRmsNorm;
 const endMropeChunk = @import("../../../sdk/blocks/rope/mrope.zig").endMropeChunk;
 const ProfClock = @import("../diag/profile.zig").ProfClock;
 const decodeProfReport = @import("../diag/profile.zig").decodeProfReport;
@@ -190,7 +189,7 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
         } else {
             // Qwen3.5: simple residual + post_attn_norm before MLP. The two
             // are strictly serial (the norm waits on the add, the MLP waits
-            // on the norm), so one kernel does both — see fusedAddRmsNorm.
+            // on the norm).
             var ff_normed = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(ff_normed);
             // A dense MLP only reads `ff_normed` through rotated weights;
@@ -203,11 +202,6 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
             } else if (try self.narrowAddNorm(h, attn_out, lw.post_attn_norm)) |fused| {
                 _ = mlx.mlx_array_free(h);
                 h = fused.h;
-                _ = mlx.mlx_array_free(ff_normed);
-                ff_normed = fused.normed;
-            } else if (try fusedAddRmsNorm(self.s, h, attn_out, lw.post_attn_norm, self.rms_eps_arr)) |fused| {
-                _ = mlx.mlx_array_free(h);
-                h = fused.sum;
                 _ = mlx.mlx_array_free(ff_normed);
                 ff_normed = fused.normed;
             } else {

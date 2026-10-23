@@ -14,8 +14,6 @@ const MtpRoundState = @import("round.zig").MtpRoundState;
 const SubLap = @import("trace.zig").SubLap;
 const capAcceptedForTokenBudget = @import("../verify.zig").capAcceptedForTokenBudget;
 const mtpAcceptRowGreedy = @import("round.zig").mtpAcceptRowGreedy;
-const mtpAdaptiveEnabled = @import("trace.zig").mtpAdaptiveEnabled;
-const mtpBatchCorrEnabled = @import("serial.zig").mtpBatchCorrEnabled;
 const mtpEmaMs = @import("regime.zig").mtpEmaMs;
 const mtpFullAccept = @import("round.zig").mtpFullAccept;
 const mtpGreedyPrefix = @import("round.zig").mtpGreedyPrefix;
@@ -38,7 +36,6 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
     const xfm = self.xfm;
     const s = xfm.s;
     const tracing = st.tracing;
-    const livecost = st.livecost;
     var ph = st.ph;
     var round_watch = st.round_watch;
     const chain = &st.chain;
@@ -134,7 +131,7 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
         st.accept_q = .{ .ctx = null };
         st.accept_defer = .{ .ctx = null };
         st.corr = .{ .ctx = null };
-    } else if (stochastic and mtpBatchCorrEnabled()) {
+    } else if (stochastic) {
         // A group-padded row filters only the 1+m positions it reads.
         var live_logits = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(live_logits);
@@ -503,7 +500,7 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
         if (!chain.lookup) {
             self.mtpPlannerObserve(observed_limit, m);
             if (!group_planner.enabled() or self.mtp_planner_width == null) {
-                if (mtpAdaptiveEnabled()) self.updateMtpEvRound(m, m) else self.updateMtpDepth(m, m);
+                self.updateMtpEvRound(m, m);
             }
         }
         if (tracing) {
@@ -518,7 +515,7 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
         self.mtpTraceRoundEnd(m, m, m_lo);
         if (times_round) {
             self.mtpRoundEndObserve(m, m + 1, m_max > m_lo, m_lo, plan.width_trial, @as(f32, @floatFromInt(round_watch.read())) / @as(f32, std.time.ns_per_ms));
-            if (livecost) self.mtp_ev_round_ms = mtpEmaMs(self.mtp_ev_round_ms, round_watch.read());
+            self.mtp_ev_round_ms = mtpEmaMs(self.mtp_ev_round_ms, round_watch.read());
         } else {
             if (chain.lookup) self.mtpLookupObserve(m, m + 1);
             self.mtpRoundUntimed();
@@ -609,7 +606,7 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
     if (!chain.lookup) {
         self.mtpPlannerObserve(if (stop_prefix.stop != null) accepted else observed_limit, accepted);
         if (!group_planner.enabled() or self.mtp_planner_width == null) {
-            if (mtpAdaptiveEnabled()) self.updateMtpEvRound(m, accepted) else self.updateMtpDepth(m, accepted);
+            self.updateMtpEvRound(m, accepted);
         }
     }
     if (tracing) {
@@ -624,7 +621,7 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
     self.mtpTraceRoundEnd(m, accepted, m_lo);
     if (times_round) {
         self.mtpRoundEndObserve(m, accepted + 1, m_max > m_lo, m_lo, plan.width_trial, @as(f32, @floatFromInt(round_watch.read())) / @as(f32, std.time.ns_per_ms));
-        if (livecost) self.mtp_ev_round_ms = mtpEmaMs(self.mtp_ev_round_ms, round_watch.read());
+        self.mtp_ev_round_ms = mtpEmaMs(self.mtp_ev_round_ms, round_watch.read());
     } else {
         if (chain.lookup) self.mtpLookupObserve(m, accepted + 1);
         self.mtpRoundUntimed();

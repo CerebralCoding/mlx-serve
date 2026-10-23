@@ -585,7 +585,7 @@ pub const ModelConfig = struct {
     mtp_acceptance_override: ?mtp_acceptance_mod.Mode = null,
     /// null = the process `--mtp-greedy-tail` (off when absent).
     mtp_greedy_tail_override: ?bool = null,
-    /// null = the process default (`MLX_SERVE_BONSAI_INT8_PREFILL`).
+    /// null = off (the route changes numerics).
     int8_prefill_override: ?bool = null,
     /// LOSSY MXFP8 copy of a dense head; null = `--lm-head-mxfp8`, else the integrated-CUDA default.
     lm_head_mxfp8_override: ?bool = null,
@@ -5481,11 +5481,11 @@ pub fn narrowsLoadedF32Norm(key: []const u8, ndim: usize, dtype: mlx.mlx_dtype) 
         (std.mem.endsWith(u8, key, "layernorm.weight") or std.mem.endsWith(u8, key, "language_model.norm.weight"));
 }
 
-/// Kill switch for the 1-D arm (`MLX_SERVE_F16_NARROW_1D=0`). A load-time
+/// The 1-D arm. A load-time
 /// dtype normalization is invisible once the model is up, so a one-boot A/B
 /// switch is the only way to attribute a future f16-checkpoint regression to
 /// it. The side-tensor arm predates this and is not switchable.
-var narrow_1d_env: ?bool = null;
+var narrow_1d_cached: ?bool = null;
 
 /// ON for Metal and CUDA: an f16 norm left beside bf16 activations widens the
 /// whole residual to f32. OFF for the Omarchy Vulkan backend, which has no
@@ -5500,13 +5500,9 @@ test "f16 1-D tables narrow to bf16 on Metal and CUDA, not on Vulkan" {
     try std.testing.expect(!narrow1dDefault(false, false));
 }
 fn narrow1dEnabled() bool {
-    if (narrow_1d_env) |v| return v;
-    const on = blk: {
-        const raw = env.get(.MLX_SERVE_F16_NARROW_1D) orelse
-            break :blk narrow1dDefault(builtin.os.tag.isDarwin(), mlx.cudaAvailable());
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    narrow_1d_env = on;
+    if (narrow_1d_cached) |v| return v;
+    const on = narrow1dDefault(builtin.os.tag.isDarwin(), mlx.cudaAvailable());
+    narrow_1d_cached = on;
     return on;
 }
 
@@ -5517,7 +5513,7 @@ var narrowed_1d: usize = 0;
 
 pub fn reportF16Narrowing() void {
     if (narrowed_1d == 0) return;
-    log.info("[dtype] narrowed {d} 1-D f16 tables to bf16 (MLX_SERVE_F16_NARROW_1D=0 disables)\n", .{narrowed_1d});
+    log.info("[dtype] narrowed {d} 1-D f16 tables to bf16\n", .{narrowed_1d});
     narrowed_1d = 0;
 }
 

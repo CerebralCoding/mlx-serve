@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """GROUPED MTP over HTTP (`enable_batch_mtp`): EOS inside an accepted draft block, and one row of a group cancelled
-mid-round, against a server the CALLER boots with native MTP, MLX_SERVE_MTP_GROUP_PLANNER=1, --mtp-min-depth 4
+mid-round, against a server the CALLER boots with native MTP, --mtp-min-depth 4
 --mtp-max-depth 4 and --log-level debug.
 
   python3 tests/test_mtp_batch_stops.py <port> --server-log <that log> [--out <dir>]

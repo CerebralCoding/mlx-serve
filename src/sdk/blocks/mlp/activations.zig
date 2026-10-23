@@ -311,9 +311,7 @@ pub fn gptOssSwiGLU(s: mlx.mlx_stream, gate: mlx.mlx_array, up: mlx.mlx_array, l
 /// So the eligibility predicate is deliberately NARROW — silu activation
 /// (baked into the kernel), matching quant geometry on gate and up — rather
 /// than a model_type list. An arch that does not meet it, gemma4's gelu MoE
-/// included, keeps stock gather and cannot regress. `MLX_SERVE_MOE_GATHER_DECODE=1`
-/// forces stock everywhere; `MLX_SERVE_MOE_GATEUP_FUSED=0` disables just the
-/// fused kernel, which also drops this predicate back to false.
+/// included, keeps stock gather and cannot regress.
 /// The `swiglu_limit` the fused SwiGLU epilogues clamp at: 0 for none, the limit when it is a
 /// whole-number clamp (GLM-5-Next's 10), null for any other limited activation (gpt_oss).
 pub fn swigluClampLimit(cfg: *const ModelConfig) ?u32 {

@@ -42,7 +42,7 @@ const moeRoutingChain = @import("routing.zig").moeRoutingChain;
 // differs (a simd tree vs MLX's N_READS blocking), which cannot move a bf16
 // result except at an exact rounding boundary.
 //
-// Kill switch: MLX_SERVE_MOE_ROUTER_FUSED=0. Engagement is LOGGED, never
+// Engagement is LOGGED, never
 // inferred — a declined kernel is output-identical to the chain.
 /// `sigmoid_bias_grouped` is `sigmoid_bias` with a GROUP LIMIT spliced
 /// between the bias and the top-k: the experts are split into NG equal groups,
@@ -233,16 +233,10 @@ const RouterCfgSlot = struct {
 var router_cfg_cache: [5]RouterCfgSlot = .{ .{}, .{}, .{}, .{}, .{} };
 
 pub var moe_router_fused_override: ?bool = null;
-var moe_router_fused_env: ?bool = null;
 var moe_router_engaged: bool = false;
 
 pub fn moeRouterFusedEnabled() bool {
-    if (moe_router_fused_override) |v| return v;
-    if (moe_router_fused_env) |v| return v;
-    const raw = env.get(.MLX_SERVE_MOE_ROUTER_FUSED);
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    moe_router_fused_env = enabled;
-    return enabled;
+    return moe_router_fused_override orelse true;
 }
 
 /// The shared-expert gate's logit, folded into the softmax router: `x` [rows * gate_k] and the flat

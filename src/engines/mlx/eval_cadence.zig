@@ -108,27 +108,9 @@ pub fn evalCadencePoint(h: mlx.mlx_array, ssm_entries: ?[]SSMCacheEntry) !void {
 /// the ladder only adds submissions. Swept on Laguna XS 2.1 NVFP4 / M4 Max,
 /// 512-token prompt / 128 decode steps, medians of 2:
 ///   off 39.88 | stride 8 40.22 | 4 40.37 | 2 41.08 | 1 41.49 ms/token
-/// Monotonically worse as the stride tightens. Kept as a knob because the
-/// balance is per-arch (a model with a much cheaper CPU-side graph could
-/// still be build-bound), but it ships off and any future default-on needs
-/// its own A/B on the arch in question. Exception: qwen4_exp batched decode
-/// ships on (`qwen4DecodeLadderStride`).
-///
-/// `MLX_SERVE_DECODE_ASYNC_LADDER` picks the boundary set:
-///   unset / "0" / "off"  disabled (the shipped default; unset is every 4th layer on qwen4_exp batched decode)
-///   "auto"               every 8th layer
-///   "<n>"                every n-th layer
-/// Only decode-width forwards ladder: a spec-verify or prefill forward
-/// already has enough GPU work per layer to keep the device busy, and an
-/// async eval mid-verify would fight the cadence's memory bound.
-pub fn decodeAsyncLadderStride(raw: ?[]const u8) u32 {
-    const v = raw orelse return 0;
-    if (v.len == 0 or std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off")) return 0;
-    if (std.mem.eql(u8, v, "auto")) return DECODE_ASYNC_LADDER_AUTO;
-    return std.fmt.parseInt(u32, v, 10) catch 0;
-}
-
-pub const DECODE_ASYNC_LADDER_AUTO: u32 = 8;
+/// Monotonically worse as the stride tightens, so it ships off (`Transformer.decode_async_ladder` 0) except on
+/// qwen4_exp batched decode (`QWEN4_DECODE_ASYNC_LADDER_DEFAULT`). Only decode-width forwards ladder: a spec-verify
+/// or prefill forward already has enough GPU work per layer to keep the device busy.
 
 // A PREFILL-side async-eval ladder (mlxfast-challenge prefillLadder:
 // asyncEval every 3rd-4th layer at seq >= 512) was ported and measured
@@ -230,22 +212,6 @@ test "prefillEvalCadence: big unfused score tensor forces eval-per-layer" {
     // cap (generate.zig) does NOT restore the coarse cadence at long context.
     // (Live: this cadence measured peak 27.0 GB and +14% prefill vs baseline.)
     try t.expectEqual(@as(u32, 1), Transformer.prefillEvalCadence(4, 256, 256, 16, 8, 1024, 102_448, false));
-}
-
-test "decodeAsyncLadderStride: ships OFF (measured negative); auto/<n> opt in" {
-    const t = testing;
-    // Unset and "auto" both take the measured default; a caller must be able
-    // to turn the ladder OFF for an A/B, and a silent fallback to ON would
-    // make the off-cell output-identical to the on-cell and read as a null win.
-    try t.expectEqual(@as(u32, 0), Transformer.decodeAsyncLadderStride(null));
-    try t.expectEqual(@as(u32, 0), Transformer.decodeAsyncLadderStride(""));
-    try t.expectEqual(@as(u32, 0), Transformer.decodeAsyncLadderStride("0"));
-    try t.expectEqual(@as(u32, 0), Transformer.decodeAsyncLadderStride("off"));
-    try t.expectEqual(@as(u32, 8), Transformer.decodeAsyncLadderStride("auto"));
-    try t.expectEqual(@as(u32, 1), Transformer.decodeAsyncLadderStride("1"));
-    try t.expectEqual(@as(u32, 4), Transformer.decodeAsyncLadderStride("4"));
-    // Garbage stays OFF rather than silently enabling a measured-negative lever.
-    try t.expectEqual(@as(u32, 0), Transformer.decodeAsyncLadderStride("banana"));
 }
 
 test "prefillEvalCadenceApplies: spec-verify-width forwards skip the cadence entirely" {

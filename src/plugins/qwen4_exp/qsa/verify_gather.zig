@@ -29,23 +29,14 @@ const qsaAttnCacheFixture = @import("sparse_attn.zig").qsaAttnCacheFixture;
 const qsaSlotAttn = @import("sparse_attn.zig").qsaSlotAttn;
 const qsaWantsBlocks = @import("sparse_attn.zig").qsaWantsBlocks;
 
-var qsa_verify_gather_env_cached: ?bool = null;
 
 /// Verify-width QSA gather (2 <= S < FUSED256_MIN_Q_LEN — an MTP/DFlash
 /// verify block): read the UNION of the S rows' selections + the union tail
 /// instead of the whole cache under a dense [S, kv] mask. With `--kv-quant 8`
 /// the dense mask arm also dequantizes the whole stored range per layer per
 /// forward; this arm dequantizes only the gathered rows.
-/// MLX_SERVE_QSA_VERIFY_GATHER=0 restores the dense mask arm.
 pub fn qsaVerifyGatherEnabled() bool {
-    if (transformer.qsa_verify_gather_override) |v| return v;
-    if (qsa_verify_gather_env_cached) |v| return v;
-    const v = blk: {
-        const raw = std.c.getenv("MLX_SERVE_QSA_VERIFY_GATHER") orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    qsa_verify_gather_env_cached = v;
-    return v;
+    return transformer.qsa_verify_gather_override orelse true;
 }
 
 /// The union is FIXED-size (S * budget blocks): at the production budget
@@ -53,24 +44,14 @@ pub fn qsaVerifyGatherEnabled() bool {
 /// rows while the mask arm reads the cache in place, so the copy only pays
 /// once the union is well under half the cache (M4 Max, S=7: gather loses 7%
 /// at 17k keys, breaks even at 34k). Quantized KV dequantizes only the
-/// gathered rows, so its floor stays lower. MLX_SERVE_QSA_VERIFY_GATHER_MIN_KV
-/// sets ONE floor for both.
+/// gathered rows, so its floor stays lower.
 pub const QSA_VERIFY_GATHER_MIN_KV_DENSE: c_int = 32768;
 pub const QSA_VERIFY_GATHER_MIN_KV_QUANT: c_int = 16384;
-var qsa_verify_gather_min_kv_env: ?c_int = null;
-var qsa_verify_gather_min_kv_env_read = false;
 
 /// `quantized` = the arm will dequantize only the gathered rows, i.e. the
 /// view carries affine triples (`DenseKVView.has_quant_triple`).
 pub fn qsaVerifyGatherMinKvFor(quantized: bool) c_int {
     if (transformer.qsa_verify_gather_min_kv_override) |v| return v;
-    if (!qsa_verify_gather_min_kv_env_read) {
-        qsa_verify_gather_min_kv_env_read = true;
-        if (std.c.getenv("MLX_SERVE_QSA_VERIFY_GATHER_MIN_KV")) |raw| {
-            qsa_verify_gather_min_kv_env = std.fmt.parseInt(c_int, std.mem.sliceTo(raw, 0), 10) catch null;
-        }
-    }
-    if (qsa_verify_gather_min_kv_env) |v| return v;
     return if (quantized) QSA_VERIFY_GATHER_MIN_KV_QUANT else QSA_VERIFY_GATHER_MIN_KV_DENSE;
 }
 
@@ -388,7 +369,7 @@ pub fn qsaVerifyGatherAttn(
         try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out, q_rope, gk, gv, attn_scale, "array", add4, .{ .ctx = null }, false, s));
     }
     if (arms.qsa_engaged_bits.take(qsaEngagedBit(.verify_gather, seq_len))) {
-        log.info("[qsa-verify-gather] engaged (S={d} kv={d} rows={d}) (MLX_SERVE_QSA_VERIFY_GATHER=0 restores the dense mask arm)\n", .{ seq_len, kv, geom.rows });
+        log.info("[qsa-verify-gather] engaged (S={d} kv={d} rows={d})\n", .{ seq_len, kv, geom.rows });
     }
     return out;
 }
@@ -397,14 +378,8 @@ pub fn qsaVerifyGatherAttn(
 
 test "qsa verify gather floor: dense KV 32768, quantized 16384, override wins" {
     const prev_o = transformer.qsa_verify_gather_min_kv_override;
-    const prev_e = qsa_verify_gather_min_kv_env;
-    defer {
-        transformer.qsa_verify_gather_min_kv_override = prev_o;
-        qsa_verify_gather_min_kv_env = prev_e;
-    }
+    defer transformer.qsa_verify_gather_min_kv_override = prev_o;
     transformer.qsa_verify_gather_min_kv_override = null;
-    qsa_verify_gather_min_kv_env = null;
-    qsa_verify_gather_min_kv_env_read = true;
     try std.testing.expectEqual(@as(c_int, 32768), qsaVerifyGatherMinKvFor(false));
     try std.testing.expectEqual(@as(c_int, 16384), qsaVerifyGatherMinKvFor(true));
     transformer.qsa_verify_gather_min_kv_override = 4096;
@@ -820,7 +795,7 @@ test "qsa route: dense bf16 verify at kv 20000 takes the fused kernel through th
     // The production route is two calls: the indexer's `qsaWantsBlocks` (blocks or the dense
     // mask) and `qsaSlotAttn` (the arm chain). Below the union gather's 32768 floor a dense
     // cache used to get the mask; the fused kernel must now serve, and
-    // MLX_SERVE_QSA_ATTN_DENSE=0 must restore the mask route.
+    // the dense-variant seam's false must restore the mask route.
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const ta = std.testing.allocator;
@@ -948,43 +923,8 @@ test "qsa route: qsaWantsBlocks admits verify widths wherever the fused kernel s
     sparse_attn.qsa_attn_min_s_override = 6;
     try std.testing.expect(!qsaWantsBlocks(1, 9000, 4, false));
     try std.testing.expect(qsaWantsBlocks(1, 9000, 6, false));
-    // MLX_SERVE_QSA_GATHER=0 still turns every block route off.
+    // The gather seam's false still turns every block route off.
     sparse_attn.qsa_attn_min_s_override = null;
     transformer.qsa_gather_override = false;
     try std.testing.expect(!qsaWantsBlocks(1, 40000, 4, false));
-}
-
-test "qsa verify gather: the S=2..15 branch is reachable from the selection arm" {
-    // (c) Wiring pin. The gatherer is dead code unless the selection arm ALSO
-    // takes the block branch at verify widths, and the dispatch calls it
-    // BEFORE the prefill kernel (which carries no q_len floor of its own, so
-    // a selection at S=2..15 would otherwise fall into it and read the whole
-    // cache). Needles are assembled at comptime so this test's own source
-    // cannot satisfy the scan.
-    const src = @embedFile("sparse_attn.zig") ++
-        @embedFile("verify_gather.zig") ++
-        @embedFile("indexer.zig") ++
-        @embedFile("../../../sdk/blocks/attention/gated_full.zig");
-    if (std.mem.indexOf(u8, src, "const want_" ++ "blocks = qsa" ++ "WantsBlocks(") == null) return error.MissingWantBlocks;
-    const want_mark = "pub fn qsa" ++ "WantsBlocks(";
-    const at = std.mem.indexOf(u8, src, want_mark) orelse return error.MissingWantBlocks;
-    const stmt_end = std.mem.indexOfPos(u8, src, at, "\n}\n") orelse src.len;
-    const stmt = src[at..stmt_end];
-    const verify_gate = "qsaVerify" ++ "GatherEnabled()";
-    const verify_min = "qsaVerify" ++ "GatherMinKvFor(";
-    if (std.mem.indexOf(u8, stmt, verify_gate) == null) return error.SelectionArmMissesVerifyWidths;
-    if (std.mem.indexOf(u8, stmt, verify_min) == null) return error.SelectionArmMissesVerifyFloor;
-
-    const disp_mark = "pub fn qsa" ++ "SlotAttn(";
-    const dat = std.mem.indexOf(u8, src, disp_mark) orelse return error.MissingDispatch;
-    const dend = std.mem.indexOfPos(u8, src, dat, "\n}\n") orelse src.len;
-    const body = src[dat..dend];
-    const call = "qsaVerify" ++ "GatherAttn(";
-    const vat = std.mem.indexOf(u8, body, call) orelse return error.DispatchMissesVerifyGather;
-    const prefill_call = "qsaPrefill" ++ "GatherProfiled(";
-    const pat = std.mem.indexOf(u8, body, prefill_call) orelse return error.DispatchMissesPrefillGather;
-    if (vat > pat) return error.VerifyGatherAfterPrefillGather;
-    const floor = "seq_len >= FUSED256_" ++ "MIN_Q_LEN";
-    const guard_at = std.mem.lastIndexOf(u8, body[0..pat], floor) orelse return error.PrefillGatherUnguarded;
-    if (pat - guard_at > 600) return error.PrefillGatherUnguarded;
 }

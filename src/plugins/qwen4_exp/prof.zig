@@ -1,6 +1,7 @@
 //! qwen4_exp forward diagnostics: per-block GPU laps (`QWEN4_PROFILE_FWD`) and the QSA attention profile.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../host/log.zig");
 const gather_qmv_rows = @import("../../sdk/blocks/moe/gather_qmv_rows.zig");
@@ -19,9 +20,9 @@ pub const Qwen4FwdProf = struct {
     op_ns: [6]u64 = @splat(0),
 
     pub fn init(seq_len: c_int, h: mlx.mlx_array) !Qwen4FwdProf {
-        const env = std.c.getenv("QWEN4_PROFILE_FWD");
+        const raw = env.get(.QWEN4_PROFILE_FWD);
         // `=1`: S 2..16 (verify). `=all`: any S, including decode S=1 and prefill.
-        const all = env != null and env.?[0] == 'a';
+        const all = raw != null and raw.?[0] == 'a';
         const timing = diagEnvOn("QWEN4_PROFILE_FWD") and (all or (seq_len >= 2 and seq_len <= 16));
         var p: Qwen4FwdProf = .{ .timing = timing, .ops = diagEnvOn("QWEN4_OPCOUNT"), .clock = ProfClock.init() };
         if (p.ops) {

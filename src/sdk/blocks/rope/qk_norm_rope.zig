@@ -31,20 +31,13 @@ pub const QkAngleSlot = struct {
 // `mlx_fast_rope` at the token's offset) extracts the exact floats the stock
 // kernel would use, cached per rope family for the forward (2 probe
 // dispatches replace ~160 removed ones). Bit-identity with the composed
-// chain is the acceptance bar (`qk norm rope fused` parity tests); kill
-// switch MLX_SERVE_QK_NORM_ROPE_FUSED=0.
+// chain is the acceptance bar (`qk norm rope fused` parity tests).
 var qk_fused_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var qk_fused_engaged: bool = false;
 pub var qk_fused_override: ?bool = null;
-var qk_fused_env: ?bool = null;
 
 pub fn qkNormRopeFusedEnabled() bool {
-    if (qk_fused_override) |v| return v;
-    if (qk_fused_env) |v| return v;
-    const raw = env.get(.MLX_SERVE_QK_NORM_ROPE_FUSED);
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    qk_fused_env = enabled;
-    return enabled;
+    return qk_fused_override orelse true;
 }
 
 // The RMS half mirrors `rms_single_row` at axis 128 / N_READS 4 / one
@@ -85,9 +78,8 @@ const QkFusedCfgKey = struct { hq: c_int, hk: c_int, rd: c_int, scaled: bool, dt
 var qk_fused_cfgs: [2]struct { cfg: ?mlx.mlx_fast_metal_kernel_config = null, key: QkFusedCfgKey = std.mem.zeroes(QkFusedCfgKey) } = .{ .{}, .{} };
 var qk_fused_next: usize = 0;
 
-/// True when the fused QK-norm+RoPE lever is on — exported so an out-of-file
-/// caller (tts.zig's talker) can skip building the angles row when the kill
-/// switch (MLX_SERVE_QK_NORM_ROPE_FUSED=0) has it declined anyway.
+/// True when the fused QK-norm+RoPE kernel is on — exported so an out-of-file
+/// caller (tts.zig's talker) can skip building the angles row when it is not.
 pub fn qkNormRopeFusedWanted() bool {
     return qkNormRopeFusedEnabled();
 }
@@ -246,8 +238,7 @@ pub fn ropeAngleRows(
 // Output is head-major [B,H,S,D], so the transposes vanish. Covers S 1..32
 // (verify widths + one-chunk tiny-prompt prefills; challenge raised the same
 // gate 16 -> 32 in 033f622).
-// Bit-identity with the composed chain is the acceptance bar; same kill
-// switch as the 128 kernel (MLX_SERVE_QK_NORM_ROPE_FUSED=0).
+// Bit-identity with the composed chain is the acceptance bar.
 pub const QK_NORM_ROPE_256_SOURCE = kernelSource("kernels/rope/qk_norm_rope_256.metal");
 
 var qk256_fused_kernel: ?mlx.mlx_fast_metal_kernel = null;

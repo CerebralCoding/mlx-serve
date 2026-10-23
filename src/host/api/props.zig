@@ -177,11 +177,11 @@ pub fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .mtp_acceptance = config.mtpAcceptance(generate_mod.mtp_acceptance_default),
         .mtp_greedy_tail = generate_mod.mtpGreedyTailFor(config.mtp_greedy_tail_override),
         .mtp_depth = lm.mtp_depth,
-        .mtp_adaptive = generate_mod.Generator.mtpAdaptiveEnabled(),
+        .mtp_adaptive = true,
         .native_speculation = if (native) |m| .{
             .lane = mlx_stream.laneName(m),
             .block_size = mlx_stream.blockSize(m),
-            .sampled = generate_mod.Generator.dsparkStochEnabledFromEnv(env.span(.MLX_SERVE_DSV4_DSPARK_STOCH)),
+            .sampled = true,
         } else null,
         .max_mtp_ctx = generate_mod.max_mtp_ctx,
         .drafter = if (lm.dflash != null) "dflash" else if (lm.drafter != null) "assistant" else "none",
@@ -311,7 +311,7 @@ pub fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel
                     .evals = u.evals_ok.load(.monotonic),
                     .eval_failures = u.evals_failed.load(.monotonic),
                 };
-                break :blk try anePropsJson(allocator, @tagName(eng.mode), eng.coveredLayers(), eng.coveredGdnLayers(), eng.rows, eng.chunk_rows, eng.share, eng.int8_bytes, stats[0..eng.units.len]);
+                break :blk try anePropsJson(allocator, "channel", eng.coveredLayers(), eng.coveredGdnLayers(), eng.rows, eng.chunk_rows, eng.share, eng.int8_bytes, stats[0..eng.units.len]);
             }
         }
         break :blk try allocator.dupe(u8, "");

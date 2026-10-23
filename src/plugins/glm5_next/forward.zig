@@ -3,6 +3,7 @@
 //! goes when glm5_next flips to its plugin.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const log = @import("../../host/log.zig");
@@ -10,7 +11,6 @@ const glm5 = @import("glm5_next.zig");
 const glm_mtp = @import("mtp.zig");
 const kda_recurrence = @import("../../sdk/blocks/kda/recurrence.zig");
 const layerCap = @import("../../engines/mlx/diag/profile.zig").layerCap;
-const diagEnvOnCached = @import("../../engines/mlx/env_transformer.zig").diagEnvOnCached;
 const PREFILL_EVAL_CADENCE_DEFAULT = @import("../../engines/mlx/eval_cadence.zig").PREFILL_EVAL_CADENCE_DEFAULT;
 const evalCadencePoint = @import("../../engines/mlx/eval_cadence.zig").evalCadencePoint;
 const prefillEvalCadenceApplies = @import("../../engines/mlx/eval_cadence.zig").prefillEvalCadenceApplies;
@@ -133,7 +133,7 @@ pub fn forwardGlm5With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_
         stream = try df.materialize(self.s);
     }
     dt.end(stream);
-    if (diagEnvOnCached(&glm_profile_env, "MLX_SERVE_GLM_PROFILE")) {
+    if (env.onCached(&glm_profile_env, .MLX_SERVE_GLM_PROFILE)) {
         log.info("[glm-profile] rows={d} collapse {d:.2} kda {d:.2} dsa {d:.2} moe {d:.2} expand {d:.2} ms\n", .{ seq_len, glmProfMs(.collapse), glmProfMs(.kda), glmProfMs(.dsa), glmProfMs(.moe), glmProfMs(.expand) });
         glm_prof_ns = @splat(0);
     }
@@ -162,7 +162,7 @@ pub fn glmSublayer(self: *Transformer, ctx: *ForwardCtx, stream: *mlx.mlx_array,
     const cfg = &self.config;
     const w = if (attn) lw.mhc_attn.? else lw.mhc_ffn.?;
     const norm_w = if (attn) lw.input_norm else lw.post_attn_norm;
-    const prof = diagEnvOnCached(&glm_profile_env, "MLX_SERVE_GLM_PROFILE");
+    const prof = env.onCached(&glm_profile_env, .MLX_SERVE_GLM_PROFILE);
     // A profiled forward evals at each seam, so it keeps the expand apart.
     const one = !prof and glm5.hcRowsServes(self.s, mlx.getShape(stream.*), mlx.mlx_array_dtype(stream.*), w.fn_rows, norm_w);
     if (!one) if (deferred.*) |*df| {

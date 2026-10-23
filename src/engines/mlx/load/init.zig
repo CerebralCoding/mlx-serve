@@ -15,7 +15,7 @@ const ModelConfig = @import("../model.zig").ModelConfig;
 const Weights = @import("../model.zig").Weights;
 const fused_rows = @import("../../../sdk/blocks/linear/fused_rows.zig");
 const transformer = @import("../transformer.zig");
-const qwen4DecodeLadderStride = @import("../../../plugins/qwen4_exp/forward.zig").qwen4DecodeLadderStride;
+const QWEN4_DECODE_ASYNC_LADDER_DEFAULT = @import("../../../plugins/qwen4_exp/forward.zig").QWEN4_DECODE_ASYNC_LADDER_DEFAULT;
 const loadHcWeights = @import("../../../plugins/qwen4_exp/load.zig").loadHcWeights;
 const Qwen4Mtp = @import("../../../plugins/qwen4_exp/mtp.zig").Qwen4Mtp;
 const loadQwen4Mtp = @import("../../../plugins/qwen4_exp/mtp.zig").loadQwen4Mtp;
@@ -27,8 +27,6 @@ const HcWeights = @import("../../../plugins/qwen4_exp/weights.zig").HcWeights;
 const attnProjRouted = @import("../../../sdk/blocks/attention/decode_attn_quant.zig").attnProjRouted;
 const weightsHaveDenseAttnProj = @import("../../../sdk/blocks/attention/decode_attn_quant.zig").weightsHaveDenseAttnProj;
 const DenseMlpWeights = @import("../../../sdk/blocks/mlp/dense.zig").DenseMlpWeights;
-const selfCheckPairedGateUpPack = @import("../../../sdk/blocks/moe/verify_kernels.zig").selfCheckPairedGateUpPack;
-const validatePairedGateUpPack = @import("../../../sdk/blocks/moe/verify_kernels.zig").validatePairedGateUpPack;
 const computeLlama3Freqs = @import("../../../sdk/blocks/rope/rope.zig").computeLlama3Freqs;
 const computeYarnFreqs = @import("../../../sdk/blocks/rope/yarn.zig").computeYarnFreqs;
 const yarnSpec = @import("../../../sdk/blocks/rope/yarn.zig").yarnSpec;
@@ -40,7 +38,6 @@ const BitsCache = @import("../../../sdk/quant/params.zig").BitsCache;
 const firstNonTernaryBias = @import("../../../sdk/quant/ternary.zig").firstNonTernaryBias;
 const firstRowExactMiss = @import("../../../sdk/quant/ternary.zig").firstRowExactMiss;
 const ternaryKernelCandidate = @import("../../../sdk/quant/ternary.zig").ternaryKernelCandidate;
-const decodeAsyncLadderStride = @import("../eval_cadence.zig").decodeAsyncLadderStride;
 const MoeLayerWeights = @import("../forward/layered.zig").MoeLayerWeights;
 const KVCache = @import("../kv/cache.zig").KVCache;
 const LayerWeights = @import("../layer_weights.zig").LayerWeights;
@@ -629,7 +626,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
         log.info("[qwen4] n-gram table {d} rows x {d} ({d}-bit, mmapped), PLE at layer {d}, QSA budget {d}/{d}\n", .{ st.table.rows, st.table.dim, st.table.bits, config.ple_layer_idx, config.indexer_budget, config.indexer_compress_ratio });
     }
 
-    const int8_on = (config.int8_prefill_override orelse qmm_int8.enabled()) and mlx.metalKernelsAvailable();
+    const int8_on = (config.int8_prefill_override orelse false) and mlx.metalKernelsAvailable();
     var int8_cache: ?*qmm_int8.Cache = null;
     errdefer if (int8_cache) |c| allocator.destroy(c);
     if (int8_on) {
@@ -673,21 +670,6 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
         config.quant_group_size == 64 and
         config.quant_mode == .affine and
         mtpNaxOqeAffineTrunkFrom(&config, moe_layers);
-    const verify_paired_gu_installed = blk: {
-        const raw = env.get(.MLX_SERVE_MOE_VERIFY_PAIRED_GU) orelse break :blk false;
-        if (raw[0] == '0') break :blk false;
-        // A pack or chip outside the contract declines like every other
-        // shape-gated kernel; only a matching pack that disagrees with
-        // stock is a load error.
-        validatePairedGateUpPack(&config, moe_layers) catch |err| {
-            log.info("[mtp-verify] paired routed gate/up declined: {s}\n", .{@errorName(err)});
-            break :blk false;
-        };
-        try selfCheckPairedGateUpPack(s, moe_layers.?);
-        log.info("[mtp-verify] paired routed gate/up q4/g64 installed for {d} layers (S=4)\n", .{moe_layers.?.len});
-        break :blk true;
-    };
-
     var cfg = config;
     if (cfg.rowExactArch()) {
         const gather_only = if (lm_head_w.ctx == emb_w.ctx) mlx.mlx_array{ .ctx = null } else emb_w;
@@ -724,12 +706,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
         .layers = layers,
         .owns_lm_head = owns_lm_head,
         .owns_norms = config.norm_has_offset,
-        .decode_async_ladder = decodeAsyncLadderStride(
-            env.span(.MLX_SERVE_DECODE_ASYNC_LADDER),
-        ),
-        .decode_async_ladder_qwen4 = qwen4DecodeLadderStride(
-            env.span(.MLX_SERVE_DECODE_ASYNC_LADDER),
-        ),
+        .decode_async_ladder_qwen4 = QWEN4_DECODE_ASYNC_LADDER_DEFAULT,
         .gelu_coeff = if (need_gelu) bf16Scalar(0.7978845608028654, s) else null,
         .gelu_inner = if (need_gelu) bf16Scalar(0.044715, s) else null,
         .half = bf16Scalar(0.5, s),
@@ -755,7 +732,6 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
         .yarn_mscale = yarn_mscale,
         .yarn_inv_freq = yarn_inv_freq,
         .moe_layers = moe_layers,
-        .verify_paired_gu_installed = verify_paired_gu_installed,
         .ssm_entries = ssm_entries,
         .moe_seq_offset = 0,
         .moe_owned_bf16 = moe_owned_bf16,

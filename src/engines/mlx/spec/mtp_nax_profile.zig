@@ -6,9 +6,7 @@ const mlx = @import("../../../mlx/ffi.zig");
 const ModelConfig = @import("../model.zig").ModelConfig;
 const mixedNaxShapeEnabled = @import("../../../sdk/blocks/linear/verify_qmm.zig").mixedNaxShapeEnabled;
 const verifyQmmEnabled = @import("../../../sdk/blocks/linear/verify_qmm.zig").verifyQmmEnabled;
-const naxLaneEnvEnabled = @import("../../../sdk/blocks/linear/verify_qmm_nax.zig").naxLaneEnvEnabled;
 const naxMinMForBits = @import("../../../sdk/blocks/linear/verify_qmm_nax.zig").naxMinMForBits;
-const naxMixedBitsEnvEnabled = @import("../../../sdk/blocks/linear/verify_qmm_nax.zig").naxMixedBitsEnvEnabled;
 const verifyQmmNaxAvailable = @import("../../../sdk/blocks/linear/verify_qmm_nax.zig").verifyQmmNaxAvailable;
 const verifyQmmNaxEnabledForMFrom = @import("../../../sdk/blocks/linear/verify_qmm_nax.zig").verifyQmmNaxEnabledForMFrom;
 const DenseMlpWeights = @import("../../../sdk/blocks/mlp/dense.zig").DenseMlpWeights;
@@ -36,7 +34,6 @@ const MtpNaxProfileInputs = struct {
     N: c_int,
     packed_k: c_int,
     verify_on: bool,
-    lane_on: bool,
     available: bool,
     min_m: c_int,
 };
@@ -113,7 +110,6 @@ fn mtpNaxProfileEnabledFrom(input: MtpNaxProfileInputs) bool {
         input.K,
         input.N,
         input.verify_on,
-        input.lane_on,
         input.available,
         input.min_m,
     ) and verifyQmmNaxEnabledForMFrom(
@@ -121,7 +117,6 @@ fn mtpNaxProfileEnabledFrom(input: MtpNaxProfileInputs) bool {
         input.K,
         input.N,
         input.verify_on,
-        input.lane_on,
         input.available,
         input.min_m,
     );
@@ -159,8 +154,8 @@ fn mtpNaxAffineProjectionMatchesQuant(
     if (out_dim >= 512 and mixedNaxShapeEnabled(expected.bits, expected.group_size, @intCast(out_dim), 8)) {
         const K: c_int = @intCast(in_dim);
         const N: c_int = @intCast(out_dim);
-        if (!verifyQmmNaxEnabledForMFrom(8, K, N, true, true, true, 8) or
-            !verifyQmmNaxEnabledForMFrom(9, K, N, true, true, true, 8)) return false;
+        if (!verifyQmmNaxEnabledForMFrom(8, K, N, true, true, 8) or
+            !verifyQmmNaxEnabledForMFrom(9, K, N, true, true, 8)) return false;
     }
     return true;
 }
@@ -326,13 +321,12 @@ pub fn mtpNaxUniformAffineTrunkFrom(config: *const ModelConfig, maybe_layers: ?[
     return true;
 }
 
-pub fn mtpNaxProfileEnabledForTrunk(self: *const Transformer, profiled_trunk: bool, mixed_bits: bool) bool {
+pub fn mtpNaxProfileEnabledForTrunk(self: *const Transformer, profiled_trunk: bool) bool {
     if (self.config.isMoe()) return false;
     if (self.config.hidden_size > std.math.maxInt(c_int)) return false;
     if (self.config.quant_mode != .affine) return false;
     if (self.config.quant_bits != 4 and self.config.quant_bits != 6 and self.config.quant_bits != 8) return false;
     if (self.config.quant_group_size != 64) return false;
-    if (mixed_bits and !naxMixedBitsEnvEnabled()) return false;
     if (self.lm_head_w.ctx == null or
         self.lm_head_s.ctx == null or
         self.lm_head_b.ctx == null) return false;
@@ -371,7 +365,6 @@ pub fn mtpNaxProfileEnabledForTrunk(self: *const Transformer, profiled_trunk: bo
         .N = w_shape[0],
         .packed_k = w_shape[1],
         .verify_on = verifyQmmEnabled(),
-        .lane_on = naxLaneEnvEnabled(),
         .available = verifyQmmNaxAvailable(),
         .min_m = naxMinMForBits(self.config.quant_bits),
     });
@@ -387,7 +380,7 @@ pub fn mtpNaxProfileEnabled(self: *const Transformer) bool {
         self.emb_b,
         self.config.hidden_size,
         self.config.vocab_size,
-    ) and self.mtpNaxProfileEnabledForTrunk(self.mtp_uniform_affine_trunk, false);
+    ) and self.mtpNaxProfileEnabledForTrunk(self.mtp_uniform_affine_trunk);
 }
 
 /// Uniform q4/gs64 Qwen3.8 target with its measured dense-bf16 token
@@ -399,7 +392,7 @@ pub fn mtpNaxQ4Gs64ProfileEnabled(self: *const Transformer) bool {
         self.emb_b,
         self.config.hidden_size,
         self.config.vocab_size,
-    ) and self.mtpNaxProfileEnabledForTrunk(self.mtp_uniform_affine_trunk, false);
+    ) and self.mtpNaxProfileEnabledForTrunk(self.mtp_uniform_affine_trunk);
 }
 
 /// Uniform q6/gs64 Qwen3.8 target with a quantized token embedding. The
@@ -414,7 +407,7 @@ pub fn mtpNaxQ6Gs64ProfileEnabled(self: *const Transformer) bool {
         self.config.hidden_size,
         self.config.vocab_size,
     );
-    const trunk = self.mtpNaxProfileEnabledForTrunk(self.mtp_uniform_affine_trunk, true);
+    const trunk = self.mtpNaxProfileEnabledForTrunk(self.mtp_uniform_affine_trunk);
     return self.config.quant_bits == 6 and embedding_match and trunk;
 }
 
@@ -428,7 +421,7 @@ pub fn mtpNaxQ8Gs64ProfileEnabled(self: *const Transformer) bool {
         self.emb_b,
         self.config.hidden_size,
         self.config.vocab_size,
-    ) and self.mtpNaxProfileEnabledForTrunk(self.mtp_uniform_affine_trunk, true);
+    ) and self.mtpNaxProfileEnabledForTrunk(self.mtp_uniform_affine_trunk);
 }
 
 /// Exact oQ4e mixed q4/q5/q6 target profile. The q5/q6 lane kill switch
@@ -442,7 +435,7 @@ pub fn mtpOqeNaxProfileEnabled(self: *const Transformer) bool {
         self.emb_b,
         self.config.hidden_size,
         self.config.vocab_size,
-    ) and self.mtpNaxProfileEnabledForTrunk(self.mtp_oqe_affine_trunk, true);
+    ) and self.mtpNaxProfileEnabledForTrunk(self.mtp_oqe_affine_trunk);
 }
 
 // ── tests ──
@@ -618,7 +611,6 @@ test "mtpNaxProfileEnabledFrom composes measured model, homogeneous trunk, and a
         .N = 248320,
         .packed_k = 640,
         .verify_on = true,
-        .lane_on = true,
         .available = true,
         .min_m = 8,
     };
@@ -701,9 +693,6 @@ test "mtpNaxProfileEnabledFrom composes measured model, homogeneous trunk, and a
     try testing.expect(!mtpNaxProfileEnabledFrom(bad));
     bad = good;
     bad.verify_on = false;
-    try testing.expect(!mtpNaxProfileEnabledFrom(bad));
-    bad = good;
-    bad.lane_on = false;
     try testing.expect(!mtpNaxProfileEnabledFrom(bad));
     bad = good;
     bad.available = false;

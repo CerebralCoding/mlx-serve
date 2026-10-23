@@ -57,10 +57,6 @@ pub fn placeholderKindOf(token: u32, mt: MediaTokens) ?std.meta.Tag(MediaItem) {
     return null;
 }
 
-fn placeholderKind(token: u32, config: *const model_mod.ModelConfig) ?std.meta.Tag(MediaItem) {
-    return placeholderKindOf(token, .{ .config = config });
-}
-
 pub const MEDIA_PLACEHOLDER_REJECT = "the rendered prompt does not carry one media placeholder per attached item: the chat template failed to render (see the server log), cannot place media in this message, or the text contains a literal media token";
 
 /// The k-th placeholder the template rendered must be item k, by kind.

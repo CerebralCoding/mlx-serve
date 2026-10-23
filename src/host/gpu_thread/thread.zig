@@ -28,21 +28,6 @@ pub fn recordLoadError(sch: *Scheduler, err_name: []const u8) void {
     sch.load_failed.store(true, .release);
 }
 
-/// Heap-allocate `T`, run `init_fn`, return owning pointer. On `init_fn`
-/// failure, the heap slot is freed before the error propagates so the
-/// scheduler never holds a half-initialized struct.
-fn boxInit(
-    allocator: std.mem.Allocator,
-    comptime T: type,
-    init_fn: anytype,
-    args: anytype,
-) !*T {
-    const ptr = try allocator.create(T);
-    errdefer allocator.destroy(ptr);
-    ptr.* = try @call(.auto, init_fn, args);
-    return ptr;
-}
-
 /// Routing decision for a GGUF entry resolved at preload time: the actual
 /// `.gguf` file (owned by the conn thread, freed after the load completes —
 /// the engines dupe/copy what they keep) and which embedded engine serves it.

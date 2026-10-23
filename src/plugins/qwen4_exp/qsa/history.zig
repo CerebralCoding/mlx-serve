@@ -184,7 +184,7 @@ const QsaKeyAppendPlan = struct { new_cap: usize, write_at: usize, new_rows: usi
 fn qsaKeyAppendPlan(rows: usize, cap: usize, add: usize, reserve: usize) QsaKeyAppendPlan {
     const need = rows + add;
     // A reservation raises the first grow to the whole request; past it the proportional policy takes over.
-    const grown = if (need <= cap) cap else @max(KVCache.nextCapacityPolicy(cap, need, false), reserve);
+    const grown = if (need <= cap) cap else @max(KVCache.nextCapacity(cap, need), reserve);
     return .{
         .new_cap = grown,
         .write_at = rows,
@@ -202,7 +202,6 @@ pub var qsa_score_incremental_appends: usize = 0;
 
 /// Ask every live entry's QSA history to hold `tokens` rows up front (same lever as `KVCache.reserve`).
 pub fn reserveQsaHistory(entries: ?[]SSMCacheEntry, tokens: usize) void {
-    if (!KVCache.kvReserveEnabled()) return;
     const es = entries orelse return;
     for (es) |*e| {
         if (tokens > e.qsa_reserve_rows) e.qsa_reserve_rows = tokens;

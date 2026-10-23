@@ -1125,7 +1125,7 @@ pub const Dit = struct {
     /// Builds blocks [0, n); fewer than all is the calibration build.
     fn aneBuild(self: *Dit, rows: u32, k: u32, units: u32, feat: u32, mlpdim: u32, share: f32, s: S, n: usize) !void {
         const a = self.allocator;
-        const eng = try ane.AnePrefill.init(a, self.io, self.blocks.len, feat, k, rows, rows, 0, 0, .channel, units);
+        const eng = try ane.AnePrefill.init(a, self.io, self.blocks.len, feat, k, rows, rows, 0, 0, units);
         errdefer eng.deinit();
         const rests = try a.alloc(SwiGLU, n);
         errdefer a.free(rests);
@@ -2088,12 +2088,6 @@ pub const Engine = struct {
         return self.generateWithOpts(allocator, pr.ids, pr.mask, seed, steps, width, height, opts, progress);
     }
 
-    /// Tokenize, run the pipeline, return PNG bytes (caller frees).
-    pub fn generatePng(self: *Engine, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, progress: ?sse.Progress) ![]u8 {
-        const img = try self.generateImage(allocator, prompt, width, height, seed, steps, progress);
-        defer _ = mlx.mlx_array_free(img);
-        return imageToPng(allocator, img, self.s);
-    }
 };
 
 /// [1,3/4,H,W] f32 [0,1] → RGB/RGBA8 PNG bytes (caller frees).

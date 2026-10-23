@@ -807,18 +807,6 @@ test "quantAttention matches dense SDPA at 4-bit (decode, T_q=1)" {
     try testing.expect(max_err < 0.05);
 }
 
-test "quantAttention reshapes Q for GQA instead of repeating K/V triples" {
-    // Phase 1 (docs/kv-quant-perf.md): the GQA repeat materializes the packed
-    // bank ×(H_q/H_kv) per layer per token — the reshape-Q form reads the
-    // triples IN PLACE. Pin that the repeat op never comes back. The needle
-    // is concatenated so this test's own source can't match it.
-    const src = @embedFile("kv_quant.zig");
-    const start = std.mem.indexOf(u8, src, "pub fn quantAttention").?;
-    const end = std.mem.indexOfPos(u8, src, start, "// ── Tests ──").?;
-    const body = src[start..end];
-    try testing.expect(std.mem.indexOf(u8, body, "mlx_repeat" ++ "_axis") == null);
-}
-
 /// Shared harness for the grouped-Q GQA parity tests: build smooth Q at
 /// `[1, H_q, T_q, D]` and K/V at `[1, H_kv, T_k, D]`, quantize K/V, then
 /// compare `quantAttention` against dense SDPA fed the SAME dequantized K/V

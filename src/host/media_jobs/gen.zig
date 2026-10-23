@@ -479,16 +479,6 @@ fn fitAspect(src_w: u32, src_h: u32, budget_w: u32, budget_h: u32) struct { w: u
     };
 }
 
-/// Native pixel dims of an encoded PNG/JPEG, without decoding the pixels.
-fn imageNativeSize(encoded: []const u8) ?struct { w: u32, h: u32 } {
-    var w: c_int = 0;
-    var h: c_int = 0;
-    var ch: c_int = 0;
-    if (stb.stbi_info_from_memory(encoded.ptr, @intCast(encoded.len), &w, &h, &ch) == 0) return null;
-    if (w <= 0 or h <= 0) return null;
-    return .{ .w = @intCast(w), .h = @intCast(h) };
-}
-
 fn decodeImageToBCHW(allocator: std.mem.Allocator, encoded: []const u8, target_h: u32, target_w: u32) ?mlx.mlx_array {
     var w: c_int = 0;
     var h: c_int = 0;
@@ -1176,31 +1166,10 @@ fn iterJsonStringArray(body: []const u8, key: []const u8) ?JsonStringArrayIter {
     return .{ .rest = body[i + 1 ..] };
 }
 
-/// Base64-decode (standard alphabet) into an owned buffer.
-fn base64DecodeAlloc(allocator: std.mem.Allocator, b64: []const u8) ![]u8 {
-    const dec = std.base64.standard.Decoder;
-    const n = try dec.calcSizeForSlice(b64);
-    const out = try allocator.alloc(u8, n);
-    errdefer allocator.free(out);
-    try dec.decode(out, b64);
-    return out;
-}
-
 /// Base64-decode an image for the media backends, which all read through
 /// stb_image: a WebP comes back re-encoded as a lossless PNG (alpha kept),
 /// anything else exactly as sent.
 pub const imageB64Alloc = plugin_job.imageUpload;
-
-/// Takes ownership of `bytes`.
-fn webpAsPng(allocator: std.mem.Allocator, bytes: []u8) ![]u8 {
-    var w: c_int = 0;
-    var h: c_int = 0;
-    const rgba = webp.WebPDecodeRGBA(bytes.ptr, bytes.len, &w, &h) orelse return bytes;
-    defer webp.WebPFree(rgba);
-    defer allocator.free(bytes);
-    const n = @as(usize, @intCast(w)) * @as(usize, @intCast(h)) * 4;
-    return png_mod.encodeRgba(allocator, rgba[0..n], @intCast(w), @intCast(h));
-}
 
 fn jsonUnescape(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;

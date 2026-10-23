@@ -429,9 +429,6 @@ pub fn mtpBatchedLossyGraph(
 
 
 test "batched corrections: point-mass residuals sample deterministically, accept vec gathers draft probs" {
-    try testing.expect(Generator.mtpBatchCorrEnabledFromEnv(null));
-    try testing.expect(!Generator.mtpBatchCorrEnabledFromEnv("0"));
-
     const s = mlx.gpuStream();
     // V=4, m=2. Row residuals are POINT MASSES so the batched categorical
     // is deterministic end-to-end (no seed dependence):
