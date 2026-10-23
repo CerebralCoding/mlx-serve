@@ -9,7 +9,7 @@ const plugins = @import("plugins.zig");
 /// The example plugins (`src/plugins/<name>/`, each with its own build.zig): `plugin new` copies them.
 pub const examples = [_][]const u8{ "_example", "_example_media", "_example_quant" };
 
-pub fn add(b: *std.Build, version: []const u8, run_unit_tests: *std.Build.Step.Run) void {
+pub fn add(b: *std.Build, version: []const u8, test_runs: []const *std.Build.Step.Run) void {
     const name = b.fmt("mlx-serve-plugin-kit-{s}", .{version});
     const wf = b.addWriteFiles();
     stage(b, wf, name, version);
@@ -33,10 +33,12 @@ pub fn add(b: *std.Build, version: []const u8, run_unit_tests: *std.Build.Step.R
         build.addArgs(&.{ "--prefix", b.fmt("{s}/{s}", .{ out, ex }), "--cache-dir", b.fmt("{s}/.zig-cache/kit-nested", .{root}) });
         // The nested build is incremental itself; the tests rerun only when a dylib's bytes change.
         build.has_side_effects = true;
-        run_unit_tests.step.dependOn(&build.step);
-        run_unit_tests.addFileInput(.{ .cwd_relative = b.fmt("{s}/{s}/lib/lib{s}.dylib", .{ out, ex, ex }) });
+        for (test_runs) |r| {
+            r.step.dependOn(&build.step);
+            r.addFileInput(.{ .cwd_relative = b.fmt("{s}/{s}/lib/lib{s}.dylib", .{ out, ex, ex }) });
+        }
     }
-    run_unit_tests.setEnvironmentVariable("MLX_SERVE_KIT_PLUGINS", out);
+    for (test_runs) |r| r.setEnvironmentVariable("MLX_SERVE_KIT_PLUGINS", out);
 }
 
 fn stage(b: *std.Build, wf: *std.Build.Step.WriteFile, name: []const u8, version: []const u8) void {

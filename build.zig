@@ -337,26 +337,37 @@ pub fn build(b: *std.Build) void {
     const unit_tests = b.addTest(.{
         .root_module = test_mod,
         .filters = if (test_filter) |f| &.{f} else &.{},
+        .test_runner = .{ .path = b.path("build/test_runner.zig"), .mode = .server },
     });
 
     const test_build = b.step("test-build", "Compile unit tests without running them");
     test_build.dependOn(&b.addInstallArtifact(unit_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
 
-    const run_unit_tests = b.addRunArtifact(unit_tests);
-    // A filtered run is a targeted one, often gated on an env var (ANE_TEST_PACK, QWEN4_TEST_MODEL)
-    // that the run's cache key does not see: it reruns every time.
-    if (test_filter != null) run_unit_tests.has_side_effects = true;
-    if (qwen_preprocess_fixture) |fixture| {
-        run_unit_tests.setEnvironmentVariable("QWEN_PREPROCESS_FIXTURE", fixture);
-        run_unit_tests.addFileInput(.{ .cwd_relative = b.fmt("{s}/manifest.json", .{fixture}) });
-        run_unit_tests.addFileInput(.{ .cwd_relative = b.fmt("{s}/source_rgb.bin", .{fixture}) });
-        run_unit_tests.addFileInput(.{ .cwd_relative = b.fmt("{s}/pixel_values.bin", .{fixture}) });
-    }
+    // The one test binary runs as `test-shards` processes in parallel, each every n-th test (build/test_runner.zig);
+    // a filtered run is one process.
+    const shards: u32 = if (test_filter != null) 1 else b.option(u32, "test-shards", "Unit-test processes run in parallel (default 8)") orelse 8;
+    const test_runs = b.allocator.alloc(*std.Build.Step.Run, shards) catch @panic("OOM");
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_unit_tests.step);
+    for (test_runs, 0..) |*run, k| {
+        run.* = b.addRunArtifact(unit_tests);
+        if (shards > 1) {
+            run.*.setEnvironmentVariable("MLX_SERVE_TEST_SHARD", b.fmt("{d}/{d}", .{ k, shards }));
+            run.*.setName(b.fmt("run test shard {d}/{d}", .{ k, shards }));
+        }
+        // A filtered run is a targeted one, often gated on an env var (ANE_TEST_PACK, QWEN4_TEST_MODEL)
+        // that the run's cache key does not see: it reruns every time.
+        if (test_filter != null) run.*.has_side_effects = true;
+        if (qwen_preprocess_fixture) |fixture| {
+            run.*.setEnvironmentVariable("QWEN_PREPROCESS_FIXTURE", fixture);
+            run.*.addFileInput(.{ .cwd_relative = b.fmt("{s}/manifest.json", .{fixture}) });
+            run.*.addFileInput(.{ .cwd_relative = b.fmt("{s}/source_rgb.bin", .{fixture}) });
+            run.*.addFileInput(.{ .cwd_relative = b.fmt("{s}/pixel_values.bin", .{fixture}) });
+        }
+        test_step.dependOn(&run.*.step);
+    }
     plugins.addTests(b, test_step);
     // `zig build kit`, and the kit's example plugins built from it as dylibs the unit tests load.
-    @import("build/kit.zig").add(b, version, run_unit_tests);
+    @import("build/kit.zig").add(b, version, test_runs);
     test_step.dependOn(&b.top_level_steps.get("lint-test").?.step);
     {
         // Zig collects tests from an artifact's root module only: the EXL3 module is its own artifact, over the
