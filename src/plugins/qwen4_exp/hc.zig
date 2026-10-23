@@ -26,7 +26,6 @@ const PleWeights = @import("weights.zig").PleWeights;
 
 /// qwen4_exp: compile the four hyper-connection elementwise tails.
 pub fn compileQwen4Hc(self: *Transformer) void {
-    if (std.c.getenv("QWEN4_NO_HCFUSE") != null) return;
     const specs = .{
         .{ &self.compiled_hc_silu, &hcSiluCallback, true },
         .{ &self.compiled_hc_mix, &hcMixCallback, false },

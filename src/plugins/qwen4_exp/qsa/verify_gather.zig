@@ -29,7 +29,6 @@ const qsaAttnCacheFixture = @import("sparse_attn.zig").qsaAttnCacheFixture;
 const qsaSlotAttn = @import("sparse_attn.zig").qsaSlotAttn;
 const qsaWantsBlocks = @import("sparse_attn.zig").qsaWantsBlocks;
 
-var qsa_verify_gather_env_cached: ?bool = null;
 
 /// Verify-width QSA gather (2 <= S < FUSED256_MIN_Q_LEN — an MTP/DFlash
 /// verify block): read the UNION of the S rows' selections + the union tail
@@ -38,14 +37,7 @@ var qsa_verify_gather_env_cached: ?bool = null;
 /// forward; this arm dequantizes only the gathered rows.
 /// MLX_SERVE_QSA_VERIFY_GATHER=0 restores the dense mask arm.
 pub fn qsaVerifyGatherEnabled() bool {
-    if (transformer.qsa_verify_gather_override) |v| return v;
-    if (qsa_verify_gather_env_cached) |v| return v;
-    const v = blk: {
-        const raw = std.c.getenv("MLX_SERVE_QSA_VERIFY_GATHER") orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    qsa_verify_gather_env_cached = v;
-    return v;
+    return transformer.qsa_verify_gather_override orelse true;
 }
 
 /// The union is FIXED-size (S * budget blocks): at the production budget
@@ -57,20 +49,11 @@ pub fn qsaVerifyGatherEnabled() bool {
 /// sets ONE floor for both.
 pub const QSA_VERIFY_GATHER_MIN_KV_DENSE: c_int = 32768;
 pub const QSA_VERIFY_GATHER_MIN_KV_QUANT: c_int = 16384;
-var qsa_verify_gather_min_kv_env: ?c_int = null;
-var qsa_verify_gather_min_kv_env_read = false;
 
 /// `quantized` = the arm will dequantize only the gathered rows, i.e. the
 /// view carries affine triples (`DenseKVView.has_quant_triple`).
 pub fn qsaVerifyGatherMinKvFor(quantized: bool) c_int {
     if (transformer.qsa_verify_gather_min_kv_override) |v| return v;
-    if (!qsa_verify_gather_min_kv_env_read) {
-        qsa_verify_gather_min_kv_env_read = true;
-        if (std.c.getenv("MLX_SERVE_QSA_VERIFY_GATHER_MIN_KV")) |raw| {
-            qsa_verify_gather_min_kv_env = std.fmt.parseInt(c_int, std.mem.sliceTo(raw, 0), 10) catch null;
-        }
-    }
-    if (qsa_verify_gather_min_kv_env) |v| return v;
     return if (quantized) QSA_VERIFY_GATHER_MIN_KV_QUANT else QSA_VERIFY_GATHER_MIN_KV_DENSE;
 }
 
@@ -388,7 +371,7 @@ pub fn qsaVerifyGatherAttn(
         try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out, q_rope, gk, gv, attn_scale, "array", add4, .{ .ctx = null }, false, s));
     }
     if (arms.qsa_engaged_bits.take(qsaEngagedBit(.verify_gather, seq_len))) {
-        log.info("[qsa-verify-gather] engaged (S={d} kv={d} rows={d}) (MLX_SERVE_QSA_VERIFY_GATHER=0 restores the dense mask arm)\n", .{ seq_len, kv, geom.rows });
+        log.info("[qsa-verify-gather] engaged (S={d} kv={d} rows={d})\n", .{ seq_len, kv, geom.rows });
     }
     return out;
 }
@@ -397,14 +380,8 @@ pub fn qsaVerifyGatherAttn(
 
 test "qsa verify gather floor: dense KV 32768, quantized 16384, override wins" {
     const prev_o = transformer.qsa_verify_gather_min_kv_override;
-    const prev_e = qsa_verify_gather_min_kv_env;
-    defer {
-        transformer.qsa_verify_gather_min_kv_override = prev_o;
-        qsa_verify_gather_min_kv_env = prev_e;
-    }
+    defer transformer.qsa_verify_gather_min_kv_override = prev_o;
     transformer.qsa_verify_gather_min_kv_override = null;
-    qsa_verify_gather_min_kv_env = null;
-    qsa_verify_gather_min_kv_env_read = true;
     try std.testing.expectEqual(@as(c_int, 32768), qsaVerifyGatherMinKvFor(false));
     try std.testing.expectEqual(@as(c_int, 16384), qsaVerifyGatherMinKvFor(true));
     transformer.qsa_verify_gather_min_kv_override = 4096;

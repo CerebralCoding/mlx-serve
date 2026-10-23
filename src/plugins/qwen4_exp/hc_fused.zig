@@ -23,15 +23,9 @@ const HcWeights = @import("weights.zig").HcWeights;
 // geometry keeps the unfused chain.
 var hc_fused_eps: ?mlx.mlx_array = null;
 var hc_fused_eps_val: f32 = 0;
-var hc_fused_env: ?bool = null;
 
 pub fn hcFusedEnabled() bool {
-    if (transformer.hc_fused_override) |v| return v;
-    if (hc_fused_env) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_HC_FUSED");
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    hc_fused_env = enabled;
-    return enabled;
+    return transformer.hc_fused_override orelse true;
 }
 
 pub const HcFusedOut = struct { mixed: mlx.mlx_array, inj: mlx.mlx_array, stream: mlx.mlx_array };

@@ -46,7 +46,6 @@ const mtpBatchedTokenV3Graph = @import("../spec/mtp/batched_graph.zig").mtpBatch
 const mtpBatchedTypicalGraph = @import("../spec/mtp/batched_graph.zig").mtpBatchedTypicalGraph;
 const mtpDepthCapFree = @import("../spec/mtp/ev_plan.zig").mtpDepthCapFree;
 const mtpDraftGreedyFor = @import("../spec/mtp/depth.zig").mtpDraftGreedyFor;
-const mtpDraftProposalEnv = @import("../spec/mtp/depth.zig").mtpDraftProposalEnv;
 const mtpEvCosts = @import("../spec/mtp/ev_costs.zig").mtpEvCosts;
 const nextChunkEnd = @import("prefill_chunk.zig").nextChunkEnd;
 const pickLookupPromptSource = @import("../spec/pld.zig").pickLookupPromptSource;
@@ -288,7 +287,7 @@ pub fn initWithOptions(
             .exact => unreachable,
         }
     }
-    if (mtp_active and options.mtp_greedy_tail and sampling.temperature > 0.01 and !mtpDraftGreedyFor(sampling, mtpDraftProposalEnv()))
+    if (mtp_active and options.mtp_greedy_tail and sampling.temperature > 0.01 and !mtpDraftGreedyFor(sampling))
         log.info("  [mtp-draft] greedy tail engaged: depth 0 samples, later depths take the head's argmax\n", .{});
     var mtp_cache: ?MtpCacheRef = null;
     var mtp_position_base: usize = ssm_cp_offset;

@@ -57,26 +57,12 @@ pub const QSA_SELECT_SPLIT_MERGE_SOURCE = std.fmt.comptimePrint("{s}{s}{s}", .{ 
 /// Threads per row-threadgroup. `MLX_SERVE_QSA_SELECT_TG=256|512|1024` is the A/B. Read once.
 pub const QSA_SELECT_TG_DEFAULT: c_int = 1024;
 pub var qsa_select_tg_override: ?c_int = null;
-var qsa_select_tg_cached: ?c_int = null;
-
-pub fn qsaSelectTg() c_int {
-    if (qsa_select_tg_override) |v| return v;
-    if (qsa_select_tg_cached) |v| return v;
-    var v: c_int = 0;
-    if (std.c.getenv("MLX_SERVE_QSA_SELECT_TG")) |raw| {
-        const parsed = std.fmt.parseInt(c_int, std.mem.sliceTo(raw, 0), 10) catch v;
-        if (parsed == 256 or parsed == 512 or parsed == 1024) v = parsed;
-    }
-    qsa_select_tg_cached = v;
-    return v;
-}
 
 // A row's threadgroup is a per-shape choice: the wide passes of a prefill chunk run more
 // rows concurrently at 256 threads, a narrow pass wants 512, and the decode widths keep
 // 1024 (the split kernels size their own slices). Outputs are identical at every width.
 pub fn qsaSelectTgFor(rows: c_int) c_int {
-    const forced = qsaSelectTg();
-    if (forced != 0) return forced;
+    if (qsa_select_tg_override) |forced| return forced;
     if (rows >= 256) return 256;
     if (rows >= 64) return 512;
     return QSA_SELECT_TG_DEFAULT;
@@ -114,18 +100,10 @@ var qsa_select_cfgs = QsaCfgCache(QsaSelectCfgKey, 1){};
 var qsa_select_engaged_bits: OneShotBits = .{};
 
 pub var qsa_select_kernel_override: ?bool = null;
-var qsa_select_kernel_env: ?bool = null;
 
 /// Fused QSA block select (default on). `MLX_SERVE_QSA_SELECT_KERNEL=0` restores the argpartition chain.
 pub fn qsaSelectKernelEnabled() bool {
-    if (qsa_select_kernel_override) |v| return v;
-    if (qsa_select_kernel_env) |v| return v;
-    const v = blk: {
-        const raw = std.c.getenv("MLX_SERVE_QSA_SELECT_KERNEL") orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    qsa_select_kernel_env = v;
-    return v;
+    return qsa_select_kernel_override orelse true;
 }
 
 /// Per-row first-not-fully-visible block index (`b < (p+1)/ratio`). `all_vis` is the caller's
@@ -203,7 +181,7 @@ pub fn qsaSelectTopBlocks(
     mtp.qsa_index_select_graphs += 1;
     if (qsa_select_engaged_bits.take(qsaWidthBucket(rows))) {
         log.info(
-            "[qsa-select] engaged (S={d} nb={d} k={d} tg={d}) — MLX_SERVE_QSA_SELECT_KERNEL=0 restores the argpartition chain\n",
+            "[qsa-select] engaged (S={d} nb={d} k={d} tg={d})\n",
             .{ rows, nb, kb, tg },
         );
     }
@@ -231,18 +209,10 @@ pub fn qsaSelectDigitBits(rows: c_int) c_int {
 }
 
 pub var qsa_select_split_override: ?bool = null;
-var qsa_select_split_env: ?bool = null;
 pub var qsa_select_used_split: bool = false;
 
 pub fn qsaSelectSplitEnabled() bool {
-    if (qsa_select_split_override) |v| return v;
-    if (qsa_select_split_env) |v| return v;
-    const v = blk: {
-        const raw = std.c.getenv("MLX_SERVE_QSA_SELECT_SPLIT") orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    qsa_select_split_env = v;
-    return v;
+    return qsa_select_split_override orelse true;
 }
 
 pub fn qsaSelectSplitServes(rows: c_int, nb: c_int, kb: c_int) bool {
@@ -319,9 +289,8 @@ fn qsaSelectTopBlocksSplit(
     const loc_count = std.math.mul(c_int, kb, g) catch return null;
     const local_kernel = getQsaSelectSplitLocalKernel() catch return null;
     const merge_kernel = getQsaSelectSplitMergeKernel() catch return null;
-    const forced = qsaSelectTg();
-    const slice_tg: c_int = if (forced != 0) forced else 512;
-    const merge_tg: c_int = if (forced != 0) forced else QSA_SELECT_TG_DEFAULT;
+    const slice_tg: c_int = qsa_select_tg_override orelse 512;
+    const merge_tg: c_int = qsa_select_tg_override orelse QSA_SELECT_TG_DEFAULT;
     const digits = qsaSelectDigitBits(rows);
     const key = QsaSelectSplitCfgKey{ .rows = rows, .k = kb, .slice_tg = slice_tg, .merge_tg = merge_tg, .digits = digits };
     const cfgs: [2]mlx.mlx_fast_metal_kernel_config = qsa_select_split_cfgs.get(key) orelse blk: {
@@ -369,7 +338,7 @@ fn qsaSelectTopBlocksSplit(
     try mlx.check(mlx.mlx_vector_array_get(&out, merge_out_vec, 0));
     if (qsa_select_split_engaged_bits.take(qsaWidthBucket(rows))) {
         log.info(
-            "[qsa-select] engaged (split G={d} S={d} nb={d} k={d} tg={d}) — MLX_SERVE_QSA_SELECT_SPLIT=0 restores the single-threadgroup kernel\n",
+            "[qsa-select] engaged (split G={d} S={d} nb={d} k={d} tg={d})\n",
             .{ g, rows, nb, kb, slice_tg },
         );
     }
@@ -1474,7 +1443,6 @@ test "qsa select tg policy: a pure function of rows, forced width wins" {
     const saved = qsa_select_tg_override;
     defer qsa_select_tg_override = saved;
     qsa_select_tg_override = null;
-    qsa_select_tg_cached = 0;
     try testing.expectEqual(@as(c_int, 256), qsaSelectTgFor(4096));
     try testing.expectEqual(@as(c_int, 256), qsaSelectTgFor(1024));
     try testing.expectEqual(@as(c_int, 256), qsaSelectTgFor(256));
@@ -1486,5 +1454,4 @@ test "qsa select tg policy: a pure function of rows, forced width wins" {
     qsa_select_tg_override = 512;
     try testing.expectEqual(@as(c_int, 512), qsaSelectTgFor(4096));
     try testing.expectEqual(@as(c_int, 512), qsaSelectTgFor(1));
-    qsa_select_tg_cached = null;
 }

@@ -550,9 +550,6 @@ pub fn main(init: std.process.Init) !void {
     server_mod.applyGpuCeilingEnv();
     mlx.exportCudaHome();
     mlx.exportPtxCacheDir(@import("mlx_stamp").bytes);
-    // Resolve lazily-cached env reads on the main thread before other threads exist.
-    @import("engines/mlx/transformer.zig").warmQsaEnvCaches();
-    @import("engines/mlx/cache/prefix_cache.zig").warmEnvCaches();
 
     // mlx-c's default handler exits the process; latch MLX failures instead (#353).
     mlx.installErrorHandler();

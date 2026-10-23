@@ -59,18 +59,6 @@ const admissionLogLevel = @import("admit.zig").admissionLogLevel;
 const qwen4ExpOomConfig = @import("bills_test.zig").qwen4ExpOomConfig;
 const qwen4ExpLive364kConfig = @import("bills_test.zig").qwen4ExpLive364kConfig;
 
-var ctx_bar_cached: ?bool = null;
-
-/// `MLX_SERVE_PREFILL_CHUNK_CTX_BAR=0` restores the share-only rung cap.
-pub fn ctxBarEnabled() bool {
-    if (ctx_bar_cached) |v| return v;
-    const v = blk: {
-        const raw = env.get(.MLX_SERVE_PREFILL_CHUNK_CTX_BAR) orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    ctx_bar_cached = v;
-    return v;
-}
 
 /// Widths `resolvePrefillChunk` will step down through. Descending, floored at
 /// `generate.PREFILL_CHUNK_FLOOR` — below that the score-budget path refuses to
@@ -128,7 +116,7 @@ pub fn prefillChunkCap(
     const share_bar: u64 = serving_budget / PREFILL_RESERVE_BUDGET_SHARE;
     // The ctx bar can only ever narrow; `--ctx-size` is a cap, not an allocation, so it can pin
     // chunk 512 for the life of a process. The narrowing is logged.
-    const ctx_bar: u64 = if (ctxBarEnabled()) (serving_budget -| ctx_kv_bytes) -| HOT_CACHE_FLOOR_BYTES else share_bar;
+    const ctx_bar: u64 = (serving_budget -| ctx_kv_bytes) -| HOT_CACHE_FLOOR_BYTES;
     return @min(share_bar, ctx_bar);
 }
 
@@ -220,7 +208,7 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
             pin_override,
         );
         // Say when the ctx bar is the binding one.
-        if (ctxBarEnabled() and config.longCtxGated() and explicitPrefillChunk() == 0) {
+        if (config.longCtxGated() and explicitPrefillChunk() == 0) {
             const share_only = resolvePrefillChunk(config, kv_bits, currentGpuMemoryCeiling(config, active_mem), active_mem, 0, hot_cache_ask);
             if (share_only > config.pinned_prefill_chunk) {
                 log.info("[prefill] chunk {d} (ctx bar: the --ctx-size KV bill; share-only would allow {d}; MLX_SERVE_PREFILL_CHUNK_CTX_BAR=0 restores)\n", .{ config.pinned_prefill_chunk, share_only });

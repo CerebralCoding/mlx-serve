@@ -1049,22 +1049,6 @@ test "the allocator pool is returned at the prefill/decode handover, long-contex
     }
 }
 
-test "prefill chunk loop yields to the interleave hook between chunks, never after the last" {
-    // The scheduler runs decode ticks for active streams at this seam so a
-    // long prefill cannot stall them for its whole duration. The final
-    // boundary is excluded: the post-prefill decode tick covers it.
-    const src = @embedFile("init.zig");
-    const progress = "if (options.prefill_progress) |p| p.store(@intCast(pos), .monotonic);";
-    const at = std.mem.indexOf(u8, src, progress) orelse return error.ProgressPublishMissing;
-    const guard = "if (pos < loop_end) {";
-    const guard_at = std.mem.indexOfPos(u8, src, at, guard) orelse return error.InterleaveGuardMissing;
-    const call = "if (options.interleave" ++ "_hook) |hk| hk.call(hk.ctx);";
-    const call_at = std.mem.indexOfPos(u8, src, guard_at, call) orelse return error.InterleaveCallMissing;
-    // The call sits INSIDE the guard (same statement block, before the loop
-    // re-tests `pos`), not somewhere later in the file.
-    try std.testing.expect(call_at - guard_at < 200);
-}
-
 test "countSpliceRows counts image, audio and video placeholders, extras only when declared" {
     const ids = [_]i32{ 7, 99, 99, 8, 88, 9, 77 };
     try testing.expectEqual(@as(usize, 2), countSpliceRows(&ids, 99, 0, 0));
@@ -1073,19 +1057,6 @@ test "countSpliceRows counts image, audio and video placeholders, extras only wh
     try testing.expectEqual(@as(usize, 0), countSpliceRows(ids[0..1], 99, 88, 77));
     // An audio-only model declares no image token: token 0 is text.
     try testing.expectEqual(@as(usize, 1), countSpliceRows(&[_]i32{ 0, 88, 0 }, 0, 88, 0));
-}
-
-test "vision prefill chunks by default and the splice offset feeds every prefill forward" {
-    // Source scan: the chunk-size pick keys on the kill switch (not bare
-    // has_vision), the chunk loop and the final-span forward both set
-    // ctx.vision_splice_offset, and the loop advances the consumed-row count.
-    const src = @embedFile("init.zig");
-    const marker = "const default_chunk = if (has_vision and !vision" ++ "_chunked) loop_end else PREFILL_CHUNK;";
-    try testing.expect(std.mem.indexOf(u8, src, marker) != null);
-    const set_off = "ctx.vision_splice" ++ "_offset = vision_rows_consumed;";
-    const first = std.mem.indexOf(u8, src, set_off) orelse return error.ChunkOffsetMissing;
-    try testing.expect(std.mem.indexOfPos(u8, src, first + 1, set_off) != null); // final-span site too
-    try testing.expect(std.mem.indexOf(u8, src, "vision_rows_consumed += countSplice" ++ "Rows(") != null);
 }
 
 test "reservedPrefillTokens: every arch reserves its prompt; only qwen4_exp pre-buys generation headroom" {

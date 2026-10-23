@@ -270,30 +270,15 @@ pub fn specAdoptPlan(base_pos: usize, snap_step: usize, matched: usize, has_head
     return .{ .head = want };
 }
 
-var ssd_first_env_cached: ?bool = null;
 /// Test/bench override for `ssdFirstEnabled()`. Null = read the environment.
 pub var ssd_first_override: ?bool = null;
 
-/// Resolve this module's lazily-cached env reads once, from the main thread.
-pub fn warmEnvCaches() void {
-    _ = ssdFirstEnabled();
-    _ = restoreMoveEnabled();
-}
-
-/// SSD-first prefix cache mode (`MLX_SERVE_PREFIX_SSD_FIRST=0` restores RAM-first); armed only
+/// SSD-first prefix cache mode; armed only
 /// where `ModelConfig.ssdFirstCapable()`.
 pub fn ssdFirstEnabled() bool {
-    if (ssd_first_override) |v| return v;
-    if (ssd_first_env_cached) |v| return v;
-    const v = blk: {
-        const raw = env.get(.MLX_SERVE_PREFIX_SSD_FIRST) orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    ssd_first_env_cached = v;
-    return v;
+    return ssd_first_override orelse true;
 }
 
-var restore_move_env_cached: ?bool = null;
 /// Test/bench override for `restoreMoveEnabled()`. Null = read the environment.
 pub var restore_move_override: ?bool = null;
 
@@ -301,14 +286,7 @@ pub var restore_move_override: ?bool = null;
 /// copies the whole prefix. Armed where `HotPrefixCache.ssd_first` is, or on demand when a share
 /// does not fit (`checkoutRestored`).
 pub fn restoreMoveEnabled() bool {
-    if (restore_move_override) |v| return v;
-    if (restore_move_env_cached) |v| return v;
-    const v = blk: {
-        const raw = env.get(.MLX_SERVE_RESTORE_MOVE) orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    restore_move_env_cached = v;
-    return v;
+    return restore_move_override orelse true;
 }
 
 /// What the shutdown flush did, for its one summary line.

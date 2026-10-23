@@ -45,46 +45,22 @@ pub const MTP_PROMOTE_ABOVE: f32 = 0.60; // per-draft rate below configured dept
 pub const MTP_DISABLE_BELOW: f32 = 0.20; // per-draft rate at depth 1 → disable (sticky)
 pub const MTP_PROMOTE_COOLDOWN: u32 = 32; // rounds promotion stays blocked after a demotion
 
-/// Draft-proposal mode is a property of the REQUEST, not of the process.
-/// A greedy target keeps the argmax proposal (the temp-0 identity
-/// contract); a sampled target proposes from the draft sampler, where
-/// `min(1, p[argmax])` no longer collapses on a flat row.
-/// MLX_SERVE_MTP_DRAFT_GREEDY overrides for A/Bs: 1 = always greedy,
-/// 0 = always sampled, absent = the per-request rule.
-pub const DraftProposal = enum { greedy, sampled, per_request };
-var mtp_draft_proposal_cache: ?DraftProposal = null;
-pub fn mtpDraftProposalEnv() DraftProposal {
-    if (mtp_draft_proposal_cache) |v| return v;
-    var mode: DraftProposal = .per_request;
-    if (env.get(.MLX_SERVE_MTP_DRAFT_GREEDY)) |p| {
-        const val = std.mem.span(p);
-        if (val.len > 0 and val[0] == '0') mode = .sampled;
-        if (val.len > 0 and val[0] == '1') mode = .greedy;
-    }
-    mtp_draft_proposal_cache = mode;
-    return mode;
-}
-
 /// Target temperature at or below which the GREEDY proposal still wins:
 /// the argmax accepts with `p_target[argmax]`, high only while the target
 /// row is sharp. Measured crossover between 0.3 and 0.7 on Flash Next.
 pub const MTP_SAMPLED_PROPOSAL_MIN_TEMP: f32 = 0.5;
 
-/// Greedy drafts for THIS request. `top_k == 1` is a deterministic target
-/// whose filtered p is one-hot, so its argmax proposal is already optimal.
-pub fn mtpDraftGreedyFor(target: SamplingParams, mode: DraftProposal) bool {
-    return switch (mode) {
-        .greedy => true,
-        // The temp-0 guard in `mtpDraftSamplingFor` still applies.
-        .sampled => false,
-        .per_request => target.temperature <= MTP_SAMPLED_PROPOSAL_MIN_TEMP or target.top_k == 1,
-    };
+/// Draft-proposal mode is a property of the REQUEST: a greedy target keeps the argmax proposal (the temp-0 identity
+/// contract); a sampled target proposes from the draft sampler, where `min(1, p[argmax])` no longer collapses on a
+/// flat row. `top_k == 1` is a deterministic target whose filtered p is one-hot, so its argmax proposal is optimal.
+pub fn mtpDraftGreedyFor(target: SamplingParams) bool {
+    return target.temperature <= MTP_SAMPLED_PROPOSAL_MIN_TEMP or target.top_k == 1;
 }
 
 /// Greedy drafts at chain depth `step` (0 = the round's first draft). The
 /// greedy tail samples depth 0 of a sampled request and takes the argmax after it.
-pub fn mtpDraftGreedyAt(target: SamplingParams, mode: DraftProposal, greedy_tail: bool, step: u32) bool {
-    return mtpDraftGreedyFor(target, mode) or (greedy_tail and step > 0);
+pub fn mtpDraftGreedyAt(target: SamplingParams, greedy_tail: bool, step: u32) bool {
+    return mtpDraftGreedyFor(target) or (greedy_tail and step > 0);
 }
 
 // ── Sharpened stochastic draft proposals (Lightning-class acceptance) ──
@@ -150,7 +126,7 @@ pub fn mtpDraftSamplingFor(target: SamplingParams, force_greedy: bool, draft_tem
 pub fn mtpDraftSampling(self: *const Generator, step: u32) SamplingParams {
     return mtpDraftSamplingFor(
         self.sampling,
-        self.mtp_serial_accept or mtpDraftGreedyAt(self.sampling, mtpDraftProposalEnv(), self.mtp_greedy_tail, step),
+        self.mtp_serial_accept or mtpDraftGreedyAt(self.sampling, self.mtp_greedy_tail, step),
         mtpDraftTempFor(&self.xfm.config),
     );
 }
@@ -319,7 +295,7 @@ test "greedy tail: depth 0 hands the verify its sampled density, a later depth t
 
     const target = SamplingParams{ .temperature = 1.0 };
     for (0..2) |d| {
-        const sampling = Generator.mtpDraftSamplingFor(target, Generator.mtpDraftGreedyAt(target, .per_request, true, @intCast(d)), Generator.MTP_DRAFT_TEMP);
+        const sampling = Generator.mtpDraftSamplingFor(target, Generator.mtpDraftGreedyAt(target, true, @intCast(d)), Generator.MTP_DRAFT_TEMP);
         for (0..2) |path| {
             const prop = if (path == 0) try shortlistStepProposal(sl, sampling, s) else try logitsStepProposal(full_logits, sampling, s);
             defer {
@@ -382,7 +358,7 @@ test "mtpDraftSamplingFor: sharpened fixed proposal for stochastic targets, gree
     const near_greedy = SamplingParams{ .temperature = 0.005 };
     try testing.expectEqual(@as(f32, 0.0), Generator.mtpDraftSamplingFor(near_greedy, false, Generator.MTP_DRAFT_TEMP).temperature);
 
-    // Explicit greedy override (MLX_SERVE_MTP_DRAFT_GREEDY=1) wins.
+    // Explicit greedy override wins.
     try testing.expectEqual(@as(f32, 0.0), Generator.mtpDraftSamplingFor(target, true, Generator.MTP_DRAFT_TEMP).temperature);
 
     // The draft temperature is the FAMILY's, passed in, never a global.
@@ -398,22 +374,19 @@ test "mtpDraftGreedyFor: the proposal mode is a property of the REQUEST" {
     // argmax proposal already accepts with probability 1.
     const one_way = SamplingParams{ .temperature = 1.0, .top_k = 1 };
 
-    // Absent env: sampled targets propose from the shortlist, greedy ones do not.
-    try testing.expect(!Generator.mtpDraftGreedyFor(sampled, .per_request));
-    try testing.expect(!Generator.mtpDraftGreedyFor(warm, .per_request));
-    try testing.expect(Generator.mtpDraftGreedyFor(cold, .per_request));
+    // Sampled targets propose from the shortlist, greedy ones do not.
+    try testing.expect(!Generator.mtpDraftGreedyFor(sampled));
+    try testing.expect(!Generator.mtpDraftGreedyFor(warm));
+    try testing.expect(Generator.mtpDraftGreedyFor(cold));
     // Bar: a sharp target keeps the argmax, a flat one samples.
-    try testing.expect(Generator.mtpDraftGreedyFor(.{ .temperature = 0.3 }, .per_request));
-    try testing.expect(Generator.mtpDraftGreedyFor(near_cold, .per_request));
-    try testing.expect(Generator.mtpDraftGreedyFor(one_way, .per_request));
+    try testing.expect(Generator.mtpDraftGreedyFor(.{ .temperature = 0.3 }));
+    try testing.expect(Generator.mtpDraftGreedyFor(near_cold));
+    try testing.expect(Generator.mtpDraftGreedyFor(one_way));
 
-    // MLX_SERVE_MTP_DRAFT_GREEDY=1 forces greedy for every request; =0 leaves
-    // the temp-0 guard in `mtpDraftSamplingFor` to keep a greedy target greedy.
-    try testing.expect(Generator.mtpDraftGreedyFor(sampled, .greedy));
-    try testing.expect(!Generator.mtpDraftGreedyFor(sampled, .sampled));
+    // The temp-0 guard in `mtpDraftSamplingFor` keeps a greedy target greedy.
     try testing.expectEqual(
         @as(f32, 0.0),
-        Generator.mtpDraftSamplingFor(cold, Generator.mtpDraftGreedyFor(cold, .sampled), 1.0).temperature,
+        Generator.mtpDraftSamplingFor(cold, Generator.mtpDraftGreedyFor(cold), 1.0).temperature,
     );
 }
 
@@ -421,20 +394,18 @@ test "mtpDraftGreedyAt: the greedy tail samples depth 0 only; a greedy request d
     const sampled = SamplingParams{ .temperature = 1.0, .top_p = 0.95, .top_k = 20 };
     for (0..4) |d| {
         const step: u32 = @intCast(d);
-        try testing.expect(!Generator.mtpDraftGreedyAt(sampled, .per_request, false, step));
-        try testing.expectEqual(step > 0, Generator.mtpDraftGreedyAt(sampled, .per_request, true, step));
+        try testing.expect(!Generator.mtpDraftGreedyAt(sampled, false, step));
+        try testing.expectEqual(step > 0, Generator.mtpDraftGreedyAt(sampled, true, step));
     }
     // Only a sampled chain's depths past 0 change: a greedy chain drafts the same sampler at every depth.
     for ([_]f32{ 0.0, 0.005, 0.3, 1.0 }) |t| {
         const target = SamplingParams{ .temperature = t, .top_p = 0.95, .top_k = 20, .seed = 7 };
-        for ([_]Generator.DraftProposal{ .greedy, .sampled, .per_request }) |mode| {
-            const greedy_chain = t <= 0.01 or Generator.mtpDraftGreedyFor(target, mode);
-            for (0..mtp_mod.MAX_DEPTH) |d| {
-                const step: u32 = @intCast(d);
-                const on = Generator.mtpDraftSamplingFor(target, Generator.mtpDraftGreedyAt(target, mode, true, step), 1.0);
-                const off = Generator.mtpDraftSamplingFor(target, Generator.mtpDraftGreedyAt(target, mode, false, step), 1.0);
-                try testing.expectEqual(greedy_chain or step == 0, std.meta.eql(on, off));
-            }
+        const greedy_chain = t <= 0.01 or Generator.mtpDraftGreedyFor(target);
+        for (0..mtp_mod.MAX_DEPTH) |d| {
+            const step: u32 = @intCast(d);
+            const on = Generator.mtpDraftSamplingFor(target, Generator.mtpDraftGreedyAt(target, true, step), 1.0);
+            const off = Generator.mtpDraftSamplingFor(target, Generator.mtpDraftGreedyAt(target, false, step), 1.0);
+            try testing.expectEqual(greedy_chain or step == 0, std.meta.eql(on, off));
         }
     }
 }

@@ -43,7 +43,6 @@ const qsaMaskFromBlocks = @import("mask.zig").qsaMaskFromBlocks;
 const qsaScoreSheetBudget = @import("score.zig").qsaScoreSheetBudget;
 const qsaSelectKernelEnabled = @import("select.zig").qsaSelectKernelEnabled;
 const qsaSelectSplitEnabled = @import("select.zig").qsaSelectSplitEnabled;
-const qsaSelectTg = @import("select.zig").qsaSelectTg;
 const QSA_VERIFY_GATHER_MIN_KV_DENSE = @import("verify_gather.zig").QSA_VERIFY_GATHER_MIN_KV_DENSE;
 const qsaVerifyBlocksHost = @import("verify_gather.zig").qsaVerifyBlocksHost;
 const qsaVerifyGatherAttn = @import("verify_gather.zig").qsaVerifyGatherAttn;
@@ -144,56 +143,13 @@ pub const QSA_ATTN_MIN_S_DEFAULT: c_int = 2;
 /// `MLX_SERVE_QSA_ATTN_BATCHED_MIN_S=2` hands batched S=1 rows back to the decode gather.
 pub const QSA_ATTN_BATCHED_MIN_S_DEFAULT: c_int = 1;
 
-var qsa_attn_nsplit_env: ?c_int = null;
 pub var qsa_attn_nsplit_override: ?c_int = null;
-var qsa_attn_min_s_env: ?c_int = null;
 pub var qsa_attn_min_s_override: ?c_int = null;
-var qsa_attn_batched_min_s_env: ?c_int = null;
-
-fn qsaAttnEnvInt(cache: *?c_int, name: [*:0]const u8, dflt: c_int) c_int {
-    if (cache.*) |v| return v;
-    const v = blk: {
-        const raw = std.c.getenv(name) orelse break :blk dflt;
-        const parsed = std.fmt.parseInt(c_int, std.mem.sliceTo(raw, 0), 10) catch break :blk dflt;
-        // Absent or 0 means "auto".
-        break :blk if (parsed <= 0) dflt else parsed;
-    };
-    cache.* = v;
-    return v;
-}
 
 /// Splits per (row, kv head): a measured constant, independent of kv and the row's key
-/// count (NSPLIT is a template). `MLX_SERVE_QSA_ATTN_NSPLIT=<n>` overrides.
-/// Resolve every lazily-cached QSA env read once, from the main thread, before any other
-/// thread exists: first touch of a `?bool`/`?c_int` from two threads is a race.
-pub fn warmQsaEnvCaches() void {
-    _ = qsaFusedEnabled();
-    _ = qsaGatherEnabled();
-    _ = qsaGatherMinKv();
-    _ = qsaGatherBk();
-    _ = qsaDecodeGatherEnabled();
-    _ = qsaHistoryShareEnabled();
-    _ = qsaVerifyGatherEnabled();
-    _ = qsaVerifyGatherMinKvFor(false);
-    _ = qsaSelectEnabledWarm();
-    _ = qsaSelectSplitEnabled();
-    _ = qsaSelectTg();
-    _ = qsaAttnKernelEnabled();
-    _ = qsaAttnDenseEnabled();
-    _ = qsaAttnNSplit();
-    _ = qsaAttnMinS();
-    _ = qsaAttnBatchedMinS();
-    _ = qsaAttnBk();
-    _ = qsaAttnBalanced();
-    _ = qsaScoreSheetBudget();
-}
-
-fn qsaSelectEnabledWarm() bool {
-    return qsaSelectKernelEnabled();
-}
-
+/// count (NSPLIT is a template).
 pub fn qsaAttnNSplit() c_int {
-    const forced = qsa_attn_nsplit_override orelse qsaAttnEnvInt(&qsa_attn_nsplit_env, "MLX_SERVE_QSA_ATTN_NSPLIT", 0);
+    const forced = qsa_attn_nsplit_override orelse 0;
     if (forced > 0) {
         var f: c_int = 1;
         while (f < forced and f < QSA_ATTN_MAX_NSPLIT) f *= 2;
@@ -202,22 +158,20 @@ pub fn qsaAttnNSplit() c_int {
     return QSA_ATTN_NSPLIT_DEFAULT;
 }
 
-/// Lowest query width the fused kernel serves. `MLX_SERVE_QSA_ATTN_MIN_S`.
+/// Lowest query width the fused kernel serves.
 pub fn qsaAttnMinS() c_int {
-    const v = qsa_attn_min_s_override orelse qsaAttnEnvInt(&qsa_attn_min_s_env, "MLX_SERVE_QSA_ATTN_MIN_S", QSA_ATTN_MIN_S_DEFAULT);
+    const v = qsa_attn_min_s_override orelse QSA_ATTN_MIN_S_DEFAULT;
     return @max(1, @min(v, FUSED256_MIN_Q_LEN - 1));
 }
 
 /// Lowest width the fused kernel serves for S=1 rows of a batched step with two or more slots.
 pub fn qsaAttnBatchedMinS() c_int {
-    const v = qsaAttnEnvInt(&qsa_attn_batched_min_s_env, "MLX_SERVE_QSA_ATTN_BATCHED_MIN_S", QSA_ATTN_BATCHED_MIN_S_DEFAULT);
-    return @max(1, @min(v, FUSED256_MIN_Q_LEN - 1));
+    return @max(1, @min(QSA_ATTN_BATCHED_MIN_S_DEFAULT, FUSED256_MIN_Q_LEN - 1));
 }
 
 /// Does the fused sparse-attention kernel serve this call? Dense KV takes the kernel's bf16
 /// variant (same split-K grid). It must never fall into `gatherQsa256`, the prefill kernel,
 /// whose grid starves at a verify width (16k fp16: 77.7 vs 93.6 tok/s).
-/// `MLX_SERVE_QSA_ATTN_DENSE=0` hands dense KV back to the mask arm / `qsaVerifyGatherAttn`.
 pub fn qsaSparseAttnServes(has_quant_triple: bool, seq_len: c_int, min_s: c_int) bool {
     if (seq_len < min_s or seq_len >= FUSED256_MIN_Q_LEN) return false;
     return has_quant_triple or qsaAttnDenseEnabled();
@@ -234,8 +188,7 @@ pub fn qsaFusedVerifyServes(quantized: bool, seq_len: c_int) bool {
 /// The indexer's choice for one single-slot call: per-row block selection (`true`) or the
 /// dense `[S, kv]` mask. Prefill and decode widths gather past `qsaGatherMinKv`. Verify widths
 /// take blocks wherever the fused kernel serves them (every kv the indexer is active);
-/// otherwise only past the union gather's own floor. `MLX_SERVE_QSA_ATTN_DENSE=0` (or
-/// `MLX_SERVE_QSA_ATTN_KERNEL=0`) restores the union-gather floor on its KV type.
+/// otherwise only past the union gather's own floor.
 pub fn qsaWantsBlocks(batch: c_int, kv: c_int, seq_len: c_int, quantized: bool) bool {
     if (batch != 1 or !qsaGatherEnabled()) return false;
     if (qsaFusedVerifyServes(quantized, seq_len)) return true;
@@ -272,30 +225,16 @@ fn getQsaAttnMergeKernel() !mlx.mlx_fast_metal_kernel {
 /// Threadgroup tile depth: 16 keys stages 12 KiB, half the dense prefill kernel's footprint.
 pub const QSA_ATTN_BK: c_int = 16;
 
-var qsa_attn_bk_env: ?c_int = null;
-var qsa_attn_balanced_env: ?bool = null;
 pub var qsa_attn_bk_override: ?c_int = null;
-pub var qsa_attn_balanced_override: ?bool = null;
 
-/// Threadgroup tile depth, `MLX_SERVE_QSA_ATTN_BK` (default `QSA_ATTN_BK`). Must be a multiple
-/// of 8 (`KT = BK / 8`). A new value owes a re-run of the NSPLIT sweep.
+/// Threadgroup tile depth (`QSA_ATTN_BK`; the test seam must be a multiple of 8, `KT = BK / 8`). A new value owes a
+/// re-run of the NSPLIT sweep.
 pub fn qsaAttnBk() c_int {
-    const v = qsa_attn_bk_override orelse qsaAttnEnvInt(&qsa_attn_bk_env, "MLX_SERVE_QSA_ATTN_BK", QSA_ATTN_BK);
+    const v = qsa_attn_bk_override orelse QSA_ATTN_BK;
     if (v <= 0 or @rem(v, 8) != 0 or v > 32) return QSA_ATTN_BK;
     return v;
 }
 
-/// `MLX_SERVE_QSA_ATTN_BALANCED=1` spreads the tile remainder one per split. Default off (invalidates the sweep).
-pub fn qsaAttnBalanced() bool {
-    if (qsa_attn_balanced_override) |v| return v;
-    if (qsa_attn_balanced_env) |v| return v;
-    const v = blk: {
-        const raw = std.c.getenv("MLX_SERVE_QSA_ATTN_BALANCED") orelse break :blk false;
-        break :blk std.mem.eql(u8, std.mem.sliceTo(raw, 0), "1");
-    };
-    qsa_attn_balanced_env = v;
-    return v;
-}
 
 var qsa_attn_q_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
 var qsa_attn_d_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
@@ -368,35 +307,19 @@ fn getQsaAttnSlotsKernel() !mlx.mlx_fast_metal_kernel {
     return kernel;
 }
 
-var qsa_attn_kernel_env: ?bool = null;
 
 /// Fused QSA sparse attention at verify widths and batched decode (default on).
 /// `MLX_SERVE_QSA_ATTN_KERNEL=0` restores the gather arms.
 pub fn qsaAttnKernelEnabled() bool {
-    if (transformer.qsa_attn_kernel_override) |v| return v;
-    if (qsa_attn_kernel_env) |v| return v;
-    const v = blk: {
-        const raw = std.c.getenv("MLX_SERVE_QSA_ATTN_KERNEL") orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    qsa_attn_kernel_env = v;
-    return v;
+    return transformer.qsa_attn_kernel_override orelse true;
 }
 
 pub var qsa_attn_dense_override: ?bool = null;
-var qsa_attn_dense_env: ?bool = null;
 
 /// The fused kernel's bf16 (dense KV) variant (default on). `MLX_SERVE_QSA_ATTN_DENSE=0`
 /// hands dense KV back to the mask arm and the union gather.
 pub fn qsaAttnDenseEnabled() bool {
-    if (qsa_attn_dense_override) |v| return v;
-    if (qsa_attn_dense_env) |v| return v;
-    const v = blk: {
-        const raw = std.c.getenv("MLX_SERVE_QSA_ATTN_DENSE") orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    qsa_attn_dense_env = v;
-    return v;
+    return qsa_attn_dense_override orelse true;
 }
 
 const QsaAttnCfgKey = struct {
@@ -409,7 +332,6 @@ const QsaAttnCfgKey = struct {
     nsg: c_int,
     nsplit: c_int,
     bk: c_int,
-    balanced: bool,
     ratio: c_int,
     dtype: mlx.mlx_dtype,
 };
@@ -560,7 +482,6 @@ pub fn qsaSparseAttnFloor(
     const nsg: c_int = @divTrunc(gqa + 7, 8);
     const nsplit = qsaAttnNSplit();
     const bk = qsaAttnBk();
-    const balanced = qsaAttnBalanced();
     const scl_data = [_]f32{attn_scale};
     const one = [_]c_int{1};
     const scl = mlx.mlx_array_new_data(&scl_data, &one, 1, .float32);
@@ -574,7 +495,6 @@ pub fn qsaSparseAttnFloor(
         .nsg = nsg,
         .nsplit = nsplit,
         .bk = bk,
-        .balanced = balanced,
         .ratio = ratio,
         .dtype = .bfloat16,
     };
@@ -597,7 +517,6 @@ pub fn qsaSparseAttnFloor(
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", @intCast(kvin.gs)));
         }
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "NSPLIT", nsplit));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BALANCED", if (balanced) 1 else 0));
 
         // Merge pass: one threadgroup per (q head, row), 256 threads.
         const mconfig = mlx.mlx_fast_metal_kernel_config_new();
@@ -668,13 +587,13 @@ pub fn qsaSparseAttnFloor(
                 kv_hi = @max(kv_hi, meta[3 + 2 * i]);
             }
             log.info(
-                "[qsa-attn] engaged (slots={d} S={d} kv={d}..{d} kv-bits={d}/gs{d} gqa={d} bk={d} nsplit={d} tgs={d}) — MLX_SERVE_QSA_ATTN_KERNEL=0 hands every slot back to the gather or mask arm below it\n",
+                "[qsa-attn] engaged (slots={d} S={d} kv={d}..{d} kv-bits={d}/gs{d} gqa={d} bk={d} nsplit={d} tgs={d})\n",
                 .{ n, seq_len, kv_lo, kv_hi, kvin.bits, kvin.gs, gqa, bk, nsplit, seq_len * h_kv * nsplit * @as(c_int, @intCast(n)) },
             );
         }
     } else if (qsa_attn_engaged_bits.take(qsaWidthBucket(seq_len) + @as(u5, if (dense) 4 else 0))) {
         log.info(
-            "[qsa-attn] engaged (S={d} kv={d} kv-bits={d}/gs{d} gqa={d} bk={d} nsplit={d} tgs={d}) — MLX_SERVE_QSA_ATTN_KERNEL=0 (or MLX_SERVE_QSA_ATTN_DENSE=0 on a dense cache) hands the call back to the gather or mask arm below it\n",
+            "[qsa-attn] engaged (S={d} kv={d} kv-bits={d}/gs{d} gqa={d} bk={d} nsplit={d} tgs={d})\n",
             .{ seq_len, kv, kvin.bits, kvin.gs, gqa, bk, nsplit, seq_len * h_kv * nsplit },
         );
     }
@@ -1007,9 +926,7 @@ test "qsa sparse attn: NSPLIT is one MEASURED constant, and the width floor bind
     qsa_attn_nsplit_override = null;
 
     defer qsa_attn_bk_override = null;
-    defer qsa_attn_balanced_override = null;
     try std.testing.expectEqual(QSA_ATTN_BK, qsaAttnBk());
-    try std.testing.expectEqual(false, qsaAttnBalanced());
     // BK must be a multiple of 8; 12 is rejected back to the default.
     qsa_attn_bk_override = 12;
     try std.testing.expectEqual(QSA_ATTN_BK, qsaAttnBk());
@@ -1021,9 +938,6 @@ test "qsa sparse attn: NSPLIT is one MEASURED constant, and the width floor bind
     try std.testing.expectEqual(@as(c_int, 8), qsaAttnBk());
     try std.testing.expect(256 * (8 + 8) * 2 <= 10 * 1024);
     qsa_attn_bk_override = null;
-    qsa_attn_balanced_override = true;
-    try std.testing.expectEqual(true, qsaAttnBalanced());
-    qsa_attn_balanced_override = null;
 
     defer qsa_attn_min_s_override = null;
     qsa_attn_min_s_override = null;
@@ -1502,8 +1416,8 @@ test "qsa sparse attn dense: one fused dispatch replaces the mask arm's op chain
 
 test "qsa sparse attn: the quantized kernel source is pinned" {
     // A change to these bytes owes an old-vs-new bit-identity run of the split outputs (pacc, pml).
-    try std.testing.expectEqual(@as(usize, 9282), QSA_ATTN_Q_SOURCE.len);
-    try std.testing.expectEqual(@as(u32, 3839740191), std.hash.Crc32.hash(QSA_ATTN_Q_SOURCE));
+    try std.testing.expectEqual(@as(usize, 8678), QSA_ATTN_Q_SOURCE.len);
+    try std.testing.expectEqual(@as(u32, 1353764805), std.hash.Crc32.hash(QSA_ATTN_Q_SOURCE));
     try std.testing.expectEqual(@as(u32, 4256800642), std.hash.Crc32.hash(QSA_ATTN_MERGE_SOURCE));
 }
 

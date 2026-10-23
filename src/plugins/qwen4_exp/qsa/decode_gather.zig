@@ -241,7 +241,7 @@ pub fn qsaDecodeGatherAttn(
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out, q_rope, gk, gv, attn_scale, "array", add4, .{ .ctx = null }, false, s));
     if (arms_mod.qsa_engaged_bits.take(qsaEngagedBit(.decode_gather, qs[2]))) {
-        log.info("[qsa-decode-gather] engaged (S={d} kv={d} rows={d}) (MLX_SERVE_QSA_DECODE_GATHER=0 restores the dense mask arm)\n", .{ qs[2], kv, gathered_len });
+        log.info("[qsa-decode-gather] engaged (S={d} kv={d} rows={d})\n", .{ qs[2], kv, gathered_len });
     }
     return out;
 }
@@ -394,7 +394,7 @@ pub fn qsaBatchedAttn(
     }
     if (!gather.qsa_batched_gather_logged) {
         gather.qsa_batched_gather_logged = true;
-        log.info("[qsa-batched-gather] engaged (slots={d} S={d}) — MLX_SERVE_QSA_BATCHED_GATHER=0 restores the dense padded mask\n", .{ slots.len, seq_len });
+        log.info("[qsa-batched-gather] engaged (slots={d} S={d})\n", .{ slots.len, seq_len });
     }
     const stacked = try qsaBatchedGatherAttn(self.allocator, self.s, q_rope, views, blks, slot_masks, ratio, attn_scale, arms);
     for (slots, arms) |slot_ctx, arm| {

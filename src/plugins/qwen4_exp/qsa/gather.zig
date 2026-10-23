@@ -28,36 +28,20 @@ const qsaMaskArm = @import("sparse_attn.zig").qsaMaskArm;
 const qsaVerifyGatherEnabled = @import("verify_gather.zig").qsaVerifyGatherEnabled;
 const qsaVerifyGatherMinKvFor = @import("verify_gather.zig").qsaVerifyGatherMinKvFor;
 
-var qsa_gather_env_cached: ?bool = null;
 
 /// MLX_SERVE_QSA_GATHER=0 restores the dense [S, kv] mask arm for the
 /// qwen4_exp QSA prefill (the block-gather kernel is the default).
 pub fn qsaGatherEnabled() bool {
-    if (transformer.qsa_gather_override) |v| return v;
-    if (qsa_gather_env_cached) |v| return v;
-    const v = blk: {
-        const raw = std.c.getenv("MLX_SERVE_QSA_GATHER") orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    qsa_gather_env_cached = v;
-    return v;
+    return transformer.qsa_gather_override orelse true;
 }
 
 /// Below this many keys the mask arm wins: it reads at most kv rows per
 /// 64-row tile, the gather reads 2051 rows per token unshared (ladder: 8k
 /// -3%, 16k +4%, 32k +19%, 64k +42%). MLX_SERVE_QSA_GATHER_MIN_KV.
 pub const QSA_GATHER_MIN_KV_DEFAULT: c_int = 8192;
-var qsa_gather_min_kv_cached: ?c_int = null;
 
 pub fn qsaGatherMinKv() c_int {
-    if (transformer.qsa_gather_min_kv_override) |v| return v;
-    if (qsa_gather_min_kv_cached) |v| return v;
-    var v: c_int = QSA_GATHER_MIN_KV_DEFAULT;
-    if (std.c.getenv("MLX_SERVE_QSA_GATHER_MIN_KV")) |raw| {
-        v = std.fmt.parseInt(c_int, std.mem.sliceTo(raw, 0), 10) catch v;
-    }
-    qsa_gather_min_kv_cached = v;
-    return v;
+    return transformer.qsa_gather_min_kv_override orelse QSA_GATHER_MIN_KV_DEFAULT;
 }
 
 /// The prefill floor where the tensor-unit QSA kernel serves: it beats the mask arm from the
@@ -65,62 +49,36 @@ pub fn qsaGatherMinKv() c_int {
 /// chunk). At or below (top-512 + 1) * 4 keys every block is visible and there is nothing to skip.
 pub const QSA_GATHER_MIN_KV_NAX: c_int = 2052;
 
-/// The kv floor for prefill widths. `MLX_SERVE_QSA_GATHER_MIN_KV` and the test override win;
-/// otherwise the NAX floor when the tensor-unit kernel serves, else the stock gather's floor.
+/// The kv floor for prefill widths. The test override wins; otherwise the NAX floor when the
+/// tensor-unit kernel serves, else the stock gather's floor.
 /// Decode and verify widths keep `qsaGatherMinKv`: their gathers do not use the NAX kernel.
 pub fn qsaPrefillGatherMinKv() c_int {
     if (transformer.qsa_gather_min_kv_override != null) return qsaGatherMinKv();
-    if (std.c.getenv("MLX_SERVE_QSA_GATHER_MIN_KV") != null) return qsaGatherMinKv();
     if (!qsaNaxEnabled() or !qsaNaxOsOk() or !verifyQmmNaxAvailable()) return qsaGatherMinKv();
     return QSA_GATHER_MIN_KV_NAX;
 }
 
 pub const QSA_GATHER_BK_DEFAULT: c_int = 32;
-var qsa_gather_bk_cached: ?c_int = null;
 pub var qsa_gather_bk_override: ?c_int = null;
 
-/// Key tile of the gather kernel: 16 or 32 (MLX_SERVE_QSA_GATHER_BK).
+/// Key tile of the gather kernel: 16 or 32.
 pub fn qsaGatherBk() c_int {
-    if (qsa_gather_bk_override) |v| return v;
-    if (qsa_gather_bk_cached) |v| return v;
-    var v: c_int = QSA_GATHER_BK_DEFAULT;
-    if (std.c.getenv("MLX_SERVE_QSA_GATHER_BK")) |raw| {
-        const parsed = std.fmt.parseInt(c_int, std.mem.sliceTo(raw, 0), 10) catch v;
-        if (parsed == 16 or parsed == 32) v = parsed;
-    }
-    qsa_gather_bk_cached = v;
-    return v;
+    return qsa_gather_bk_override orelse QSA_GATHER_BK_DEFAULT;
 }
 
-var qsa_decode_gather_env_cached: ?bool = null;
 
 /// Decode-width QSA gather (S==1): reuse the sorted block selection and read
 /// only the selected blocks + incomplete tail instead of the full KV — O(topk)
 /// per step, never O(kv). MLX_SERVE_QSA_DECODE_GATHER=0 restores the dense
 /// bool-mask arm (same selection, full-KV SDPA).
 pub fn qsaDecodeGatherEnabled() bool {
-    if (transformer.qsa_decode_gather_override) |v| return v;
-    if (qsa_decode_gather_env_cached) |v| return v;
-    const v = blk: {
-        const raw = std.c.getenv("MLX_SERVE_QSA_DECODE_GATHER") orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    qsa_decode_gather_env_cached = v;
-    return v;
+    return transformer.qsa_decode_gather_override orelse true;
 }
 
-var qsa_batched_gather_env_cached: ?bool = null;
 pub var qsa_batched_gather_logged: bool = false;
 
 pub fn qsaBatchedGatherEnabled() bool {
-    if (transformer.qsa_batched_gather_override) |v| return v;
-    if (qsa_batched_gather_env_cached) |v| return v;
-    const v = blk: {
-        const raw = std.c.getenv("MLX_SERVE_QSA_BATCHED_GATHER") orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    qsa_batched_gather_env_cached = v;
-    return v;
+    return transformer.qsa_batched_gather_override orelse true;
 }
 
 pub fn qsaBatchedGatherOn(seq_len: c_int) bool {
@@ -144,20 +102,12 @@ pub fn qsaBatchedGatherFloor(seq_len: c_int, quantized: bool) c_int {
     return qsaGatherMinKv();
 }
 
-var qsa_history_share_env_cached: ?bool = null;
 
 /// `MLX_SERVE_QSA_HISTORY_SHARE=0` restores the end-of-prefill materialized copy of the QSA
 /// indexer history. On (default) the newest SSM checkpoint takes a view of the slot's live
 /// history at commit (`handoffQsaHistoryToLatest`): one copy per (slot ∪ entry).
 pub fn qsaHistoryShareEnabled() bool {
-    if (transformer.qsa_history_share_override) |v| return v;
-    if (qsa_history_share_env_cached) |v| return v;
-    const v = blk: {
-        const raw = std.c.getenv("MLX_SERVE_QSA_HISTORY_SHARE") orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    qsa_history_share_env_cached = v;
-    return v;
+    return transformer.qsa_history_share_override orelse true;
 }
 
 /// Virtual key index -> cache position for one query's block selection:
@@ -206,22 +156,10 @@ fn getAttnQsa256Kernel() !mlx.mlx_fast_metal_kernel {
 var qsa_nax_os_cached: ?bool = null;
 var qsa_nax_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
 pub var qsa_nax_override: ?bool = null;
-var qsa_nax_env: ?bool = null;
-
-/// Default on: the hardware gate (`qsaNaxEligible`) decides, `=0` is the kill switch.
-pub fn qsaNaxEnabledFrom(raw: ?[]const u8) bool {
-    const v = raw orelse return true;
-    return !std.mem.eql(u8, v, "0");
-}
 
 pub fn qsaNaxEnabled() bool {
     if (qsaNaxProbeFailed()) return false;
-    if (qsa_nax_override) |v| return v;
-    if (qsa_nax_env) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_QSA_NAX");
-    const v = qsaNaxEnabledFrom(if (raw) |r| std.mem.sliceTo(r, 0) else null);
-    qsa_nax_env = v;
-    return v;
+    return qsa_nax_override orelse true;
 }
 
 fn qsaNaxOsSupported(version: []const u8) bool {
@@ -294,12 +232,7 @@ pub fn qsaNaxArm() void {
         return;
     }
     if (qsa_nax_probe_state.load(.acquire) != 0) return;
-    if (qsa_nax_override) |v| {
-        if (!v) return;
-    } else {
-        const raw = std.c.getenv("MLX_SERVE_QSA_NAX");
-        if (!qsaNaxEnabledFrom(if (raw) |r| std.mem.sliceTo(r, 0) else null)) return;
-    }
+    if (qsa_nax_override) |v| if (!v) return;
     if (!verifyQmmNaxAvailable()) return;
     if (!qsaNaxOsOk()) return;
     const ok = qsaNaxRunProbe();
@@ -646,10 +579,10 @@ pub fn gatherQsa256(
             @as(usize, @intCast(bk + 8)) * 256 * 2;
         if (use_nax) {
             qsa_gather_engaged_nax += 1;
-            log.info("[qsa-gather] engaged: msv_qsa_nax_precise S={d} kv={d} blocks={d} bk={d} tgmem={d} (MLX_SERVE_QSA_NAX=0 restores the stock gather)\n", .{ qs[2], ks[2], bs[2], bk, tgmem });
+            log.info("[qsa-gather] engaged: msv_qsa_nax_precise S={d} kv={d} blocks={d} bk={d} tgmem={d}\n", .{ qs[2], ks[2], bs[2], bk, tgmem });
         } else {
             qsa_gather_engaged_stock += 1;
-            log.info("[qsa-gather] engaged: msv_attn_qsa256 S={d} kv={d} blocks={d} bk={d} tgmem={d} (MLX_SERVE_QSA_GATHER=0 restores the dense mask arm)\n", .{ qs[2], ks[2], bs[2], bk, tgmem });
+            log.info("[qsa-gather] engaged: msv_attn_qsa256 S={d} kv={d} blocks={d} bk={d} tgmem={d}\n", .{ qs[2], ks[2], bs[2], bk, tgmem });
         }
     }
     return out;
@@ -808,7 +741,7 @@ test "qsa prefill floor: the NAX floor only where the tensor-unit kernel serves,
     qsa_nax_override = false;
     try std.testing.expectEqual(qsaGatherMinKv(), qsaPrefillGatherMinKv());
     qsa_nax_override = true;
-    if (qsaNaxOsOk() and verifyQmmNaxAvailable() and std.c.getenv("MLX_SERVE_QSA_GATHER_MIN_KV") == null)
+    if (qsaNaxOsOk() and verifyQmmNaxAvailable())
         try std.testing.expectEqual(QSA_GATHER_MIN_KV_NAX, qsaPrefillGatherMinKv());
     transformer.qsa_gather_min_kv_override = 5000;
     try std.testing.expectEqual(@as(c_int, 5000), qsaPrefillGatherMinKv());
@@ -1020,12 +953,6 @@ fn qsaBoostLastTileK(
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_astype(&out, k_host, .bfloat16, stream));
     return out;
-}
-
-test "qsaNaxEnabledFrom: on by default, MLX_SERVE_QSA_NAX=0 restores the stock gather" {
-    try std.testing.expect(qsaNaxEnabledFrom(null));
-    try std.testing.expect(qsaNaxEnabledFrom("1"));
-    try std.testing.expect(!qsaNaxEnabledFrom("0"));
 }
 
 test "qsaNaxOsSupported: cooperative input tensors require macOS 26.3" {

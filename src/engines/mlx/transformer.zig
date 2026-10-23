@@ -176,8 +176,6 @@ pub const qsaScoreK32tFromPooled = @import("../../plugins/qwen4_exp/qsa/score.zi
 pub const qsaScoreFused = @import("../../plugins/qwen4_exp/qsa/score.zig").qsaScoreFused;
 pub const qsaScoreSheet = @import("../../plugins/qwen4_exp/qsa/score.zig").qsaScoreSheet;
 pub const QSA_SCORE_SHEET_BUDGET_MB_DEFAULT = @import("../../plugins/qwen4_exp/qsa/score.zig").QSA_SCORE_SHEET_BUDGET_MB_DEFAULT;
-pub const QSA_SCORE_SHEET_BUDGET_MB_MAX = @import("../../plugins/qwen4_exp/qsa/score.zig").QSA_SCORE_SHEET_BUDGET_MB_MAX;
-pub const qsaScoreSheetMbFrom = @import("../../plugins/qwen4_exp/qsa/score.zig").qsaScoreSheetMbFrom;
 pub const qsaScoreSheetBudget = @import("../../plugins/qwen4_exp/qsa/score.zig").qsaScoreSheetBudget;
 pub const qsaScoreRowsPerChunkFor = @import("../../plugins/qwen4_exp/qsa/score.zig").qsaScoreRowsPerChunkFor;
 pub const qsaScoreRowsPerChunkFused = @import("../../plugins/qwen4_exp/qsa/score.zig").qsaScoreRowsPerChunkFused;
@@ -188,7 +186,6 @@ pub const QSA_ATTN_NSPLIT_DEFAULT = @import("../../plugins/qwen4_exp/qsa/sparse_
 pub const QSA_ATTN_MAX_NSPLIT = @import("../../plugins/qwen4_exp/qsa/sparse_attn.zig").QSA_ATTN_MAX_NSPLIT;
 pub const QSA_ATTN_MIN_S_DEFAULT = @import("../../plugins/qwen4_exp/qsa/sparse_attn.zig").QSA_ATTN_MIN_S_DEFAULT;
 pub const QSA_ATTN_BATCHED_MIN_S_DEFAULT = @import("../../plugins/qwen4_exp/qsa/sparse_attn.zig").QSA_ATTN_BATCHED_MIN_S_DEFAULT;
-pub const warmQsaEnvCaches = @import("../../plugins/qwen4_exp/qsa/sparse_attn.zig").warmQsaEnvCaches;
 pub const qsaAttnNSplit = @import("../../plugins/qwen4_exp/qsa/sparse_attn.zig").qsaAttnNSplit;
 pub const qsaAttnMinS = @import("../../plugins/qwen4_exp/qsa/sparse_attn.zig").qsaAttnMinS;
 pub const qsaAttnBatchedMinS = @import("../../plugins/qwen4_exp/qsa/sparse_attn.zig").qsaAttnBatchedMinS;
@@ -197,7 +194,6 @@ pub const qsaFusedVerifyServes = @import("../../plugins/qwen4_exp/qsa/sparse_att
 pub const qsaWantsBlocks = @import("../../plugins/qwen4_exp/qsa/sparse_attn.zig").qsaWantsBlocks;
 pub const QSA_ATTN_BK = @import("../../plugins/qwen4_exp/qsa/sparse_attn.zig").QSA_ATTN_BK;
 pub const qsaAttnBk = @import("../../plugins/qwen4_exp/qsa/sparse_attn.zig").qsaAttnBk;
-pub const qsaAttnBalanced = @import("../../plugins/qwen4_exp/qsa/sparse_attn.zig").qsaAttnBalanced;
 pub const qsaAttnKernelEnabled = @import("../../plugins/qwen4_exp/qsa/sparse_attn.zig").qsaAttnKernelEnabled;
 pub const qsaAttnDenseEnabled = @import("../../plugins/qwen4_exp/qsa/sparse_attn.zig").qsaAttnDenseEnabled;
 pub const qsaAttnCfgBuilds = @import("../../plugins/qwen4_exp/qsa/sparse_attn.zig").qsaAttnCfgBuilds;
@@ -439,8 +435,7 @@ pub var device_gen_override: ?DeviceGen = null;
 /// hardware.
 pub var vqmm_nax_probe_override: ?bool = null;
 
-/// Kill switch (MLX_SERVE_FUSED_256=0 disables the kernel entirely). Test
-/// seam: `fused256_override` forces BOTH arms on/off without the environment.
+/// Test seam: forces BOTH hd-256 kernel arms on/off.
 pub var fused256_override: ?bool = null;
 
 pub var qsa_gather_override: ?bool = null;
