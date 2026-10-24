@@ -38,7 +38,7 @@ const arch_ane = @import("../../engines/ane/lm.zig");
 const gen_mod = @import("../media_jobs/gen.zig");
 const generate_mod = @import("../../engines/mlx/generate.zig");
 const log = @import("../log.zig");
-const mlx_stream = if (@import("build_options").mlx_stream) @import("../../sdk/weights/streamed/glue.zig") else @import("../../sdk/weights/streamed/stub.zig");
+const mlx_stream = if (@import("build_options").mlx_stream) @import("../../engines/mlx/modules/stream_glue.zig") else @import("../../engines/mlx/modules/stream_stub.zig");
 
 /// Bumped every time a model becomes `.ready`; readers compare against the value they last acted on.
 pub var load_generation = std.atomic.Value(u64).init(0);

@@ -27,7 +27,7 @@ test {
     _ = @import("env.zig");
     _ = @import("sdk/util/win_io.zig");
     _ = @import("sdk/quant/gguf/claim.zig");
-    if (@import("build_options").mlx_stream) _ = @import("sdk/weights/streamed/glue.zig");
+    if (@import("build_options").mlx_stream) _ = @import("engines/mlx/modules/stream_glue.zig");
     _ = @import("sdk/weights/streamed/dupes_test.zig");
     _ = @import("plugins/deepseek_v41/stream/dupes_test.zig");
     _ = @import("version.zig");

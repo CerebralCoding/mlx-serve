@@ -14,7 +14,7 @@ const model_discovery = @import("discovery.zig");
 const mlx_gguf = @import("../../sdk/quant/gguf/claim.zig");
 const status = @import("../status.zig");
 const dsv41_mod = @import("../../plugins/deepseek_v41/deepseek_v41.zig");
-const mlx_stream = if (@import("build_options").mlx_stream) @import("../../sdk/weights/streamed/glue.zig") else @import("../../sdk/weights/streamed/stub.zig");
+const mlx_stream = if (@import("build_options").mlx_stream) @import("../../engines/mlx/modules/stream_glue.zig") else @import("../../engines/mlx/modules/stream_stub.zig");
 const testing = std.testing;
 
 /// A load whose own bill exceeds the memory cap is refused whatever else is resident.
