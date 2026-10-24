@@ -6,7 +6,6 @@ const transformer_mod = @import("transformer.zig");
 const generate_mod = @import("generate.zig");
 const rp_mod = @import("../../host/chat/reasoning/protocol.zig");
 const drafter_mod = @import("../../plugins/gemma4/assistant_drafter.zig");
-const diffusion_mod = @import("../../plugins/diffusion_gemma/runner.zig");
 const model_mod = @import("model.zig");
 const prefix_cache_mod = @import("cache/prefix_cache.zig");
 const metrics_mod = @import("../../host/metrics/metrics.zig");
@@ -112,11 +111,6 @@ pub const Slot = struct {
     llama_mtp_rounds: u32 = 0,
     llama_mtp_drafted: u32 = 0,
     llama_mtp_accepted: u32 = 0,
-    /// DiffusionGemma canvas-denoising runner. Created in
-    /// `runPrefillDiffusion` for `config.isDiffusion()` models; owns the
-    /// dequantized embedding table; freed in `Slot.deinit`. Mutually
-    /// exclusive with `legacy_gen` (the autoregressive MLX path).
-    diffusion: ?*diffusion_mod.Runner = null,
     /// True when this slot holds one of `model.session_claims` from `submit`
     /// (one per ds4 session or llama sequence); released in `complete()`.
     holds_session: bool = false,
@@ -332,7 +326,6 @@ pub const Slot = struct {
             .ctx = undefined, // set after slot is in stable storage so pointers are valid
             .legacy_gen = null,
             .ds4_session = null,
-            .diffusion = null,
             .ds4_rng = @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds()),
             .llama_seq = null,
             .llama_rng = @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds()),
@@ -426,11 +419,6 @@ pub const Slot = struct {
         // in Scheduler.complete; they die with the model.
         self.ds4_session = null;
         self.llama_seq = null;
-        if (self.diffusion) |runner| {
-            runner.deinit();
-            self.allocator.destroy(runner);
-            self.diffusion = null;
-        }
         if (self.model.transformer) |xfm| if (xfm.qwen4Trunk()) |t| t.markQsaPooledRopeStale();
         if (self.legacy_gen) |*gen| {
             gen.deinit(self.allocator);

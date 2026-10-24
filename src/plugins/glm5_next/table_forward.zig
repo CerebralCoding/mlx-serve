@@ -2,35 +2,31 @@
 //! sublayers and the MoE, every slot's KV and recurrent state through `CacheOps`. Prefill, decode, verify (rows
 //! capture their KDA states) and batched rows (each slot's state advanced by its own call, the MLP shared).
 //! copied_from: plugins/glm5_next/forward.zig (`forwardGlm5With`, `glmSublayer`, `glmBranch`, `glmBranchSlots`,
-//! `glmKdaSlots`, `glmDsaAttn`, `forwardGlmBatchedDecode`), the ForwardCtx reads replaced by `Slots`; the legacy
-//! copy goes when glm5_next flips to its plugin.
+//! `glmKdaSlots`, `glmDsaAttn`, `forwardGlmBatchedDecode`), the ForwardCtx reads replaced by `Slots`.
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const glm5 = @import("glm5_next.zig");
-const legacy = @import("forward.zig");
 const slots_mod = @import("slots.zig");
+const trunk = @import("trunk.zig");
+const kda = @import("kda.zig");
 const kda_recurrence = @import("../../sdk/blocks/kda/recurrence.zig");
-const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
-const MoeLayerWeights = @import("../../engines/mlx/forward/layered.zig").MoeLayerWeights;
-const LinearAttnWeights = @import("../../sdk/blocks/gdn/gated_delta_net.zig").LinearAttnWeights;
+const spliceVisionRows = @import("../../sdk/vision/splice.zig").spliceVisionRows;
 const axisView = @import("../../mlx/array.zig").axisView;
 const concatAxis1 = @import("../../mlx/array.zig").concatAxis1;
-const DsaWeights = @import("weights.zig").DsaWeights;
 const glm_moe = @import("moe.zig");
-const MoeWeights = @import("../../sdk/bases/blocks/moe.zig").Moe.Weights;
 
 const Array = mlx.mlx_array;
 const Slots = slots_mod.Slots;
+const Model = trunk.Model;
+const Layer = trunk.Layer;
 
 /// The rows a batched tick carries per trunk forward (the MoE decode kernels' row limit).
-pub const MOE_DECODE_BATCH_MAX = legacy.MOE_DECODE_BATCH_MAX;
+pub const MOE_DECODE_BATCH_MAX = 8;
 
 /// One forward's inputs beyond the token ids.
 pub const Step = struct {
     slots: Slots,
-    /// Every layer's MoE as the shared block reads it (`moe.Table`).
-    moe: []const ?MoeWeights,
     /// A batched tick: `ids` holds one next token per slot as rows of one window.
     batched: bool = false,
     /// Per-row KDA state capture (a speculative verify).
@@ -46,18 +42,16 @@ pub const Step = struct {
 };
 
 /// The final-normed hidden `[1, S, H]`; the head is the caller's.
-pub fn hidden(xfm: *Transformer, st: *const Step, token_ids: Array) !Array {
-    const ml = xfm.moe_layers.?;
-    const cfg = &xfm.config;
-    xfm.spec_capture_ssm = st.capture;
-    defer xfm.spec_capture_ssm = false;
+pub fn hidden(m: *Model, st: *const Step, token_ids: Array) !Array {
+    const cfg = m.c;
+    const s = m.s;
 
-    var emb = try xfm.embedding(token_ids);
+    var emb = try m.embedding(token_ids);
     {
         errdefer _ = mlx.mlx_array_free(emb);
         // Prompt rows only; the splice frees the embedding it replaces.
-        if (st.media.ctx != null and mlx.getShape(emb)[1] > 1 and (cfg.image_token_id != 0 or cfg.audio_token_id != 0 or cfg.video_token_id != 0))
-            emb = try xfm.spliceVisionEmbeddings(emb, token_ids, st.media, cfg.image_token_id, cfg.audio_token_id, cfg.video_token_id, st.media_offset);
+        if (st.media.ctx != null and mlx.getShape(emb)[1] > 1 and cfg.image_token_id != 0)
+            emb = try spliceVisionRows(emb, token_ids, st.media, cfg.image_token_id, 0, 0, st.media_offset, s);
     }
     defer _ = mlx.mlx_array_free(emb);
     const x_shape = mlx.getShape(emb);
@@ -69,28 +63,28 @@ pub fn hidden(xfm: *Transformer, st: *const Step, token_ids: Array) !Array {
     {
         var e4 = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(e4);
-        try mlx.check(mlx.mlx_expand_dims(&e4, emb, 2, xfm.s));
-        try mlx.check(mlx.mlx_broadcast_to(&stream, e4, &[_]c_int{ batch, seq_len, glm5.HC, x_shape[2] }, 4, xfm.s));
+        try mlx.check(mlx.mlx_expand_dims(&e4, emb, 2, m.s));
+        try mlx.check(mlx.mlx_broadcast_to(&stream, e4, &[_]c_int{ batch, seq_len, glm5.HC, x_shape[2] }, 4, m.s));
     }
 
     const n_layers = cfg.num_hidden_layers;
     var deferred: ?glm5.Deferred = null;
     defer if (deferred) |*df| df.deinit();
-    for (ml[0..n_layers], 0..) |*lw, li| {
+    for (m.layers[0..n_layers], 0..) |*lw, li| {
         for ([_]bool{ true, false }) |attn| {
-            try sublayer(xfm, st, &stream, &deferred, lw, attn, li, batch, seq_len, is_prefill);
+            try sublayer(m, st, &stream, &deferred, lw, attn, li, batch, seq_len, is_prefill);
         }
         // DFlash taps the MEAN of the layer's hyper-connection streams (SGLang's `hc_contract`).
         for (st.capture_ids, st.capture_out) |cid, *slot| if (cid == li) {
             if (deferred) |*df| {
                 _ = mlx.mlx_array_free(stream);
-                stream = try df.materialize(xfm.s);
+                stream = try df.materialize(m.s);
                 df.deinit();
                 deferred = null;
             }
             var mean = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(mean);
-            try mlx.check(mlx.mlx_mean_axis(&mean, stream, 2, false, xfm.s));
+            try mlx.check(mlx.mlx_mean_axis(&mean, stream, 2, false, m.s));
             _ = mlx.mlx_array_set(slot, mean);
         };
         if (is_prefill and st.eval_every > 0 and ((li + 1) % st.eval_every == 0 or li + 1 == n_layers)) {
@@ -99,31 +93,31 @@ pub fn hidden(xfm: *Transformer, st: *const Step, token_ids: Array) !Array {
     }
     if (deferred) |*df| {
         _ = mlx.mlx_array_free(stream);
-        stream = try df.materialize(xfm.s);
+        stream = try df.materialize(m.s);
     }
     var mean = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(mean);
-    try mlx.check(mlx.mlx_mean_axis(&mean, stream, 2, false, xfm.s));
-    return xfm.rmsNorm(mean, xfm.final_norm);
+    try mlx.check(mlx.mlx_mean_axis(&mean, stream, 2, false, m.s));
+    return m.rmsNorm(mean, m.final_norm);
 }
 
 /// One sublayer (attention when `attn`, else the MLP) inside its hyper-connection. For one token the expand stays
 /// in `deferred` (then `stream` is stale until the forward materializes it).
-fn sublayer(xfm: *Transformer, st: *const Step, stream: *Array, deferred: *?glm5.Deferred, lw: *const MoeLayerWeights, attn: bool, li: usize, batch: c_int, seq_len: c_int, is_prefill: bool) !void {
-    const cfg = &xfm.config;
-    const w = if (attn) lw.mhc_attn.? else lw.mhc_ffn.?;
-    const norm_w = if (attn) lw.input_norm else lw.post_attn_norm;
-    const one = glm5.hcRowsServes(xfm.s, mlx.getShape(stream.*), mlx.mlx_array_dtype(stream.*), w.fn_rows, norm_w);
+fn sublayer(m: *Model, st: *const Step, stream: *Array, deferred: *?glm5.Deferred, lw: *const Layer, attn: bool, li: usize, batch: c_int, seq_len: c_int, is_prefill: bool) !void {
+    const cfg = m.c;
+    const w = if (attn) lw.attn_hc.? else lw.ffn_hc.?;
+    const norm_w = if (attn) lw.input_norm else lw.post_norm;
+    const one = glm5.hcRowsServes(m.s, mlx.getShape(stream.*), mlx.mlx_array_dtype(stream.*), w.fn_rows, norm_w);
     if (!one) if (deferred.*) |*df| {
         _ = mlx.mlx_array_free(stream.*);
-        stream.* = try df.materialize(xfm.s);
+        stream.* = try df.materialize(m.s);
         df.deinit();
         deferred.* = null;
     };
     if (one) {
-        var pre = try glm5.hcPre(xfm.s, if (deferred.* == null) stream.* else null, if (deferred.*) |*df| df else null, w.fn_rows, w.scale, w.base, norm_w, cfg.dsv4_hc_sinkhorn_iters, cfg.dsv4_hc_eps, cfg.rms_norm_eps, cfg.rms_norm_eps);
+        var pre = try glm5.hcPre(m.s, if (deferred.* == null) stream.* else null, if (deferred.*) |*df| df else null, w.fn_rows, w.scale, w.base, norm_w, cfg.dsv4_hc_sinkhorn_iters, cfg.dsv4_hc_eps, cfg.rms_norm_eps, cfg.rms_norm_eps);
         defer pre.deinit();
-        const out = try branch(xfm, st, pre.normed, lw, attn, li, batch, seq_len, is_prefill);
+        const out = try branch(m, st, pre.normed, lw, attn, li, batch, seq_len, is_prefill);
         defer _ = mlx.mlx_array_free(out);
         if (deferred.*) |*df| {
             _ = mlx.mlx_array_set(stream, pre.h);
@@ -132,81 +126,82 @@ fn sublayer(xfm: *Transformer, st: *const Step, stream: *Array, deferred: *?glm5
         deferred.* = pre.defer_(out, stream.*);
         return;
     }
-    var c = try glm5.collapse(xfm.s, stream.*, w.fn_rows, w.scale, w.base, cfg.dsv4_hc_sinkhorn_iters, cfg.dsv4_hc_eps, cfg.rms_norm_eps);
+    var c = try glm5.collapse(m.s, stream.*, w.fn_rows, w.scale, w.base, cfg.dsv4_hc_sinkhorn_iters, cfg.dsv4_hc_eps, cfg.rms_norm_eps);
     defer c.deinit();
-    const normed = try xfm.rmsNorm(c.x, norm_w);
+    const normed = try m.rmsNorm(c.x, norm_w);
     defer _ = mlx.mlx_array_free(normed);
-    const out = try branch(xfm, st, normed, lw, attn, li, batch, seq_len, is_prefill);
+    const out = try branch(m, st, normed, lw, attn, li, batch, seq_len, is_prefill);
     defer _ = mlx.mlx_array_free(out);
-    const res = try glm5.expand(xfm.s, out, stream.*, &c);
+    const res = try glm5.expand(m.s, out, stream.*, &c);
     _ = mlx.mlx_array_free(stream.*);
     stream.* = res;
 }
 
-fn branch(xfm: *Transformer, st: *const Step, normed: Array, lw: *const MoeLayerWeights, attn: bool, li: usize, batch: c_int, seq_len: c_int, is_prefill: bool) !Array {
-    if (st.batched) return branchSlots(xfm, st.slots, st.moe, normed, lw, attn, li);
-    return if (attn) switch (lw.attn) {
-        .linear => |*la| try slots_mod.kda(xfm, st.slots, 0, normed, la, li, batch, seq_len, is_prefill),
-        .full => |*fa| try dsaAttn(xfm, st.slots, 0, normed, &fa.dsa.?, @intCast(li), batch, seq_len),
+fn branch(m: *Model, st: *const Step, normed: Array, lw: *const Layer, attn: bool, li: usize, batch: c_int, seq_len: c_int, is_prefill: bool) !Array {
+    if (st.batched) return branchSlots(m, st.slots, normed, lw, attn, li);
+    return if (attn) switch (lw.mixer) {
+        .kda => |*la| try slots_mod.kda(m, st.slots, 0, normed, la, @intCast(li), batch, seq_len, is_prefill, st.capture),
+        .dsa => |*d| try dsaAttn(m, st.slots, 0, normed, d, @intCast(li), batch, seq_len),
+        .mla => error.GlmLayerIsMla,
     } else switch (lw.mlp) {
-        .moe => try glm_moe.forward(&st.moe[li].?, xfm.s, normed),
-        .dense => |*dw| try xfm.denseMLP(normed, dw),
+        .moe => |*mw| try glm_moe.forward(mw, m.s, normed),
+        .dense => |*dw| try m.denseMlp(dw, normed),
     };
 }
 
 /// One batched tick's branch: `normed` `[1, N, H]` holds N slots' next-token rows. The MLP and the projections read
 /// their weights once for all N rows; a slot's own state (its KDA recurrence, its DSA cache) is advanced by its call.
-fn branchSlots(xfm: *Transformer, sl: Slots, moe_ws: []const ?MoeWeights, normed: Array, lw: *const MoeLayerWeights, attn: bool, li: usize) !Array {
+fn branchSlots(m: *Model, sl: Slots, normed: Array, lw: *const Layer, attn: bool, li: usize) !Array {
     if (!attn) return switch (lw.mlp) {
-        .moe => try glm_moe.forward(&moe_ws[li].?, xfm.s, normed),
-        .dense => |*dw| try xfm.denseMLP(normed, dw),
+        .moe => |*mw| try glm_moe.forward(mw, m.s, normed),
+        .dense => |*dw| try m.denseMlp(dw, normed),
     };
-    switch (lw.attn) {
-        .linear => |*la| return kdaSlots(xfm, sl, normed, la, li),
-        .full => |*fa| {
+    switch (lw.mixer) {
+        .kda => |*la| return kdaSlots(m, sl, normed, la, @intCast(li)),
+        .mla => return error.GlmLayerIsMla,
+        .dsa => |*d| {
             var rows: [MOE_DECODE_BATCH_MAX]Array = undefined;
             var built: usize = 0;
             defer for (rows[0..built]) |r| {
                 _ = mlx.mlx_array_free(r);
             };
             for (0..sl.len()) |i| {
-                const row = try axisView(xfm.s, normed, 1, i);
+                const row = try axisView(m.s, normed, 1, i);
                 defer _ = mlx.mlx_array_free(row);
-                rows[i] = try dsaAttn(xfm, sl, i, row, &fa.dsa.?, @intCast(li), 1, 1);
+                rows[i] = try dsaAttn(m, sl, i, row, d, @intCast(li), 1, 1);
                 built += 1;
             }
-            return concatAxis1(xfm.s, rows[0..sl.len()]);
+            return concatAxis1(m.s, rows[0..sl.len()]);
         },
     }
 }
 
 /// KDA over N slots' rows: one joined input projection and one output projection, the fused one-token step per
 /// slot against that slot's own conv and recurrent state. A layer whose projection is not joined runs per slot.
-fn kdaSlots(xfm: *Transformer, sl: Slots, x: Array, la: *const LinearAttnWeights, li: usize) !Array {
-    const cfg = &xfm.config;
+fn kdaSlots(m: *Model, sl: Slots, x: Array, la: *const trunk.Kda, layer: u32) !Array {
+    const cfg = m.c;
     const heads: c_int = @intCast(cfg.linear_num_value_heads);
-    const dk: c_int = @intCast(cfg.linear_key_head_dim);
     var rows: [MOE_DECODE_BATCH_MAX]Array = undefined;
     var built: usize = 0;
     defer for (rows[0..built]) |r| {
         _ = mlx.mlx_array_free(r);
     };
-    const layer: u32 = @intCast(li);
-    const joined = la.in.w.ctx != null and la.a_log_h.ctx != null and la.a2.w.ctx != null and la.z2.w.ctx != null;
+    const joined = la.in.built() and la.a_log_h.ctx != null and la.a2.w.ctx != null and la.z2.w.ctx != null;
     // A GPU that cannot launch the fused step declines at the first slot, and a slot with no state yet steps from
     // zeros: the per-slot path below serves both.
     if (joined) joined_path: {
         for (0..sl.len()) |i| {
             if (sl.state(i, layer, .ssm).ctx == null or sl.state(i, layer, .conv).ctx == null) break :joined_path;
         }
-        const all = try xfm.qmatmul(x, la.in.w, la.in.s, la.in.b);
+        const all = try m.mm(&la.in.lin, x);
         defer _ = mlx.mlx_array_free(all);
         const w = la.in.widths;
-        const lows = legacy.kdaLows(xfm, la, dk);
+        const fb = kda.low(m, &la.a2);
+        const gb = kda.low(m, &la.z2);
         for (0..sl.len()) |i| {
-            const proj = try axisView(xfm.s, all, 1, i);
+            const proj = try axisView(m.s, all, 1, i);
             defer _ = mlx.mlx_array_free(proj);
-            const r = (try kda_recurrence.decodeStep(xfm.s, proj, w[0], w[0] + w[1], w[0] + w[1] + w[2], heads, sl.state(i, layer, .conv), la.conv1d_w, la.a_log_h, la.dt_f32, sl.state(i, layer, .ssm), la.norm_w, lows.fb, lows.gb, cfg.kda_gate_lower_bound, cfg.rms_norm_eps, false)) orelse if (i == 0) break :joined_path else return error.GlmBatchedKdaDeclined;
+            const r = (try kda_recurrence.decodeStep(m.s, proj, w[0], w[0] + w[1], w[0] + w[1] + w[2], heads, sl.state(i, layer, .conv), la.conv_w, la.a_log_h, la.dt_f32, sl.state(i, layer, .ssm), la.norm_w, fb, gb, cfg.kda_gate_lower_bound, cfg.rms_norm_eps, false)) orelse if (i == 0) break :joined_path else return error.GlmBatchedKdaDeclined;
             defer _ = mlx.mlx_array_free(r.conv_state);
             defer _ = mlx.mlx_array_free(r.state);
             try sl.setState(i, layer, .conv, r.conv_state);
@@ -214,25 +209,25 @@ fn kdaSlots(xfm: *Transformer, sl: Slots, x: Array, la: *const LinearAttnWeights
             rows[i] = r.y;
             built += 1;
         }
-        const y = try concatAxis1(xfm.s, rows[0..sl.len()]);
+        const y = try concatAxis1(m.s, rows[0..sl.len()]);
         defer _ = mlx.mlx_array_free(y);
-        return xfm.qmatmul(y, la.out_w, la.out_s, la.out_b);
+        return m.mm(&la.out, y);
     }
     for (0..sl.len()) |i| {
-        const row = try axisView(xfm.s, x, 1, i);
+        const row = try axisView(m.s, x, 1, i);
         defer _ = mlx.mlx_array_free(row);
-        rows[i] = try slots_mod.kda(xfm, sl, i, row, la, li, 1, 1, false);
+        rows[i] = try slots_mod.kda(m, sl, i, row, la, layer, 1, 1, false, false);
         built += 1;
     }
-    return concatAxis1(xfm.s, rows[0..sl.len()]);
+    return concatAxis1(m.s, rows[0..sl.len()]);
 }
 
 /// DeepSeek sparse attention on slot `i`. The cache holds, per token, the latent (`k`) and the indexer's key and
 /// pool gate (`v`). Queries attend in the latent (absorbed MLA) over the tokens the indexer picks; when every query
 /// picks every earlier token the attention is plain causal and prefill runs it on lifted keys.
-pub fn dsaAttn(xfm: *Transformer, sl: Slots, slot: usize, x: Array, d: *const DsaWeights, layer: u32, batch: c_int, seq_len: c_int) !Array {
-    const cfg = &xfm.config;
-    const s = xfm.s;
+pub fn dsaAttn(m: *const Model, sl: Slots, slot: usize, x: Array, d: *const trunk.Dsa, layer: u32, batch: c_int, seq_len: c_int) !Array {
+    const cfg = m.c;
+    const s = m.s;
     const offset: usize = sl.positions[slot];
     const heads: c_int = @intCast(cfg.num_attention_heads);
     const hd: c_int = @intCast(cfg.dsa_head_dim);
@@ -240,13 +235,13 @@ pub fn dsaAttn(xfm: *Transformer, sl: Slots, slot: usize, x: Array, d: *const Ds
     const ihd: c_int = @intCast(cfg.dsa_index_head_dim);
     const ih: c_int = @intCast(cfg.dsa_index_heads);
 
-    const q_a = try xfm.qmatmul(x, d.q_a.w, d.q_a.s, d.q_a.b);
+    const q_a = try m.mm(&d.q_a, x);
     defer _ = mlx.mlx_array_free(q_a);
-    const kv_a = try xfm.qmatmul(x, d.kv_a.w, d.kv_a.s, d.kv_a.b);
+    const kv_a = try m.mm(&d.kv_a, x);
     defer _ = mlx.mlx_array_free(kv_a);
-    const q_resid = try xfm.rmsNorm(q_a, d.q_a_norm);
+    const q_resid = try m.rmsNorm(q_a, d.q_a_norm);
     defer _ = mlx.mlx_array_free(q_resid);
-    const q_flat = try xfm.qmatmul(q_resid, d.q_b.w, d.q_b.s, d.q_b.b);
+    const q_flat = try m.mm(&d.q_b, q_resid);
     defer _ = mlx.mlx_array_free(q_flat);
     var q4 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(q4);
@@ -255,14 +250,14 @@ pub fn dsaAttn(xfm: *Transformer, sl: Slots, slot: usize, x: Array, d: *const Ds
     defer _ = mlx.mlx_array_free(qh);
     try mlx.check(mlx.mlx_transpose_axes(&qh, q4, &[_]c_int{ 0, 2, 1, 3 }, 4, s));
 
-    const lat = try xfm.rmsNorm(kv_a, d.kv_a_norm);
+    const lat = try m.rmsNorm(kv_a, d.kv_a_norm);
     defer _ = mlx.mlx_array_free(lat);
     var lat4 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(lat4);
     try mlx.check(mlx.mlx_reshape(&lat4, lat, &[_]c_int{ batch, 1, seq_len, r }, 4, s));
 
     // Indexer key (LayerNorm) and pool gate (f32 projection, stored in the key's dtype).
-    const ik = try xfm.qmatmul(x, d.idx_wk.w, d.idx_wk.s, d.idx_wk.b);
+    const ik = try m.mm(&d.idx_wk, x);
     defer _ = mlx.mlx_array_free(ik);
     var ikn = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(ikn);
@@ -333,9 +328,9 @@ pub fn dsaAttn(xfm: *Transformer, sl: Slots, slot: usize, x: Array, d: *const Ds
         var kv_rows = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(kv_rows);
         try mlx.check(mlx.mlx_slice(&kv_rows, view.k, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ batch, 1, @as(c_int, @intCast(offset)) + dense_rows, r }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4, s));
-        const keys = try legacy.glmHeadMm(xfm, kv_rows, &d.embed_q, false, cfg.dsa_head_dim);
+        const keys = try m.headMm(kv_rows, &d.embed_q, false);
         defer _ = mlx.mlx_array_free(keys);
-        const values = try legacy.glmHeadMm(xfm, kv_rows, &d.unembed, true, cfg.dsa_kv_lora_rank);
+        const values = try m.headMm(kv_rows, &d.unembed, true);
         defer _ = mlx.mlx_array_free(values);
         var q_rows = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(q_rows);
@@ -352,13 +347,12 @@ pub fn dsaAttn(xfm: *Transformer, sl: Slots, slot: usize, x: Array, d: *const Ds
         var q_scale: ?f32 = scale;
         const q_abs = blk: {
             if (rows == 1 and d.embed_q.s.ctx != null) {
-                const qp = xfm.quantParamsHinted(d.embed_q.w, d.embed_q.s, cfg.dsa_head_dim);
-                if (qp.mode == .affine) if (try glm5.headQmv(s, qh_s, d.embed_q.w, d.embed_q.s, d.embed_q.b, qp.bits, qp.group_size, scale)) |y| {
+                if (d.embed_q.mode == .affine) if (try glm5.headQmv(s, qh_s, d.embed_q.w, d.embed_q.s, d.embed_q.b, d.embed_q.bits, d.embed_q.group_size, scale)) |y| {
                     q_scale = null;
                     break :blk y;
                 };
             }
-            break :blk try legacy.glmHeadMm(xfm, qh_s, &d.embed_q, true, cfg.dsa_head_dim);
+            break :blk try m.headMm(qh_s, &d.embed_q, true);
         };
         defer _ = mlx.mlx_array_free(q_abs);
         var o_lat = mlx.mlx_array_new();
@@ -388,14 +382,14 @@ pub fn dsaAttn(xfm: *Transformer, sl: Slots, slot: usize, x: Array, d: *const Ds
         } else {
             const qr_s = try rowsFrom(q_resid, 1, sparse_from, s);
             defer _ = mlx.mlx_array_free(qr_s);
-            const q_idx_flat = try xfm.qmatmul(qr_s, d.idx_wq_b.w, d.idx_wq_b.s, d.idx_wq_b.b);
+            const q_idx_flat = try m.mm(&d.idx_wq_b, qr_s);
             defer _ = mlx.mlx_array_free(q_idx_flat);
             var q_idx = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(q_idx);
             try mlx.check(mlx.mlx_reshape(&q_idx, q_idx_flat, &[_]c_int{ batch, rows, ih, ihd }, 4, s));
             const x_s = try rowsFrom(x, 1, sparse_from, s);
             defer _ = mlx.mlx_array_free(x_s);
-            const wp = try xfm.qmatmul(x_s, d.idx_wproj.w, d.idx_wproj.s, d.idx_wproj.b);
+            const wp = try m.mm(&d.idx_wproj, x_s);
             defer _ = mlx.mlx_array_free(wp);
             var wpf = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(wpf);
@@ -415,7 +409,7 @@ pub fn dsaAttn(xfm: *Transformer, sl: Slots, slot: usize, x: Array, d: *const Ds
             _ = mlx.mlx_array_free(o_lat);
             o_lat = lat_out;
         }
-        parts[1] = try legacy.glmHeadMm(xfm, o_lat, &d.unembed, true, cfg.dsa_kv_lora_rank);
+        parts[1] = try m.headMm(o_lat, &d.unembed, true);
     }
     var o = mlx.mlx_array_new(); // [B, H, S, hd]
     defer _ = mlx.mlx_array_free(o);
@@ -434,7 +428,7 @@ pub fn dsaAttn(xfm: *Transformer, sl: Slots, slot: usize, x: Array, d: *const Ds
     try mlx.check(mlx.mlx_reshape(&flat, ot, &[_]c_int{ batch, seq_len, heads * hd }, 3, s));
     const of = try glm5.withDependency(flat, view.v);
     defer _ = mlx.mlx_array_free(of);
-    return xfm.qmatmul(of, d.o.w, d.o.s, d.o.b);
+    return m.mm(&d.o, of);
 }
 
 /// `a` from index `from` on along `axis`, a new reference.

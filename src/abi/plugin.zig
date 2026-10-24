@@ -94,7 +94,6 @@ pub const Caps = packed struct(u64) {
     shared_readonly_state: bool = false,
     long_ctx: bool = false,
     moe: bool = false,
-    block_diffusion: bool = false,
     prefix_cache: bool = true,
     /// The exactness contracts (P2 step 7): drafted == plain, restored == cold, batched == solo.
     exact_drafted: bool = false,
@@ -118,7 +117,7 @@ pub const Caps = packed struct(u64) {
     /// The model reads a Thunderbolt cluster's plan itself (`distributed.planFor`); a planned pack whose plugin does
     /// not is loaded by the legacy path.
     cluster_plan: bool = false,
-    _: u38 = 0,
+    _: u39 = 0,
 };
 
 pub const ThinkingDefault = enum(u8) { unset, off, on, on_with_tools };
@@ -230,20 +229,6 @@ pub const SpecFacts = extern struct {
     embed_scale: f32 = 0,
 };
 
-/// A block-diffusion model's canvas loop (`Caps.block_diffusion`): the engine denoises `length` tokens per block with
-/// `.canvas` forwards and commits each block through a `.prefill` (the model's causal encoder pass).
-pub const CanvasFacts = extern struct {
-    size: u32 = @sizeOf(CanvasFacts),
-    length: u32 = 0,
-    max_steps: u32 = 48,
-    t_min: f32 = 0.4,
-    t_max: f32 = 0.8,
-    entropy_bound: f32 = 0.1,
-    confidence_threshold: f32 = 0.005,
-    stability_threshold: u32 = 1,
-    pad_token: u32 = 0,
-};
-
 /// Placeholder token ids a media item's rows replace; 0 = unset, never token 0.
 pub const PlaceholderIds = extern struct {
     size: u32 = @sizeOf(PlaceholderIds),
@@ -301,7 +286,6 @@ pub const Parsed = extern struct {
     embed: EmbedFacts = .{},
     weights: WeightFacts = .{},
     mrope: MropeFacts = .{},
-    canvas: CanvasFacts = .{},
     /// The plugin's own parsed config, read by its `bill` and `load`.
     private: ?*anyopaque = null,
 };
@@ -349,9 +333,7 @@ pub const LoadCtx = extern struct {
     weights: ?*const Source = null,
 };
 
-/// `.canvas`: a block-diffusion denoising step over `rows` canvas tokens at `positions[0]`, attending bidirectionally
-/// to the cache and the whole canvas; it reads the cache and never writes it (logits for every row).
-pub const Mode = enum(u8) { prefill, decode, verify, batched_rows, canvas };
+pub const Mode = enum(u8) { prefill, decode, verify, batched_rows };
 pub const Logits = enum(u8) { last_row, all_rows, none };
 
 /// One forward. `tokens` holds `rows` tokens per slot, slot after slot; `slots`, `positions` and `caches` hold one
@@ -382,8 +364,7 @@ pub const Forward = extern struct {
     /// A wide forward evaluates its residual after every this many layers and after the last (0 = never): the
     /// engine's bound on a prompt chunk's transient memory.
     eval_every: u32 = 0,
-    /// An MTP head's input: the trunk's hidden rows `[1, rows, hidden]` beside its token rows; a `.canvas` forward's
-    /// self-conditioning signal `[1, rows, hidden]` (null on the first denoising step).
+    /// An MTP head's input: the trunk's hidden rows `[1, rows, hidden]` beside its token rows.
     hidden_in: Array = .{},
     /// The engine reads nothing off the result before the next `forward_settle`: a host-side input the forward
     /// needs (an n-gram lookup of a still-lazy token) may be deferred to it rather than synced inside the forward.
@@ -662,7 +643,6 @@ pub fn declaresMode(caps: Caps, mode: Mode) bool {
     return switch (mode) {
         .prefill, .decode, .verify => true,
         .batched_rows => caps.batches_decode,
-        .canvas => caps.block_diffusion,
     };
 }
 
@@ -677,7 +657,7 @@ test "abi plugin: caps fit one word with the generic defaults" {
 }
 
 test "abi plugin: every struct opens with its size, set by default" {
-    inline for (.{ LayerSpan, Quant, GenDefaults, Shell, NoThink, SamplingDefaults, ChatFacts, MarkerAlias, TokenizerFacts, SsmState, CacheFacts, SpecPolicy, SpecFacts, PlaceholderIds, EmbedFacts, WeightFacts, MropeFacts, CanvasFacts, Parsed, Shape, Bill, ForwardOut, KvView, LayerCache, CacheHooks, SpecHooks, EmbedHooks, WeightHooks, MediaItem }) |T| {
+    inline for (.{ LayerSpan, Quant, GenDefaults, Shell, NoThink, SamplingDefaults, ChatFacts, MarkerAlias, TokenizerFacts, SsmState, CacheFacts, SpecPolicy, SpecFacts, PlaceholderIds, EmbedFacts, WeightFacts, MropeFacts, Parsed, Shape, Bill, ForwardOut, KvView, LayerCache, CacheHooks, SpecHooks, EmbedHooks, WeightHooks, MediaItem }) |T| {
         try testing.expectEqual(@as(usize, 0), @offsetOf(T, "size"));
         const v: T = .{};
         try testing.expectEqual(@as(u32, @sizeOf(T)), v.size);
@@ -691,9 +671,8 @@ test "abi plugin: unset generation defaults read as unset" {
     try testing.expect(std.math.isNan(g.temperature) and std.math.isNan(g.top_p) and g.top_k == -1);
 }
 
-test "abi plugin: prefill, decode and verify are always declared; batched rows and canvas follow the caps" {
-    try testing.expect(declaresMode(.{}, .verify) and !declaresMode(.{}, .batched_rows) and !declaresMode(.{}, .canvas));
+test "abi plugin: prefill, decode and verify are always declared; batched rows follow the caps" {
+    try testing.expect(declaresMode(.{}, .verify) and !declaresMode(.{}, .batched_rows));
     try testing.expect(declaresMode(.{ .batches_decode = true }, .batched_rows));
-    try testing.expect(declaresMode(.{ .block_diffusion = true }, .canvas));
     try testing.expect(declaresMode(.{ .embed = true }, .prefill) and !declaresMode(.{ .embed = true }, .decode));
 }

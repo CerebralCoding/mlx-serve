@@ -190,8 +190,7 @@ pub fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .prefix_cache_mem_bytes = resolvedPrefixCacheMem(),
         .prefix_cache_disk_bytes = http_server.prefix_cache_disk_bytes,
         .prefix_cache_ram_enabled = http_server.prefix_cache_capacity > 0 and http_server.prefix_cache_ram_enabled,
-        // Diffusion prefill returns before the interleave hook: nothing to share.
-        .prefill_decode_share = if (config.isDiffusion()) 0 else scheduler_mod.prefillDecodeShare(),
+        .prefill_decode_share = scheduler_mod.prefillDecodeShare(),
     };
 }
 

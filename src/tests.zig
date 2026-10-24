@@ -86,7 +86,6 @@ test {
     _ = @import("sdk/blocks/attention/lane_attn.zig");
     _ = @import("sdk/blocks/norms/add_norm.zig");
     _ = @import("sdk/blocks/moe/moe_fp4.zig");
-    _ = @import("plugins/glm5_next/mtp.zig");
     _ = @import("sdk/quant/exl3/sushi_pack.zig");
     _ = @import("engines/mlx/load/sushi_adapt.zig");
     _ = @import("sdk/quant/nvfp4/modelopt_pack.zig");
@@ -124,7 +123,6 @@ test {
     _ = @import("sdk/spec/mtp/mtp.zig");
     _ = @import("engines/mlx/spec/round_cost.zig");
     _ = @import("engines/mlx/spec/mtp_group_planner.zig");
-    _ = @import("plugins/diffusion_gemma/runner.zig");
     _ = @import("plugins/deepseek_v4/deepseek_v4.zig");
     _ = @import("plugins/deepseek_v41/engram.zig");
     _ = @import("sdk/weights/nocache_reader.zig");

@@ -380,7 +380,6 @@ pub const vars = struct {
     pub const MLX_SERVE_DECODE_GRAPH_DUMP: Var = .{ .kind = .diag, .type = .text, .default = "unset", .owner = "engines/mlx", .since = "26.9.6", .doc = "path: print one decode forward's lazy graph" };
     pub const MLX_SERVE_DECODE_PROFILE: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "engines/mlx/diag", .since = "26.7.10", .doc = "per-layer decode profile (syncs every layer)" };
     pub const MLX_SERVE_DFLASH_TRACE: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "engines/mlx/spec/mtp", .since = "26.8.5", .doc = "DFlash per-round trace (exactly 1)" };
-    pub const MLX_SERVE_DIFFUSION_TRACE: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "plugins/diffusion_gemma", .since = "26.6.10", .doc = "DiffusionGemma decoder head trace" };
     pub const MLX_SERVE_DISPATCH_PROBE: Var = .{ .kind = .diag, .type = .int, .default = "0", .owner = "engines/mlx/diag", .since = "26.7.12", .doc = "count the dispatches of N decode steps" };
     pub const MLX_SERVE_DSPARK_PROFILE: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "plugins/deepseek_v4", .since = "26.7.12", .doc = "DeepSeek-V4 DSpark per-round profile" };
     pub const MLX_SERVE_DSPARK_TRACE: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "plugins/deepseek_v4", .since = "26.7.12", .doc = "DeepSeek-V4 DSpark draft trace" };
@@ -480,7 +479,6 @@ pub const vars = struct {
     pub const DFLASH2_FIXTURES: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "engines/mlx/spec/dflash", .since = "26.8.10", .doc = "dflash2 fixture parity: conv block forward + greedy selector path vs z-lab model_mlx" };
     pub const DFLASH_ASSISTANT_DIR: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "engines/mlx/spec/dflash", .since = "26.8.5", .doc = "dflash fixture parity: encoder + two draft rounds vs transformers reference" };
     pub const DFLASH_FIXTURES: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "engines/mlx/spec/dflash", .since = "26.8.5", .doc = "dflash fixture parity: encoder + two draft rounds vs transformers reference" };
-    pub const DIFFUSION_TEST_MODEL: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/diffusion_gemma", .since = "26.6.10", .doc = "diffusion: live converged-canvas self-consistency vs mlx-vlm (DIFFUSION_TEST_MODEL)" };
     pub const DSV41_AR_BASELINE_GB: Var = .{ .kind = .fixture, .type = .float, .default = "the box's", .owner = "plugins/deepseek_v41/stream", .since = "26.10.2", .doc = "dsv41 ar harness: the guard's memory baseline, GB" };
     pub const DSV41_AR_CEILING_GB: Var = .{ .kind = .fixture, .type = .float, .default = "the GPU working set", .owner = "plugins/deepseek_v41/stream", .since = "26.10.2", .doc = "dsv41 ar harness: the guard's ceiling, GB" };
     pub const DSV41_AR_OUT: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/deepseek_v41/stream", .since = "26.10.2", .doc = "dsv41 ar harness: receipt path" };

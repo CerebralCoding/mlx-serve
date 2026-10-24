@@ -126,8 +126,8 @@ test "gatherExpertMm: a sorted nvfp4 gather past 65,535 rows matches the dequant
     try testing.expect(n2 > 0 and @sqrt(e2 / n2) < 0.01);
 }
 
-test "splitPackedGateUp slices DiffusionGemma experts.gate_up_proj into gate/up halves" {
-    // DiffusionGemma packs each expert's gate and up projections in one
+test "splitPackedGateUp slices a packed experts.gate_up_proj into gate/up halves" {
+    // A packed bank holds each expert's gate and up projections in one
     // tensor [E, 2*M, X] with gate rows first (HF chunks the gate_up output
     // in halves: gate = [..., :M], up = [..., M:]). The split must slice
     // axis 1 so the same code serves the packed quantized weight, its

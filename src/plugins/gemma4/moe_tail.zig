@@ -1,21 +1,19 @@
 //! plugins/gemma4/moe_tail, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns gemma4MoeLayerTail, trace_tail_once.
+//! Owns gemma4MoeLayerTail.
 
 const std = @import("std");
-const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
-const debugTraceHead = @import("../../engines/mlx/diag/profile.zig").debugTraceHead;
 const MoeLayerWeights = @import("../../engines/mlx/forward/layered.zig").MoeLayerWeights;
 const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
 const fusedResidualNorm = @import("../../sdk/blocks/norms/residual_norm.zig").fusedResidualNorm;
 
-/// Gemma 4 / DiffusionGemma layer tail (from the HF reference):
+/// Gemma 4 layer tail (from the HF reference):
 ///   h = residual + post_attn_norm(attn_out)          [attn_out borrowed]
 ///   residual = h
 ///   shared  = post_ff_norm_1(mlp(pre_ff_norm(h)))
 ///   experts = post_ff_norm_2(moe(pre_ff_norm_2(residual)))  [router sees RAW residual]
 ///   h = residual + post_ff_norm(shared + experts)
-///   h *= layer_scalar (encoder variant when requested and bound)
+///   h *= layer_scalar
 /// Consumes `h_in`; returns the new layer output (caller owns).
 ///
 /// With `fused` (decode width) each residual seam is one dispatch
@@ -92,13 +90,6 @@ pub fn gemma4MoeLayerTail(self: *Transformer, h_in: mlx.mlx_array, attn_out: mlx
     const expert_normed = try self.rmsNorm(expert_out, lw.post_ff_norm_2.?);
     defer _ = mlx.mlx_array_free(expert_normed);
 
-    if (env.get(.MLX_SERVE_DIFFUSION_TRACE) != null and trace_tail_once) {
-        trace_tail_once = false;
-        debugTraceHead("tail residual", h, self.s);
-        debugTraceHead("tail shared_normed", shared_normed, self.s);
-        debugTraceHead("tail expert_normed", expert_normed, self.s);
-    }
-
     // Combine: shared + experts → post_ff_norm → residual add
     var combined = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(combined);
@@ -118,9 +109,3 @@ pub fn gemma4MoeLayerTail(self: *Transformer, h_in: mlx.mlx_array, attn_out: mlx
     }
     return h;
 }
-
-// ── DiffusionGemma bidirectional canvas decoder ──
-
-/// MLX_SERVE_DIFFUSION_TRACE=1 debugging aid: print the first 8 values
-/// of position 0 of a hidden state.
-pub var trace_tail_once: bool = true;

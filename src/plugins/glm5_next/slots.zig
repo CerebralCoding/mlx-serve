@@ -1,13 +1,12 @@
 //! A table forward's slots through `CacheOps`: each slot's cache and first position, a KV view the attention layers
-//! append and read, and a KDA layer on the slot's recurrent state. The shared GatedDeltaNet (`gatedDeltaNet`) takes
-//! an `SSMCacheEntry`; `kda` hands it the slot's state and writes what it leaves back (Ling 3.0 shares this).
+//! append and read, and a KDA layer on the slot's recurrent state (`kda.zig` steps an `Entry`; `kda` hands it the
+//! slot's state and writes what it leaves back). Ling 3.0 shares this.
 
 const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
 const mlx = @import("../../mlx/ffi.zig");
-const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
-const SSMCacheEntry = @import("../../engines/mlx/ssm/entry.zig").SSMCacheEntry;
-const LinearAttnWeights = @import("../../sdk/blocks/gdn/gated_delta_net.zig").LinearAttnWeights;
+const kda_mod = @import("kda.zig");
+const trunk = @import("trunk.zig");
 
 const Array = mlx.mlx_array;
 
@@ -87,35 +86,28 @@ fn takeRef(a: Array) Array {
     return r;
 }
 
-fn freeIf(a: Array) void {
-    if (a.ctx != null) _ = mlx.mlx_array_free(a);
-}
-
-/// Slot `i`'s recurrent state at `layer` as the entry `gatedDeltaNet` reads, holding its own references.
-pub fn entryOf(sl: Slots, i: usize, layer: u32) SSMCacheEntry {
+/// Slot `i`'s recurrent state at `layer` as the KDA layer steps it, holding its own references.
+pub fn entryOf(sl: Slots, i: usize, layer: u32) kda_mod.Entry {
     const conv = sl.state(i, layer, .conv);
     const ssm = sl.state(i, layer, .ssm);
     return .{ .conv_state = takeRef(conv), .ssm_state = takeRef(ssm), .initialized = conv.ctx != null or ssm.ctx != null };
 }
 
 /// Writes the entry's state (and a verify's per-row capture) back to slot `i`, then frees the entry.
-pub fn putEntry(sl: Slots, i: usize, layer: u32, e: *SSMCacheEntry) !void {
-    defer {
-        for ([_]Array{ e.conv_state, e.ssm_state, e.spec_conv_input, e.spec_state_seq }) |a| freeIf(a);
-        e.* = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false };
-    }
+pub fn putEntry(sl: Slots, i: usize, layer: u32, e: *kda_mod.Entry) !void {
+    defer e.deinit();
     if (e.conv_state.ctx != null) try sl.setState(i, layer, .conv, e.conv_state);
     if (e.ssm_state.ctx != null) try sl.setState(i, layer, .ssm, e.ssm_state);
     if (e.spec_conv_input.ctx != null) try sl.setState(i, layer, .conv_input, e.spec_conv_input);
     if (e.spec_state_seq.ctx != null) try sl.setState(i, layer, .state_seq, e.spec_state_seq);
 }
 
-/// A KDA (GatedDeltaNet) layer on slot `i`'s rows `x`.
-pub fn kda(xfm: *Transformer, sl: Slots, i: usize, x: Array, la: *const LinearAttnWeights, li: usize, batch: c_int, seq: c_int, is_prefill: bool) !Array {
-    var e = entryOf(sl, i, @intCast(li));
-    errdefer for ([_]Array{ e.conv_state, e.ssm_state, e.spec_conv_input, e.spec_state_seq }) |a| freeIf(a);
-    const y = try xfm.gatedDeltaNet(x, la, &e, li, batch, seq, is_prefill);
+/// A KDA layer on slot `i`'s rows `x`; `capture` keeps a verify's per-row states.
+pub fn kda(m: *trunk.Model, sl: Slots, i: usize, x: Array, la: *const trunk.Kda, layer: u32, batch: c_int, seq: c_int, is_prefill: bool, capture: bool) !Array {
+    var e = entryOf(sl, i, layer);
+    errdefer e.deinit();
+    const y = try kda_mod.forward(m, x, la, &e, batch, seq, is_prefill, capture);
     errdefer _ = mlx.mlx_array_free(y);
-    try putEntry(sl, i, @intCast(li), &e);
+    try putEntry(sl, i, layer, &e);
     return y;
 }

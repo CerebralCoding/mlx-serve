@@ -47,7 +47,6 @@ let streamOnlyModelTypes: Set<String> = ["glm_moe_dsa"]
 let supportedModelTypes: Set<String> = [
     "gemma3", "gemma3_text", "gemma4", "gemma4_text",
     "gemma4_unified", "gemma4_unified_text",
-    "diffusion_gemma", // DiffusionGemma block diffusion (text-only; vision tower not wired)
     "qwen3", "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next",
     "qwen3_moe", "qwen3_moe_text",
     "qwen4_exp", "qwen4_exp_text", // Qwen3.8-Flash-Next (GDN + QSA + n-gram PLE MoE)

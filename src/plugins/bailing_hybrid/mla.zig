@@ -1,24 +1,23 @@
 //! Ling 3.0's multi-head latent attention (the naive DeepSeek-V3 form: per-head keys and values expanded before the
-//! cache) on one slot through `CacheOps`; the legacy copy goes when bailing_hybrid flips to its plugin.
+//! cache) on one slot through `CacheOps`.
 //! copied_from: sdk/blocks/attention/mla.zig (`mlaAttnWith`, the cache update replaced by `Slots.append`).
 
 const mlx = @import("../../mlx/ffi.zig");
 const Slots = @import("../glm5_next/slots.zig").Slots;
-const FullAttnWeights = @import("../../engines/mlx/layer_weights.zig").FullAttnWeights;
-const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
+const trunk = @import("../glm5_next/trunk.zig");
 
 pub fn mlaAttn(
-    self: *Transformer,
+    self: *const trunk.Model,
     sl: Slots,
     x: mlx.mlx_array,
-    fa: *const FullAttnWeights,
+    fa: *const trunk.Mla,
     layer: u32,
     offset: c_int,
     batch: c_int,
     seq_len: c_int,
     is_prefill: bool,
 ) !mlx.mlx_array {
-    const cfg = &self.config;
+    const cfg = self.c;
     const h_count: c_int = @intCast(cfg.num_attention_heads);
     const nope: c_int = @intCast(cfg.mla_qk_nope_head_dim);
     const rope_d: c_int = @intCast(cfg.mla_qk_rope_head_dim);
@@ -36,14 +35,14 @@ pub fn mlaAttn(
     // q_proj is flash's, where `q_lora_rank` is null. Both produce the same
     // [batch, seq, heads * qk_head_dim] flat query, so everything below is
     // shared — only the projection differs.
-    const q_flat = if (fa.mla_q_direct_w.ctx != null)
-        try self.qmatmul(x, fa.mla_q_direct_w, fa.mla_q_direct_s, fa.mla_q_direct_b)
+    const q_flat = if (fa.q.w.ctx != null)
+        try self.mm(&fa.q, x)
     else blk: {
-        const q_a = try self.qmatmul(x, fa.mla_q_a_w, fa.mla_q_a_s, fa.mla_q_a_b);
+        const q_a = try self.mm(&fa.q_a, x);
         defer _ = mlx.mlx_array_free(q_a);
-        const q_a_n = try self.rmsNorm(q_a, fa.mla_q_a_norm);
+        const q_a_n = try self.rmsNorm(q_a, fa.q_a_norm);
         defer _ = mlx.mlx_array_free(q_a_n);
-        break :blk try self.qmatmul(q_a_n, fa.mla_q_b_w, fa.mla_q_b_s, fa.mla_q_b_b);
+        break :blk try self.mm(&fa.q_b, q_a_n);
     };
     defer _ = mlx.mlx_array_free(q_flat);
 
@@ -62,7 +61,7 @@ pub fn mlaAttn(
     try mlx.check(mlx.mlx_slice(&q_rot_raw, q_t, &[_]c_int{ 0, 0, 0, nope }, 4, &[_]c_int{ batch, h_count, seq_len, qk_dim }, 4, &strides4, 4, self.s));
 
     // ── KV: one compressed latent per token, plus one shared rope key.
-    const kv_a = try self.qmatmul(x, fa.mla_kv_a_w, fa.mla_kv_a_s, fa.mla_kv_a_b);
+    const kv_a = try self.mm(&fa.kv_a, x);
     defer _ = mlx.mlx_array_free(kv_a);
     var latent_raw = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(latent_raw);
@@ -71,9 +70,9 @@ pub fn mlaAttn(
     defer _ = mlx.mlx_array_free(k_pe_flat);
     try mlx.check(mlx.mlx_slice(&k_pe_flat, kv_a, &[_]c_int{ 0, 0, kv_lora }, 3, &[_]c_int{ batch, seq_len, kv_lora + rope_d }, 3, &strides3, 3, self.s));
 
-    const latent = try self.rmsNorm(latent_raw, fa.mla_kv_a_norm);
+    const latent = try self.rmsNorm(latent_raw, fa.kv_a_norm);
     defer _ = mlx.mlx_array_free(latent);
-    const kv_flat = try self.qmatmul(latent, fa.mla_kv_b_w, fa.mla_kv_b_s, fa.mla_kv_b_b);
+    const kv_flat = try self.mm(&fa.kv_b, latent);
     defer _ = mlx.mlx_array_free(kv_flat);
     var kv_heads = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(kv_heads);
@@ -157,8 +156,8 @@ pub fn mlaAttn(
     defer if (gated.ctx != null) {
         _ = mlx.mlx_array_free(gated);
     };
-    if (cfg.mla_head_gate and fa.g_w.ctx != null) {
-        const gate_logits = try self.qmatmul(x, fa.g_w, fa.g_s, fa.g_b);
+    if (cfg.mla_head_gate and fa.g.w.ctx != null) {
+        const gate_logits = try self.mm(&fa.g, x);
         defer _ = mlx.mlx_array_free(gate_logits);
         // The reference takes the sigmoid in fp32 and casts back.
         var g_f32 = mlx.mlx_array_new();
@@ -189,5 +188,5 @@ pub fn mlaAttn(
     // transform nobody characterized. Quantized checkpoints (every
     // shipped mirror) skip the path either way; this only binds a future
     // bf16 mirror, and it can opt in once someone A/Bs it.
-    return self.qmatmul(attn_flat, fa.o_w, fa.o_s, fa.o_b);
+    return self.mm(&fa.o, attn_flat);
 }

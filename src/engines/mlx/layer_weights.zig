@@ -2,7 +2,6 @@
 //! Owns LayerWeights, FullAttnWeights, QW.
 
 const mlx = @import("../../mlx/ffi.zig");
-const DsaWeights = @import("../../plugins/glm5_next/weights.zig").DsaWeights;
 const FusedRows = @import("../../sdk/blocks/linear/fused_rows.zig").FusedRows;
 
 // ── Standard decoder-only layer weights ──
@@ -82,36 +81,11 @@ pub const FullAttnWeights = struct {
     qkv: FusedRows = .{},
     // Per-head attention OUTPUT gate (self_attn.g_proj / attention.g_proj →
     // [B,S,n_heads]). The ACTIVATION is the arch's, not the weight's: Laguna
-    // applies softplus, bailing_hybrid's MLA a sigmoid. Null-ctx on every
+    // applies softplus. Null-ctx on every
     // other arch → skipped by appendFullAttnWeights and by the gate branches.
     g_w: mlx.mlx_array = .{ .ctx = null },
     g_s: mlx.mlx_array = .{ .ctx = null },
     g_b: mlx.mlx_array = .{ .ctx = null },
-    // Multi-head Latent Attention (bailing_hybrid). When `mla_q_a_w` is
-    // non-null this layer projects through a low-rank Q and a compressed KV
-    // latent instead of q/k/v — those three fields stay null-ctx and
-    // `mlaAttnWith` runs in place of gatedFullAttnWith. `o_w` holds the
-    // checkpoint's `dense` (the output projection) as usual.
-    /// The direct Q projection, used INSTEAD of the q_a/q_b pair when the
-    /// config carries `q_lora_rank: null` (`ModelConfig.mlaHasQLora`). Exactly
-    /// one of `mla_q_direct_w` and `mla_q_a_w` is non-null on an MLA layer.
-    mla_q_direct_w: mlx.mlx_array = .{ .ctx = null },
-    mla_q_direct_s: mlx.mlx_array = .{ .ctx = null },
-    mla_q_direct_b: mlx.mlx_array = .{ .ctx = null },
-    mla_q_a_w: mlx.mlx_array = .{ .ctx = null },
-    mla_q_a_s: mlx.mlx_array = .{ .ctx = null },
-    mla_q_a_b: mlx.mlx_array = .{ .ctx = null },
-    mla_q_a_norm: mlx.mlx_array = .{ .ctx = null },
-    mla_q_b_w: mlx.mlx_array = .{ .ctx = null },
-    mla_q_b_s: mlx.mlx_array = .{ .ctx = null },
-    mla_q_b_b: mlx.mlx_array = .{ .ctx = null },
-    mla_kv_a_w: mlx.mlx_array = .{ .ctx = null },
-    mla_kv_a_s: mlx.mlx_array = .{ .ctx = null },
-    mla_kv_a_b: mlx.mlx_array = .{ .ctx = null },
-    mla_kv_a_norm: mlx.mlx_array = .{ .ctx = null },
-    mla_kv_b_w: mlx.mlx_array = .{ .ctx = null },
-    mla_kv_b_s: mlx.mlx_array = .{ .ctx = null },
-    mla_kv_b_b: mlx.mlx_array = .{ .ctx = null },
     // qwen4_exp QSA indexer: one projection for the index queries + the
     // single shared key head, and their per-head RMS norms. Null-ctx on
     // every other arch.
@@ -134,8 +108,6 @@ pub const FullAttnWeights = struct {
     // "nothing". Passed straight to mlx's fused SDPA, which takes them as a
     // function constant (`_has_sinks_`) — no unfused fallback.
     sinks: mlx.mlx_array = .{ .ctx = null },
-    /// GLM-5-Next DeepSeek sparse attention; null on every other arch.
-    dsa: ?DsaWeights = null,
 };
 
 pub const QW = @import("../../sdk/blocks/linear/fused_rows.zig").QW;

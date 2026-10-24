@@ -5,7 +5,6 @@ const std = @import("std");
 const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const profile = @import("../diag/profile.zig");
-const MhcWeights = @import("../../../plugins/glm5_next/weights.zig").MhcWeights;
 const HcWeights = @import("../../../plugins/qwen4_exp/weights.zig").HcWeights;
 const PleWeights = @import("../../../plugins/qwen4_exp/weights.zig").PleWeights;
 const LinearAttnWeights = @import("../../../sdk/blocks/gdn/gated_delta_net.zig").LinearAttnWeights;
@@ -51,9 +50,6 @@ pub const MoeLayerWeights = struct {
     hc_attn: ?HcWeights = null,
     hc_mlp: ?HcWeights = null,
     ple: ?PleWeights = null,
-    // GLM-5-Next: the Sinkhorn hyper-connections around attention and the MLP.
-    mhc_attn: ?MhcWeights = null,
-    mhc_ffn: ?MhcWeights = null,
 };
 
 pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
@@ -61,7 +57,6 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
     const offset = ctx.moe_seq_offset.*;
     const cfg = &self.config;
     const is_gemma4 = cfg.isGemma4Layers();
-    const is_mla = cfg.isMla();
 
     // PLD spec-decode: thread the per-position SSM capture flag down to the
     // GatedDeltaNet layers (which don't take the ctx). Reset on exit so it
@@ -169,9 +164,7 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
         // Attention: linear (GatedDeltaNet) or full
         const attn_out = switch (lw.attn) {
             .linear => |la| try self.gatedDeltaNet(normed, &la, &ctx.ssm_entries.?[layer_idx], layer_idx, batch, seq_len, is_prefill),
-            .full => |fa| if (is_mla)
-                try self.mlaAttnWith(ctx, normed, &fa, li, @intCast(offset), batch, seq_len, is_prefill)
-            else if (is_gemma4)
+            .full => |fa| if (is_gemma4)
                 try self.gemma4MoeAttnWith(ctx, normed, &fa, li, @intCast(offset), batch, seq_len, is_prefill, &local_prefill_mask, local_decode_mask)
             else
                 try self.gatedFullAttnWith(ctx, normed, &fa, li, @intCast(offset), batch, seq_len, is_prefill),

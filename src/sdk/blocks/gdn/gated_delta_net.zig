@@ -4,7 +4,6 @@
 const mlx = @import("../../../mlx/ffi.zig");
 const gdn_decode = @import("decode.zig");
 const log = @import("../../../host/log.zig");
-const kda_recurrence = @import("../kda/recurrence.zig");
 const decode_fused = @import("decode_fused.zig");
 const env = @import("../../../env.zig");
 const QW = @import("../linear/fused_rows.zig").QW;
@@ -61,18 +60,12 @@ pub const LinearAttnWeights = struct {
     /// Row-joined [qkv | z | a | b] (separate projections only); the fields
     /// above are views of it once built (fuseRowGroup).
     in: FusedRows = .{},
-    /// Low-rank gates (GLM-5-Next KDA): `a = a2(a(x))`, `z = z2(z(x))`. Null-ctx = full rank.
-    a2: QW = .{},
-    z2: QW = .{},
     /// q/k/v quantized at different widths cannot join: `qkv_w` is null and each projects alone.
     qkv_parts: [3]QW = .{ .{}, .{}, .{} },
-    /// f32 copies the KDA kernels read: A_log per head [Hv], dt_bias [Hv*Dk] (GLM-5-Next).
-    a_log_h: mlx.mlx_array = .{ .ctx = null },
-    dt_f32: mlx.mlx_array = .{ .ctx = null },
 
     /// The ANE GDN program projects one joined qkv and a full-rank z.
     pub fn aneGdnServes(la: *const LinearAttnWeights) bool {
-        return !la.combined_proj and la.qkv_w.ctx != null and la.z2.w.ctx == null;
+        return !la.combined_proj and la.qkv_w.ctx != null;
     }
 };
 

@@ -7,7 +7,6 @@ const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
 const mtp_lookup = @import("mtp_lookup.zig");
 const mtp_mod = @import("../../../sdk/spec/mtp/mtp.zig");
-const glm_mtp = @import("../../../plugins/glm5_next/mtp.zig");
 const plugin_head = @import("../plugin/head.zig");
 const Transformer = transformer_mod.Transformer;
 const KVCache = transformer_mod.KVCache;
@@ -34,8 +33,6 @@ pub const MtpHeadRef = union(enum) {
     /// (`qwen4_mtp`, module-owned ⇒ single-flight); row r of the history is
     /// (pre-mixer stream at position r, token r+1), query position r+1.
     qwen4: *Qwen4Trunk,
-    /// glm5_next: the checkpoint's `mtp.0` NextN layer; per-request state is a one-layer `KVCache`.
-    glm: *glm_mtp.Head,
     /// A served model's head (`SpecHooks.head`); its cache is a one-layer `KVCache` (`MtpCacheRef.qwen`).
     plugin: *plugin_head.Head,
 
@@ -45,7 +42,7 @@ pub const MtpHeadRef = union(enum) {
         return switch (self) {
             .qwen => false,
             // Per-request state swaps onto the module (`Qwen4MtpState`); nothing is shared.
-            .qwen4, .glm, .plugin => false,
+            .qwen4, .plugin => false,
         };
     }
 
@@ -59,7 +56,6 @@ pub const MtpHeadRef = union(enum) {
                 t.qwen4MtpActivate(st);
                 break :blk .{ .qwen4 = .{ .t = t, .st = st, .allocator = allocator } };
             },
-            .glm => |h| .{ .glm = try h.makeCache(allocator) },
             .plugin => |h| .{ .plugin = try MtpCacheRef.PluginRef.init(allocator, h.heads) },
         };
     }
@@ -100,7 +96,6 @@ pub const MtpHeadRef = union(enum) {
         host_ids: ?[]const u32,
     ) !mtp_mod.StepOut {
         return switch (self) {
-            .glm => |h| h.forward(target, &cache.glm, id_arr, hidden, want),
             .plugin => |h| h.forward(target, &cache.plugin, id_arr, hidden, rope_offset, want, mrope_ctx, host_ids != null),
             .qwen => |h| mtp_mod.forwardWithMrope(h, target, &cache.qwen, id_arr, hidden, rope_offset, want == .logits, mrope_ctx),
             .qwen4 => |t| blk: {
@@ -113,7 +108,7 @@ pub const MtpHeadRef = union(enum) {
     /// One draft row past a padded history append (`HeadPlace`); qwen4 only.
     pub fn forwardPlaced(self: MtpHeadRef, cache: *MtpCacheRef, id_arr: mlx.mlx_array, hidden: mlx.mlx_array, place: *const Qwen4Mtp.HeadPlace, want: mtp_mod.StepWant) !mtp_mod.StepOut {
         const t = switch (self) {
-            .qwen, .glm, .plugin => return error.MtpPlacement,
+            .qwen, .plugin => return error.MtpPlacement,
             .qwen4 => |t| t,
         };
         cache.activate();
@@ -131,7 +126,7 @@ pub const MtpHeadRef = union(enum) {
     pub fn maxDepth(self: MtpHeadRef) u32 {
         return switch (self) {
             .plugin => |h| if (h.heads > 1) h.heads else std.math.maxInt(u32),
-            .qwen, .qwen4, .glm => std.math.maxInt(u32),
+            .qwen, .qwen4 => std.math.maxInt(u32),
         };
     }
 
@@ -148,7 +143,6 @@ pub const MtpHeadRef = union(enum) {
     ) !void {
         switch (self) {
             .qwen => |h| try mtp_mod.appendHistoryWithMrope(h, target, &cache.qwen, token_ids, hidden, rope_offset, mrope_ctx),
-            .glm => |h| try h.appendHistory(target, &cache.glm, token_ids, hidden),
             .plugin => |h| try h.appendHistory(&cache.plugin, token_ids, hidden, rope_offset, mrope_ctx, allocator),
             .qwen4 => |t| {
                 const ids_i32 = try allocator.alloc(i32, token_ids.len);
@@ -174,7 +168,6 @@ pub const MtpHeadRef = union(enum) {
             // Transformer is still under construction and its lm_head — the
             // very weight the coarse head is a copy of — is not assigned yet.
             .qwen4 => |t| t.qwen4DraftRerankReady(),
-            .glm => |h| h.canRerankDrafts(),
             .plugin => |h| h.canRerankDrafts(),
         };
     }
@@ -191,7 +184,6 @@ pub const MtpHeadRef = union(enum) {
         return switch (self) {
             .qwen => |h| h.draftSelect(target, x, suppress_mask),
             .qwen4 => |t| t.qwen4DraftSelect(x, suppress_mask),
-            .glm => |h| h.draftSelect(target, x, suppress_mask),
             .plugin => |h| h.draftSelect(target, x, suppress_mask),
         };
     }
@@ -208,7 +200,6 @@ pub const MtpHeadRef = union(enum) {
         return switch (self) {
             .qwen => |h| h.draftShortlist(target, x, suppress_mask),
             .qwen4 => |t| t.qwen4DraftShortlist(x, suppress_mask),
-            .glm => |h| h.draftShortlist(target, x, suppress_mask),
             .plugin => |h| h.draftShortlist(target, x, suppress_mask),
         };
     }
@@ -218,7 +209,7 @@ pub const MtpHeadRef = union(enum) {
         return switch (self) {
             .qwen => |h| h.draftSelectBatched(target, x, suppress_mask),
             .qwen4 => |t| t.qwen4DraftSelectBatched(x, suppress_mask),
-            .glm, .plugin => mtp_mod.fullReadoutArgmax(target.s, target, x, suppress_mask),
+            .plugin => mtp_mod.fullReadoutArgmax(target.s, target, x, suppress_mask),
         };
     }
 
@@ -227,7 +218,7 @@ pub const MtpHeadRef = union(enum) {
         return switch (self) {
             .qwen => |h| h.draftShortlistsBatched(target, x, suppress_mask, out),
             .qwen4 => |t| t.qwen4DraftShortlistsBatched(x, suppress_mask, out),
-            .glm, .plugin => mtp_mod.exactShortlistsBatched(target.s, target, x, suppress_mask, out),
+            .plugin => mtp_mod.exactShortlistsBatched(target.s, target, x, suppress_mask, out),
         };
     }
 
@@ -240,7 +231,6 @@ pub const MtpHeadRef = union(enum) {
         return switch (self) {
             .qwen => |h| h.m5NaxCostProfile(target),
             .qwen4 => |t| @import("../../../plugins/qwen4_exp/cost_profile.zig").qwen4G17CostProfileForKv(t, kv),
-            .glm => .generic,
             .plugin => |h| h.profile,
         };
     }
@@ -252,7 +242,6 @@ pub const MtpHeadRef = union(enum) {
     pub fn evSeed(self: MtpHeadRef) ?struct { accept: [mtp_mod.MAX_DEPTH]f32, m_lo: u32 } {
         return switch (self) {
             .qwen => |h| if (h.ev_seed_accept) |a| .{ .accept = a, .m_lo = h.ev_seed_m_lo } else null,
-            .glm => |h| if (h.ev_seed_accept) |a| .{ .accept = a, .m_lo = h.ev_seed_m_lo } else null,
             .plugin => |h| if (h.ev_seed_accept) |a| .{ .accept = a, .m_lo = h.ev_seed_m_lo } else null,
             .qwen4 => |t| blk: {
                 if (t.qwen4_mtp) |*m| {
@@ -266,10 +255,6 @@ pub const MtpHeadRef = union(enum) {
     pub fn setEvSeed(self: MtpHeadRef, accept: [mtp_mod.MAX_DEPTH]f32, m_lo: u32) void {
         switch (self) {
             .qwen => |h| {
-                h.ev_seed_accept = accept;
-                h.ev_seed_m_lo = m_lo;
-            },
-            .glm => |h| {
                 h.ev_seed_accept = accept;
                 h.ev_seed_m_lo = m_lo;
             },
@@ -292,8 +277,6 @@ pub const MtpHeadRef = union(enum) {
 pub const MtpCacheRef = union(enum) {
     qwen: KVCache,
     qwen4: Qwen4Ref,
-    /// The GLM head's one-layer latent + indexer cache, driven like `.qwen`.
-    glm: KVCache,
     plugin: PluginRef,
 
     /// A served model's head history (one KV layer and one recurrent entry per head: what a KV layer cannot hold,
@@ -335,7 +318,7 @@ pub const MtpCacheRef = union(enum) {
     /// Install this request's state on the qwen4 head; no-op on the sidecar arm.
     pub fn activate(self: *const MtpCacheRef) void {
         switch (self.*) {
-            .qwen, .glm, .plugin => {},
+            .qwen, .plugin => {},
             .qwen4 => |r| r.t.qwen4MtpActivate(r.st),
         }
     }
@@ -348,7 +331,7 @@ pub const MtpCacheRef = union(enum) {
 
     pub fn step(self: *const MtpCacheRef) usize {
         return switch (self.*) {
-            .qwen, .glm => |*c| c.step,
+            .qwen => |*c| c.step,
             .plugin => |*r| r.kv.step,
             .qwen4 => |r| blk: {
                 r.t.qwen4MtpActivate(r.st);
@@ -362,7 +345,7 @@ pub const MtpCacheRef = union(enum) {
     /// pointer must also carry `head()`. Null when head persistence is off.
     pub fn kv(self: *MtpCacheRef) ?*KVCache {
         return switch (self.*) {
-            .qwen, .glm => |*c| c,
+            .qwen => |*c| c,
             // Per-depth heads keep rows waiting for their tokens in the recurrent entries: never persisted, the
             // history rebuilt from the uncached tail.
             .plugin => |*r| if (r.ssm.len > 1) null else &r.kv,
@@ -377,7 +360,7 @@ pub const MtpCacheRef = union(enum) {
     /// The trunk owning the in-checkpoint head; null on the sidecar arm and whenever `kv()` is null.
     pub fn head(self: *MtpCacheRef) ?*Qwen4Trunk {
         return switch (self.*) {
-            .qwen, .glm, .plugin => null,
+            .qwen, .plugin => null,
             .qwen4 => |r| blk: {
                 r.t.qwen4MtpActivate(r.st);
                 break :blk r.t;
@@ -387,7 +370,7 @@ pub const MtpCacheRef = union(enum) {
 
     pub fn truncate(self: *MtpCacheRef, len: usize, s: mlx.mlx_stream) !void {
         switch (self.*) {
-            .qwen, .glm => |*c| try c.truncate(len, s),
+            .qwen => |*c| try c.truncate(len, s),
             .plugin => |*r| {
                 try r.kv.truncate(len, s);
                 r.next_head = 0;
@@ -401,7 +384,7 @@ pub const MtpCacheRef = union(enum) {
 
     pub fn deinit(self: *MtpCacheRef) void {
         switch (self.*) {
-            .qwen, .glm => |*c| c.deinit(),
+            .qwen => |*c| c.deinit(),
             .plugin => |*r| r.deinit(),
             .qwen4 => |r| {
                 r.t.qwen4MtpRelease(r.st);
@@ -416,7 +399,7 @@ pub const MtpCacheRef = union(enum) {
     /// across the whole prompt.
     pub fn appendEvalArrays(self: *const MtpCacheRef, vec: mlx.mlx_vector_array) void {
         switch (self.*) {
-            .qwen, .glm => |*c| c.appendEvalArrays(vec),
+            .qwen => |*c| c.appendEvalArrays(vec),
             .plugin => |*r| r.appendEvalArrays(vec),
             .qwen4 => |r| {
                 r.t.qwen4MtpActivate(r.st);

@@ -55,7 +55,6 @@ pub fn forwardMoeBatchedDecode(
     hidden_rows: ?*?[]mlx.mlx_array,
 ) ![]mlx.mlx_array {
     if (self.plugin) |b| return plugin_driver.forwardBatched(self, b, next_tokens, ctxs, rope_offsets, hidden_rows);
-    if (self.config.isGlm5()) return self.forwardGlmBatchedDecode(next_tokens, ctxs, hidden_rows);
     const N: c_int = @intCast(next_tokens.len);
     std.debug.assert(next_tokens.len == ctxs.len);
     if (!gdn_batched_logged) {

@@ -9,8 +9,6 @@ const log = @import("../../../host/log.zig");
 const ModelConfig = @import("../model.zig").ModelConfig;
 const Weights = @import("../model.zig").Weights;
 const materializedOwnedCopy = @import("../../../mlx/array.zig").materializedOwnedCopy;
-const bailingRouterBaseAt = @import("../../../plugins/bailing_hybrid/load.zig").bailingRouterBaseAt;
-const expertContainerAt = @import("../../../plugins/hy_v3/load.zig").expertContainerAt;
 const loadHcWeights = @import("../../../plugins/qwen4_exp/load.zig").loadHcWeights;
 const LinearAttnWeights = @import("../../../sdk/blocks/gdn/gated_delta_net.zig").LinearAttnWeights;
 const DenseMlpWeights = @import("../../../sdk/blocks/mlp/dense.zig").DenseMlpWeights;
@@ -345,94 +343,6 @@ pub fn getWeightAt(weights: *const Weights, buf: *[256]u8, base: []const u8, suf
 pub fn getWeightAtOpt(weights: *const Weights, buf: *[256]u8, base: []const u8, suffix: []const u8) ?mlx.mlx_array {
     const name = std.fmt.bufPrint(buf, "{s}.{s}", .{ base, suffix }) catch unreachable;
     return weights.get(name);
-}
-
-/// A quantized (or dense) projection `<base>.<sub>.{weight,scales,biases}`.
-pub fn loadQWAt(weights: *const Weights, buf: *[256]u8, base: []const u8, sub: []const u8) error{MissingWeight}!QW {
-    var nb: [160]u8 = undefined;
-    const b = std.fmt.bufPrint(&nb, "{s}.{s}", .{ base, sub }) catch unreachable;
-    return .{
-        .w = try getWeightAt(weights, buf, b, "weight"),
-        .s = getWeightAtOpt(weights, buf, b, "scales") orelse mlx.mlx_array_new(),
-        .b = getWeightAtOpt(weights, buf, b, "biases") orelse mlx.mlx_array_new(),
-    };
-}
-
-/// A bailing_hybrid / GLM-5-Next routed MoE under `<base>.mlp.*` (a trunk layer or the MTP
-/// block): mlx-lm's stacked `switch_mlp` banks, a router bias and one UNGATED shared expert.
-pub fn loadRoutedMoeAt(weights: *const Weights, name_buf: *[256]u8, base: []const u8, is_glm: bool, config: *const ModelConfig, owned_bf16: *std.ArrayList(mlx.mlx_array), allocator: std.mem.Allocator, s: mlx.mlx_stream) !MoeMlpWeights {
-    // bailing_hybrid MoE: mlx-lm's stacked `mlp.experts.*` banks, an
-    // `mlp.gate.weight` router with an f32 `mlp.gate.expert_bias`
-    // SELECTION bias, and one UNGATED always-added shared expert.
-    // Routing itself (sigmoid → +bias → group limit → top-k → renorm →
-    // routed_scaling_factor) is hy3's chain with the group limit
-    // inserted; `moe_n_group`/`moe_topk_group` pick it in moeMLP2.
-    //
-    // mlx-lm's converter renames both banks: it quantizes the router
-    // and keeps its module level, so the router lands at
-    // `mlp.gate.gate_proj.*`, and it stacks the experts under
-    // `mlp.switch_mlp.*`. Resolve each by probing, exactly as laguna
-    // and hy_v3 already do, so reference and converted checkpoints
-    // both bind.
-    const rt = bailingRouterBaseAt(weights, name_buf, base);
-    const ex = expertContainerAt(weights, name_buf, base);
-    var rtbuf: [64]u8 = undefined;
-    var exbuf: [64]u8 = undefined;
-    const exl3 = is_glm and config.exl3 != null;
-    const lf: [3][]const u8 = if (exl3) .{ "trellis", "suh", "svh" } else .{ "weight", "scales", "biases" };
-    var mw: MoeMlpWeights = .{
-        .router_w = try getWeightAt(weights, name_buf, base, moeExpertSuffix(&rtbuf, rt, "weight")),
-        .router_s = getWeightAtOpt(weights, name_buf, base, moeExpertSuffix(&rtbuf, rt, "scales")) orelse mlx.mlx_array_new(),
-        .router_b = getWeightAtOpt(weights, name_buf, base, moeExpertSuffix(&rtbuf, rt, "biases")) orelse mlx.mlx_array_new(),
-        .switch_gate_w = try getWeightAt(weights, name_buf, base, expertLeaf(&exbuf, ex, "gate_proj", lf[0])),
-        .switch_gate_s = getWeightAtOpt(weights, name_buf, base, expertLeaf(&exbuf, ex, "gate_proj", lf[1])) orelse mlx.mlx_array_new(),
-        .switch_gate_b = getWeightAtOpt(weights, name_buf, base, expertLeaf(&exbuf, ex, "gate_proj", lf[2])) orelse mlx.mlx_array_new(),
-        .switch_up_w = try getWeightAt(weights, name_buf, base, expertLeaf(&exbuf, ex, "up_proj", lf[0])),
-        .switch_up_s = getWeightAtOpt(weights, name_buf, base, expertLeaf(&exbuf, ex, "up_proj", lf[1])) orelse mlx.mlx_array_new(),
-        .switch_up_b = getWeightAtOpt(weights, name_buf, base, expertLeaf(&exbuf, ex, "up_proj", lf[2])) orelse mlx.mlx_array_new(),
-        .switch_down_w = try getWeightAt(weights, name_buf, base, expertLeaf(&exbuf, ex, "down_proj", lf[0])),
-        .switch_down_s = getWeightAtOpt(weights, name_buf, base, expertLeaf(&exbuf, ex, "down_proj", lf[1])) orelse mlx.mlx_array_new(),
-        .switch_down_b = getWeightAtOpt(weights, name_buf, base, expertLeaf(&exbuf, ex, "down_proj", lf[2])) orelse mlx.mlx_array_new(),
-        .shared_gate_w = try getWeightAt(weights, name_buf, base, "mlp.shared_experts.gate_proj.weight"),
-        .shared_gate_s = getWeightAtOpt(weights, name_buf, base, "mlp.shared_experts.gate_proj.scales") orelse mlx.mlx_array_new(),
-        .shared_gate_b = getWeightAtOpt(weights, name_buf, base, "mlp.shared_experts.gate_proj.biases") orelse mlx.mlx_array_new(),
-        .shared_up_w = try getWeightAt(weights, name_buf, base, "mlp.shared_experts.up_proj.weight"),
-        .shared_up_s = getWeightAtOpt(weights, name_buf, base, "mlp.shared_experts.up_proj.scales") orelse mlx.mlx_array_new(),
-        .shared_up_b = getWeightAtOpt(weights, name_buf, base, "mlp.shared_experts.up_proj.biases") orelse mlx.mlx_array_new(),
-        .shared_down_w = try getWeightAt(weights, name_buf, base, "mlp.shared_experts.down_proj.weight"),
-        .shared_down_s = getWeightAtOpt(weights, name_buf, base, "mlp.shared_experts.down_proj.scales") orelse mlx.mlx_array_new(),
-        .shared_down_b = getWeightAtOpt(weights, name_buf, base, "mlp.shared_experts.down_proj.biases") orelse mlx.mlx_array_new(),
-        .expert_bias = if (is_glm)
-            try f32Table(try getWeightAt(weights, name_buf, base, "mlp.gate.e_score_correction_bias"), false, owned_bf16, allocator, s)
-        else
-            getWeightAtOpt(weights, name_buf, base, "mlp.gate.expert_bias") orelse blk: {
-                // moe_router_enable_expert_bias=false ships no bias; the
-                // reference zero-inits it (selection = plain sigmoid top-k).
-                var zeros = mlx.mlx_array_new();
-                const zshape = [_]c_int{@intCast(config.num_experts)};
-                try mlx.check(mlx.mlx_zeros(&zeros, &zshape, 1, .float32, s));
-                try owned_bf16.append(allocator, zeros);
-                break :blk zeros;
-            },
-        .route_norm = config.moe_route_norm,
-        .route_scale = config.router_scaling_factor,
-        .shared_ungated = true,
-        // ModelOpt NVFP4 banks: each expert's gate scale and its up x down product.
-        .per_expert_scale = getWeightAtOpt(weights, name_buf, base, "mlp.switch_mlp.expert_scale"),
-        .gate_expert_scale = getWeightAtOpt(weights, name_buf, base, "mlp.switch_mlp.gate_proj.expert_scale") orelse .{ .ctx = null },
-        .up_expert_scale = getWeightAtOpt(weights, name_buf, base, "mlp.switch_mlp.up_proj.expert_scale") orelse .{ .ctx = null },
-    };
-    try maybeTransposeForBf16(&mw.router_w, mw.router_s, owned_bf16, allocator, s);
-    // GLM-5-Next routes in f32 (`moe_router_dtype`).
-    if (is_glm and mw.router_s.ctx == null) mw.router_w = try f32Table(mw.router_w, false, owned_bf16, allocator, s);
-    try maybeTransposeForBf16(&mw.switch_gate_w, mw.switch_gate_s, owned_bf16, allocator, s);
-    try maybeTransposeForBf16(&mw.switch_up_w, mw.switch_up_s, owned_bf16, allocator, s);
-    try maybeTransposeForBf16(&mw.switch_down_w, mw.switch_down_s, owned_bf16, allocator, s);
-    try maybeTransposeForBf16(&mw.shared_gate_w, mw.shared_gate_s, owned_bf16, allocator, s);
-    try maybeTransposeForBf16(&mw.shared_up_w, mw.shared_up_s, owned_bf16, allocator, s);
-    try maybeTransposeForBf16(&mw.shared_down_w, mw.shared_down_s, owned_bf16, allocator, s);
-    if (exl3) try checkExl3Bank(&mw, config.*, config.exl3.?);
-    return mw;
 }
 
 pub fn getLayerWeightAt(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, base: []const u8, rest: []const u8) error{MissingWeight}!mlx.mlx_array {

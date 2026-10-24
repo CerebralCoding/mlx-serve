@@ -27,7 +27,7 @@ ENFORCED = "scripts/lint_enforced.txt"
 PLUGIN_ALIASES = {"qwen4_exp": ["qwen4"], "glm5_next": ["glm5", "glm"], "deepseek_v41": ["dsv41", "deepseek41"],
                   "deepseek_v4": ["dsv4", "deepseek"], "mimo_v2": ["mimo"], "nemotron_h": ["nemotron"],
                   "minimax_h3": ["h3"], "prism_hadamard_qwen35": ["prism", "bonsai"], "muse_glimmer": ["muse"],
-                  "flux2": ["flux"], "moss_image": ["moss"], "diffusion_gemma": ["diffusion"]}
+                  "flux2": ["flux"], "moss_image": ["moss"]}
 # Model names with no plugin folder yet: they still make an `is<Model>()` call a model-identity check.
 EXTRA_MODELS = ["inkling", "embeddinggemma", "embeddinggemma2", "gemma3", "qwen3", "laguna", "kolibri1", "flint",
                 "spark25", "k2horizon", "hyv3", "bailing", "minicpm", "gptoss", "mistral"]

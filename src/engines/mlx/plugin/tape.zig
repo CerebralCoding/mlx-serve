@@ -55,6 +55,35 @@ fn floatsOf(a: std.mem.Allocator, x: Array) ![]f32 {
     return a.dupe(f32, p[0..mlx.mlx_array_size(c)]);
 }
 
+const sample_len = 64;
+
+/// XxHash3 of `x`'s dtype, shape and bytes as uint32 `[2]`.
+fn digest(x: Array) !Array {
+    const bytes = try bytesOf(testing.allocator, x);
+    defer testing.allocator.free(bytes);
+    var h = std.hash.XxHash3.init(0);
+    h.update(std.mem.asBytes(&@backingInt(mlx.mlx_array_dtype(x))));
+    h.update(std.mem.sliceAsBytes(mlx.getShape(x)));
+    h.update(bytes);
+    const v = h.final();
+    const words = [2]u32{ @truncate(v), @truncate(v >> 32) };
+    return mlx.mlx_array_new_data(&words, &[_]c_int{2}, 1, .uint32);
+}
+
+/// `sample_len` elements of `x` evenly spread over its flat order, in its dtype.
+fn sample(x: Array) !Array {
+    const a = testing.allocator;
+    const bytes = try bytesOf(a, x);
+    defer a.free(bytes);
+    const item = mlx.mlx_array_itemsize(x);
+    const n = bytes.len / item;
+    const k = @min(n, sample_len);
+    const out = try a.alloc(u8, k * item);
+    defer a.free(out);
+    for (0..k) |i| @memcpy(out[i * item ..][0..item], bytes[(i * n / k) * item ..][0..item]);
+    return mlx.mlx_array_new_data(out.ptr, &[_]c_int{@intCast(k)}, 1, mlx.mlx_array_dtype(x));
+}
+
 pub const Tape = struct {
     /// Recording: the file under the root, and the bytes so far.
     path: ?[]u8 = null,
@@ -63,6 +92,9 @@ pub const Tape = struct {
     data: []const u8 = &.{},
     at: usize = 0,
     same_device: bool = true,
+    /// Arrays over this many bytes are kept as a digest of their dtype, shape and bytes (compared on the recording's
+    /// device only) and an even sample of `sample_len` elements; 0 = every array whole. Set alike to record and play.
+    compact_over: usize = 0,
 
     pub fn recorder(root: []const u8, rel: []const u8) !Tape {
         const a = testing.allocator;
@@ -95,6 +127,20 @@ pub const Tape = struct {
 
     /// Appends `x` (the legacy forward's value) to the recording.
     pub fn put(t: *Tape, x: Array) !void {
+        if (!t.compacts(x)) return t.putWhole(x);
+        const d = try digest(x);
+        defer _ = mlx.mlx_array_free(d);
+        try t.putWhole(d);
+        const s = try sample(x);
+        defer _ = mlx.mlx_array_free(s);
+        try t.putWhole(s);
+    }
+
+    fn compacts(t: *const Tape, x: Array) bool {
+        return t.compact_over > 0 and mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x) > t.compact_over;
+    }
+
+    fn putWhole(t: *Tape, x: Array) !void {
         const a = testing.allocator;
         const sh = mlx.getShape(x);
         try t.buf.append(a, @intCast(@backingInt(mlx.mlx_array_dtype(x))));
@@ -114,6 +160,16 @@ pub const Tape = struct {
 
     /// `got` against the next recorded value; a greedy run (`tokens`) only on the recording's device.
     pub fn expectNext(t: *Tape, got: Array, tokens: bool) !void {
+        if (!t.compacts(got)) return t.expectWhole(got, tokens);
+        const d = try digest(got);
+        defer _ = mlx.mlx_array_free(d);
+        try t.expectWhole(d, true);
+        const s = try sample(got);
+        defer _ = mlx.mlx_array_free(s);
+        try t.expectWhole(s, tokens);
+    }
+
+    fn expectWhole(t: *Tape, got: Array, tokens: bool) !void {
         const a = testing.allocator;
         const dt: mlx.mlx_dtype = @fromBackingInt(@intCast((try t.take(1))[0]));
         const nd = (try t.take(1))[0];
@@ -161,3 +217,26 @@ pub const Tape = struct {
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = t.buf.items });
     }
 };
+
+// ── tests ──
+
+test "proof tape: an array past compact_over is kept as a digest and an even sample, and replays" {
+    const a = testing.allocator;
+    var vals: [1024]f32 = undefined;
+    for (&vals, 0..) |*v, i| v.* = @floatFromInt(i);
+    const x = mlx.mlx_array_new_data(&vals, &[_]c_int{ 4, 256 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    var r: Tape = .{ .compact_over = 64 };
+    defer r.buf.deinit(a);
+    var dbuf: [64]u8 = undefined;
+    const dev = deviceName(&dbuf);
+    try r.buf.appendSlice(a, magic);
+    try r.buf.append(a, @intCast(dev.len));
+    try r.buf.appendSlice(a, dev);
+    try r.put(x);
+    try testing.expect(r.buf.items.len < @sizeOf(@TypeOf(vals)) / 2);
+    var p = try Tape.player(r.buf.items);
+    p.compact_over = 64;
+    try p.expectNext(x, false);
+    try p.expectDone();
+}

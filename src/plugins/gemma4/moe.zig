@@ -1,4 +1,4 @@
-//! Gemma 4's routed experts (26B-A4B, DiffusionGemma): the sigma-MoE router (the raw residual rms-normed by the
+//! Gemma 4's routed experts (26B-A4B): the sigma-MoE router (the raw residual rms-normed by the
 //! folded `router.scale`, a softmax top-k renormed, times `router.per_expert_scale` of the picks) over GeGLU experts.
 //! The shared dense MLP and the norms around it are the layer's (`decoder.zig`). Arms as the legacy takes them for a
 //! tanh-GELU pack: one decode row through the stock gather, wider calls through mlx-lm's `_gather_sort` (the NAX

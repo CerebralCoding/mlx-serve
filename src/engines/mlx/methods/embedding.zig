@@ -77,37 +77,6 @@ pub fn embedding(self: *const Transformer, token_ids: mlx.mlx_array) !mlx.mlx_ar
     return raw;
 }
 
-/// Dense [vocab, hidden] bf16 view of the embedding table. DiffusionGemma
-/// self-conditioning computes `probs @ table` — a plain matmul over a
-/// float table — so quantized checkpoints dequantize the WHOLE table once
-/// per generation request (mlx-vlm does the same; quantized_matmul with
-/// transpose=false is several times slower at this shape). ~1.5 GB
-/// transient for the 262K×2816 table. Caller frees. Dense bf16
-/// checkpoints return a refcount-share of the live table.
-pub fn dequantizedEmbedding(self: *Transformer) !mlx.mlx_array {
-    if (self.emb_s.ctx == null) {
-        var out = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_array_set(&out, self.emb_w));
-        return out;
-    }
-    const emb_qp = self.quantParamsHinted(self.emb_w, self.emb_s, self.config.hidden_size);
-    var dense = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(dense);
-    try mlx.check(mlx.mlx_dequantize(
-        &dense,
-        self.emb_w,
-        self.emb_s,
-        self.emb_b,
-        mlx.mlx_optional_int.some(@intCast(emb_qp.group_size)),
-        mlx.mlx_optional_int.some(@intCast(emb_qp.bits)),
-        emb_qp.mode.cstr(),
-        .{}, // global_scale (null)
-        .{ .value = .bfloat16, .has_value = true },
-        self.s,
-    ));
-    return dense;
-}
-
 pub fn dequantTake(self: *const Transformer, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, ids: mlx.mlx_array) !mlx.mlx_array {
     var tw = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(tw);

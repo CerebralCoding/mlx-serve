@@ -153,7 +153,7 @@ const Graph = struct {
 
 fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) Verdict {
     const m: *Model = @ptrCast(@alignCast(mp));
-    if (!abi.declaresMode(m.caps, f.mode) or f.mode == .canvas) return Verdict.refuse(.unsupported, "_example: forward mode not declared");
+    if (!abi.declaresMode(m.caps, f.mode)) return Verdict.refuse(.unsupported, "_example: forward mode not declared");
     if (f.capture_layers.len > 0) return Verdict.refuse(.unsupported, "_example: no layer capture");
     const ops = f.cache_ops orelse return Verdict.refuse(.failed, "_example: a decoder needs the engine's cache");
     const slots = f.caches.len;

@@ -3,7 +3,6 @@
 const mlx = @import("../../../mlx/ffi.zig");
 const gdn_decode = @import("../../../sdk/blocks/gdn/decode.zig");
 const log = @import("../../../host/log.zig");
-const kda_recurrence = @import("../../../sdk/blocks/kda/recurrence.zig");
 const decode_fused = @import("../../../sdk/blocks/gdn/decode_fused.zig");
 const env = @import("../../../env.zig");
 const scalarOf = @import("../../../mlx/array.zig").scalarOf;
@@ -170,8 +169,7 @@ pub fn gatedDeltaNetProjected(
         z_proj = try standinOnes(&[_]c_int{ batch, seq_len, value_dim }, self.s);
         a_proj = try standinOnes(&[_]c_int{ batch, seq_len, num_v_heads }, self.s);
         b_proj = try standinOnes(&[_]c_int{ batch, seq_len, num_v_heads }, self.s);
-    } else if (la.in.w.ctx != null and (self.rowGroupServes(batch * seq_len) or (cfg.kda_vector_gate and batch == 1 and seq_len <= kda_recurrence.MAX_WINDOW))) {
-        // A KDA verify window rides the row-joined projection too: the fused step below takes up to 16 rows (two launches).
+    } else if (la.in.w.ctx != null and self.rowGroupServes(batch * seq_len)) {
         const all = try self.qmatmul(x, la.in.w, la.in.s, la.in.b);
         in_all = all;
         qkv = mlx.mlx_array_new();
@@ -189,58 +187,6 @@ pub fn gatedDeltaNetProjected(
         a_proj = try self.qmatmul(x, la.a_w, la.a_s, la.a_b);
         b_proj = try self.qmatmul(x, la.b_w, la.b_s, la.b_b);
     }
-    // KDA decode: one dispatch per layer over the row-joined projection. A spec verify
-    // steps row by row instead, keeping each row's state for the partial-accept rollback
-    // (`spec_state_seq`, `spec_conv_input`: the layout `ssmRollbackFromCapture` reads).
-    if (in_all.ctx != null and batch == 1 and seq_len <= kda_recurrence.MAX_WINDOW and la.a_log_h.ctx != null and
-        ssm.initialized and ssm.ssm_state.ctx != null and ssm.conv_state.ctx != null)
-    step: {
-        const w = la.in.widths;
-        const a2q = self.quantParamsHinted(la.a2.w, la.a2.s, @intCast(dk));
-        const z2q = self.quantParamsHinted(la.z2.w, la.z2.s, @intCast(dk));
-        const fb: kda_recurrence.Low = .{ .w = la.a2.w, .s = la.a2.s, .b = la.a2.b, .bits = a2q.bits, .gs = a2q.group_size };
-        const gb: kda_recurrence.Low = .{ .w = la.z2.w, .s = la.z2.s, .b = la.z2.b, .bits = z2q.bits, .gs = z2q.group_size };
-        const r = (try kda_recurrence.decodeStep(self.s, in_all, w[0], w[0] + w[1], w[0] + w[1] + w[2], num_v_heads, ssm.conv_state, la.conv1d_w, la.a_log_h, la.dt_f32, ssm.ssm_state, la.norm_w, fb, gb, cfg.kda_gate_lower_bound, cfg.rms_norm_eps, self.spec_capture_ssm)) orelse break :step;
-        defer _ = mlx.mlx_array_free(r.y);
-        if (self.spec_capture_ssm) {
-            // The window's conv inputs behind the 3 that preceded it, and the state after
-            // every row: the layout `ssmRollbackFromCapture` slices.
-            var qkv_rows = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(qkv_rows);
-            try mlx.check(mlx.mlx_slice(&qkv_rows, in_all, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ 1, seq_len, w[0] }, 3, &[_]c_int{ 1, 1, 1 }, 3, self.s));
-            const parts = [_]mlx.mlx_array{ ssm.conv_state, qkv_rows };
-            const vec = mlx.mlx_vector_array_new_data(&parts, 2);
-            defer _ = mlx.mlx_vector_array_free(vec);
-            if (ssm.spec_conv_input.ctx != null) _ = mlx.mlx_array_free(ssm.spec_conv_input);
-            ssm.spec_conv_input = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_concatenate_axis(&ssm.spec_conv_input, vec, 1, self.s));
-            if (ssm.spec_state_seq.ctx != null) _ = mlx.mlx_array_free(ssm.spec_state_seq);
-            ssm.spec_state_seq = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_reshape(&ssm.spec_state_seq, r.state_seq, &[_]c_int{ seq_len, 1, num_v_heads, dv, dk }, 5, self.s));
-            _ = mlx.mlx_array_free(r.state_seq);
-        }
-        _ = mlx.mlx_array_free(ssm.conv_state);
-        ssm.conv_state = r.conv_state;
-        _ = mlx.mlx_array_free(ssm.ssm_state);
-        ssm.ssm_state = r.state;
-        return if (skip_output) standinRef(r.y) else self.qmatmul(r.y, la.out_w, la.out_s, la.out_b);
-    }
-    // Low-rank gates: the projections above are the first stage. The joined
-    // buffer's a/z columns are then first-stage values, so readers lose it.
-    if (la.a2.w.ctx != null or la.z2.w.ctx != null) {
-        if (la.a2.w.ctx != null) {
-            const full = try self.qmatmul(a_proj, la.a2.w, la.a2.s, la.a2.b);
-            _ = mlx.mlx_array_free(a_proj);
-            a_proj = full;
-        }
-        if (la.z2.w.ctx != null) {
-            const full = try self.qmatmul(z_proj, la.z2.w, la.z2.s, la.z2.b);
-            _ = mlx.mlx_array_free(z_proj);
-            z_proj = full;
-        }
-        if (in_all.ctx != null) _ = mlx.mlx_array_free(in_all);
-        in_all = .{ .ctx = null };
-    }
     // Scale scalars + the parameter-free rms_norm ones-weight (mlx-c
     // requires a non-empty weight) are cached on the Transformer — they
     // used to be rebuilt every layer every decode step.
@@ -256,7 +202,7 @@ pub fn gatedDeltaNetProjected(
     // out_proj rotation in two dispatches (gdn_decode.zig).
     if (self.rht != null and batch == 1 and seq_len == 1 and projected == null and !skip_output and
         !self.spec_capture_ssm and ssm.initialized and ssm.ssm_state.ctx != null and kernel == 4 and
-        !cfg.kda_vector_gate and !cfg.kdaUsesBoundedGate() and !cfg.kda_sigmoid_out_gate)
+        !cfg.kda_sigmoid_out_gate)
     fast: {
         const reg = self.rht.?;
         const signs = reg.get(la.out_w) orelse break :fast;
@@ -290,7 +236,7 @@ pub fn gatedDeltaNetProjected(
     // the norm-gate epilogue.
     if (self.rht == null and batch == 1 and seq_len == 1 and projected == null and
         !self.spec_capture_ssm and ssm.initialized and ssm.ssm_state.ctx != null and kernel == 4 and
-        !cfg.kda_vector_gate and !cfg.kdaUsesBoundedGate() and gdnDecodeRecurEnabled())
+        gdnDecodeRecurEnabled())
     fast: {
         if (self.gdn_eps == null) self.gdn_eps = mlx.mlx_array_new_float(cfg.rms_norm_eps);
         const r = (try gdn_decode.recur(.{ .hk = num_k_heads, .hv = num_v_heads, .dk = dk, .dv = dv }, .{
@@ -332,7 +278,7 @@ pub fn gatedDeltaNetProjected(
     // A grouped verify's `projected` slices ride it too, or its rows round unlike a solo verify's.
     if (self.rht == null and batch == 1 and seq_len >= 1 and seq_len <= gdn_decode.MAX_SEQ and
         self.spec_capture_ssm and ssm.initialized and ssm.ssm_state.ctx != null and kernel == 4 and
-        !cfg.kda_vector_gate and !cfg.kdaUsesBoundedGate() and gdnDecodeRecurEnabled())
+        gdnDecodeRecurEnabled())
     fast: {
         if (self.gdn_eps == null) self.gdn_eps = mlx.mlx_array_new_float(cfg.rms_norm_eps);
         const geo = gdn_decode.Geometry{ .hk = num_k_heads, .hv = num_v_heads, .dk = dk, .dv = dv };
@@ -443,14 +389,9 @@ pub fn gatedDeltaNetProjected(
     var g_fused: ?mlx.mlx_array = null;
     var beta_fused: ?mlx.mlx_array = null;
 
-    // KDA: the per-core recurrence builds the per-channel gate itself, so the prework skips
-    // its per-head one.
-    const kda_fused = cfg.kda_vector_gate and cfg.kdaUsesBoundedGate() and !self.spec_capture_ssm and
-        kda_recurrence.serves(self.s, num_k_heads, num_v_heads, dk, dv, mlx.mlx_array_dtype(qkv), self.ssmStateDtype());
     // Wide prework is token-local; a cold chunk supplies the same zero history as conv1dWithCache.
-    const prefill_fused = (cfg.longCtxGated() or kda_fused) and is_prefill and gdnPrefillFusedFor(seq_len, batch);
-    if (((!cfg.kda_vector_gate and !cfg.kdaUsesBoundedGate()) or kda_fused) and
-        (batch * seq_len <= GDN_FUSED_MAX_ROWS or prefill_fused) and
+    const prefill_fused = cfg.longCtxGated() and is_prefill and gdnPrefillFusedFor(seq_len, batch);
+    if ((batch * seq_len <= GDN_FUSED_MAX_ROWS or prefill_fused) and
         kernel == 4 and (ssm.initialized or prefill_fused))
     blk: {
         var zero_conv = mlx.mlx_array{ .ctx = null };
@@ -486,7 +427,7 @@ pub fn gatedDeltaNetProjected(
             .dv = dv,
             .seq = seq_len,
             .batch = batch,
-            .gate = !kda_fused,
+            .gate = true,
             .g_dtype = gdn_decode.gateDtype(mlx.mlx_array_dtype(qkv), self.ssmStateDtype()),
         }) catch null) orelse break :blk;
         // Spec-capture rollback slices the conv INPUT; build the concat
@@ -524,10 +465,7 @@ pub fn gatedDeltaNetProjected(
         k_scaled = pre.k;
         v_heads = pre.v;
         fused_prework = true;
-        if (kda_fused) {
-            _ = mlx.mlx_array_free(pre.g);
-            beta_fused = pre.beta;
-        } else if (gdnDecodeFusedEnabled()) {
+        if (gdnDecodeFusedEnabled()) {
             g_fused = pre.g;
             beta_fused = pre.beta;
         } else {
@@ -603,26 +541,9 @@ pub fn gatedDeltaNetProjected(
     // Gating. GatedDeltaNet: g = exp(-exp(A_log) * softplus(a + dt_bias)),
     // one scalar per (token, value head) — one fused kernel via compiled
     // closure (mirrors mlx-lm's compute_g), raw chain as fallback.
-    // [B, S, Hv]. KDA: one value per KEY CHANNEL — [B, S, Hv*Dk], which the
-    // `_vec` kernel variant indexes.
-    //
-    // The two ARMS of fla's kernel are selected by the bound, exactly as
-    // `kda_gate_lower_bound`'s declaration says (0 = no bound): non-zero
-    // takes the bounded-sigmoid form, zero the softplus one. The softplus
-    // chain is elementwise and A_log arrives pre-expanded per key channel,
-    // so it serves a per-channel gate unchanged — where feeding `bound = 0`
-    // to `kdaGateChain` would silently yield exp(0) = 1, a gate that never
-    // forgets, on a checkpoint that simply omitted the key.
-    const vector_gate = cfg.kda_vector_gate;
-    // The per-core recurrence evaluates the bounded gate while staging.
-    const kda_percore = kda_fused and g_fused == null;
-    const g = if (kda_percore) mlx.mlx_array{ .ctx = null } else g_fused orelse if (cfg.kdaUsesBoundedGate())
-        try kdaGateChain(la.A_log, a_proj, la.dt_bias, cfg.kda_gate_lower_bound, self.s)
-    else
-        try self.computeGdnGate(la.A_log, a_proj, la.dt_bias);
-    defer if (g.ctx != null) {
-        _ = mlx.mlx_array_free(g);
-    };
+    // [B, S, Hv].
+    const g = g_fused orelse try self.computeGdnGate(la.A_log, a_proj, la.dt_bias);
+    defer _ = mlx.mlx_array_free(g);
 
     // beta = sigmoid(b)
     const beta = beta_fused orelse blk: {
@@ -673,9 +594,9 @@ pub fn gatedDeltaNetProjected(
     var y_bthd = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(y_bthd);
 
-    if (!kda_percore and !mlx.streamIsGpu(self.s)) {
-        const r = (try gdnRecurCuda(self.s, q_scaled, k_scaled, v_heads, g, beta, ssm.ssm_state, vector_gate, self.spec_capture_ssm, gdn_out_dtype)) orelse
-            try gdnRecurOps(self.s, q_scaled, k_scaled, v_heads, g, beta, ssm.ssm_state, vector_gate, self.spec_capture_ssm, gdn_out_dtype);
+    if (!mlx.streamIsGpu(self.s)) {
+        const r = (try gdnRecurCuda(self.s, q_scaled, k_scaled, v_heads, g, beta, ssm.ssm_state, false, self.spec_capture_ssm, gdn_out_dtype)) orelse
+            try gdnRecurOps(self.s, q_scaled, k_scaled, v_heads, g, beta, ssm.ssm_state, false, self.spec_capture_ssm, gdn_out_dtype);
         _ = mlx.mlx_array_free(y_bthd);
         y_bthd = r.y;
         _ = mlx.mlx_array_free(ssm.ssm_state);
@@ -710,7 +631,7 @@ pub fn gatedDeltaNetProjected(
         const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
         defer _ = mlx.mlx_vector_array_free(inputs_vec);
 
-        const gdn_kernel = try getGdnKernelSeq(vector_gate);
+        const gdn_kernel = try getGdnKernelSeq(false);
         var outputs_vec = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(outputs_vec);
         try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, gdn_kernel, inputs_vec, config, self.s));
@@ -730,12 +651,6 @@ pub fn gatedDeltaNetProjected(
         try mlx.check(mlx.mlx_vector_array_get(&final_state, outputs_vec, 2));
         _ = mlx.mlx_array_free(ssm.ssm_state);
         ssm.ssm_state = final_state;
-    } else if (kda_percore) {
-        const r = try kda_recurrence.recur(self.s, q_scaled, k_scaled, v_heads, a_proj, beta, la.a_log_h, la.dt_f32, cfg.kda_gate_lower_bound, ssm.ssm_state);
-        _ = mlx.mlx_array_free(y_bthd);
-        y_bthd = r.y;
-        _ = mlx.mlx_array_free(ssm.ssm_state);
-        ssm.ssm_state = r.state;
     } else {
         const state_shape_out = [_]c_int{ batch, num_v_heads, dv, dk };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &state_shape_out, 4, gdn_state_dtype));
@@ -748,10 +663,7 @@ pub fn gatedDeltaNetProjected(
         // smaller TB to fit the threadgroup budget. A null means even the
         // smallest block overflows — decline and stay on the stock kernel
         // rather than emit a kernel that cannot compile.
-        // The blocked kernel reads a PER-HEAD gate; a per-channel (KDA)
-        // gate is a different indexing contract, so it declines outright
-        // rather than silently reading the wrong element.
-        const blocked_tb: ?u32 = if (!vector_gate and gdnBlockedEnabled() and gdnBlockedEligible(seq_len, dk, dv, num_k_heads, num_v_heads))
+        const blocked_tb: ?u32 = if (gdnBlockedEnabled() and gdnBlockedEligible(seq_len, dk, dv, num_k_heads, num_v_heads))
             gdnBlockTFor(GDN_BLOCK_T, dk, gdn_in_itemsize)
         else
             null;
@@ -769,7 +681,7 @@ pub fn gatedDeltaNetProjected(
         const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
         defer _ = mlx.mlx_vector_array_free(inputs_vec);
 
-        const gdn_kernel = try gdnRouteKernel(route, blocked_tb orelse 0, vector_gate);
+        const gdn_kernel = try gdnRouteKernel(route, blocked_tb orelse 0, false);
         var outputs_vec = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(outputs_vec);
         if (qwen4Standin().gdn_recur) {

@@ -438,7 +438,7 @@ pub fn mtpChainBuildBatchedActive(gens: []const *Generator, chains: []MtpPreDraf
         if (g.mtpMropeContext() != null) any_mrope = true;
         switch (g.mtp.?) {
             .qwen4 => one_sidecar = false,
-            .glm, .plugin => {
+            .plugin => {
                 all_qwen4 = false;
                 one_sidecar = false;
             },

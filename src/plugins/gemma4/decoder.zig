@@ -16,9 +16,6 @@ const Attention = @import("../gemma3/load.zig").Attention;
 const Compiled = @import("../gemma3/compiled.zig").Compiled;
 const gelu_ple = @import("gelu_ple.zig");
 const moe = @import("moe.zig");
-const da = @import("../../sdk/bases/blocks/decoder_attention.zig");
-const kv = @import("../../sdk/bases/kv.zig");
-const compiled_mod = @import("../gemma3/compiled.zig");
 
 const b = bases.blocks;
 const Array = ops.Array;
@@ -38,14 +35,12 @@ pub const batches_decode = Attention.supports_batched_rows and Mlp.supports_batc
 /// A layer's per-layer-embedding gate, projection and norm.
 pub const Ple = struct { gate: Linear, proj: Linear, norm: Array };
 
-/// A 26B-A4B layer's routed half: the second feed-forward input norm, the two branch norms, the experts, and the
-/// causal encoder pass's own layer scalar (DiffusionGemma; null = the decoder's).
+/// A 26B-A4B layer's routed half: the second feed-forward input norm, the two branch norms and the experts.
 pub const MoeTail = struct {
     pre_ff_norm_2: Array,
     post_ff_norm_1: Array,
     post_ff_norm_2: Array,
     experts: moe.Weights,
-    encoder_scalar: Array = .{},
 };
 
 pub const Layer = struct {
@@ -73,14 +68,7 @@ pub const Weights = struct {
     final_norm: Array,
     head: Head.Weights,
     compiled: *const Compiled,
-    /// DiffusionGemma: the self-conditioning module; set, the trunk's other forwards are its causal encoder pass
-    /// (the encoder's own layer scalars).
-    self_cond: ?SelfCond = null,
 };
-
-/// DiffusionGemma's self-conditioning: a GeGLU over the previous step's soft embeddings (`pre_norm` first), added
-/// to the canvas embeddings, then a weight-less norm (`ones`).
-pub const SelfCond = struct { pre_norm: Array, gate: Linear, up: Linear, down: Linear, ones: Array };
 
 /// `h + [rms(delta, w_pre)]`, times `scale`, then `rms(sum, w_post)` when asked: one dispatch at a solo decode step
 /// where the kernel takes the shape, else the composed ops. `pre_post_eps`: `w_pre` norms at the post-norm epsilon.
@@ -202,8 +190,6 @@ fn denseTail(w: *const Weights, c: *Ctx, h: Array, attn: Array, L: *const Layer,
 /// One forward of `ids` (`[slots, rows]` int32). Results are owned by `g`.
 pub fn forward(w: *const Weights, shared: *const bases.Shared, g: *Graph, ids: Array, run: Run) !Out {
     var c = run.ctx(g, shared);
-    // A block-diffusion model's every non-canvas forward is its causal encoder pass.
-    const encoder = w.self_cond != null;
     var h = try run.splice(g, try Embed.forward(&w.embed, &c, ids), ids);
     // Per-layer inputs read the text tokens only: an image position's id is 0 (the reference's `text_mask`).
     const img = run.placeholders.image;
@@ -221,7 +207,7 @@ pub fn forward(w: *const Weights, shared: *const bases.Shared, g: *Graph, ids: A
         const normed = carried orelse try lg.rmsNorm(h, L.input_norm, shared.eps);
         const attn = try Attention.forward(&L.attn, &c, normed);
         const end = if (L.moe) |*mt|
-            try moeTail(&c, h, attn, L, mt, if (encoder and mt.encoder_scalar.ctx != null) mt.encoder_scalar else L.layer_scalar, next)
+            try moeTail(&c, h, attn, L, mt, L.layer_scalar, next)
         else
             try denseTail(w, &c, h, attn, L, next, ple_input);
 
@@ -237,84 +223,4 @@ pub fn forward(w: *const Weights, shared: *const bases.Shared, g: *Graph, ids: A
     c.g = g;
     const final = carried orelse try g.rmsNorm(h, w.final_norm, shared.eps);
     return run.finish(g, &c, final, Head, &w.head);
-}
-
-// ── DiffusionGemma's canvas ──
-
-/// `gelu_tanh(gate) * up` as the engine's `computeGeglu` takes it (the table kernel, the compiled GeGLU, the ops).
-fn geglu(w: *const Weights, g: *Graph, gate: Array, up: Array) !Array {
-    const dt = ops.dtype(gate);
-    if (dt == .bfloat16 or dt == .float16) {
-        const table = try w.compiled.geluTable(dt);
-        if (table.ctx != null) if (try fused_act.tableGateMul(g.s, .gelu_tanh, gate, up, table, null)) |y| return g.adopt(y);
-    }
-    if (w.compiled.geglu.ctx != null) return g.adopt(try compiled_mod.apply(w.compiled.geglu, &.{ gate, up }));
-    return g.mul(try g.adopt(try w.compiled.geluOf(gate)), up);
-}
-
-/// Canvas attention: q, k, v of the canvas alone, roped at the committed
-/// length, the committed keys read from the cache (never written; a sliding layer its last `window - 1`) ahead of
-/// the canvas's, one unmasked bidirectional read at scale 1.0.
-fn canvasAttn(aw: *const Attention.Weights, c: *Ctx, x: Array) !Array {
-    const g = c.g;
-    const geo = &aw.geo;
-    const s = c.rows;
-    const off: c_int = @intCast(c.offset());
-    const perm = [_]c_int{ 0, 2, 1, 3 };
-    const kv_shape = [_]c_int{ 1, s, geo.kv_heads, geo.head_dim };
-    const q = try g.reshape(try aw.q.forward(g, x), &.{ 1, s, geo.heads, geo.head_dim });
-    const q_rope = try da.ropeAt(g, try g.transpose(try g.rmsNorm(q, aw.q_norm, c.shared.eps), &perm), geo, off);
-    const k = try g.reshape(try aw.k.forward(g, x), &kv_shape);
-    const v = try g.reshape(try aw.v.forward(g, x), &kv_shape);
-    const v_n = if (aw.v_norm.ctx != null) try g.rmsNorm(v, aw.v_norm, c.shared.eps) else v;
-    var k_all = try da.ropeAt(g, try g.transpose(try g.rmsNorm(k, aw.k_norm, c.shared.eps), &perm), geo, off);
-    var v_all = try g.transpose(v_n, &perm);
-    const ops_c = try c.cacheOps();
-    if (ops_c.len(c.cache(), c.layer) > 0) {
-        var view = try kv.view(c, c.cache(), c.layer);
-        defer kv.release(c, &view);
-        const dv = kv.dense(view);
-        var ck = dv.k;
-        var cv = dv.v;
-        const keep: c_int = @as(c_int, @intCast(aw.window)) - 1;
-        const held = ops.shape(ck)[2];
-        if (aw.window > 0 and keep > 0 and held > keep) {
-            ck = try g.sliceAxis(ck, 2, held - keep, held);
-            cv = try g.sliceAxis(cv, 2, held - keep, held);
-        }
-        k_all = try g.concat(&.{ ck, k_all }, 2);
-        v_all = try g.concat(&.{ cv, v_all }, 2);
-    }
-    const out = try da.sdpaRaw(g, q_rope, k_all, v_all, 1.0, "", .{}, false);
-    return aw.o.forward(g, try g.mergeHeads(out));
-}
-
-/// One denoising step over the canvas `ids` `[1, L]` at the committed length: the embeddings with the
-/// self-conditioning signal `signal` (`[1, L, hidden]`; null on the first step), every layer over canvas attention
-/// and the unfused MoE tail with the decoder's scalars, the softcapped logits of every row.
-pub fn canvas(w: *const Weights, shared: *const bases.Shared, g: *Graph, ids: Array, run: Run, signal: Array) !Out {
-    const sc = w.self_cond orelse return error.NotABlockDiffusionModel;
-    var c = run.ctx(g, shared);
-    var h = try Embed.forward(&w.embed, &c, ids);
-    if (signal.ctx != null) {
-        const sn = try g.rmsNorm(signal, sc.pre_norm, shared.eps);
-        const ffn = try sc.down.forward(g, try geglu(w, g, try sc.gate.forward(g, sn), try sc.up.forward(g, sn)));
-        h = try g.add(h, ffn);
-    }
-    h = try g.rmsNorm(h, sc.ones, shared.eps);
-    for (w.layers, 0..) |*L, i| {
-        var lg = g.scope();
-        defer lg.deinit();
-        c.g = &lg;
-        c.layer = @intCast(i);
-        const mt = if (L.moe) |*m| m else return error.CanvasNeedsExperts;
-        const attn = try canvasAttn(&L.attn, &c, try lg.rmsNorm(h, L.input_norm, shared.eps));
-        const end = try moeTail(&c, h, attn, L, mt, L.layer_scalar, .{});
-        c.g = g;
-        const old_h = h;
-        h = try g.keep(end.h);
-        g.drop(old_h);
-    }
-    c.g = g;
-    return run.finish(g, &c, try g.rmsNorm(h, w.final_norm, shared.eps), Head, &w.head);
 }

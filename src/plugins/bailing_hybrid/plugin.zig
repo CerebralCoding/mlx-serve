@@ -1,6 +1,6 @@
 //! Ling 3.0 (`bailing_hybrid`, BailingMoeV3): KDA linear attention (a per-channel bounded-sigmoid gate) beside
 //! naive MLA every `layer_group_size`-th layer, a grouped sigmoid MoE with one ungated shared expert. Its own forward
-//! (`table_forward.zig`) over the layered weights GLM-5.3-Flash's plugin loads (`glm5_next/host.zig`).
+//! (`table_forward.zig`) over the trunk GLM-5.3-Flash's plugin loads (`glm5_next/trunk.zig`).
 
 const std = @import("std");
 const abi = @import("../../abi/plugin.zig");

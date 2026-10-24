@@ -30,7 +30,6 @@ src/sdk/bases/hybrid.zig	DtypeTrace.begin(	every forward path arms a dtype trace
 src/sdk/bases/encoder.zig	DtypeTrace.begin(	every forward path arms a dtype trace
 src/plugins/gemma3/encoder.zig	DtypeTrace.begin(	every forward path arms a dtype trace
 src/sdk/bases/decoder.zig	DtypeTrace.begin(	every forward path arms a dtype trace
-src/plugins/glm5_next/forward.zig	DtypeTrace.begin(	every forward path arms a dtype trace
 src/plugins/qwen4_exp/forward.zig	DtypeTrace.begin(	every forward path arms a dtype trace
 src/engines/mlx/prefill.zig	.interleave_hook = .{ .ctx = &interleave_ctx, .call = interleaveDecodeTickCb }	the one Generator construction site wires the prefill interleave hook
 src/engines/mlx/step.zig	slot.prefill_ns = prefill_sw.read() -| slot.prefill_interleaved_ns;	interleaved decode time is billed to the decoding slots, never the prefilling slot
@@ -136,6 +135,6 @@ src/plugins/qwen4_exp/qsa/indexer.zig	yarnScaleRotated	the QSA indexer's scalar 
 src/plugins/qwen4_exp/qsa/indexer.zig	!deliberately NOT applied	the QSA indexer never skips the YaRN mscale
 src/engines/mlx/methods/yarn.zig	constTableAs(self.yarn_mscale.?,	the YaRN mscale table reaches a multiply only through constTableAs
 src/engines/mlx/forward/*.zig	applyVisionEmbeddingsWith	every generative forward arm splices vision rows
-src/plugins/glm5_next/forward.zig	applyVisionEmbeddingsWith	every generative forward arm splices vision rows
+src/plugins/glm5_next/table_forward.zig	spliceVisionRows(	the GLM-5.3 table forward splices vision rows on prompt chunks
 src/plugins/qwen4_exp/forward.zig	applyVisionEmbeddingsWith	every generative forward arm splices vision rows
 src/sdk/bases/run.zig	spliceVisionRows(	the plugin bases splice vision rows on prompt chunks

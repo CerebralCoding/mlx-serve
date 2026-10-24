@@ -75,13 +75,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
     if (config.glm5_stream) return initMlxStream(io, allocator, config, s);
     if (config.dsv41_stream) return initMlxStream(io, allocator, config, s);
 
-    // Embeddings: the table's own name is the checkpoint's, not a family
-    // trait — one lookup table, three call sites (weight/scales/biases)
-    // that must agree.
-    const emb_base: []const u8 = if (std.mem.eql(u8, config.model_type, "bailing_hybrid"))
-        "word_embeddings"
-    else
-        "embed_tokens";
+    const emb_base: []const u8 = "embed_tokens";
     const emb_w = getNamedWeight(weights, &name_buf, prefix, emb_base, "weight") orelse {
         log.err("MISSING WEIGHT: {s}.{s}.weight\n", .{ prefix, emb_base });
         return error.MissingWeight;
