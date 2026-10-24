@@ -234,6 +234,10 @@ typedef struct {
     int32_t ndst;
     uint64_t dst[MAX_COMP];
     int64_t len[MAX_COMP];
+    int32_t scatter;              /* SCATTER: part d is read from fds[d] at offs[d], never from `offset` */
+    int32_t fds[MAX_COMP];
+    int64_t sizes[MAX_COMP];
+    int64_t offs[MAX_COMP];
 } range_t;
 
 typedef struct {
@@ -505,6 +509,7 @@ static void gauge_exit(void) {
 static int direct_reads = 0;
 static int run_range_staged(const job_t *job, const range_t *rg, char *stage, int64_t *out);
 static int run_range_direct_route(const job_t *job, const range_t *rg, char *stage, int64_t *out);
+static int run_range_scatter(const job_t *job, const range_t *rg, char *stage, int64_t *out);
 static int (*run_range)(const job_t *, const range_t *, char *, int64_t *) = run_range_staged;
 
 int q3ld_direct_config(int32_t on) {
@@ -1007,10 +1012,10 @@ static void *worker(void *arg) {
             pthread_mutex_unlock(&mu);
         } else {
             RANGE_DELAY();
-            status = try_adopt(&job, &ranges[t], out);
+            status = ranges[t].scatter ? -1 : try_adopt(&job, &ranges[t], out);
             if (status < 0) {
                 gauge_enter();
-                status = run_range(&job, &ranges[t], stage, out);
+                status = ranges[t].scatter ? run_range_scatter(&job, &ranges[t], stage, out) : run_range(&job, &ranges[t], stage, out);
                 gauge_exit();
             }
         }
@@ -1291,6 +1296,34 @@ int q3ld_start(int32_t nw, const uint64_t *staging_ptrs, int64_t sbytes, int64_t
     return 0;
 }
 
+/* SCATTER (mlx-serve, ABI 2026102401): a range whose parts live apart (an MLX pack keeps an expert's weight, scales and
+ * biases in separate tensors, possibly in separate shards).  Each part runs the stock range loop on its own file and
+ * offset; the range's status is the first failing part's, its counters the parts' sums. */
+static int run_range_scatter(const job_t *job, const range_t *rg, char *stage, int64_t *out) {
+    int64_t calls = 0, returned = 0, total = 0, t_start = 0;
+    int status = ST_OK;
+    out[4] = 0;
+    for (int32_t d = 0; d < rg->ndst && status == ST_OK; d++) {
+        job_t part = { rg->fds[d], rg->sizes[d], job->deadline, job->ticket };
+        range_t one = { 0 };
+        one.offset = rg->offs[d];
+        one.ndst = 1;
+        one.dst[0] = rg->dst[d];
+        one.len[0] = rg->len[d];
+        int64_t o[RES_W] = { 0 };
+        status = run_range(&part, &one, stage, o);
+        calls += o[1]; returned += o[2]; total += o[3];
+        if (o[4]) out[4] = o[4];
+        if (!t_start) t_start = o[5];
+    }
+    out[1] = calls;
+    out[2] = returned;
+    out[3] = total;
+    out[5] = t_start ? t_start : q3ld_monotonic_ns();
+    out[6] = q3ld_monotonic_ns();
+    return status;
+}
+
 /* One job (a stock fill unit) -- q3_nativeissue.c's q3ni_submit, plus the claim of the speculative records
  * containing its ranges.  Returns 0; -1 bad args / not running; -2 a ticket is still pending; -3 queue full. */
 int q3ld_submit(int32_t fd, int64_t file_size, int64_t deadline, int32_t n, int32_t ngu, int32_t ndown,
@@ -1309,6 +1342,7 @@ int q3ld_submit(int32_t fd, int64_t file_size, int64_t deadline, int32_t n, int3
         int32_t item = down ? i - n : i;
         range_t *rg = &ranges[first + i];
         rg->offset = offsets[i];
+        rg->scatter = 0;
         rg->ndst = down ? ndown : ngu;
         for (int32_t c = 0; c < rg->ndst; c++) {
             int32_t k = down ? ngu + c : c;
@@ -1346,6 +1380,53 @@ int q3ld_submit(int32_t fd, int64_t file_size, int64_t deadline, int32_t n, int3
     for (int32_t i = 0; i < count; i++) {          /* a job per range, in ticket order: every gate/up, then every down */
         job_t *job = &queue[(qhead + qlen) % qcap];
         job->fd = fd; job->file_size = file_size; job->deadline = deadline; job->ticket = first + i;
+        __atomic_store_n(&qlen, qlen + 1, __ATOMIC_RELAXED);
+    }
+    EV(1, first);
+    pthread_cond_broadcast(&work_cv);
+    pthread_mutex_unlock(&mu);
+    return 0;
+}
+
+/* SCATTER: q3ld_submit's 2n range jobs (every gate/up range, then every down range) whose part c of record i is read
+ * from fds[i * (ngu + ndown) + c] (file size sizes[...]) at offsets[...].  Never claims a speculative record or binds a
+ * pre-range: those are keyed by one file's offsets.  Returns q3ld_submit's codes. */
+int q3ld_submit_scatter(int32_t n, int32_t ngu, int32_t ndown, const int32_t *fds, const int64_t *sizes,
+                        const int64_t *offsets, const uint64_t *const *rows, const int64_t *lens, int64_t first) {
+    if (n < 1 || n > MAX_ITEMS || ngu < 1 || ndown < 1 || ngu > MAX_COMP || ndown > MAX_COMP) return -1;
+    int32_t count = 2 * n, nc = ngu + ndown;
+    if (first < 0 || first + count > nt) return -1;
+    pthread_mutex_lock(&mu);
+    if (!running || stopping) { pthread_mutex_unlock(&mu); return -1; }
+    for (int32_t i = 0; i < count; i++) {
+        if (res[(first + i) * RES_W] == ST_PENDING) { pthread_mutex_unlock(&mu); return -2; }
+    }
+    if (qlen + count > qcap) { pthread_mutex_unlock(&mu); return -3; }
+    for (int32_t i = 0; i < count; i++) {
+        int down = i >= n;
+        int32_t item = down ? i - n : i;
+        range_t *rg = &ranges[first + i];
+        rg->offset = 0;
+        rg->scatter = 1;
+        rg->ndst = down ? ndown : ngu;
+        for (int32_t c = 0; c < rg->ndst; c++) {
+            int32_t k = down ? ngu + c : c;
+            rg->dst[c] = rows[item][k];
+            rg->len[c] = lens[k];
+            rg->fds[c] = fds[item * nc + k];
+            rg->sizes[c] = sizes[item * nc + k];
+            rg->offs[c] = offsets[item * nc + k];
+        }
+        int64_t *out = res + (first + i) * RES_W;
+        for (int k = 1; k < RES_W; k++) out[k] = 0;
+        out[0] = ST_PENDING;
+        pre_of[first + i] = 0;
+        sub_len[first + i] = i == 0 ? count : 0;
+        gate_of[first + i] = 0;
+    }
+    for (int32_t i = 0; i < count; i++) {
+        job_t *job = &queue[(qhead + qlen) % qcap];
+        job->fd = -1; job->file_size = 0; job->deadline = -1; job->ticket = first + i;
         __atomic_store_n(&qlen, qlen + 1, __ATOMIC_RELAXED);
     }
     EV(1, first);
@@ -1992,7 +2073,7 @@ int64_t q3ld_test_ev_log(int64_t *buf, int64_t cap) {
 }
 #endif
 
-int32_t q3ld_abi(void) { return 2026101401; }              /* DIRECT as a construction route; 2026101201 WITHDRAW over range jobs; 2026101101 range jobs, 2026101001 WITHDRAW, EXL3_LANE_PORT 2026092704, original 2026092504 */
+int32_t q3ld_abi(void) { return 2026102401; }              /* SCATTER ranges; 2026101401 DIRECT as a construction route; 2026101201 WITHDRAW over range jobs; 2026101101 range jobs, 2026101001 WITHDRAW, EXL3_LANE_PORT 2026092704, original 2026092504 */
 int32_t q3ld_max_gates(void) { return MAX_GATES; }
 int32_t q3ld_max_gate_tickets(void) { return MAX_GATE_TICKETS; }
 int32_t q3ld_max_pre(void) { return MAX_PRE; }

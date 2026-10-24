@@ -35,11 +35,15 @@ const PatternFile = struct {
     ufd: io.UncachedFd,
 
     fn init(len: usize) !PatternFile {
+        return initSeeded(len, 11);
+    }
+
+    fn initSeeded(len: usize, seed: u64) !PatternFile {
         var tmp = std.testing.tmpDir(.{});
         errdefer tmp.cleanup();
         const image = try testing.allocator.alloc(u8, len);
         errdefer testing.allocator.free(image);
-        expert_bank.fillPattern(image, 11);
+        expert_bank.fillPattern(image, seed);
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "pattern.bin", .data = image });
         var root: [512]u8 = undefined;
         var pbuf: [600]u8 = undefined;
@@ -150,6 +154,43 @@ test "dsv41 io: pool scatters a synthetic file" {
         std.mem.sort(u32, got, {}, std.sort.asc(u32));
         for (got, 0..) |t, k| try testing.expectEqual(first + @as(u32, @intCast(k)), t);
     }
+}
+
+test "io scatter: each part of a record lands from its own file and offset; a part past its file's end fails its range" {
+    const page = std.heap.pageSize();
+    var f0 = try PatternFile.initSeeded(16 * page + 77, 3);
+    defer f0.deinit();
+    var f1 = try PatternFile.initSeeded(9 * page + 5, 4);
+    defer f1.deinit();
+    const files = [2]*const PatternFile{ &f0, &f1 };
+    var pool = try Pool.start(testing.allocator, .{ .workers = 2, .staging_bytes = page, .tickets = 64 });
+    defer pool.stop();
+    const lens = [n_components]u64{ page + 3, 17, 4099, 1, 777, 2 * page + 5, 1000, page - 1, 33 };
+    const n = 3;
+    var d = try Dests.init(n, &lens);
+    defer testing.allocator.free(d.buf);
+    var parts: [n][n_components]R96.Part = undefined;
+    for (&parts, 0..) |*rec, i| for (rec, 0..) |*p, k| {
+        const f = files[(i + k) % 2];
+        p.* = .{ .fd = f.ufd, .offset = (i * 977 + k * 1301) % (f.image.len - lens[k]) };
+    };
+    const first = try R96.submitScatter(pool, &parts, d.rows[0..n], &lens);
+    try pool.wait(first, 2 * n, 10 * std.time.ns_per_s);
+    for (0..n) |i| {
+        for (0..n_components) |k| {
+            const f = files[(i + k) % 2];
+            try testing.expectEqualSlices(u8, f.image[parts[i][k].offset..][0..lens[k]], d.part(i, k, &lens));
+        }
+        try testing.expectEqual(Status.ok, pool.result(first + @as(u32, @intCast(i))).status);
+        try testing.expectEqual(Status.ok, pool.result(first + @as(u32, @intCast(n + i))).status);
+    }
+    // A down part one byte past the end of its file: that record's down range is short, the rest land.
+    parts[1][n_components - 1] = .{ .fd = f1.ufd, .offset = f1.image.len - lens[n_components - 1] + 1 };
+    const again = try R96.submitScatter(pool, &parts, d.rows[0..n], &lens);
+    try pool.wait(again, 2 * n, 10 * std.time.ns_per_s);
+    try testing.expectEqual(Status.short, pool.result(again + n + 1).status);
+    try testing.expectEqual(Status.ok, pool.result(again + 1).status);
+    try testing.expectEqual(Status.ok, pool.result(again + n + 2).status);
 }
 
 test "dsv41 io: injected faults map to status words" {

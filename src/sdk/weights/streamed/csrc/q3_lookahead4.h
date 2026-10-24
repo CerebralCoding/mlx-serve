@@ -55,6 +55,10 @@ int q3ld_start(int32_t nw, const uint64_t *staging_ptrs, int64_t sbytes, int64_t
  * speculative records and binds the pre-ranges that hold its ranges. 0, -1, -2 ticket pending, -3 queue full. */
 int q3ld_submit(int32_t fd, int64_t file_size, int64_t deadline, int32_t n, int32_t ngu, int32_t ndown,
                 const int64_t *offsets, const uint64_t *const *rows, const int64_t *lens, int64_t first);
+/* q3ld_submit's jobs with each record's part c read from its own file: fds / sizes / offsets[i * (ngu + ndown) + c].
+ * No speculative claim, no pre-range bind. */
+int q3ld_submit_scatter(int32_t n, int32_t ngu, int32_t ndown, const int32_t *fds, const int64_t *sizes,
+                        const int64_t *offsets, const uint64_t *const *rows, const int64_t *lens, int64_t first);
 /* The submit whose first ticket is `first`, while no worker has started it, leaves the queue unread: every range job of
  * it, all or none; its tickets are published with ST_WITHDRAWN (no row written). 1 withdrawn, 0 not queued (a worker
  * started it and it runs as submitted / it is done / no submit starts at `first`), -1 not running / bad ticket, -2
@@ -88,7 +92,7 @@ int q3ld_ev_config(int32_t kind, uint64_t obj, int64_t timeout_ns, uint64_t star
 int32_t q3ld_ev_gates(int32_t n, const uint64_t *values, const int32_t *counts, const int64_t *tickets);
 int32_t q3ld_ev_release(uint64_t value);    /* force every live gate <= value; forced count, -1 off */
 int32_t q3ld_ev_state(int64_t *out);        /* 10 words; returns the live gate count */
-int32_t q3ld_abi(void);                     /* 2026101001 */
+int32_t q3ld_abi(void);                     /* 2026102401 */
 int32_t q3ld_max_gates(void);
 int32_t q3ld_max_gate_tickets(void);
 int32_t q3ld_max_pre(void);
