@@ -14,7 +14,6 @@ const acestep = @import("../../plugins/acestep/acestep.zig");
 const music3 = @import("../../plugins/music3/music3.zig");
 const yue2 = @import("../../plugins/yue2/yue2.zig");
 const stable_audio = @import("../../plugins/stable_audio3/stable_audio.zig");
-const kokoro = @import("../../plugins/kokoro/kokoro.zig");
 const ltx_bill = @import("../../plugins/ltx/config.zig");
 const minimax_h3 = @import("../../plugins/minimax_h3/h3.zig");
 const ane = @import("../../sdk/ane/offload.zig");
