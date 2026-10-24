@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../../sdk/util/log.zig");
 const qsa_row_mask = @import("../qsa_mask.zig");
 const qsa_decode = @import("../qsa_decode.zig");
 const history = @import("history.zig");

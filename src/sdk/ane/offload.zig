@@ -29,7 +29,7 @@
 const std = @import("std");
 const env = @import("../../env.zig");
 const builtin = @import("builtin");
-const log = @import("../../host/log.zig");
+const log = @import("../util/log.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const status = @import("../util/system.zig");
 

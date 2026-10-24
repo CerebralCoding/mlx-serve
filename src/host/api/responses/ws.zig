@@ -1,7 +1,7 @@
 //! WsBridge; WebSocket transport, body from ws request
 
 const std = @import("std");
-const log = @import("../../log.zig");
+const log = @import("../../../sdk/util/log.zig");
 const responses_mod = @import("model.zig");
 const model_registry_mod = @import("../../registry/registry.zig");
 const LoadedModel = model_registry_mod.LoadedModel;

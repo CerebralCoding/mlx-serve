@@ -1,14 +1,14 @@
 //! The ds4 engine on the scheduler: GGUF stub state, load, prefill and decode tick.
 
 const std = @import("std");
-const tokenizer_mod = @import("../../host/tokenizer/tokenizer.zig");
+const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
 const generate_mod = @import("../mlx/generate.zig");
 const model_mod = @import("../mlx/model.zig");
 const chat_mod = @import("../../host/chat/chat.zig");
 const tokenize_cache_mod = @import("../../host/tokenizer/cache.zig");
-const gguf_meta = @import("../../host/registry/engine_pick.zig");
+const gguf_meta = @import("../../sdk/quant/gguf/engine_pick.zig");
 const arch_ds4 = if (@import("build_options").ds4_engine) @import("bridge.zig") else @import("stub.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const load = @import("load.zig");
 const round = @import("round.zig");
 const ModelConfig = model_mod.ModelConfig;

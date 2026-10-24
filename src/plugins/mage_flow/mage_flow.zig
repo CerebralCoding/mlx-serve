@@ -22,10 +22,10 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const stb = @import("stb");
 const qvis = @import("../../sdk/vision/qwen_vision.zig");
-const sse = @import("../../host/media_jobs/sse.zig");
+const sse = @import("../../sdk/media/progress.zig");
 const w8a8 = @import("../../sdk/blocks/dit/w8a8.zig");
 const int8_attn = @import("../../sdk/blocks/dit/int8_attn.zig");
 const ops = @import("../../mlx/ops.zig");
@@ -235,8 +235,8 @@ pub fn parseConfig(io: std.Io, a: std.mem.Allocator, model_dir: []const u8) !Con
 // (`student.dconv_encoder.*`) is loaded lazily elsewhere for img2img.
 // ══════════════════════════════════════════════════════════════════════════
 
-const model_mod = @import("../../engines/mlx/model.zig");
-const tok_mod = @import("../../host/tokenizer/tokenizer.zig");
+const model_mod = @import("../../sdk/weights/load.zig");
+const tok_mod = @import("../../sdk/tokenizer/tokenizer.zig");
 const Weights = model_mod.Weights;
 const S = mlx.mlx_stream;
 

@@ -25,7 +25,7 @@ const qwen_vision = @import("../../sdk/vision/qwen_vision.zig");
 const glm_vision = @import("../glm5_next/vision.zig");
 const transformer = @import("../../engines/mlx/transformer.zig");
 const params = @import("../../sdk/quant/params.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 
 const Lin = glm_vision.Lin;
 const linear = glm_vision.linear;

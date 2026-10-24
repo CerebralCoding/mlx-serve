@@ -2,7 +2,7 @@ const std = @import("std");
 const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../util/log.zig");
 
 var kernels: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
 var announced = false;

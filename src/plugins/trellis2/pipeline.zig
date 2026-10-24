@@ -10,10 +10,10 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const log = @import("../../host/log.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
+const log = @import("../../sdk/util/log.zig");
+const model_mod = @import("../../sdk/weights/load.zig");
 const scope_mod = @import("../../mlx/scope.zig");
-const sse = @import("../../host/media_jobs/sse.zig");
+const sse = @import("../../sdk/media/progress.zig");
 const glb = @import("../../sdk/mesh/glb.zig");
 const png = @import("../../sdk/media/png.zig");
 const uvwrap = @import("../../sdk/mesh/uvwrap.zig");

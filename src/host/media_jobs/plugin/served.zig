@@ -7,7 +7,7 @@ const common = @import("../../../abi/common.zig");
 const sdk_plugin = @import("../../../sdk/plugin.zig");
 const registry = @import("../../../plugins/registry.zig");
 const FsPackDir = @import("../../registry/pack_dir.zig").FsPackDir;
-const log = @import("../../log.zig");
+const log = @import("../../../sdk/util/log.zig");
 const outside = @import("../../plugins/loader.zig");
 
 pub const MediaTable = abi.MediaTable;

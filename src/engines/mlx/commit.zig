@@ -5,7 +5,7 @@ const mlx = @import("../../mlx/ffi.zig");
 const transformer_mod = @import("transformer.zig");
 const generate_mod = @import("generate.zig");
 const prefix_cache_mod = @import("cache/prefix_cache.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const Generator = generate_mod.Generator;
 const testing = std.testing;
 

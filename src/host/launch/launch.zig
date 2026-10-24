@@ -17,7 +17,7 @@
 
 const std = @import("std");
 const env = @import("../../env.zig");
-const log = @import("../log.zig");
+const log = @import("../../sdk/util/log.zig");
 const opencode2_plugin = @import("opencode2_plugin");
 const agent_skills = @import("agent_skills");
 

@@ -11,7 +11,7 @@
 const std = @import("std");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../util/log.zig");
 
 // Mirrors MLX's `rms_norm` kernels so the normed output is bit-equal to
 // `add -> fast::rms_norm`: FOUR consecutive elements per thread per pass,

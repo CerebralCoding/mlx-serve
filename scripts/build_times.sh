@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Clean ReleaseFast build time and peak compiler memory, then the rebuild time after a one-line edit in each named
 # file (the edit is reverted). Run on a quiet machine: nothing else compiling or on the GPU.
-#   scripts/build_times.sh [file ...]          e.g. scripts/build_times.sh src/engines/mlx/transformer.zig src/host/log.zig
+#   scripts/build_times.sh [file ...]          e.g. scripts/build_times.sh src/engines/mlx/transformer.zig src/sdk/util/log.zig
 # Env: ZIG (default .zig-toolchain/zig), ZIG_ARGS (extra `zig build` args, e.g. -Dstrip=true),
 #      OUT (default ~/claude-tmp/build-times/<timestamp>). One line per build goes to stdout and $OUT/results.txt.
 set -euo pipefail

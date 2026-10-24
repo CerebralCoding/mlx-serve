@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../../sdk/util/log.zig");
 const MoeLayerWeights = @import("../forward/layered.zig").MoeLayerWeights;
 const ForwardCtx = @import("../forward_ctx.zig").ForwardCtx;
 const Transformer = @import("../transformer.zig").Transformer;

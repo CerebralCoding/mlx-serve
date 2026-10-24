@@ -24,8 +24,8 @@ const Config = config.Config;
 
 /// The engine's ternary arm over a loaded Gemma model: the verdict over every quantized tensor it reads (an untied
 /// embedding table skipped, as `firstNonTernaryBias`), qmv2's kernels for the 2-bit projections when it holds.
-pub const armTernary = @import("../lfm2/reader.zig").armTernary;
-pub const gatherOnly = @import("../lfm2/reader.zig").gatherOnly;
+pub const armTernary = @import("../../sdk/bases/reader.zig").armTernary;
+pub const gatherOnly = @import("../../sdk/bases/reader.zig").gatherOnly;
 
 /// The Gemma attention block: sliding layers, KV sharing, value norms and K=V, the fused hd-256 decode step.
 pub const Attention = b.decoder_attention.DecoderAttention(.{ .sliding = true, .kv_sharing = true, .value_norm = true });

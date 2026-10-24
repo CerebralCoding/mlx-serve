@@ -2,7 +2,7 @@
 
 const mlx = @import("../../../mlx/ffi.zig");
 const gdn_decode = @import("../../../sdk/blocks/gdn/decode.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../../sdk/util/log.zig");
 const decode_fused = @import("../../../sdk/blocks/gdn/decode_fused.zig");
 const env = @import("../../../env.zig");
 const scalarOf = @import("../../../mlx/array.zig").scalarOf;

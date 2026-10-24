@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../../sdk/util/log.zig");
 const ForwardCtx = @import("../../../engines/mlx/forward_ctx.zig").ForwardCtx;
 const KVCache = @import("../../../engines/mlx/kv/cache.zig").KVCache;
 const Trunk = @import("../trunk.zig").Trunk;

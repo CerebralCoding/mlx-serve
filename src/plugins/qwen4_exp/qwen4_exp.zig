@@ -14,7 +14,7 @@
 const std = @import("std");
 const crt = @import("../../sdk/util/crt.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const ple_gpu = @import("ple_gpu.zig");
 const embedded_ple = @import("ple_table.zig");
 pub const EmbeddedSpec = embedded_ple.EmbeddedSpec;

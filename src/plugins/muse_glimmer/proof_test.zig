@@ -13,7 +13,7 @@ const fixture = @import("../../sdk/bases/proof/fixture.zig");
 const ops = @import("../../mlx/ops.zig");
 const dflash_mod = @import("../../engines/mlx/spec/dflash/dflash.zig");
 const Generator = @import("../../engines/mlx/generate/generator.zig").Generator;
-const Tokenizer = @import("../../host/tokenizer/tokenizer.zig").Tokenizer;
+const Tokenizer = @import("../../sdk/tokenizer/tokenizer.zig").Tokenizer;
 const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
 const testing = std.testing;
 

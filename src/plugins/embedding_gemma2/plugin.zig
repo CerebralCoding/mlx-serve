@@ -36,5 +36,4 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
 
 test {
     _ = config;
-    _ = @import("proof_test.zig");
 }

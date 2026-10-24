@@ -8,7 +8,7 @@
 
 const mlx = @import("../../../mlx/ffi.zig");
 const ops = @import("../../../mlx/ops.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../util/log.zig");
 const abi = @import("../../../abi/plugin.zig");
 const block = @import("../block.zig");
 const kv = @import("../kv.zig");

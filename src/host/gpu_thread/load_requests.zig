@@ -4,7 +4,7 @@ const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const arch_ane = @import("../../engines/ane/lm.zig");
-const log = @import("../log.zig");
+const log = @import("../../sdk/util/log.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
 const LoadedModel = model_registry_mod.LoadedModel;
 

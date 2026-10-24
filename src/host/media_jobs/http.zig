@@ -1,7 +1,7 @@
 //! GenJob runners; handleGen
 
 const std = @import("std");
-const log = @import("../log.zig");
+const log = @import("../../sdk/util/log.zig");
 const scheduler_mod = @import("../../engines/mlx/scheduler.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const media_mod = @import("gen.zig");

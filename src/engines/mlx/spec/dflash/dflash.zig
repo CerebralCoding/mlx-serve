@@ -30,7 +30,7 @@ const std = @import("std");
 const env = @import("../../../../env.zig");
 const kernelSource = @import("../../../../mlx/kernels.zig").source;
 const mlx = @import("../../../../mlx/ffi.zig");
-const log = @import("../../../../host/log.zig");
+const log = @import("../../../../sdk/util/log.zig");
 const model_mod = @import("../../model.zig");
 const transformer_mod = @import("../../transformer.zig");
 // The chunked row requantizer + its packed-triple handle are shared with the

@@ -1,10 +1,10 @@
 //! usage, timings, cachedFormatChat, jsonEscape
 
 const std = @import("std");
-const tokenizer_mod = @import("../tokenizer/tokenizer.zig");
+const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
 const generate_mod = @import("../../engines/mlx/generate.zig");
 const chat_mod = @import("../chat/chat.zig");
-const log = @import("../log.zig");
+const log = @import("../../sdk/util/log.zig");
 const responses_mod = @import("responses/model.zig");
 const tokenize_cache_mod = @import("../tokenizer/cache.zig");
 const model_registry_mod = @import("../registry/registry.zig");

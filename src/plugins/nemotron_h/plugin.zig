@@ -9,7 +9,7 @@ const mlx = @import("../../mlx/ffi.zig");
 const ops = @import("../../mlx/ops.zig");
 const bases = @import("../../sdk/bases/bases.zig");
 const run_mod = @import("../../sdk/bases/run.zig");
-const reader = @import("../lfm2/reader.zig");
+const reader = @import("../../sdk/bases/reader.zig");
 const mtp_head = @import("mtp_head.zig");
 const row_exact = @import("../../sdk/bases/blocks/row_exact.zig");
 pub const config = @import("config.zig");
@@ -335,6 +335,4 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
 
 test {
     _ = config;
-    _ = @import("proof_test.zig");
-    _ = @import("mtp_head_test.zig");
 }

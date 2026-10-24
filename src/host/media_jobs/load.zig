@@ -2,7 +2,7 @@
 
 const mlx = @import("../../mlx/ffi.zig");
 const gen_mod = @import("gen.zig");
-const log = @import("../log.zig");
+const log = @import("../../sdk/util/log.zig");
 const served = @import("plugin/served.zig");
 const plugin_engine = @import("plugin/engine.zig");
 

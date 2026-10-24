@@ -4,7 +4,7 @@
 const std = @import("std");
 const abi = @import("../../abi/media.zig");
 const sdk = @import("../../sdk/root.zig");
-const job = @import("../../host/media_jobs/plugin_job.zig");
+const job = @import("../../sdk/media/job.zig");
 const kokoro = @import("kokoro.zig");
 const mlx = @import("../../mlx/ffi.zig");
 pub const config = @import("config.zig");

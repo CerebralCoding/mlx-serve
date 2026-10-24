@@ -1,14 +1,14 @@
 //! CPU-side load state (config, tokenizer, chat config) built off the inference thread.
 
 const std = @import("std");
-const tokenizer_mod = @import("../tokenizer/tokenizer.zig");
+const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
 const gen_mod = @import("../media_jobs/gen.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const chat_mod = @import("../chat/chat.zig");
 const model_discovery = @import("discovery.zig");
-const gguf_meta = @import("engine_pick.zig");
+const gguf_meta = @import("../../sdk/quant/gguf/engine_pick.zig");
 const mlx_gguf = @import("../../sdk/quant/gguf/claim.zig");
-const log = @import("../log.zig");
+const log = @import("../../sdk/util/log.zig");
 const ModelConfig = model_mod.ModelConfig;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const ChatConfig = chat_mod.ChatConfig;

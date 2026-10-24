@@ -10,7 +10,7 @@ const std = @import("std");
 const env = @import("../env.zig");
 const abi = @import("../abi/host.zig");
 const mlx = @import("../mlx/ffi.zig");
-const log = @import("log.zig");
+const log = @import("../sdk/util/log.zig");
 const metrics = @import("metrics/metrics.zig");
 
 pub const Options = struct {

@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../../sdk/util/log.zig");
 const ModelConfig = @import("../model.zig").ModelConfig;
 const Weights = @import("../model.zig").Weights;
 const fuseRowsInPlace = @import("../../../sdk/blocks/linear/fused_rows.zig").fuseRowsInPlace;

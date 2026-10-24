@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../../sdk/util/log.zig");
 const io_util = @import("../../../sdk/util/io_util.zig");
 const KVQuantConfig = @import("../../../engines/mlx/cache/kv_quant.zig").KVQuantConfig;
 const verifyQmmNaxAvailable = @import("../../../sdk/blocks/linear/verify_qmm_nax.zig").verifyQmmNaxAvailable;

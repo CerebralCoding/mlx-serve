@@ -13,17 +13,12 @@ const moe = @import("../../sdk/bases/blocks/moe.zig");
 const gated = @import("../../sdk/bases/blocks/gated_attention.zig");
 const qk_rope = @import("../../sdk/bases/blocks/qk_rope.zig");
 const compiled = @import("../../sdk/bases/blocks/compiled.zig");
-const reader = @import("../lfm2/reader.zig");
+const reader = @import("../../sdk/bases/reader.zig");
 const EitherMlp = @import("../lfm2/plugin.zig").EitherMlp;
 const mtp_head = @import("mtp_head.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "hy_v3",
-    .kind = .model,
-    .claims = &config.model_types,
-    .gate_models = &.{"mlx-community/Hy3-oQ2e"},
-};
+pub const plugin = config.plugin;
 
 const b = bases.blocks;
 const Array = mlx.mlx_array;
@@ -288,6 +283,4 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
 
 test {
     _ = config;
-    _ = @import("proof_test.zig");
-    _ = @import("mtp_head_test.zig");
 }

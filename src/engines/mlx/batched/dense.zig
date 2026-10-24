@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../../sdk/util/log.zig");
 const layered = @import("layered.zig");
 const batchedAttnPerSlot = @import("../../../sdk/blocks/attention/batched.zig").batchedAttnPerSlot;
 const DenseKVView = @import("../../../sdk/blocks/attention/kv_view.zig").DenseKVView;

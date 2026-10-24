@@ -1,7 +1,7 @@
 //! MTP and DFlash traces and their env switches.
 const std = @import("std");
 const env = @import("../../../../env.zig");
-const log = @import("../../../../host/log.zig");
+const log = @import("../../../../sdk/util/log.zig");
 const io_util = @import("../../../../sdk/util/io_util.zig");
 const mtp_mod = @import("../../../../sdk/spec/mtp/mtp.zig");
 const testing = std.testing;

@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const abi = @import("../../../abi/plugin.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../../sdk/util/log.zig");
 const ple = @import("../../../plugins/qwen4_exp/ple.zig");
 const ForwardCtx = @import("../forward_ctx.zig").ForwardCtx;
 const Transformer = @import("../transformer.zig").Transformer;

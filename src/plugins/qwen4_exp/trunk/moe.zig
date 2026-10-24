@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../../sdk/util/log.zig");
 const exl3 = @import("../../../sdk/quant/exl3/format.zig");
 const distributed_mod = @import("../../../engines/mlx/cluster/distributed.zig");
 const gather_qmm_nax = @import("../../../sdk/blocks/moe/gather_qmm_nax.zig");

@@ -13,7 +13,7 @@ const llama = @import("../../../plugins/llama/plugin.zig");
 const proof = @import("proof.zig");
 const ForwardCtx = @import("../forward_ctx.zig").ForwardCtx;
 const Generator = @import("../generate/generator.zig").Generator;
-const Tokenizer = @import("../../../host/tokenizer/tokenizer.zig").Tokenizer;
+const Tokenizer = @import("../../../sdk/tokenizer/tokenizer.zig").Tokenizer;
 const Transformer = @import("../transformer.zig").Transformer;
 
 const testing = std.testing;

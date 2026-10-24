@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const testing = @import("../../engines/mlx/kv/cache.zig").testing;
+const testing = std.testing;
 const materializedOwnedCopy = @import("../../mlx/array.zig").materializedOwnedCopy;
 const jsonF64 = @import("../../sdk/testing/parity.zig").jsonF64;
 const jsonToMlxArray = @import("../../sdk/testing/parity.zig").jsonToMlxArray;

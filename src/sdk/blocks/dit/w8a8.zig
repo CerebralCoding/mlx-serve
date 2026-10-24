@@ -11,7 +11,7 @@
 const std = @import("std");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../util/log.zig");
 const bill = @import("w8a8_bill.zig");
 
 pub const converted = bill.converted;

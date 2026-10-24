@@ -7,104 +7,22 @@
 const std = @import("std");
 const server_mod = @import("../http/server.zig");
 const Conn = server_mod.Conn;
-const preview = @import("preview.zig");
+const preview = @import("../../sdk/media/preview.zig");
+const progress_mod = @import("../../sdk/media/progress.zig");
 
-/// Erased progress callback handed into the model code (flux/tts/ltx) so the
-/// inner loops can report step/total without importing the HTTP layer.
-pub const Progress = struct {
-    ctx: *anyopaque,
-    cb: *const fn (ctx: *anyopaque, stage: []const u8, step: u32, total: u32) void,
-    /// Optional "has the client gone away?" probe. Long inner loops poll it
-    /// each step and abort with error.Cancelled — without it a cancelled
-    /// request burns the GPU to completion and queues everything behind it.
-    cancelled_cb: ?*const fn (ctx: *anyopaque) bool = null,
-    /// Opt-in per-step JPEG (issue #208). Null unless the client asked and
-    /// the sink is an SSE stream. Cached-velocity H3 steps leave this unused.
-    preview_cb: ?*const fn (ctx: *anyopaque, stage: []const u8, step: u32, total: u32, frame: preview.Encoded) void = null,
-    preview_opts: preview.Opts = .{},
-    /// False when the caller's own `cancelled_cb` already gives chat its turn (a media plugin's table `boundary`).
-    yields: bool = true,
-    pub fn emit(self: Progress, stage: []const u8, step: u32, total: u32) void {
-        self.cb(self.ctx, stage, step, total);
-    }
-    pub fn emitPreview(self: Progress, stage: []const u8, step: u32, total: u32, frame: preview.Encoded) void {
-        if (self.preview_cb) |f| {
-            f(self.ctx, stage, step, total, frame);
-        } else {
-            self.emit(stage, step, total);
-        }
-    }
-    pub fn wantsPreview(self: Progress) bool {
-        return self.preview_cb != null and self.preview_opts.enabled;
-    }
-    pub fn cancelled(self: Progress) bool {
-        const f = self.cancelled_cb orelse return false;
-        return f(self.ctx);
-    }
-    /// The per-step poll: gives chat its turn on the inference thread (when a
-    /// scheduler hook is installed), then reports whether the client left.
-    pub fn boundary(self: Progress) bool {
-        if (self.yields) if (gen_yield) |y| y.step(y.ctx);
-        return self.cancelled();
-    }
-};
-
-/// The scheduler's chat turn while a media job owns the inference thread.
-pub const Yield = struct {
-    ctx: *anyopaque,
-    /// At a step boundary: run chat for its share of the step just finished.
-    step: *const fn (ctx: *anyopaque) void,
-    /// Serve chat until `done` is set; `wake` interrupts its idle wait.
-    serve_until: *const fn (ctx: *anyopaque, done: *const std.atomic.Value(bool)) void,
-    wake: *const fn (ctx: *anyopaque) void,
-};
-
-/// Installed by the scheduler around a media job, on the inference thread only.
-/// Thread-local rather than a `Progress` field so every wrapper that rebuilds a
-/// `Progress` (H3's chained windows, LTX's windows) keeps it.
-pub threadlocal var gen_yield: ?*const Yield = null;
-
-/// The streaming job's connection on this thread, set by `StreamCtx.progress` and cleared by the scheduler when
-/// the job ends: a CPU stage that runs for minutes (`offload`) keeps the socket alive through it.
-pub threadlocal var stream_conn: ?*Conn = null;
+pub const Progress = progress_mod.Progress;
+pub const Yield = progress_mod.Yield;
+pub const offload = progress_mod.offload;
 
 /// Writes an SSE comment whenever the stream has been silent for the keepalive interval, until `done`. A client's
 /// idle-body timeout (Node's fetch: 300 s, then `TypeError: terminated`) otherwise cuts a job whose unwrap alone
 /// outlasts it. A failed write is left for the next progress event or probe to find.
-fn beatUntil(conn: *Conn, done: *const std.atomic.Value(bool)) void {
+fn beatUntil(ctx: *anyopaque, done: *const std.atomic.Value(bool)) void {
+    const conn: *Conn = @ptrCast(@alignCast(ctx));
     while (!done.load(.acquire)) {
         if (conn.ws_mode == null and conn.keepaliveDue()) conn.writeAll(": keepalive\n\n") catch {};
         std.Io.sleep(conn.io, .fromMilliseconds(100), .real) catch {};
     }
-}
-
-fn ReturnOf(comptime func: anytype) type {
-    return @typeInfo(@TypeOf(func)).@"fn".return_type.?;
-}
-
-/// Run a pure-CPU stage (zero MLX: it runs off the inference thread) on a worker
-/// thread while chat keeps the inference thread. Inline when no hook is installed.
-pub fn offload(comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) ReturnOf(func) {
-    const conn = stream_conn;
-    if (gen_yield == null and conn == null) return @call(.auto, func, args);
-    const Job = struct {
-        args: @TypeOf(args),
-        y: ?*const Yield,
-        result: ReturnOf(func) = undefined,
-        done: std.atomic.Value(bool) = .init(false),
-        fn run(j: *@This()) void {
-            j.result = @call(.auto, func, j.args);
-            j.done.store(true, .release);
-            if (j.y) |y| y.wake(y.ctx);
-        }
-    };
-    var job = Job{ .args = args, .y = gen_yield };
-    const t = std.Thread.spawn(.{}, Job.run, .{&job}) catch return @call(.auto, func, args);
-    const beater = if (conn) |c| std.Thread.spawn(.{}, beatUntil, .{ c, &job.done }) catch null else null;
-    if (job.y) |y| y.serve_until(y.ctx, &job.done);
-    t.join();
-    if (beater) |b| b.join();
-    return job.result;
 }
 
 /// SSE response headers (no Content-Length — the body is an event stream).
@@ -175,7 +93,7 @@ pub const StreamCtx = struct {
         return false;
     }
     pub fn progress(self: *StreamCtx) Progress {
-        stream_conn = if (self.stream) self.conn else null;
+        progress_mod.stream_keepalive = if (self.stream) .{ .ctx = self.conn, .beat_until = beatUntil } else null;
         const opts = (preview.Opts{
             .enabled = self.preview,
             .frames = self.preview_frames,
@@ -359,8 +277,8 @@ test "Progress.boundary gives the installed scheduler hook its turn, then report
     try std.testing.expectEqual(@as(u32, 0), h.steps);
 
     const y = Yield{ .ctx = &h, .step = H.step, .serve_until = H.serve, .wake = H.wake };
-    gen_yield = &y;
-    defer gen_yield = null;
+    progress_mod.gen_yield = &y;
+    defer progress_mod.gen_yield = null;
     try std.testing.expect(!p.boundary());
     h.flag = true;
     try std.testing.expect(p.boundary());
@@ -388,8 +306,8 @@ test "offload runs a CPU stage on a worker while the hook serves, and returns it
 
     var h = H{};
     const y = Yield{ .ctx = &h, .step = H.step, .serve_until = H.serve, .wake = H.wake };
-    gen_yield = &y;
-    defer gen_yield = null;
+    progress_mod.gen_yield = &y;
+    defer progress_mod.gen_yield = null;
     const r = try offload(H.work, .{ 3, 5 });
     try std.testing.expectEqual(@as(u32, 8), r.sum);
     try std.testing.expect(r.tid != me);
@@ -409,7 +327,7 @@ test "offload keeps a streaming job's socket alive through a long CPU stage, wit
     conn.heartbeat = .{ .last_write_ms = 0, .interval_ms = 1 };
     var sctx = StreamCtx{ .conn = &conn, .stream = true };
     _ = sctx.progress();
-    defer stream_conn = null;
+    defer progress_mod.stream_keepalive = null;
     const H = struct {
         fn work() u32 {
             std.Io.sleep(std.Io.Threaded.global_single_threaded.io(), .fromMilliseconds(250), .real) catch {};
@@ -430,8 +348,8 @@ test "offload keeps a streaming job's socket alive through a long CPU stage, wit
     // With the scheduler's hook serving chat meanwhile.
     var dummy: u8 = 0;
     const y = Yield{ .ctx = &dummy, .step = H.step, .serve_until = H.serve, .wake = H.wake };
-    gen_yield = &y;
-    defer gen_yield = null;
+    progress_mod.gen_yield = &y;
+    defer progress_mod.gen_yield = null;
     conn.heartbeat = .{ .last_write_ms = 0, .interval_ms = 1 };
     try std.testing.expectEqual(@as(u32, 7), offload(H.work, .{}));
     n = std.c.recv(sv[1], &buf, buf.len, std.posix.MSG.DONTWAIT);
@@ -440,11 +358,11 @@ test "offload keeps a streaming job's socket alive through a long CPU stage, wit
 
 test "a job that is not streaming registers no keepalive connection, and a stale one is dropped" {
     var dummy: Conn = undefined;
-    stream_conn = &dummy;
-    defer stream_conn = null;
+    progress_mod.stream_keepalive = .{ .ctx = &dummy, .beat_until = beatUntil };
+    defer progress_mod.stream_keepalive = null;
     var quiet = StreamCtx{ .conn = &dummy, .stream = false };
     _ = quiet.progress();
-    try std.testing.expect(stream_conn == null);
+    try std.testing.expect(progress_mod.stream_keepalive == null);
 }
 
 test "a NON-streaming job still gets a cancellation probe, and writes no SSE" {
@@ -509,7 +427,7 @@ test "preview SSE event carries JPEG b64 and is absent when the flag is off" {
         .preview = true,
     };
     const p = sctx.progress();
-    defer stream_conn = null; // the scheduler clears it in production; a stale one segfaults a later offload
+    defer progress_mod.stream_keepalive = null; // the scheduler clears it in production; a stale one segfaults a later offload
     try std.testing.expect(p.wantsPreview());
     const jpg = [_]u8{ 0xFF, 0xD8, 0xFF, 0xD9 };
     p.emitPreview("Generating", 8, 30, .{ .jpeg = @constCast(&jpg), .w = 16, .h = 9 });

@@ -189,7 +189,7 @@ fn run(s: mlx.mlx_stream, x: mlx.mlx_array, geo: [3]Bank, bind: []const [3]Bank,
         try apply(set.downred.?, &.{ act, w[2][0], w[2][1], inds, scores, sh.down, sh.logit }, &.{ rows, hidden }, dt, .{ 32, @divExact(hidden, rows_per_sg), rows }, rows_per_sg, &dr_tmpl, s);
     if (!engaged) {
         engaged = true;
-        @import("../../../host/log.zig").info("[moe] fp4 decode kernels engaged: {s} rows={d} topk={d} inter={d} hidden={d} gate_scale={} shared={} banks={d}\n", .{ @tagName(mode), rows, topk, inter, hidden, scales.gate != null, shared != null, bind.len });
+        @import("../../util/log.zig").info("[moe] fp4 decode kernels engaged: {s} rows={d} topk={d} inter={d} hidden={d} gate_scale={} shared={} banks={d}\n", .{ @tagName(mode), rows, topk, inter, hidden, scales.gate != null, shared != null, bind.len });
     }
     return y;
 }

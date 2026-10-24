@@ -2,7 +2,7 @@
 //! Owns qkAngleFor, qkAngleRowsFor, attnDqFor, attnProj, attnProjBias.
 
 const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../../sdk/util/log.zig");
 const decode_attn_quant = @import("../../../sdk/blocks/attention/decode_attn_quant.zig");
 const fused_rows = @import("../../../sdk/blocks/linear/fused_rows.zig");
 const lastDim = @import("../../../mlx/array.zig").lastDim;

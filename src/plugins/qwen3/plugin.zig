@@ -13,7 +13,7 @@ const run_mod = @import("../../sdk/bases/run.zig");
 const compiled = @import("../../sdk/bases/blocks/compiled.zig");
 const moe_affine4 = @import("../../sdk/blocks/moe/moe_affine4.zig");
 const QuantParams = @import("../../sdk/quant/params.zig").QuantParams;
-const QuantMode = @import("../../engines/mlx/model.zig").QuantMode;
+const QuantMode = @import("../../sdk/quant/params.zig").QuantMode;
 const ld = @import("load.zig");
 pub const config = @import("config.zig");
 
@@ -387,5 +387,4 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
 
 test {
     _ = config;
-    _ = @import("proof_test.zig");
 }

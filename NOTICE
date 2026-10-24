@@ -762,7 +762,7 @@ and they are listed because they made that work possible.
     fits `LTXAV` (128 channels) and `MiniMaxH3Video` (24), and the
     `Latent2RGBPreviewer` + `preview_to_image` arithmetic they are applied
     with. `tests/dump_latent_rgb_factors.py` EXECUTES those classes to emit
-    `src/host/media_jobs/latent_rgb.zig` and `src/fixtures/latent_rgb.json`; the coefficients
+    `src/sdk/media/latent_rgb.zig` and `src/fixtures/latent_rgb.json`; the coefficients
     and reference outputs it produces are golden values, not source, and no
     ComfyUI code is transcribed or shipped.
   * Larryvrh/ComfyUI-MiniMax-H3-Turbo (Apache-2.0), whose `_turbo_sampler`

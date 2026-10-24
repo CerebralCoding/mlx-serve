@@ -21,7 +21,7 @@ const glm_vision = @import("../glm5_next/vision.zig");
 const transformer = @import("../../engines/mlx/transformer.zig");
 const weights_mod = @import("../../engines/mlx/load/weights.zig");
 const params = @import("../../sdk/quant/params.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const chat_mod = @import("../../host/chat/chat.zig");
 
 const Lin = glm_vision.Lin;

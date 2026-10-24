@@ -2,12 +2,12 @@
 //! resolution, schema thinking policy
 
 const std = @import("std");
-const tokenizer_mod = @import("../../tokenizer/tokenizer.zig");
+const tokenizer_mod = @import("../../../sdk/tokenizer/tokenizer.zig");
 const generate_mod = @import("../../../engines/mlx/generate.zig");
 const generation_settings = @import("../../api/generation_settings.zig");
 const chat_mod = @import("../chat.zig");
 const rp_mod = @import("protocol.zig");
-const log = @import("../../log.zig");
+const log = @import("../../../sdk/util/log.zig");
 const responses_mod = @import("../../api/responses/model.zig");
 const model_registry_mod = @import("../../registry/registry.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;

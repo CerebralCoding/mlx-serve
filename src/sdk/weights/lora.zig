@@ -41,7 +41,7 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../util/log.zig");
 
 /// Non-owning adapter reference installed on a linear layer. `at`/`bt` are
 /// pre-transposed bf16 so the hot path is two plain matmuls.

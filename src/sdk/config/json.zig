@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
-const generation = @import("../../sdk/config/generation.zig");
+const generation = @import("generation.zig");
 
 pub const Object = std.json.ObjectMap;
 pub const Value = std.json.Value;

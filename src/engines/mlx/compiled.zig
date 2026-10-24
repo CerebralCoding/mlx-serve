@@ -2,7 +2,7 @@
 //! Owns compileGelu, compileGeglu, gegluClosureCallback, compileSoftcap, softcapClosureCallback, and 7 more.
 
 const mlx = @import("../../mlx/ffi.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const Transformer = @import("transformer.zig").Transformer;
 
 /// Compile GELU activation for kernel fusion.

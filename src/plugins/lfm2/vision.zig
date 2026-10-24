@@ -18,7 +18,7 @@ const model_mod = @import("../../engines/mlx/model.zig");
 const ModelConfig = model_mod.ModelConfig;
 const Weights = model_mod.Weights;
 const qwen_vision = @import("../../sdk/vision/qwen_vision.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 
 pub const Resized = qwen_vision.Resized;
 

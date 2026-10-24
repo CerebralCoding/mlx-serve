@@ -5,7 +5,7 @@ const chat_mod = @import("../../host/chat/chat.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const qwen_vision = @import("../../sdk/vision/qwen_vision.zig");
 const lfm2_vision = @import("vision.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 
 const resampleFilterFor = @import("../../host/media/decode.zig").resampleFilterFor;
 const DecodedRgb = @import("../../host/media/decode.zig").DecodedRgb;

@@ -6,7 +6,7 @@
 const std = @import("std");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../util/log.zig");
 
 pub const HEADER = kernelSource("kernels/common/mpp_tensor_ops.metal");
 

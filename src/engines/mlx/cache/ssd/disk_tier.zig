@@ -55,7 +55,7 @@ const transformer_mod = @import("../../transformer.zig");
 const model = @import("../../model.zig");
 const io_util = @import("../../../../sdk/util/io_util.zig");
 const disk_writer = @import("writer.zig");
-const log = @import("../../../../host/log.zig");
+const log = @import("../../../../sdk/util/log.zig");
 
 const KVCache = transformer_mod.KVCache;
 

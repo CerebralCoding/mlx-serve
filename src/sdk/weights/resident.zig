@@ -5,7 +5,7 @@
 const std = @import("std");
 const abi = @import("../../abi/quant.zig");
 const mlx = @import("../../mlx/ffi.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../util/log.zig");
 
 pub const Resident = struct {
     weights: Weights,

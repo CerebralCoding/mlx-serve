@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../../sdk/util/log.zig");
 const layered = @import("../batched/layered.zig");
 const MAX_BATCH_ROWS = @import("../../../sdk/bases/run.zig").MAX_BATCH_ROWS;
 const bf16Scalar = @import("../../../mlx/array.zig").bf16Scalar;

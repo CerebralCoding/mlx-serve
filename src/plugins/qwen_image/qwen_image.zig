@@ -22,13 +22,13 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const log = @import("../../host/log.zig");
-const sse = @import("../../host/media_jobs/sse.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
-const tok_mod = @import("../../host/tokenizer/tokenizer.zig");
+const log = @import("../../sdk/util/log.zig");
+const sse = @import("../../sdk/media/progress.zig");
+const model_mod = @import("../../sdk/weights/load.zig");
+const tok_mod = @import("../../sdk/tokenizer/tokenizer.zig");
 const mage_flow = @import("../mage_flow/mage_flow.zig");
 const qwen_image_edit = @import("edit.zig");
-const model_discovery = @import("../../host/registry/discovery.zig");
+const model_discovery = @import("../../sdk/weights/resident.zig");
 const lora_mod = @import("../../sdk/weights/lora.zig");
 
 const Weights = model_mod.Weights;

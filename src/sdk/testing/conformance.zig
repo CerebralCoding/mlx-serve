@@ -16,7 +16,7 @@ const fixture = @import("fixture.zig");
 const test_cache = @import("cache_ops.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const Resident = @import("../weights/resident.zig").Resident;
-const loadWeights = @import("../../engines/mlx/model.zig").loadWeights;
+const loadWeights = @import("../weights/load.zig").loadWeights;
 
 const testing = std.testing;
 const Allocator = std.mem.Allocator;

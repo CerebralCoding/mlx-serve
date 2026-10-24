@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../../sdk/util/log.zig");
 const sushi_pack = @import("../../../sdk/quant/exl3/sushi_pack.zig");
 const decode_attn_quant = @import("../../../sdk/blocks/attention/decode_attn_quant.zig");
 const verify_projection = @import("../../../sdk/blocks/linear/verify_projection.zig");

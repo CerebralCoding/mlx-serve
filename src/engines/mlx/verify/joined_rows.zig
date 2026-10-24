@@ -2,7 +2,7 @@
 //! Owns AttnVerifyInputs, VerifyRowsKind, verifyRowsJoined, attnVerifyRows, GdnVerifyInputs, gdnVerifyRows.
 
 const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../../sdk/util/log.zig");
 const verify_projection = @import("../../../sdk/blocks/linear/verify_projection.zig");
 const LinearAttnWeights = @import("../../../sdk/blocks/gdn/gated_delta_net.zig").LinearAttnWeights;
 const verifyAttnProjection = @import("../../../sdk/blocks/linear/verify_projection.zig").verifyAttnProjection;

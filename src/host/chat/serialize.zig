@@ -10,7 +10,7 @@ const VideoData = @import("types.zig").VideoData;
 const Message = @import("types.zig").Message;
 const ChatConfig = @import("types.zig").ChatConfig;
 const renderChatTemplate = @import("render.zig").renderChatTemplate;
-const appendJsonString = @import("json_text.zig").appendJsonString;
+const appendJsonString = @import("../../sdk/util/json_text.zig").appendJsonString;
 
 /// How an assistant message with NO content should serialize.
 ///

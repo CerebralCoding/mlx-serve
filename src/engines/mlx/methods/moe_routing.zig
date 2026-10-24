@@ -1,7 +1,7 @@
 //! The legacy `Transformer`'s methods over `sdk/blocks/moe/routing.zig` (what reads the engine's model state).
 
 const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../../sdk/util/log.zig");
 const Transformer = @import("../transformer.zig").Transformer;
 const RouterGate = @import("../../../sdk/blocks/moe/router_kernel.zig").RouterGate;
 const moeRouterTopK = @import("../../../sdk/blocks/moe/router_kernel.zig").moeRouterTopK;

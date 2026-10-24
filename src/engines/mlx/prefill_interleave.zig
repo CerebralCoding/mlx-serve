@@ -7,7 +7,7 @@ const transformer_mod = @import("transformer.zig");
 const generate_mod = @import("generate.zig");
 const model_mod = @import("model.zig");
 const prefix_cache_mod = @import("cache/prefix_cache.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
 const testing = std.testing;
 

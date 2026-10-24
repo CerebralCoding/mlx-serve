@@ -2,7 +2,7 @@ const std = @import("std");
 const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../../sdk/util/log.zig");
 
 const KVCache = transformer_mod.KVCache;
 const SSMCacheEntry = transformer_mod.SSMCacheEntry;

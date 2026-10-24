@@ -5,7 +5,7 @@ const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 const quant_config = @import("../../sdk/config/quantization_config.zig");
-const json = @import("../lfm2/json.zig");
+const json = @import("../../sdk/config/json.zig");
 
 pub const plugin = @import("../../sdk/plugin.zig").Plugin{
     .name = "bert",

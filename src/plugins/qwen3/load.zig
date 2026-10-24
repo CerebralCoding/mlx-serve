@@ -12,7 +12,7 @@ const native = @import("../../sdk/quant/native.zig");
 const hadamard = @import("../../sdk/quant/hadamard/format.zig");
 const fuseRowGroup = @import("../../sdk/blocks/linear/fused_rows.zig").fuseRowGroup;
 const daq = @import("../../sdk/blocks/attention/decode_attn_quant.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 
 const Array = mlx.mlx_array;
 pub const Linear = bases.blocks.linear.Linear;

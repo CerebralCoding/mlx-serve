@@ -22,9 +22,9 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
-const log = @import("../../host/log.zig");
-const tok_mod = @import("../../host/tokenizer/tokenizer.zig");
+const model_mod = @import("../../sdk/weights/load.zig");
+const log = @import("../../sdk/util/log.zig");
+const tok_mod = @import("../../sdk/tokenizer/tokenizer.zig");
 const mage_flow = @import("../mage_flow/mage_flow.zig");
 const mrope = @import("../../sdk/vision/mrope.zig");
 const qvis = @import("../../sdk/vision/qwen_vision.zig");

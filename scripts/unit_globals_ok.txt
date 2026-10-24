@@ -25,8 +25,8 @@
 # Named: device probes, load-time counters each unit logs itself, test-only state.
 engines.mlx.diag.profile.dispatch_probe_cached
 engines.mlx.kv.cache.KVCache.kv_cap_buf_grows
-engines.mlx.model.narrow_1d_cached
-engines.mlx.model.narrowed_1d
+sdk.weights.load.narrow_1d_cached
+sdk.weights.load.narrowed_1d
 engines.mlx.ssm.checkpoint.cadence_conv_eval_count
 sdk.blocks.conv.depthwise.compact_conv_state_copy_count
 sdk.util.system.gpu_cores

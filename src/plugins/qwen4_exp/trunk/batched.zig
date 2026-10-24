@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../../sdk/util/log.zig");
 const Trunk = @import("../trunk.zig").Trunk;
 const ple = @import("../ple.zig");
 const ForwardCtx = @import("../../../engines/mlx/forward_ctx.zig").ForwardCtx;

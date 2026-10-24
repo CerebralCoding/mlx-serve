@@ -1,8 +1,8 @@
 //! One-shot generation drivers (plain, PLD, drafter, MTP) and their result finishers.
 const std = @import("std");
 const transformer_mod = @import("../transformer.zig");
-const tokenizer_mod = @import("../../../host/tokenizer/tokenizer.zig");
-const log = @import("../../../host/log.zig");
+const tokenizer_mod = @import("../../../sdk/tokenizer/tokenizer.zig");
+const log = @import("../../../sdk/util/log.zig");
 const io_util = @import("../../../sdk/util/io_util.zig");
 const drafter_mod = @import("../../../plugins/gemma4/assistant_drafter.zig");
 const mtp_mod = @import("../../../sdk/spec/mtp/mtp.zig");

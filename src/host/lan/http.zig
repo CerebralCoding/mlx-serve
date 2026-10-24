@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const crt = @import("../../sdk/util/crt.zig");
-const log = @import("../log.zig");
+const log = @import("../../sdk/util/log.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const ModelRegistry = model_registry_mod.ModelRegistry;
 const io_util = @import("../../sdk/util/io_util.zig");

@@ -3,7 +3,7 @@
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const generate_mod = @import("../generate.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../../sdk/util/log.zig");
 const testing = std.testing;
 
 const holdsForMemory = @import("../batching/verdict.zig").holdsForMemory;

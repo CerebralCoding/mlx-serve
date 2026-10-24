@@ -10,7 +10,7 @@ const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const ltx_audio = @import("../ltx/audio.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const Scope = @import("../../mlx/scope.zig").Scope;
 
 const A = mlx.mlx_array;

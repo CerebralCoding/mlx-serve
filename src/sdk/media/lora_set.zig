@@ -5,7 +5,7 @@
 const std = @import("std");
 const abi = @import("../../abi/media.zig");
 const lora = @import("../weights/lora.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../util/log.zig");
 
 const Verdict = abi.Verdict;
 

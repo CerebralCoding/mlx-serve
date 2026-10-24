@@ -6,7 +6,7 @@ const tokenize_cache_mod = @import("../../host/tokenizer/cache.zig");
 const load = @import("load.zig");
 const policy = @import("policy.zig");
 const arch_llama = if (@import("build_options").llama_engine) @import("bridge.zig") else @import("stub.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 
 const MAX_BATCH_GROUP = @import("../mlx/batching/verdict.zig").MAX_BATCH_GROUP;
 const publishHotCacheResidency = @import("../mlx/cache/budget.zig").publishHotCacheResidency;

@@ -359,7 +359,7 @@ pub fn hcPre(s: mlx.mlx_stream, x: ?mlx.mlx_array, deferred: ?*const Deferred, f
             if (e != error.MlxError or tpg <= 256 or !mlx.takeErrorIf("Thread group size")) return e;
             out.deinit();
             hc_pre_tpg = @divTrunc(tpg, 2);
-            @import("../../host/log.zig").info("[glm5] hcPre: {d} threads per threadgroup on this GPU\n", .{hc_pre_tpg});
+            @import("../../sdk/util/log.zig").info("[glm5] hcPre: {d} threads per threadgroup on this GPU\n", .{hc_pre_tpg});
             continue;
         };
         probed.* = true;
@@ -1267,7 +1267,7 @@ pub fn moeDecode(s: mlx.mlx_stream, x: mlx.mlx_array, inds: mlx.mlx_array, score
     });
     if (!moe_decode_engaged) {
         moe_decode_engaged = true;
-        @import("../../host/log.zig").info("[moe] glm5 decode kernels engaged: topk={d} inter={d} bits={d}/{d}\n", .{ topk, inter, gate.bits, down.bits });
+        @import("../../sdk/util/log.zig").info("[moe] glm5 decode kernels engaged: topk={d} inter={d} bits={d}/{d}\n", .{ topk, inter, gate.bits, down.bits });
     }
     return out[0];
 }

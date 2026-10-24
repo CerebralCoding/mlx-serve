@@ -22,7 +22,7 @@ const verdict = @import("../../engines/mlx/batching/verdict.zig");
 const env = @import("../../env.zig");
 const Generator = @import("../../engines/mlx/generate/generator.zig").Generator;
 const SamplingParams = @import("../../engines/mlx/sampling/params.zig").SamplingParams;
-const Tokenizer = @import("../../host/tokenizer/tokenizer.zig").Tokenizer;
+const Tokenizer = @import("../../sdk/tokenizer/tokenizer.zig").Tokenizer;
 const Tape = @import("../../engines/mlx/plugin/tape.zig").Tape;
 
 const testing = std.testing;

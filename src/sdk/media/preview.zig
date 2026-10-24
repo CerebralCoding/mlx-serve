@@ -3,7 +3,7 @@
 //! A full VAE decode every denoise step is not safe (H3 stages the text
 //! encoder and DiT because they cannot both stay resident). This is the
 //! no-extra-weights fallback from issue #208: the PUBLISHED linear
-//! latent-to-RGB projection for the backend's latent space (`src/host/media_jobs/latent_rgb.zig`,
+//! latent-to-RGB projection for the backend's latent space (`src/sdk/media/latent_rgb.zig`,
 //! generated from ComfyUI's fitted tables), optional bilinear resize, then
 //! JPEG. Hermetic — no MLX.
 //!
@@ -24,7 +24,7 @@ const latent_rgb = @import("latent_rgb.zig");
 
 pub const Map = latent_rgb.Map;
 /// LTX-2 (2.3 and 2.5), 128 channels. NOT LTX-0.9's `LTXV` table — same
-/// geometry, different latent space (see src/host/media_jobs/latent_rgb.zig).
+/// geometry, different latent space (see src/sdk/media/latent_rgb.zig).
 pub const ltx_av = latent_rgb.ltx_av;
 /// MiniMax-H3, 24 channels.
 pub const minimax_h3 = latent_rgb.minimax_h3;
@@ -464,7 +464,7 @@ test "latent2rgb fixtures: the projection IS the reference's, per map" {
     defer parsed.deinit();
     const root = parsed.value.object;
 
-    // (1) the tables in src/host/media_jobs/latent_rgb.zig ARE the generated golden numbers.
+    // (1) the tables in src/sdk/media/latent_rgb.zig ARE the generated golden numbers.
     const maps = root.get("maps").?.object;
     inline for (.{ .{ "ltx_av", ltx_av }, .{ "minimax_h3", minimax_h3 } }) |pair| {
         const m = maps.get(pair[0]).?.object;

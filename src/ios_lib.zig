@@ -48,7 +48,7 @@ const model_registry_mod = @import("host/registry/registry.zig");
 const scheduler_mod = @import("engines/mlx/scheduler.zig");
 const server_mod = @import("host/http/server.zig");
 const gen_mod = @import("host/media_jobs/gen.zig");
-pub const log = @import("host/log.zig");
+pub const log = @import("sdk/util/log.zig");
 
 /// Returns the engine version string (NUL-terminated, static lifetime).
 export fn mlxserve_version() [*:0]const u8 {

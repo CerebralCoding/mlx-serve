@@ -42,8 +42,4 @@ pub const blocks = struct {
 test {
     _ = block;
     _ = @import("../testing/cache_ops.zig");
-    _ = @import("../../engines/mlx/kv/cache_ops.zig");
-    _ = @import("proof/dense_test.zig");
-    _ = @import("proof/layered_test.zig");
-    _ = @import("proof/attention_test.zig");
 }

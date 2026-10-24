@@ -23,7 +23,7 @@ const env = @import("../../env.zig");
 const build_options = @import("build_options");
 const ollama = @import("../api/ollama/translate.zig");
 const model_discovery = @import("../registry/discovery.zig");
-const log = @import("../log.zig");
+const log = @import("../../sdk/util/log.zig");
 
 // ── Unparsed-argument reporting ─────────────────────────────────────────
 

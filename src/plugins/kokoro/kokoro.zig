@@ -37,7 +37,7 @@
 const std = @import("std");
 const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 
 const S = mlx.mlx_stream;
 
@@ -761,9 +761,9 @@ fn applyStyle(norm: mlx.mlx_array, gamma: mlx.mlx_array, beta: mlx.mlx_array, s:
 // Weight access
 // ════════════════════════════════════════════════════════════════════════
 
-// `loadComponent` (safetensors → map) lives in ltx_video; the NLC conv
+// `loadComponent` (safetensors → map) lives in ltx/component; the NLC conv
 // primitives live in ltx_audio. Both are reused rather than duplicated.
-const ltx = @import("../ltx/video.zig");
+const ltx = @import("../ltx/component.zig");
 const ltxa = @import("../ltx/audio.zig");
 
 /// A missing key is a BUG (bad conversion, wrong checkpoint), never something

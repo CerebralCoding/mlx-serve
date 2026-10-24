@@ -1,7 +1,7 @@
 //! Tool-call parsing: `parseToolCalls` (the dialect dispatch) and `ParsedToolCall`.
 
 const std = @import("std");
-const log = @import("../../log.zig");
+const log = @import("../../../sdk/util/log.zig");
 const testing = std.testing;
 
 const indexOfThinkCloseTag = @import("../reasoning/think_tags.zig").indexOfThinkCloseTag;

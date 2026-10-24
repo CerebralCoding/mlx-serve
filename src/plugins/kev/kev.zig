@@ -3,10 +3,10 @@
 //! and rounding mirror `kev.api` and `kev.model`; the tokens and answers are pinned by `tests/fixtures/kev`.
 const std = @import("std");
 const laya = @import("../laya/laya.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
-const tokenizer_mod = @import("../../host/tokenizer/tokenizer.zig");
+const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
 const transformer_mod = @import("../../engines/mlx/transformer.zig");
 const forward_ctx = @import("../../engines/mlx/forward_ctx.zig");
 const cache_mod = @import("../../engines/mlx/kv/cache.zig");

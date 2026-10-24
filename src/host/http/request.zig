@@ -1,7 +1,7 @@
 //! connection thread, JSON depth, readRequest; header helpers
 
 const std = @import("std");
-const log = @import("../log.zig");
+const log = @import("../../sdk/util/log.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
 const nowMsMonotonic = io_util.nowMsMonotonic;
 const testing = std.testing;

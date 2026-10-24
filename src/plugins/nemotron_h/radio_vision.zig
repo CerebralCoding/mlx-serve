@@ -18,7 +18,7 @@ const glm_vision = @import("../glm5_next/vision.zig");
 const transformer = @import("../../engines/mlx/transformer.zig");
 const activations = @import("../../sdk/blocks/mlp/activations.zig");
 const params = @import("../../sdk/quant/params.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 
 const ModelConfig = model_mod.ModelConfig;
 

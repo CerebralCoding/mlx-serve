@@ -1,8 +1,8 @@
 //! Chat template loading: include stubs, the model dir sniff, `loadChatConfig`, and `formatChat`.
 
 const std = @import("std");
-const tokenizer_mod = @import("../tokenizer/tokenizer.zig");
-const log = @import("../log.zig");
+const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
+const log = @import("../../sdk/util/log.zig");
 const mlx_gguf = @import("../../sdk/quant/gguf/claim.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;
 const testing = std.testing;

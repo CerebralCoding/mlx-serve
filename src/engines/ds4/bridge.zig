@@ -18,10 +18,10 @@
 const std = @import("std");
 const env = @import("../../env.zig");
 const builtin = @import("builtin");
-const gguf_meta = @import("../../host/registry/engine_pick.zig");
+const gguf_meta = @import("../../sdk/quant/gguf/engine_pick.zig");
 const ffi = @import("ffi.zig");
 const metal_sources = @import("ds4_metal_sources");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 
 pub const Error = error{
     EngineOpenFailed,

@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const ModelConfig = @import("model.zig").ModelConfig;
 const checkpoint = @import("ssm/checkpoint.zig");
 const gather_qmv = @import("../../sdk/blocks/moe/gather_qmv.zig");

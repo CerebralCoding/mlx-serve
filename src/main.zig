@@ -9,7 +9,7 @@ pub const io_util = @import("sdk/util/io_util.zig");
 pub const shared = @import("sdk/util/shared.zig");
 const mlx_gguf = @import("sdk/quant/gguf/claim.zig");
 const model_mod = @import("engines/mlx/model.zig");
-const tokenizer_mod = @import("host/tokenizer/tokenizer.zig");
+const tokenizer_mod = @import("sdk/tokenizer/tokenizer.zig");
 const transformer_mod = @import("engines/mlx/transformer.zig");
 const plugin_driver = @import("engines/mlx/plugin/driver.zig");
 const round_cost_mod = @import("engines/mlx/spec/round_cost.zig");
@@ -23,7 +23,7 @@ comptime {
     @import("plugin_host_check.zig").reexports(@This());
 }
 const model_discovery = @import("host/registry/discovery.zig");
-const gguf_meta = @import("host/registry/engine_pick.zig");
+const gguf_meta = @import("sdk/quant/gguf/engine_pick.zig");
 const model_registry_mod = @import("host/registry/registry.zig");
 const drafter_mod = @import("plugins/gemma4/assistant_drafter.zig");
 const mtp_graft = @import("plugins/prism_hadamard_qwen35/mtp_graft.zig");
@@ -51,7 +51,7 @@ comptime {
     if (@import("builtin").os.tag == .macos) @export(&info_plist, .{ .name = "mlx_serve_info_plist", .section = "__TEXT,__info_plist" });
 }
 const launch_mod = @import("host/launch/launch.zig");
-pub const log = @import("host/log.zig");
+pub const log = @import("sdk/util/log.zig");
 const metrics_mod = @import("host/metrics/metrics.zig");
 const sleep_inhibit_mod = @import("host/gpu_thread/sleep_inhibit.zig");
 const version_mod = @import("version.zig");

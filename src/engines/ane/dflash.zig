@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const env = @import("../../env.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const mil = @import("mil.zig");
 const pack_mod = @import("pack.zig");
 const rt = @import("rt.zig");

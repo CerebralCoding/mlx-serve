@@ -8,7 +8,7 @@ const std = @import("std");
 const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../util/log.zig");
 
 /// One output row a simdgroup: more rows share the x registers but their live state cuts occupancy.
 const ROWS: c_int = 1;

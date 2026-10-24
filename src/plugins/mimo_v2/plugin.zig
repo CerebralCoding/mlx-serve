@@ -11,7 +11,7 @@ const run_mod = @import("../../sdk/bases/run.zig");
 const moe = @import("../../sdk/bases/blocks/moe.zig");
 const compiled = @import("../../sdk/bases/blocks/compiled.zig");
 const gated = @import("../../sdk/bases/blocks/gated_attention.zig");
-const reader = @import("../lfm2/reader.zig");
+const reader = @import("../../sdk/bases/reader.zig");
 const EitherMlp = @import("../lfm2/plugin.zig").EitherMlp;
 const SinkAttention = @import("sink_attention.zig").SinkAttention;
 const mtp_head = @import("mtp_head.zig");
@@ -289,8 +289,4 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
 
 test {
     _ = config;
-    _ = @import("proof_test.zig");
-    _ = @import("mtp_head_test.zig");
-    _ = @import("sushi_test.zig");
-    _ = @import("streamed_test.zig");
 }

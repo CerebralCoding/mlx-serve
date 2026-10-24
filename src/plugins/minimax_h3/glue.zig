@@ -9,7 +9,7 @@ const std = @import("std");
 const env = @import("../../env.zig");
 const kernelSource = @import("../../mlx/kernels.zig").source;
 const mlx = @import("../../mlx/ffi.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 
 var enabled_cache: ?bool = null;
 pub var disabled_for_test = false; // lets a test run the chain these kernels replace

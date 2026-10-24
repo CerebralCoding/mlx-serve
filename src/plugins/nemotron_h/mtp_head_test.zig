@@ -203,7 +203,7 @@ test "nemotron_h served: an MTP round loop through the engine's head equals the 
 
 const Generator = @import("../../engines/mlx/generate/generator.zig").Generator;
 const SamplingParams = @import("../../engines/mlx/sampling/params.zig").SamplingParams;
-const Tokenizer = @import("../../host/tokenizer/tokenizer.zig").Tokenizer;
+const Tokenizer = @import("../../sdk/tokenizer/tokenizer.zig").Tokenizer;
 
 /// `want` tokens after `prompt`: serial decode, or MTP rounds through `head` (every token through a real round).
 fn generate(x: *Transformer, head: ?MtpHeadRef, sp: SamplingParams, out: []u32) !void {

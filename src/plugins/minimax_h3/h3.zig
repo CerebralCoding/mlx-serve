@@ -28,8 +28,8 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
-const log = @import("../../host/log.zig");
+const model_mod = @import("../../sdk/weights/load.zig");
+const log = @import("../../sdk/util/log.zig");
 const mage_flow = @import("../mage_flow/mage_flow.zig");
 /// Runtime LoRA adapters, shared with the image/LTX backends — ONE loader for
 /// every adapter format we accept, Turbo included.
@@ -41,7 +41,7 @@ const h3_split = @import("cluster.zig");
 const h3_vsa = @import("vsa.zig");
 const add_norm = @import("../../sdk/blocks/norms/add_norm.zig");
 const ane = @import("../../sdk/ane/offload.zig");
-const gen_sse = @import("../../host/media_jobs/sse.zig");
+const gen_sse = @import("../../sdk/media/progress.zig");
 /// Vision presentation math (grids, adaLN tags, mRoPE), pinned against
 /// ComfyUI's own output by `fixtures/minimax_h3_vision.json`.
 pub const h3v = @import("vision.zig");
@@ -3759,7 +3759,7 @@ fn tryEmitH3Preview(
 
 fn renderH3Preview(
     allocator: std.mem.Allocator,
-    opts: @import("../../host/media_jobs/preview.zig").Opts,
+    opts: @import("../../sdk/media/preview.zig").Opts,
     video_x: mlx.mlx_array,
     velocity: mlx.mlx_array,
     sigma: f64,
@@ -3768,8 +3768,8 @@ fn renderH3Preview(
     lat_w: u32,
     first_frame: bool,
     s: S,
-) !@import("../../host/media_jobs/preview.zig").Encoded {
-    const preview_mod = @import("../../host/media_jobs/preview.zig");
+) !@import("../../sdk/media/preview.zig").Encoded {
+    const preview_mod = @import("../../sdk/media/preview.zig");
     const sv = try scalarLike(@floatCast(sigma), velocity, s);
     defer _ = mlx.mlx_array_free(sv);
     const scaled = try mulA(velocity, sv, s);
@@ -3914,7 +3914,7 @@ fn generateOne(
     defer mage_flow.mf_dq_gemm_override = dq_override_prev;
 
     // ── 1. tokenize (raw ids, NO special tokens and no chat template) ──
-    const tok_mod = @import("../../host/tokenizer/tokenizer.zig");
+    const tok_mod = @import("../../sdk/tokenizer/tokenizer.zig");
     var tok = try tok_mod.loadTokenizerAny(io, allocator, paths.tokenizer_dir);
     defer tok.deinit();
     const ids_u32 = try tok.encode(allocator, req.prompt);
@@ -4678,7 +4678,7 @@ const ChainProgress = struct {
         const self: *ChainProgress = @ptrCast(@alignCast(ptr));
         return self.inner.cancelled();
     }
-    fn previewCb(ptr: *anyopaque, stage: []const u8, step: u32, total: u32, frame: @import("../../host/media_jobs/preview.zig").Encoded) void {
+    fn previewCb(ptr: *anyopaque, stage: []const u8, step: u32, total: u32, frame: @import("../../sdk/media/preview.zig").Encoded) void {
         const self: *ChainProgress = @ptrCast(@alignCast(ptr));
         var buf: [96]u8 = undefined;
         const label = std.fmt.bufPrint(&buf, "Window {d}/{d}: {s}", .{ self.window + 1, self.windows, stage }) catch stage;

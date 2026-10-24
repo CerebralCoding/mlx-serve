@@ -10,7 +10,7 @@
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../../sdk/util/log.zig");
 const server = @import("../../../host/http/server.zig");
 const status = @import("../../../sdk/util/system.zig");
 const model_settings = @import("../../../host/registry/model_settings.zig");

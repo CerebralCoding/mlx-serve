@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../../sdk/util/log.zig");
 const QuantMode = @import("../../../sdk/quant/params.zig").QuantMode;
 const moe_fp4 = @import("../../../sdk/blocks/moe/moe_fp4.zig");
 const moe_affine4 = @import("../../../sdk/blocks/moe/moe_affine4.zig");

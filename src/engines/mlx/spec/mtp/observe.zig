@@ -1,6 +1,6 @@
 //! MTP round observation: exact-depth acceptance and round-end updates.
 const std = @import("std");
-const log = @import("../../../../host/log.zig");
+const log = @import("../../../../sdk/util/log.zig");
 const io_util = @import("../../../../sdk/util/io_util.zig");
 const round_cost = @import("../round_cost.zig");
 const group_planner = @import("../mtp_group_planner.zig");

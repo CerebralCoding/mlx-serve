@@ -4,7 +4,7 @@
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const rht = @import("hadamard/rht.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../util/log.zig");
 const Weights = @import("../weights/resident.zig").Weights;
 const biasNegScalePeak = @import("ternary.zig").biasNegScalePeak;
 

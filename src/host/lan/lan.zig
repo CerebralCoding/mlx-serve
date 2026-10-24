@@ -25,7 +25,7 @@
 const std = @import("std");
 const crt = @import("../../sdk/util/crt.zig");
 const os_mutex = @import("../../sdk/util/os_mutex.zig");
-const log = @import("../log.zig");
+const log = @import("../../sdk/util/log.zig");
 const agent_budget = @import("../launch/budget.zig");
 
 pub const SERVICE_TYPE = "_mlxserve._tcp";

@@ -19,7 +19,7 @@ const dflash_mod = @import("../spec/dflash/dflash.zig");
 const MtpHeadRef = @import("../spec/mtp_head_ref.zig").MtpHeadRef;
 const MtpCacheRef = @import("../spec/mtp_head_ref.zig").MtpCacheRef;
 const Generator = @import("../generate/generator.zig").Generator;
-const Tokenizer = @import("../../../host/tokenizer/tokenizer.zig").Tokenizer;
+const Tokenizer = @import("../../../sdk/tokenizer/tokenizer.zig").Tokenizer;
 const Transformer = @import("../transformer.zig").Transformer;
 
 const testing = std.testing;

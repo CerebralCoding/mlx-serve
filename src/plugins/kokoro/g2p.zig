@@ -22,7 +22,7 @@
 
 const std = @import("std");
 const env = @import("../../env.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 
 pub const Phonemizer = struct {
     allocator: std.mem.Allocator,

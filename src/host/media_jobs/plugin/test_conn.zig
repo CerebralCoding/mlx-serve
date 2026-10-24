@@ -4,6 +4,7 @@ const std = @import("std");
 const testing = std.testing;
 const Conn = @import("../../http/server.zig").Conn;
 const sse = @import("../sse.zig");
+const media_progress = @import("../../../sdk/media/progress.zig");
 
 /// Everything `run` writes to a connection, read off the other end of a socketpair.
 pub fn capture(a: std.mem.Allocator, comptime run: anytype, args: anytype) ![]u8 {
@@ -26,7 +27,7 @@ pub fn capture(a: std.mem.Allocator, comptime run: anytype, args: anytype) ![]u8
     conn.init(.{ .socket = .{ .handle = sv[0], .address = undefined } }, testing.io);
     // The job's keepalive registration outlives it here (the scheduler clears it in production): drop it with the conn.
     const r = @call(.auto, run, .{&conn} ++ args);
-    sse.stream_conn = null;
+    media_progress.stream_keepalive = null;
     _ = std.c.close(sv[0]);
     t.join();
     _ = std.c.close(sv[1]);
@@ -56,7 +57,7 @@ pub fn captureMany(a: std.mem.Allocator, comptime n: usize, comptime run: anytyp
         t.* = try std.Thread.spawn(.{}, Drain.f, .{ p[1], o, a });
     }
     @call(.auto, run, .{&conns} ++ args);
-    sse.stream_conn = null;
+    media_progress.stream_keepalive = null;
     var got: [n][]u8 = undefined;
     for (&sv, &outs, &threads, &got) |p, *o, t, *g| {
         _ = std.c.close(p[0]);

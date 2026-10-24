@@ -4,12 +4,12 @@
 const std = @import("std");
 const abi = @import("../../abi/media.zig");
 const sdk = @import("../../sdk/root.zig");
-const job = @import("../../host/media_jobs/plugin_job.zig");
+const job = @import("../../sdk/media/job.zig");
 const image_request = @import("../../sdk/media/image_request.zig");
 const image_pixels = @import("../../sdk/media/image_pixels.zig");
 const LoraSet = @import("../../sdk/media/lora_set.zig").LoraSet;
 const mlx = @import("../../mlx/ffi.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const moss = @import("moss_image.zig");
 pub const config = @import("config.zig");
 

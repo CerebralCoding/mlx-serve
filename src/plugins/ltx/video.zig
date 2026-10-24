@@ -32,7 +32,7 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const transformer_mod = @import("../../engines/mlx/transformer.zig");
 const forward_ctx = @import("../../engines/mlx/forward_ctx.zig");
@@ -43,6 +43,7 @@ const int8_attn = @import("../../sdk/blocks/dit/int8_attn.zig");
 const diffvae = @import("diffvae.zig");
 const diffvae_fwd = @import("diffvae_forward.zig");
 const config_fields = @import("../../sdk/media/config_fields.zig");
+const component = @import("component.zig");
 
 const S = mlx.mlx_stream;
 
@@ -164,60 +165,7 @@ pub fn loadLtxConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
     return parseLtxConfig(allocator, bytes) catch .{};
 }
 
-// ── Single-component weight loader ──
-//
-// The LTX checkpoint stores each sub-model as a separate `*.safetensors` file in
-// ONE directory (transformer-dev 11GB, connector 5.9GB, vae_decoder 777MB, ...).
-// `model.loadWeights` scans a whole dir → it would load all 40GB+ at once (OOM).
-// We load a single component file instead and classify each tensor q4-vs-bf16 by
-// the presence of a sibling `.scales` entry.
-
-pub const Component = struct {
-    map: std.StringHashMap(mlx.mlx_array),
-    allocator: std.mem.Allocator,
-    // Runtime LoRA (non-owning; the engine owns the Stack and
-    // re-installs the pointer after every transformer swap). Checked by
-    // dQLin only — the DiT projections are the modules video LoRAs target.
-    // A Stack may hold several simultaneously-attached adapters; their
-    // deltas are summed (lora.deltaSum), never merged.
-    lora: ?*const lora_mod.Stack = null,
-    /// Int8 copies of the DiT block linears that REPLACE their packed `<base>.weight/.scales/.biases`
-    /// (`--w8a8`); `dQLin` reads them.
-    w8: w8a8.Overlay = .{},
-
-    pub fn deinit(self: *Component) void {
-        var it = self.map.iterator();
-        while (it.next()) |e| {
-            _ = mlx.mlx_array_free(e.value_ptr.*);
-            self.allocator.free(e.key_ptr.*);
-        }
-        self.map.deinit();
-        self.w8.deinit(self.allocator);
-    }
-
-    /// Whether the linear behind `weight_key` (`<base>.weight`) is present, packed or int8.
-    pub fn hasWeight(self: *const Component, weight_key: []const u8) bool {
-        return self.map.contains(weight_key) or self.w8.has(weight_key);
-    }
-
-    pub fn get(self: *const Component, key: []const u8) ?mlx.mlx_array {
-        return self.map.get(key);
-    }
-
-    /// A weight is quantized (q4) iff a sibling `<base>.scales` exists. `weight`
-    /// keys end in `.weight`; the quant siblings are `.scales`/`.biases`.
-    pub fn isQuantized(self: *const Component, weight_key: []const u8) bool {
-        if (!std.mem.endsWith(u8, weight_key, ".weight")) return false;
-        const base = weight_key[0 .. weight_key.len - ".weight".len];
-        var buf: [512]u8 = undefined;
-        const scales_key = std.fmt.bufPrint(&buf, "{s}.scales", .{base}) catch return false;
-        return self.map.contains(scales_key);
-    }
-
-    pub fn count(self: *const Component) u32 {
-        return @intCast(self.map.count());
-    }
-};
+pub const Component = component.Component;
 
 /// The transformer component: loaded, then its block linears to int8 where the route takes them.
 pub fn loadTransformer(allocator: std.mem.Allocator, path: [:0]const u8, cfg: LtxConfig, load_s: S, s: S) !Component {
@@ -230,41 +178,7 @@ pub fn loadTransformer(allocator: std.mem.Allocator, path: [:0]const u8, cfg: Lt
     return comp;
 }
 
-/// Load one `*.safetensors` file (absolute path) into a Component map.
-pub fn loadComponent(allocator: std.mem.Allocator, path: [:0]const u8, s: S) !Component {
-    var comp = Component{ .map = std.StringHashMap(mlx.mlx_array).init(allocator), .allocator = allocator };
-    errdefer comp.deinit();
-
-    var tensor_map = mlx.mlx_map_string_to_array_new();
-    defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
-    var meta_map = mlx.mlx_map_string_to_string_new();
-    defer _ = mlx.mlx_map_string_to_string_free(meta_map);
-    try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, path, s));
-
-    const iter = mlx.mlx_map_string_to_array_iterator_new(tensor_map);
-    defer _ = mlx.mlx_map_string_to_array_iterator_free(iter);
-    while (true) {
-        var key: ?[*:0]const u8 = null;
-        var value = mlx.mlx_array_new();
-        const rc = mlx.mlx_map_string_to_array_iterator_next(&key, &value, iter);
-        if (rc != 0 or key == null) {
-            _ = mlx.mlx_array_free(value);
-            break;
-        }
-        const key_slice = std.mem.span(key.?);
-        const owned_key = try allocator.dupe(u8, key_slice);
-        errdefer allocator.free(owned_key);
-        // Transfer the iterator's reference straight into the map (the
-        // model.zig loadSafetensorsFile pattern). The old copy-via-
-        // mlx_array_set left `value`'s reference dangling on the floor —
-        // a phantom +1 on EVERY tensor, so Component.deinit could never
-        // release the buffers and each engine unload leaked the whole
-        // materialized component set (~18 GB per video load→gen→unload).
-        try comp.map.put(owned_key, value);
-    }
-    log.info("[ltx] loaded {d} tensors from {s}\n", .{ comp.count(), path });
-    return comp;
-}
+pub const loadComponent = component.loadComponent;
 
 // ── Primitives the DiT/VAE need beyond the LLM stack ──
 
@@ -3104,7 +3018,7 @@ fn ditX0(comp: *const Component, alloc: std.mem.Allocator, cfg: LtxConfig, vx: m
 }
 
 /// Optional progress sink for long generations (shared with flux/tts servers).
-pub const Progress = @import("../../host/media_jobs/sse.zig").Progress;
+pub const Progress = @import("../../sdk/media/progress.zig").Progress;
 
 /// Whether classifier-free guidance needs the second (negative) DiT forward.
 /// Both scales at 1.0 → guidance is a no-op, so the negative pass is skipped.
@@ -3166,12 +3080,12 @@ fn tryEmitLtxPreview(
 /// already exactly the wanted frames in order.
 fn renderLtxPreview(
     alloc: std.mem.Allocator,
-    opts: @import("../../host/media_jobs/preview.zig").Opts,
+    opts: @import("../../sdk/media/preview.zig").Opts,
     win: ProgressWindow,
     x0_tokens: mlx.mlx_array,
     s: S,
-) !@import("../../host/media_jobs/preview.zig").Encoded {
-    const preview_mod = @import("../../host/media_jobs/preview.zig");
+) !@import("../../sdk/media/preview.zig").Encoded {
+    const preview_mod = @import("../../sdk/media/preview.zig");
     const shp = mlx.getShape(x0_tokens);
     if (shp.len < 3) return error.BadLatentShape;
     const nv: u32 = @intCast(shp[1]);
@@ -5140,7 +5054,7 @@ test "ltx preview: the Latent2RGB preview resembles the decoded frame" {
     const raw = std.c.getenv("LTX_VAE_DIR") orelse std.c.getenv("LTX_TEST_MODEL") orelse return error.SkipZigTest;
     const dir = std.mem.span(raw);
     if (dir.len == 0) return error.SkipZigTest;
-    const preview_mod = @import("../../host/media_jobs/preview.zig");
+    const preview_mod = @import("../../sdk/media/preview.zig");
     const allocator = testing.allocator;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
