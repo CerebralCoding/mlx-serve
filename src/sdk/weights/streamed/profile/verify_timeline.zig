@@ -16,7 +16,7 @@ pub var active: bool = false;
 
 /// Cycles <= max_tokens - 1 (the cell's default cap: 1,024 ids).
 pub const max_cycles = 1024;
-pub const max_layers = @import("deepseek_v41.zig").max_layers;
+pub const max_layers = @import("decode_timers.zig").max_layers;
 /// Buffers past this are counted (`dropped`), not recorded.
 pub const max_buffers = 1 << 18;
 
@@ -640,7 +640,7 @@ test "dsv41 verify timeline: a default build stamps nothing and links no shim; t
 test "dsv41 smoke 0b: the command-buffer hook sees MLX's own commits on the GPU stream (no model)" {
     if (comptime !enabled) return error.SkipZigTest;
     _ = env.get(.DSV41_PHASE0B_MLX) orelse return error.SkipZigTest;
-    const ops = @import("ops.zig");
+    const ops = @import("../ops.zig");
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     var g = try ops.MlxOps.init(std.testing.allocator, s);

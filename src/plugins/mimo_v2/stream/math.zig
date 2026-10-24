@@ -5,7 +5,7 @@
 const std = @import("std");
 const env = @import("mlx_host").env;
 const mlx = @import("sdk").mlx;
-const ops = @import("../../deepseek_v41/stream/ops.zig");
+const ops = @import("../../../sdk/weights/streamed/ops.zig");
 const quant = @import("../../../sdk/weights/streamed/sdk_ext.zig").quant;
 const bank_mod = @import("bank.zig");
 const profile = @import("profile.zig");
@@ -104,7 +104,7 @@ const windowRows = Mxfp4.window;
 pub const Profile = struct {
     pub const enabled = profile.enabled;
     pub const now = profile.now;
-    pub const Mode = @import("../../deepseek_v41/stream/prefill_timers.zig").Mode;
+    pub const Mode = @import("../../../sdk/weights/streamed/profile/prefill_timers.zig").Mode;
     pub const charge = profile.charge;
     pub fn setMode(_: Mode) void {}
     pub fn countWideCall() void {}
@@ -518,7 +518,7 @@ const windowView = Math.viewWindow;
 pub const top_k: u32 = 8;
 /// Tokens per joinless gather tile (a multiple of `tile_rows`).
 pub const combine_tokens: u32 = 4 * tile_rows;
-const max_sources = @import("../../deepseek_v41/stream/experts.zig").joinless_sources;
+const max_sources = @import("../../../sdk/weights/streamed/experts.zig").joinless_sources;
 const max_combine_tiles = (@import("config.zig").prefill_max_tokens + tile_rows - 1) / tile_rows;
 comptime {
     if (combine_tokens % tile_rows != 0) @compileError("mimo_v2: a gather tile must hold whole reduction tiles");
@@ -1145,9 +1145,9 @@ fn joinProbeCase(a: std.mem.Allocator, g: *ops.MlxOps, name: []const u8, nt: u32
     // Candidate: the shared merge to at most 24 sources, then the joinless gather.
     const loc = try a.alloc(i32, 2 * nr);
     defer a.free(loc);
-    var sc: @import("../../deepseek_v41/stream/experts.zig").JoinlessScratch(T) = .{};
+    var sc: @import("../../../sdk/weights/streamed/experts.zig").JoinlessScratch(T) = .{};
     defer sc.deinit(a);
-    _ = try @import("../../deepseek_v41/stream/experts.zig").mergeJoinless(ops.MlxOps, g, a, parts, pos, loc, &sc);
+    _ = try @import("../../../sdk/weights/streamed/experts.zig").mergeJoinless(ops.MlxOps, g, a, parts, pos, loc, &sc);
     try g.evalAll(parts.items);
     const candidate = try combineParts(g, parts.items, loc, weights, nt, H, reduceTilesSync);
     defer g.release(candidate);

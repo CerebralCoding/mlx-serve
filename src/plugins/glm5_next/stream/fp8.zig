@@ -26,7 +26,7 @@ const std = @import("std");
 const env = @import("mlx_host").env;
 const sdk = @import("sdk");
 const mlx = sdk.mlx;
-const ops_be = @import("../../deepseek_v41/stream/ops.zig");
+const ops_be = @import("../../../sdk/weights/streamed/ops.zig");
 const glm = @import("config.zig");
 const mimo_fp8 = @import("../../mimo_v2/stream/fp8_linear.zig");
 /// MLX custom kernels through the plugin's launch cache (sdk_ext/metal_launch.zig): no per-call source rebuild.

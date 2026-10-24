@@ -161,7 +161,7 @@ test "mimo sdk2 mxfp4 SDK source: contract, absolute layers, and U32/U8 trace bi
     try testing.expectEqual(@as(u32, 0), source.relativeLayer(1));
     try testing.expectEqual(@as(u32, 46), source.relativeLayer(47));
     try testing.expectEqual(@as(u32, 0), source.bankRows(0, .base));
-    var g = @import("../../deepseek_v41/stream/ops.zig").TraceOps.init(testing.allocator);
+    var g = @import("../../../sdk/weights/streamed/ops.zig").TraceOps.init(testing.allocator);
     defer g.deinit();
     try testing.expect(try source.bankArrays(&g, 0, .transient) == null);
     const arrays = try traceBank(&g, &layers[46], 8);
@@ -201,7 +201,7 @@ test "mimo sdk2 mxfp4 SDK GPU: asynchronous windows and bound six-component slot
     defer side.deinit();
     const mlx_stream = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(mlx_stream);
-    var g = try @import("../../deepseek_v41/stream/ops.zig").MlxOps.init(a, mlx_stream);
+    var g = try @import("../../../sdk/weights/streamed/ops.zig").MlxOps.init(a, mlx_stream);
     defer g.deinit();
     const stream = try Stream.init(a, &side.bank, .{
         .rows = &.{ 1, 1 },
@@ -250,7 +250,7 @@ test "mimo sdk2 mxfp4 SDK GPU: asynchronous windows and bound six-component slot
     try testing.expect(source.stats().expert_bytes_read > 128 * geom.record_bytes);
 }
 
-fn fixtureBindings(source: *StreamSource, g: *@import("../../deepseek_v41/stream/ops.zig").MlxOps) ![2][3]?BankArrays {
+fn fixtureBindings(source: *StreamSource, g: *@import("../../../sdk/weights/streamed/ops.zig").MlxOps) ![2][3]?BankArrays {
     var banks: [2][3]?BankArrays = undefined;
     for (&banks, 1..) |*layer, absolute| for ([_]BankKind{ .base, .ext, .transient }, 0..) |kind, i| {
         layer[i] = try source.bankArrays(g, @intCast(absolute), kind);
@@ -258,7 +258,7 @@ fn fixtureBindings(source: *StreamSource, g: *@import("../../deepseek_v41/stream
     return banks;
 }
 
-fn checkFixtureCall(source: *StreamSource, g: *@import("../../deepseek_v41/stream/ops.zig").MlxOps, call: *StreamSource.Call, ids: []const u16, banks: *const [3]?BankArrays, bytes: []const u8) !void {
+fn checkFixtureCall(source: *StreamSource, g: *@import("../../../sdk/weights/streamed/ops.zig").MlxOps, call: *StreamSource.Call, ids: []const u16, banks: *const [3]?BankArrays, bytes: []const u8) !void {
     const testing = std.testing;
     const r = call.route.?;
     const layer = &source.stream.bank.layers[r.layer];
@@ -1534,7 +1534,7 @@ const HitTraceMath = struct {
     }
     hidden: c_int,
     inter: c_int,
-    const Tr = @import("../../deepseek_v41/stream/ops.zig").TraceOps;
+    const Tr = @import("../../../sdk/weights/streamed/ops.zig").TraceOps;
     pub fn gateUp(self: *const HitTraceMath, g: *Tr, x: u32, _: u32, _: Projection(u32), _: Projection(u32)) !u32 {
         return g.kernel(&.{ g.shapeOf(x).d[0], self.inter }, .bfloat16);
     }
@@ -1584,7 +1584,7 @@ fn hitInstallRun(a: std.mem.Allocator, hitpass: bool, pre: *[4]usize) !void {
     var g = Tr.init(a);
     defer g.deinit();
     g.record_host = true;
-    const Ex = @import("../../deepseek_v41/stream/experts.zig").ExpertsWith(Tr, StreamSource, HitTraceMath, .{});
+    const Ex = @import("../../../sdk/weights/streamed/experts.zig").ExpertsWith(Tr, StreamSource, HitTraceMath, .{});
     const c: @import("config.zig").Config = .{ .hidden_size = 32, .moe_intermediate_size = 32, .n_layers = 3, .n_routed_experts = 64, .n_experts_per_tok = 8 };
     var ex = try Ex.initWith(a, &g, &ss, .{ .hidden = 32, .inter = 32 }, &c, .{ .banked = true, .devroute = hitpass });
     defer ex.deinit();

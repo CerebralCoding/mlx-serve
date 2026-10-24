@@ -113,7 +113,7 @@ const Bank = struct {
     geo: Geometry,
     bytes: []u8,
 
-    const Geometry = if (build_options.mlx_stream) stream.dsv41_streamed.Geometry else void;
+    const Geometry = if (build_options.mlx_stream) stream.bank_source.Geometry else void;
 
     fn init(a: std.mem.Allocator, seed: u64, n_experts: u32) !Bank {
         const geo = try Geometry.init(128, 128, n_experts, 0, 8);
@@ -295,7 +295,7 @@ fn streamedParity(n_experts: u32) !void {
     try tmp.dir.createDir(io, "bank", .default_dir);
     var bank_dir = try tmp.dir.openDir(io, "bank", .{});
     defer bank_dir.close(io);
-    try stream.dsv41_streamed.writeBank(a, io, bank_dir, bank.geo, bank.bytes, "synthetic/dsv41-tiny", "0000000000000000000000000000000000000000");
+    try stream.bank_source.writeBank(a, io, bank_dir, bank.geo, bank.bytes, "synthetic/dsv41-tiny", "0000000000000000000000000000000000000000");
     var buf: [512]u8 = undefined;
     const dir = try a.dupe(u8, buf[0..try tmp.dir.realPath(io, &buf)]);
     const bank_path = try std.fmt.allocPrint(a, "{s}/bank", .{dir});

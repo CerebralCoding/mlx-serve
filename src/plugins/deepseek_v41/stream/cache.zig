@@ -7,7 +7,7 @@
 
 const std = @import("std");
 const v41 = @import("deepseek_v41.zig");
-const ops = @import("ops.zig");
+const ops = @import("../../../sdk/weights/streamed/ops.zig");
 
 const sdk_kv = @import("../../../sdk/weights/streamed/sdk_ext.zig").kv;
 const sdk_testing = @import("../../../sdk/weights/streamed/sdk_ext.zig").kv_testing;

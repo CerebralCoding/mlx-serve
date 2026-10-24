@@ -26,7 +26,7 @@ const mtl = @import("../../../sdk/weights/streamed/sdk_ext/metal_launch.zig");
 const kset = @import("../../../sdk/weights/streamed/sdk_ext/kernel_set.zig");
 const quant = @import("../../../sdk/weights/streamed/sdk_ext.zig").quant;
 const xq = @import("../../../sdk/quant/exl3/stream/quant.zig");
-const ops = @import("../../deepseek_v41/stream/ops.zig");
+const ops = @import("../../../sdk/weights/streamed/ops.zig");
 
 pub const G = ops.MlxOps;
 pub const T = G.T;

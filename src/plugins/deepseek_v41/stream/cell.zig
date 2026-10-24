@@ -11,7 +11,7 @@ const host_env = @import("mlx_host").env;
 const kset = @import("../../../sdk/weights/streamed/sdk_ext/kernel_set.zig");
 const mlx = @import("sdk").mlx;
 const sdk = @import("sdk");
-const ops = @import("ops.zig");
+const ops = @import("../../../sdk/weights/streamed/ops.zig");
 const arm_mod = @import("arm.zig");
 const expert_stream = @import("../../../sdk/weights/streamed/expert/stream.zig");
 

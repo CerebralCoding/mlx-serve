@@ -23,16 +23,16 @@ const fp8 = @import("fp8.zig");
 const mimo_math = @import("../../mimo_v2/stream/math.zig");
 const mimo_stream = @import("../../mimo_v2/stream/stream.zig");
 const prefill_combine = @import("../../mimo_v2/stream/prefill_combine.zig");
-const dsv_bill = @import("../../deepseek_v41/stream/bill.zig");
+const phase_mem = @import("../../../sdk/weights/streamed/phase_memory.zig");
 const gpu_warm = @import("../../mimo_v2/stream/gpu_warm.zig");
 const exl3_math = @import("exl3_math.zig");
 const prompt_levers = @import("prompt_levers.zig");
 const io_util = sdk.io_util;
 
 const Term = sdk.MemoryBill.Term;
-const wireTables = dsv_bill.wireTables;
+const wireTables = phase_mem.wireTables;
 /// DeepSeek's measured wiring cost per live buffer (MiMo's `buffer_allowance` constant).
-pub const wire_buffer_bytes = dsv_bill.wire_buffer_bytes;
+pub const wire_buffer_bytes = phase_mem.wire_buffer_bytes;
 /// The fill's floor: fewer prompt rows refuse the load by name (the harness's `MIN_ROWS`).
 pub const min_rows: u32 = glm.default_expert_rows;
 /// How far the constructed footprint may sit above the construction terms before the construction check reports it.

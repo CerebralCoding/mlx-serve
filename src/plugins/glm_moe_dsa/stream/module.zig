@@ -50,7 +50,7 @@ const exl3_quant = @import("exl3_quant.zig");
 const glm53_quant = @import("glm53_exl3/quant.zig");
 /// PROFILE builds (`-Dplugin-profile=true`): each draft round's verify on the GPU timeline, its summary at the
 /// request's end (`VERIFY_GPU_TIMELINE`); every other build compiles it out.
-const timeline = @import("../../deepseek_v41/stream/verify_timeline.zig");
+const timeline = @import("../../../sdk/weights/streamed/profile/verify_timeline.zig");
 const prefill_timers = @import("prefill_timers.zig");
 const phase_mem = @import("../../../sdk/weights/streamed/phase_memory.zig");
 

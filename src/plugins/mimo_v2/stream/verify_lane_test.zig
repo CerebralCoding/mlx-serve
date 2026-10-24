@@ -6,8 +6,8 @@ const std = @import("std");
 const sdk = @import("sdk");
 const mlx = sdk.mlx;
 const sdk_ext = @import("../../../sdk/weights/streamed/sdk_ext.zig");
-const ops = @import("../../deepseek_v41/stream/ops.zig");
-const shared = @import("../../deepseek_v41/stream/experts.zig");
+const ops = @import("../../../sdk/weights/streamed/ops.zig");
+const shared = @import("../../../sdk/weights/streamed/experts.zig");
 const bank_mod = @import("bank.zig");
 const stream_mod = @import("stream.zig");
 const source_mod = @import("source.zig");
@@ -179,7 +179,7 @@ pub const LaneMath = struct {
 /// The scheduler's wide-call counter (`runWideCore` counts each entry); the rest of the profile surface is inert.
 pub const LaneProfile = struct {
     pub const enabled = false;
-    pub const Mode = @import("../../deepseek_v41/stream/prefill_timers.zig").Mode;
+    pub const Mode = @import("../../../sdk/weights/streamed/profile/prefill_timers.zig").Mode;
     var wide_calls: u32 = 0;
     pub fn now() u64 {
         return 0;

@@ -33,7 +33,7 @@ const log = sdk.log;
 /// MLX custom kernels through the plugin's launch cache (sdk_ext/metal_launch.zig).
 const mtl = @import("../../../sdk/weights/streamed/sdk_ext/metal_launch.zig");
 const kset = @import("../../../sdk/weights/streamed/sdk_ext/kernel_set.zig");
-const ops_be = @import("../../deepseek_v41/stream/ops.zig");
+const ops_be = @import("../../../sdk/weights/streamed/ops.zig");
 const glm = @import("config.zig");
 const fp8 = @import("fp8.zig");
 const kda = @import("kda.zig");

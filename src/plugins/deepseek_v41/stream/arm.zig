@@ -25,15 +25,15 @@ const std = @import("std");
 const env = @import("mlx_host").env;
 const sdk = @import("sdk");
 const v41 = @import("deepseek_v41.zig");
-const ops = @import("ops.zig");
-const xp = @import("experts.zig");
+const ops = @import("../../../sdk/weights/streamed/ops.zig");
+const xp = @import("../../../sdk/weights/streamed/experts.zig");
 const expert_bank = @import("../../../sdk/weights/streamed/expert/bank.zig");
 const expert_io = @import("../../../sdk/weights/streamed/sdk_ext.zig").expert.io;
 const expert_stream = @import("../../../sdk/weights/streamed/expert/stream.zig");
 const expert_admission = @import("../../../sdk/weights/streamed/expert/admission.zig");
 const expert_policy = @import("../../../sdk/weights/streamed/sdk_ext.zig").expert.policy;
 const dspark_head = @import("dspark_head.zig");
-const prefill_timers = @import("prefill_timers.zig");
+const prefill_timers = @import("../../../sdk/weights/streamed/profile/prefill_timers.zig");
 
 /// The receipt's `decode_binding`: which loop drove the cell.
 pub const DecodeBinding = enum { stand_in, dspark };

@@ -844,7 +844,7 @@ pub fn compareBits(comptime T: type, a: std.mem.Allocator, actual: Array, expect
     defer a.free(right);
     const raw_left = if (T == u32) mlx.mlx_array_data_uint32(actual) else mlx.mlx_array_data_bfloat16(actual);
     const raw_right = if (T == u32) mlx.mlx_array_data_uint32(expected) else mlx.mlx_array_data_bfloat16(expected);
-    const copy = @import("../../deepseek_v41/stream/ops.zig").copyStrided;
+    const copy = @import("../../../sdk/weights/streamed/ops.zig").copyStrided;
     const rank = mlx.getShape(actual).len;
     copy(T, T, raw_left orelse return error.MimoKVFixtureData, mlx.getShape(actual), mlx.mlx_array_strides(actual)[0..rank], left);
     copy(T, T, raw_right orelse return error.MimoKVFixtureData, mlx.getShape(expected), mlx.mlx_array_strides(expected)[0..rank], right);

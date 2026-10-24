@@ -59,8 +59,8 @@ pub const arch = @import("plugins/deepseek_v41/stream/plugin.zig");
 /// (the conformance suite's list; the host's glue binds each arch by its own entry: the root's, `mimo` and `glm`).
 pub const archs = .{ @import("plugins/deepseek_v41/stream/plugin.zig"), @import("plugins/glm_moe_dsa/stream/plugin.zig") };
 pub const sdk = @import("sdk");
-/// DeepSeek-V4.1's routed experts streamed for the resident trunk (`sdk/weights/streamed.zig` `Streamed`).
-pub const dsv41_streamed = @import("plugins/deepseek_v41/stream/streamed.zig");
+/// The expert bank source a resident trunk streams its routed experts from (`sdk/weights/streamed.zig` `Streamed`).
+pub const bank_source = @import("sdk/weights/streamed/bank_source.zig");
 /// The streamed halves of the dupes parity harnesses (test builds only): each arch's trunk over a pack, for the main
 /// test module's `plugins/<model>/stream/dupes_test.zig` to compare against the resident arch.
 pub const dupes = if (@import("builtin").is_test) struct {

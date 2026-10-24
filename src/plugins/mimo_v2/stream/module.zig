@@ -22,8 +22,8 @@ const kv_storage = @import("kv.zig");
 const profile = @import("profile.zig");
 const draft = @import("draft.zig");
 /// The plugin's draw for every row handed to the host (`sdk_ext.sampler`): bound per request by `draft_lane.arm`.
-pub const Sampler = @import("../../../sdk/weights/streamed/sdk_ext.zig").sampler.SamplerOf(@import("../../deepseek_v41/stream/ops.zig").MlxOps);
-const dt = @import("../../deepseek_v41/stream/decode_timers.zig");
+pub const Sampler = @import("../../../sdk/weights/streamed/sdk_ext.zig").sampler.SamplerOf(@import("../../../sdk/weights/streamed/ops.zig").MlxOps);
+const dt = @import("../../../sdk/weights/streamed/profile/decode_timers.zig");
 const expert_policy = @import("../../../sdk/weights/streamed/sdk_ext.zig").expert.policy;
 const route_trace = @import("route_trace.zig");
 const mtp_profile = @import("mtp_profile.zig");
@@ -1610,7 +1610,7 @@ fn readIds(ids: Array, out: []u32) []const u32 {
     const data = mlx.mlx_array_data_uint32(ids).?;
     const nd = mlx.mlx_array_ndim(ids);
     // The top-k ids are a strided view of the partition: read through its strides (as `checkRouting` does).
-    @import("../../deepseek_v41/stream/ops.zig").copyStrided(u32, u32, data, mlx.getShape(ids), mlx.mlx_array_strides(ids)[0..nd], out);
+    @import("../../../sdk/weights/streamed/ops.zig").copyStrided(u32, u32, data, mlx.getShape(ids), mlx.mlx_array_strides(ids)[0..nd], out);
     return out;
 }
 
@@ -2250,7 +2250,7 @@ fn runCompleteLayer(a: std.mem.Allocator, layer: *const Layer, source: *source_m
             const raw = mlx.mlx_array_data_float32(f) orelse return error.MimoNumericalData;
             const logical = try a.alloc(f32, expected.len);
             defer a.free(logical);
-            @import("../../deepseek_v41/stream/ops.zig").copyStrided(f32, f32, raw, mlx.getShape(f), mlx.mlx_array_strides(f)[0..2], logical);
+            @import("../../../sdk/weights/streamed/ops.zig").copyStrided(f32, f32, raw, mlx.getShape(f), mlx.mlx_array_strides(f)[0..2], logical);
             for (logical, expected) |got, want| {
                 max_abs = @max(max_abs, @abs(got - want));
                 try expectNear(got, want, tolerance);
@@ -2318,7 +2318,7 @@ fn runRealShapeHead(a: std.mem.Allocator, s: Stream) !void {
         const raw = mlx.mlx_array_data_float32(f) orelse return error.MimoNumericalData;
         const logical = try a.alloc(f32, vocab);
         defer a.free(logical);
-        @import("../../deepseek_v41/stream/ops.zig").copyStrided(f32, f32, raw, mlx.getShape(f), mlx.mlx_array_strides(f)[0..2], logical);
+        @import("../../../sdk/weights/streamed/ops.zig").copyStrided(f32, f32, raw, mlx.getShape(f), mlx.mlx_array_strides(f)[0..2], logical);
         for (logical, 0..) |got, row| try expectNear(got, bf16Round(input[fixtureColumn(row, hidden, spec.shift)] * spec.coefficient), 0);
     }
     try head_peak.finish("head_Q4_4096x152576_rows1_exact_CPU_sparse", 0, s);
@@ -2336,7 +2336,7 @@ fn runRealShapeHead(a: std.mem.Allocator, s: Stream) !void {
         const raw = mlx.mlx_array_data_float32(f) orelse return error.MimoNumericalData;
         const logical = try a.alloc(f32, ids.len * hidden);
         defer a.free(logical);
-        @import("../../deepseek_v41/stream/ops.zig").copyStrided(f32, f32, raw, mlx.getShape(f), mlx.mlx_array_strides(f)[0..2], logical);
+        @import("../../../sdk/weights/streamed/ops.zig").copyStrided(f32, f32, raw, mlx.getShape(f), mlx.mlx_array_strides(f)[0..2], logical);
         for (logical, 0..) |got, i| {
             const col = fixtureColumn(ids[i / hidden], hidden, spec.shift);
             try expectNear(got, if (i % hidden == col) spec.coefficient else 0, 0);
@@ -2507,7 +2507,7 @@ fn compareArrays(a: std.mem.Allocator, left: Array, right: Array, tolerance: f32
     defer a.free(lh);
     const rh = try a.alloc(f32, n);
     defer a.free(rh);
-    const copy = @import("../../deepseek_v41/stream/ops.zig").copyStrided;
+    const copy = @import("../../../sdk/weights/streamed/ops.zig").copyStrided;
     const rank = mlx.getShape(l).len;
     copy(f32, f32, mlx.mlx_array_data_float32(l).?, mlx.getShape(l), mlx.mlx_array_strides(l)[0..rank], lh);
     copy(f32, f32, mlx.mlx_array_data_float32(r).?, mlx.getShape(r), mlx.mlx_array_strides(r)[0..rank], rh);
@@ -2592,7 +2592,7 @@ fn checkRouting(s: Stream) !void {
     // remains four. Read it exactly as the production source's hostU32 does.
     var ids: [4]u32 = undefined;
     var scores: [4]f32 = undefined;
-    const copyStrided = @import("../../deepseek_v41/stream/ops.zig").copyStrided;
+    const copyStrided = @import("../../../sdk/weights/streamed/ops.zig").copyStrided;
     copyStrided(u32, u32, ids_data, mlx.getShape(result.ids), mlx.mlx_array_strides(result.ids)[0..2], &ids);
     copyStrided(f32, f32, score_data, mlx.getShape(result.scores), mlx.mlx_array_strides(result.scores)[0..2], &scores);
     for (0..2) |r| {
@@ -3179,7 +3179,7 @@ fn historyCompare(a: std.mem.Allocator, mode: mimo.Attention, which: []const u8,
     defer a.free(left);
     const right = try a.alloc(u16, count);
     defer a.free(right);
-    const copy = @import("../../deepseek_v41/stream/ops.zig").copyStrided;
+    const copy = @import("../../../sdk/weights/streamed/ops.zig").copyStrided;
     copy(u16, u16, mlx.mlx_array_data_bfloat16(actual) orelse return error.MimoKVFixtureData, shape, mlx.mlx_array_strides(actual)[0..4], left);
     copy(u16, u16, mlx.mlx_array_data_bfloat16(expected) orelse return error.MimoKVFixtureData, shape, mlx.mlx_array_strides(expected)[0..4], right);
     if (std.mem.eql(u16, left, right)) return;
@@ -3553,7 +3553,7 @@ test "mimo read-ahead MLX: predictor ids equal the router's on a synthetic layer
         defer routes.deinit();
         try mlx.check(mlx.mlx_array_eval(routes.ids));
         const nd = mlx.mlx_array_ndim(routes.ids);
-        @import("../../deepseek_v41/stream/ops.zig").copyStrided(u32, u32, mlx.mlx_array_data_uint32(routes.ids).?, mlx.getShape(routes.ids), mlx.mlx_array_strides(routes.ids)[0..nd], want[lo..hi]);
+        @import("../../../sdk/weights/streamed/ops.zig").copyStrided(u32, u32, mlx.mlx_array_data_uint32(routes.ids).?, mlx.getShape(routes.ids), mlx.mlx_array_strides(routes.ids)[0..nd], want[lo..hi]);
         start = end;
     }
     try std.testing.expectEqualSlices(u32, want, predicted);

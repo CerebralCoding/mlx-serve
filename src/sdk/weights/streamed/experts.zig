@@ -25,22 +25,21 @@
 const std = @import("std");
 const env = @import("mlx_host").env;
 const mlx = @import("sdk").mlx;
-const v41 = @import("deepseek_v41.zig");
 const ops = @import("ops.zig");
-const expert_bank = @import("../../../sdk/weights/streamed/expert/bank.zig");
+const expert_bank = @import("expert/bank.zig");
 const expert_io = sdk_ext.expert.io;
-const expert_policy = @import("../../../sdk/weights/streamed/sdk_ext.zig").expert.policy;
-const expert_stream = @import("../../../sdk/weights/streamed/expert/stream.zig");
-const expert_lookahead = @import("../../../sdk/weights/streamed/expert/lookahead.zig");
+const expert_policy = @import("sdk_ext.zig").expert.policy;
+const expert_stream = @import("expert/stream.zig");
+const expert_lookahead = @import("expert/lookahead.zig");
 const expert_event = sdk_ext.expert.event;
-const xk = @import("../../../sdk/quant/exl3/stream/kernels.zig");
-const sdk_ext = @import("../../../sdk/weights/streamed/sdk_ext.zig");
-const quant = @import("../../../sdk/weights/streamed/sdk_ext.zig").quant;
-const dt = @import("decode_timers.zig");
-const timeline = @import("verify_timeline.zig");
-const first_cycle = @import("decode_first.zig");
-const prof = @import("prefill_timers.zig");
-const xq = @import("../../../sdk/quant/exl3/stream/quant.zig");
+const xk = @import("../../quant/exl3/stream/kernels.zig");
+const sdk_ext = @import("sdk_ext.zig");
+const quant = @import("sdk_ext.zig").quant;
+const dt = @import("profile/decode_timers.zig");
+const timeline = @import("profile/verify_timeline.zig");
+const first_cycle = @import("profile/decode_first.zig");
+const prof = @import("profile/prefill_timers.zig");
+const xq = @import("../../quant/exl3/stream/quant.zig");
 
 pub const max_route_ids = expert_policy.max_route_ids;
 /// The widest decode / verify forward (the RC routes' and the verify block's rows): at most
@@ -443,7 +442,7 @@ pub fn EagerChain(comptime G: type, comptime Gemv: type) type {
         gemv: Gemv,
         swiglu_limit: f64,
 
-        pub fn init(gemv: Gemv, c: *const v41.Config) Self {
+        pub fn init(gemv: Gemv, c: anytype) Self {
             return .{ .gemv = gemv, .swiglu_limit = c.swiglu_limit };
         }
 
@@ -498,7 +497,7 @@ pub fn QuantMath(comptime G: type, comptime Q: type) type {
         pub const max_decode_rows: u32 = Q.max_decode_rows;
         q: *Q,
 
-        pub fn init(q: *Q, _: *const v41.Config) Self {
+        pub fn init(q: *Q, _: anytype) Self {
             return .{ .q = q };
         }
 
@@ -2165,14 +2164,10 @@ fn opsBetween(g: *const TraceOps, log: []const FakeSource.Event, first: usize, o
     };
 }
 
-fn testConfig(hidden: u32, inter: u32, n_layers: u8) v41.Config {
-    var c: v41.Config = undefined;
-    c.hidden_size = hidden;
-    c.moe_intermediate_size = inter;
-    c.n_layers = n_layers;
-    c.n_experts_per_tok = 6;
-    c.swiglu_limit = 10.0;
-    return c;
+const TestConfig = struct { hidden_size: u32, moe_intermediate_size: u32, n_layers: u32, n_experts_per_tok: u32 = 6, swiglu_limit: f64 = 10.0, n_routed_experts: u32 = undefined };
+
+fn testConfig(hidden: u32, inter: u32, n_layers: u8) TestConfig {
+    return .{ .hidden_size = hidden, .moe_intermediate_size = inter, .n_layers = n_layers };
 }
 
 test "dsv41 experts: the fake and the stream adapter are expert sources" {
@@ -2880,7 +2875,7 @@ test "dsv41 experts: a wide call runs the DIG-X prefill route with the lane samp
             calls: []const struct { name: []const u8, a_rows: u32, route: struct { seed: u64, slots: []const u32, counts: []const u32 }, events: []const []const u8 },
         },
     };
-    const parsed = try std.json.parseFromSlice(Sample, a, @embedFile("../../../sdk/weights/streamed/fixtures/dsv41_prefill_wave_samples.json"), .{ .ignore_unknown_fields = true });
+    const parsed = try std.json.parseFromSlice(Sample, a, @embedFile("fixtures/dsv41_prefill_wave_samples.json"), .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     const tier = for (parsed.value.cases) |cs| {
         if (std.mem.eql(u8, cs.case, "tier")) break cs;
@@ -3040,7 +3035,7 @@ test "dsv41 experts: the stream adapter hands the hook every routed record's row
 test "dsv41 experts: the recorded trace's 3,600 decode calls run through the hook as the Python bank serves them" {
     const path = std.mem.span(env.get(.DSV41_PHASE1_ROUTE_FIXTURE) orelse return error.SkipZigTest);
     const a = testing.allocator;
-    const FixPlan = @import("../../../sdk/weights/streamed/expert/policy_test.zig").FixPlan;
+    const FixPlan = @import("expert/policy_test.zig").FixPlan;
     const Fixture = struct {
         layers: u32,
         experts: u32,
@@ -3064,7 +3059,7 @@ test "dsv41 experts: the recorded trace's 3,600 decode calls run through the hoo
         try src.seedPrefill(@intCast(l), f.resident0[l]);
         for (f.seed_plans[l]) |want| {
             const call = try src.route(@intCast(l), want.ids, &.{});
-            try @import("../../../sdk/weights/streamed/expert/policy_test.zig").expectPlan(&call.plan, want);
+            try @import("expert/policy_test.zig").expectPlan(&call.plan, want);
             src.release(call);
         }
     }
@@ -3106,7 +3101,7 @@ test "dsv41 experts: the recorded trace's 3,600 decode calls run through the hoo
         const call = for (&src.calls) |*cl| {
             if (cl.state == .released) break cl;
         } else unreachable;
-        @import("../../../sdk/weights/streamed/expert/policy_test.zig").expectPlan(&call.plan, want) catch |e| {
+        @import("expert/policy_test.zig").expectPlan(&call.plan, want) catch |e| {
             std.debug.print("route {d} (cycle {d}, layer {d}) differs\n", .{ i, i / f.layers, l });
             return e;
         };
@@ -4792,7 +4787,7 @@ fn resolvePlan(rows: []const u32, src: []const u8, off: []const u32, s: i32, row
 
 test "dsv41 experts: JOINLESS's merge at L1's counts: the 28 smallest of 51 outputs share one source, every assignment keeps its row" {
     const a = testing.allocator;
-    try testing.expectEqual(@as(usize, @import("kernel_routes.zig").JoinlessCombine(TraceOps).sources), joinless_sources);
+    try testing.expectEqual(@as(usize, @import("../../quant/exl3/stream/kernel_routes.zig").JoinlessCombine(TraceOps).sources), joinless_sources);
     // L1's layer at 16,384 tokens, modeled: 98,304 routed rows in 51 outputs (the deferred base call's 17
     // waves, then six transient calls' 34, each call's last wave ragged).
     const rows = [51]u32{
@@ -5003,7 +4998,7 @@ test "dsv41 smoke 0b: joinless merge: the combine over the minimal copy's source
         return error.TestUnexpectedResult;
     });
     const ks = sdk_ext.kernels.KernelSet(xk);
-    const dkr = @import("kernel_routes.zig");
+    const dkr = @import("../../quant/exl3/stream/kernel_routes.zig");
     const G = ops.MlxOps;
     const T = G.T;
     const a = testing.allocator;

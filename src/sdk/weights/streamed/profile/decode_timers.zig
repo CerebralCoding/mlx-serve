@@ -4,10 +4,12 @@
 //! to nothing (the timed path carries no timer, branch or counter).
 
 const std = @import("std");
-const bo = @import("../../../sdk/weights/streamed/build_flags.zig");
-const sdk_ext = @import("../../../sdk/weights/streamed/sdk_ext.zig");
+const bo = @import("../build_flags.zig");
+const sdk_ext = @import("../sdk_ext.zig");
 
 pub const enabled: bool = if (@hasDecl(bo, "dsv41_decode_timers")) bo.dsv41_decode_timers else false;
+/// Routed layers a per-layer profile row holds.
+pub const max_layers = 64;
 
 /// Where a cycle's host time goes. The verify forward's own share (`verify`) holds the routed calls'
 /// `barrier`, `route` and `read_wait`; the rest of it is the forward's encode (graph builds, wave

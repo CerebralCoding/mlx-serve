@@ -1340,7 +1340,7 @@ const X19Layer = struct {
 test "mimo GPU glue X19: router_rows vs router1 and MLX's M = 1 product bit for bit, M-invariant at M = 1..8 (random and the release's 47 routers); the BF16 predictor bit-equal to the F32 predictor at M = 1; rates and device times vs the F32 GEMM and gather_mv" {
     const module = @import("module.zig");
     const math_mod = @import("math.zig");
-    const ops = @import("../../deepseek_v41/stream/ops.zig");
+    const ops = @import("../../../sdk/weights/streamed/ops.zig");
     const enabled = env.get(.MIMO_GLUE_GPU) orelse return error.SkipZigTest;
     if (!std.mem.eql(u8, std.mem.span(enabled), "1")) return error.SkipZigTest;
     const guard = env.get(._GPU_WINDOW_LOCKED) orelse return error.GpuLockRequired;

@@ -1,7 +1,7 @@
 //! The streamed weight source: routed experts read from an SSD bank (`experts.bin` + `expert-manifest.json`) into slot
 //! rows, for a trunk whose MoE reads them through `Routed`. The streamer is mlx-stream's (`streamed/expert/`,
-//! `streamed/sdk_ext/expert/`, the read pool in `streamed/csrc/`; module `mlx_stream`). Banks: the MXFP4 record bank
-//! (MiMo's and DeepSeek-V4.1's experts) and DeepSeek-V4.1's EXL3 repack (`plugins/deepseek_v41/stream/streamed.zig`).
+//! `streamed/sdk_ext/expert/`, the read pool in `streamed/csrc/`; module `mlx_stream`). Bank: the MXFP4 record bank
+//! (`streamed/bank_source.zig`; MiMo's and DeepSeek-V4.1's experts).
 //! Without mlx-stream, or without a bank, opening refuses by name.
 
 const std = @import("std");
@@ -25,7 +25,7 @@ pub const Streamed = struct {
         rows: ?[]const u32 = null,
     };
 
-    const Source = if (build_options.mlx_stream) plugin.dsv41_streamed.Source else void;
+    const Source = if (build_options.mlx_stream) plugin.bank_source.Source else void;
 
     src: Source,
 
@@ -43,8 +43,7 @@ pub const Streamed = struct {
 
     pub fn routedSource(self: *Streamed) Routed {
         if (comptime !build_options.mlx_stream) unreachable;
-        const Mxfp4 = plugin.dsv41_streamed.Mxfp4;
-        const Exl3 = plugin.dsv41_streamed.Exl3;
+        const Mxfp4 = plugin.bank_source.Mxfp4;
         const C = struct {
             fn fetch(ctx: *anyopaque, layer: u32, ids: []const u16) anyerror!Fetched {
                 const src: *Mxfp4 = @ptrCast(@alignCast(ctx));
@@ -55,22 +54,13 @@ pub const Streamed = struct {
                 };
                 return .{ .kind = f.kind, .row = f.row, .banks = banks };
             }
-            fn rows(ctx: *anyopaque, layer: u32, x: mlx.mlx_array, idx: mlx.mlx_array, wts: mlx.mlx_array) anyerror!mlx.mlx_array {
-                const src: *Exl3 = @ptrCast(@alignCast(ctx));
-                return src.rows(layer, x, idx, wts);
-            }
-            fn settle(comptime S: type) fn (*anyopaque) anyerror!void {
-                return struct {
-                    fn f(ctx: *anyopaque) anyerror!void {
-                        const src: *S = @ptrCast(@alignCast(ctx));
-                        return src.settle();
-                    }
-                }.f;
+            fn settle(ctx: *anyopaque) anyerror!void {
+                const src: *Mxfp4 = @ptrCast(@alignCast(ctx));
+                return src.settle();
             }
         };
         return switch (self.src) {
-            .mxfp4 => |x| .{ .ctx = x, .math = .{ .trunk = C.fetch }, .settle_fn = C.settle(Mxfp4) },
-            .exl3 => |x| .{ .ctx = x, .math = .{ .source = C.rows }, .settle_fn = C.settle(Exl3) },
+            .mxfp4 => |x| .{ .ctx = x, .math = .{ .trunk = C.fetch }, .settle_fn = C.settle },
         };
     }
 };
