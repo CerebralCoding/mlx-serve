@@ -18,6 +18,8 @@ const row_exact = @import("../../sdk/bases/blocks/row_exact.zig");
 const naxAvailable = @import("../../mlx/device.zig").naxAvailable;
 const qmm_int8 = @import("../../sdk/blocks/qmm/qmm_int8.zig");
 const rht = @import("../../sdk/quant/hadamard/rht.zig");
+const rope_scaling = @import("../../sdk/config/rope_scaling.zig");
+const scaled = @import("../../sdk/blocks/rope/scaled.zig");
 const lane_qmm = @import("../../sdk/blocks/qmm/lane_qmm.zig");
 const log = @import("../../sdk/util/log.zig");
 const prism_seam = @import("../prism_hadamard_qwen35/seam.zig");
@@ -121,6 +123,9 @@ pub const Loaded = struct {
     rht: ?*rht.Registry = null,
     /// The MTP head (`SpecHooks.head`), loaded on the engine's request.
     head: ?mtp.Head = null,
+    /// The scaled rope's spectrum and YaRN's `[head_dim]` factor (null = none), owned.
+    rope_freqs: Array = .{ .ctx = null },
+    rope_mscale: Array = .{ .ctx = null },
 
     fn release(m: *Loaded) void {
         lane_qmm.release(@intFromPtr(m));
@@ -198,6 +203,16 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
         }
     }
     try gdn.consts(&m.geo, act, s);
+    scaled.logScaling(if (c.next) "qwen3_next" else "qwen3_5", c.rope);
+    if (try scaled.freqs(c.rope, c.ropeDims(), c.rope_theta)) |f| {
+        m.rope_freqs = f;
+        try m.owned.own(f);
+    }
+    const ms: f32 = @floatCast(rope_scaling.mscale(c.rope));
+    if (ms != 1.0) {
+        m.rope_mscale = try scaled.mscaleTable(ms, c.ropeDims(), c.head_dim, act, s);
+        try m.owned.own(m.rope_mscale);
+    }
     // The engine compiles its chains only where a GPU runs them.
     const gpu = !mlx.noGpuBackend() and mlx.streamIsGpu(s);
     if (gpu) m.geo.gate_fn = gdn.compileGate(m.geo.state, s);
@@ -468,6 +483,11 @@ fn attnLayer(m: *Loaded, r: *ld.Reader, c: *const config.Config, i: u32, s: mlx.
             .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(c.query_pre_attn_scalar))),
             .rope_dims = @intCast(c.ropeDims()),
             .rope_base = c.rope_theta,
+            .yarn_freqs = m.rope_freqs,
+            .yarn_mscale = m.rope_mscale,
+            .yarn_factor = @floatCast(rope_scaling.mscale(c.rope)),
+            .rope_scale = rope_scaling.positionScale(c.rope),
+            .ntk = rope_scaling.ntk(c.rope, c.max_position_embeddings),
         },
         .angles = &m.angles,
     };
@@ -594,7 +614,7 @@ fn headLoad(mp: *anyopaque, ctx: *const abi.LoadCtx) callconv(.c) Verdict {
         .none => return Verdict.refuse(.failed, "qwen3_5: not loaded"),
         inline .dense, .moe, .prism => |*d| &d.base.weights.embed.table,
     };
-    m.head = mtp.load(config.of(ctx.parsed), embed, ctx.model_dir.slice(), .{ .ctx = ctx.stream.ctx }) catch |e| return ld.failed(e);
+    m.head = mtp.load(config.of(ctx.parsed), embed, .{ .freqs = m.rope_freqs, .mscale = m.rope_mscale }, ctx.model_dir.slice(), .{ .ctx = ctx.stream.ctx }) catch |e| return ld.failed(e);
     return .ok;
 }
 

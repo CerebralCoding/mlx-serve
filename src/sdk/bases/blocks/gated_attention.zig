@@ -26,6 +26,7 @@ const qk_norm_rope = @import("../../blocks/rope/qk_norm_rope.zig");
 const residual_norm = @import("../../blocks/norms/residual_norm.zig");
 const decode_fused = @import("../../blocks/gdn/decode_fused.zig");
 const DenseKVView = @import("../../blocks/attention/kv_view.zig").DenseKVView;
+const rope_scaling = @import("../../config/rope_scaling.zig");
 
 const Array = ops.Array;
 const Graph = ops.Graph;
@@ -61,11 +62,15 @@ pub const Geo = struct {
     scale: f32,
     rope_dims: c_int,
     rope_base: f32,
-    /// YaRN: the scaled spectrum (in place of `rope_base`), the `[head_dim]` mscale table in the activation dtype and
-    /// its attention factor; null `yarn_freqs` = plain RoPE.
+    /// A scaled spectrum (in place of `rope_base`: YaRN, llama3), YaRN's `[head_dim]` mscale table in the activation
+    /// dtype (null = none) and its attention factor; null `yarn_freqs` = plain RoPE.
     yarn_freqs: Array = .{ .ctx = null },
     yarn_mscale: Array = .{ .ctx = null },
     yarn_factor: f32 = 1.0,
+    /// The scale on positions (a linear scaling's `1 / factor`).
+    rope_scale: f32 = 1.0,
+    /// Dynamic NTK: past the window the base grows with the sequence; null = the static base.
+    ntk: ?rope_scaling.Ntk = null,
     /// The q projection carries a per-head sigmoid output gate beside each head (`attn_output_gate`).
     output_gate: bool = true,
 
@@ -74,6 +79,12 @@ pub const Geo = struct {
     }
     fn base(geo: *const Geo) mlx.mlx_optional_float {
         return .{ .value = geo.rope_base, .has_value = !geo.yarn() };
+    }
+    /// `base`, dynamic NTK's for a forward reaching `seq` positions.
+    fn baseAt(geo: *const Geo, seq: c_int) mlx.mlx_optional_float {
+        var b = geo.base();
+        if (geo.ntk) |n| b.value = @floatCast(n.base(geo.rope_base, @intCast(geo.rope_dims), @intCast(seq)));
+        return b;
     }
 };
 
@@ -161,10 +172,10 @@ fn mix(w: *const GatedAttention.Weights, c: *Ctx, x: Array) !Array {
     const off: c_int = @intCast(c.offset());
     var q_rope: ?Array = null;
     var k_rope: Array = undefined;
-    const fusable = b == 1 and c.mrope == null and w.q_norm.ctx != null and w.k_norm.ctx != null and qk_norm_rope.qkNormRopeFusedEnabled();
+    const fusable = b == 1 and c.mrope == null and geo.ntk == null and w.q_norm.ctx != null and w.k_norm.ctx != null and qk_norm_rope.qkNormRopeFusedEnabled();
     if (fusable and s == 1 and hd == 128) blk: {
-        const ang = qk_rope.angles(c, w.angles, family, rd, geo.base(), geo.yarn_freqs, off, 1, 1.0, 1.0) catch break :blk;
-        const ms: ?Array = if (geo.yarn()) geo.yarn_mscale else null;
+        const ang = qk_rope.angles(c, w.angles, family, rd, geo.base(), geo.yarn_freqs, off, 1, 1.0, geo.rope_scale) catch break :blk;
+        const ms: ?Array = if (geo.yarn_mscale.ctx != null) geo.yarn_mscale else null;
         const pair = (qk_norm_rope.fusedQkNormRope(g.s, queries, k_r, w.q_norm, w.k_norm, ang, ms, c.shared.eps_arr, h, kvh, rd) catch null) orelse break :blk;
         q_rope = g.adopt(pair[0]) catch |e| {
             _ = mlx.mlx_array_free(pair[1]);
@@ -176,7 +187,7 @@ fn mix(w: *const GatedAttention.Weights, c: *Ctx, x: Array) !Array {
     // slot's position + its depth.
     if (q_rope == null and fusable and hd == 256 and s <= 32) blk: {
         const tree_rows: ?c_int = if (c.tree) |t| t.attn.max_depth + 1 else null;
-        var ang = qk_rope.angles(c, w.angles, family, rd, geo.base(), geo.yarn_freqs, off, tree_rows orelse s, mscale, 1.0) catch break :blk;
+        var ang = qk_rope.angles(c, w.angles, family, rd, geo.base(), geo.yarn_freqs, off, tree_rows orelse s, mscale, geo.rope_scale) catch break :blk;
         if (c.tree) |t| ang = try g.reshape(try g.take(try g.reshape(ang, &.{ tree_rows.?, rd }), t.attn.depth, 0), &.{s * rd});
         const none = Array{ .ctx = null };
         const r = (try qk_rope.fused256(g, queries, k_r, none, w.q_norm, w.k_norm, none, ang, c.shared.eps_arr, h, kvh, s, rd)) orelse break :blk;
@@ -195,25 +206,27 @@ fn mix(w: *const GatedAttention.Weights, c: *Ctx, x: Array) !Array {
             var off_buf: [slot_reads.MAX_SLOTS]i32 = undefined;
             for (c.positions, 0..) |p, i| off_buf[i] = @intCast(p);
             const offsets = try g.fromSlice(i32, off_buf[0..c.positions.len], &.{b});
-            q_rope = try g.call(mlx.mlx_fast_rope_dynamic, .{ q_t, rd, false, geo.base(), 1.0, offsets, geo.yarn_freqs });
-            k_rope = try g.call(mlx.mlx_fast_rope_dynamic, .{ k_t, rd, false, geo.base(), 1.0, offsets, geo.yarn_freqs });
-            if (geo.yarn()) {
+            q_rope = try g.call(mlx.mlx_fast_rope_dynamic, .{ q_t, rd, false, geo.base(), geo.rope_scale, offsets, geo.yarn_freqs });
+            k_rope = try g.call(mlx.mlx_fast_rope_dynamic, .{ k_t, rd, false, geo.base(), geo.rope_scale, offsets, geo.yarn_freqs });
+            if (geo.yarn_mscale.ctx != null) {
                 q_rope = try g.mul(q_rope.?, geo.yarn_mscale);
                 k_rope = try g.mul(k_rope, geo.yarn_mscale);
             }
         } else {
-            q_rope = try g.call(mlx.mlx_fast_rope, .{ q_t, rd, false, geo.base(), 1.0, off, geo.yarn_freqs });
-            k_rope = try g.call(mlx.mlx_fast_rope, .{ k_t, rd, false, geo.base(), 1.0, off, geo.yarn_freqs });
-            if (geo.yarn()) {
-                q_rope = try g.mul(q_rope.?, geo.yarn_mscale);
-                k_rope = try g.mul(k_rope, geo.yarn_mscale);
-            }
+            q_rope = try ropeAt(g, q_t, geo, off);
+            k_rope = try ropeAt(g, k_t, geo, off);
         }
     }
     const q = q_rope.?;
 
     const out = if (is_batched) try batchedRead(c, q, k_rope, v_t, s, geo.scale) else try soloRead(c, q, k_rope, v_t, s, geo.scale);
     return tail(w, c.row_exact, g, out, gate, b, s, decode_shape);
+}
+
+/// `x` `[B, H, S, D]` roped from `off` (dynamic NTK's base for the positions it reaches), YaRN's factor after.
+pub fn ropeAt(g: *Graph, x: Array, geo: *const Geo, off: c_int) !Array {
+    const r = try g.call(mlx.mlx_fast_rope, .{ x, geo.rope_dims, false, geo.baseAt(off + ops.shape(x)[2]), geo.rope_scale, off, geo.yarn_freqs });
+    return if (geo.yarn_mscale.ctx != null) g.mul(r, geo.yarn_mscale) else r;
 }
 
 fn soloRead(c: *Ctx, q: Array, k: Array, v: Array, s: c_int, scale: f32) !Array {

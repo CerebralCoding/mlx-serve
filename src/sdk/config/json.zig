@@ -14,6 +14,15 @@ pub fn field(o: Object, key: []const u8) ?Value {
     return if (v == .null) null else v;
 }
 
+/// `layer_types` naming only full attention (transformers v5 writes it for every model) is the every-layer full
+/// attention a dense decoder serves; absent too.
+pub fn allFullAttention(cfg: Object) bool {
+    const lt = field(cfg, "layer_types") orelse return true;
+    if (lt != .array) return false;
+    for (lt.array.items) |item| if (item != .string or !std.mem.eql(u8, item.string, "full_attention")) return false;
+    return true;
+}
+
 pub fn int(v: ?Value) ?u32 {
     const x = v orelse return null;
     if (x != .integer) return null;

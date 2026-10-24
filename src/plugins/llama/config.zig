@@ -7,6 +7,8 @@ const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 const generation = @import("../../sdk/config/generation.zig");
 const quant_config = @import("../../sdk/config/quantization_config.zig");
+const rope_scaling = @import("../../sdk/config/rope_scaling.zig");
+const json_read = @import("../../sdk/config/json.zig");
 
 pub const plugin = @import("../../sdk/plugin.zig").Plugin{
     .name = "llama",
@@ -32,14 +34,6 @@ pub const family: Family = .{ .name = "llama", .model_types = &model_types };
 /// Every layer's blocks serve batched rows (`plugin.zig` checks it against the base).
 pub const batches_decode = true;
 
-/// Llama 3.x `rope_type: "llama3"` (HF `_compute_llama3_parameters`).
-pub const Llama3 = struct {
-    factor: f64,
-    low_freq_factor: f64 = 1.0,
-    high_freq_factor: f64 = 4.0,
-    original_max_position_embeddings: f64 = 8192.0,
-};
-
 /// The fields the forward and the load read.
 pub const Config = struct {
     vocab_size: u32,
@@ -51,7 +45,9 @@ pub const Config = struct {
     head_dim: u32,
     rms_norm_eps: f32,
     rope_theta: f32,
-    llama3: ?Llama3 = null,
+    /// The `rope_scaling` block (mlx-lm's `initialize_rope`).
+    rope: rope_scaling.Scaling = .none,
+    max_position_embeddings: u32 = 0,
     tie_word_embeddings: bool = false,
     /// Channel groups each residual-width RMS norm normalizes apart; 1 = a plain norm.
     norm_groups: u32 = 1,
@@ -94,29 +90,6 @@ pub fn float(v: ?std.json.Value) ?f64 {
     return if (std.math.isFinite(f)) f else null;
 }
 
-/// The llama3 schedule of `rope_scaling` (or v5's `rope_parameters`); `error.Unsupported` for any other scaling.
-fn ropeScaling(cfg: std.json.ObjectMap) error{Unsupported}!?Llama3 {
-    const rs = field(cfg, "rope_scaling") orelse field(cfg, "rope_parameters") orelse return null;
-    if (rs != .object) return error.Unsupported;
-    // The engine reads a block that names no schedule as the plain rope.
-    const t = field(rs.object, "rope_type") orelse field(rs.object, "type") orelse return null;
-    if (t != .string) return error.Unsupported;
-    if (std.mem.eql(u8, t.string, "default")) {
-        if (field(rs.object, "partial_rotary_factor")) |p| if ((float(p) orelse return error.Unsupported) != 1.0) return error.Unsupported;
-        return null;
-    }
-    if (!std.mem.eql(u8, t.string, "llama3")) return error.Unsupported;
-    var r = Llama3{ .factor = float(field(rs.object, "factor")) orelse return error.Unsupported };
-    if (field(rs.object, "low_freq_factor")) |v| r.low_freq_factor = float(v) orelse return error.Unsupported;
-    if (field(rs.object, "high_freq_factor")) |v| r.high_freq_factor = float(v) orelse return error.Unsupported;
-    if (field(rs.object, "original_max_position_embeddings")) |v| r.original_max_position_embeddings = float(v) orelse return error.Unsupported;
-    if (r.factor <= 0 or r.high_freq_factor <= r.low_freq_factor) return error.Unsupported;
-    // The engine stores these as f32: read them through f32 so the schedule is the same table.
-    inline for (.{ "factor", "low_freq_factor", "high_freq_factor", "original_max_position_embeddings" }) |n|
-        @field(r, n) = @as(f32, @floatCast(@field(r, n)));
-    return r;
-}
-
 fn quantMode(name: []const u8) ?abi.QuantMode {
     inline for (.{ .affine, .nvfp4, .mxfp4, .mxfp8 }) |m| if (std.mem.eql(u8, name, @tagName(m))) return m;
     return null;
@@ -124,9 +97,10 @@ fn quantMode(name: []const u8) ?abi.QuantMode {
 
 /// Keys whose presence means a shape this plugin does not serve (another family's, or a feature the base lacks).
 const foreign_keys = [_][]const u8{
-    "layer_types",       "query_pre_attn_scalar", "vision_config",               "num_experts",
-    "num_local_experts", "pooling_mode",          "expert_quant",                "use_bidirectional_attention",
-    "modules",           "linear_num_key_heads",  "hidden_size_per_layer_input",
+    "query_pre_attn_scalar", "vision_config",               "num_experts",
+    "num_local_experts",     "pooling_mode",                "expert_quant",
+    "modules",               "use_bidirectional_attention", "linear_num_key_heads",
+    "hidden_size_per_layer_input",
 };
 
 pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.Str, span: ?*const abi.LayerSpan, stub: bool, out: *abi.Parsed) callconv(.c) abi.Verdict {
@@ -165,11 +139,12 @@ pub fn parseFamily(comptime fam: Family, dir: *const abi.PackDir, config_json: a
         if (fam.grouped_norms and std.mem.eql(u8, k, "num_experts")) continue;
         if (field(cfg, k) != null or field(root, k) != null) return unsupported("a key this plugin does not model");
     }
+    if (!json_read.allFullAttention(cfg)) return unsupported("layer_types other than full attention");
     // A sentence-transformers pooling sidecar makes the pack an embedding model.
     if (dir.has("1_Pooling/config.json")) return unsupported("an embedding pack (1_Pooling)");
 
-    const act = field(cfg, "hidden_act") orelse return unsupported("no hidden_act");
-    if (act != .string or !std.mem.eql(u8, act.string, "silu")) return unsupported("hidden_act other than silu");
+    // mlx-lm's llama MLP is SwiGLU whatever the config says; an absent `hidden_act` is HF's default, silu.
+    if (field(cfg, "hidden_act")) |act| if (act != .string or !std.mem.eql(u8, act.string, "silu")) return unsupported("hidden_act other than silu");
 
     var c: Config = .{
         .vocab_size = int(field(cfg, "vocab_size")) orelse return unsupported("vocab_size"),
@@ -196,7 +171,10 @@ pub fn parseFamily(comptime fam: Family, dir: *const abi.PackDir, config_json: a
     if (field(cfg, "rope_parameters")) |rp| if (rp == .object) if (float(field(rp.object, "rope_theta"))) |t| {
         c.rope_theta = @floatCast(t);
     };
-    c.llama3 = ropeScaling(cfg) catch return unsupported("a rope scaling other than llama3");
+    if (field(cfg, "rope_parameters")) |rp| if (rp == .object) if (field(rp.object, "partial_rotary_factor")) |v| {
+        if ((float(v) orelse return unsupported("a partial rotary factor")) != 1.0) return unsupported("a partial rotary factor");
+    };
+    c.rope = rope_scaling.parse(cfg);
     if (fam.grouped_norms) if (field(cfg, "layernorm_num_groups")) |v| if (v == .integer and v.integer > 1) {
         c.norm_groups = int(v) orelse return unsupported("layernorm_num_groups");
         if (c.hidden_size % c.norm_groups != 0) return unsupported("layernorm_num_groups");
@@ -208,7 +186,7 @@ pub fn parseFamily(comptime fam: Family, dir: *const abi.PackDir, config_json: a
         c.tie_word_embeddings = v.bool;
     };
 
-    var p: abi.Parsed = .{ .caps = .{ .batches_decode = batches_decode, .dflash_capture = true } };
+    var p: abi.Parsed = .{ .caps = .{ .batches_decode = batches_decode and c.rope != .dynamic, .dflash_capture = true } };
     const s = &p.shell;
     s.* = .{
         .vocab_size = c.vocab_size,
@@ -222,9 +200,11 @@ pub fn parseFamily(comptime fam: Family, dir: *const abi.PackDir, config_json: a
         .model_type = abi.Str.of(type_name),
     };
     readShell(cfg, root, s) catch return unsupported("a token id or the context out of range");
+    c.max_position_embeddings = @intCast(s.max_position_embeddings);
+    if (c.rope == .dynamic and c.max_position_embeddings == 0) c.rope = .unmodeled;
     c.quant = readQuant(root) catch return unsupported("the quantization block");
     s.quant = c.quant;
-    if (c.llama3 != null) p.cache.layout_namespace = abi.Str.of("llama3-rope-v1");
+    if (rope_scaling.layoutNamespace(c.rope)) |ns| p.cache.layout_namespace = abi.Str.of(ns);
     // Discovery's stub parse stops at config.json; the load's parse reads the sidecar too.
     if (!stub) generation.apply(dir, s);
 
@@ -328,7 +308,7 @@ test "llama config: a Llama 3.2 pack parses into the shell, its llama3 rope and 
     try testing.expectEqual(@as(i64, 128000), p.shell.bos);
     try testing.expectEqual(@as(u8, 4), p.shell.quant.bits);
     try testing.expectEqualStrings("llama3-rope-v1", p.cache.layout_namespace.slice());
-    try testing.expectEqual(@as(f64, 32), of(&p).llama3.?.factor);
+    try testing.expectEqual(@as(f64, 32), of(&p).rope.llama3.factor);
     try testing.expectEqualStrings("{\"bits\":4,\"group_size\":64,\"mode\":\"affine\"}", of(&p).block_json);
 }
 
@@ -336,16 +316,38 @@ test "llama config: shapes this plugin does not serve are refused unsupported, b
     inline for (.{
         "{\"model_type\":\"gemma3\"}",
         "{\"model_type\":\"llama\",\"hidden_act\":\"gelu\"}",
-        llama32[0 .. llama32.len - 1] ++ ",\"layer_types\":[]}",
+        llama32[0 .. llama32.len - 1] ++ ",\"layer_types\":[\"full_attention\",\"sliding_attention\"]}",
     }) |json| {
         var p: abi.Parsed = .{};
         const v = parseJson(json, true, &p);
         try testing.expect(v.code == .unsupported and p.private == null);
     }
-    const linear = try std.mem.replaceOwned(u8, testing.allocator, llama32, "\"rope_type\":\"llama3\"", "\"rope_type\":\"linear\"");
-    defer testing.allocator.free(linear);
-    var lp: abi.Parsed = .{};
-    try testing.expectEqual(abi.Verdict.Code.unsupported, parseJson(linear, true, &lp).code);
     var p: abi.Parsed = .{};
     try testing.expectEqual(abi.Verdict.Code.failed, parseJson("{", true, &p).code);
+}
+
+test "llama config: transformers v5's all-full layer_types is the layout served" {
+    const v5 = llama32[0 .. llama32.len - 1] ++ ",\"layer_types\":[\"full_attention\",\"full_attention\"]}";
+    var p: abi.Parsed = .{};
+    try testing.expect(parseJson(v5, true, &p).isOk());
+    defer freeParsed(&p);
+    try testing.expect(p.caps.batches_decode);
+}
+
+test "llama config: the rope scalings mlx-lm builds are served; any other block runs unscaled, as the engine served it" {
+    inline for (.{
+        .{ "\"rope_type\":\"linear\"", "scaled-rope-v1", true },
+        .{ "\"rope_type\":\"dynamic\"", "scaled-rope-v1", false },
+        .{ "\"rope_type\":\"yarn\"", "scaled-rope-v1", true },
+        .{ "\"rope_type\":\"longrope\"", "", true },
+        .{ "\"rope_type\":\"su\"", "", true },
+    }) |case| {
+        const json = try std.mem.replaceOwned(u8, testing.allocator, llama32, "\"rope_type\":\"llama3\"", case[0]);
+        defer testing.allocator.free(json);
+        var p: abi.Parsed = .{};
+        try testing.expect(parseJson(json, true, &p).isOk());
+        defer freeParsed(&p);
+        try testing.expectEqualStrings(case[1], p.cache.layout_namespace.slice());
+        try testing.expectEqual(case[2], p.caps.batches_decode);
+    }
 }

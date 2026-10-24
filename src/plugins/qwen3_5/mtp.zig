@@ -25,6 +25,7 @@ const gated_attention = @import("../../sdk/bases/blocks/gated_attention.zig");
 const Array = mlx.mlx_array;
 const Verdict = abi.Verdict;
 const MtpModel = mtp_mod.MtpModel;
+const rope_scaling = @import("../../sdk/config/rope_scaling.zig");
 const QLinear = mtp_mod.QLinear;
 
 /// The loaded head and what its forward reads of the trunk.
@@ -33,6 +34,8 @@ pub const Head = struct {
     c: *const config.Config,
     /// The trunk's embedding table (borrowed from the model).
     embed: *const ld.Linear,
+    /// The trunk's scaled rope (borrowed from the model).
+    rope: Rope,
     /// A routed-expert head's MLP over the head's own tensors (borrowed from `m`); null = dense.
     moe: ?moe_block.Moe.Weights = null,
 
@@ -57,8 +60,11 @@ pub const Head = struct {
     }
 };
 
+/// The trunk's scaled spectrum (null = the base's) and YaRN's `[head_dim]` factor (null = none).
+pub const Rope = struct { freqs: Array = .{ .ctx = null }, mscale: Array = .{ .ctx = null } };
+
 /// Loads the pack's head; `error.UnsupportedMtpHead` for a layout this port does not run.
-pub fn load(c: *const config.Config, embed: *const ld.Linear, model_dir: []const u8, s: mlx.mlx_stream) !Head {
+pub fn load(c: *const config.Config, embed: *const ld.Linear, rope_tables: Rope, model_dir: []const u8, s: mlx.mlx_stream) !Head {
     var m = try mtp_mod.loadMtp(std.Io.Threaded.global_single_threaded.io(), ld.gpa, s, model_dir);
     errdefer m.deinit();
     if (m.layout != .qwen or m.eh_proj != null) return error.UnsupportedMtpHead;
@@ -70,7 +76,7 @@ pub fn load(c: *const config.Config, embed: *const ld.Linear, model_dir: []const
         .moe => |*mw| try moeWeights(c, mw),
         else => null,
     };
-    return .{ .m = m, .c = c, .embed = embed, .moe = moe };
+    return .{ .m = m, .c = c, .embed = embed, .rope = rope_tables, .moe = moe };
 }
 
 /// One projection of the head's MoE layer, its quant solved from the weight's geometry against `in_dim`.
@@ -265,16 +271,36 @@ fn ropeDims(c: *const config.Config) c_int {
     return @intCast(c.ropeDims());
 }
 
-/// RoPE at `off`, or the per-row M-RoPE angles `mr` (cos, sin) when the rows sit inside a prompt's position table.
-fn rope(x: Array, c: *const config.Config, off: c_int, mr: ?[2]Array, s: mlx.mlx_stream) !Array {
+/// The trunk's rope base for a forward reaching `seq` positions (null under a scaled spectrum).
+fn ropeBase(h: *const Head, seq: c_int) mlx.mlx_optional_float {
+    const c = h.c;
+    if (h.rope.freqs.ctx != null) return .{ .value = 0, .has_value = false };
+    const n = rope_scaling.ntk(c.rope, c.max_position_embeddings) orelse return mlx.mlx_optional_float.some(c.rope_theta);
+    return mlx.mlx_optional_float.some(@floatCast(n.base(c.rope_theta, c.ropeDims(), @intCast(seq))));
+}
+
+/// YaRN's factor on `x`'s rotated dims (a new reference).
+fn mscaled(h: *const Head, x: Array, s: mlx.mlx_stream) !Array {
+    var out = mlx.mlx_array_new();
+    if (h.rope.mscale.ctx == null) {
+        try mlx.check(mlx.mlx_array_set(&out, x));
+    } else try mlx.check(mlx.mlx_multiply(&out, x, h.rope.mscale, s));
+    return out;
+}
+
+/// RoPE at `off` as the trunk ropes, or the per-row M-RoPE angles `mr` (cos, sin) when the rows sit inside a prompt's
+/// position table.
+fn rope(x: Array, h: *const Head, off: c_int, mr: ?[2]Array, s: mlx.mlx_stream) !Array {
+    const c = h.c;
     if (mr) |m| {
         var g = ops.Graph.init(ld.gpa, s);
         defer g.deinit();
         return g.escape(try gated_attention.applyMrope(&g, x, m[0], m[1], ropeDims(c)));
     }
     var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_fast_rope(&out, x, ropeDims(c), false, mlx.mlx_optional_float.some(c.rope_theta), 1.0, off, .{ .ctx = null }, s));
-    return out;
+    defer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_fast_rope(&out, x, ropeDims(c), false, ropeBase(h, off + mlx.getShape(x)[2]), rope_scaling.positionScale(c.rope), off, h.rope.freqs, s));
+    return mscaled(h, out, s);
 }
 
 fn transposed(x: Array, s: mlx.mlx_stream) !Array {
@@ -326,7 +352,7 @@ fn appendKvOnly(h: *const Head, kv: Kv, ids: Array, hidden: Array, off: c_int, m
     defer _ = mlx.mlx_array_free(kt);
     const vt = try transposed(vr, s);
     defer _ = mlx.mlx_array_free(vt);
-    const kro = try rope(kt, c, off, mr, s);
+    const kro = try rope(kt, h, off, mr, s);
     defer _ = mlx.mlx_array_free(kro);
     var view = try kv.append(kro, vt);
     kv.ops.release(&view);
@@ -446,9 +472,9 @@ fn forwardRows(h: *const Head, kv: Kv, ids: Array, hidden: Array, off: c_int, wa
     }
     const fr = try front(h, ids, hidden, n);
     defer fr.deinit();
-    const qro = try rope(fr.q, c, off, mr, s);
+    const qro = try rope(fr.q, h, off, mr, s);
     defer _ = mlx.mlx_array_free(qro);
-    const kro = try rope(fr.k, c, off, mr, s);
+    const kro = try rope(fr.k, h, off, mr, s);
     defer _ = mlx.mlx_array_free(kro);
     var view = try kv.append(kro, fr.v);
     defer kv.ops.release(&view);
@@ -504,7 +530,11 @@ pub fn forwardLanes(h: *const Head, f: *const abi.Forward, out: *abi.ForwardOut)
         var by_lane = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(by_lane);
         try mlx.check(mlx.mlx_transpose_axes(&by_lane, x, &[_]c_int{ 2, 1, 0, 3 }, 4, s));
-        try mlx.check(mlx.mlx_fast_rope_dynamic(o, by_lane, ropeDims(c), false, mlx.mlx_optional_float.some(c.rope_theta), 1.0, off_arr, .{ .ctx = null }, s));
+        var r = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(r);
+        try mlx.check(mlx.mlx_fast_rope_dynamic(&r, by_lane, ropeDims(c), false, ropeBase(h, 0), rope_scaling.positionScale(c.rope), off_arr, h.rope.freqs, s));
+        _ = mlx.mlx_array_free(o.*);
+        o.* = try mscaled(h, r, s);
     }
 
     const none = mlx.mlx_array_new();
