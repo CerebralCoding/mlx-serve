@@ -55,7 +55,7 @@ pub fn rowExactQmm(cfg: *const ModelConfig, x: mlx.mlx_array, w: mlx.mlx_array, 
 }
 
 pub fn projectWithConfig(cfg: *const ModelConfig, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
-    const qp = quantParamsOrDense(cfg, w, sc, lastDim(x));
+    const qp = quantParamsOrDense(.of(cfg), w, sc, lastDim(x));
     if (cfg.rowExactDecode() and qp.mode == .affine) {
         if (try rowExactQmm(cfg, x, w, sc, bi, qp.bits, qp.group_size, s)) |y| return y;
     }

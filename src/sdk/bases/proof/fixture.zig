@@ -206,7 +206,7 @@ pub const Legacy = struct {
     /// A projection as the legacy `qmatmul` resolves it (`in_dim` = the activation's width).
     pub fn lin(lg: *const Legacy, w: Array, s: Array, b: Array, bias: Array, in_dim: u32) linear.Linear {
         if (s.ctx == null) return .{ .w = w, .bias = bias };
-        const qp = computeQuantParams(&lg.config, w, s, in_dim);
+        const qp = computeQuantParams(.of(&lg.config), w, s, in_dim);
         return .{ .w = w, .s = s, .b = b, .bias = bias, .bits = qp.bits, .group_size = qp.group_size, .mode = qp.mode };
     }
 

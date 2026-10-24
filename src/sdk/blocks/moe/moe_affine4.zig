@@ -239,7 +239,6 @@ fn readF32(a: mlx.mlx_array, s: mlx.mlx_stream) ![]f32 {
 
 test "moe affine-4 decode: no worse than the per-slot gather kernels against the f32 truth (Flash Next geometry, K not a whole block)" {
     const s = mlx.gpuStream();
-    const xfm = @import("../../../engines/mlx/transformer.zig");
     const gather_qmv_vars = @import("gather_qmv.zig");
     const down_reduce_vars = @import("down_reduce.zig");
     var prng = std.Random.DefaultPrng.init(0xA4E0);
@@ -287,14 +286,14 @@ test "moe affine-4 decode: no worse than the per-slot gather kernels against the
     var scores = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(scores);
     try mlx.check(mlx.mlx_astype(&scores, sc32, .bfloat16, s));
-    const sigtab = try xfm.swigluSigTable(s, .bfloat16, std.heap.c_allocator);
+    const sigtab = try @import("../mlp/fused_activations.zig").swigluSigTable(s, .bfloat16, std.heap.c_allocator);
 
     const ours = (try decode(s, x, g.b, u.b, d.b, null, null, null, inds, scores, sigtab, 64)) orelse return error.KernelDeclined;
     defer _ = mlx.mlx_array_free(ours);
     // The shipped per-slot kernels on the same inputs.
-    const act = (try xfm.gatherQmvGateUp(s, x, g.b.w, g.b.s, g.b.b, u.b.w, u.b.s, u.b.b, inds, 4, 64, .affine, 0)) orelse return error.GatherDeclined;
+    const act = (try gather_qmv_vars.gatherQmvGateUp(s, x, g.b.w, g.b.s, g.b.b, u.b.w, u.b.s, u.b.b, inds, 4, 64, .affine, 0)) orelse return error.GatherDeclined;
     defer _ = mlx.mlx_array_free(act);
-    const stock = (try xfm.gatherQmvDownReduce(s, act, d.b.w, d.b.s, d.b.b, inds, scores, 4, 64, .affine)) orelse return error.GatherDeclined;
+    const stock = (try down_reduce_vars.gatherQmvDownReduce(s, act, d.b.w, d.b.s, d.b.b, inds, scores, 4, 64, .affine)) orelse return error.GatherDeclined;
     defer _ = mlx.mlx_array_free(stock);
 
     // f32 truth over the dequantized experts.
@@ -401,7 +400,7 @@ test "moe affine-4 decode: an ungated shared expert folded into both kernels is 
 
 fn ungatedFoldCase(comptime H: c_int, comptime I: c_int, comptime SI: c_int, comptime TOPK: c_int) !void {
     const s = mlx.gpuStream();
-    const xfm = @import("../../../engines/mlx/transformer.zig");
+    const xfm = @import("../mlp/fused_activations.zig");
     var prng = std.Random.DefaultPrng.init(0xF117 + @as(u64, @intCast(H)));
     const rnd = prng.random();
     const E: c_int = TOPK + 2;

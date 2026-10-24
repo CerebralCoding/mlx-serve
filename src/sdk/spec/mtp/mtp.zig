@@ -2646,7 +2646,7 @@ fn embedTargetTokens(
     // an 8-bit table as 4-bit crashes (`scales/biases shape mismatch`). Mirrors
     // `Transformer.embedding` → `quantParamsHinted`. Uniform-4-bit checkpoints
     // (ddalcu, MTPLX) resolve to the same 4/gs64/affine, so they're unchanged.
-    const emb_qp = params_mod.computeQuantParams(&target.config, target.emb_w, target.emb_s, target.config.hidden_size);
+    const emb_qp = params_mod.computeQuantParams(.of(&target.config), target.emb_w, target.emb_s, target.config.hidden_size);
     var dequant = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(dequant);
     try mlx.check(mlx.mlx_dequantize(
@@ -2697,7 +2697,7 @@ pub fn targetLmHead(self: anytype, target: *Transformer, x: mlx.mlx_array, s: ml
 /// the trunk global on mixed checkpoints — hy_v3 ships an 8-bit head over a
 /// 2-bit trunk).
 fn headQuantParams(config: *const model_mod.ModelConfig, w: mlx.mlx_array, sc: mlx.mlx_array) params_mod.QuantParams {
-    return params_mod.computeQuantParams(config, w, sc, config.hidden_size);
+    return params_mod.computeQuantParams(.of(config), w, sc, config.hidden_size);
 }
 
 /// Outputs of the pre-rope half of the MTP layer. All arrays owned.

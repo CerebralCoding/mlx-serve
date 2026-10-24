@@ -768,7 +768,7 @@ pub const Engine = struct {
         if (self.xfm.lm_head_s.ctx == null) return w;
         const scales = try o.own(try laya.take(self.xfm.lm_head_s, index, 0, o.s));
         const biases = if (self.xfm.lm_head_b.ctx != null) try o.own(try laya.take(self.xfm.lm_head_b, index, 0, o.s)) else A{};
-        const qp = params.computeQuantParams(&self.config, self.xfm.lm_head_w, self.xfm.lm_head_s, self.config.hidden_size);
+        const qp = params.computeQuantParams(.of(&self.config), self.xfm.lm_head_w, self.xfm.lm_head_s, self.config.hidden_size);
         var out = mlx.mlx_array_new();
         errdefer free(out);
         try mlx.check(mlx.mlx_dequantize(&out, w, scales, biases, mlx.mlx_optional_int.some(@intCast(qp.group_size)), mlx.mlx_optional_int.some(@intCast(qp.bits)), qp.mode.cstr(), .{}, .{ .value = .bfloat16, .has_value = true }, o.s));

@@ -102,13 +102,13 @@ pub inline fn quantParamsHinted(self: *const Transformer, w: mlx.mlx_array, sc: 
             };
         }
         if (entry == null) {
-            const detected = computeQuantParams(&self.config, w, sc, in_dim);
+            const detected = computeQuantParams(.of(&self.config), w, sc, in_dim);
             _ = cache.put(key_raw, detected);
             return detected;
         }
     }
     // Probe window saturated — fall through to direct detect, no cache write.
-    return computeQuantParams(&self.config, w, sc, in_dim);
+    return computeQuantParams(.of(&self.config), w, sc, in_dim);
 }
 
 pub inline fn qmatmulAddBias(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bias: mlx.mlx_array) !mlx.mlx_array {

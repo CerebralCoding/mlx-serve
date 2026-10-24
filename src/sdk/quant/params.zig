@@ -3,7 +3,6 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const ModelConfig = @import("../../engines/mlx/model.zig").ModelConfig;
 const testing = std.testing;
 
 // ── Quantization params cache ──
@@ -14,7 +13,16 @@ const testing = std.testing;
 // matching the perf commit's intent of "eliminate per-call detect overhead" while
 // supporting mixed-precision quantization (Gemma-4 MoE per-layer bits, etc.).
 pub const BITS_CACHE_CAP: usize = 1024; // plenty for 60 layers × ~10 quant weights × factor
-pub const QuantParams = struct { bits: u32, group_size: u32, mode: QuantMode = .affine };
+pub const QuantParams = struct {
+    bits: u32,
+    group_size: u32,
+    mode: QuantMode = .affine,
+
+    /// The model-wide scheme a config declares (`quant_bits`, `quant_group_size`, `quant_mode`).
+    pub fn of(cfg: anytype) QuantParams {
+        return .{ .bits = cfg.quant_bits, .group_size = cfg.quant_group_size, .mode = cfg.quant_mode };
+    }
+};
 
 const QuantParamsCache = struct {
     keys: [BITS_CACHE_CAP]?*anyopaque = @splat(null),
@@ -55,9 +63,9 @@ pub const BitsCache = QuantParamsCache;
 
 /// `computeQuantParams` for a weight that may be dense (null-ctx scales), as
 /// `quantParamsHinted` does for the Transformer methods.
-pub fn quantParamsOrDense(cfg: *const ModelConfig, w: mlx.mlx_array, sc: mlx.mlx_array, in_dim: ?u32) QuantParams {
-    if (sc.ctx == null) return .{ .bits = cfg.quant_bits, .group_size = cfg.quant_group_size, .mode = cfg.quant_mode };
-    return computeQuantParams(cfg, w, sc, in_dim);
+pub fn quantParamsOrDense(model: QuantParams, w: mlx.mlx_array, sc: mlx.mlx_array, in_dim: ?u32) QuantParams {
+    if (sc.ctx == null) return model;
+    return computeQuantParams(model, w, sc, in_dim);
 }
 
 pub fn affineParamsFromGeometry(w: mlx.mlx_array, sc: mlx.mlx_array, in_dim: u32) ?QuantParams {
@@ -102,19 +110,19 @@ fn fpQuantModeFor(bits: u32, group_size: u32) ?QuantMode {
 /// Returns null when the geometry AGREES with the model-wide declaration —
 /// the caller then returns the config verbatim, so a consistent checkpoint
 /// resolves exactly as it did before this existed.
-fn fpParamsFromGeometry(config: *const ModelConfig, w_cols: u32, s_cols: u32, in_dim: u32) ?QuantParams {
+fn fpParamsFromGeometry(model: QuantParams, w_cols: u32, s_cols: u32, in_dim: u32) ?QuantParams {
     if (w_cols == 0 or s_cols == 0 or in_dim == 0) return null;
     const packed_bits = w_cols * 32;
     if (packed_bits % in_dim != 0 or in_dim % s_cols != 0) return null;
     const bits = packed_bits / in_dim;
     const group_size = in_dim / s_cols;
-    if (bits == config.quant_bits and group_size == config.quant_group_size) return null;
+    if (bits == model.bits and group_size == model.group_size) return null;
     const mode = fpQuantModeFor(bits, group_size) orelse return null;
     return .{ .bits = bits, .group_size = group_size, .mode = mode };
 }
 
 /// Per-weight (bits, group_size, mode) solved from packed geometry ALONE, for
-/// callers that have no `ModelConfig` to consult — an MTP sidecar file carries
+/// callers that have no model-wide scheme to consult — an MTP sidecar file carries
 /// weights and nothing else. The mode is separated on the same evidence
 /// `computeQuantParams` uses: affine is the only mode whose checkpoints ship
 /// per-group biases, and every fp mode stores fp8-encoded `uint8` scales, so
@@ -140,14 +148,14 @@ pub fn quantParamsFromGeometry(
     return .{ .bits = (w_cols * 32) / in_dim, .group_size = in_dim / s_cols, .mode = mode };
 }
 
-pub fn computeQuantParams(config: *const ModelConfig, w: mlx.mlx_array, sc: mlx.mlx_array, in_dim: ?u32) QuantParams {
+pub fn computeQuantParams(model: QuantParams, w: mlx.mlx_array, sc: mlx.mlx_array, in_dim: ?u32) QuantParams {
     const w_shape = mlx.getShape(w);
     const s_shape = mlx.getShape(sc);
     const w_cols: u32 = if (w_shape.len >= 2) @intCast(w_shape[w_shape.len - 1]) else 0;
     const s_cols: u32 = if (s_shape.len >= 2) @intCast(s_shape[s_shape.len - 1]) else 0;
 
     if (mlx.mlx_array_dtype(sc) == .uint8) {
-        if (config.quant_mode != .affine) {
+        if (model.mode != .affine) {
             // A per-tensor override can live INSIDE the fp family: LFM2.5-2.6B-MLX's
             // mxfp4 build stores `model.embed_tokens` as mxfp8. Every fp mode
             // carries uint8 (E8M0/E4M3) scales, so the scales-dtype rule above
@@ -156,20 +164,20 @@ pub fn computeQuantParams(config: *const ModelConfig, w: mlx.mlx_array, sc: mlx.
             // i.e. a dead server on the first request. The packed geometry says
             // it exactly; solve, exactly as the affine arm below does.
             if (in_dim) |in| {
-                if (fpParamsFromGeometry(config, w_cols, s_cols, in)) |qp| return qp;
+                if (fpParamsFromGeometry(model, w_cols, s_cols, in)) |qp| return qp;
             } else if (s_cols > 0 and (w_cols * 32) % s_cols == 0) {
                 const per_group = (w_cols * 32) / s_cols;
                 const bits: u32 = if (per_group == 256) 8 else 4;
                 const gs = per_group / bits;
                 if (fpQuantModeFor(bits, gs)) |mode| return .{ .bits = bits, .group_size = gs, .mode = mode };
             }
-            return .{ .bits = config.quant_bits, .group_size = config.quant_group_size, .mode = config.quant_mode };
+            return model;
         }
         const gs: u32 = if (w_cols > 0 and s_cols > 0) (w_cols * 32) / (s_cols * 8) else 32;
         return .{ .bits = 8, .group_size = gs, .mode = .mxfp8 };
     }
 
-    if (config.quant_mode == .affine) {
+    if (model.mode == .affine) {
         // Exact per-weight solve when the caller knows the input dim — a
         // hinted tensor whose geometry contradicts the config's group size
         // (MTP sidecars mix gs 128/64/32 over a gs-64 trunk) resolves to its
@@ -178,8 +186,8 @@ pub fn computeQuantParams(config: *const ModelConfig, w: mlx.mlx_array, sc: mlx.
             if (affineParamsFromGeometry(w, sc, in)) |qp| return qp;
         }
         return .{
-            .bits = detectQuantBits(w, sc, config.quant_group_size),
-            .group_size = config.quant_group_size,
+            .bits = detectQuantBits(w, sc, model.group_size),
+            .group_size = model.group_size,
             .mode = .affine,
         };
     }
@@ -300,11 +308,8 @@ test "affineParamsFromGeometry: exact per-weight solve for off-config sidecar qu
     // And through computeQuantParams on an AFFINE gs-64 config: the hinted
     // exact solve must WIN over the config group size (pre-fix this returned
     // bits 10 / gs 64 for the q_proj geometry).
-    var cfg = ModelConfig{};
-    cfg.quant_bits = 4;
-    cfg.quant_group_size = 64;
-    cfg.quant_mode = .affine;
-    const qp_via = computeQuantParams(&cfg, wq, sq, H);
+    const cfg: QuantParams = .{ .bits = 4, .group_size = 64, .mode = .affine };
+    const qp_via = computeQuantParams(cfg, wq, sq, H);
     try testing.expectEqual(@as(u32, 5), qp_via.bits);
     try testing.expectEqual(@as(u32, 128), qp_via.group_size);
 }
@@ -331,10 +336,7 @@ test "computeQuantParams resolves an fp override INSIDE the fp family (mxfp8 emb
         }
     };
 
-    var cfg = ModelConfig{};
-    cfg.quant_bits = 4;
-    cfg.quant_group_size = 32;
-    cfg.quant_mode = .mxfp4;
+    const cfg: QuantParams = .{ .bits = 4, .group_size = 32, .mode = .mxfp4 };
 
     // embed_tokens: w [V, 512] u32 + scales [V, 64] u8 → 2048 values/row at
     // 8 bits, gs 32. (Real shapes; V shrunk — only the last axis is read.)
@@ -342,7 +344,7 @@ test "computeQuantParams resolves an fp override INSIDE the fp family (mxfp8 emb
     defer _ = mlx.mlx_array_free(we);
     const se = try mk.arr(&.{ 1024, 64 }, .uint8, s);
     defer _ = mlx.mlx_array_free(se);
-    const qp_e = computeQuantParams(&cfg, we, se, H);
+    const qp_e = computeQuantParams(cfg, we, se, H);
     try testing.expectEqual(QuantMode.mxfp8, qp_e.mode);
     try testing.expectEqual(@as(u32, 8), qp_e.bits);
     try testing.expectEqual(@as(u32, 32), qp_e.group_size);
@@ -353,20 +355,17 @@ test "computeQuantParams resolves an fp override INSIDE the fp family (mxfp8 emb
     defer _ = mlx.mlx_array_free(wl);
     const sl = try mk.arr(&.{ 2048, 64 }, .uint8, s);
     defer _ = mlx.mlx_array_free(sl);
-    const qp_l = computeQuantParams(&cfg, wl, sl, H);
+    const qp_l = computeQuantParams(cfg, wl, sl, H);
     try testing.expectEqual(QuantMode.mxfp4, qp_l.mode);
     try testing.expectEqual(@as(u32, 4), qp_l.bits);
     try testing.expectEqual(@as(u32, 32), qp_l.group_size);
 
     // An nvfp4 model's own tensors (gs 16) stay nvfp4 — the solve agrees with
     // the config, so it never re-labels a consistent checkpoint.
-    var cfg_nv = ModelConfig{};
-    cfg_nv.quant_bits = 4;
-    cfg_nv.quant_group_size = 16;
-    cfg_nv.quant_mode = .nvfp4;
+    const cfg_nv: QuantParams = .{ .bits = 4, .group_size = 16, .mode = .nvfp4 };
     const s_nv = try mk.arr(&.{ 2048, 128 }, .uint8, s);
     defer _ = mlx.mlx_array_free(s_nv);
-    const qp_nv = computeQuantParams(&cfg_nv, wl, s_nv, H);
+    const qp_nv = computeQuantParams(cfg_nv, wl, s_nv, H);
     try testing.expectEqual(QuantMode.nvfp4, qp_nv.mode);
     try testing.expectEqual(@as(u32, 16), qp_nv.group_size);
 
@@ -374,19 +373,19 @@ test "computeQuantParams resolves an fp override INSIDE the fp family (mxfp8 emb
     // the config stands, and the load fails honestly if it really disagrees.
     const s_odd = try mk.arr(&.{ 2048, 21 }, .uint8, s);
     defer _ = mlx.mlx_array_free(s_odd);
-    const qp_odd = computeQuantParams(&cfg, wl, s_odd, H);
+    const qp_odd = computeQuantParams(cfg, wl, s_odd, H);
     try testing.expectEqual(QuantMode.mxfp4, qp_odd.mode);
     try testing.expectEqual(@as(u32, 4), qp_odd.bits);
     try testing.expectEqual(@as(u32, 32), qp_odd.group_size);
 
     // No inner-dim hint: bits x group_size (256 / 128 / 64) still names one fp format.
-    const qp_nohint = computeQuantParams(&cfg, we, se, null);
+    const qp_nohint = computeQuantParams(cfg, we, se, null);
     try testing.expectEqual(QuantMode.mxfp8, qp_nohint.mode);
     try testing.expectEqual(@as(u32, 8), qp_nohint.bits);
-    const qp_nohint_nv = computeQuantParams(&cfg, wl, s_nv, null);
+    const qp_nohint_nv = computeQuantParams(cfg, wl, s_nv, null);
     try testing.expectEqual(QuantMode.nvfp4, qp_nohint_nv.mode);
     try testing.expectEqual(@as(u32, 16), qp_nohint_nv.group_size);
-    const qp_nohint_odd = computeQuantParams(&cfg, wl, s_odd, null);
+    const qp_nohint_odd = computeQuantParams(cfg, wl, s_odd, null);
     try testing.expectEqual(QuantMode.mxfp4, qp_nohint_odd.mode);
 }
 
@@ -399,10 +398,7 @@ test "computeQuantParams resolves mixed nvfp4 + affine-override weights" {
     const IN = 2560;
     const OUT = 8;
 
-    var cfg = ModelConfig{};
-    cfg.quant_bits = 4;
-    cfg.quant_group_size = 16;
-    cfg.quant_mode = .nvfp4;
+    const cfg: QuantParams = .{ .bits = 4, .group_size = 16, .mode = .nvfp4 };
 
     // nvfp4 tensor: w [OUT, IN*4/32] u32, scales [OUT, IN/16] u8.
     var w_nv = mlx.mlx_array_new();
@@ -413,7 +409,7 @@ test "computeQuantParams resolves mixed nvfp4 + affine-override weights" {
     const sc_nv_sh = [_]c_int{ OUT, IN / 16 };
     try mlx.check(mlx.mlx_zeros(&w_nv, &w_nv_sh, 2, .uint32, s));
     try mlx.check(mlx.mlx_zeros(&sc_nv, &sc_nv_sh, 2, .uint8, s));
-    const qp_nv = computeQuantParams(&cfg, w_nv, sc_nv, null);
+    const qp_nv = computeQuantParams(cfg, w_nv, sc_nv, null);
     try testing.expectEqual(QuantMode.nvfp4, qp_nv.mode);
     try testing.expectEqual(@as(u32, 4), qp_nv.bits);
     try testing.expectEqual(@as(u32, 16), qp_nv.group_size);
@@ -429,24 +425,21 @@ test "computeQuantParams resolves mixed nvfp4 + affine-override weights" {
     try mlx.check(mlx.mlx_zeros(&sc_af, &sc_af_sh, 2, .bfloat16, s));
 
     // With the activation inner-dim hint: exact.
-    const qp_af = computeQuantParams(&cfg, w_af, sc_af, IN);
+    const qp_af = computeQuantParams(cfg, w_af, sc_af, IN);
     try testing.expectEqual(QuantMode.affine, qp_af.mode);
     try testing.expectEqual(@as(u32, 8), qp_af.bits);
     try testing.expectEqual(@as(u32, 64), qp_af.group_size);
 
     // Without a hint: falls back to mlx-lm's override default gs=64.
-    const qp_af_nohint = computeQuantParams(&cfg, w_af, sc_af, null);
+    const qp_af_nohint = computeQuantParams(cfg, w_af, sc_af, null);
     try testing.expectEqual(QuantMode.affine, qp_af_nohint.mode);
     try testing.expectEqual(@as(u32, 8), qp_af_nohint.bits);
     try testing.expectEqual(@as(u32, 64), qp_af_nohint.group_size);
 
     // Plain affine model (config mode affine, bf16 scales): unchanged
     // detect-against-config-gs behavior.
-    var cfg_affine = ModelConfig{};
-    cfg_affine.quant_bits = 4;
-    cfg_affine.quant_group_size = 64;
-    cfg_affine.quant_mode = .affine;
-    const qp_plain = computeQuantParams(&cfg_affine, w_af, sc_af, null);
+    const cfg_affine: QuantParams = .{ .bits = 4, .group_size = 64, .mode = .affine };
+    const qp_plain = computeQuantParams(cfg_affine, w_af, sc_af, null);
     try testing.expectEqual(QuantMode.affine, qp_plain.mode);
     try testing.expectEqual(@as(u32, 8), qp_plain.bits);
     try testing.expectEqual(@as(u32, 64), qp_plain.group_size);

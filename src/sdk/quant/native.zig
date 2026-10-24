@@ -115,7 +115,7 @@ pub fn loadInto(ctx: *const abi.LoadCtx, base: []const u8, in_dim: u32, out: *ab
         out.bits = 8;
         return;
     }
-    const qp = params.computeQuantParams(&st.cfg, w, sc, if (in_dim > 0) in_dim else null);
+    const qp = params.computeQuantParams(.of(&st.cfg), w, sc, if (in_dim > 0) in_dim else null);
     out.bits = @intCast(qp.bits);
     out.group_size = qp.group_size;
     out.layout = @intFromEnum(switch (qp.mode) {

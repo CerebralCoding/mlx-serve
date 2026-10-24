@@ -1005,7 +1005,7 @@ pub const DflashModel = struct {
             .{ .bits = 0, .group_size = 0, .mode = .affine }
         else
             transformer_mod.computeQuantParams(
-                &target.config,
+                .of(&target.config),
                 target.lm_head_w,
                 target.lm_head_s,
                 target.config.hidden_size,

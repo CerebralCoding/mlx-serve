@@ -56,7 +56,7 @@ pub fn firstRowExactMiss(config: *const ModelConfig, weights: *const Weights, ga
         const w = weights.map.get(std.fmt.bufPrint(&buf, "{s}.weight", .{base}) catch return key) orelse continue;
         if (gather_only.ctx != null and w.ctx == gather_only.ctx) continue;
         const bi = weights.map.get(std.fmt.bufPrint(&buf, "{s}.biases", .{base}) catch return key) orelse return key;
-        const qp = computeQuantParams(config, w, kv.value_ptr.*, null);
+        const qp = computeQuantParams(.of(config), w, kv.value_ptr.*, null);
         if (qp.mode != .affine or !rowqmv.fits(w, kv.value_ptr.*, bi, qp.bits, qp.group_size)) return key;
     }
     return null;
