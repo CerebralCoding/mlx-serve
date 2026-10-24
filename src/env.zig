@@ -308,7 +308,6 @@ pub const vars = struct {
     pub const MINIMAX_H3_VSA: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/minimax_h3", .since = "26.10.3", .doc = "H3 trained VSA sparse attention (=0: dense attention, no gate branch)" };
     pub const MLX_SERVE_ANE_FORCE: Var = .{ .kind = .fixture, .type = .text, .default = "unset", .owner = "engines/mlx", .since = "26.8.10", .doc = "allows --ane-prefill on NAX GPUs, where it measured a loss" };
     pub const MLX_SERVE_CUDA_QMV_TC: Var = .{ .kind = .kill, .type = .flag, .default = "on where measured (sm_120)", .owner = "sdk/blocks/qmm", .since = "26.10.3", .doc = "CUDA tensor-core 4-bit GEMV for 2..8 rows" };
-    pub const MLX_SERVE_DECODE_ATTN_QUANT_REQUANT: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "sdk/blocks/attention", .since = "26.10.2", .doc = "requantize the decode-attention side copies" };
     pub const MLX_SERVE_DSV41_ATTN_F16: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 f16 attention (=0: f32)" };
     pub const MLX_SERVE_DSV41_CED: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 CED prefill chunks (=0: full forward)" };
     pub const MLX_SERVE_DSV41_HEAD8: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 dense LM head requantized to 8-bit (=0: as shipped)" };

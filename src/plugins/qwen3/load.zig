@@ -181,19 +181,12 @@ pub fn probePrefix(src: *const quant_abi.Source, preferred: []const u8) ?[]const
 }
 
 /// The decode-only requantized copy of an attention projection (`--decode-attn-quant`), owned by `o`; empty where
-/// the engine builds none (the flag off, a quantized weight without `attnDqRequantEnabled`, an ineligible shape).
+/// the engine builds none (the flag off, a quantized weight, an ineligible shape).
 /// copied_from: sdk/blocks/attention/proj.zig (`attnDqFor`; built at load, not at the first decode step).
 pub fn sideCopy(o: *Owned, l: Linear, layer: u32, layers: u32, s: mlx.mlx_stream) !Linear {
-    if (!daq.decodeAttnQuantEnabled() or (l.s.ctx != null and !daq.attnDqRequantEnabled())) return .{};
-    var dense: Array = .{ .ctx = null };
-    defer if (dense.ctx != null) {
-        _ = mlx.mlx_array_free(dense);
-    };
-    if (l.s.ctx != null and l.mode == .affine and l.bits == 8) dense = try daq.denseFromAffine8(s, l.w, l.s, l.b, l.group_size);
-    const src = if (dense.ctx != null) dense else l.w;
-    if (!daq.decodeAttnQuantEligible(mlx.getShape(src), mlx.mlx_array_dtype(src), l.s.ctx != null and dense.ctx == null)) return .{};
-    const nvfp4 = dense.ctx != null or daq.attnDqUseNvfp4(layer, layers);
-    const copy = (try daq.buildAttnDqCopy(s, src, nvfp4)) orelse return .{};
+    if (!daq.decodeAttnQuantEnabled() or l.s.ctx != null) return .{};
+    if (!daq.decodeAttnQuantEligible(mlx.getShape(l.w), mlx.mlx_array_dtype(l.w), false)) return .{};
+    const copy = (try daq.buildAttnDqCopy(s, l.w, daq.attnDqUseNvfp4(layer, layers))) orelse return .{};
     const out: Linear = .{ .w = copy.w, .s = copy.s, .b = copy.b, .bits = copy.bits, .group_size = copy.group_size, .mode = copy.mode };
     try o.linear(out);
     if (!daq.attn_dq_engaged) {

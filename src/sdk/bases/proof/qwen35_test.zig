@@ -182,7 +182,7 @@ fn gdnWeights(lg: *fixture.Legacy, la: *const LinearAttnWeights, geo: gdn.Geo) g
 
 fn proj(lg: *fixture.Legacy, w: Array, s: Array, bi: Array, in_dim: u32, layer: u32) !gated.Proj {
     var p: gated.Proj = .{ .lin = lg.lin(w, s, bi, .{}, in_dim) };
-    if (s.ctx == null) if (try lg.xfm.attnDqFor(w, s, bi, in_dim, layer)) |c| {
+    if (s.ctx == null) if (try lg.xfm.attnDqFor(w, layer)) |c| {
         p.dq = .{ .w = c.w, .s = c.s, .b = c.b, .bits = c.bits, .group_size = c.group_size, .mode = c.mode };
     };
     return p;

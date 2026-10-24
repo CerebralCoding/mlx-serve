@@ -134,36 +134,26 @@ pub fn rowGroupServes(self: *const Trunk, rows: c_int) bool {
 
 /// Attention projection with the decode-only requant (`batch == 1 and !is_prefill`: serial decode and verify).
 pub inline fn attnProj(self: *Trunk, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, decode_shape: bool, layer: u32) !mlx.mlx_array {
-    if (decode_shape and (sc.ctx == null or decode_attn_quant.attnDqRequantEnabled()) and decode_attn_quant.decodeAttnQuantEnabled()) {
-        if (self.attnDqFor(w, sc, bi, lastDim(x), layer) catch null) |dq| {
+    if (decode_shape and sc.ctx == null and decode_attn_quant.decodeAttnQuantEnabled()) {
+        if (self.attnDqFor(w, layer) catch null) |dq| {
             return qmatmulBits(x, dq.w, dq.s, dq.b, dq.bits, dq.group_size, dq.mode, self.s);
         }
     }
     return self.qmatmul(x, w, sc, bi);
 }
 
-/// The decode side copy of a dense (or 8-bit affine) attention weight, cached by the weight's pointer with its
+/// The decode side copy of a dense attention weight, cached by the weight's pointer with its
 /// refusal; the tail layers take nvfp4-g16 (`attnDqUseNvfp4`).
-pub fn attnDqFor(self: *Trunk, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, in_dim: ?u32, layer: u32) !?AttnDqCopy {
+pub fn attnDqFor(self: *Trunk, w: mlx.mlx_array, layer: u32) !?AttnDqCopy {
     const key = @intFromPtr(w.ctx orelse return null);
     if (self.attn_dq.get(key)) |slot| return slot;
-    var dense = mlx.mlx_array{ .ctx = null };
-    defer if (dense.ctx != null) {
-        _ = mlx.mlx_array_free(dense);
-    };
-    if (sc.ctx != null) {
-        const qp = self.quantParamsHinted(w, sc, in_dim);
-        if (qp.mode == .affine and qp.bits == 8) dense = try decode_attn_quant.denseFromAffine8(self.s, w, sc, bi, qp.group_size);
-    }
-    const src = if (dense.ctx != null) dense else w;
-    const wsh = mlx.getShape(src);
-    if (!decode_attn_quant.decodeAttnQuantEligible(wsh, mlx.mlx_array_dtype(src), sc.ctx != null and dense.ctx == null)) {
+    if (!decode_attn_quant.decodeAttnQuantEligible(mlx.getShape(w), mlx.mlx_array_dtype(w), false)) {
         try self.attn_dq.put(self.allocator, key, null);
         log.debug("[decode-attn-quant] declined a projection: shape/dtype ineligible\n", .{});
         return null;
     }
-    const nvfp4 = dense.ctx != null or decode_attn_quant.attnDqUseNvfp4(layer, @intCast(self.config.num_hidden_layers));
-    const copy = (try decode_attn_quant.buildAttnDqCopy(self.s, src, nvfp4)) orelse {
+    const nvfp4 = decode_attn_quant.attnDqUseNvfp4(layer, @intCast(self.config.num_hidden_layers));
+    const copy = (try decode_attn_quant.buildAttnDqCopy(self.s, w, nvfp4)) orelse {
         try self.attn_dq.put(self.allocator, key, null);
         return null;
     };
