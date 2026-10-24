@@ -109,6 +109,23 @@ pub fn entries(comptime mods: []const type, comptime names: []const []const u8) 
     return out;
 }
 
+/// `entries` with each table taken by its exported symbol: every plugin compiled as its own unit (`src/unit.zig`), so
+/// only its metadata (`plugin`, MLX-free) is analyzed here.
+pub fn externEntries(comptime mods: []const type, comptime names: []const []const u8) [mods.len]Entry {
+    var out: [mods.len]Entry = undefined;
+    inline for (mods, names, 0..) |M, name, i| {
+        check(M, name);
+        const sym = common.exportName(M.plugin.name, tableVersion(M.plugin.kind));
+        out[i] = .{ .plugin = M.plugin };
+        switch (M.plugin.kind) {
+            .model => out[i].model = @extern(*const model_abi.ModelTable, .{ .name = sym }),
+            .media => out[i].media = @extern(*const media_abi.MediaTable, .{ .name = sym }),
+            .quant => out[i].quant = @extern(*const quant_abi.QuantTable, .{ .name = sym }),
+        }
+    }
+    return out;
+}
+
 /// Exports each registered table as `mlx_serve_plugin_<name>_v<version>`.
 pub fn exportAll(comptime mods: []const type) void {
     inline for (mods) |M| @export(&M.table, .{ .name = common.exportName(M.plugin.name, tableVersion(M.plugin.kind)) });

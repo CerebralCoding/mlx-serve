@@ -2437,19 +2437,26 @@ fn yarnMscale(factor: f32) f32 {
     return 0.1 * @log(@as(f32, factor)) + 1.0;
 }
 
-/// Launch-time JSON deep-merged into every `config.json` before it is parsed,
-/// set once from `--config-overrides`. vLLM's `--hf-overrides` analogue: the
-/// only way to re-shape a checkpoint's declared geometry — most often to scale
-/// its rope and widen the context — without editing the model directory, and
-/// therefore the way to A/B a scaling experiment on identical weights.
-var config_overrides: ?[]const u8 = null;
+/// Process-wide under `-Dunits` (sdk/util/shared.zig): one copy in the host.
+const ModelCliState = struct {
+    /// Launch-time JSON deep-merged into every `config.json` before it is parsed,
+    /// set once from `--config-overrides`. vLLM's `--hf-overrides` analogue: the
+    /// only way to re-shape a checkpoint's declared geometry — most often to scale
+    /// its rope and widen the context — without editing the model directory, and
+    /// therefore the way to A/B a scaling experiment on identical weights.
+    config_overrides: ?[]const u8 = null,
+};
+const modelCli_shared = @import("../../sdk/util/shared.zig").Shared(ModelCliState, "model_cli", .{});
+inline fn modelCli() *ModelCliState {
+    return modelCli_shared.get();
+}
 
 pub fn setConfigOverrides(raw: ?[]const u8) void {
-    config_overrides = raw;
+    modelCli().config_overrides = raw;
 }
 
 pub fn getConfigOverrides() ?[]const u8 {
-    return config_overrides;
+    return modelCli().config_overrides;
 }
 
 /// Deep-merge `overrides` into a config.json document: objects merge key by key
@@ -2548,7 +2555,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
     // The launch-time overrides apply to EVERY parse (primary load, on-demand
     // load, discovery stubs), so the advertised context and the loaded model
     // can never disagree about what window the checkpoint has.
-    const merged: ?[]const u8 = if (config_overrides) |ov| blk: {
+    const merged: ?[]const u8 = if (modelCli().config_overrides) |ov| blk: {
         break :blk try mergeConfigJson(allocator, content, ov);
     } else null;
     defer if (merged) |m| allocator.free(m);
@@ -4859,9 +4866,9 @@ fn parseQwenAudioConfig(root: std.json.ObjectMap) !QwenAudioConfig {
     const ac = jsonField(root, "audio_config") orelse return qa;
     const o = try jsonValue(.object, ac);
     inline for (.{
-        .{ "d_model", "d_model" },             .{ "encoder_layers", "layers" },     .{ "encoder_attention_heads", "heads" },
-        .{ "encoder_ffn_dim", "ffn" },         .{ "num_mel_bins", "mel_bins" },     .{ "downsample_hidden_size", "downsample" },
-        .{ "n_window", "n_window" },           .{ "n_window_infer", "n_window_infer" }, .{ "output_dim", "output_dim" },
+        .{ "d_model", "d_model" },     .{ "encoder_layers", "layers" },         .{ "encoder_attention_heads", "heads" },
+        .{ "encoder_ffn_dim", "ffn" }, .{ "num_mel_bins", "mel_bins" },         .{ "downsample_hidden_size", "downsample" },
+        .{ "n_window", "n_window" },   .{ "n_window_infer", "n_window_infer" }, .{ "output_dim", "output_dim" },
     }) |kv| {
         if (jsonField(o, kv[0])) |v| @field(qa, kv[1]) = try jsonU32(v);
     }

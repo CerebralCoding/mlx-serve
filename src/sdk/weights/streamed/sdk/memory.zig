@@ -103,16 +103,23 @@ fn taskVmInfo() ?TaskVmInfo {
     return info;
 }
 
-/// Bytes the host's other models hold in this process (its own bill's footprint reads count them too). The host
-/// keeps it current; a plugin's absolute footprint bounds rise by it.
-var foreign_bytes = std.atomic.Value(u64).init(0);
+/// Process-wide under `-Dunits` (sdk/util/shared.zig): one copy in the host.
+const MemoryState = struct {
+    /// Bytes the host's other models hold in this process (its own bill's footprint reads count them too). The host
+    /// keeps it current; a plugin's absolute footprint bounds rise by it.
+    foreign_bytes: std.atomic.Value(u64) = .init(0),
+};
+const memoryState_shared = @import("mlx_host").shared.Shared(MemoryState, "streamed_memory", .{});
+inline fn memoryState() *MemoryState {
+    return memoryState_shared.get();
+}
 
 pub fn setForeignBytes(n: u64) void {
-    foreign_bytes.store(n, .monotonic);
+    memoryState().foreign_bytes.store(n, .monotonic);
 }
 
 pub fn foreignBytes() u64 {
-    return foreign_bytes.load(.monotonic);
+    return memoryState().foreign_bytes.load(.monotonic);
 }
 
 /// This process's phys_footprint (MLX's Metal / IOKit memory included) and its lifetime peak, in bytes.

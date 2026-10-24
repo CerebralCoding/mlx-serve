@@ -169,7 +169,7 @@ pub fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
     return .{
         .engine = "mlx",
         .kv_quant = if (lm.llama_engine != null) @tagName(http_server.llama_settings.kv_quant) else if (kv.isQuant()) (if (kv.bits == 4) "4" else "8") else "off",
-        .kv_attn_mode = http_server.server_config.kv_attn_mode,
+        .kv_attn_mode = http_server.serverState().server_config.kv_attn_mode,
         .decode_attn_quant = decode_attn_quant_mod.decodeAttnQuantEnabled() and (if (lm.transformer) |x| x.dense_attn_proj else false),
         .prefill_chunk = generate_mod.prefill_chunk_override,
         .mtp_loaded = lm.mtp != null or (if (lm.transformer) |x| x.dsparkStages() > 0 else false),
@@ -185,7 +185,7 @@ pub fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         } else null,
         .max_mtp_ctx = generate_mod.max_mtp_ctx,
         .drafter = if (lm.dflash != null) "dflash" else if (lm.drafter != null) "assistant" else "none",
-        .pld = .{ .enable = http_server.server_config.default_enable_pld, .draft_len = http_server.server_config.default_pld_draft_len, .key_len = http_server.server_config.default_pld_key_len },
+        .pld = .{ .enable = http_server.serverState().server_config.default_enable_pld, .draft_len = http_server.serverState().server_config.default_pld_draft_len, .key_len = http_server.serverState().server_config.default_pld_key_len },
         .max_concurrent = http_server.max_concurrent,
         .prefix_cache_mem_bytes = resolvedPrefixCacheMem(),
         .prefix_cache_disk_bytes = http_server.prefix_cache_disk_bytes,
@@ -213,15 +213,14 @@ pub fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 
             st.mtp_loaded, st.mtp_default_on, mtp_acceptance_mod.name(st.mtp_acceptance), param, st.mtp_greedy_tail, st.mtp_depth, st.mtp_adaptive, st.max_mtp_ctx,
         });
     return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_attn_mode\":\"{s}\",\"decode_attn_quant\":{},\"prefill_chunk\":{d},\"mtp\":{s},\"drafter\":\"{s}\",\"pld\":{{\"default_on\":{},\"draft_len\":{d},\"key_len\":{d}}},\"max_concurrent\":{d},\"prefill_decode_share\":{d:.2},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d}}}}}", .{
-        build_options.version,                      st.engine,
-        st.kv_quant,                                @tagName(st.kv_attn_mode),
-        st.decode_attn_quant,                       st.prefill_chunk,
-        mtp_json,
-        st.drafter,                                 st.pld.enable,
-        st.pld.draft_len,                           st.pld.key_len,
-        st.max_concurrent,                          st.prefill_decode_share,
-        st.prefix_cache_ram_enabled,                st.prefix_cache_mem_bytes,
-        st.prefix_cache_disk_bytes,
+        build_options.version,     st.engine,
+        st.kv_quant,               @tagName(st.kv_attn_mode),
+        st.decode_attn_quant,      st.prefill_chunk,
+        mtp_json,                  st.drafter,
+        st.pld.enable,             st.pld.draft_len,
+        st.pld.key_len,            st.max_concurrent,
+        st.prefill_decode_share,   st.prefix_cache_ram_enabled,
+        st.prefix_cache_mem_bytes, st.prefix_cache_disk_bytes,
     });
 }
 
@@ -320,7 +319,7 @@ pub fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel
 
     // qwen4 n-gram table warm (F8) — the two module-level atomics are zero
     // whenever no table is warming, so the object is absent off qwen4_exp.
-    const ngram_json = try ngramWarmPropsJson(allocator, qwen4_mod.live_warm_bytes.load(.acquire), qwen4_mod.live_warm_total.load(.acquire));
+    const ngram_json = try ngramWarmPropsJson(allocator, qwen4_mod.warmBytes().live_warm_bytes.load(.acquire), qwen4_mod.warmBytes().live_warm_total.load(.acquire));
     defer allocator.free(ngram_json);
     const batching_json = try batchingPropsJson(allocator, batchVerdictFor(lm));
     defer allocator.free(batching_json);
@@ -522,14 +521,24 @@ test "settingsPropsJson: native lane configuration is not generic MTP or request
         .{ .enabled = false, .sampled = true, .stages = 0 },
     }) |case| {
         const frag = try settingsPropsJson(testing.allocator, .{
-            .engine = "mlx", .kv_quant = "8", .kv_attn_mode = .auto,
-            .decode_attn_quant = false, .prefill_chunk = 8192,
-            .mtp_loaded = case.stages > 0, .mtp_default_on = case.enabled,
-            .mtp_acceptance = .exact, .mtp_greedy_tail = true, .mtp_depth = 6,
-            .mtp_adaptive = true, .max_mtp_ctx = 0,
+            .engine = "mlx",
+            .kv_quant = "8",
+            .kv_attn_mode = .auto,
+            .decode_attn_quant = false,
+            .prefill_chunk = 8192,
+            .mtp_loaded = case.stages > 0,
+            .mtp_default_on = case.enabled,
+            .mtp_acceptance = .exact,
+            .mtp_greedy_tail = true,
+            .mtp_depth = 6,
+            .mtp_adaptive = true,
+            .max_mtp_ctx = 0,
             .native_speculation = .{ .lane = "dspark typical 0.3", .block_size = case.stages, .sampled = case.sampled },
-            .drafter = "none", .pld = PldDefaults.off, .max_concurrent = 1,
-            .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0,
+            .drafter = "none",
+            .pld = PldDefaults.off,
+            .max_concurrent = 1,
+            .prefix_cache_mem_bytes = 0,
+            .prefix_cache_disk_bytes = 0,
         });
         defer testing.allocator.free(frag);
         var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, frag[",\"settings\":".len..], .{});

@@ -85,7 +85,7 @@ pub fn mlxActiveBytes() u64 {
 /// The n-gram table is resident, wired, only on the `--ple-gpu` arm, and sits outside the
 /// `.safetensors` sum; the host gather only faults in the rows it reads.
 pub fn pleTableBill(io: std.Io, config: *const model_mod.ModelConfig) u64 {
-    if (!ple_gpu.enabled) return 0;
+    if (!ple_gpu.pleGpu().enabled) return 0;
     if (config.embedded_ple_payload_bytes) |bytes| return bytes;
     const p = config.ngram_table_path orelse return 0;
     const st = std.Io.Dir.cwd().statFile(io, p, .{}) catch return 0;
@@ -303,12 +303,12 @@ test "pleTableBill: the GPU arm bills the n-gram table, embedded shards included
     const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/ngram_table.bin", .{ cwd, tmp.sub_path });
     defer std.testing.allocator.free(path);
 
-    const was = ple_gpu.enabled;
-    defer ple_gpu.enabled = was;
+    const was = ple_gpu.pleGpu().enabled;
+    defer ple_gpu.pleGpu().enabled = was;
     var config: model_mod.ModelConfig = .{ .model_type = "qwen4_exp", .ngram_table_path = path };
-    ple_gpu.enabled = false;
+    ple_gpu.pleGpu().enabled = false;
     try std.testing.expectEqual(@as(u64, 0), pleTableBill(io, &config));
-    ple_gpu.enabled = true;
+    ple_gpu.pleGpu().enabled = true;
     try std.testing.expectEqual(@as(u64, 10), pleTableBill(io, &config));
     // An embedded pack bills its shards' payload; its `ngram_table.bin` path names no file.
     config.embedded_ple_payload_bytes = 120;

@@ -97,7 +97,7 @@ pub fn handleAnthropicStreaming(
     // same way for all three modes.
     const config = lm.config.?;
     const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.shapesLogits(), 0, requestHasCompany());
-    if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ http_server.server_config.default_pld_draft_len, http_server.server_config.default_pld_key_len });
+    if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ http_server.serverState().server_config.default_pld_draft_len, http_server.serverState().server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
 
@@ -128,8 +128,8 @@ pub fn handleAnthropicStreaming(
         .enable_mtp = stream_mode == .mtp,
         .mtp = if (stream_mode == .mtp) lm.mtp else null,
         .mtp_depth = lm.mtp_depth,
-        .pld_draft_len = http_server.server_config.default_pld_draft_len,
-        .pld_key_len = http_server.server_config.default_pld_key_len,
+        .pld_draft_len = http_server.serverState().server_config.default_pld_draft_len,
+        .pld_key_len = http_server.serverState().server_config.default_pld_key_len,
         .kv_attn_fused = resolveKvAttnFused(config, kv_attn_explicit, prompt_ids.len, kv_quant_override),
         .logprobs_n = 0,
         .vision_embeddings = slot_ve_anth,

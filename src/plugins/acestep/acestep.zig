@@ -96,23 +96,23 @@ const QwenCfg = struct {
 
 /// config.json keys → `Cfg` fields; an omitted key keeps the published value.
 const cfg_keys = .{
-    .{ "hidden_size", "hidden" },                                .{ "num_hidden_layers", "layers" },
-    .{ "num_attention_heads", "heads" },                         .{ "num_key_value_heads", "kv_heads" },
-    .{ "head_dim", "head_dim" },                                 .{ "intermediate_size", "intermediate" },
-    .{ "encoder_hidden_size", "enc_hidden" },                    .{ "encoder_intermediate_size", "enc_intermediate" },
-    .{ "encoder_num_attention_heads", "enc_heads" },             .{ "encoder_num_key_value_heads", "enc_kv_heads" },
-    .{ "num_lyric_encoder_hidden_layers", "lyric_layers" },      .{ "num_timbre_encoder_hidden_layers", "timbre_layers" },
-    .{ "text_hidden_dim", "text_hidden" },                       .{ "audio_acoustic_hidden_dim", "acoustic_dim" },
-    .{ "in_channels", "in_channels" },                           .{ "patch_size", "patch_size" },
-    .{ "sliding_window", "sliding_window" },                     .{ "rope_theta", "rope_theta" },
-    .{ "rms_norm_eps", "eps" },                                  .{ "timbre_fix_frame", "timbre_fix_frame" },
-    .{ "sample_rate", "sample_rate" },                           .{ "vae_hop", "vae_hop" },
+    .{ "hidden_size", "hidden" },                           .{ "num_hidden_layers", "layers" },
+    .{ "num_attention_heads", "heads" },                    .{ "num_key_value_heads", "kv_heads" },
+    .{ "head_dim", "head_dim" },                            .{ "intermediate_size", "intermediate" },
+    .{ "encoder_hidden_size", "enc_hidden" },               .{ "encoder_intermediate_size", "enc_intermediate" },
+    .{ "encoder_num_attention_heads", "enc_heads" },        .{ "encoder_num_key_value_heads", "enc_kv_heads" },
+    .{ "num_lyric_encoder_hidden_layers", "lyric_layers" }, .{ "num_timbre_encoder_hidden_layers", "timbre_layers" },
+    .{ "text_hidden_dim", "text_hidden" },                  .{ "audio_acoustic_hidden_dim", "acoustic_dim" },
+    .{ "in_channels", "in_channels" },                      .{ "patch_size", "patch_size" },
+    .{ "sliding_window", "sliding_window" },                .{ "rope_theta", "rope_theta" },
+    .{ "rms_norm_eps", "eps" },                             .{ "timbre_fix_frame", "timbre_fix_frame" },
+    .{ "sample_rate", "sample_rate" },                      .{ "vae_hop", "vae_hop" },
 };
 
 /// text_encoder/config.json keys → `QwenCfg` fields.
 const qwen_keys = .{
-    .{ "hidden_size", "hidden" },          .{ "num_hidden_layers", "layers" }, .{ "num_attention_heads", "heads" },
-    .{ "num_key_value_heads", "kv_heads" }, .{ "head_dim", "head_dim" },     .{ "rms_norm_eps", "eps" },
+    .{ "hidden_size", "hidden" },           .{ "num_hidden_layers", "layers" }, .{ "num_attention_heads", "heads" },
+    .{ "num_key_value_heads", "kv_heads" }, .{ "head_dim", "head_dim" },        .{ "rms_norm_eps", "eps" },
     .{ "rope_theta", "rope_theta" },
 };
 
@@ -385,7 +385,7 @@ fn ropeInPlace(x: mlx.mlx_array, hd: c_int, theta: f32, s: S) !mlx.mlx_array {
 /// Unmasked attention merged to [1, T, H*128]: on the int8 kernel when the route takes it
 /// (`--w8a8`), else sdpa then `mergeHeads`.
 fn attnMerged(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, s: S) !mlx.mlx_array {
-    if (w8a8.enabled) if (try int8_attn.attention(q, k, v, scale, s)) |o| {
+    if (w8a8.w8a8State().enabled) if (try int8_attn.attention(q, k, v, scale, s)) |o| {
         defer _ = mlx.mlx_array_free(o);
         const sh = mlx.getShape(o);
         return reshape(o, &[_]c_int{ 1, sh[0], sh[1] }, s);
@@ -1876,7 +1876,7 @@ pub const Engine = struct {
         errdefer self.w.deinit();
         if (self.w.get("silence_latent") == null) return error.MissingAceStepWeight;
         // The ANE seam reads the packed DiT weights; the packs are 8-bit g64.
-        if (w8a8.enabled and !ane.media_offload.audio) {
+        if (w8a8.w8a8State().enabled and !ane.aneState().media_offload.audio) {
             const n = try self.w.w8.convert(allocator, &self.w.map, .{ .base = "decoder.layers.0.self_attn.q_proj", .in_features = self.cfg.hidden }, self.s);
             log.info("[acestep] int8: {d} DiT linears\n", .{n});
         }
@@ -2071,7 +2071,7 @@ pub const Engine = struct {
     /// Build the per-DiT-block ANE programs for a run of `seq_len` tokens.
     /// Never fails the request: every refusal is a NAMED `[ane]` line.
     pub fn buildAne(self: *Engine, seq_len: u32) void {
-        if (self.ane_eng != null or !ane.media_offload.audio) return;
+        if (self.ane_eng != null or !ane.aneState().media_offload.audio) return;
         if (!ane.available()) {
             log.warn("[ane] audio offload: AppleNeuralEngine framework not present — GPU only\n", .{});
             return;
@@ -3331,13 +3331,13 @@ test "ACE-Step DiT: the w8a8 route stays within its bar of the packed forward" {
     const model_dir = std.mem.span(std.c.getenv("ACESTEP_TEST_MODEL") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    const prev = w8a8.enabled;
-    defer w8a8.enabled = prev;
-    w8a8.enabled = false;
+    const prev = w8a8.w8a8State().enabled;
+    defer w8a8.w8a8State().enabled = prev;
+    w8a8.w8a8State().enabled = false;
     var packed_bytes: usize = 0;
     const want = try aceProbe(io, a, model_dir, &packed_bytes);
     defer _ = mlx.mlx_array_free(want);
-    w8a8.enabled = true;
+    w8a8.w8a8State().enabled = true;
     var int8_bytes: usize = 0;
     const got = try aceProbe(io, a, model_dir, &int8_bytes);
     defer _ = mlx.mlx_array_free(got);

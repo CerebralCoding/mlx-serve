@@ -639,7 +639,7 @@ pub const EditGeometry = struct {
             }
             if (blk + 1 == shapes.len) {
                 target_start = e0;
-                @memset(tgtm[e0..e0 + h * w], 1);
+                @memset(tgtm[e0 .. e0 + h * w], 1);
             } else {
                 // The target block is not a prefix segment: its rows are the
                 // maskless target query range.
@@ -874,7 +874,7 @@ pub const Dit = struct {
             try b.out.toW8a8(s);
             b.qkv = try w8a8.fuse(&.{ &b.q.w8, &b.k.w8, &b.v.w8 }, .stack, s);
             b.gp = try w8a8.fuse(&.{ &b.gate.w8, &b.proj.w8 }, .interleave, s);
-            if (w8a8.enabled) w.dropBlock("transformer_blocks.{d}.", i);
+            if (w8a8.w8a8State().enabled) w.dropBlock("transformer_blocks.{d}.", i);
         }
         return self;
     }
@@ -1010,7 +1010,7 @@ pub const Dit = struct {
         defer if (full_v) |a| free(a);
         const qi = try sliceAxis(q, 2, T, sh[1], s);
         defer free(qi);
-        if (w8a8.enabled) if (try int8_attn.attention(qi, full_k orelse k, full_v orelse v, scale, s)) |img8| {
+        if (w8a8.w8a8State().enabled) if (try int8_attn.attention(qi, full_k orelse k, full_v orelse v, scale, s)) |img8| {
             defer free(img8);
             const all = if (T == 0) try contig(img8, s) else blk: {
                 const qt = try sliceAxis(q, 2, 0, T, s);
@@ -2104,8 +2104,8 @@ pub const Engine = struct {
         logMemory("load");
 
         log.info("[image] Qwen-Image-2.1 ready (DiT {d}×{d} {s}, VAE {d}ch /{d}, text encoder {s}, {d} steps{s})\n", .{
-            self.dit_cfg.layers, self.dit_cfg.hidden(), @tagName(self.dit.dtype),
-            self.vae_cfg.z_dim,  VAE_DOWNSAMPLE,        if (staged) "staged per request" else "resident",
+            self.dit_cfg.layers, self.dit_cfg.hidden(),                                         @tagName(self.dit.dtype),
+            self.vae_cfg.z_dim,  VAE_DOWNSAMPLE,                                                if (staged) "staged per request" else "resident",
             self.stepsFor(0),    if (self.sample_sigmas != null) " from sample_sigmas" else "",
         });
         return self;
@@ -2321,10 +2321,7 @@ pub const Engine = struct {
     /// target. Mirrors `generateImage`'s conventions (seeded noise, Euler
     /// sigma loop, real CFG blend, per-step progress, banded VAE decode).
     /// Returns the image [1,3,H,W] f32 in [0,1] (owned; caller frees).
-    pub fn editImage(self: *Engine, allocator: std.mem.Allocator, prompt: []const u8,
-        image_bytes: []const []const u8, out_w: u32, out_h: u32, seed: u64, steps: u32,
-        opts: EditOpts, progress: ?sse.Progress) !mlx.mlx_array
-    {
+    pub fn editImage(self: *Engine, allocator: std.mem.Allocator, prompt: []const u8, image_bytes: []const []const u8, out_w: u32, out_h: u32, seed: u64, steps: u32, opts: EditOpts, progress: ?sse.Progress) !mlx.mlx_array {
         if (!self.has_tower) return error.QwenEditNotImplemented;
         if (image_bytes.len == 0) return error.NoReferenceImages;
         const a = allocator;
@@ -2337,7 +2334,7 @@ pub const Engine = struct {
         const z: c_int = @intCast(self.dit_cfg.in_ch);
 
         log.info("[qwen-image] edit {d}x{d} refs={d} steps={d} guidance={d:.1} refres={d} ({s})\n", .{
-            out_w,                      out_h,  image_bytes.len, n_steps, opts.guidance_scale, opts.ref_resolution,
+            out_w,                                                                               out_h, image_bytes.len, n_steps, opts.guidance_scale, opts.ref_resolution,
             if (opts.guidance_scale != 1.0) "two forwards per step" else "one forward per step",
         });
         if (progress) |p| p.emit("Encoding prompt", 0, n_steps);
@@ -2854,7 +2851,15 @@ test "QwenImage edit scaffold: no capability by default, editImage refuses" {
     };
     try testing.expect(!e.supportsEdit());
     try testing.expectError(error.QwenEditNotImplemented, e.editImage(
-        testing.allocator, "make the sky red", &.{"stub bytes"}, 512, 512, 7, 4, .{}, null,
+        testing.allocator,
+        "make the sky red",
+        &.{"stub bytes"},
+        512,
+        512,
+        7,
+        4,
+        .{},
+        null,
     ));
 }
 
@@ -3183,13 +3188,13 @@ test "QwenImage DiT: the w8a8 route stays within its bar of the packed forward" 
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     const cfg = try DitConfig.parse(io, a, dir);
-    const prev = w8a8.enabled;
-    defer w8a8.enabled = prev;
-    w8a8.enabled = false;
+    const prev = w8a8.w8a8State().enabled;
+    defer w8a8.w8a8State().enabled = prev;
+    w8a8.w8a8State().enabled = false;
     var packed_bytes: usize = 0;
     const want = try qwenProbe(io, a, s, dir, cfg, &packed_bytes);
     defer free(want);
-    w8a8.enabled = true;
+    w8a8.w8a8State().enabled = true;
     var int8_bytes: usize = 0;
     const got = try qwenProbe(io, a, s, dir, cfg, &int8_bytes);
     defer free(got);
@@ -3203,9 +3208,9 @@ test "QwenImage DiT: the w8a8 route stays within its bar of the packed forward" 
 
 test "QwenImage block: an adapter on the fused int8 gate/proj equals the same adapter on the separate projections" {
     if (!@import("../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
-    const prev = w8a8.enabled;
-    defer w8a8.enabled = prev;
-    w8a8.enabled = true;
+    const prev = w8a8.w8a8State().enabled;
+    defer w8a8.w8a8State().enabled = prev;
+    w8a8.w8a8State().enabled = true;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     var dit = try TinyPrefixModel.init(.bfloat16, s); // only its stream and dtype are read
@@ -3812,7 +3817,15 @@ test "QwenImage edit e2e towerless refuses (env-gated)" {
     const refs = try editE2eRefs(a);
     defer for (refs) |p| a.free(p);
     try testing.expectError(error.QwenEditNotImplemented, engine.editImage(
-        a, "make the fox wear a tiny hat", &refs, 256, 256, 42, 2, .{}, null,
+        a,
+        "make the fox wear a tiny hat",
+        &refs,
+        256,
+        256,
+        42,
+        2,
+        .{},
+        null,
     ));
 }
 

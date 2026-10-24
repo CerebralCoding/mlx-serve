@@ -1228,16 +1228,24 @@ test "wired fit target: zero headroom, clamped, declines empty" {
 // already caught the exception, so a Metal working-set OOM killed the server (#353).
 // Our handler latches the message and returns; the engine raises a named error at its
 // next checkpoint and the process stays serviceable.
-var mlx_error_latched = std.atomic.Value(bool).init(false);
-var mlx_error_buf: [512]u8 = undefined;
-var mlx_error_len: usize = 0;
-/// pthread mutex: mlx-c calls the handler from whatever thread raised, none carry an `Io`.
-var mlx_error_mtx: os_mutex.Mutex = .{};
+/// Process-wide under `-Dunits` (sdk/util/shared.zig): one copy in the host.
+const LatchState = struct {
+    mlx_error_latched: std.atomic.Value(bool) = .init(false),
+    mlx_error_buf: [512]u8 = undefined,
+    mlx_error_len: usize = 0,
+    /// pthread mutex: mlx-c calls the handler from whatever thread raised, none carry an `Io`.
+    mlx_error_mtx: os_mutex.Mutex = .{},
+    gpu_context_lost: std.atomic.Value(bool) = .init(false),
+};
+const latch_shared = @import("../sdk/util/shared.zig").Shared(LatchState, "mlx_error_latch", .{});
+inline fn latch() *LatchState {
+    return latch_shared.get();
+}
 fn lockErrBuf() void {
-    mlx_error_mtx.lock();
+    latch().mlx_error_mtx.lock();
 }
 fn unlockErrBuf() void {
-    mlx_error_mtx.unlock();
+    latch().mlx_error_mtx.unlock();
 }
 
 /// Memory-class latched messages become a memory 503 (`[METAL] ... Insufficient Memory`,
@@ -1276,15 +1284,13 @@ pub fn mlxErrorIsContextLost(msg: []const u8) bool {
     return false;
 }
 
-var gpu_context_lost = std.atomic.Value(bool).init(false);
-
 /// True once the latch has seen a sticky CUDA error: requests are refused, /health says so.
 pub fn gpuContextLost() bool {
-    return gpu_context_lost.load(.acquire);
+    return latch().gpu_context_lost.load(.acquire);
 }
 
 pub fn resetGpuContextLostForTest() void {
-    gpu_context_lost.store(false, .release);
+    latch().gpu_context_lost.store(false, .release);
 }
 
 fn latchMlxError(msg: [*:0]const u8, data: ?*anyopaque) callconv(.c) void {
@@ -1292,16 +1298,16 @@ fn latchMlxError(msg: [*:0]const u8, data: ?*anyopaque) callconv(.c) void {
     const span = std.mem.span(msg);
     lockErrBuf();
     defer unlockErrBuf();
-    if (!gpu_context_lost.load(.acquire) and mlxErrorIsContextLost(span)) {
-        gpu_context_lost.store(true, .release);
+    if (!latch().gpu_context_lost.load(.acquire) and mlxErrorIsContextLost(span)) {
+        latch().gpu_context_lost.store(true, .release);
         log.err("[mlx] GPU context lost: every request is refused until the server restarts\n", .{});
     }
     // First error wins: follow-on noise from a poisoned stream must not hide the cause.
-    if (!mlx_error_latched.load(.acquire)) {
-        const n = @min(span.len, mlx_error_buf.len);
-        @memcpy(mlx_error_buf[0..n], span[0..n]);
-        mlx_error_len = n;
-        mlx_error_latched.store(true, .release);
+    if (!latch().mlx_error_latched.load(.acquire)) {
+        const n = @min(span.len, latch().mlx_error_buf.len);
+        @memcpy(latch().mlx_error_buf[0..n], span[0..n]);
+        latch().mlx_error_len = n;
+        latch().mlx_error_latched.store(true, .release);
     }
     log.err("[mlx] {s}\n", .{span});
 }
@@ -1313,39 +1319,39 @@ pub fn installErrorHandler() void {
 
 /// True when an MLX call has failed since the last `takeError`.
 pub fn errorPending() bool {
-    return mlx_error_latched.load(.acquire);
+    return latch().mlx_error_latched.load(.acquire);
 }
 
 /// Peek the latch without consuming it: the name of the error `checkError` would raise, or
 /// null. A slot finish must not answer 200 over a failed forward, yet must leave the latch
 /// for the decode-tick wrapper that fails the rest of a batched group.
 pub fn peekErrorName() ?[]const u8 {
-    if (!mlx_error_latched.load(.acquire)) return null;
+    if (!latch().mlx_error_latched.load(.acquire)) return null;
     lockErrBuf();
     defer unlockErrBuf();
-    return if (mlxErrorIsMemory(mlx_error_buf[0..mlx_error_len])) "OutOfMemory" else "MlxFailure";
+    return if (mlxErrorIsMemory(latch().mlx_error_buf[0..latch().mlx_error_len])) "OutOfMemory" else "MlxFailure";
 }
 
 /// Consume the latched message into `buf` (copied), clearing the latch.
 pub fn takeError(buf: []u8) ?[]const u8 {
-    if (!mlx_error_latched.load(.acquire)) return null;
+    if (!latch().mlx_error_latched.load(.acquire)) return null;
     lockErrBuf();
     defer unlockErrBuf();
-    const n = @min(mlx_error_len, buf.len);
-    @memcpy(buf[0..n], mlx_error_buf[0..n]);
-    mlx_error_len = 0;
-    mlx_error_latched.store(false, .release);
+    const n = @min(latch().mlx_error_len, buf.len);
+    @memcpy(buf[0..n], latch().mlx_error_buf[0..n]);
+    latch().mlx_error_len = 0;
+    latch().mlx_error_latched.store(false, .release);
     return buf[0..n];
 }
 
 /// Consume the latch only when its message contains `needle`; any other error stays latched.
 pub fn takeErrorIf(needle: []const u8) bool {
-    if (!mlx_error_latched.load(.acquire)) return false;
+    if (!latch().mlx_error_latched.load(.acquire)) return false;
     lockErrBuf();
     defer unlockErrBuf();
-    if (std.mem.indexOf(u8, mlx_error_buf[0..mlx_error_len], needle) == null) return false;
-    mlx_error_len = 0;
-    mlx_error_latched.store(false, .release);
+    if (std.mem.indexOf(u8, latch().mlx_error_buf[0..latch().mlx_error_len], needle) == null) return false;
+    latch().mlx_error_len = 0;
+    latch().mlx_error_latched.store(false, .release);
     return true;
 }
 
@@ -1406,7 +1412,7 @@ var fault_step = FaultSite{ .env = "MLX_SERVE_MLX_FAULT_STEP", .msg = FAULT_STEP
 
 /// Consume a latched failure: `error.OutOfMemory` for the memory class, else `error.MlxFailure`.
 fn consumeLatch() !void {
-    if (!mlx_error_latched.load(.acquire)) return;
+    if (!latch().mlx_error_latched.load(.acquire)) return;
     var buf: [512]u8 = undefined;
     const msg = takeError(&buf) orelse return;
     if (mlxErrorIsMemory(msg)) return error.OutOfMemory;

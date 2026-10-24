@@ -26,8 +26,8 @@ pub const Qwen4FwdProf = struct {
         const timing = diagEnvOn("QWEN4_PROFILE_FWD") and (all or (seq_len >= 2 and seq_len <= 16));
         var p: Qwen4FwdProf = .{ .timing = timing, .ops = diagEnvOn("QWEN4_OPCOUNT"), .clock = ProfClock.init() };
         if (p.ops) {
-            gather_qmv_rows.moe_rows_fused_layers = 0;
-            gather_qmv_rows.moe_sorted_layers = 0;
+            gather_qmv_rows.moeStats().moe_rows_fused_layers = 0;
+            gather_qmv_rows.moeStats().moe_sorted_layers = 0;
         }
         if (timing) {
             try mlx.check(mlx.mlx_array_eval(h));
@@ -61,7 +61,7 @@ pub const Qwen4FwdProf = struct {
     }
 
     pub fn report(self: *const Qwen4FwdProf, seq_len: c_int, kv: usize, capture: bool, gdn_layers: u32, attn_layers: u32) void {
-        if (self.ops) log.info("[qwen4-ops] S={d} ple {d} hcRead {d} gdn {d} attn {d} hcWrite {d} mlp {d} moeFused {d} moeSorted {d}\n", .{ seq_len, self.op_ns[0], self.op_ns[1], self.op_ns[2], self.op_ns[3], self.op_ns[4], self.op_ns[5], gather_qmv_rows.moe_rows_fused_layers, gather_qmv_rows.moe_sorted_layers });
+        if (self.ops) log.info("[qwen4-ops] S={d} ple {d} hcRead {d} gdn {d} attn {d} hcWrite {d} mlp {d} moeFused {d} moeSorted {d}\n", .{ seq_len, self.op_ns[0], self.op_ns[1], self.op_ns[2], self.op_ns[3], self.op_ns[4], self.op_ns[5], gather_qmv_rows.moeStats().moe_rows_fused_layers, gather_qmv_rows.moeStats().moe_sorted_layers });
         if (!self.timing) return;
         const ms = struct {
             fn f(n: u64) f64 {

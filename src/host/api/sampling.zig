@@ -23,9 +23,9 @@ const Sampling = struct { temperature: f32, top_p: f32, top_k: u32, min_p: ?f32,
 /// value of 0 (greedy / disabled) is a value, not an omission.
 pub fn resolveSampling(gen: generation_settings.Profile, root: std.json.ObjectMap, config: *const model_mod.ModelConfig) Sampling {
     return .{
-        .temperature = gen.resolve(f32, .temperature, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), http_server.server_config.default_temperature orelse config.gen_temperature orelse 1.0),
-        .top_p = gen.resolve(f32, .top_p, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), http_server.server_config.default_top_p orelse config.gen_top_p orelse 1.0),
-        .top_k = gen.resolve(u32, .top_k, parseJsonTopKOpt(root, "top_k"), http_server.server_config.default_top_k orelse config.gen_top_k orelse 0),
+        .temperature = gen.resolve(f32, .temperature, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), http_server.serverState().server_config.default_temperature orelse config.gen_temperature orelse 1.0),
+        .top_p = gen.resolve(f32, .top_p, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), http_server.serverState().server_config.default_top_p orelse config.gen_top_p orelse 1.0),
+        .top_k = gen.resolve(u32, .top_k, parseJsonTopKOpt(root, "top_k"), http_server.serverState().server_config.default_top_k orelse config.gen_top_k orelse 0),
         .min_p = gen.resolveOpt(f32, .min_p, parseJsonFloatOpt(root, "min_p", 0.0, 1.0), config.gen_min_p),
         .repeat_penalty = requestRepeatPenalty(root, gen),
         .presence_penalty = gen.resolve(f32, .presence_penalty, parseJsonFloatOpt(root, "presence_penalty", 0.0, 2.0), 0.0),
@@ -103,7 +103,7 @@ const AUTO_MAX_TOKENS_SENTINEL: u32 = std.math.maxInt(u32) / 4;
 
 /// The one read of `ServerConfig.default_max_tokens`. 0 = flag not given.
 pub fn launchMaxTokensDefault() u32 {
-    return http_server.server_config.default_max_tokens;
+    return http_server.serverState().server_config.default_max_tokens;
 }
 
 /// Resolve a request's `max_tokens` (or its aliases) to an effective cap.
@@ -299,9 +299,9 @@ test "parseJsonFloat handles integer value" {
 }
 
 test "clampMaxTokens honors the effective context (auto-pinned, not just --ctx-size)" {
-    const original = http_server.server_config.max_context_size;
-    defer http_server.server_config.max_context_size = original;
-    http_server.server_config.max_context_size = 0; // auto: the old code never clamped here
+    const original = http_server.serverState().server_config.max_context_size;
+    defer http_server.serverState().server_config.max_context_size = original;
+    http_server.serverState().server_config.max_context_size = 0; // auto: the old code never clamped here
 
     // 4096-token window, 4000-token prompt -> only 96 tokens of generation left.
     try testing.expectEqual(@as(u32, 96), clampMaxTokens(8192, 4000, 4096));
@@ -315,13 +315,13 @@ test "clampMaxTokens honors the effective context (auto-pinned, not just --ctx-s
 }
 
 test "omittedMaxTokensDefault: context-bound when ctx is known, finite fallback otherwise" {
-    const original = http_server.server_config.max_context_size;
-    defer http_server.server_config.max_context_size = original;
+    const original = http_server.serverState().server_config.max_context_size;
+    defer http_server.serverState().server_config.max_context_size = original;
 
     // OpenAI semantics: omitted max_tokens = generate until EOS bounded by the
     // context window. The old fixed 256 default broke agent clients (pi) whose
     // thinking-enabled turns hit `length` mid-reasoning on EVERY request.
-    http_server.server_config.max_context_size = 32768;
+    http_server.serverState().server_config.max_context_size = 32768;
     const sentinel = omittedMaxTokensDefault(32768);
     // Big enough that clampMaxTokens (the downstream bound) always wins…
     try testing.expect(sentinel > 32768);
@@ -330,7 +330,7 @@ test "omittedMaxTokensDefault: context-bound when ctx is known, finite fallback 
 
     // ctx unknown (max_context_size=0): clampMaxTokens won't bound anything,
     // so the default itself must stay finite.
-    http_server.server_config.max_context_size = 0;
+    http_server.serverState().server_config.max_context_size = 0;
     try testing.expectEqual(@as(u32, 4096), omittedMaxTokensDefault(0));
 }
 
@@ -368,7 +368,7 @@ test "--max-tokens is the omitted-field default: unset is byte-identical, set wi
     try t.expectEqual(@as(u32, 65536), resolveRequestMaxTokens(.{ .integer = 0 }, auto));
 
     // The live wrapper reads the ServerConfig field through the one accessor.
-    const slot = &@field(http_server.server_config, "default_max_tokens");
+    const slot = &@field(http_server.serverState().server_config, "default_max_tokens");
     const orig = slot.*;
     defer slot.* = orig;
     slot.* = 0;
@@ -457,35 +457,35 @@ test "an omitted max_tokens reserves the LAUNCH default, not the whole window" {
 }
 
 test "clampMaxTokens no limit when ctx_size=0" {
-    const original = http_server.server_config.max_context_size;
-    defer http_server.server_config.max_context_size = original;
-    http_server.server_config.max_context_size = 0;
+    const original = http_server.serverState().server_config.max_context_size;
+    defer http_server.serverState().server_config.max_context_size = original;
+    http_server.serverState().server_config.max_context_size = 0;
 
     try testing.expectEqual(@as(u32, 1000), clampMaxTokens(1000, 500, 0));
 }
 
 test "clampMaxTokens clamps when would exceed" {
-    const original = http_server.server_config.max_context_size;
-    defer http_server.server_config.max_context_size = original;
-    http_server.server_config.max_context_size = 4096;
+    const original = http_server.serverState().server_config.max_context_size;
+    defer http_server.serverState().server_config.max_context_size = original;
+    http_server.serverState().server_config.max_context_size = 4096;
 
     // prompt=3000, max_tokens=2000 → clamp to 1096
     try testing.expectEqual(@as(u32, 1096), clampMaxTokens(2000, 3000, 4096));
 }
 
 test "clampMaxTokens no clamp when fits" {
-    const original = http_server.server_config.max_context_size;
-    defer http_server.server_config.max_context_size = original;
-    http_server.server_config.max_context_size = 4096;
+    const original = http_server.serverState().server_config.max_context_size;
+    defer http_server.serverState().server_config.max_context_size = original;
+    http_server.serverState().server_config.max_context_size = 4096;
 
     // prompt=100, max_tokens=200 → fits, no clamp
     try testing.expectEqual(@as(u32, 200), clampMaxTokens(200, 100, 4096));
 }
 
 test "clampMaxTokens at boundary" {
-    const original = http_server.server_config.max_context_size;
-    defer http_server.server_config.max_context_size = original;
-    http_server.server_config.max_context_size = 4096;
+    const original = http_server.serverState().server_config.max_context_size;
+    defer http_server.serverState().server_config.max_context_size = original;
+    http_server.serverState().server_config.max_context_size = 4096;
 
     // prompt=4096 → only 1 token allowed
     try testing.expectEqual(@as(u32, 1), clampMaxTokens(100, 4096, 4096));

@@ -71,8 +71,15 @@ var gateup_rows_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var gateup_rows_cfg_key: GateUpRowsCfgKey = std.mem.zeroes(GateUpRowsCfgKey);
 var gqmv_gateup_rows_engaged: bool = false;
 
-pub var moe_rows_fused_layers: u32 = 0;
-pub var moe_sorted_layers: u32 = 0;
+/// Process-wide under `-Dunits` (sdk/util/shared.zig): one copy in the host.
+const MoeStatsState = struct {
+    moe_rows_fused_layers: u32 = 0,
+    moe_sorted_layers: u32 = 0,
+};
+const moeStats_shared = @import("../../util/shared.zig").Shared(MoeStatsState, "moe_rows_stats", .{});
+pub inline fn moeStats() *MoeStatsState {
+    return moeStats_shared.get();
+}
 
 pub fn moeRowsFusedEnabled() bool {
     return transformer.moe_rows_fused_override orelse true;
@@ -304,7 +311,6 @@ test "moe decode dispatch: single-slot verify widths take the rows arm when enab
     standin.qwen4_standin_override = .{};
     moe_verify_rows_override = false;
     try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 4, K, false, false));
-
 }
 
 test "gatherQmvGateUpRows accepts N=8 K=10" {

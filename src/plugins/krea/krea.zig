@@ -204,7 +204,6 @@ const MixedLinear = struct {
         return g.matmul(xb, self.w);
     }
 
-
     fn outFeatures(self: *const MixedLinear) u32 {
         if (self.w8) |q| return @intCast(q.n);
         return @intCast(if (self.quantized) mlx.getShape(self.w)[0] else mlx.getShape(self.w)[1]);
@@ -684,7 +683,7 @@ const Attention = struct {
         const L: c_int = ops.shape(qkv)[1];
         const h = try self.projectHeads(&g, qkv, cos, sin);
         const scale: f32 = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(self.head_dim)));
-        const attn8 = if (w8a8.enabled and mask == null) try int8_attn.attention(h.q, h.k, h.v, scale, g.s) else null;
+        const attn8 = if (w8a8.w8a8State().enabled and mask == null) try int8_attn.attention(h.q, h.k, h.v, scale, g.s) else null;
         const merged = if (attn8) |a8|
             try g.adopt(a8)
         else
@@ -1090,13 +1089,12 @@ pub const Dit = struct {
         return parent.keep(try self.txtmlp3.forward(&g, try gelu.geluTanh(&g, l1, .float32, gelu.SQRT_2_PI)));
     }
 
-
     /// Build the per-block ANE programs once the run's token count is known.
     /// Never fails the request: every refusal is a NAMED `[ane]` line and the
     /// DiT runs GPU-only.
     fn aneEnsure(self: *Dit, seq: u32, s: S) void {
         if (self.ane_tried) return;
-        if (!ane.media_offload.image) return;
+        if (!ane.aneState().media_offload.image) return;
         if (!ane.available()) {
             self.ane_tried = true;
             log.warn("[ane] image offload: AppleNeuralEngine framework not present — GPU only\n", .{});
@@ -1301,12 +1299,12 @@ pub fn loadDit(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []cons
             .attn = try Attention.load(&w, allocator, attnk, feat, cfg.heads, cfg.kvheads, hd, s),
             .mlp = try SwiGLU.load(&w, allocator, mlpk, feat, mlpdim, s),
         };
-        if (!ane.media_offload.image) { // the ANE seam reads the packed weights
+        if (!ane.aneState().media_offload.image) { // the ANE seam reads the packed weights
             inline for (.{ &b.attn.wq, &b.attn.wk, &b.attn.wv, &b.attn.gate, &b.attn.wo, &b.mlp.gate, &b.mlp.up }) |l| try l.toW8a8(s);
             try b.mlp.down.toW8a8(s);
             try b.attn.fuseW8a8(s);
             try b.mlp.fuseW8a8(s);
-            if (w8a8.enabled) w.dropBlock("blocks.{d}.", i);
+            if (w8a8.w8a8State().enabled) w.dropBlock("blocks.{d}.", i);
         }
     }
 
@@ -1349,11 +1347,10 @@ pub fn attachLora(dit: *Dit, stack_arg: *const lora_mod.Stack) u32 {
     // Main 28 blocks
     for (dit.blocks, 0..) |*b, i| {
         const mods = .{
-            .{ "attn.wq", &b.attn.wq },   .{ "attn.wk", &b.attn.wk },
-            .{ "attn.wv", &b.attn.wv },   .{ "attn.gate", &b.attn.gate },
-            .{ "attn.wo", &b.attn.wo },
-            .{ "mlp.gate", &b.mlp.gate }, .{ "mlp.up", &b.mlp.up },
-            .{ "mlp.down", &b.mlp.down },
+            .{ "attn.wq", &b.attn.wq }, .{ "attn.wk", &b.attn.wk },
+            .{ "attn.wv", &b.attn.wv }, .{ "attn.gate", &b.attn.gate },
+            .{ "attn.wo", &b.attn.wo }, .{ "mlp.gate", &b.mlp.gate },
+            .{ "mlp.up", &b.mlp.up },   .{ "mlp.down", &b.mlp.down },
         };
         inline for (mods) |m| {
             const key = std.fmt.bufPrint(&kbuf, "blocks.{d}.{s}", .{ i, m[0] }) catch "";
@@ -1370,9 +1367,8 @@ pub fn attachLora(dit: *Dit, stack_arg: *const lora_mod.Stack) u32 {
         const mods = .{
             .{ "attn.wq", &lb.attn.wq }, .{ "attn.wk", &lb.attn.wk },
             .{ "attn.wv", &lb.attn.wv }, .{ "attn.gate", &lb.attn.gate },
-            .{ "attn.wo", &lb.attn.wo },
-            .{ "mlp.gate", &lb.mlp.gate }, .{ "mlp.up", &lb.mlp.up },
-            .{ "mlp.down", &lb.mlp.down },
+            .{ "attn.wo", &lb.attn.wo }, .{ "mlp.gate", &lb.mlp.gate },
+            .{ "mlp.up", &lb.mlp.up },   .{ "mlp.down", &lb.mlp.down },
         };
         inline for (mods) |m| {
             const key = std.fmt.bufPrint(&kbuf, "txtfusion.layerwise_blocks.{d}.{s}", .{ i, m[0] }) catch "";
@@ -1389,9 +1385,8 @@ pub fn attachLora(dit: *Dit, stack_arg: *const lora_mod.Stack) u32 {
         const mods = .{
             .{ "attn.wq", &rb.attn.wq }, .{ "attn.wk", &rb.attn.wk },
             .{ "attn.wv", &rb.attn.wv }, .{ "attn.gate", &rb.attn.gate },
-            .{ "attn.wo", &rb.attn.wo },
-            .{ "mlp.gate", &rb.mlp.gate }, .{ "mlp.up", &rb.mlp.up },
-            .{ "mlp.down", &rb.mlp.down },
+            .{ "attn.wo", &rb.attn.wo }, .{ "mlp.gate", &rb.mlp.gate },
+            .{ "mlp.up", &rb.mlp.up },   .{ "mlp.down", &rb.mlp.down },
         };
         inline for (mods) |m| {
             const key = std.fmt.bufPrint(&kbuf, "txtfusion.refiner_blocks.{d}.{s}", .{ i, m[0] }) catch "";
@@ -2087,7 +2082,6 @@ pub const Engine = struct {
         defer allocator.free(pr.mask);
         return self.generateWithOpts(allocator, pr.ids, pr.mask, seed, steps, width, height, opts, progress);
     }
-
 };
 
 /// [1,3/4,H,W] f32 [0,1] → RGB/RGBA8 PNG bytes (caller frees).
@@ -2438,9 +2432,9 @@ fn toySwiglu(seed: u64, s: S) !SwiGLU {
 
 test "krea SwiGLU: an adapter on the fused int8 gate/up equals the same adapter on the separate projections" {
     if (!@import("../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
-    const prev = w8a8.enabled;
-    defer w8a8.enabled = prev;
-    w8a8.enabled = true;
+    const prev = w8a8.w8a8State().enabled;
+    defer w8a8.w8a8State().enabled = prev;
+    w8a8.w8a8State().enabled = true;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     var tg = Graph.init(testing.allocator, s);
@@ -2582,13 +2576,13 @@ test "krea DiT: the w8a8 route stays within its bar of the packed forward" {
     const io = std.Io.Threaded.global_single_threaded.io();
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
-    const prev = w8a8.enabled;
-    defer w8a8.enabled = prev;
-    w8a8.enabled = false;
+    const prev = w8a8.w8a8State().enabled;
+    defer w8a8.w8a8State().enabled = prev;
+    w8a8.w8a8State().enabled = false;
     var packed_bytes: usize = 0;
     const want = try kreaProbe(io, a, s, model_dir, &packed_bytes);
     defer _ = mlx.mlx_array_free(want);
-    w8a8.enabled = true;
+    w8a8.w8a8State().enabled = true;
     var int8_bytes: usize = 0;
     const got = try kreaProbe(io, a, s, model_dir, &int8_bytes);
     defer _ = mlx.mlx_array_free(got);

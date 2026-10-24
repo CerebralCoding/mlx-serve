@@ -331,7 +331,6 @@ const TeLayer = struct {
     }
 };
 
-
 pub const TextEncoder = struct {
     cfg: FluxConfig,
     allocator: std.mem.Allocator,
@@ -465,26 +464,41 @@ pub fn loadTextEncoder(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir
     return te;
 }
 
-
 // ── DiT: double-stream blocks (text and image apart, joint attention), then single-stream blocks over the joint
 // sequence [text, image]; one modulation per stream kind, shared by every block ──
 
 const DoubleBlock = struct {
-    q: QLinear, k: QLinear, v: QLinear, o: QLinear,
-    add_q: QLinear, add_k: QLinear, add_v: QLinear, add_o: QLinear,
-    nq: mlx.mlx_array, nk: mlx.mlx_array, naq: mlx.mlx_array, nak: mlx.mlx_array,
-    ff_in: QLinear, ff_out: QLinear,
-    ffc_in: QLinear, ffc_out: QLinear,
+    q: QLinear,
+    k: QLinear,
+    v: QLinear,
+    o: QLinear,
+    add_q: QLinear,
+    add_k: QLinear,
+    add_v: QLinear,
+    add_o: QLinear,
+    nq: mlx.mlx_array,
+    nk: mlx.mlx_array,
+    naq: mlx.mlx_array,
+    nak: mlx.mlx_array,
+    ff_in: QLinear,
+    ff_out: QLinear,
+    ffc_in: QLinear,
+    ffc_out: QLinear,
     fn deinit(self: *DoubleBlock) void {
-        inline for (.{"q","k","v","o","add_q","add_k","add_v","add_o","ff_in","ff_out","ffc_in","ffc_out"}) |f| @field(self, f).deinit();
-        inline for (.{"nq","nk","naq","nak"}) |f| _ = mlx.mlx_array_free(@field(self, f));
+        inline for (.{ "q", "k", "v", "o", "add_q", "add_k", "add_v", "add_o", "ff_in", "ff_out", "ffc_in", "ffc_out" }) |f| @field(self, f).deinit();
+        inline for (.{ "nq", "nk", "naq", "nak" }) |f| _ = mlx.mlx_array_free(@field(self, f));
     }
 };
 const SingleBlock = struct {
-    qkv_mlp: QLinear, o: QLinear, nq: mlx.mlx_array, nk: mlx.mlx_array,
+    qkv_mlp: QLinear,
+    o: QLinear,
+    nq: mlx.mlx_array,
+    nk: mlx.mlx_array,
     fn deinit(self: *SingleBlock) void {
-        self.qkv_mlp.deinit(); self.o.deinit();
-        _ = mlx.mlx_array_free(self.nq); _ = mlx.mlx_array_free(self.nk);
+        self.qkv_mlp.deinit();
+        self.o.deinit();
+        _ = mlx.mlx_array_free(self.nq);
+        _ = mlx.mlx_array_free(self.nk);
     }
 };
 
@@ -494,22 +508,30 @@ pub const Dit = struct {
     s: S,
     x_embedder: QLinear,
     context_embedder: QLinear,
-    t_lin1: QLinear, t_lin2: QLinear,
-    mod_img: QLinear, mod_txt: QLinear, mod_single: QLinear,
+    t_lin1: QLinear,
+    t_lin2: QLinear,
+    mod_img: QLinear,
+    mod_txt: QLinear,
+    mod_single: QLinear,
     doubles: []DoubleBlock,
     singles: []SingleBlock,
     norm_out_lin: QLinear,
     proj_out: QLinear,
 
     pub fn deinit(self: *Dit) void {
-        self.x_embedder.deinit(); self.context_embedder.deinit();
-        self.t_lin1.deinit(); self.t_lin2.deinit();
-        self.mod_img.deinit(); self.mod_txt.deinit(); self.mod_single.deinit();
+        self.x_embedder.deinit();
+        self.context_embedder.deinit();
+        self.t_lin1.deinit();
+        self.t_lin2.deinit();
+        self.mod_img.deinit();
+        self.mod_txt.deinit();
+        self.mod_single.deinit();
         for (self.doubles) |*b| b.deinit();
         self.allocator.free(self.doubles);
         for (self.singles) |*b| b.deinit();
         self.allocator.free(self.singles);
-        self.norm_out_lin.deinit(); self.proj_out.deinit();
+        self.norm_out_lin.deinit();
+        self.proj_out.deinit();
     }
 
     /// Interleaved-RoPE cos/sin [seq, 64] from position ids [seq, 4] (t, h, w, l), 16 frequencies per axis.
@@ -666,7 +688,7 @@ fn attention(parent: *Graph, q: Array, k: Array, v: Array, ctx: StepCtx) !Array 
     const kr = try rope_blk.ropePairs(&g, k, ctx.cos, ctx.sin, .bfloat16);
     const out_sh = [_]c_int{ 1, ctx.nj, ctx.heads * ctx.hd };
     const scale: f32 = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(ctx.hd)));
-    if (w8a8.enabled) if (try int8_attn.attention(qr, kr, v, scale, g.s)) |o|
+    if (w8a8.w8a8State().enabled) if (try int8_attn.attention(qr, kr, v, scale, g.s)) |o|
         return parent.keep(try g.reshape(try g.adopt(o), &out_sh));
     const at = try g.transpose(try g.sdpa(qr, kr, v, scale, .none), &.{ 0, 2, 1, 3 });
     return parent.keep(try g.reshape(at, &out_sh));
@@ -746,7 +768,8 @@ pub fn loadDit(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []cons
     log.info("[flux] dit: inner={d} heads={d}x{d} double={d} single={d} joint={d}\n", .{
         d.cfg.inner_dim, d.cfg.heads, d.cfg.head_dim, d.cfg.double_layers, d.cfg.single_layers, d.cfg.joint_dim,
     });
-    d.allocator = allocator; d.s = s;
+    d.allocator = allocator;
+    d.s = s;
     d.x_embedder = try QLinear.load(&w, allocator, "x_embedder");
     d.context_embedder = try QLinear.load(&w, allocator, "context_embedder");
     d.t_lin1 = try QLinear.load(&w, allocator, "time_guidance_embed.linear_1");
@@ -758,23 +781,29 @@ pub fn loadDit(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []cons
     d.proj_out = try QLinear.load(&w, allocator, "proj_out");
     d.doubles = try allocator.alloc(DoubleBlock, d.cfg.double_layers);
     for (d.doubles, 0..) |*b, i| {
-        const pfx = try fmtKey(allocator, "transformer_blocks.{d}", .{i}); defer allocator.free(pfx);
+        const pfx = try fmtKey(allocator, "transformer_blocks.{d}", .{i});
+        defer allocator.free(pfx);
         b.* = try loadDouble(&w, allocator, pfx);
         // The token-GEMM linears go int8 (`--w8a8`); modulation and embedders see one row or run once.
         inline for (.{ "q", "k", "v", "o", "add_q", "add_k", "add_v", "add_o", "ff_in", "ff_out", "ffc_in", "ffc_out" }) |f| try @field(b, f).toW8a8(s);
-        if (w8a8.enabled) w.dropBlock("transformer_blocks.{d}.", i);
+        if (w8a8.w8a8State().enabled) w.dropBlock("transformer_blocks.{d}.", i);
     }
     d.singles = try allocator.alloc(SingleBlock, d.cfg.single_layers);
     for (d.singles, 0..) |*b, i| {
-        const pfx = try fmtKey(allocator, "single_transformer_blocks.{d}", .{i}); defer allocator.free(pfx);
-        const qp = try fmtKey(allocator, "{s}.attn.to_qkv_mlp_proj", .{pfx}); defer allocator.free(qp);
-        const op = try fmtKey(allocator, "{s}.attn.to_out", .{pfx}); defer allocator.free(op);
-        const nq = try fmtKey(allocator, "{s}.attn.norm_q.weight", .{pfx}); defer allocator.free(nq);
-        const nk = try fmtKey(allocator, "{s}.attn.norm_k.weight", .{pfx}); defer allocator.free(nk);
+        const pfx = try fmtKey(allocator, "single_transformer_blocks.{d}", .{i});
+        defer allocator.free(pfx);
+        const qp = try fmtKey(allocator, "{s}.attn.to_qkv_mlp_proj", .{pfx});
+        defer allocator.free(qp);
+        const op = try fmtKey(allocator, "{s}.attn.to_out", .{pfx});
+        defer allocator.free(op);
+        const nq = try fmtKey(allocator, "{s}.attn.norm_q.weight", .{pfx});
+        defer allocator.free(nq);
+        const nk = try fmtKey(allocator, "{s}.attn.norm_k.weight", .{pfx});
+        defer allocator.free(nk);
         b.* = .{ .qkv_mlp = try QLinear.load(&w, allocator, qp), .o = try QLinear.load(&w, allocator, op), .nq = try ownWeight(&w, nq), .nk = try ownWeight(&w, nk) };
         try b.qkv_mlp.toW8a8(s);
         try b.o.toW8a8(s);
-        if (w8a8.enabled) w.dropBlock("single_transformer_blocks.{d}.", i);
+        if (w8a8.w8a8State().enabled) w.dropBlock("single_transformer_blocks.{d}.", i);
     }
     return d;
 }
@@ -791,11 +820,11 @@ pub fn attachLora(dit: *Dit, stack: *const lora_mod.Stack) u32 {
     var rbuf: [lora_mod.MAX_LORAS]lora_mod.Ref = undefined;
     for (dit.doubles, 0..) |*b, i| {
         const mods = .{
-            .{ "attn.to_q", &b.q },           .{ "attn.to_k", &b.k },
-            .{ "attn.to_v", &b.v },           .{ "attn.to_out", &b.o },
-            .{ "attn.add_q_proj", &b.add_q }, .{ "attn.add_k_proj", &b.add_k },
-            .{ "attn.add_v_proj", &b.add_v }, .{ "attn.to_add_out", &b.add_o },
-            .{ "ff.linear_in", &b.ff_in },    .{ "ff.linear_out", &b.ff_out },
+            .{ "attn.to_q", &b.q },                 .{ "attn.to_k", &b.k },
+            .{ "attn.to_v", &b.v },                 .{ "attn.to_out", &b.o },
+            .{ "attn.add_q_proj", &b.add_q },       .{ "attn.add_k_proj", &b.add_k },
+            .{ "attn.add_v_proj", &b.add_v },       .{ "attn.to_add_out", &b.add_o },
+            .{ "ff.linear_in", &b.ff_in },          .{ "ff.linear_out", &b.ff_out },
             .{ "ff_context.linear_in", &b.ffc_in }, .{ "ff_context.linear_out", &b.ffc_out },
         };
         inline for (mods) |m| {
@@ -834,31 +863,52 @@ pub fn detachLora(dit: *Dit) void {
 fn loadDouble(w: *const Weights, a: std.mem.Allocator, pfx: []const u8) !DoubleBlock {
     const ld = struct {
         fn q(ww: *const Weights, aa: std.mem.Allocator, p: []const u8, sub: []const u8) !QLinear {
-            const k = try fmtKey(aa, "{s}.{s}", .{ p, sub }); defer aa.free(k);
+            const k = try fmtKey(aa, "{s}.{s}", .{ p, sub });
+            defer aa.free(k);
             return QLinear.load(ww, aa, k);
         }
         fn n(ww: *const Weights, aa: std.mem.Allocator, p: []const u8, sub: []const u8) !mlx.mlx_array {
-            const k = try fmtKey(aa, "{s}.{s}", .{ p, sub }); defer aa.free(k);
+            const k = try fmtKey(aa, "{s}.{s}", .{ p, sub });
+            defer aa.free(k);
             return ownWeight(ww, k);
         }
     };
     return .{
-        .q = try ld.q(w, a, pfx, "attn.to_q"), .k = try ld.q(w, a, pfx, "attn.to_k"), .v = try ld.q(w, a, pfx, "attn.to_v"), .o = try ld.q(w, a, pfx, "attn.to_out"),
-        .add_q = try ld.q(w, a, pfx, "attn.add_q_proj"), .add_k = try ld.q(w, a, pfx, "attn.add_k_proj"), .add_v = try ld.q(w, a, pfx, "attn.add_v_proj"), .add_o = try ld.q(w, a, pfx, "attn.to_add_out"),
-        .nq = try ld.n(w, a, pfx, "attn.norm_q.weight"), .nk = try ld.n(w, a, pfx, "attn.norm_k.weight"), .naq = try ld.n(w, a, pfx, "attn.norm_added_q.weight"), .nak = try ld.n(w, a, pfx, "attn.norm_added_k.weight"),
-        .ff_in = try ld.q(w, a, pfx, "ff.linear_in"), .ff_out = try ld.q(w, a, pfx, "ff.linear_out"),
-        .ffc_in = try ld.q(w, a, pfx, "ff_context.linear_in"), .ffc_out = try ld.q(w, a, pfx, "ff_context.linear_out"),
+        .q = try ld.q(w, a, pfx, "attn.to_q"),
+        .k = try ld.q(w, a, pfx, "attn.to_k"),
+        .v = try ld.q(w, a, pfx, "attn.to_v"),
+        .o = try ld.q(w, a, pfx, "attn.to_out"),
+        .add_q = try ld.q(w, a, pfx, "attn.add_q_proj"),
+        .add_k = try ld.q(w, a, pfx, "attn.add_k_proj"),
+        .add_v = try ld.q(w, a, pfx, "attn.add_v_proj"),
+        .add_o = try ld.q(w, a, pfx, "attn.to_add_out"),
+        .nq = try ld.n(w, a, pfx, "attn.norm_q.weight"),
+        .nk = try ld.n(w, a, pfx, "attn.norm_k.weight"),
+        .naq = try ld.n(w, a, pfx, "attn.norm_added_q.weight"),
+        .nak = try ld.n(w, a, pfx, "attn.norm_added_k.weight"),
+        .ff_in = try ld.q(w, a, pfx, "ff.linear_in"),
+        .ff_out = try ld.q(w, a, pfx, "ff.linear_out"),
+        .ffc_in = try ld.q(w, a, pfx, "ff_context.linear_in"),
+        .ffc_out = try ld.q(w, a, pfx, "ff_context.linear_out"),
     };
 }
 
 // ── VAE: packed latents [1, 128, h, w] ↔ pixels [1, 3, 16h, 16w]; channels-last inside, bf16 activations ──
 
 const VaeAttn = struct {
-    gnw: mlx.mlx_array, gnb: mlx.mlx_array,
-    q: QLinear, k: QLinear, v: QLinear, o: QLinear,
+    gnw: mlx.mlx_array,
+    gnb: mlx.mlx_array,
+    q: QLinear,
+    k: QLinear,
+    v: QLinear,
+    o: QLinear,
     fn deinit(self: *VaeAttn) void {
-        _ = mlx.mlx_array_free(self.gnw); _ = mlx.mlx_array_free(self.gnb);
-        self.q.deinit(); self.k.deinit(); self.v.deinit(); self.o.deinit();
+        _ = mlx.mlx_array_free(self.gnw);
+        _ = mlx.mlx_array_free(self.gnb);
+        self.q.deinit();
+        self.k.deinit();
+        self.v.deinit();
+        self.o.deinit();
     }
 };
 
@@ -882,20 +932,33 @@ fn bnStats(parent: *Graph, mean: Array, variance: Array) !struct { mean: Array, 
 pub const Vae = struct {
     allocator: std.mem.Allocator,
     s: S,
-    bn_mean: mlx.mlx_array, bn_var: mlx.mlx_array,
-    pq_w: mlx.mlx_array, pq_b: mlx.mlx_array, // post_quant_conv 1x1
-    conv_in_w: mlx.mlx_array, conv_in_b: mlx.mlx_array,
-    mid_r0: Resnet, mid_attn: VaeAttn, mid_r1: Resnet,
+    bn_mean: mlx.mlx_array,
+    bn_var: mlx.mlx_array,
+    pq_w: mlx.mlx_array,
+    pq_b: mlx.mlx_array, // post_quant_conv 1x1
+    conv_in_w: mlx.mlx_array,
+    conv_in_b: mlx.mlx_array,
+    mid_r0: Resnet,
+    mid_attn: VaeAttn,
+    mid_r1: Resnet,
     up_resnets: [4][3]Resnet,
-    up_conv_w: [3]mlx.mlx_array, up_conv_b: [3]mlx.mlx_array, // upsamplers for blocks 0,1,2
-    norm_out_w: mlx.mlx_array, norm_out_b: mlx.mlx_array,
-    conv_out_w: mlx.mlx_array, conv_out_b: mlx.mlx_array,
+    up_conv_w: [3]mlx.mlx_array,
+    up_conv_b: [3]mlx.mlx_array, // upsamplers for blocks 0,1,2
+    norm_out_w: mlx.mlx_array,
+    norm_out_b: mlx.mlx_array,
+    conv_out_w: mlx.mlx_array,
+    conv_out_b: mlx.mlx_array,
 
     pub fn deinit(self: *Vae) void {
-        inline for (.{ "bn_mean","bn_var","pq_w","pq_b","conv_in_w","conv_in_b","norm_out_w","norm_out_b","conv_out_w","conv_out_b" }) |f| _ = mlx.mlx_array_free(@field(self, f));
-        freeResnet(&self.mid_r0); self.mid_attn.deinit(); freeResnet(&self.mid_r1);
+        inline for (.{ "bn_mean", "bn_var", "pq_w", "pq_b", "conv_in_w", "conv_in_b", "norm_out_w", "norm_out_b", "conv_out_w", "conv_out_b" }) |f| _ = mlx.mlx_array_free(@field(self, f));
+        freeResnet(&self.mid_r0);
+        self.mid_attn.deinit();
+        freeResnet(&self.mid_r1);
         for (&self.up_resnets) |*blk| for (blk) |*r| freeResnet(r);
-        for (0..3) |i| { _ = mlx.mlx_array_free(self.up_conv_w[i]); _ = mlx.mlx_array_free(self.up_conv_b[i]); }
+        for (0..3) |i| {
+            _ = mlx.mlx_array_free(self.up_conv_w[i]);
+            _ = mlx.mlx_array_free(self.up_conv_b[i]);
+        }
     }
 
     /// Packed latents [1, 128, h, w] (bn-normalized) → image [1, 3, 16h, 16w] in [-1, 1].
@@ -944,20 +1007,27 @@ fn patchify(parent: *Graph, x: Array) !Array {
 fn loadResnet(w: *const Weights, a: std.mem.Allocator, pfx: []const u8) !Resnet {
     const g = struct {
         fn k(ww: *const Weights, aa: std.mem.Allocator, p: []const u8, sub: []const u8) !mlx.mlx_array {
-            const kk = try fmtKey(aa, "{s}.{s}", .{ p, sub }); defer aa.free(kk);
+            const kk = try fmtKey(aa, "{s}.{s}", .{ p, sub });
+            defer aa.free(kk);
             return ownWeight(ww, kk);
         }
         fn opt(ww: *const Weights, aa: std.mem.Allocator, p: []const u8, sub: []const u8) ?mlx.mlx_array {
-            const kk = fmtKey(aa, "{s}.{s}", .{ p, sub }) catch return null; defer aa.free(kk);
+            const kk = fmtKey(aa, "{s}.{s}", .{ p, sub }) catch return null;
+            defer aa.free(kk);
             return ownOpt(ww, kk);
         }
     };
     return .{
-        .n1w = try g.k(w, a, pfx, "norm1.weight"), .n1b = try g.k(w, a, pfx, "norm1.bias"),
-        .c1w = try g.k(w, a, pfx, "conv1.weight"), .c1b = try g.k(w, a, pfx, "conv1.bias"),
-        .n2w = try g.k(w, a, pfx, "norm2.weight"), .n2b = try g.k(w, a, pfx, "norm2.bias"),
-        .c2w = try g.k(w, a, pfx, "conv2.weight"), .c2b = try g.k(w, a, pfx, "conv2.bias"),
-        .sw = g.opt(w, a, pfx, "conv_shortcut.weight"), .sb = g.opt(w, a, pfx, "conv_shortcut.bias"),
+        .n1w = try g.k(w, a, pfx, "norm1.weight"),
+        .n1b = try g.k(w, a, pfx, "norm1.bias"),
+        .c1w = try g.k(w, a, pfx, "conv1.weight"),
+        .c1b = try g.k(w, a, pfx, "conv1.bias"),
+        .n2w = try g.k(w, a, pfx, "norm2.weight"),
+        .n2b = try g.k(w, a, pfx, "norm2.bias"),
+        .c2w = try g.k(w, a, pfx, "conv2.weight"),
+        .c2b = try g.k(w, a, pfx, "conv2.bias"),
+        .sw = g.opt(w, a, pfx, "conv_shortcut.weight"),
+        .sb = g.opt(w, a, pfx, "conv_shortcut.bias"),
     };
 }
 
@@ -967,7 +1037,8 @@ pub fn loadVae(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []cons
     var w = try model_mod.loadWeights(io, allocator, dir);
     defer w.deinit();
     var v: Vae = undefined;
-    v.allocator = allocator; v.s = s;
+    v.allocator = allocator;
+    v.s = s;
     v.bn_mean = try ownWeight(&w, "bn.running_mean");
     v.bn_var = try ownWeight(&w, "bn.running_var");
     v.pq_w = try ownWeight(&w, "post_quant_conv.weight");
@@ -992,8 +1063,10 @@ pub fn loadVae(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []cons
         }
     }
     for (0..3) |bi| {
-        const wk = try fmtKey(allocator, "decoder.up_blocks.{d}.upsamplers.0.conv.weight", .{bi}); defer allocator.free(wk);
-        const bk = try fmtKey(allocator, "decoder.up_blocks.{d}.upsamplers.0.conv.bias", .{bi}); defer allocator.free(bk);
+        const wk = try fmtKey(allocator, "decoder.up_blocks.{d}.upsamplers.0.conv.weight", .{bi});
+        defer allocator.free(wk);
+        const bk = try fmtKey(allocator, "decoder.up_blocks.{d}.upsamplers.0.conv.bias", .{bi});
+        defer allocator.free(bk);
         v.up_conv_w[bi] = try ownWeight(&w, wk);
         v.up_conv_b[bi] = try ownWeight(&w, bk);
     }
@@ -1134,7 +1207,6 @@ fn cfgBlend(parent: *Graph, cond: Array, uncond: Array, scale: f32) !Array {
     defer g.deinit();
     return parent.keep(try g.add(uncond, try g.mul(try g.sub(cond, uncond), try g.scalar(scale, .float32))));
 }
-
 
 // ── The text → image pipeline ──
 
@@ -1357,7 +1429,6 @@ pub fn generateFromCondWithOpts(dit: *Dit, vae: *Vae, enc_owned: mlx.mlx_array, 
     return g.escape(out);
 }
 
-
 // ── tests ──
 
 const testing = std.testing;
@@ -1413,35 +1484,52 @@ test "flux DiT reproduces noise_step0" {
     const n0_p = std.mem.span(std.c.getenv("FLUX_NOISE0") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    const lat = try readF32(io, a, lat_p); defer a.free(lat);
-    const pe = try readF32(io, a, pe_p); defer a.free(pe);
-    const ii = try readI32(io, a, ii_p); defer a.free(ii);
-    const ti = try readI32(io, a, ti_p); defer a.free(ti);
-    const ref = try readF32(io, a, n0_p); defer a.free(ref);
+    const lat = try readF32(io, a, lat_p);
+    defer a.free(lat);
+    const pe = try readF32(io, a, pe_p);
+    defer a.free(pe);
+    const ii = try readI32(io, a, ii_p);
+    defer a.free(ii);
+    const ti = try readI32(io, a, ti_p);
+    defer a.free(ti);
+    const ref = try readF32(io, a, n0_p);
+    defer a.free(ref);
 
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
-    var dit = try loadDit(io, a, s, model_dir); defer dit.deinit();
+    var dit = try loadDit(io, a, s, model_dir);
+    defer dit.deinit();
 
     // upload latents [1,4096,128] and pe [1,512,7680] as bf16
     const lat_sh = [_]c_int{ 1, 4096, 128 };
-    const lat_f = mlx.mlx_array_new_data(lat.ptr, &lat_sh, 3, .float32); defer _ = mlx.mlx_array_free(lat_f);
-    const lat_bf = try astype(lat_f, .bfloat16, s); defer _ = mlx.mlx_array_free(lat_bf);
+    const lat_f = mlx.mlx_array_new_data(lat.ptr, &lat_sh, 3, .float32);
+    defer _ = mlx.mlx_array_free(lat_f);
+    const lat_bf = try astype(lat_f, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(lat_bf);
     const pe_sh = [_]c_int{ 1, 512, 7680 };
-    const pe_f = mlx.mlx_array_new_data(pe.ptr, &pe_sh, 3, .float32); defer _ = mlx.mlx_array_free(pe_f);
-    const pe_bf = try astype(pe_f, .bfloat16, s); defer _ = mlx.mlx_array_free(pe_bf);
+    const pe_f = mlx.mlx_array_new_data(pe.ptr, &pe_sh, 3, .float32);
+    defer _ = mlx.mlx_array_free(pe_f);
+    const pe_bf = try astype(pe_f, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(pe_bf);
 
     var tg = Graph.init(a, s);
     defer tg.deinit();
     const noise = tg.escape(try dit.forward(&tg, lat_bf, pe_bf, 1000.0, ii, ti));
     defer _ = mlx.mlx_array_free(noise);
-    const nf = try astype(noise, .float32, s); defer _ = mlx.mlx_array_free(nf);
+    const nf = try astype(noise, .float32, s);
+    defer _ = mlx.mlx_array_free(nf);
     _ = mlx.mlx_array_eval(nf);
     const n: usize = @intCast(mlx.mlx_array_size(nf));
     const data = mlx.mlx_array_data_float32(nf) orelse return error.NoData;
     try testing.expectEqual(ref.len, n);
-    var dot: f64 = 0; var na: f64 = 0; var nb: f64 = 0;
-    for (0..n) |i| { dot += @as(f64, data[i]) * ref[i]; na += @as(f64, data[i]) * data[i]; nb += @as(f64, ref[i]) * ref[i]; }
+    var dot: f64 = 0;
+    var na: f64 = 0;
+    var nb: f64 = 0;
+    for (0..n) |i| {
+        dot += @as(f64, data[i]) * ref[i];
+        na += @as(f64, data[i]) * data[i];
+        nb += @as(f64, ref[i]) * ref[i];
+    }
     const corr = dot / (std.math.sqrt(na) * std.math.sqrt(nb));
     std.debug.print("[flux-dit] n={d} corr={d:.6}\n", .{ n, corr });
     try testing.expect(corr > 0.99);
@@ -1455,23 +1543,38 @@ test "flux VAE reproduces decoded image" {
     const dec_p = std.mem.span(std.c.getenv("FLUX_DECODED") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    const pk = try readF32(io, a, pk_p); defer a.free(pk);
-    const ref = try readF32(io, a, dec_p); defer a.free(ref);
+    const pk = try readF32(io, a, pk_p);
+    defer a.free(pk);
+    const ref = try readF32(io, a, dec_p);
+    defer a.free(ref);
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
-    var vae = try loadVae(io, a, s, model_dir); defer vae.deinit();
+    var vae = try loadVae(io, a, s, model_dir);
+    defer vae.deinit();
     const pk_sh = [_]c_int{ 1, 128, 64, 64 };
-    const pk_f = mlx.mlx_array_new_data(pk.ptr, &pk_sh, 4, .float32); defer _ = mlx.mlx_array_free(pk_f);
+    const pk_f = mlx.mlx_array_new_data(pk.ptr, &pk_sh, 4, .float32);
+    defer _ = mlx.mlx_array_free(pk_f);
     var tg = Graph.init(a, s);
     defer tg.deinit();
     const dec = try vae.decode(&tg, pk_f);
-    const df = try astype(dec, .float32, s); defer _ = mlx.mlx_array_free(df);
+    const df = try astype(dec, .float32, s);
+    defer _ = mlx.mlx_array_free(df);
     _ = mlx.mlx_array_eval(df);
     const n: usize = @intCast(mlx.mlx_array_size(df));
     const data = mlx.mlx_array_data_float32(df) orelse return error.NoData;
     try testing.expectEqual(ref.len, n);
-    var dot: f64 = 0; var na: f64 = 0; var nb: f64 = 0; var se: f64 = 0;
-    for (0..n) |i| { const x: f64 = data[i]; const y: f64 = ref[i]; dot += x*y; na += x*x; nb += y*y; se += (x-y)*(x-y); }
+    var dot: f64 = 0;
+    var na: f64 = 0;
+    var nb: f64 = 0;
+    var se: f64 = 0;
+    for (0..n) |i| {
+        const x: f64 = data[i];
+        const y: f64 = ref[i];
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+        se += (x - y) * (x - y);
+    }
     const corr = dot / (std.math.sqrt(na) * std.math.sqrt(nb));
     const rmse = std.math.sqrt(se / @as(f64, @floatFromInt(n)));
     std.debug.print("[flux-vae] n={d} corr={d:.6} rmse={d:.5}\n", .{ n, corr, rmse });
@@ -1780,14 +1883,21 @@ test "flux end-to-end pipeline matches reference image" {
     const dec_p = std.mem.span(std.c.getenv("FLUX_DECODED") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    const ids = try readI32(io, a, ids_p); defer a.free(ids);
-    const mask = try readI32(io, a, mask_p); defer a.free(mask);
-    const ref = try readF32(io, a, dec_p); defer a.free(ref); // [1,3,1024,1024] in [-1,1]
+    const ids = try readI32(io, a, ids_p);
+    defer a.free(ids);
+    const mask = try readI32(io, a, mask_p);
+    defer a.free(mask);
+    const ref = try readF32(io, a, dec_p);
+    defer a.free(ref); // [1,3,1024,1024] in [-1,1]
 
-    const s = mlx.mlx_default_gpu_stream_new(); defer _ = mlx.mlx_stream_free(s);
-    var te = try loadTextEncoder(io, a, s, model_dir); defer te.deinit();
-    var dit = try loadDit(io, a, s, model_dir); defer dit.deinit();
-    var vae = try loadVae(io, a, s, model_dir); defer vae.deinit();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var te = try loadTextEncoder(io, a, s, model_dir);
+    defer te.deinit();
+    var dit = try loadDit(io, a, s, model_dir);
+    defer dit.deinit();
+    var vae = try loadVae(io, a, s, model_dir);
+    defer vae.deinit();
 
     const img = try generateWithOpts(&te, &dit, &vae, ids, mask, 42, 4, 1024, 1024, .{}, null); // [0,1]
     defer _ = mlx.mlx_array_free(img);
@@ -1795,11 +1905,15 @@ test "flux end-to-end pipeline matches reference image" {
     const n: usize = @intCast(mlx.mlx_array_size(img));
     const data = mlx.mlx_array_data_float32(img) orelse return error.NoData;
     // reference is in [-1,1]; convert to [0,1] for comparison
-    var dot: f64 = 0; var na: f64 = 0; var nb: f64 = 0;
+    var dot: f64 = 0;
+    var na: f64 = 0;
+    var nb: f64 = 0;
     for (0..n) |i| {
         const x: f64 = data[i];
         const y: f64 = std.math.clamp(@as(f64, ref[i]) / 2.0 + 0.5, 0, 1);
-        dot += x * y; na += x * x; nb += y * y;
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
     }
     const corr = dot / (std.math.sqrt(na) * std.math.sqrt(nb));
     std.debug.print("[flux-e2e] n={d} corr={d:.5}\n", .{ n, corr });
@@ -1906,8 +2020,13 @@ test "flux geometry is read off the checkpoint, not assumed (klein 4B vs 9B)" {
     try testing.expectEqual(four.rope_theta_dit, nine.rope_theta_dit);
 
     const te4 = teConfigFrom(.{
-        .hidden = 2560, .q_norm_len = 128, .q_proj_rows = 4096,
-        .k_proj_rows = 1024, .gate_proj_rows = 9728, .layers = 36, .vocab = 151936,
+        .hidden = 2560,
+        .q_norm_len = 128,
+        .q_proj_rows = 4096,
+        .k_proj_rows = 1024,
+        .gate_proj_rows = 9728,
+        .layers = 36,
+        .vocab = 151936,
     }, .{});
     try testing.expectEqual(@as(u32, 2560), te4.te_hidden);
     try testing.expectEqual(@as(u32, 32), te4.te_heads);
@@ -1916,8 +2035,13 @@ test "flux geometry is read off the checkpoint, not assumed (klein 4B vs 9B)" {
     try testing.expectEqual(@as(u32, 36), te4.te_layers);
 
     const te9 = teConfigFrom(.{
-        .hidden = 4096, .q_norm_len = 128, .q_proj_rows = 4096,
-        .k_proj_rows = 1024, .gate_proj_rows = 12288, .layers = 36, .vocab = 151936,
+        .hidden = 4096,
+        .q_norm_len = 128,
+        .q_proj_rows = 4096,
+        .k_proj_rows = 1024,
+        .gate_proj_rows = 12288,
+        .layers = 36,
+        .vocab = 151936,
     }, .{});
     try testing.expectEqual(@as(u32, 4096), te9.te_hidden);
     try testing.expectEqual(@as(u32, 12288), te9.te_inter);
@@ -2090,13 +2214,13 @@ test "FLUX DiT: the w8a8 route stays within its bar of the packed forward" {
     const io = std.Io.Threaded.global_single_threaded.io();
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
-    const prev = w8a8.enabled;
-    defer w8a8.enabled = prev;
-    w8a8.enabled = false;
+    const prev = w8a8.w8a8State().enabled;
+    defer w8a8.w8a8State().enabled = prev;
+    w8a8.w8a8State().enabled = false;
     var packed_bytes: usize = 0;
     const want = try fluxProbe(io, a, s, model_dir, &packed_bytes);
     defer _ = mlx.mlx_array_free(want);
-    w8a8.enabled = true;
+    w8a8.w8a8State().enabled = true;
     var int8_bytes: usize = 0;
     const got = try fluxProbe(io, a, s, model_dir, &int8_bytes);
     defer _ = mlx.mlx_array_free(got);

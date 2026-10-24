@@ -5,6 +5,7 @@
 pub const mlx = @import("mlx/ffi.zig");
 pub const log = @import("host/log.zig");
 pub const io_util = @import("sdk/util/io_util.zig");
+pub const shared = @import("sdk/util/shared.zig");
 /// The process environment (`src/env.zig`): every variable a plugin reads is registered there.
 pub const env = @import("env.zig");
 pub const mtp_acceptance = @import("engines/mlx/spec/mtp_acceptance.zig");

@@ -19,10 +19,10 @@ pub const MediaTable = abi.MediaTable;
 pub fn machine() abi.Machine {
     return .{
         .gpu_working_set = mlx.maxRecommendedWorkingSet(),
-        .w8a8 = w8a8.enabled and w8a8.nax(),
-        .ane_image = ane.media_offload.image,
-        .ane_video = ane.media_offload.video,
-        .ane_audio = ane.media_offload.audio,
+        .w8a8 = w8a8.w8a8State().enabled and w8a8.nax(),
+        .ane_image = ane.aneState().media_offload.image,
+        .ane_video = ane.aneState().media_offload.video,
+        .ane_audio = ane.aneState().media_offload.audio,
         .low_mem = low_mem.default(),
         .ram_total = status.getTotalMemBytes(),
         .ram_available = status.getAvailableMemBytes(),

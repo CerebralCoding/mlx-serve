@@ -5,7 +5,7 @@ const std = @import("std");
 const mlx = @import("ffi.zig");
 const log = @import("../host/log.zig");
 const model_mod = @import("../engines/mlx/model.zig");
-const transformer_mod = @import("../engines/mlx/transformer.zig");
+const params = @import("../sdk/quant/params.zig");
 
 const S = mlx.mlx_stream;
 const A = mlx.mlx_array;
@@ -46,7 +46,7 @@ pub fn linear(w: *const Weights, comptime fmt: []const u8, args: anytype, in_dim
     if (w.get(try std.fmt.bufPrint(buf[prefix.len..], "{s}.scales", .{prefix}))) |sca| {
         l.scales = sca;
         l.biases = try getW(w, "{s}.biases", .{prefix});
-        const qp = transformer_mod.affineParamsFromGeometry(l.w, sca, in_dim) orelse {
+        const qp = params.affineParamsFromGeometry(l.w, sca, in_dim) orelse {
             log.err("unsolvable quant geometry for {s}\n", .{prefix});
             return error.BadQuantGeometry;
         };

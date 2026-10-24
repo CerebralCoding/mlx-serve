@@ -39,17 +39,24 @@ pub const tally = @import("expert/tally.zig");
 /// `expert-usage-v1.json`; `prompt_residents`, the reverse change's route.
 pub const usage = @import("expert/usage.zig");
 
-/// The one reader per process: the host takes it at the load claim of an arch whose caps say `uses_expert_reader`
-/// (its source declares `uses_reader`), before the preflight and the weights, and gives it back when the loaded model
-/// goes or the load fails. A second is refused by name, never at the pool's start.
-var reader_taken = std.atomic.Value(bool).init(false);
+/// Process-wide under `-Dunits` (sdk/util/shared.zig): one copy in the host.
+const ExpertState = struct {
+    /// The one reader per process: the host takes it at the load claim of an arch whose caps say `uses_expert_reader`
+    /// (its source declares `uses_reader`), before the preflight and the weights, and gives it back when the loaded model
+    /// goes or the load fails. A second is refused by name, never at the pool's start.
+    reader_taken: std.atomic.Value(bool) = .init(false),
+};
+const expertState_shared = @import("mlx_host").shared.Shared(ExpertState, "streamed_expert", .{});
+inline fn expertState() *ExpertState {
+    return expertState_shared.get();
+}
 
 pub fn takeReader() error{ExpertReaderInUse}!void {
-    if (reader_taken.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return error.ExpertReaderInUse;
+    if (expertState().reader_taken.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return error.ExpertReaderInUse;
 }
 
 pub fn giveReader() void {
-    reader_taken.store(false, .release);
+    expertState().reader_taken.store(false, .release);
 }
 
 /// The record layout a bank fills when it opens (EXL3: 9 components, 6 gate/up; MXFP4: 6, 4): each component's dtype,

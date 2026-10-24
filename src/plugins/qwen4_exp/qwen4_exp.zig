@@ -149,10 +149,17 @@ fn warmEnabled() bool {
     return warm_override orelse true;
 }
 
-/// What the background page-cache warm has read so far, and the table's total size. Published
-/// by the warm thread, read lock-free by metrics and `/props`; zero when nothing is warming.
-pub var live_warm_bytes = std.atomic.Value(u64).init(0);
-pub var live_warm_total = std.atomic.Value(u64).init(0);
+/// Process-wide under `-Dunits` (sdk/util/shared.zig): one copy in the host.
+const WarmState = struct {
+    /// What the background page-cache warm has read so far, and the table's total size. Published
+    /// by the warm thread, read lock-free by metrics and `/props`; zero when nothing is warming.
+    live_warm_bytes: std.atomic.Value(u64) = .init(0),
+    live_warm_total: std.atomic.Value(u64) = .init(0),
+};
+const warm_shared = @import("../../sdk/util/shared.zig").Shared(WarmState, "qwen4_warm", .{});
+pub inline fn warmBytes() *WarmState {
+    return warm_shared.get();
+}
 const empty_embedded_map: [0]u8 align(std.heap.page_size_min) = .{};
 
 /// A progress line at each 8 GB step or after 10 s of silence, never twice per step. Pure.
@@ -363,8 +370,8 @@ pub const NgramTable = struct {
             th.join();
             self.warm_thread = null;
         }
-        live_warm_bytes.store(0, .release);
-        live_warm_total.store(0, .release);
+        warmBytes().live_warm_bytes.store(0, .release);
+        warmBytes().live_warm_total.store(0, .release);
         if (self.pool) |p| p.destroy();
         self.pool = null;
         if (self.fd >= 0) crt.close(self.fd);
@@ -470,8 +477,8 @@ pub const NgramTable = struct {
         while (self.warmRegion(i)) |r| : (i += 1) total += r.len;
         self.warm_stop.store(false, .release);
         self.warm_bytes.store(0, .release);
-        live_warm_bytes.store(0, .release);
-        live_warm_total.store(total, .release);
+        warmBytes().live_warm_bytes.store(0, .release);
+        warmBytes().live_warm_total.store(total, .release);
         log.info("[qwen4] ngram table warm: started, {d:.1} GB in the background (page cache)\n", .{asGb(total)});
         self.warm_thread = std.Thread.spawn(.{}, warmMain, .{ self, total }) catch null;
     }
@@ -493,7 +500,7 @@ pub const NgramTable = struct {
                 off += @intCast(got);
                 done += @intCast(got);
                 self.warm_bytes.store(done, .release);
-                live_warm_bytes.store(done, .release);
+                warmBytes().live_warm_bytes.store(done, .release);
                 // One clock read per 8 MB pread is free next to the read itself.
                 const el: u64 = @intCast(t0.untilNow(wio, .boot).nanoseconds);
                 if (prog.should(done, el)) log.info("[qwen4] ngram table warm: {d:.1}/{d:.1} GB after {d:.0} s\n", .{ asGb(done), asGb(total), @as(f64, @floatFromInt(el)) / 1e9 });
@@ -586,7 +593,6 @@ pub const NgramTable = struct {
         if (self.embedded) |source| return source.preadPart(r, region, dst);
         return crt.pread(self.fd, dst.ptr, dst.len, @intCast(off)) == @as(isize, @intCast(dst.len));
     }
-
 };
 
 const E2M1 = [16]f32{ 0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6 };
@@ -1113,7 +1119,6 @@ test "ngram prefill prefetch is KV-GATED: a short prompt walks, a long one pools
     try testing.expect(!plePrefillPrefetchWanted(.kv_gated, 8192, 131_072, false));
     try testing.expect(!plePrefillPrefetchWanted(.off, 1_000_000, min, false));
     try testing.expect(plePrefillPrefetchWanted(.on, 0, min, false));
-
 }
 
 test "ngram prefill calibration: margin, invalid timers and explicit overrides" {

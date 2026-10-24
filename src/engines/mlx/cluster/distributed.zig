@@ -290,7 +290,7 @@ const Bell = struct {
         var off: usize = 0;
         while (off < out.len) {
             const n = std.c.read(b.fd, out.ptr + off, out.len - off);
-            if (n < 0 and std.c._errno().* == @intFromEnum(std.c.E.INTR)) continue;
+            if (n < 0 and std.c._errno().* == @backingInt(std.c.E.INTR)) continue;
             if (n <= 0) return error.DistPeerGone;
             off += @intCast(n);
         }
@@ -307,7 +307,7 @@ const Bell = struct {
         while (true) {
             const n = std.c.read(b.fd, &x, 1);
             if (n == 1) return;
-            if (n < 0 and std.c._errno().* == @intFromEnum(std.c.E.INTR)) continue;
+            if (n < 0 and std.c._errno().* == @backingInt(std.c.E.INTR)) continue;
             return error.DistPeerGone;
         }
     }
@@ -412,18 +412,18 @@ const Plan = struct {
     experts: i32,
 
     fn msg(p: Plan, name_len: usize) Msg {
-        return .{ MAGIC, @intFromEnum(p.mode), @intCast(p.span.start), @intCast(p.span.end), @intCast(p.span.total), @intCast(name_len), p.hidden, p.experts };
+        return .{ MAGIC, @backingInt(p.mode), @intCast(p.span.start), @intCast(p.span.end), @intCast(p.span.total), @intCast(name_len), p.hidden, p.experts };
     }
     fn parse(m: Msg) !Plan {
         if (m[0] != MAGIC) return error.DistProtocolMismatch;
-        return .{ .mode = @enumFromInt(m[1]), .span = .{ .start = @intCast(m[2]), .end = @intCast(m[3]), .total = @intCast(m[4]) }, .hidden = m[6], .experts = m[7] };
+        return .{ .mode = @fromBackingInt(@intCast(m[1])), .span = .{ .start = @intCast(m[2]), .end = @intCast(m[3]), .total = @intCast(m[4]) }, .hidden = m[6], .experts = m[7] };
     }
     fn matches(p: Plan, cfg: *const model_mod.ModelConfig) bool {
         return cfg.num_hidden_layers == p.span.total and cfg.hidden_size == p.hidden and cfg.num_experts == p.experts;
     }
     /// Sends the plan for `model_dir`; returns that copy's `modelIdentity`.
     fn send(p: Plan, link: *const Link, model_dir: []const u8) !u64 {
-        const g = group.?;
+        const g = cluster().group.?;
         const id = try modelIdentity(g.io, g.allocator, model_dir);
         const name = std.fs.path.basename(model_dir);
         try sendMsg(link, p.msg(name.len), 1);
@@ -512,7 +512,7 @@ pub const Peer = struct {
             log.err("[dist] forward at {d} but the worker holds {d} tokens: its caches cannot follow this reuse\n", .{ offset, self.peer_pos });
             return error.DistPeerDiverged;
         }
-        try self.sendOrdered(.{ OP_FORWARD, sh[0], sh[1], @intCast(offset & 0x7fffffff), @intCast(offset >> 31), sh[2], @intFromEnum(mlx.mlx_array_dtype(h)), 0 }, &.{h});
+        try self.sendOrdered(.{ OP_FORWARD, sh[0], sh[1], @intCast(offset & 0x7fffffff), @intCast(offset >> 31), sh[2], @backingInt(mlx.mlx_array_dtype(h)), 0 }, &.{h});
         self.peer_pos = offset + @as(usize, @intCast(sh[1]));
         self.exchanges += 1;
         return queuedRecv(&self.link, sh, mlx.mlx_array_dtype(h), 1);
@@ -524,7 +524,7 @@ pub const Peer = struct {
         const xs = mlx.getShape(x);
         const ls = mlx.getShape(logits);
         self.exchanges += 1;
-        try self.sendOrdered(.{ OP_MOE, xs[0], xs[1], xs[2], ls[ls.len - 1], @intFromEnum(mlx.mlx_array_dtype(x)), @intCast(layer), @intFromEnum(mlx.mlx_array_dtype(logits)) }, &.{ x, logits });
+        try self.sendOrdered(.{ OP_MOE, xs[0], xs[1], xs[2], ls[ls.len - 1], @backingInt(mlx.mlx_array_dtype(x)), @intCast(layer), @backingInt(mlx.mlx_array_dtype(logits)) }, &.{ x, logits });
     }
 
     /// The worker's partial for the layer input `x`: its shape and dtype.
@@ -556,7 +556,7 @@ pub const Peer = struct {
     /// The worker holds its part of the copy the plan was made for: another folder of the same
     /// name (another quantization or revision) would pair this Mac's part with the wrong weights.
     fn samePlannedCopy(self: *const Peer, model_dir: []const u8) !void {
-        const g = group.?;
+        const g = cluster().group.?;
         if (try modelIdentity(g.io, g.allocator, model_dir) == self.plan_id) return;
         log.err("[dist] {s} is not the copy the worker loaded; restart the server to pair with it\n", .{model_dir});
         return error.DistModelMismatch;
@@ -616,36 +616,48 @@ fn dependsOn(x: mlx.mlx_array, dep: mlx.mlx_array) !mlx.mlx_array {
     return r;
 }
 
-var peer_slot: ?Peer = null;
+/// Process-wide under `-Dunits` (sdk/util/shared.zig): one copy in the host.
+const ClusterState = struct {
+    group: ?Group = null,
+    joined: std.atomic.Value(bool) = .init(false),
+    joined_link: Link = undefined,
+    last_job_buf: [160]u8 = undefined,
+    last_job_len: usize = 0,
+    /// The inference thread writes the note while `/props` reads it.
+    last_job_mu: std.atomic.Mutex = .unlocked,
+    last_split: [2]u32 = .{ 0, 0 },
+    peer_slot: ?Peer = null,
+    /// Round trips since the last timing line, and their totals (µs): the whole exchange and the
+    /// worker's share of it.
+    timing: struct { n: u32 = 0, round_us: u64 = 0, worker_us: u64 = 0 } = .{},
+    /// What the worker said about the group's model when it joined: 0 has it, else NOT_FOUND or
+    /// MISMATCH (-1 = not asked: no bell connection).
+    worker_copy: std.atomic.Value(i32) = .init(-1),
+    /// The worker's compute time for its last step (µs), sent over the bell after each one.
+    worker_us: std.atomic.Value(u32) = .init(0),
+};
+const cluster_shared = @import("../../../sdk/util/shared.zig").Shared(ClusterState, "cluster_state", .{});
+inline fn cluster() *ClusterState {
+    return cluster_shared.get();
+}
 
 /// The group this server leads (`--dist`): set at startup, while a thread waits
 /// for the worker to join; the handshake runs when the group's model loads.
 const Group = struct { io: std.Io, allocator: std.mem.Allocator, mode: Mode, model: []const u8, split: ?u32 };
-var group: ?Group = null;
-var joined = std.atomic.Value(bool).init(false);
-/// What the worker said about the group's model when it joined: 0 has it, else NOT_FOUND or
-/// MISMATCH (-1 = not asked: no bell connection).
-var worker_copy = std.atomic.Value(i32).init(-1);
 /// The worker's bell connection closed: it left, and JACCL forms a group once per process,
 /// so this server must restart to pair again (the app does it, `/props` cluster "worker_gone").
 var worker_gone = std.atomic.Value(bool).init(false);
-/// The worker's compute time for its last step (µs), sent over the bell after each one.
-var worker_us = std.atomic.Value(u32).init(0);
-/// Round trips since the last timing line, and their totals (µs): the whole exchange and the
-/// worker's share of it.
-var timing: struct { n: u32 = 0, round_us: u64 = 0, worker_us: u64 = 0 } = .{};
 
 /// The worker's free memory as it answered on joining (MiB), for the load bill.
 var worker_free_mib = std.atomic.Value(u32).init(0);
-var joined_link: Link = undefined;
 
 /// The `/props` "cluster" object (with its leading comma), empty when this server is
 /// not rank 0 of a group: what the app draws the split from.
 pub fn propsJson(allocator: std.mem.Allocator) ![]u8 {
     if (peer()) |p| return clusterJson(allocator, p);
-    const g = group orelse return allocator.dupe(u8, "");
+    const g = cluster().group orelse return allocator.dupe(u8, "");
     return std.fmt.allocPrint(allocator, ",\"cluster\":{{\"mode\":\"{s}\",\"model\":{f},\"joined\":{},\"planned\":false,\"worker_ready\":false,\"worker_model\":\"{s}\",\"worker_gone\":{}}}", .{
-        @tagName(g.mode), std.json.fmt(std.fs.path.basename(g.model), .{}), joined.load(.acquire), workerCopyName(), worker_gone.load(.acquire),
+        @tagName(g.mode), std.json.fmt(std.fs.path.basename(g.model), .{}), cluster().joined.load(.acquire), workerCopyName(), worker_gone.load(.acquire),
     });
 }
 
@@ -653,8 +665,8 @@ pub fn propsJson(allocator: std.mem.Allocator) ![]u8 {
 /// comma), empty when it leads none: its model and whether the other Mac has joined, so that
 /// Mac's app can offer to join it.
 pub fn pairFields(allocator: std.mem.Allocator) ![]u8 {
-    const g = group orelse return allocator.dupe(u8, "");
-    return pairFieldsFor(allocator, std.fs.path.basename(g.model), joined.load(.acquire));
+    const g = cluster().group orelse return allocator.dupe(u8, "");
+    return pairFieldsFor(allocator, std.fs.path.basename(g.model), cluster().joined.load(.acquire));
 }
 
 fn pairFieldsFor(allocator: std.mem.Allocator, model: []const u8, has_joined: bool) ![]u8 {
@@ -663,21 +675,20 @@ fn pairFieldsFor(allocator: std.mem.Allocator, model: []const u8, has_joined: bo
 
 fn clusterJson(allocator: std.mem.Allocator, p: *const Peer) ![]u8 {
     const sp = p.span;
-    while (!last_job_mu.tryLock()) std.atomic.spinLoopHint();
-    defer last_job_mu.unlock();
+    while (!cluster().last_job_mu.tryLock()) std.atomic.spinLoopHint();
+    defer cluster().last_job_mu.unlock();
     // Rows mode: the worker's speed relative to this Mac and the link, once measured.
     const speed: f64 = if (p.worker_calib_us > 0 and p.host_calib_us > 0) @as(f64, @floatFromInt(p.host_calib_us)) / @as(f64, @floatFromInt(p.worker_calib_us)) else 0;
     return std.fmt.allocPrint(allocator, ",\"cluster\":{{\"mode\":\"{s}\",\"model\":{f},\"joined\":{},\"planned\":{},\"worker_ready\":{},\"layers\":{d},\"here\":[{d},{d}],\"worker\":[{d},{d}],\"expert_shards\":{d},\"worker_free_mib\":{d},\"worker_total_mib\":{d},\"exchanges\":{d},\"worker_name\":{f},\"worker_speed\":{d:.2},\"link_gbps\":{d:.1},\"last_job\":{f},\"split_rows\":[{d},{d}],\"worker_model\":\"{s}\",\"worker_gone\":{}}}", .{
-        @tagName(p.mode), std.json.fmt(std.fs.path.basename(p.model), .{}), joined.load(.acquire), p.planned, p.ready, sp.total, sp.start, sp.end,
-        if (p.mode == .pipeline) sp.end else 0, sp.total, if (p.shard) |sh| sh.size else 0,
-        p.worker.avail_mib, p.worker.total_mib, p.exchanges, std.json.fmt(p.workerName(), .{}) , speed, p.link_bytes_per_us / 1000,
-        std.json.fmt(last_job_buf[0..last_job_len], .{}), last_split[0], last_split[1], workerCopyName(), worker_gone.load(.acquire),
+        @tagName(p.mode),                       std.json.fmt(std.fs.path.basename(p.model), .{}),                     cluster().joined.load(.acquire),  p.planned,               p.ready,            sp.total,                   sp.start,                          sp.end,
+        if (p.mode == .pipeline) sp.end else 0, sp.total,                                                             if (p.shard) |sh| sh.size else 0, p.worker.avail_mib,      p.worker.total_mib, p.exchanges,                std.json.fmt(p.workerName(), .{}), speed,
+        p.link_bytes_per_us / 1000,             std.json.fmt(cluster().last_job_buf[0..cluster().last_job_len], .{}), cluster().last_split[0],          cluster().last_split[1], workerCopyName(),   worker_gone.load(.acquire),
     });
 }
 
 /// `/props` cluster "worker_model": whether the worker has the group's model.
 fn workerCopyName() []const u8 {
-    return switch (worker_copy.load(.acquire)) {
+    return switch (cluster().worker_copy.load(.acquire)) {
         0 => "ok",
         NOT_FOUND => "missing",
         MISMATCH => "different",
@@ -685,19 +696,13 @@ fn workerCopyName() []const u8 {
     };
 }
 
-var last_job_buf: [160]u8 = undefined;
-var last_job_len: usize = 0;
-var last_split: [2]u32 = .{ 0, 0 };
-/// The inference thread writes the note while `/props` reads it.
-var last_job_mu: std.atomic.Mutex = .unlocked;
-
 /// What the last video job did with the worker (`/props` cluster "last_job", and its rows
 /// on each Mac, zeros when it ran here alone).
 pub fn noteJob(split: [2]u32, comptime fmt: []const u8, args: anytype) void {
-    while (!last_job_mu.tryLock()) std.atomic.spinLoopHint();
-    defer last_job_mu.unlock();
-    last_split = split;
-    last_job_len = if (std.fmt.bufPrint(&last_job_buf, fmt, args)) |t| t.len else |_| 0;
+    while (!cluster().last_job_mu.tryLock()) std.atomic.spinLoopHint();
+    defer cluster().last_job_mu.unlock();
+    cluster().last_split = split;
+    cluster().last_job_len = if (std.fmt.bufPrint(&cluster().last_job_buf, fmt, args)) |t| t.len else |_| 0;
 }
 
 /// Rank 0 at shutdown: releases the worker. A peer that vanishes mid-protocol crashes the
@@ -731,7 +736,7 @@ pub fn release() void {
 
 /// Rank 0's peer, once `connect` has run.
 pub fn peer() ?*Peer {
-    return if (peer_slot) |*p| p else null;
+    return if (cluster().peer_slot) |*p| p else null;
 }
 
 /// What this rank holds of `model_dir`'s model when it is the group's model: on the first
@@ -750,7 +755,7 @@ pub fn planFor(model_dir: []const u8, config: *const model_mod.ModelConfig) !?Pa
 /// of layers, chosen as the plan chooses it (or the plan itself once made); `whole` otherwise.
 pub fn hostShare(model_dir: []const u8, config: *const model_mod.ModelConfig, whole: u64) u64 {
     if (!holds(model_dir)) return whole;
-    const g = group.?;
+    const g = cluster().group.?;
     const n: u64 = config.num_hidden_layers;
     if (n == 0) return whole;
     if (peer()) |p| if (p.planned) return if (p.mode == .tensor) whole / 2 + whole / 10 else whole * p.span.len() / n;
@@ -775,13 +780,13 @@ fn shareFor(g: Group, config: *const model_mod.ModelConfig, whole: u64, mine: u6
 /// Whether a Thunderbolt pair holds `model_dir`: the worker joined, so no other load unloads it
 /// to make room (an explicit unload still does, on both Macs: `release`).
 pub fn holds(model_dir: []const u8) bool {
-    return joined.load(.acquire) and serves(model_dir);
+    return cluster().joined.load(.acquire) and serves(model_dir);
 }
 
 /// Whether `model_dir` is the model this server's group serves.
 pub fn serves(model_dir: []const u8) bool {
     if (comptime builtin.os.tag != .macos) return false; // a cluster exists only on macOS
-    const g = group orelse return false;
+    const g = cluster().group orelse return false;
     return samePath(g.model, model_dir);
 }
 
@@ -818,13 +823,13 @@ pub fn planRows(model_dir: []const u8, hidden: i32, blocks: i32) !*Peer {
 
 /// The worker's hello, read once.
 fn join() !*Peer {
-    if (peer_slot == null) {
-        const g = group.?;
-        if (!joined.load(.acquire)) {
+    if (cluster().peer_slot == null) {
+        const g = cluster().group.?;
+        if (!cluster().joined.load(.acquire)) {
             log.err("[dist] {s} is served with a worker: start `mlx-serve worker` on the other Mac first\n", .{std.fs.path.basename(g.model)});
             return error.DistWorkerNotJoined;
         }
-        switch (worker_copy.load(.acquire)) {
+        switch (cluster().worker_copy.load(.acquire)) {
             NOT_FOUND, MISMATCH => {
                 log.err("[dist] the worker does not have {s}: download the same model there, then join again\n", .{std.fs.path.basename(g.model)});
                 return error.DistWorkerMissingModel;
@@ -832,15 +837,15 @@ fn join() !*Peer {
             else => {},
         }
         // The worker sends its hello only once rung: JACCL's send polls until this recv is posted.
-        try joined_link.bell.ring();
-        const worker = try Hello.parse(try recvMsg(&joined_link, 1));
-        var p: Peer = .{ .link = joined_link, .mode = g.mode, .model = g.model, .split = g.split, .worker = worker };
-        if (worker.name_len > 0) try recvBytes(&joined_link, p.worker_name_buf[0..@intCast(worker.name_len)], 1);
+        try cluster().joined_link.bell.ring();
+        const worker = try Hello.parse(try recvMsg(&cluster().joined_link, 1));
+        var p: Peer = .{ .link = cluster().joined_link, .mode = g.mode, .model = g.model, .split = g.split, .worker = worker };
+        if (worker.name_len > 0) try recvBytes(&cluster().joined_link, p.worker_name_buf[0..@intCast(worker.name_len)], 1);
         p.worker_name_len = @intCast(worker.name_len);
         log.info("[dist] worker {s}: {d} MiB free of {d}\n", .{ p.workerName(), worker.avail_mib, worker.total_mib });
-        peer_slot = p;
+        cluster().peer_slot = p;
     }
-    return &peer_slot.?;
+    return &cluster().peer_slot.?;
 }
 
 fn plan(self: *Peer, config: *const model_mod.ModelConfig, model_dir: []const u8) !void {
@@ -887,7 +892,7 @@ fn planDsv41(self: *Peer, config: *const model_mod.ModelConfig, model_dir: []con
     const pl: Plan = .{ .mode = .pipeline, .span = self.remote.?, .hidden = @intCast(config.hidden_size), .experts = @intCast(config.num_experts) };
     self.plan_id = try pl.send(&self.link, model_dir);
     self.planned = true;
-    dsv41_mod.pair_exchange = &dsv41Exchange;
+    dsv41_mod.clusterHooks().pair_exchange = &dsv41Exchange;
 }
 
 /// Host, DeepSeek-V4.1: one step's stream and mix through the worker's layers and back.
@@ -895,9 +900,9 @@ fn dsv41Exchange(x: mlx.mlx_array, pre: mlx.mlx_array, p0: usize, snap: bool, ve
     const self = peer() orelse return error.DistWorkerNotJoined;
     if (!self.ready) try self.awaitReady();
     const xs = mlx.getShape(x);
-    const t0 = io_util.nowUsMonotonic(group.?.io);
-    defer noteRoundTrip(io_util.nowUsMonotonic(group.?.io) - t0);
-    try self.sendOrdered(.{ OP_DSV41, xs[0], @intCast(p0 & 0x7fffffff), @intCast(p0 >> 31), @as(i32, @intFromBool(snap)) | @as(i32, @intFromBool(verify)) << 1, xs[1], @intFromEnum(mlx.mlx_array_dtype(x)), @intFromEnum(mlx.mlx_array_dtype(pre)) }, &.{ x, pre });
+    const t0 = io_util.nowUsMonotonic(cluster().group.?.io);
+    defer noteRoundTrip(io_util.nowUsMonotonic(cluster().group.?.io) - t0);
+    try self.sendOrdered(.{ OP_DSV41, xs[0], @intCast(p0 & 0x7fffffff), @intCast(p0 >> 31), @as(i32, @intFromBool(snap)) | @as(i32, @intFromBool(verify)) << 1, xs[1], @backingInt(mlx.mlx_array_dtype(x)), @backingInt(mlx.mlx_array_dtype(pre)) }, &.{ x, pre });
     self.exchanges += 1;
     const xo = try queuedRecv(&self.link, xs, mlx.mlx_array_dtype(x), 1);
     errdefer _ = mlx.mlx_array_free(xo);
@@ -907,15 +912,15 @@ fn dsv41Exchange(x: mlx.mlx_array, pre: mlx.mlx_array, p0: usize, snap: bool, ve
 /// Every 64 round trips: what one took, and how much of it the worker computed (the rest is the
 /// link, both sends and the hand-off). The worker's time arrives over the bell, a step late.
 fn noteRoundTrip(us: i64) void {
-    timing.n += 1;
-    timing.round_us += @intCast(@max(us, 0));
-    timing.worker_us += worker_us.load(.acquire);
-    if (timing.n < 64) return;
-    const n: f64 = @floatFromInt(timing.n);
-    const round = @as(f64, @floatFromInt(timing.round_us)) / n / 1000;
-    const work = @as(f64, @floatFromInt(timing.worker_us)) / n / 1000;
-    log.info("[dist] timing over {d} steps: round trip {d:.2} ms = worker {d:.2} ms + link {d:.2} ms\n", .{ timing.n, round, work, round - work });
-    timing = .{};
+    cluster().timing.n += 1;
+    cluster().timing.round_us += @intCast(@max(us, 0));
+    cluster().timing.worker_us += cluster().worker_us.load(.acquire);
+    if (cluster().timing.n < 64) return;
+    const n: f64 = @floatFromInt(cluster().timing.n);
+    const round = @as(f64, @floatFromInt(cluster().timing.round_us)) / n / 1000;
+    const work = @as(f64, @floatFromInt(cluster().timing.worker_us)) / n / 1000;
+    log.info("[dist] timing over {d} steps: round trip {d:.2} ms = worker {d:.2} ms + link {d:.2} ms\n", .{ cluster().timing.n, round, work, round - work });
+    cluster().timing = .{};
 }
 
 /// Worker, DeepSeek-V4.1: its run of layers (`pl.span`), then one step per OP_DSV41 until
@@ -947,9 +952,9 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
             OP_RELEASE => return true,
             OP_DSV41 => {
                 const p0: usize = @as(usize, @intCast(msg[2])) | (@as(usize, @intCast(msg[3])) << 31);
-                const x = try queuedRecv(link, &.{ msg[1], msg[5], d }, @enumFromInt(msg[6]), 0);
+                const x = try queuedRecv(link, &.{ msg[1], msg[5], d }, @fromBackingInt(@intCast(msg[6])), 0);
                 defer _ = mlx.mlx_array_free(x);
-                const pre = try queuedRecv(link, &.{ msg[1], msg[5] }, @enumFromInt(msg[7]), 0);
+                const pre = try queuedRecv(link, &.{ msg[1], msg[5] }, @fromBackingInt(@intCast(msg[7])), 0);
                 defer _ = mlx.mlx_array_free(pre);
                 const t0 = io_util.nowUsMonotonic(io);
                 const out = try dsv41_mod.workerStep(m, allocator, x, pre, p0, msg[4] & 1 != 0, msg[4] & 2 != 0);
@@ -991,24 +996,24 @@ fn recvBytes(link: *const Link, out: []u8, src: u32) !void {
 /// inference thread, when `model` loads (`planFor`).
 pub fn connect(io: std.Io, allocator: std.mem.Allocator, cfg: Config, mode: Mode, model: []const u8, split: ?u32) !void {
     if (comptime builtin.os.tag != .macos) return error.RdmaUnavailable; // a cluster exists only on macOS
-    group = .{ .io = io, .allocator = allocator, .mode = mode, .model = try allocator.dupe(u8, model), .split = split };
+    cluster().group = .{ .io = io, .allocator = allocator, .mode = mode, .model = try allocator.dupe(u8, model), .split = split };
     const t = try std.Thread.spawn(.{ .stack_size = 1 << 20 }, waitForWorker, .{ io, cfg });
     t.detach();
 }
 
 fn waitForWorker(io: std.Io, cfg: Config) void {
-    joined_link = Link.open(io, cfg) catch |err| {
+    cluster().joined_link = Link.open(io, cfg) catch |err| {
         log.err("[dist] the cluster link did not open: {s}\n", .{@errorName(err)});
         return;
     };
     // Asked before `joined`: the inference thread's first ring must not land inside the question.
-    askForModel(&joined_link) catch |err| {
+    askForModel(&cluster().joined_link) catch |err| {
         log.err("[dist] the worker did not answer about the model ({s}); is it an older mlx-serve?\n", .{@errorName(err)});
         return;
     };
-    joined.store(true, .release);
-    log.info("[dist] worker joined; it loads its part with {s}\n", .{std.fs.path.basename(group.?.model)});
-    watchWorker(&joined_link);
+    cluster().joined.store(true, .release);
+    log.info("[dist] worker joined; it loads its part with {s}\n", .{std.fs.path.basename(cluster().group.?.model)});
+    watchWorker(&cluster().joined_link);
 }
 
 /// Waits on the bell for the worker to leave: it never writes after its answer, so a read
@@ -1018,10 +1023,10 @@ fn watchWorker(link: *const Link) void {
     // After its answer the worker writes only each step's compute time (µs, u32).
     var x: [4]u8 = undefined;
     while (link.bell.readAll(&x)) |_| {
-        worker_us.store(std.mem.readInt(u32, &x, .little), .release);
+        cluster().worker_us.store(std.mem.readInt(u32, &x, .little), .release);
     } else |_| {}
     worker_gone.store(true, .release);
-    joined.store(false, .release);
+    cluster().joined.store(false, .release);
     log.warn("[dist] the worker left; this server restarts to pair again\n", .{});
 }
 
@@ -1029,7 +1034,7 @@ fn watchWorker(link: *const Link) void {
 /// the group's model by name and `modelIdentity`, answered with whether the worker has it.
 fn askForModel(link: *const Link) !void {
     if (!link.bell.open()) return;
-    const g = group.?;
+    const g = cluster().group.?;
     const name = std.fs.path.basename(g.model);
     const id = try modelIdentity(g.io, g.allocator, g.model);
     var head: [10]u8 = undefined;
@@ -1041,7 +1046,7 @@ fn askForModel(link: *const Link) !void {
     if (try std.posix.poll(&fds, 30_000) == 0) return error.DistNoAnswer;
     var reply: [5]u8 = undefined;
     try link.bell.readAll(&reply);
-    worker_copy.store(reply[0], .release);
+    cluster().worker_copy.store(reply[0], .release);
     worker_free_mib.store(std.mem.readInt(u32, reply[1..5], .little), .release);
     if (reply[0] != 0) log.err("[dist] the worker does not have {s} ({s}): download the same model there, then join again\n", .{ name, workerCopyName() });
 }
@@ -1242,7 +1247,7 @@ fn servePlan(io: std.Io, allocator: std.mem.Allocator, link: *const Link, roots:
                     return error.DistPeerDiverged;
                 }
                 const shape = [_]c_int{ m[1], m[2], m[5] };
-                const h = try queuedRecv(link, &shape, @enumFromInt(m[6]), 0);
+                const h = try queuedRecv(link, &shape, @fromBackingInt(@intCast(m[6])), 0);
                 defer _ = mlx.mlx_array_free(h);
                 const raw = try t.forwardQwen4Stream(&ctx, h);
                 defer _ = mlx.mlx_array_free(raw);
@@ -1263,9 +1268,9 @@ fn servePlan(io: std.Io, allocator: std.mem.Allocator, link: *const Link, roots:
                 if (m[1] * m[2] > 1 or forwards % 256 == 0) log.info("[dist] worker: forward {d}: {d}x{d} rows, now at {d} tokens\n", .{ forwards, m[1], m[2], t.moe_seq_offset });
             },
             OP_MOE => {
-                const x = try queuedRecv(link, &.{ m[1], m[2], m[3] }, @enumFromInt(m[5]), 0);
+                const x = try queuedRecv(link, &.{ m[1], m[2], m[3] }, @fromBackingInt(@intCast(m[5])), 0);
                 defer _ = mlx.mlx_array_free(x);
-                const logits = try queuedRecv(link, &.{ m[1], m[2], m[4] }, @enumFromInt(m[7]), 0);
+                const logits = try queuedRecv(link, &.{ m[1], m[2], m[4] }, @fromBackingInt(@intCast(m[7])), 0);
                 defer _ = mlx.mlx_array_free(logits);
                 const raw = try t.moeExpertsRouted(x, @intCast(m[6]), logits);
                 defer _ = mlx.mlx_array_free(raw);
@@ -1596,8 +1601,8 @@ test "a plan made for one copy refuses another folder of the same name" {
     const b = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}/b/Flash", .{ cwd, tmp.sub_path });
     defer allocator.free(b);
 
-    group = .{ .io = io, .allocator = allocator, .mode = .pipeline, .model = a, .split = null };
-    defer group = null;
+    cluster().group = .{ .io = io, .allocator = allocator, .mode = .pipeline, .model = a, .split = null };
+    defer cluster().group = null;
     var p: Peer = undefined;
     p.plan_id = try modelIdentity(io, allocator, a);
     try p.samePlannedCopy(a);
@@ -1621,10 +1626,10 @@ test "the pair holds its own folder, not another one with the same name" {
     const b = try std.fmt.allocPrint(allocator, "{s}/b/Flash", .{root});
     defer allocator.free(b);
 
-    group = .{ .io = io, .allocator = allocator, .mode = .pipeline, .model = a, .split = null };
-    defer group = null;
-    joined.store(true, .release);
-    defer joined.store(false, .release);
+    cluster().group = .{ .io = io, .allocator = allocator, .mode = .pipeline, .model = a, .split = null };
+    defer cluster().group = null;
+    cluster().joined.store(true, .release);
+    defer cluster().joined.store(false, .release);
     try std.testing.expect(holds(a));
     try std.testing.expect(holds(a_spelled));
     try std.testing.expect(!holds(b));
@@ -1680,9 +1685,9 @@ test "the worker answers whether it has the host's copy of the model when it joi
     defer allocator.free(base);
     const host_model = try std.fmt.allocPrint(allocator, "{s}/host/Flash", .{base});
     defer allocator.free(host_model);
-    group = .{ .io = io, .allocator = allocator, .mode = .pipeline, .model = host_model, .split = null };
-    defer group = null;
-    defer worker_copy.store(-1, .release);
+    cluster().group = .{ .io = io, .allocator = allocator, .mode = .pipeline, .model = host_model, .split = null };
+    defer cluster().group = null;
+    defer cluster().worker_copy.store(-1, .release);
 
     const Case = struct { root: []const u8, want: i32 };
     for ([_]Case{ .{ .root = "worker", .want = 0 }, .{ .root = "other", .want = MISMATCH }, .{ .root = "nowhere", .want = NOT_FOUND } }) |c| {
@@ -1700,7 +1705,7 @@ test "the worker answers whether it has the host's copy of the model when it joi
         const has = try answerModel(io, allocator, &worker, &.{root});
         asker.join();
         try std.testing.expectEqual(c.want == 0, has);
-        try std.testing.expectEqual(c.want, worker_copy.load(.acquire));
+        try std.testing.expectEqual(c.want, cluster().worker_copy.load(.acquire));
     }
 }
 
@@ -1718,16 +1723,16 @@ test "a paired model is never picked to unload while the worker is joined" {
     _ = try reg.ensureLoaded("other");
     reg.release(other); // `other` is now the newest; Flash the oldest
 
-    group = .{ .io = std.testing.io, .allocator = std.testing.allocator, .mode = .pipeline, .model = "/m/Flash", .split = null };
-    defer group = null;
-    joined.store(true, .release);
-    defer joined.store(false, .release);
+    cluster().group = .{ .io = std.testing.io, .allocator = std.testing.allocator, .mode = .pipeline, .model = "/m/Flash", .split = null };
+    defer cluster().group = null;
+    cluster().joined.store(true, .release);
+    defer cluster().joined.store(false, .release);
 
     reg.mutex.lockUncancelable(reg.io);
     defer reg.mutex.unlock(reg.io);
     try std.testing.expectEqualStrings("other", reg.pickLruEvictable("", false).?.id);
     try std.testing.expect(!reg_mod.ModelRegistry.idleEvictable(flash, std.math.maxInt(i64), 0));
-    joined.store(false, .release);
+    cluster().joined.store(false, .release);
     try std.testing.expectEqualStrings("Flash", reg.pickLruEvictable("", false).?.id);
 }
 
@@ -1751,8 +1756,8 @@ test "after the stop message rank 0 sends the worker nothing more" {
     // A read-only bell fails to ring, so no message reaches the (absent) RDMA link.
     const fd = std.c.open("/dev/null", .{ .ACCMODE = .RDONLY });
     defer _ = std.c.close(fd);
-    peer_slot = .{ .link = .{ .group = undefined, .rank = 0, .size = 2, .bell = .{ .fd = fd } }, .mode = .pipeline, .model = "/m/H3", .split = null, .worker = undefined, .ready = true };
-    defer peer_slot = null;
+    cluster().peer_slot = .{ .link = .{ .group = undefined, .rank = 0, .size = 2, .bell = .{ .fd = fd } }, .mode = .pipeline, .model = "/m/H3", .split = null, .worker = undefined, .ready = true };
+    defer cluster().peer_slot = null;
     shutdown();
     try std.testing.expect(!peer().?.ready); // the model's unload at teardown must not message a stopped worker
 }

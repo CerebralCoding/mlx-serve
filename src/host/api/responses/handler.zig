@@ -891,7 +891,7 @@ fn handleResponsesInner(
     if (is_stream) {
         // Pick speculative-decoding mode for the streaming Responses path.
         const stream_mode = pickStreamMode(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.shapesLogits(), 0, requestHasCompany());
-        if (stream_mode == .pld) log.info("  pld=enabled (streaming responses, draft_len={d}, key_len={d})\n", .{ http_server.server_config.default_pld_draft_len, http_server.server_config.default_pld_key_len });
+        if (stream_mode == .pld) log.info("  pld=enabled (streaming responses, draft_len={d}, key_len={d})\n", .{ http_server.serverState().server_config.default_pld_draft_len, http_server.serverState().server_config.default_pld_key_len });
         if (stream_mode == .drafter) log.info("  drafter=enabled (streaming responses, block_size={d})\n", .{lm.drafter_block_size});
         if (stream_mode == .mtp) log.info("  mtp=enabled (streaming responses, depth={d})\n", .{lm.mtp_depth});
 
@@ -931,8 +931,8 @@ fn handleResponsesInner(
             .mrope_pos = slot_mrope.pos,
             .mrope_total = slot_mrope.total,
             .mrope_delta = slot_mrope.delta,
-            .pld_draft_len = http_server.server_config.default_pld_draft_len,
-            .pld_key_len = http_server.server_config.default_pld_key_len,
+            .pld_draft_len = http_server.serverState().server_config.default_pld_draft_len,
+            .pld_key_len = http_server.serverState().server_config.default_pld_key_len,
             .kv_attn_fused = resolveKvAttnFused(config, kv_attn_explicit, prompt_ids.len, kv_quant_override),
             .logprobs_n = 0,
             .kv_quant_config = kv_quant_override,

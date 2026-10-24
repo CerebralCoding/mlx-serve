@@ -1908,7 +1908,7 @@ pub const Engine = struct {
         self.mix = try buildMix(&self.ce_w, self.s);
         errdefer _ = mlx.mlx_array_free(self.mix);
         try readFourier(&self.dit_w, &self.fourier_w);
-        if (w8a8.enabled) {
+        if (w8a8.w8a8State().enabled) {
             const n = try self.dit_w.w8.convert(allocator, &self.dit_w.map, .{ .base = "transformer_blocks.0.attn.to_q", .in_features = self.cfg.dit_hidden }, self.s);
             log.info("[music3] int8: {d} DiT linears\n", .{n});
         }
@@ -3109,8 +3109,7 @@ test "music3 caption facts: the user's own words always win" {
     // clause, so it still fires alongside the tempo fact.
     const c3 = try captionWithFacts(a, "an instrumental piece", 96, "", true);
     defer a.free(c3);
-    try std.testing.expectEqualStrings(
-        "an instrumental piece\nInstrumental only: no vocals, no singing, no lyrics. BPM: 96.", c3);
+    try std.testing.expectEqualStrings("an instrumental piece\nInstrumental only: no vocals, no singing, no lyrics. BPM: 96.", c3);
 }
 
 test "music3 caption facts: instrumental clause leads, then bpm, then key" {
@@ -3119,8 +3118,7 @@ test "music3 caption facts: instrumental clause leads, then bpm, then key" {
     // between runs makes seeds non-reproducible for no reason.
     const c = try captionWithFacts(a, "ambient", 70, "A minor", true);
     defer a.free(c);
-    try std.testing.expectEqualStrings(
-        "ambient\nInstrumental only: no vocals, no singing, no lyrics. BPM: 70. Key: A minor.", c);
+    try std.testing.expectEqualStrings("ambient\nInstrumental only: no vocals, no singing, no lyrics. BPM: 70. Key: A minor.", c);
 }
 
 /// One DiT forward on seeded noise (64 latent frames, batch 2 like the CFG pair), velocity as f32;
@@ -3152,13 +3150,13 @@ test "music3 DiT: the w8a8 route stays within its bar of the packed forward" {
     _ = std.c.getenv("MUSIC3_TEST_MODEL") orelse return error.SkipZigTest;
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    const prev = w8a8.enabled;
-    defer w8a8.enabled = prev;
-    w8a8.enabled = false;
+    const prev = w8a8.w8a8State().enabled;
+    defer w8a8.w8a8State().enabled = prev;
+    w8a8.w8a8State().enabled = false;
     var packed_bytes: usize = 0;
     const want = try dit3Probe(io, a, &packed_bytes);
     defer _ = mlx.mlx_array_free(want);
-    w8a8.enabled = true;
+    w8a8.w8a8State().enabled = true;
     var int8_bytes: usize = 0;
     const got = try dit3Probe(io, a, &int8_bytes);
     defer _ = mlx.mlx_array_free(got);

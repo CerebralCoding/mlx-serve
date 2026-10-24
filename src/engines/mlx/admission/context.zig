@@ -262,9 +262,9 @@ test "safeAutoContext leaves headroom below the memory ceiling and rounds to 102
 }
 
 test "autoContextFor: the safety margin applies to MEMORY, never to the model's own max" {
-    const original = http_server.server_config.max_context_size;
-    defer http_server.server_config.max_context_size = original;
-    http_server.server_config.max_context_size = 0;
+    const original = http_server.serverState().server_config.max_context_size;
+    defer http_server.serverState().server_config.max_context_size = original;
+    http_server.serverState().server_config.max_context_size = 0;
     // The OS reserve alone eats a 7 GB CI runner's free RAM; it is not what is on trial.
     const orig_reserve = metrics.os_reserve_override;
     defer metrics.os_reserve_override = orig_reserve;
@@ -293,9 +293,9 @@ test "autoContextFor: the safety margin applies to MEMORY, never to the model's 
 }
 
 test "getEffectiveContextLength returns the PINNED value, not a fresh memory reading" {
-    const original = http_server.server_config.max_context_size;
-    defer http_server.server_config.max_context_size = original;
-    http_server.server_config.max_context_size = 0; // auto
+    const original = http_server.serverState().server_config.max_context_size;
+    defer http_server.serverState().server_config.max_context_size = original;
+    http_server.serverState().server_config.max_context_size = 0; // auto
 
     var config = model_mod.ModelConfig{};
     config.max_position_embeddings = 131072;
@@ -311,13 +311,13 @@ test "getEffectiveContextLength returns the PINNED value, not a fresh memory rea
     try testing.expectEqual(@as(u32, 12345), getEffectiveContextLength(&config));
 
     // ...but an explicit --ctx-size still wins.
-    http_server.server_config.max_context_size = 4096;
+    http_server.serverState().server_config.max_context_size = 4096;
     try testing.expectEqual(@as(u32, 4096), getEffectiveContextLength(&config));
 }
 
 test "pinAutoContext is idempotent and a no-op under --ctx-size" {
-    const original = http_server.server_config.max_context_size;
-    defer http_server.server_config.max_context_size = original;
+    const original = http_server.serverState().server_config.max_context_size;
+    defer http_server.serverState().server_config.max_context_size = original;
 
     var config = model_mod.ModelConfig{};
     config.max_position_embeddings = 131072;
@@ -326,7 +326,7 @@ test "pinAutoContext is idempotent and a no-op under --ctx-size" {
     config.num_key_value_heads = 2;
     config.head_dim = 256;
 
-    http_server.server_config.max_context_size = 0;
+    http_server.serverState().server_config.max_context_size = 0;
     const first = pinAutoContext(&config);
     try testing.expect(first > 0);
     try testing.expectEqual(first, config.pinned_context);
@@ -336,7 +336,7 @@ test "pinAutoContext is idempotent and a no-op under --ctx-size" {
     // Explicit --ctx-size: never overwrite, always report the override.
     var manual = model_mod.ModelConfig{};
     manual.max_position_embeddings = 131072;
-    http_server.server_config.max_context_size = 8192;
+    http_server.serverState().server_config.max_context_size = 8192;
     try testing.expectEqual(@as(u32, 8192), pinAutoContext(&manual));
     try testing.expectEqual(@as(u32, 0), manual.pinned_context);
 }
@@ -351,20 +351,20 @@ test "a GLM-5.3 request of 16,387 prompt tokens asking max_tokens 131,072 keeps 
 }
 
 test "getEffectiveContextLength uses ctx_size override" {
-    const original = http_server.server_config.max_context_size;
-    defer http_server.server_config.max_context_size = original;
+    const original = http_server.serverState().server_config.max_context_size;
+    defer http_server.serverState().server_config.max_context_size = original;
 
-    http_server.server_config.max_context_size = 4096;
+    http_server.serverState().server_config.max_context_size = 4096;
     var config = model_mod.ModelConfig{};
     config.max_position_embeddings = 32768;
     try testing.expectEqual(@as(u32, 4096), getEffectiveContextLength(&config));
 }
 
 test "getEffectiveContextLength computes safe default from GPU memory" {
-    const original = http_server.server_config.max_context_size;
-    defer http_server.server_config.max_context_size = original;
+    const original = http_server.serverState().server_config.max_context_size;
+    defer http_server.serverState().server_config.max_context_size = original;
 
-    http_server.server_config.max_context_size = 0;
+    http_server.serverState().server_config.max_context_size = 0;
     var config = model_mod.ModelConfig{};
     config.max_position_embeddings = 131072;
     config.num_attention_heads = 8;
@@ -377,7 +377,7 @@ test "getEffectiveContextLength computes safe default from GPU memory" {
     try testing.expect(computed <= config.max_position_embeddings);
 
     // Explicit --ctx-size overrides the computed default
-    http_server.server_config.max_context_size = 32768;
+    http_server.serverState().server_config.max_context_size = 32768;
     try testing.expectEqual(@as(u32, 32768), getEffectiveContextLength(&config));
 }
 

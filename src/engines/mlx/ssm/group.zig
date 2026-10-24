@@ -25,10 +25,17 @@ pub const SsmMergeKind = packed struct {
     ple: bool = false,
 };
 
-var ssm_member_gen_src: std.atomic.Value(u64) = .init(1);
+/// Process-wide under `-Dunits` (sdk/util/shared.zig): one copy in the host.
+const SsmGroupState = struct {
+    ssm_member_gen_src: std.atomic.Value(u64) = .init(1),
+};
+const ssmGroup_shared = @import("../../../sdk/util/shared.zig").Shared(SsmGroupState, "ssm_group", .{});
+inline fn ssmGroup() *SsmGroupState {
+    return ssmGroup_shared.get();
+}
 
 pub fn nextSsmMemberGen() u64 {
-    return ssm_member_gen_src.fetchAdd(1, .monotonic);
+    return ssmGroup().ssm_member_gen_src.fetchAdd(1, .monotonic);
 }
 
 const SsmGroupMember = struct {

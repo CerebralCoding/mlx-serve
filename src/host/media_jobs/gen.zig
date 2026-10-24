@@ -744,8 +744,8 @@ fn convertsW8a8(model_type: []const u8) ?bool {
 /// The engines whose ANE seam reads the packed DiT weights, so `--ane-*` keeps them packed (the loaders
 /// skip the conversion) and the bill must not assume the int8 copy.
 fn aneKeepsPacked(model_type: []const u8) bool {
-    if (std.mem.eql(u8, model_type, "acestep")) return ane.media_offload.audio;
-    if (std.mem.eql(u8, model_type, "minimax_h3")) return ane.media_offload.video;
+    if (std.mem.eql(u8, model_type, "acestep")) return ane.aneState().media_offload.audio;
+    if (std.mem.eql(u8, model_type, "minimax_h3")) return ane.aneState().media_offload.video;
     return false;
 }
 
@@ -1799,8 +1799,8 @@ test "estimatePeakResidentBytes: minimax_h3 stages, other types keep the sum" {
 test "residency bill: a DiT that --w8a8 converts is billed at its int8 copy, not the pack's bytes" {
     w8a8.nax_override = true; // only shard headers are read, so any machine can run this
     defer w8a8.nax_override = null;
-    w8a8.enabled = true;
-    defer w8a8.enabled = false;
+    w8a8.w8a8State().enabled = true;
+    defer w8a8.w8a8State().enabled = false;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -1823,15 +1823,15 @@ test "residency bill: a DiT that --w8a8 converts is billed at its int8 copy, not
     try std.testing.expectEqual(file + 1000 - 51200 + 33280 + 16640, estimatePeakResidentBytesIn(io, tmp.dir, "krea2_turbo"));
     // a type the route does not convert keeps the plain sum
     try std.testing.expectEqual(file + 1000, estimatePeakResidentBytesIn(io, tmp.dir, "stable_audio3"));
-    w8a8.enabled = false;
+    w8a8.w8a8State().enabled = false;
     try std.testing.expectEqual(file + 1000, estimatePeakResidentBytesIn(io, tmp.dir, "krea2_turbo"));
 }
 
 test "residency bill: ACE-Step, Music3, Hunyuan3D and LTX DiT shards are billed at their int8 copy" {
     w8a8.nax_override = true; // only shard headers are read, so any machine can run this
     defer w8a8.nax_override = null;
-    w8a8.enabled = true;
-    defer w8a8.enabled = false;
+    w8a8.w8a8State().enabled = true;
+    defer w8a8.w8a8State().enabled = false;
     const io = std.testing.io;
     // One 4-bit g64 block linear [N=128, K=256]: 18432 B in the pack, 33280 B as int8.
     const Pack = struct {
@@ -1863,15 +1863,15 @@ test "residency bill: ACE-Step, Music3, Hunyuan3D and LTX DiT shards are billed 
         try std.testing.expectEqual(file - 18432 + 33280 + extra, estimatePeakResidentBytesIn(io, tmp.dir, c.model_type));
     }
     // The ANE seam reads the packed weights, so under `--ane-audio` ACE-Step is billed as the pack.
-    ane.media_offload.audio = true;
-    defer ane.media_offload.audio = false;
+    ane.aneState().media_offload.audio = true;
+    defer ane.aneState().media_offload.audio = false;
     {
         var tmp = std.testing.tmpDir(.{ .iterate = true });
         defer tmp.cleanup();
         const file = try Pack.shard(tmp.dir, "model.safetensors", "decoder.layers.0.self_attn.q_proj");
         try std.testing.expectEqual(file, estimatePeakResidentBytesIn(io, tmp.dir, "acestep"));
     }
-    ane.media_offload.audio = false;
+    ane.aneState().media_offload.audio = false;
     // LTX bills both variants' resident bytes, one of them spare (they never coexist).
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();

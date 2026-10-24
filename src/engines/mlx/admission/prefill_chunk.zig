@@ -59,7 +59,6 @@ const admissionLogLevel = @import("admit.zig").admissionLogLevel;
 const qwen4ExpOomConfig = @import("bills_test.zig").qwen4ExpOomConfig;
 const qwen4ExpLive364kConfig = @import("bills_test.zig").qwen4ExpLive364kConfig;
 
-
 /// Widths `resolvePrefillChunk` will step down through. Descending, floored at
 /// `generate.PREFILL_CHUNK_FLOOR` — below that the score-budget path refuses to
 /// go either, and a 256-token forward stops amortizing the per-chunk sweeps.
@@ -624,9 +623,9 @@ test "the SSD-first budget bills the FLOOR reserve, at the deployed pack's live 
     const active: u64 = 69_827 * MiB;
     const ceiling: u64 = 109_395 * MiB;
 
-    const orig_ctx = http_server.server_config.max_context_size;
-    defer http_server.server_config.max_context_size = orig_ctx;
-    http_server.server_config.max_context_size = 0;
+    const orig_ctx = http_server.serverState().server_config.max_context_size;
+    defer http_server.serverState().server_config.max_context_size = orig_ctx;
+    http_server.serverState().server_config.max_context_size = 0;
     cfg.pinned_context = 0;
     per_request_chunk_override = true;
     defer per_request_chunk_override = null;
@@ -705,9 +704,9 @@ test "SSD-first is gated on a DISK TIER: with --prefix-cache-disk off, qwen4_exp
     prefix_cache_mod.ssd_first_override = true;
 
     // The SSD arm floors at one session's KV, the RAM arm is a residual bounded by the ask.
-    const orig_ctx = http_server.server_config.max_context_size;
-    defer http_server.server_config.max_context_size = orig_ctx;
-    http_server.server_config.max_context_size = 1_048_576; // explicit: no auto-sizing in the way
+    const orig_ctx = http_server.serverState().server_config.max_context_size;
+    defer http_server.serverState().server_config.max_context_size = orig_ctx;
+    http_server.serverState().server_config.max_context_size = 1_048_576; // explicit: no auto-sizing in the way
     cfg.pinned_context = 0;
     const ask: u64 = 4 * 1024 * 1024 * 1024;
 
@@ -739,9 +738,9 @@ test "an auto boot advertises the session the SSD-first budget floor was billed 
     const active: u64 = 69_827 * MiB;
     const ceiling: u64 = 109_395 * MiB;
 
-    const original = http_server.server_config.max_context_size;
-    defer http_server.server_config.max_context_size = original;
-    http_server.server_config.max_context_size = 0;
+    const original = http_server.serverState().server_config.max_context_size;
+    defer http_server.serverState().server_config.max_context_size = original;
+    http_server.serverState().server_config.max_context_size = 0;
     cfg.pinned_context = 0;
 
     const chunk: u32 = @intCast(generate_mod.effectivePrefillChunk(
@@ -795,9 +794,9 @@ test "the load-time session bill is billed at the boot's --kv-quant, not bf16" {
     try t.expectEqual(@as(u64, 24_576), kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 16));
 
     // An explicit `--ctx-size`, so the two numbers differ in the width and nothing else.
-    const saved_ctx = http_server.server_config.max_context_size;
-    defer http_server.server_config.max_context_size = saved_ctx;
-    http_server.server_config.max_context_size = 786_432;
+    const saved_ctx = http_server.serverState().server_config.max_context_size;
+    defer http_server.serverState().server_config.max_context_size = saved_ctx;
+    http_server.serverState().server_config.max_context_size = 786_432;
     const ceiling: u64 = 109_395 * MiB;
     const active: u64 = 69_827 * MiB;
     const chunk: u32 = cfg.pinned_prefill_chunk;
@@ -839,10 +838,10 @@ test "an explicit --ctx-size boot never consults the session reserve" {
     const MiB: u64 = 1 << 20;
     const per_tok: u64 = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(&cfg);
 
-    const original = http_server.server_config.max_context_size;
-    defer http_server.server_config.max_context_size = original;
+    const original = http_server.serverState().server_config.max_context_size;
+    defer http_server.serverState().server_config.max_context_size = original;
 
-    http_server.server_config.max_context_size = 262_144;
+    http_server.serverState().server_config.max_context_size = 262_144;
     cfg.pinned_context = 0;
     for ([_]u64{ 0, 40_000 * MiB, 109_395 * MiB, 900_000 * MiB }) |ceiling| {
         for ([_]u64{ 0, 69_827 * MiB }) |active| {
@@ -858,7 +857,7 @@ test "an explicit --ctx-size boot never consults the session reserve" {
         );
     }
 
-    http_server.server_config.max_context_size = 0;
+    http_server.serverState().server_config.max_context_size = 0;
     cfg.pinned_context = 131_072;
     try t.expectEqual(@as(u32, 131_072), ssdFirstSessionTokensNow(&cfg, kv_bits, 109_395 * MiB, 69_827 * MiB, 4096));
 }

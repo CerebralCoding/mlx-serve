@@ -223,7 +223,7 @@ pub fn flushDeferredPleGroup(self: *Transformer, ctxs: []const *ForwardCtx) !voi
     var sync_lap = io_util_mod.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
     try mlx.check(mlx.mlx_eval(vec));
     self.verify_laps.ple_sync_ns = sync_lap.read();
-    transformer.deferred_ple_group_syncs += 1;
+    transformer.cli().deferred_ple_group_syncs += 1;
     var k: usize = 0;
     for (ctxs) |ctx| {
         const p = ctx.ple_pending orelse continue;
@@ -917,12 +917,12 @@ test "deferred PLE at N rows: a failed row abandons every row's claim and leaves
         try testing.expectEqual(prev_valid_before[i], e.ple_prev_valid);
     }
 
-    const sync_before = transformer.deferred_ple_group_syncs;
+    const sync_before = transformer.cli().deferred_ple_group_syncs;
     layered.verify_fail_after_flush = 1;
     const flushed_failure = xfm.forwardRowAxisVerify(&rows, &ctxs, &logits, &last, &all, null, null);
     layered.verify_fail_after_flush = null;
     try testing.expectError(error.InjectedGroupFlushFailure, flushed_failure);
-    try testing.expectEqual(@as(u64, 1), transformer.deferred_ple_group_syncs - sync_before);
+    try testing.expectEqual(@as(u64, 1), transformer.cli().deferred_ple_group_syncs - sync_before);
     for (ctxs, 0..) |ctx, row| {
         try testing.expectEqual(offsets_before[row], ctx.moe_seq_offset.*);
         for (ctx.cache.entries, 0..) |entry, layer| try testing.expectEqual(kv_offsets_before[row][layer], entry.offset);

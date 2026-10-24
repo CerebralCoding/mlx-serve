@@ -362,9 +362,9 @@ pub const Gguf = struct {
 pub fn openGguf(table: *const abi.ModelTable, g: *const Gguf, by_file: bool, oracle: both.Oracle) !both.Both {
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    const prev = mlx_gguf.enabled;
-    mlx_gguf.enabled = true;
-    defer mlx_gguf.enabled = prev;
+    const prev = mlx_gguf.claimState().enabled;
+    mlx_gguf.claimState().enabled = true;
+    defer mlx_gguf.claimState().enabled = prev;
     var tmp = testing.tmpDir(.{});
     errdefer tmp.cleanup();
     try g.write(io, tmp.dir, "model.gguf");

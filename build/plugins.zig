@@ -12,8 +12,8 @@ const registry_path = "src/plugins/registry.zig";
 const denied = [_][]const u8{ "src/mlx/", "src/engines/", "src/host/", "src/kernels/" };
 
 /// Zig caches the configure phase: every input the scan reads is declared, so a new plugin folder, a changed
-/// `config.zig` closure, a new fixture or a deleted registry re-runs it.
-pub fn generate(b: *std.Build) void {
+/// `config.zig` closure, a new fixture or a deleted registry re-runs it. Returns the registered plugins' names.
+pub fn generate(b: *std.Build) []const []const u8 {
     const a = b.allocator;
     const io = b.graph.io;
     const root = b.root.root_dir.handle;
@@ -40,6 +40,7 @@ pub fn generate(b: *std.Build) void {
     const src = render(a, split.plugins, split.templates, jsons.items) catch @panic("OOM");
     writeIfChanged(io, root, registry_path, src) catch |e| std.process.fatal("plugins: cannot write {s}: {t}", .{ registry_path, e });
     b.dependOnFileContents(b.path(registry_path));
+    return split.plugins;
 }
 
 /// The build's own tests of this file (the scan, the closure check, the rendering), on the host.
@@ -181,11 +182,14 @@ fn render(a: std.mem.Allocator, plugins: []const []const u8, templates: []const 
     try out.appendSlice(a,
         \\};
         \\
-        \\pub const entries = sdk.entries(&plugins, &plugins_names);
+        \\/// `-Dunits`: every plugin is its own compile unit (`src/unit.zig`) exporting its table; the host links them by name.
+        \\const units = @import("build_options").units and !@import("builtin").is_test;
+        \\
+        \\pub const entries = if (units) sdk.externEntries(&plugins, &plugins_names) else sdk.entries(&plugins, &plugins_names);
         \\
         \\comptime {
         \\    _ = sdk.entries(&templates, &templates_names);
-        \\    sdk.exportAll(&plugins);
+        \\    if (!units) sdk.exportAll(&plugins);
         \\}
         \\
         \\test "plugin registry: every template and plugin passes conformance; one plugin claims each fixture pack" {

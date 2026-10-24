@@ -6,6 +6,7 @@ const build_options = @import("build_options");
 // pub: Sushi's EXL3 module (src/sdk/quant/exl3/sushi) and mlx-stream reach these through their host root.
 pub const mlx = @import("mlx/ffi.zig");
 pub const io_util = @import("sdk/util/io_util.zig");
+pub const shared = @import("sdk/util/shared.zig");
 const mlx_gguf = @import("sdk/quant/gguf/claim.zig");
 const model_mod = @import("engines/mlx/model.zig");
 const tokenizer_mod = @import("host/tokenizer/tokenizer.zig");
@@ -703,7 +704,7 @@ pub fn main(init: std.process.Init) !void {
     var max_resident_mem_explicit: bool = false;
     var idle_evict_secs: ?u32 = null;
     var metrics_enabled = false;
-    @import("sdk/blocks/dit/w8a8.zig").enabled = @import("sdk/blocks/dit/w8a8.zig").defaultOn(transformer_mod.naxAvailable(), ane_mod.totalMemBytes());
+    @import("sdk/blocks/dit/w8a8.zig").w8a8State().enabled = @import("sdk/blocks/dit/w8a8.zig").defaultOn(transformer_mod.naxAvailable(), ane_mod.totalMemBytes());
     // GGUF engine routing override. null → auto (decided by gguf_meta on
     // file inspection); set explicitly via --engine to force ds4 or llama.
     var engine_override: ?gguf_meta.Engine = null;
@@ -895,7 +896,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--mtp-head-kv-quant")) {
             mtp_head_kv_quant = true;
         } else if (std.mem.eql(u8, args[i], "--ple-gpu")) {
-            ple_gpu.enabled = true;
+            ple_gpu.pleGpu().enabled = true;
         } else if (std.mem.eql(u8, args[i], "--ane-prefill")) {
             // ANE prefill-MLP offload (perf-plan-aug-17 P5): opt-in, lossy
             // by design (int8 fp16 datapath). Eligibility + machine gates
@@ -910,15 +911,15 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             };
         } else if (std.mem.eql(u8, args[i], "--w8a8")) {
-            @import("sdk/blocks/dit/w8a8.zig").enabled = true;
+            @import("sdk/blocks/dit/w8a8.zig").w8a8State().enabled = true;
         } else if (std.mem.eql(u8, args[i], "--no-w8a8")) {
-            @import("sdk/blocks/dit/w8a8.zig").enabled = false;
+            @import("sdk/blocks/dit/w8a8.zig").w8a8State().enabled = false;
         } else if (std.mem.eql(u8, args[i], "--int8-qk")) {
-            @import("sdk/blocks/attention/nax_attention.zig").int8_qk_cli = true;
+            @import("sdk/blocks/attention/nax_attention.zig").naxCli().int8_qk_cli = true;
         } else if (std.mem.eql(u8, args[i], "--lm-head-mxfp8")) {
-            @import("engines/mlx/transformer.zig").lm_head_mxfp8_cli = true;
+            @import("engines/mlx/transformer.zig").cli().lm_head_mxfp8_cli = true;
         } else if (std.mem.eql(u8, args[i], "--no-lm-head-mxfp8")) {
-            @import("engines/mlx/transformer.zig").lm_head_mxfp8_cli = false;
+            @import("engines/mlx/transformer.zig").cli().lm_head_mxfp8_cli = false;
         } else if (std.mem.eql(u8, args[i], "--ane-image")) {
             ane_media.image = true;
         } else if (std.mem.eql(u8, args[i], "--ane-video")) {
@@ -942,9 +943,9 @@ pub fn main(init: std.process.Init) !void {
             // DSpark support GGUF sits beside a served .gguf model.
             ds4_dspark = true;
         } else if (std.mem.eql(u8, args[i], "--decode-attn-quant")) {
-            transformer_mod.decode_attn_quant_flag = true;
+            transformer_mod.cli().decode_attn_quant_flag = true;
         } else if (std.mem.eql(u8, args[i], "--no-decode-attn-quant")) {
-            transformer_mod.decode_attn_quant_flag = false;
+            transformer_mod.cli().decode_attn_quant_flag = false;
         } else if (std.mem.eql(u8, args[i], "--mtp-min-depth") or std.mem.eql(u8, args[i], "--mtp-max-depth") or std.mem.eql(u8, args[i], "--mtp-depth")) {
             const is_min = std.mem.eql(u8, args[i], "--mtp-min-depth");
             const deprecated = std.mem.eql(u8, args[i], "--mtp-depth");
@@ -1067,7 +1068,7 @@ pub fn main(init: std.process.Init) !void {
             };
         } else if (std.mem.eql(u8, args[i], "--wired-margin-gib") and i + 1 < args.len) {
             i += 1;
-            server_mod.wired_limit_margin_bytes = server_mod.parseWiredMarginGib(args[i]) catch {
+            server_mod.serverState().wired_limit_margin_bytes = server_mod.parseWiredMarginGib(args[i]) catch {
                 log.err("--wired-margin-gib: expected an integer 2..32, got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
@@ -1192,7 +1193,7 @@ pub fn main(init: std.process.Init) !void {
 
     // One value for the three media seams (they run under gen.zig with no
     // server config in reach); the env stays the benching override.
-    ane_mod.media_offload = ane_media;
+    ane_mod.aneState().media_offload = ane_media;
 
     const decode_share_env: ?[]const u8 = env.span(.MLX_SERVE_PREFILL_DECODE_SHARE);
     scheduler_mod.prefill_decode_share = scheduler_mod.resolveDecodeShare(decode_share_flag, decode_share_env) catch {
@@ -1366,7 +1367,7 @@ pub fn main(init: std.process.Init) !void {
     // Its kernels are Metal-only; on CUDA llama.cpp serves the same files faster.
     if (mlx_gguf_enabled and !mlx.metalKernelsAvailable())
         log.warn("[gguf] --mlx-gguf needs Metal kernels; GGUFs go to llama.cpp/ds4 on this backend\n", .{});
-    mlx_gguf.enabled = mlx_gguf_enabled and engine_override == null and mlx.metalKernelsAvailable();
+    mlx_gguf.claimState().enabled = mlx_gguf_enabled and engine_override == null and mlx.metalKernelsAvailable();
     // The model's engine setting outranks `--engine`, as every per-model setting outranks its flag.
     const gguf_setting = model_settings_mod.ggufEngineFor(allocator, io, model_dir);
     const mlx_gguf_path = if (gguf_setting == null) mlx_gguf.servablePath(io, allocator, model_dir) else null;

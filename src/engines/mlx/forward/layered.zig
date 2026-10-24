@@ -91,7 +91,7 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
     const prof = prof_on and (seq_len == 1 or env.get(.MLX_SERVE_DECODE_FWD_UBENCH) != null);
     if (prof) {
         try mlx.check(mlx.mlx_array_eval(h));
-        profile.decode_prof.embed_ns += pclk.lap();
+        profile.profileState().decode_prof.embed_ns += pclk.lap();
     }
     // One-shot dtype trace. A residual stream that is wider than the
     // weights promotes EVERY projection's weight on read, which inflates
@@ -180,7 +180,7 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
         defer _ = mlx.mlx_array_free(attn_out);
         if (prof) {
             try mlx.check(mlx.mlx_array_eval(attn_out));
-            if (lw.attn == .linear) profile.decode_prof.gdn_ns += pclk.lap() else profile.decode_prof.attn_ns += pclk.lap();
+            if (lw.attn == .linear) profile.profileState().decode_prof.gdn_ns += pclk.lap() else profile.profileState().decode_prof.attn_ns += pclk.lap();
         }
 
         if (is_gemma4) {
@@ -241,7 +241,7 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
 
         if (prof) {
             try mlx.check(mlx.mlx_array_eval(h));
-            profile.decode_prof.mlp_ns += pclk.lap();
+            profile.profileState().decode_prof.mlp_ns += pclk.lap();
         }
 
         // DFlash capture: this h IS `hidden_states[li+1]` — the layer's
@@ -295,8 +295,8 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
     if (ctx.skip_lm_head) {
         if (prof) {
             try mlx.check(mlx.mlx_array_eval(final_normed));
-            profile.decode_prof.lmhead_ns += pclk.lap();
-            profile.decode_prof.calls += 1;
+            profile.profileState().decode_prof.lmhead_ns += pclk.lap();
+            profile.profileState().decode_prof.calls += 1;
         }
         return final_normed;
     }
@@ -312,9 +312,9 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
 
     if (prof) {
         try mlx.check(mlx.mlx_array_eval(logits));
-        profile.decode_prof.lmhead_ns += pclk.lap();
-        profile.decode_prof.calls += 1;
-        if (profile.decode_prof.calls % 64 == 0) decodeProfReport();
+        profile.profileState().decode_prof.lmhead_ns += pclk.lap();
+        profile.profileState().decode_prof.calls += 1;
+        if (profile.profileState().decode_prof.calls % 64 == 0) decodeProfReport();
     }
 
     return logits;

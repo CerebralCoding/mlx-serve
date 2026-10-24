@@ -39,7 +39,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // A plugin registers by its folder: the scan writes src/plugins/registry.zig, every graph compiles it.
-    plugins.generate(b);
+    const plugin_names = plugins.generate(b);
 
     // `zig build lint`: the house rules over src/ (scripts/lint.py), no Zig compile. Report-only unless
     // -Dlint-strict, which fails on the rules listed in scripts/lint_enforced.txt. `--all`: run the script directly.
@@ -140,6 +140,9 @@ pub fn build(b: *std.Build) void {
     // builds its own options with ios=true so the engine swaps the embedded
     // ds4 + llama.cpp engines for no-op stubs (iOS serves MLX safetensors only).
     build_options.addOption(bool, "ios", false);
+    // `-Dunits`: every plugin compiles as its own object (src/unit.zig) beside the host, in parallel.
+    const units = b.option(bool, "units", "Compile each plugin as its own unit, in parallel") orelse false;
+    build_options.addOption(bool, "units", units);
     // True when the embedded engines (ds4, libllama) are actually linked:
     // macOS (Metal) and Linux (CUDA) exe = yes; the iOS static lib = no, it
     // gets compile-time stubs (src/arch/*_stub.zig, src/engines/ds4/ffi_stub.zig).
@@ -264,6 +267,31 @@ pub fn build(b: *std.Build) void {
         .name = "mlx-serve",
         .root_module = mod,
     });
+    // `-Dunits`: each plugin is an object of its own, compiled in parallel with the host and linked in.
+    const units_step = b.step("units", "Compile every plugin unit (-Dunits) without linking");
+    // Plugin units compile their own copy of the globals they reach: scripts/unit_globals.py fails on one the host
+    // sets or reads that is not `Shared` (names survive in a Debug build only).
+    const units_check = b.step("units-check", "Check the plugin units hold no unshared host state (-Dunits, Debug)");
+    const check_run = b.addSystemCommand(&.{ "python3", "scripts/unit_globals.py" });
+    check_run.has_side_effects = true;
+    if (units) units_check.dependOn(&check_run.step) else for ([_]*std.Build.Step{ units_step, units_check }) |s| s.dependOn(&b.addFail("pass -Dunits=true").step);
+    // Taken before any unit joins `mod`: an added object becomes one of its include sources, which would chain the units.
+    const unit_includes = b.allocator.dupe(std.Build.Module.IncludeDir, mod.include_dirs.items) catch @panic("OOM");
+    if (units) {
+        // The host is an object too, so it compiles beside the units; the exe's root only calls into it.
+        mod.addObject(b.addObject(.{ .name = "host", .root_module = unitModule(b, mod, unit_includes, "src/host_unit.zig", target, optimize) }));
+        mod.root_source_file = b.path("src/exe.zig");
+        for (plugin_names) |name| {
+            const unit_options = b.addOptions();
+            unit_options.addOption([]const u8, "plugin", name);
+            const um = unitModule(b, mod, unit_includes, "src/unit.zig", target, optimize);
+            um.addImport("unit_options", unit_options.createModule());
+            const obj = b.addObject(.{ .name = b.fmt("unit-{s}", .{name}), .root_module = um });
+            mod.addObject(obj);
+            units_step.dependOn(&b.addInstallFile(obj.getEmittedBin(), b.fmt("units/{s}.o", .{name})).step);
+            check_run.addFileArg(obj.getEmittedBin());
+        }
+    }
 
     // Ensure Mach-O header has room for install_name_tool path changes (app bundling)
     exe.headerpad_max_install_names = true;
@@ -485,6 +513,7 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     build_options.addOption([]const u8, "llama_tag", readLlamaTag(b) orelse "unknown");
     build_options.addOption([]const u8, "git_sha", "");
     build_options.addOption(bool, "ios", false);
+    build_options.addOption(bool, "units", false);
     build_options.addOption(bool, "ds4_engine", !windows);
     build_options.addOption(bool, "llama_engine", true);
     build_options.addOption(bool, "mlx_stream", false);
@@ -729,6 +758,7 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
     const ios_options = b.addOptions();
     ios_options.addOption([]const u8, "version", version);
     ios_options.addOption(bool, "ios", true);
+    ios_options.addOption(bool, "units", false);
     // Mirror the build options the shared engine sources read (server.zig,
     // scheduler.zig). iOS is sandboxed (no curl/model-pull subprocess), so
     // mas=true; ds4 + llama.cpp are stubbed here, so their version pins are
@@ -932,11 +962,24 @@ fn readLlamaTag(b: *std.Build) ?[]const u8 {
 /// EXL3 lanes (`src/sdk/quant/exl3/stream/`) and the expert streamer (`src/sdk/weights/streamed/`), one module rooted at
 /// `src/mlx_stream.zig` (`src/sdk/weights/streamed/glue.zig` binds it). Its contract types are its own `sdk` module;
 /// both reach the host through `mlx_host`.
-fn addMlxStreamModule(b: *std.Build, host: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
-    host.addImport("mlx_stream", mlxStreamPkg(b, host, "src/mlx_stream.zig", target, optimize, false));
+/// A `-Dunits` object's module rooted at `root`: the exe module's imports and include dirs, its own pair of absorbed
+/// modules (they import their host root), and no C sources (the exe links those once).
+fn unitModule(b: *std.Build, mod: *std.Build.Module, includes: []const std.Build.Module.IncludeDir, root: []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    const m = b.createModule(.{ .root_source_file = b.path(root), .target = target, .optimize = optimize, .link_libcpp = true });
+    var it = mod.import_table.iterator();
+    while (it.next()) |e| if (!std.mem.eql(u8, e.key_ptr.*, "sushi_exl3") and !std.mem.eql(u8, e.key_ptr.*, "mlx_stream")) m.addImport(e.key_ptr.*, e.value_ptr.*);
+    m.include_dirs.appendSlice(b.allocator, includes) catch @panic("OOM");
+    addMlxLib(b, m);
+    _ = addExl3Module(b, m, target, optimize);
+    m.addImport("mlx_stream", mlxStreamPkg(b, m, "src/mlx_stream.zig", target, optimize, false, false));
+    return m;
 }
 
-fn mlxStreamPkg(b: *std.Build, host: *std.Build.Module, root: []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, inject: bool) *std.Build.Module {
+fn addMlxStreamModule(b: *std.Build, host: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    host.addImport("mlx_stream", mlxStreamPkg(b, host, "src/mlx_stream.zig", target, optimize, false, true));
+}
+
+fn mlxStreamPkg(b: *std.Build, host: *std.Build.Module, root: []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, inject: bool, c_sources: bool) *std.Build.Module {
     const sdk = b.createModule(.{
         .root_source_file = b.path("src/sdk/weights/streamed/sdk/root.zig"),
         .target = target,
@@ -964,15 +1007,15 @@ fn mlxStreamPkg(b: *std.Build, host: *std.Build.Module, root: []const u8, target
     else
         &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread" };
     const cxx: []const []const u8 = &.{ "-std=c++20", "-O2", "-D_METAL_", "-DACCELERATE_NEW_LAPACK", "-fno-sanitize=all", "-Wall", "-Wno-unused-parameter", "-Wno-deprecated-declarations" };
-    m.addCSourceFile(.{ .file = b.path(b.pathJoin(&.{ csrc, "q3_lookahead4_exl3.c" })), .flags = c });
-    m.addCSourceFile(.{ .file = b.path(b.pathJoin(&.{ csrc, "q3_event_shim.mm" })), .flags = &.{ "-O2", "-Wall", "-Wextra", "-Werror", "-fno-objc-arc" } });
-    m.addCSourceFile(.{ .file = b.path(b.pathJoin(&.{ csrc, "mlx_event_shim.cpp" })), .flags = cxx });
-    m.addCSourceFile(.{ .file = b.path(b.pathJoin(&.{ csrc, "mlx_alloc_shim.cpp" })), .flags = cxx });
+    if (c_sources) m.addCSourceFile(.{ .file = b.path(b.pathJoin(&.{ csrc, "q3_lookahead4_exl3.c" })), .flags = c });
+    if (c_sources) m.addCSourceFile(.{ .file = b.path(b.pathJoin(&.{ csrc, "q3_event_shim.mm" })), .flags = &.{ "-O2", "-Wall", "-Wextra", "-Werror", "-fno-objc-arc" } });
+    if (c_sources) m.addCSourceFile(.{ .file = b.path(b.pathJoin(&.{ csrc, "mlx_event_shim.cpp" })), .flags = cxx });
+    if (c_sources) m.addCSourceFile(.{ .file = b.path(b.pathJoin(&.{ csrc, "mlx_alloc_shim.cpp" })), .flags = cxx });
     if (profile) {
         const objc: []const []const u8 = &.{ "-O2", "-Wall", "-Wextra", "-Werror", "-fno-objc-arc" };
-        m.addCSourceFile(.{ .file = b.path(b.pathJoin(&.{ csrc, "dsv41_cb_timeline.mm" })), .flags = objc });
-        m.addCSourceFile(.{ .file = b.path(b.pathJoin(&.{ csrc, "dsv41_newbuffer_count.mm" })), .flags = objc });
-        m.addCSourceFile(.{ .file = b.path(b.pathJoin(&.{ csrc, "dsv41_tl_mlx.cpp" })), .flags = cxx });
+        if (c_sources) m.addCSourceFile(.{ .file = b.path(b.pathJoin(&.{ csrc, "dsv41_cb_timeline.mm" })), .flags = objc });
+        if (c_sources) m.addCSourceFile(.{ .file = b.path(b.pathJoin(&.{ csrc, "dsv41_newbuffer_count.mm" })), .flags = objc });
+        if (c_sources) m.addCSourceFile(.{ .file = b.path(b.pathJoin(&.{ csrc, "dsv41_tl_mlx.cpp" })), .flags = cxx });
     }
     m.addIncludePath(b.path(csrc));
     m.addIncludePath(b.path("lib/mlx/include"));
@@ -994,7 +1037,7 @@ fn addMlxStreamTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
     _ = addExl3Module(b, host, target, optimize);
     if (frameworks) |fw| host.addFrameworkPath(.{ .cwd_relative = fw });
     for ([_][]const u8{ "IOKit", "CoreFoundation", "Foundation", "Metal", "IOSurface" }) |f| host.linkFramework(f, .{});
-    const m = mlxStreamPkg(b, host, root, target, optimize, true);
+    const m = mlxStreamPkg(b, host, root, target, optimize, true, true);
     return b.addTest(.{ .name = name, .root_module = m, .filters = if (filter) |f| &.{f} else &.{} });
 }
 
@@ -1005,7 +1048,6 @@ fn pluginProfile(b: *std.Build) bool {
     if (plugin_profile_opt == null) plugin_profile_opt = b.option(bool, "plugin-profile", "Compile the mlx-stream plugin's profile probes in (profile builds only)") orelse false;
     return plugin_profile_opt.?;
 }
-
 
 /// `src/sdk/quant/exl3/sushi/`: Sushi's EXL3 + STQ module (`sushi_exl3`), kept as upstream ships it. It reaches
 /// mlx, log and io_util through `mlx_host`, so the host root exposes them.

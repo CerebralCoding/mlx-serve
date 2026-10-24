@@ -97,7 +97,7 @@ pub fn resolveKvAttnFusedPure(mode: KvAttnMode, explicit: ?bool, prompt_len: usi
 pub fn resolveKvAttnFused(config: *const model_mod.ModelConfig, explicit: ?bool, prompt_len: usize, kv_override: ?transformer_mod.KVQuantConfig) bool {
     if (config.rowExactDecode()) return false;
     const scheme: kv_quant_mod.Scheme = (kv_override orelse configuredKvQuantFor(config)).scheme;
-    return resolveKvAttnFusedPure(http_server.server_config.kv_attn_mode, explicit, prompt_len, scheme);
+    return resolveKvAttnFusedPure(http_server.serverState().server_config.kv_attn_mode, explicit, prompt_len, scheme);
 }
 
 /// Per-request `kv_attn_mode` body field: "fused" | "dense" force the read
@@ -195,7 +195,7 @@ pub const PldDefaults = struct {
 /// engine drafts on its own.
 pub fn requestPld(root: std.json.ObjectMap, lm: *const LoadedModel) bool {
     if (lm.ane != null) return false;
-    return if (root.get("enable_pld")) |v| v == .bool and v.bool else http_server.server_config.default_enable_pld;
+    return if (root.get("enable_pld")) |v| v == .bool and v.bool else http_server.serverState().server_config.default_enable_pld;
 }
 
 /// Choose the speculative-decoding mode for a streaming request based on

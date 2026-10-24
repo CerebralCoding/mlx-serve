@@ -302,12 +302,12 @@ fn routedExperts(w: *const Moe.Weights, g: *Graph, x: Array, r: Routed, shared_d
         useGatherQmv(w) and w.gate.s.ctx != null and w.up.s.ctx != null and w.down.s.ctx != null and
         try gatherQmvRows(w, g, &out, x, r, D, K, B, S))
     {
-        gather_qmv_rows.moe_rows_fused_layers +%= 1;
+        gather_qmv_rows.moeStats().moe_rows_fused_layers +%= 1;
         reduced = true;
     } else if (cuda_fmt != null and try cudaDecode(w, g, &out, x, r, cuda_fmt.?)) {
         reduced = true;
     } else if (do_sort) {
-        gather_qmv_rows.moe_sorted_layers +%= 1;
+        gather_qmv_rows.moeStats().moe_sorted_layers +%= 1;
         const s = try sorted(w, g, x, r, B, S, D, K);
         out = s.out;
         reduced = s.reduced;

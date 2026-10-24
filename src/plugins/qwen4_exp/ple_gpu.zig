@@ -13,9 +13,16 @@ const qwen4_ple = @import("ple_table.zig");
 /// Why the loader picked its arm. Everything but `.gpu` serves the host gather.
 pub const Arm = enum { gpu, off, bits, misaligned, too_large, low_memory };
 
-/// `--ple-gpu`, set once in `main()`. Off by default: the first GPU forward makes the whole
-/// table resident beside the weights, and the host gather faults in only the rows it reads.
-pub var enabled: bool = false;
+/// Process-wide under `-Dunits` (sdk/util/shared.zig): one copy in the host.
+const PleGpuState = struct {
+    /// `--ple-gpu`, set once in `main()`. Off by default: the first GPU forward makes the whole
+    /// table resident beside the weights, and the host gather faults in only the rows it reads.
+    enabled: bool = false,
+};
+const pleGpu_shared = @import("../../sdk/util/shared.zig").Shared(PleGpuState, "ple_gpu", .{});
+pub inline fn pleGpu() *PleGpuState {
+    return pleGpu_shared.get();
+}
 
 pub const Budget = struct {
     page: usize,

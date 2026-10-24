@@ -301,9 +301,9 @@ test "qwen4_exp served: greedy decode and MTP rounds emit the legacy tokens and 
     // A random head drafts what the trunk rejects (every round rolls back); a sign-reading lm_head makes the head
     // agree often, so rounds accept all, some or none of their drafts.
     // The GPU n-gram gather (`--ple-gpu`) leaves the history owed past each decode step (`Owed.history`).
-    defer ple_gpu.enabled = false;
+    defer ple_gpu.pleGpu().enabled = false;
     for ([_]u64{ 47, 51, 51 }, [_]fixture.Opts{ .{}, .{ .sign_head = true }, .{ .sign_head = true } }, [_]bool{ false, false, true }) |seed, opts, gpu| {
-        ple_gpu.enabled = gpu;
+        ple_gpu.pleGpu().enabled = gpu;
         const p = try Pair.openWith(.q4, seed, opts);
         if (gpu) try testing.expect(p.legacy.qwen4.?.gpu != null and p.served.qwen4Host().qwen4.?.gpu != null);
         defer p.close();

@@ -191,7 +191,21 @@ pub const MediaOffload = struct {
     audio: bool = false,
     share: ?f32 = null,
 };
-pub var media_offload: MediaOffload = .{};
+/// Process-wide under `-Dunits` (sdk/util/shared.zig): one copy in the host.
+const AneState = struct {
+    media_offload: MediaOffload = .{},
+    /// Live ANE totals across resident engines, for the `--metrics` gauges and
+    /// anything else that wants "what is the ANE holding right now" without
+    /// walking the registry. Published by `publishLive` after a successful
+    /// build, retired by deinit; zero whenever no engine is resident (the
+    /// zero-when-off metrics invariant).
+    live_int8_bytes: std.atomic.Value(u64) = .init(0),
+    live_layers: std.atomic.Value(u64) = .init(0),
+};
+const aneState_shared = @import("../util/shared.zig").Shared(AneState, "ane_offload", .{});
+pub inline fn aneState() *AneState {
+    return aneState_shared.get();
+}
 
 /// The share a media seam falls back to when nothing can be solved.
 pub const DEFAULT_MEDIA_SHARE: f32 = 0.45;
@@ -402,7 +416,7 @@ pub fn planMediaOffload(io: std.Io, s: mlx.mlx_stream, what: []const u8, layers:
     var gb: [96]u8 = undefined;
     const group = lineageGroup(&gb, what, layers, hidden, ffn) catch return null;
     const units = unitCount(chipBrand(), dualEnabled());
-    const fixed: ?f32 = if (media_offload.share) |v| blk: {
+    const fixed: ?f32 = if (aneState().media_offload.share) |v| blk: {
         log.info("[ane] {s} offload share {d:.2} (explicit)\n", .{ what, v });
         break :blk v;
     } else if (cachedShare(group)) |v| blk: {
@@ -510,7 +524,6 @@ pub fn anePrefillAllowed(nax_available: bool, force_env: ?[]const u8) bool {
 /// added at the seam, so the resident int8 copy scales with the share. Measured 2026-08-18 (27B oQ4e, M4 Max,
 /// medians): channel-0.45 306.4/301.1 vs a token-row split at 0.40 300.7/294.3 vs off 258.2/239.0 at 16k/32k, at
 /// 9.3 GB ANE bytes against the row split's 20.4.
-
 /// Dual-ANE split: two pinned units computing disjoint channel slices
 /// concurrently. Default ON where it was measured (M3 Ultra), off elsewhere
 /// (unmeasurable on single-ANE silicon; private API on top of private API).
@@ -673,14 +686,6 @@ pub fn bankGroupLen(sizes: []const u64, start: usize, group: usize, cap: u64) us
 pub fn internalFreeDiskBytes() u64 {
     return msv_ane_internal_free_disk();
 }
-
-/// Live ANE totals across resident engines, for the `--metrics` gauges and
-/// anything else that wants "what is the ANE holding right now" without
-/// walking the registry. Published by `publishLive` after a successful
-/// build, retired by deinit; zero whenever no engine is resident (the
-/// zero-when-off metrics invariant).
-pub var live_int8_bytes = std.atomic.Value(u64).init(0);
-pub var live_layers = std.atomic.Value(u64).init(0);
 
 pub const RowQuant = struct {
     q: []i8,
@@ -1130,14 +1135,14 @@ pub const AnePrefill = struct {
         self.share = share;
         self.int8_bytes = int8_bytes;
         self.published = true;
-        _ = live_int8_bytes.fetchAdd(int8_bytes, .monotonic);
-        _ = live_layers.fetchAdd(@intCast(self.coveredLayers() + self.coveredGdnLayers()), .monotonic);
+        _ = aneState().live_int8_bytes.fetchAdd(int8_bytes, .monotonic);
+        _ = aneState().live_layers.fetchAdd(@intCast(self.coveredLayers() + self.coveredGdnLayers()), .monotonic);
     }
 
     pub fn deinit(self: *AnePrefill) void {
         if (self.published) {
-            _ = live_int8_bytes.fetchSub(self.int8_bytes, .monotonic);
-            _ = live_layers.fetchSub(@intCast(self.coveredLayers() + self.coveredGdnLayers()), .monotonic);
+            _ = aneState().live_int8_bytes.fetchSub(self.int8_bytes, .monotonic);
+            _ = aneState().live_layers.fetchSub(@intCast(self.coveredLayers() + self.coveredGdnLayers()), .monotonic);
         }
         const allocator = self.allocator;
         const base = self.units.ptr;
@@ -1841,8 +1846,8 @@ test "bankGroupLen: monolithic under the cap, the ladder's rungs, never zero pro
 
 test "quantizeRowsInt8: round-trip, per-row scales, zero row" {
     const w = [_]f32{
-        1.0,  -2.0, 0.5,  0.25, // row 0: amax 2
-        0.0,  0.0,  0.0,  0.0, // row 1: all zero
+        1.0, -2.0, 0.5, 0.25, // row 0: amax 2
+        0.0, 0.0, 0.0, 0.0, // row 1: all zero
         -0.1, 0.05, 0.02, 0.1, // row 2: amax 0.1
     };
     var rq = try quantizeRowsInt8(testing.allocator, &w, 3, 4);

@@ -127,13 +127,13 @@ fn wiredCeilingFloorFor(config: ?*const model_mod.ModelConfig) u64 {
 fn wiredCeilingFloorForRam(config: ?*const model_mod.ModelConfig, total_ram: u64) u64 {
     const c = config orelse return 0;
     if (!c.longCtxGated()) return 0;
-    const floor = wiredLimitFloor(wiredLimitBytes(), total_ram, http_server.wired_limit_margin_bytes);
+    const floor = wiredLimitFloor(wiredLimitBytes(), total_ram, http_server.serverState().wired_limit_margin_bytes);
     if (floor > 0 and wired_floor_logged.cmpxchgStrong(false, true, .monotonic, .monotonic) == null) {
         log.info("[mem] ceiling {d} MB from iogpu.wired_limit_mb={d} (working set {d} MB, margin {d} MB)\n", .{
             floor >> 20,
             wiredLimitBytes() >> 20,
             getGpuWorkingSetLimit() >> 20,
-            http_server.wired_limit_margin_bytes >> 20,
+            http_server.serverState().wired_limit_margin_bytes >> 20,
         });
     }
     return floor;
@@ -167,7 +167,7 @@ pub fn currentGpuMemoryCeiling(config: ?*const model_mod.ModelConfig, active_mem
     // SAME build (measured 5,120 / 10,240 / 55,296 tokens, 27B iQ on a 32 GB
     // M1 Pro). Add them back and subtract the known figure once. Zero — and so
     // exactly the old expression — whenever no offload is resident.
-    const ane_bytes = ane_mod.live_int8_bytes.load(.monotonic);
+    const ane_bytes = ane_mod.aneState().live_int8_bytes.load(.monotonic);
     var cache_mem: usize = 0;
     _ = mlx.mlx_get_cache_memory(&cache_mem);
     return gpuCeilingWithWiredFloor(

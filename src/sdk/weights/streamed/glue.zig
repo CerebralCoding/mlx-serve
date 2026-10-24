@@ -70,7 +70,7 @@ pub const Model = struct {
 fn billedContext(comptime k: Kind, config: *const ModelConfig) u64 {
     const context = server.manualContext(config);
     if (context > 0) return context;
-    return auto_context.get(config.pack_dir.?) orelse Side(k).default_context;
+    return glueState().auto_context.get(config.pack_dir.?) orelse Side(k).default_context;
 }
 
 /// The contexts an auto context tries, largest first (the model sets none): the first whose load bill at the fill's
@@ -90,7 +90,7 @@ fn resolveContext(comptime k: Kind, gpa: std.mem.Allocator, io: std.Io, config: 
     const manual = server.manualContext(config);
     if (manual > 0) return manual;
     const dir = config.pack_dir.?;
-    if (auto_context.get(dir)) |c| return c;
+    if (glueState().auto_context.get(dir)) |c| return c;
     const ceiling = server.staticGpuMemoryCeiling();
     const avail = if (ceiling > 0) @min(status.getAvailableMemBytes(), ceiling) else status.getAvailableMemBytes();
     const Bills = struct {
@@ -109,7 +109,7 @@ fn resolveContext(comptime k: Kind, gpa: std.mem.Allocator, io: std.Io, config: 
     };
     const chosen = largestFitting(avail, &auto_context_rungs, Bills{ .gpa = gpa, .io = io, .config = config, .ceiling = ceiling }) orelse Side(k).default_context;
     log.info("mlx-stream: context {d} tokens (auto: the largest rung whose load fits the {d:.1} GB available; set ctx_size to pin one)\n", .{ chosen, @as(f64, @floatFromInt(avail)) / 1_073_741_824.0 });
-    auto_context.note(dir, chosen);
+    glueState().auto_context.note(dir, chosen);
     return chosen;
 }
 
@@ -195,8 +195,15 @@ const PackValues = struct {
         return self.values[i];
     }
 };
-var max_output: PackValues = .{};
-var auto_context: PackValues = .{};
+/// Process-wide under `-Dunits` (sdk/util/shared.zig): one copy in the host.
+const GlueState = struct {
+    auto_context: PackValues = .{},
+    max_output: PackValues = .{},
+};
+const glueState_shared = @import("../../util/shared.zig").Shared(GlueState, "streamed_glue", .{});
+inline fn glueState() *GlueState {
+    return glueState_shared.get();
+}
 
 fn packKey(dir: []const u8) u64 {
     return std.hash.Wyhash.hash(0, dir) | 1;
@@ -204,19 +211,19 @@ fn packKey(dir: []const u8) u64 {
 
 /// Records GLM-5.3's `maxOutput` for the pack at `dir`.
 pub fn noteMaxOutput(dir: []const u8, value: u64) void {
-    max_output.note(dir, value);
+    glueState().max_output.note(dir, value);
 }
 
 /// The generation past the billed context a GLM-5.3 request of the pack at `dir` may take: the `maxOutput` its last
 /// parse recorded; the arch's default (`glm.generation_headroom`) for a pack not parsed yet.
 fn maxOutputOf(dir: []const u8) u64 {
-    return max_output.get(dir) orelse plugin.glm.generation_headroom;
+    return glueState().max_output.get(dir) orelse plugin.glm.generation_headroom;
 }
 
 /// Sampled before the weights load: the memory already in use, which the plugin's rows fill on top of, and the
 /// host's wired-limit margin.
 fn facts() sdk.LoadFacts {
-    return .{ .memory_baseline_bytes = status.getTotalMemBytes() -| status.getAvailableMemBytes(), .wired_margin_bytes = server.wired_limit_margin_bytes };
+    return .{ .memory_baseline_bytes = status.getTotalMemBytes() -| status.getAvailableMemBytes(), .wired_margin_bytes = server.serverState().wired_limit_margin_bytes };
 }
 
 /// What a load holds under the GPU ceiling: the preflight's bill.
@@ -432,7 +439,7 @@ test "mlx_stream: a model that sets no context takes the largest rung whose load
     // The recorded auto context is what `contextLength` reads for a model without ctx_size.
     var config: ModelConfig = .{ .model_type = "deepseek_v41", .pack_dir = "/packs/dsv41-repack", .dsv41_stream = true, .ctx_override = 0 };
     try testing.expectEqual(@as(u32, @intCast(plugin.default_context + plugin.generation_headroom)), contextLength(&config));
-    auto_context.note("/packs/dsv41-repack", 131072);
+    glueState().auto_context.note("/packs/dsv41-repack", 131072);
     try testing.expectEqual(@as(u32, 131072 + @as(u32, @intCast(plugin.generation_headroom))), contextLength(&config));
     config.ctx_override = 40000;
     try testing.expectEqual(@as(u32, 40000 + @as(u32, @intCast(plugin.generation_headroom))), contextLength(&config));

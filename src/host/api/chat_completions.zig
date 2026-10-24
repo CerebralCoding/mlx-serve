@@ -568,7 +568,7 @@ pub fn handleChatCompletions(
     // PLD on hybrid SSM models (LFM2.5, Nemotron-H) works once the SSM
     // snapshot/restore paths handle null ssm_state correctly — see
     // `ssmSnapshot`/`ssmRestore` in transformer.zig.
-    if (enable_pld) log.info("  pld=enabled (draft_len={d}, key_len={d})\n", .{ http_server.server_config.default_pld_draft_len, http_server.server_config.default_pld_key_len });
+    if (enable_pld) log.info("  pld=enabled (draft_len={d}, key_len={d})\n", .{ http_server.serverState().server_config.default_pld_draft_len, http_server.serverState().server_config.default_pld_key_len });
 
     // Tools do not disable the drafter; logprobs require the target's plain path.
     const drafter_explicit_in_json: bool = root.get("enable_drafter") != null;

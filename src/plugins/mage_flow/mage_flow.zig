@@ -2239,7 +2239,7 @@ pub const Dit = struct {
         for (0..self.blocks.len) |i| {
             self.blocks[i] = try loadDitBlock(&w, a, i, hidden, mlp, dtype, s);
             try convertDitBlock(&self.blocks[i], s);
-            if (w8a8.enabled) w.dropBlock("transformer_blocks.{d}.", i);
+            if (w8a8.w8a8State().enabled) w.dropBlock("transformer_blocks.{d}.", i);
         }
         self.norm_out_w = try MfLinear.load(&w, a, "norm_out.linear", hidden, dtype, s);
         self.norm_out_b = try loadVecDt(&w, a, "norm_out.linear", "bias", dtype, s);
@@ -2251,8 +2251,8 @@ pub const Dit = struct {
     pub fn deinit(self: *Dit) void {
         inline for (.{ &self.img_in_w, &self.txt_in_w, &self.t1w, &self.t2w, &self.norm_out_w, &self.proj_out_w }) |f| f.deinit();
         const top = [_]mlx.mlx_array{
-            self.img_in_b, self.txt_norm_w,  self.txt_in_b,
-            self.t1b,      self.t2b,         self.norm_out_b,
+            self.img_in_b,   self.txt_norm_w, self.txt_in_b,
+            self.t1b,        self.t2b,        self.norm_out_b,
             self.proj_out_b,
         };
         for (top) |f| _ = mlx.mlx_array_free(f);
@@ -2554,7 +2554,7 @@ fn jointAttn(aw: *const DitAttnW, img_in: mlx.mlx_array, txt_in: mlx.mlx_array, 
     const v = try concatHeadsFirst(tvh, ivh, s);
     defer _ = mlx.mlx_array_free(v);
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
-    if (w8a8.enabled and mask == null) if (try int8Joint(aw, q, k, v, scale, Ltxt, heads * hd, s)) |r| return r;
+    if (w8a8.w8a8State().enabled and mask == null) if (try int8Joint(aw, q, k, v, scale, Ltxt, heads * hd, s)) |r| return r;
     // The f32 q/k norms promote q/k to f32. cuDNN's fused attention takes only
     // bf16/f16, and MLX's CUDA fallback materializes the [seq x seq] scores
     // (46 GB for a 2048x1360 edit), so CUDA attends in bf16. Metal keeps f32.
@@ -3505,7 +3505,6 @@ const TE_PREFIX =
     "<|im_end|>\n<|im_start|>user\n";
 const TE_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n";
 
-
 /// A text-encoder projection as `sdk/blocks/text_encoders/qwen3` calls it (no bias).
 const TeLin = struct {
     l: MfLinear,
@@ -3871,7 +3870,6 @@ fn buildTeRope(allocator: std.mem.Allocator, L: usize, dtype: mlx.mlx_dtype, s: 
     defer _ = mlx.mlx_array_free(sf);
     return .{ .cos = try astype(cf, dtype, s), .sin = try astype(sf, dtype, s) };
 }
-
 
 /// Slice the last axis of a 4-D array [start, end).
 fn sliceLastAxis(x: mlx.mlx_array, start: c_int, end: c_int, s: S) !mlx.mlx_array {
@@ -5203,13 +5201,13 @@ test "MageFlow DiT: the w8a8 route stays within its bar of the packed forward" {
     const io = std.Io.Threaded.global_single_threaded.io();
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
-    const prev = w8a8.enabled;
-    defer w8a8.enabled = prev;
-    w8a8.enabled = false;
+    const prev = w8a8.w8a8State().enabled;
+    defer w8a8.w8a8State().enabled = prev;
+    w8a8.w8a8State().enabled = false;
     var packed_bytes: usize = 0;
     const want = try mageProbe(io, a, s, model_dir, &packed_bytes);
     defer _ = mlx.mlx_array_free(want);
-    w8a8.enabled = true;
+    w8a8.w8a8State().enabled = true;
     var int8_bytes: usize = 0;
     const got = try mageProbe(io, a, s, model_dir, &int8_bytes);
     defer _ = mlx.mlx_array_free(got);

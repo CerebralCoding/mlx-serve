@@ -240,15 +240,24 @@ pub const ServerConfig = struct {
     default_max_tokens: u32 = 0,
 };
 
-/// Live process-wide config. Mutated by `serve()` at startup from its
-/// parameters; never written from a handler after that. Public so main.zig
-/// can supply defaults (notably the per-request override CLI flags don't
-/// flow through `serve()` arguments).
-pub var server_config: ServerConfig = .{};
+/// Process-wide under `-Dunits` (sdk/util/shared.zig): one copy in the host.
+const ServerState = struct {
+    /// Live process-wide config. Mutated by `serve()` at startup from its
+    /// parameters; never written from a handler after that. Public so main.zig
+    /// can supply defaults (notably the per-request override CLI flags don't
+    /// flow through `serve()` arguments).
+    server_config: ServerConfig = .{},
+    /// `--wired-margin-gib` in bytes: what stays unplanned under a raised wired limit.
+    wired_limit_margin_bytes: u64 = WIRED_LIMIT_MARGIN_BYTES,
+};
+const serverState_shared = @import("../../sdk/util/shared.zig").Shared(ServerState, "server_config", .{});
+pub inline fn serverState() *ServerState {
+    return serverState_shared.get();
+}
 
 pub fn getTimeoutNs() u64 {
-    if (server_config.request_timeout_sec == 0) return 0;
-    return @as(u64, server_config.request_timeout_sec) * std.time.ns_per_s;
+    if (serverState().server_config.request_timeout_sec == 0) return 0;
+    return @as(u64, serverState().server_config.request_timeout_sec) * std.time.ns_per_s;
 }
 
 /// Plan 01 Phase 2 — continuous-batching scheduler. Always non-null in
@@ -277,7 +286,7 @@ pub fn configuredKvQuantFor(config: *const model_mod.ModelConfig) kv_quant_mod.K
 /// The explicit context for THIS model: its `model-settings.json` `ctx_size`, else `--ctx-size`.
 /// 0 = auto. Every reader of the manual context goes through here, never `server_config.max_context_size`.
 pub fn manualContext(config: *const model_mod.ModelConfig) u32 {
-    return if (config.ctx_override > 0) config.ctx_override else server_config.max_context_size;
+    return if (config.ctx_override > 0) config.ctx_override else serverState().server_config.max_context_size;
 }
 
 /// Plan 05 — model registry. Always non-null in serve mode (set by
@@ -399,7 +408,7 @@ pub fn serve(
     port: u16,
     cfg: ServerConfig,
 ) !void {
-    server_config = cfg;
+    serverState().server_config = cfg;
     // Before `Scheduler.init`: that call is the model load and every load-time bill inside it
     // asks for the KV width.
     configured_kv_quant = load_params.kv_quant_config;
@@ -561,7 +570,6 @@ pub fn serve(
         std.posix.sigaction(std.posix.SIG.TERM, &sigact, null);
     }
 
-
     // ── LAN sharing/discovery (src/host/lan/lan.zig): started HERE — the one chokepoint
     //    every serve path (model/headless/gen/ds4/llama) flows through — so the
     //    advertised port is always the bound port. Bonjour being unavailable
@@ -625,23 +633,23 @@ pub fn serve(
         }
     }
 
-    if (server_config.request_timeout_sec > 0) {
-        log.info("Request timeout: {d}s\n", .{server_config.request_timeout_sec});
+    if (serverState().server_config.request_timeout_sec > 0) {
+        log.info("Request timeout: {d}s\n", .{serverState().server_config.request_timeout_sec});
     }
     const model_ctx = config.contextCap();
     if (model_ctx > 0) {
         log.info("Model context length: {d} tokens\n", .{model_ctx});
     }
-    if (server_config.default_reasoning_budget >= 0) {
-        log.info("Reasoning budget: {d} tokens\n", .{server_config.default_reasoning_budget});
+    if (serverState().server_config.default_reasoning_budget >= 0) {
+        log.info("Reasoning budget: {d} tokens\n", .{serverState().server_config.default_reasoning_budget});
     } else {
         log.info("Reasoning budget: unlimited\n", .{});
     }
     if (launchMaxTokensDefault() > 0) {
         log.info("default max_tokens for omitted requests: {d}\n", .{launchMaxTokensDefault()});
     }
-    if (server_config.default_enable_pld) {
-        log.info("PLD speculative decoding: ENABLED (draft_len={d}, key_len={d}; default for new requests)\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
+    if (serverState().server_config.default_enable_pld) {
+        log.info("PLD speculative decoding: ENABLED (draft_len={d}, key_len={d}; default for new requests)\n", .{ serverState().server_config.default_pld_draft_len, serverState().server_config.default_pld_key_len });
     }
     if (scheduler.dflash != null) {
         log.info("DFlash speculative decoding: ENABLED (block_size={d}; default for new requests)\n", .{scheduler.drafter_block_size});
@@ -765,9 +773,6 @@ pub fn serve(
     log.info("\nShutting down gracefully...\n", .{});
 }
 
-/// `--wired-margin-gib` in bytes: what stays unplanned under a raised wired limit.
-pub var wired_limit_margin_bytes: u64 = WIRED_LIMIT_MARGIN_BYTES;
-
 const GaugeSamplerCtx = struct {
     metrics: *instr.Metrics,
     scheduler: *scheduler_mod.Scheduler,
@@ -796,10 +801,10 @@ fn sampleGauges(ctx: GaugeSamplerCtx) void {
     ctx.metrics.mlx_cache_bytes.set(@as(u64, mlx_cache));
     // ANE prefill offload totals — published by the engines themselves
     // (ane.publishLive / deinit), so this is a lock-free read.
-    ctx.metrics.ane_int8_bytes.set(ane_mod.live_int8_bytes.load(.monotonic));
-    ctx.metrics.ane_layers.set(ane_mod.live_layers.load(.monotonic));
+    ctx.metrics.ane_int8_bytes.set(ane_mod.aneState().live_int8_bytes.load(.monotonic));
+    ctx.metrics.ane_layers.set(ane_mod.aneState().live_layers.load(.monotonic));
     // qwen4 n-gram table warm (F8) — same lock-free published-atomic pattern.
-    ctx.metrics.ngram_warm_bytes.set(qwen4_mod.live_warm_bytes.load(.monotonic));
+    ctx.metrics.ngram_warm_bytes.set(qwen4_mod.warmBytes().live_warm_bytes.load(.monotonic));
 
     // Request queue depth — brief lock to read two scheduler counters only.
     ctx.scheduler.queue_mu.lockUncancelable(ctx.scheduler.io);
@@ -908,13 +913,13 @@ fn gaugeSamplerLoop(ctx: GaugeSamplerCtx) void {
 const testing = std.testing;
 
 test "getTimeoutNs computes correctly" {
-    const original = server_config.request_timeout_sec;
-    defer server_config.request_timeout_sec = original;
+    const original = serverState().server_config.request_timeout_sec;
+    defer serverState().server_config.request_timeout_sec = original;
 
-    server_config.request_timeout_sec = 300;
+    serverState().server_config.request_timeout_sec = 300;
     try testing.expectEqual(@as(u64, 300_000_000_000), getTimeoutNs());
 
-    server_config.request_timeout_sec = 0;
+    serverState().server_config.request_timeout_sec = 0;
     try testing.expectEqual(@as(u64, 0), getTimeoutNs());
 }
 

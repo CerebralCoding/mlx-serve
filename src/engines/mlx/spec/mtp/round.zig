@@ -50,7 +50,6 @@ const sampleRowsHomogeneous = @import("../../sampling/lazy.zig").sampleRowsHomog
 const specDecodeUnsupported = @import("../verify.zig").specDecodeUnsupported;
 const verifyArgmax = @import("../verify.zig").verifyArgmax;
 
-
 /// A speculative round between its draft chain and its verdict. `mtpRoundBegin`
 /// builds it, `mtpRoundVerify` (solo) or the scheduler's group verify fills the
 /// three verify outputs, `mtpRoundFinish` consumes them.
@@ -727,7 +726,6 @@ pub fn mtpStopPrefix(drafts: []const u32, accepted: u32, eos: []const u32) struc
 
 // ── tests ──
 
-
 test "seeded MTP draft and correction draws replay despite unrelated MLX random draws" {
     const s = mlx.gpuStream();
     const q_data = [_]f32{ 0.5, 0.5, 0.0, 0.0 };
@@ -1281,9 +1279,9 @@ test "acceptance failure restores every unfinished row after verify returns" {
         for (slot.entries, saved_ssm[i]) |*entry, *snapshot| snapshot.* = transformer_mod.ssmSnapshot(entry);
         saved_rows += 1;
     }
-    const syncs = transformer_mod.deferred_ple_group_syncs;
+    const syncs = transformer_mod.cli().deferred_ple_group_syncs;
     try Generator.mtpGroupVerify(&gens, &ptrs);
-    try testing.expectEqual(@as(u64, 1), transformer_mod.deferred_ple_group_syncs - syncs);
+    try testing.expectEqual(@as(u64, 1), transformer_mod.cli().deferred_ple_group_syncs - syncs);
     for (states) |state| try testing.expect(state.?.verify_rollback != null);
     mlx.fault.arm(1);
     const result = Generator.mtpGroupAccept(&gens, &ptrs);

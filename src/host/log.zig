@@ -32,14 +32,46 @@ pub const Level = enum {
     }
 };
 
-var current_level: Level = .info;
+/// Process-wide under `-Dunits` (sdk/util/shared.zig): one copy in the host.
+const SinksState = struct {
+    current_level: Level = .info,
+    /// Read outside the mutex on every log call, so keep it atomic. When false the
+    /// sink costs one relaxed load and nothing else.
+    sink_active: bool = false,
+    sink_bytes: u64 = 0,
+    sink_fd: c_int = -1,
+    sink_max_bytes: u64 = default_max_bytes,
+    /// A pthread mutex, not `std.Io.Mutex`: locking the latter needs an `Io`
+    /// handle, and log calls arrive from threads that don't carry one.
+    sink_mutex: os_mutex.Mutex = .{},
+    sink_path_buf: [1024]u8 = undefined,
+    sink_path_len: usize = 0,
+    /// Server builds log to stderr; TEST builds do not.
+    ///
+    /// A unit test that exercises a logging code path (the tool-call parse layer
+    /// alone emits hundreds of lines) sprays them into the suite's stderr, where
+    /// they do two kinds of damage: they bury the one line that matters when a test
+    /// actually fails, and Zig's build runner echoes any test stderr back tagged
+    /// with a `failed command: …/test --listen=-` line — which READS AS A FAILURE
+    /// even though the build exits 0 and every test passed. That false signal cost
+    /// real debugging time on both sides of a genuine CI break (2026-07-14). Test
+    /// failures themselves are unaffected: they surface through the test runner and
+    /// through each test's own `std.debug.print`, neither of which goes through here.
+    ///
+    /// Flip it locally (see the file-sink test) when a test must assert on logging.
+    stderr_enabled: bool = !builtin.is_test,
+};
+const sinks_shared = @import("../sdk/util/shared.zig").Shared(SinksState, "log_state", .{});
+inline fn sinks() *SinksState {
+    return sinks_shared.get();
+}
 
 pub fn setLevel(level: Level) void {
-    current_level = level;
+    sinks().current_level = level;
 }
 
 pub fn isDebug() bool {
-    return @intFromEnum(current_level) >= @intFromEnum(Level.debug);
+    return @backingInt(sinks().current_level) >= @backingInt(Level.debug);
 }
 
 // ── File sink ──
@@ -56,25 +88,12 @@ pub const default_max_bytes: u64 = 32 * 1024 * 1024;
 const line_buf_len = 16 * 1024;
 const truncation_marker = "…[mlx-serve: log line truncated]\n";
 
-/// A pthread mutex, not `std.Io.Mutex`: locking the latter needs an `Io`
-/// handle, and log calls arrive from threads that don't carry one.
-var sink_mutex: os_mutex.Mutex = .{};
-
 fn lockSink() void {
-    sink_mutex.lock();
+    sinks().sink_mutex.lock();
 }
 fn unlockSink() void {
-    sink_mutex.unlock();
+    sinks().sink_mutex.unlock();
 }
-
-var sink_fd: c_int = -1;
-var sink_bytes: u64 = 0;
-var sink_max_bytes: u64 = default_max_bytes;
-var sink_path_buf: [1024]u8 = undefined;
-var sink_path_len: usize = 0;
-/// Read outside the mutex on every log call, so keep it atomic. When false the
-/// sink costs one relaxed load and nothing else.
-var sink_active: bool = false;
 
 /// Build the default log path for a server listening on `port`:
 /// `<home>/.mlx-serve/logs/mlx-serve-<port>.log`. Per-port so the app's server
@@ -112,7 +131,7 @@ fn makeParentDirs(path: []const u8) void {
 /// `max_bytes` of 0 disables rotation. Errors are returned so the caller can
 /// warn — a failure here is never fatal to the server.
 pub fn openFile(path: []const u8, max_bytes: u64) !void {
-    if (path.len == 0 or path.len >= sink_path_buf.len) return error.InvalidLogPath;
+    if (path.len == 0 or path.len >= sinks().sink_path_buf.len) return error.InvalidLogPath;
 
     makeParentDirs(path);
 
@@ -125,93 +144,78 @@ pub fn openFile(path: []const u8, max_bytes: u64) !void {
 
     lockSink();
     defer unlockSink();
-    if (sink_fd >= 0) crt.close(sink_fd);
-    sink_fd = fd;
-    sink_max_bytes = max_bytes;
+    if (sinks().sink_fd >= 0) crt.close(sinks().sink_fd);
+    sinks().sink_fd = fd;
+    sinks().sink_max_bytes = max_bytes;
     // Start the rotation counter at the file's current size.
     const end = crt.seekEnd(fd);
-    sink_bytes = if (end > 0) @intCast(end) else 0;
-    @memcpy(sink_path_buf[0..path.len], path);
-    sink_path_len = path.len;
-    @atomicStore(bool, &sink_active, true, .release);
+    sinks().sink_bytes = if (end > 0) @intCast(end) else 0;
+    @memcpy(sinks().sink_path_buf[0..path.len], path);
+    sinks().sink_path_len = path.len;
+    @atomicStore(bool, &sinks().sink_active, true, .release);
 }
 
 pub fn closeFile() void {
     lockSink();
     defer unlockSink();
-    @atomicStore(bool, &sink_active, false, .release);
-    if (sink_fd >= 0) crt.close(sink_fd);
-    sink_fd = -1;
-    sink_bytes = 0;
-    sink_path_len = 0;
+    @atomicStore(bool, &sinks().sink_active, false, .release);
+    if (sinks().sink_fd >= 0) crt.close(sinks().sink_fd);
+    sinks().sink_fd = -1;
+    sinks().sink_bytes = 0;
+    sinks().sink_path_len = 0;
 }
 
 /// Path of the live log file, or null when no sink is open.
 pub fn filePath() ?[]const u8 {
-    if (!@atomicLoad(bool, &sink_active, .acquire)) return null;
-    return sink_path_buf[0..sink_path_len];
+    if (!@atomicLoad(bool, &sinks().sink_active, .acquire)) return null;
+    return sinks().sink_path_buf[0..sinks().sink_path_len];
 }
 
-/// Caller holds `sink_mutex`.
+/// Caller holds `sinks().sink_mutex`.
 fn rotateLocked() void {
-    if (sink_path_len == 0) return;
+    if (sinks().sink_path_len == 0) return;
     var live: [1024]u8 = undefined;
     var prev: [1024]u8 = undefined;
-    @memcpy(live[0..sink_path_len], sink_path_buf[0..sink_path_len]);
-    live[sink_path_len] = 0;
-    @memcpy(prev[0..sink_path_len], sink_path_buf[0..sink_path_len]);
-    @memcpy(prev[sink_path_len..][0..2], ".1");
-    prev[sink_path_len + 2] = 0;
+    @memcpy(live[0..sinks().sink_path_len], sinks().sink_path_buf[0..sinks().sink_path_len]);
+    live[sinks().sink_path_len] = 0;
+    @memcpy(prev[0..sinks().sink_path_len], sinks().sink_path_buf[0..sinks().sink_path_len]);
+    @memcpy(prev[sinks().sink_path_len..][0..2], ".1");
+    prev[sinks().sink_path_len + 2] = 0;
 
-    if (sink_fd >= 0) crt.close(sink_fd);
+    if (sinks().sink_fd >= 0) crt.close(sinks().sink_fd);
     _ = crt.rename(@ptrCast(&live), @ptrCast(&prev));
-    sink_fd = crt.openWrite(@ptrCast(&live), true);
-    sink_bytes = 0;
-    if (sink_fd < 0) @atomicStore(bool, &sink_active, false, .release);
+    sinks().sink_fd = crt.openWrite(@ptrCast(&live), true);
+    sinks().sink_bytes = 0;
+    if (sinks().sink_fd < 0) @atomicStore(bool, &sinks().sink_active, false, .release);
 }
 
 fn writeToSink(bytes: []const u8) void {
     lockSink();
     defer unlockSink();
-    if (sink_fd < 0) return;
-    if (shouldRotate(sink_bytes, bytes.len, sink_max_bytes)) rotateLocked();
-    if (sink_fd < 0) return;
+    if (sinks().sink_fd < 0) return;
+    if (shouldRotate(sinks().sink_bytes, bytes.len, sinks().sink_max_bytes)) rotateLocked();
+    if (sinks().sink_fd < 0) return;
 
     var off: usize = 0;
     while (off < bytes.len) {
-        const n = crt.write(sink_fd, bytes[off..]);
+        const n = crt.write(sinks().sink_fd, bytes[off..]);
         if (n <= 0) return; // ENOSPC / EIO: drop the line, never kill the server
         off += @intCast(n);
     }
-    sink_bytes += bytes.len;
+    sinks().sink_bytes += bytes.len;
 }
-
-/// Server builds log to stderr; TEST builds do not.
-///
-/// A unit test that exercises a logging code path (the tool-call parse layer
-/// alone emits hundreds of lines) sprays them into the suite's stderr, where
-/// they do two kinds of damage: they bury the one line that matters when a test
-/// actually fails, and Zig's build runner echoes any test stderr back tagged
-/// with a `failed command: …/test --listen=-` line — which READS AS A FAILURE
-/// even though the build exits 0 and every test passed. That false signal cost
-/// real debugging time on both sides of a genuine CI break (2026-07-14). Test
-/// failures themselves are unaffected: they surface through the test runner and
-/// through each test's own `std.debug.print`, neither of which goes through here.
-///
-/// Flip it locally (see the file-sink test) when a test must assert on logging.
-var stderr_enabled: bool = !builtin.is_test;
 
 /// Env-gated live-test harnesses (generation runs driven through the test
 /// binary) opt back into stderr logging: the phase/step lines ARE the
 /// harness's observable output, and a profile run without them is blind.
 pub fn enableStderr() void {
-    stderr_enabled = true;
+    sinks().stderr_enabled = true;
 }
 
 /// Format once, fan out to stderr and (when open) the file. A format `rtfmt` accepts is walked at run time, so a
 /// call site costs its packed arguments, not its own instance of the formatter.
 fn emit(comptime fmt: []const u8, args: anytype) void {
-    if (!stderr_enabled and !@atomicLoad(bool, &sink_active, .acquire)) return;
+    if (!sinks().stderr_enabled and !@atomicLoad(bool, &sinks().sink_active, .acquire)) return;
     var buf: [line_buf_len]u8 = undefined;
     // Format into everything but the marker's reserved tail, so an overlong line stays ONE `write(2)`: two writes
     // could interleave with another thread's line between them.
@@ -229,37 +233,37 @@ fn writeLine(buf: *[line_buf_len]u8, len: usize, whole: bool) void {
         @memcpy(buf[n..][0..truncation_marker.len], truncation_marker);
         n += truncation_marker.len;
     }
-    if (stderr_enabled) std.debug.print("{s}", .{buf[0..n]});
-    if (@atomicLoad(bool, &sink_active, .acquire)) writeToSink(buf[0..n]);
+    if (sinks().stderr_enabled) std.debug.print("{s}", .{buf[0..n]});
+    if (@atomicLoad(bool, &sinks().sink_active, .acquire)) writeToSink(buf[0..n]);
 }
 
 pub fn info(comptime fmt: []const u8, args: anytype) void {
-    if (@intFromEnum(current_level) >= @intFromEnum(Level.info)) {
+    if (@backingInt(sinks().current_level) >= @backingInt(Level.info)) {
         emit(fmt, args);
     }
 }
 
 pub fn warn(comptime fmt: []const u8, args: anytype) void {
-    if (@intFromEnum(current_level) >= @intFromEnum(Level.warn)) {
+    if (@backingInt(sinks().current_level) >= @backingInt(Level.warn)) {
         emit(fmt, args);
     }
 }
 
 pub fn err(comptime fmt: []const u8, args: anytype) void {
-    if (@intFromEnum(current_level) >= @intFromEnum(Level.err)) {
+    if (@backingInt(sinks().current_level) >= @backingInt(Level.err)) {
         emit(fmt, args);
     }
 }
 
 pub fn debug(comptime fmt: []const u8, args: anytype) void {
-    if (@intFromEnum(current_level) >= @intFromEnum(Level.debug)) {
+    if (@backingInt(sinks().current_level) >= @backingInt(Level.debug)) {
         emit(fmt, args);
     }
 }
 
 /// Would a line at `level` be written? Ask first when the arguments are costly to build.
 pub fn enabled(level: Level) bool {
-    return @intFromEnum(current_level) >= @intFromEnum(level);
+    return @backingInt(sinks().current_level) >= @backingInt(level);
 }
 
 /// `info`/`debug`/`warn` with the level chosen at runtime.
@@ -286,20 +290,20 @@ test "Level.fromString invalid returns null" {
 
 test "Level ordering" {
     // err < warn < info < debug
-    try testing.expect(@intFromEnum(Level.err) < @intFromEnum(Level.warn));
-    try testing.expect(@intFromEnum(Level.warn) < @intFromEnum(Level.info));
-    try testing.expect(@intFromEnum(Level.info) < @intFromEnum(Level.debug));
+    try testing.expect(@backingInt(Level.err) < @backingInt(Level.warn));
+    try testing.expect(@backingInt(Level.warn) < @backingInt(Level.info));
+    try testing.expect(@backingInt(Level.info) < @backingInt(Level.debug));
 }
 
 test "setLevel changes current level" {
-    const original = current_level;
+    const original = sinks().current_level;
     defer setLevel(original); // restore
 
     setLevel(.debug);
-    try testing.expectEqual(Level.debug, current_level);
+    try testing.expectEqual(Level.debug, sinks().current_level);
     try testing.expect(isDebug());
     setLevel(.err);
-    try testing.expectEqual(Level.err, current_level);
+    try testing.expectEqual(Level.err, sinks().current_level);
     try testing.expect(!isDebug());
 }
 
@@ -324,7 +328,7 @@ test "shouldRotate: caps growth, never loops on an oversized first line" {
 
 // NOTE: the sink is a process-global singleton, so every assertion about it
 // lives in ONE test — the build runner executes tests in parallel and two
-// tests calling `openFile` would fight over `sink_fd`.
+// tests calling `openFile` would fight over `sinks().sink_fd`.
 test "file sink: writes lines, honors level, survives reopen, rotates at the cap" {
     // A private dir per run: a fixed /tmp path collided when two test binaries ran at once.
     var tmp = std.testing.tmpDir(.{});
@@ -339,12 +343,12 @@ test "file sink: writes lines, honors level, survives reopen, rotates at the cap
     const rotated = try std.fmt.bufPrintSentinel(&rot_buf, "{s}/s.log.1", .{root}, 0);
     const deep = try std.fmt.bufPrintSentinel(&deep_buf, "{s}/a/b/c/deep.log", .{root}, 0);
 
-    const original = current_level;
+    const original = sinks().current_level;
     defer setLevel(original);
     setLevel(.info);
-    const original_stderr = stderr_enabled;
-    stderr_enabled = false; // this test drives info/debug for real
-    defer stderr_enabled = original_stderr;
+    const original_stderr = sinks().stderr_enabled;
+    sinks().stderr_enabled = false; // this test drives info/debug for real
+    defer sinks().stderr_enabled = original_stderr;
 
     // No sink yet -> nothing on disk, and filePath reports that.
     try testing.expect(filePath() == null);
@@ -412,30 +416,29 @@ fn readFileForTest(path: [*:0]const u8, buf: []u8) usize {
 }
 
 test "enabled/atLevel: the level check a caller can ask BEFORE building its arguments" {
-    const original = current_level;
-    defer current_level = original;
-    const original_stderr = stderr_enabled;
-    stderr_enabled = false; // this test drives atLevel for real
-    defer stderr_enabled = original_stderr;
+    const original = sinks().current_level;
+    defer sinks().current_level = original;
+    const original_stderr = sinks().stderr_enabled;
+    sinks().stderr_enabled = false; // this test drives atLevel for real
+    defer sinks().stderr_enabled = original_stderr;
 
-    current_level = .info;
+    sinks().current_level = .info;
     try testing.expect(enabled(.err));
     try testing.expect(enabled(.warn));
     try testing.expect(enabled(.info));
     try testing.expect(!enabled(.debug));
 
-    current_level = .warn;
+    sinks().current_level = .warn;
     try testing.expect(enabled(.warn));
     try testing.expect(!enabled(.info));
     try testing.expect(!enabled(.debug));
 
-    current_level = .debug;
+    sinks().current_level = .debug;
     inline for (.{ Level.err, Level.warn, Level.info, Level.debug }) |lv| {
         try testing.expect(enabled(lv));
     }
 
-    current_level = .info;
+    sinks().current_level = .info;
     atLevel(.debug, "suppressed {d}\n", .{1});
     atLevel(.info, "written {d}\n", .{2});
 }
-

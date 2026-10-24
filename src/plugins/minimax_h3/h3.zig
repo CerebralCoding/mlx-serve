@@ -94,7 +94,6 @@ pub const PATCH_W = geometry.PATCH_W;
 
 // ── Frame ladder ────────────────────────────────────────────────────────────
 
-
 /// Snap DOWN to the same ladder, with the model's 5-frame floor. A ref2va
 /// reference video is TRIMMED rather than padded — the reference node drops
 /// frames off the end (`while n % 17 != 5: n -= 1`) because inventing frames
@@ -105,9 +104,6 @@ pub fn alignRefFrameCount(n: u32) u32 {
     while (v % 17 != 5) v -= 1;
     return v;
 }
-
-
-
 
 // ── Canvas ──────────────────────────────────────────────────────────────────
 
@@ -1037,7 +1033,6 @@ fn denseLinear(x: mlx.mlx_array, w: mlx.mlx_array, bias: ?mlx.mlx_array, s: S) !
 
 // ── Model config ────────────────────────────────────────────────────────────
 
-
 // ── Weights ─────────────────────────────────────────────────────────────────
 
 const AttnW = struct {
@@ -1067,7 +1062,7 @@ const AttnW = struct {
         const gate_w = try std.fmt.allocPrint(a, "{s}.weight", .{gate_p});
         defer a.free(gate_w);
         if (w.get(gate_w) != null) r.gate = try MfLinear.load(w, a, gate_p, cfg.hidden_size, dt, s);
-        if (!ane.media_offload.video) { // the ANE seam reads the packed weights
+        if (!ane.aneState().media_offload.video) { // the ANE seam reads the packed weights
             try r.qkv.toW8a8(s);
             try r.out.toW8a8(s);
             if (r.gate) |*g| try g.toW8a8(s);
@@ -1099,7 +1094,7 @@ const MlpW = struct {
             .fc2 = try MfLinear.load(w, a, p2, cfg.ffn_hidden_size, dt, s),
         };
         errdefer r.deinit();
-        if (!ane.media_offload.video) {
+        if (!ane.aneState().media_offload.video) {
             try r.fc1.toW8a8(s);
             try r.fc2.toW8a8(s);
         }
@@ -1537,7 +1532,7 @@ fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTable
     }
 
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.attention_head_dim)));
-    if (w8a8.enabled and vsa == null and ablate == .none) if (try int8_attn.attention(t[0], t[1], t[2], scale, s)) |flat8| {
+    if (w8a8.w8a8State().enabled and vsa == null and ablate == .none) if (try int8_attn.attention(t[0], t[1], t[2], scale, s)) |flat8| {
         defer _ = mlx.mlx_array_free(flat8);
         const out8 = try aw.out.forward(flat8, null, s);
         return lora_mod.addSlot(out8, flat8, &aw.out_lora, s);
@@ -2123,14 +2118,14 @@ pub const Model = struct {
         m.refiner = try allocator.alloc(RefinerBlockW, cfg.token_refiner_num_layers);
         for (m.refiner, 0..) |*b, i| {
             b.* = try RefinerBlockW.load(w, allocator, @intCast(i), cfg, dt, s);
-            if (w8a8.enabled) w.dropBlock("token_refiner.blocks.{d}.", i);
+            if (w8a8.w8a8State().enabled) w.dropBlock("token_refiner.blocks.{d}.", i);
         }
         m.refiner_final_norm = try ownWeightAs(w, allocator, "token_refiner.final_norm", ".weight", dt, s);
 
         m.blocks = try allocator.alloc(BlockW, cfg.num_layers);
         for (m.blocks, 0..) |*b, i| {
             b.* = try BlockW.load(w, allocator, @intCast(i), cfg, dt, s);
-            if (w8a8.enabled) w.dropBlock("blocks.{d}.", i);
+            if (w8a8.w8a8State().enabled) w.dropBlock("blocks.{d}.", i);
         }
 
         m.final_norm = try ownWeightAs(w, allocator, "final_layer.norm", ".weight", dt, s);
@@ -2145,10 +2140,10 @@ pub const Model = struct {
 
     pub fn deinit(self: *Model) void {
         for ([_]mlx.mlx_array{
-            self.video_patch_w, self.video_patch_b, self.audio_patch_w, self.audio_patch_b,
-            self.condition_bias, self.te_in_w,      self.te_in_b,       self.te_out_w,
-            self.te_out_b,      self.inv_freq,      self.final_norm,    self.video_out_w,
-            self.video_out_b,   self.audio_out_w,   self.audio_out_b,   self.refiner_final_norm,
+            self.video_patch_w,  self.video_patch_b, self.audio_patch_w, self.audio_patch_b,
+            self.condition_bias, self.te_in_w,       self.te_in_b,       self.te_out_w,
+            self.te_out_b,       self.inv_freq,      self.final_norm,    self.video_out_w,
+            self.video_out_b,    self.audio_out_w,   self.audio_out_b,   self.refiner_final_norm,
         }) |a| _ = mlx.mlx_array_free(a);
         self.condition_proj.deinit();
         for (self.refiner) |*b| b.deinit();
@@ -2172,7 +2167,7 @@ pub const Model = struct {
     /// fails the request: every refusal is a NAMED `[ane]` line and the DiT
     /// runs GPU-only. Called after LoRA attach, so a Turbo run declines.
     pub fn buildAne(self: *Model, io: std.Io, seq_len: u32, s: S) void {
-        if (self.ane_eng != null or !ane.media_offload.video) return;
+        if (self.ane_eng != null or !ane.aneState().media_offload.video) return;
         if (!ane.available()) {
             log.warn("[ane] video offload: AppleNeuralEngine framework not present — GPU only\n", .{});
             return;
@@ -2291,10 +2286,10 @@ pub const Model = struct {
             }
         };
         for ([_]mlx.mlx_array{
-            self.video_patch_w, self.video_patch_b, self.audio_patch_w, self.audio_patch_b,
-            self.condition_bias, self.te_in_w,      self.te_in_b,       self.te_out_w,
-            self.te_out_b,      self.inv_freq,      self.final_norm,    self.video_out_w,
-            self.video_out_b,   self.audio_out_w,   self.audio_out_b,   self.refiner_final_norm,
+            self.video_patch_w,  self.video_patch_b, self.audio_patch_w, self.audio_patch_b,
+            self.condition_bias, self.te_in_w,       self.te_in_b,       self.te_out_w,
+            self.te_out_b,       self.inv_freq,      self.final_norm,    self.video_out_w,
+            self.video_out_b,    self.audio_out_w,   self.audio_out_b,   self.refiner_final_norm,
         }) |x| push.arr(vec, x);
         push.lin(vec, &self.condition_proj);
         for (self.refiner) |*b| {
@@ -2798,7 +2793,6 @@ pub const Model = struct {
 // For text-only input Qwen3-VL's M-RoPE (mrope_section [24,20,20]) collapses to
 // plain 1-D rotate-half RoPE, because all three axes share the running position.
 
-
 /// An encoder projection as the shared Qwen3 layer calls it.
 const TeProj = struct {
     l: *const MfLinear,
@@ -3164,9 +3158,17 @@ pub const TextEncoder = struct {
         var g = ops.Graph.init(self.allocator, s);
         defer g.deinit();
         const w = .{
-            .input_ln = layer.input_ln, .post_ln = layer.post_ln, .q_norm = layer.q_norm, .k_norm = layer.k_norm,
-            .q = TeProj{ .l = &layer.qw }, .k = TeProj{ .l = &layer.kw }, .v = TeProj{ .l = &layer.vw }, .o = TeProj{ .l = &layer.ow },
-            .gate = TeProj{ .l = &layer.gate_w }, .up = TeProj{ .l = &layer.up_w }, .down = TeProj{ .l = &layer.down_w },
+            .input_ln = layer.input_ln,
+            .post_ln = layer.post_ln,
+            .q_norm = layer.q_norm,
+            .k_norm = layer.k_norm,
+            .q = TeProj{ .l = &layer.qw },
+            .k = TeProj{ .l = &layer.kw },
+            .v = TeProj{ .l = &layer.vw },
+            .o = TeProj{ .l = &layer.ow },
+            .gate = TeProj{ .l = &layer.gate_w },
+            .up = TeProj{ .l = &layer.up_w },
+            .down = TeProj{ .l = &layer.down_w },
         };
         const out = try qwen3_te.layerForward(&g, w, .{ .heads = cfg.heads, .kv_heads = cfg.kv_heads, .head_dim = cfg.head_dim, .eps = cfg.eps }, .{ .half = .{ .cos = rope.cos, .sin = rope.sin } }, x, mask);
         return g.escape(out);
@@ -3440,7 +3442,6 @@ pub const RefMedia = struct {
     }
 };
 
-
 pub const GenRequest = struct {
     geometry: Geometry = .{},
     /// Keep the text encoder and DiT loaded in this cache between requests (null = the staged
@@ -3501,8 +3502,6 @@ pub const GenRequest = struct {
     /// and the prompt addresses it as `<Picture i>` / `<Video k>` / `<Audio j>`.
     refs: []const RefMedia = &.{},
 };
-
-
 
 /// What the audio latent is advanced by this step, per unit of the
 /// slope-scaled velocity the forward returns (`Output.audio` carries
@@ -3579,18 +3578,25 @@ pub const Resident = struct {
     }
 };
 
-/// Every engine's cache, so another model's load can ask them all to let go.
-var live_residents: [8]?*Resident = @splat(null);
+/// Process-wide under `-Dunits` (sdk/util/shared.zig): one copy in the host.
+const ResidentsState = struct {
+    /// Every engine's cache, so another model's load can ask them all to let go.
+    live_residents: [8]?*Resident = @splat(null),
+};
+const residents_shared = @import("../../sdk/util/shared.zig").Shared(ResidentsState, "h3_residents", .{});
+inline fn residents() *ResidentsState {
+    return residents_shared.get();
+}
 
 pub fn registerResident(r: *Resident) void {
-    for (&live_residents) |*slot| if (slot.* == null) {
+    for (&residents().live_residents) |*slot| if (slot.* == null) {
         slot.* = r;
         return;
     };
 }
 
 pub fn unregisterResident(r: *Resident) void {
-    for (&live_residents) |*slot| if (slot.* == r) {
+    for (&residents().live_residents) |*slot| if (slot.* == r) {
         slot.* = null;
     };
 }
@@ -3599,7 +3605,7 @@ pub fn unregisterResident(r: *Resident) void {
 /// be refused for memory: residency is opportunistic and never blocks anything.
 pub fn releaseAllResidents() u64 {
     var freed: u64 = 0;
-    for (live_residents) |slot| if (slot) |r| {
+    for (residents().live_residents) |slot| if (slot) |r| {
         freed += r.release();
     };
     return freed;
@@ -3857,7 +3863,7 @@ pub fn bindLoras(allocator: std.mem.Allocator, stack: *lora_mod.Stack, model: *M
     for (stack.paths[0..stack.count], stack.scales[0..stack.count], counts[0..stack.count], 0..) |p, sc, n, i| {
         const is_turbo = turbo and i == 0;
         log.info("[minimax-h3] lora {d}/{d}: {d}/{d} modules, scale {d:.2}{s} — {s}\n", .{
-            i + 1,          stack.count, n, Model.LORA_TARGETS, sc,
+            i + 1,                            stack.count,             n, Model.LORA_TARGETS, sc,
             if (is_turbo) " (turbo)" else "", std.fs.path.basename(p),
         });
         // A style LoRA legitimately targets a subset, but matching NOTHING means the file is for
@@ -4992,8 +4998,8 @@ test "minimax h3 live: generates a clip" {
 
     const prompt = envStr("MINIMAX_H3_PROMPT") orelse
         "A calico cat sits on a sunlit windowsill, slowly blinking as it watches rain streak down the glass. " ++
-        "The camera holds steady in a close medium shot. Warm afternoon light rims the cat's fur against the cool grey outside. " ++
-        "overall_soundscape: steady rainfall against glass with a soft room tone and the cat's quiet purring.";
+            "The camera holds steady in a close medium shot. Warm afternoon light rims the cat's fur against the cool grey outside. " ++
+            "overall_soundscape: steady rainfall against glass with a soft room tone and the cat's quiet purring.";
 
     var res = try generate(a, io, .{
         .tokenizer_dir = tokdir,
@@ -5033,12 +5039,10 @@ test "minimax h3 live: generates a clip" {
     std.debug.print("[minimax-h3] wrote {d} frames {d}x{d} to {s}\n", .{ res.frame_count, res.width, res.height, out_dir });
 }
 
-
 fn envU32(comptime name: []const u8, dflt: u32) u32 {
     const v = envStr(name) orelse return dflt;
     return std.fmt.parseInt(u32, v, 10) catch dflt;
 }
-
 
 fn allFinite(x: mlx.mlx_array, s: S) !bool {
     var isf = mlx.mlx_array_new();
@@ -5808,9 +5812,9 @@ test "minimax h3: reference sizing matches the reference node" {
         );
         testing.expectEqual(jsonU32(o.get("out_w").?), got.w) catch |e| {
             std.debug.print("image {d}x{d} gen {d}x{d} {s}: w {d}\n", .{
-                jsonU32(o.get("in_w").?), jsonU32(o.get("in_h").?),
+                jsonU32(o.get("in_w").?),  jsonU32(o.get("in_h").?),
                 jsonU32(o.get("gen_w").?), jsonU32(o.get("gen_h").?),
-                o.get("mode").?.string, got.w,
+                o.get("mode").?.string,    got.w,
             });
             return e;
         };
@@ -6407,11 +6411,11 @@ test "minimax h3: DiT block linears under w8a8 stay within their bar of the pack
     var rope = RopeTables{ .cos = try reshape(rc, &[_]c_int{ 1, seq, 1, half }, s), .sin = try reshape(rs, &[_]c_int{ 1, seq, 1, half }, s) };
     defer rope.deinit();
 
-    const prev = w8a8.enabled;
-    defer w8a8.enabled = prev;
+    const prev = w8a8.w8a8State().enabled;
+    defer w8a8.w8a8State().enabled = prev;
     var outs: [2][2]mlx.mlx_array = undefined; // [arm][attn, mlp]
     for (&outs, [_]bool{ false, true }) |*o, on| {
-        w8a8.enabled = on;
+        w8a8.w8a8State().enabled = on;
         var attn = try AttnW.load(&w, a, "attn", cfg, .bfloat16, s);
         defer attn.deinit();
         var mlp_w = try MlpW.load(&w, a, "mlp", cfg, .bfloat16, s);

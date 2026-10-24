@@ -13,13 +13,20 @@ const model_discovery = @import("../../../host/registry/discovery.zig");
 
 pub const kernels = gguf.kernels;
 
-/// Opt-in (`--mlx-gguf`); `--engine ds4|llama` keeps it off.
-pub var enabled: bool = false;
+/// Process-wide under `-Dunits` (sdk/util/shared.zig): one copy in the host.
+const ClaimState = struct {
+    /// Opt-in (`--mlx-gguf`); `--engine ds4|llama` keeps it off.
+    enabled: bool = false,
+};
+const claimState_shared = @import("../../util/shared.zig").Shared(ClaimState, "gguf_claim", .{});
+pub inline fn claimState() *ClaimState {
+    return claimState_shared.get();
+}
 
 /// Resolved .gguf path when this engine serves `model_dir`, else null. Caller frees.
 pub fn servablePath(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) ?[]u8 {
     if (comptime @import("builtin").os.tag == .windows) return null; // Metal-only engine
-    if (!enabled or !model_discovery.isGgufModelPath(io, model_dir)) return null;
+    if (!claimState().enabled or !model_discovery.isGgufModelPath(io, model_dir)) return null;
     const path = model_discovery.resolveGgufFile(io, allocator, model_dir) catch return null;
     var f = gguf.gguf.File.open(allocator, path) catch {
         allocator.free(path);
@@ -107,9 +114,9 @@ test "real GGUF: stands in for a model dir, and --engine turns it off (a real GG
     const allocator = std.testing.allocator;
     const model_mod = @import("../../../engines/mlx/model.zig");
     const tokenizer_mod = @import("../../../host/tokenizer/tokenizer.zig");
-    const prev = enabled;
-    defer enabled = prev;
-    enabled = true;
+    const prev = claimState().enabled;
+    defer claimState().enabled = prev;
+    claimState().enabled = true;
 
     var config = try model_mod.parseConfig(io, allocator, model);
     defer config.deinit(allocator);
@@ -127,7 +134,7 @@ test "real GGUF: stands in for a model dir, and --engine turns it off (a real GG
     try std.testing.expect(tok.special_tokens.count() > 0);
 
     try std.testing.expect(weightBytes(io, model).? > 1 << 20);
-    enabled = false;
+    claimState().enabled = false;
     try std.testing.expectEqual(@as(?[]u8, null), servablePath(io, allocator, model));
 }
 

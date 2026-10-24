@@ -316,7 +316,7 @@ pub fn implicitEffortBudgetFor(allocator: std.mem.Allocator, lm: *LoadedModel, t
 /// The request's `--reasoning-budget`: the generation-defaults budget rule replaces the flag,
 /// and effort words map against it exactly as they map against the flag.
 pub fn defaultReasoningBudget(gen: generation_settings.Profile) i32 {
-    return gen.value(i32, .reasoning_budget) orelse http_server.server_config.default_reasoning_budget;
+    return gen.value(i32, .reasoning_budget) orelse http_server.serverState().server_config.default_reasoning_budget;
 }
 
 /// A forced budget rule replaces whatever the request and its effort word decided.
@@ -722,7 +722,7 @@ test "schema thinking policy defers only a resolved reasoning protocol" {
 
 test "reasoning budget: the rule stands in for --reasoning-budget, forced it replaces the request's" {
     var gen = generation_settings.Profile{};
-    try std.testing.expectEqual(http_server.server_config.default_reasoning_budget, defaultReasoningBudget(gen));
+    try std.testing.expectEqual(http_server.serverState().server_config.default_reasoning_budget, defaultReasoningBudget(gen));
     gen.set(.reasoning_budget, .{ .number = 1024 }, false);
     try std.testing.expectEqual(@as(i32, 1024), defaultReasoningBudget(gen));
     // xhigh maps to the default budget, so an unforced rule caps it; medium keeps its own.

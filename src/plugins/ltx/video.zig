@@ -141,8 +141,8 @@ pub fn parseLtxConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Ltx
         if (v == .bool) cfg.keyframes_abs_pos = v.bool;
     }
     try config_fields.fill(LtxConfig, .{
-        .{ "num_layers", "num_layers" },                         .{ "num_attention_heads", "num_heads" },
-        .{ "attention_head_dim", "head_dim" },                   .{ "audio_num_attention_heads", "audio_num_heads" },
+        .{ "num_layers", "num_layers" },                   .{ "num_attention_heads", "num_heads" },
+        .{ "attention_head_dim", "head_dim" },             .{ "audio_num_attention_heads", "audio_num_heads" },
         .{ "audio_attention_head_dim", "audio_head_dim" },
     }, try config_fields.section(root, "transformer"), &cfg);
     try config_fields.fill(LtxConfig, .{.{ "num_blocks", "connector_num_blocks" }}, try config_fields.section(root, "connector"), &cfg);
@@ -223,7 +223,7 @@ pub const Component = struct {
 pub fn loadTransformer(allocator: std.mem.Allocator, path: [:0]const u8, cfg: LtxConfig, load_s: S, s: S) !Component {
     var comp = try loadComponent(allocator, path, load_s);
     errdefer comp.deinit();
-    if (w8a8.enabled) {
+    if (w8a8.w8a8State().enabled) {
         const n = try comp.w8.convert(allocator, &comp.map, .{ .base = "transformer.transformer_blocks.0.attn1.to_q", .in_features = cfg.videoDim() }, s);
         log.info("[ltx] int8: {d} block linears\n", .{n});
     }
@@ -2319,7 +2319,7 @@ fn ditAttention(comp: *const Component, alloc: std.mem.Allocator, x: mlx.mlx_arr
     var attn = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(attn);
     // The STG skip replaces the output with v, so the kernel only serves a normal pass.
-    const o8: ?mlx.mlx_array = if (w8a8.enabled and !skip_to_values) try int8_attn.attentionHeads(qh, kh, vh, scale, s) else null;
+    const o8: ?mlx.mlx_array = if (w8a8.w8a8State().enabled and !skip_to_values) try int8_attn.attentionHeads(qh, kh, vh, scale, s) else null;
     if (o8) |o| {
         _ = mlx.mlx_array_free(attn);
         attn = o;
@@ -6735,15 +6735,15 @@ test "LTX DiT: the w8a8 route stays within its bar of the packed forward" {
     defer _ = mlx.mlx_stream_free(s);
     const path = try std.fmt.allocPrintSentinel(a, "{s}/transformer-distilled.safetensors", .{dir}, 0);
     defer a.free(path);
-    const prev = w8a8.enabled;
-    defer w8a8.enabled = prev;
-    w8a8.enabled = false;
+    const prev = w8a8.w8a8State().enabled;
+    defer w8a8.w8a8State().enabled = prev;
+    w8a8.w8a8State().enabled = false;
     var packed_bytes: usize = 0;
     const want = try ltxProbe(a, s, path, &packed_bytes);
     defer for (want) |x| {
         _ = mlx.mlx_array_free(x);
     };
-    w8a8.enabled = true;
+    w8a8.w8a8State().enabled = true;
     var int8_bytes: usize = 0;
     const got = try ltxProbe(a, s, path, &int8_bytes);
     defer for (got) |x| {

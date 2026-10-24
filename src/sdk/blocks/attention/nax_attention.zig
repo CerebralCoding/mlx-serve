@@ -176,15 +176,22 @@ pub fn int8QkEnabledFrom(raw: ?[*:0]const u8) bool {
     return v[0] != 0 and v[0] != '0';
 }
 
-/// Set by `--int8-qk`.
-pub var int8_qk_cli: bool = false;
+/// Process-wide under `-Dunits` (sdk/util/shared.zig): one copy in the host.
+const NaxCliState = struct {
+    /// Set by `--int8-qk`.
+    int8_qk_cli: bool = false,
+};
+const naxCli_shared = @import("../../util/shared.zig").Shared(NaxCliState, "nax_attention_cli", .{});
+pub inline fn naxCli() *NaxCliState {
+    return naxCli_shared.get();
+}
 
 pub fn int8QkOn(cli: bool, raw: ?[*:0]const u8) bool {
     return cli or int8QkEnabledFrom(raw);
 }
 
 fn int8QkEnabled() bool {
-    if (int8_qk_env == null) int8_qk_env = int8QkOn(int8_qk_cli, env.get(.MLX_SERVE_INT8_QK));
+    if (int8_qk_env == null) int8_qk_env = int8QkOn(naxCli().int8_qk_cli, env.get(.MLX_SERVE_INT8_QK));
     return int8_qk_env.?;
 }
 

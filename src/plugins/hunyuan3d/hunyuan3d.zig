@@ -900,7 +900,7 @@ const DitAttn = struct {
         const v = try transpose(v4, &[_]c_int{ 0, 2, 1, 3 }, s);
         defer _ = mlx.mlx_array_free(v);
         const scale: f32 = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(@as(u32, @intCast(hd)))));
-        const o8 = if (w8a8.enabled) try int8_attn.attentionHeads(q, k, v, scale, s) else null;
+        const o8 = if (w8a8.w8a8State().enabled) try int8_attn.attentionHeads(q, k, v, scale, s) else null;
         const attn = o8 orelse try sdpa(q, k, v, scale, s);
         defer _ = mlx.mlx_array_free(attn);
         const merged = try mergeHeads(attn, s);
@@ -1388,7 +1388,7 @@ pub fn loadDit(allocator: std.mem.Allocator, cfg: Hy3dConfig, model_dir: []const
                 .norm_b = try normVec(&w, knb, s),
             };
         }
-        if (w8a8.enabled) {
+        if (w8a8.w8a8State().enabled) {
             try blk.toW8a8(s);
             w.dropBlock("blocks.{d}.", i);
         }
@@ -2787,14 +2787,14 @@ test "hy3d DiT: the w8a8 route stays within its bar of the packed forward" {
     const model_dir = std.mem.span(std.c.getenv("HY3D_TEST_MODEL") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    const prev = w8a8.enabled;
-    defer w8a8.enabled = prev;
-    w8a8.enabled = false;
+    const prev = w8a8.w8a8State().enabled;
+    defer w8a8.w8a8State().enabled = prev;
+    w8a8.w8a8State().enabled = false;
     var packed_bytes: usize = 0;
     var packed_peak: usize = 0;
     const want = try dit3dProbe(io, a, model_dir, &packed_bytes, &packed_peak);
     defer _ = mlx.mlx_array_free(want);
-    w8a8.enabled = true;
+    w8a8.w8a8State().enabled = true;
     var int8_bytes: usize = 0;
     var int8_peak: usize = 0;
     const got = try dit3dProbe(io, a, model_dir, &int8_bytes, &int8_peak);

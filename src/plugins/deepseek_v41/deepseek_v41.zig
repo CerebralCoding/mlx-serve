@@ -1177,11 +1177,18 @@ pub const Pair = struct {
     }
 };
 
-/// Host: hands one step's stream `[L, hc, dim]` and mix `[L, hc]` to the worker at `Pair.lo` and
-/// returns both as they stand after `Pair.hi` (caller frees); `snap`: the host snapshots when
-/// the step ends, so the worker does too; `verify`: a DSpark verify chunk, so the worker arms
-/// the same rollback anchors. Set by distributed.zig.
-pub var pair_exchange: ?*const fn (x: A, pre: A, p0: usize, snap: bool, verify: bool) anyerror![2]A = null;
+/// Process-wide under `-Dunits` (sdk/util/shared.zig): one copy in the host.
+const ClusterHooksState = struct {
+    /// Host: hands one step's stream `[L, hc, dim]` and mix `[L, hc]` to the worker at `Pair.lo` and
+    /// returns both as they stand after `Pair.hi` (caller frees); `snap`: the host snapshots when
+    /// the step ends, so the worker does too; `verify`: a DSpark verify chunk, so the worker arms
+    /// the same rollback anchors. Set by distributed.zig.
+    pair_exchange: ?*const fn (x: A, pre: A, p0: usize, snap: bool, verify: bool) anyerror![2]A = null,
+};
+const clusterHooks_shared = @import("../../sdk/util/shared.zig").Shared(ClusterHooksState, "dsv41_cluster", .{});
+pub inline fn clusterHooks() *ClusterHooksState {
+    return clusterHooks_shared.get();
+}
 
 /// The highest set bit of `mask` at or below `l`, or -1.
 fn latestBit(mask: u64, l: usize) i64 {
@@ -1789,7 +1796,7 @@ pub fn ropeQat(sc: *Scope, m: *const Dsv41Model, x: A, periods: A, offset: A, sc
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, @intCast(@min(n, 256)), 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "RD", @intCast(m.cfg.dsv4_rope_head_dim)));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "ROW", ci(n / dim(x, 0))));
-    const kind: c_int = if (m.qat_off or qk == null) 0 else @as(c_int, @intFromEnum(qk.?)) + 1;
+    const kind: c_int = if (m.qat_off or qk == null) 0 else @as(c_int, @backingInt(qk.?)) + 1;
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "QK", kind));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "OT", out_dt orelse dt));
@@ -3380,7 +3387,7 @@ fn runLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
 /// Host: every span's stream and mix to the worker, and back as they stand after its layers.
 /// The picks and candidates restart at the next source layer (a valid cut is one).
 fn exchange(m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const Spans, p0: usize, snap: bool, verify: bool) !void {
-    const xchg = pair_exchange orelse return error.DsvPairNotJoined;
+    const xchg = clusterHooks().pair_exchange orelse return error.DsvPairNotJoined;
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
     const back = try xchg(try sc.concat(sp.xs, 0), try sc.concat(sp.pres, 0), p0, snap, verify);
@@ -3618,7 +3625,7 @@ fn compileRegions(m: *Dsv41Model) !void {
     for (m.regions) |*r| inline for (comptime std.enums.values(Region)) |kind| {
         const raw = mlx.mlx_closure_new_func_payload(&RegionBody(kind).call, @ptrCast(r), null);
         defer _ = mlx.mlx_closure_free(raw);
-        try mlx.check(mlx.mlx_compile(&r.fns[@intFromEnum(kind)], raw, false));
+        try mlx.check(mlx.mlx_compile(&r.fns[@backingInt(kind)], raw, false));
     };
 }
 
@@ -3635,7 +3642,7 @@ fn runRegion(sc: *Scope, m: *const Dsv41Model, li: usize, comptime kind: Region,
     defer _ = mlx.mlx_vector_array_free(in);
     var res = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(res);
-    try mlx.check(mlx.mlx_closure_apply(&res, m.regions[li].fns[@intFromEnum(kind)], in));
+    try mlx.check(mlx.mlx_closure_apply(&res, m.regions[li].fns[@backingInt(kind)], in));
     for (out, 0..) |*o, i| {
         var x = mlx.mlx_array_new();
         o.* = try sc.res(mlx.mlx_vector_array_get(&x, res, i), &x);
@@ -6339,8 +6346,8 @@ test "dsv41 pair: DSpark on the host drafts what the whole model drafts, rollbac
         }
     };
     Xchg.w = worker;
-    pair_exchange = &Xchg.call;
-    defer pair_exchange = null;
+    clusterHooks().pair_exchange = &Xchg.call;
+    defer clusterHooks().pair_exchange = null;
 
     const ids = try t.ids();
     defer gpa.free(ids);
@@ -6408,8 +6415,8 @@ test "dsv41 pair: a host and a worker split at a valid cut give the unsplit mode
         }
     };
     Xchg.w = worker;
-    pair_exchange = &Xchg.call;
-    defer pair_exchange = null;
+    clusterHooks().pair_exchange = &Xchg.call;
+    defer clusterHooks().pair_exchange = null;
     // Several spans per chunk on both sides.
     for ([_]*Dsv41Model{ t.m, host, worker }) |m| m.span = 4;
 

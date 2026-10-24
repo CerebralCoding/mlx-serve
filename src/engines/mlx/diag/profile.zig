@@ -51,8 +51,15 @@ pub fn layerCap(n: usize) usize {
     return if (cap == 0) n else @min(cap, n);
 }
 
-pub var decode_prof: DecodeProf = .{};
-var decode_prof_enabled: ?bool = null;
+/// Process-wide under `-Dunits` (sdk/util/shared.zig): one copy in the host.
+const ProfileState = struct {
+    decode_prof: DecodeProf = .{},
+    decode_prof_enabled: ?bool = null,
+};
+const profileState_shared = @import("../../../sdk/util/shared.zig").Shared(ProfileState, "decode_profile", .{});
+pub inline fn profileState() *ProfileState {
+    return profileState_shared.get();
+}
 
 pub const ProfClock = struct {
     io: std.Io,
@@ -71,9 +78,9 @@ pub const ProfClock = struct {
 };
 
 pub fn decodeProfileEnabled() bool {
-    if (decode_prof_enabled) |v| return v;
+    if (profileState().decode_prof_enabled) |v| return v;
     const v = env.get(.MLX_SERVE_DECODE_PROFILE) != null;
-    decode_prof_enabled = v;
+    profileState().decode_prof_enabled = v;
     return v;
 }
 
@@ -89,21 +96,21 @@ pub fn dispatchProbeCount() usize {
 }
 
 pub fn decodeProfReport() void {
-    const n = decode_prof.calls;
+    const n = profileState().decode_prof.calls;
     if (n == 0) return;
     const per = struct {
         fn ms(ns: u64, calls: u64) f64 {
             return @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(calls)) / 1.0e6;
         }
     };
-    const e = per.ms(decode_prof.embed_ns, n);
-    const a = per.ms(decode_prof.attn_ns, n);
-    const g = per.ms(decode_prof.gdn_ns, n);
-    const m = per.ms(decode_prof.mlp_ns, n);
-    const l = per.ms(decode_prof.lmhead_ns, n);
-    const mr = per.ms(decode_prof.moe_router_ns, n);
-    const mx_ = per.ms(decode_prof.moe_experts_ns, n);
-    const ms_ = per.ms(decode_prof.moe_shared_ns, n);
+    const e = per.ms(profileState().decode_prof.embed_ns, n);
+    const a = per.ms(profileState().decode_prof.attn_ns, n);
+    const g = per.ms(profileState().decode_prof.gdn_ns, n);
+    const m = per.ms(profileState().decode_prof.mlp_ns, n);
+    const l = per.ms(profileState().decode_prof.lmhead_ns, n);
+    const mr = per.ms(profileState().decode_prof.moe_router_ns, n);
+    const mx_ = per.ms(profileState().decode_prof.moe_experts_ns, n);
+    const ms_ = per.ms(profileState().decode_prof.moe_shared_ns, n);
     log.info("[decode-prof] n={d} serial/tok={d:.2}ms  embed={d:.2} attn={d:.2} gdn={d:.2} mlp={d:.2} lmhead={d:.2} ms | moe: router={d:.2} experts={d:.2} shared={d:.2} ms\n", .{ n, e + a + g + m + l, e, a, g, m, l, mr, mx_, ms_ });
-    decode_prof = .{};
+    profileState().decode_prof = .{};
 }

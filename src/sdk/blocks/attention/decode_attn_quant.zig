@@ -65,7 +65,7 @@ pub const DECODE_ATTN_QUANT_DEFAULT = true;
 /// 2026-08-01); laguna's clean characterization keeps the plain default.
 pub fn decodeAttnQuantExplicit() bool {
     if (transformer.decode_attn_quant_override) |v| return v; // test seam counts as explicit
-    return transformer.decode_attn_quant_flag orelse false;
+    return transformer.cli().decode_attn_quant_flag orelse false;
 }
 
 /// LOSSY opt-in (`MLX_SERVE_DECODE_ATTN_QUANT_REQUANT=1`): 8-bit affine
@@ -77,7 +77,7 @@ pub fn attnDqRequantEnabled() bool {
 
 pub fn decodeAttnQuantEnabled() bool {
     if (transformer.decode_attn_quant_override) |v| return v;
-    return transformer.decode_attn_quant_flag orelse DECODE_ATTN_QUANT_DEFAULT;
+    return transformer.cli().decode_attn_quant_flag orelse DECODE_ATTN_QUANT_DEFAULT;
 }
 
 /// `attnProj` is reached only from the MoE/qwen4 forward, and not by its MLA or Gemma 4 arms.

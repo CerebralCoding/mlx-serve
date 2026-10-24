@@ -27,9 +27,16 @@ pub fn defaultOn(nax_present: bool, ram_bytes: u64) bool {
     return nax_present and ram_bytes >= DEFAULT_MIN_RAM_BYTES;
 }
 
-/// Process switch; `main` sets it from `defaultOn` before it reads `--w8a8` / `--no-w8a8`. Off under
-/// `zig build test`, so every other oracle keeps its packed numerics and the tests of this route opt in.
-pub var enabled: bool = false;
+/// Process-wide under `-Dunits` (sdk/util/shared.zig): one copy in the host.
+const W8a8State = struct {
+    /// Process switch; `main` sets it from `defaultOn` before it reads `--w8a8` / `--no-w8a8`. Off under
+    /// `zig build test`, so every other oracle keeps its packed numerics and the tests of this route opt in.
+    enabled: bool = false,
+};
+const w8a8State_shared = @import("../../util/shared.zig").Shared(W8a8State, "w8a8", .{});
+pub inline fn w8a8State() *W8a8State {
+    return w8a8State_shared.get();
+}
 
 /// Test seam for the hardware answer, so the header-only tests run on any machine.
 pub var nax_override: ?bool = null;
@@ -42,7 +49,7 @@ pub fn nax() bool {
 /// Whether this linear can take the route: NAX present, K a multiple of the
 /// rotation block, N a multiple of the store tile's width.
 pub fn eligible(k: u32, n: u32) bool {
-    if (!enabled) return false;
+    if (!w8a8State().enabled) return false;
     return bill.shapeEligible(k, n) and nax();
 }
 
@@ -51,7 +58,7 @@ pub fn eligible(k: u32, n: u32) bool {
 /// copy (N*K + 4N) because the originals are released. Null when the route is off
 /// or the header is unreadable.
 pub fn residentBytes(io: std.Io, dir: std.Io.Dir, name: []const u8) ?u64 {
-    if (!enabled) return null;
+    if (!w8a8State().enabled) return null;
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1008,8 +1015,8 @@ test "w8a8 pair projections equal the two standalone projections" {
 test "w8a8 resident bytes re-bill each convertible linear at its int8 copy" {
     nax_override = true; // only shard headers are read, so any machine can run this
     defer nax_override = null;
-    enabled = true;
-    defer enabled = false;
+    w8a8State().enabled = true;
+    defer w8a8State().enabled = false;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1035,17 +1042,17 @@ test "w8a8 resident bytes re-bill each convertible linear at its int8 copy" {
     try testing.expect(!converted("blocks.0.adaln_proj.linear.weight") and !converted("txtfusion.layerwise_blocks.0.attn.wq.weight") and !converted("img_in.weight"));
     // LTX / ACE-Step / Music3 / Hunyuan3D block linears; their embedders, encoders and routed experts stay packed.
     for ([_][]const u8{
-        "transformer.transformer_blocks.7.audio_attn1.to_q.weight",   "transformer.transformer_blocks.7.audio_to_video_attn.to_out.weight",
-        "transformer.transformer_blocks.7.audio_ff.proj_in.weight",   "decoder.layers.3.cross_attn.k_proj.weight",
-        "decoder.layers.3.mlp.down_proj.weight",                      "transformer_blocks.4.ff_in.weight",
-        "transformer_blocks.4.attn.to_out.0.weight",                  "blocks.9.attn2.k.weight",
-        "blocks.9.moe.shared.fc1.weight",                             "blocks.12.skip.linear.weight",
+        "transformer.transformer_blocks.7.audio_attn1.to_q.weight", "transformer.transformer_blocks.7.audio_to_video_attn.to_out.weight",
+        "transformer.transformer_blocks.7.audio_ff.proj_in.weight", "decoder.layers.3.cross_attn.k_proj.weight",
+        "decoder.layers.3.mlp.down_proj.weight",                    "transformer_blocks.4.ff_in.weight",
+        "transformer_blocks.4.attn.to_out.0.weight",                "blocks.9.attn2.k.weight",
+        "blocks.9.moe.shared.fc1.weight",                           "blocks.12.skip.linear.weight",
     }) |n| try testing.expect(converted(n));
     for ([_][]const u8{
-        "transformer.patchify_proj.weight",                           "transformer.adaln_single.linear.weight",
-        "encoder.lyric_encoder.layers.0.mlp.up_proj.weight",          "decoder.condition_embedder.weight",
-        "blocks.9.moe.experts.fc1.weight",                            "blocks.9.moe.gate.weight",
-        "x_embedder.weight",                                          "proj_in.weight",
+        "transformer.patchify_proj.weight",                  "transformer.adaln_single.linear.weight",
+        "encoder.lyric_encoder.layers.0.mlp.up_proj.weight", "decoder.condition_embedder.weight",
+        "blocks.9.moe.experts.fc1.weight",                   "blocks.9.moe.gate.weight",
+        "x_embedder.weight",                                 "proj_in.weight",
     }) |n| try testing.expect(!converted(n));
 }
 
@@ -1077,8 +1084,8 @@ fn putPacked(a: std.mem.Allocator, map: *std.StringHashMap(mlx.mlx_array), base:
 
 test "w8a8 overlay converts the pack's own (bits, group), dense weights as they are, and frees what it replaced" {
     if (!@import("../../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
-    enabled = true;
-    defer enabled = false;
+    w8a8State().enabled = true;
+    defer w8a8State().enabled = false;
     const a = testing.allocator;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
@@ -1104,7 +1111,7 @@ test "w8a8 overlay converts the pack's own (bits, group), dense weights as they 
     const up = try testLinear(128, 256, 0, 0, 4, s);
     try map.put(try a.dupe(u8, "blocks.0.mlp.up.weight"), up.dense);
     try map.put(try a.dupe(u8, "blocks.0.attn.q_norm.weight"), try randn(&.{512}, 5, .bfloat16, s));
-    try map.put(try a.dupe(u8, "txt.embed.weight"), try randn(&.{128, 512}, 6, .bfloat16, s));
+    try map.put(try a.dupe(u8, "txt.embed.weight"), try randn(&.{ 128, 512 }, 6, .bfloat16, s));
 
     const x = try randn(&.{ 64, 512 }, 7, .bfloat16, s);
     defer _ = mlx.mlx_array_free(x);
@@ -1129,8 +1136,8 @@ test "w8a8 overlay converts the pack's own (bits, group), dense weights as they 
 
 test "w8a8 takeLinear takes a packed or a dense linear and leaves an off-route one alone" {
     if (!@import("../../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
-    enabled = true;
-    defer enabled = false;
+    w8a8State().enabled = true;
+    defer w8a8State().enabled = false;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     const p = try testLinear(128, 512, 4, 64, 1, s);

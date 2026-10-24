@@ -39,6 +39,7 @@ pub const panic = std.debug.simple_panic;
 // SDK's too (`sdk.acceptance`), kept as main.zig has it, and nothing on iOS reads it.
 pub const mlx = @import("mlx/ffi.zig");
 pub const io_util = @import("sdk/util/io_util.zig");
+pub const shared = @import("sdk/util/shared.zig");
 pub const mtp_acceptance = @import("engines/mlx/spec/mtp_acceptance.zig");
 const model_mod = @import("engines/mlx/model.zig");
 const transformer_mod = @import("engines/mlx/transformer.zig");

@@ -457,15 +457,20 @@ pub var qsa_verify_gather_override: ?bool = null;
 
 pub var qsa_verify_gather_min_kv_override: ?c_int = null;
 
-pub var deferred_ple_group_syncs: u64 = 0;
-
-/// `--lm-head-mxfp8` / `--no-lm-head-mxfp8`; null = the default below.
-pub var lm_head_mxfp8_cli: ?bool = null;
-
-/// Set by the CLI (`--decode-attn-quant` / `--no-decode-attn-quant`) before
-/// any load; a transformer-level global so every serve path (headless
-/// included — the runHeadlessServe flag-eater class) sees one value.
-pub var decode_attn_quant_flag: ?bool = null;
+/// Process-wide under `-Dunits` (sdk/util/shared.zig): one copy in the host.
+const CliState = struct {
+    /// Set by the CLI (`--decode-attn-quant` / `--no-decode-attn-quant`) before
+    /// any load; a transformer-level global so every serve path (headless
+    /// included — the runHeadlessServe flag-eater class) sees one value.
+    decode_attn_quant_flag: ?bool = null,
+    /// `--lm-head-mxfp8` / `--no-lm-head-mxfp8`; null = the default below.
+    lm_head_mxfp8_cli: ?bool = null,
+    deferred_ple_group_syncs: u64 = 0,
+};
+const cli_shared = @import("../../sdk/util/shared.zig").Shared(CliState, "transformer_cli", .{});
+pub inline fn cli() *CliState {
+    return cli_shared.get();
+}
 
 pub var decode_attn_quant_override: ?bool = null; // test seam
 

@@ -197,13 +197,13 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
             return error.MissingWeight;
         }
     }
-    if (lmHeadMxfp8On(config.lm_head_mxfp8_override, transformer.lm_head_mxfp8_cli, mlx.cudaIntegrated(), config.isQwen4(), config.quant_bits)) {
+    if (lmHeadMxfp8On(config.lm_head_mxfp8_override, transformer.cli().lm_head_mxfp8_cli, mlx.cudaIntegrated(), config.isQwen4(), config.quant_bits)) {
         if (head_key != null and lm_head_s.ctx == null) {
             lm_head_s = try quantizeHeadMxfp8(weights, head_key.?, lm_head_w, s);
             lm_head_w = weights.get(head_key.?).?;
             const shape = mlx.getShape(lm_head_s);
             log.info("[lm-head] mxfp8 (lossy): the {d}x{d} bf16 head quantized at load\n", .{ shape[0], shape[1] * 32 });
-        } else if ((config.lm_head_mxfp8_override orelse transformer.lm_head_mxfp8_cli) != null)
+        } else if ((config.lm_head_mxfp8_override orelse transformer.cli().lm_head_mxfp8_cli) != null)
             log.info("[lm-head] mxfp8 declined: the head is {s}\n", .{if (lm_head_s.ctx != null) "already quantized" else "the embedding"});
     }
 
@@ -614,7 +614,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
         _ = mlx.mlx_get_active_memory(&weights_bytes);
         // A pipeline rank without the PLE layer, or a tensor worker, never reads the table.
         if (config.pleLocalLayer() != null and !(if (config.dist_shard) |sh| sh.rank != 0 else false)) {
-            st.gpu = ple_gpu.load(&st.table, ple_gpu.enabled, weights_bytes);
+            st.gpu = ple_gpu.load(&st.table, ple_gpu.pleGpu().enabled, weights_bytes);
             if (st.gpu == null) st.table.calibrateArm();
             // The weights load just evicted the table from page cache; an embedded pack's GPU
             // arm holds its own copy.

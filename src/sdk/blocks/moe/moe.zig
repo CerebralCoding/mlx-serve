@@ -473,7 +473,7 @@ pub fn moeMLP2WithRouter(self: *Transformer, router_x: mlx.mlx_array, expert_x_i
     if (moe_prof) {
         try mlx.check(mlx.mlx_array_eval(inds));
         try mlx.check(mlx.mlx_array_eval(norm_scores));
-        profile.decode_prof.moe_router_ns += mclk.lap();
+        profile.profileState().decode_prof.moe_router_ns += mclk.lap();
     }
 
     const x_shape = mlx.getShape(expert_x);
@@ -519,13 +519,13 @@ pub fn moeMLP2WithRouter(self: *Transformer, router_x: mlx.mlx_array, expert_x_i
         useGatherQmvDecode(self, gate_qp, up_qp) and mw.switch_gate_s.ctx != null and mw.switch_up_s.ctx != null and mw.switch_down_s.ctx != null and
         try self.moeDecodeGatherQmvRows(&down_out, expert_x, inds, norm_scores, &moe_reduced, mw, gate_qp, up_qp, down_qp, D, K, B, S))
     {
-        gather_qmv_rows.moe_rows_fused_layers +%= 1;
+        gather_qmv_rows.moeStats().moe_rows_fused_layers +%= 1;
         cost_arm = 1;
     } else if (cuda_fmt != null and try self.moeCudaDecode(&down_out, expert_x, inds, norm_scores, mw, cuda_fmt.?)) {
         moe_reduced = true;
         cost_arm = 1;
     } else if (do_sort) {
-        gather_qmv_rows.moe_sorted_layers +%= 1;
+        gather_qmv_rows.moeStats().moe_sorted_layers +%= 1;
         cost_arm = 2;
         // ── Global-sort prefill path ──
 
@@ -798,7 +798,7 @@ pub fn moeMLP2WithRouter(self: *Transformer, router_x: mlx.mlx_array, expert_x_i
 
     if (moe_prof) {
         try mlx.check(mlx.mlx_array_eval(down_out));
-        profile.decode_prof.moe_experts_ns += mclk.lap();
+        profile.profileState().decode_prof.moe_experts_ns += mclk.lap();
     }
 
     // Weight by scores: down_out * norm_scores[..., None] → sum over K.
@@ -825,7 +825,7 @@ pub fn moeMLP2WithRouter(self: *Transformer, router_x: mlx.mlx_array, expert_x_i
         const result = try self.moeAddUngatedShared(expert_sum, expert_x, mw);
         if (moe_prof) {
             try mlx.check(mlx.mlx_array_eval(result));
-            profile.decode_prof.moe_shared_ns += mclk.lap();
+            profile.profileState().decode_prof.moe_shared_ns += mclk.lap();
         }
         return result;
     }
