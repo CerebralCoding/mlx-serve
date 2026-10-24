@@ -1,5 +1,6 @@
 //! The legacy `Transformer`'s methods over `sdk/blocks/linear/qmatmul.zig` (what reads the engine's model state).
 
+const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const qmv2 = @import("../../../sdk/blocks/qmm/qmv2.zig");
 const mlx_gguf = @import("../../../sdk/quant/gguf/root.zig");
@@ -49,7 +50,7 @@ pub inline fn qmatmul(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_arr
         if (try qmv2.qmm(x, w, sc, bi, qp.bits, qp.group_size, true, false, self.s)) |y| return y;
     }
     if (self.config.rowExactDecode() and qp.mode == .affine) {
-        if (try rowExactQmm(&self.config, x, w, sc, bi, qp.bits, qp.group_size, self.s)) |y| return y;
+        if (try rowExactQmm(std.mem.eql(u8, self.config.model_type, "nemotron_h"), x, w, sc, bi, qp.bits, qp.group_size, self.s)) |y| return y;
     }
     return qmatmulBits(x, w, sc, bi, qp.bits, qp.group_size, qp.mode, self.s);
 }

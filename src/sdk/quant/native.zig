@@ -6,7 +6,6 @@ const std = @import("std");
 const abi = @import("../../abi/quant.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const block = @import("block.zig");
-const model = @import("../../engines/mlx/model.zig");
 const params = @import("params.zig");
 const sushi_pack = @import("exl3/sushi_pack.zig");
 const modelopt_pack = @import("nvfp4/modelopt_pack.zig");
@@ -23,7 +22,7 @@ pub const Layout = enum(u8) { dense, affine, nvfp4, mxfp4, mxfp8, fp8_rows };
 
 /// The per-load state: the block's declaration as the engine's resolver reads it.
 pub const State = struct {
-    cfg: model.ModelConfig = .{},
+    model: params.QuantParams = .{ .bits = 0, .group_size = 0 },
     /// Hadamard: the rotation block.
     block: u32 = 0,
 };
@@ -63,9 +62,7 @@ pub fn open(ctx: *abi.LoadCtx) callconv(.c) Verdict {
     const mode = QuantMode.fromString(d.mode) orelse return Verdict.refuse(.unsupported, "quantization mode other than affine, nvfp4, mxfp4, mxfp8");
     const st = std.heap.page_allocator.create(State) catch return failed(error.OutOfMemory);
     st.* = .{};
-    st.cfg.quant_bits = d.bits;
-    st.cfg.quant_group_size = d.group_size;
-    st.cfg.quant_mode = mode;
+    st.model = .{ .bits = d.bits, .group_size = d.group_size, .mode = mode };
     if (block.hadamardBlock(arena.allocator(), ctx.config_json.slice())) |b| st.block = b;
     ctx.state = st;
     return .ok;
@@ -115,7 +112,7 @@ pub fn loadInto(ctx: *const abi.LoadCtx, base: []const u8, in_dim: u32, out: *ab
         out.bits = 8;
         return;
     }
-    const qp = params.computeQuantParams(.of(&st.cfg), w, sc, if (in_dim > 0) in_dim else null);
+    const qp = params.computeQuantParams(st.model, w, sc, if (in_dim > 0) in_dim else null);
     out.bits = @intCast(qp.bits);
     out.group_size = qp.group_size;
     out.layout = @intFromEnum(switch (qp.mode) {
@@ -201,7 +198,6 @@ const testing = std.testing;
 const ops = @import("../../mlx/ops.zig");
 const parity = @import("../testing/parity.zig");
 const resident = @import("../weights/resident.zig");
-const projectWithConfig = @import("../blocks/linear/qmatmul.zig").projectWithConfig;
 
 pub const Triple = struct {
     w: mlx.mlx_array,
@@ -235,7 +231,7 @@ pub fn putTriple(weights: *resident.Weights, base: []const u8, t: Triple) !void 
 pub const Case = struct { base: []const u8, layout: Layout, bits: u8 = 0, group_size: u32 = 0 };
 
 /// Loads every case of `r` through `t` and checks the resolved params, then that `t.matmul` at 1, 3 and 9 rows is
-/// bit-equal to the engine's direct path (`projectWithConfig`, which resolves per weight from the activation).
+/// bit-equal to the direct path (`quantParamsOrDense` from the activation, then `qmatmulBits`).
 fn expectParity(t: *const abi.QuantTable, r: *const resident.Resident, block_json: []const u8, cases: []const Case, k: c_int, s: mlx.mlx_stream) !void {
     const src = r.source();
     var ctx: abi.LoadCtx = .{ .block_json = .of(block_json), .source = &src, .stream = .{ .ctx = s.ctx } };
@@ -262,7 +258,9 @@ fn expectParity(t: *const abi.QuantTable, r: *const resident.Resident, block_jso
             var got: abi.Array = .{};
             try testing.expect(t.matmul(&w, wrap(x), .{ .ctx = s.ctx }, &got).isOk());
             defer _ = mlx.mlx_array_free(arr(got));
-            const want = try projectWithConfig(&state(&ctx).?.cfg, x, dense_t, tensor(&ctx, c.base, "scales"), tensor(&ctx, c.base, "biases"), s);
+            const sc = tensor(&ctx, c.base, "scales");
+            const qp = params.quantParamsOrDense(state(&ctx).?.model, dense_t, sc, @intCast(k));
+            const want = try qmatmulBits(x, dense_t, sc, tensor(&ctx, c.base, "biases"), qp.bits, qp.group_size, qp.mode, s);
             defer _ = mlx.mlx_array_free(want);
             try ops.expectBitEqual(arr(got), want);
         }
