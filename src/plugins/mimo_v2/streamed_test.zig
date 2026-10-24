@@ -150,7 +150,7 @@ fn parity(n_experts: u32) !void {
     const moe_w = &m.layers[FIRST_MOE].mlp.second;
 
     // The in-memory banks: the served steps, then the block alone at every arm's widths in bf16 and f32.
-    const widths = [_]c_int{ 1, 2, 8, 20 };
+    const widths = [_]c_int{ 1, 2, 8, 20, 128 };
     const native = try logits(&b, a, null);
     var native_block: [2][widths.len][]u32 = undefined;
     for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }, 0..) |dt, di| for (widths, 0..) |rows, wi| {
@@ -158,7 +158,8 @@ fn parity(n_experts: u32) !void {
     };
 
     const few: [MOE_LAYERS]u32 = @splat(3);
-    for ([_]?[]const u32{ null, &few }) |rows| {
+    const most: [MOE_LAYERS]u32 = @splat(@max(3, n_experts * 2 / 3));
+    for ([_]?[]const u32{ null, &few, &most }) |rows| {
         var sw = try streamed.Streamed.open(testing.allocator, io, bank_dir, b.xfm.s, .{ .rows = rows });
         defer sw.close();
         const r = sw.routedSource();
@@ -170,9 +171,9 @@ fn parity(n_experts: u32) !void {
             try testing.expectEqualSlices(u32, native_block[di][wi], try blockOut(&b, a, moe_w, w, dt, 0x10 + wi, r));
         };
         const st = sw.src.mxfp4.stats();
-        std.debug.print("mimo_v2 streamed ({d} experts, {s}): {d} routes, {d} hits, {d} misses, {d} evictions\n", .{ n_experts, if (rows == null) "every expert resident" else "3 rows a layer", st.route_calls, st.expert_cache_hits, st.expert_cache_misses, st.expert_cache_evictions });
+        std.debug.print("mimo_v2 streamed ({d} experts, {s}): {d} routes, {d} hits, {d} misses, {d} evictions\n", .{ n_experts, if (rows == null) "every expert resident" else if (rows.?[0] == 3) "3 rows a layer" else "2/3 of the experts a layer", st.route_calls, st.expert_cache_hits, st.expert_cache_misses, st.expert_cache_evictions });
         // With three rows a layer, decode reads pairs from more than one slot bank.
-        if (rows != null) try testing.expect(st.expert_cache_evictions > 0 and moe_fp4.banked_dispatches != banked);
+        if (rows != null and rows.?[0] == 3) try testing.expect(st.expert_cache_evictions > 0 and moe_fp4.banked_dispatches != banked);
     }
 }
 
@@ -180,9 +181,11 @@ fn parity(n_experts: u32) !void {
 
 test "mimo_v2 streamed: the resident's experts through the Routed hook from an experts.bin are its in-memory banks' logits bit for bit" {
     if (!build_options.mlx_stream or mlx.noGpuBackend()) return error.SkipZigTest;
-    // 8 experts: the prompt's gathers take the row-block class (40 pairs, 5 a row); 32: the per-pair one.
+    // 8 experts: the prompt's gathers take the row-block class (40 pairs, 5 a row); 32: the per-pair one; 96: a call
+    // whose experts outnumber one fetch (`sortedGroups`).
     try parity(8);
     try parity(32);
+    try parity(96);
 }
 
 /// One expert projection of `bank` (model layer 0) dequantized to f32 `[out, in]`, owned by `g`.
