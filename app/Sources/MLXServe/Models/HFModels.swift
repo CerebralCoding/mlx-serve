@@ -145,6 +145,26 @@ func discoverableMediaModelType(_ modelType: String) -> Bool {
 enum MediaModality: CaseIterable {
     case image, voice, music, sound, video, mesh
 
+    /// A `/v1/models` row's `modality` (src/host/api/model_row_facts.zig); nil for one with no create pane.
+    init?(served: String) {
+        switch served {
+        case "image": self = .image
+        case "speech": self = .voice
+        case "music": self = .music
+        case "sound": self = .sound
+        case "video": self = .video
+        case "3d": self = .mesh
+        default: return nil
+        }
+    }
+
+    /// The pane of the local pack at `path`: what the server says of it when it lists the pack (an outside
+    /// plugin's packs included), else the app's own map of `modelType` (no server, or an older one).
+    static func of(modelType: String, path: String, rows: [ModelInfo]) -> MediaModality? {
+        if let served = ModelSettingsApply.row(for: path, in: rows)?.modality { return MediaModality(served: served) }
+        return MediaModality(modelType: modelType)
+    }
+
     init?(modelType: String) {
         if modelType.hasPrefix("flux2") || modelType.hasPrefix("krea")
             || modelType.hasPrefix("mage_flow") || modelType == "mageflow"
