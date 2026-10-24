@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const testing = @import("../../../engines/mlx/kv/cache.zig").testing;
+const testing = std.testing;
 const bf16Scalar = @import("../../../engines/mlx/load/weights.zig").bf16Scalar;
 const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
 

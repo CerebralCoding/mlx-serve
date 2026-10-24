@@ -99,7 +99,7 @@ pub var downred_engaged: bool = false;
 
 
 fn downReduceFusedEnabled() bool {
-    return transformer.downred_override orelse true;
+    return downred_override orelse true;
 }
 
 /// Fused down-projection + router weighting + K-reduction at decode width.
@@ -361,6 +361,8 @@ pub fn gatherQmvDownReduceRows(
     return y;
 }
 
+pub var downred_override: ?bool = null;
+
 // ── tests ──
 
 test "down+reduce lanes per row: 16 on G17, 8 on every other generation and on phones" {
@@ -374,8 +376,8 @@ test "moe down+reduce fused: no worse than gatherQmv + multiply + sum vs fp32 tr
     var prng = std.Random.DefaultPrng.init(0xD09E);
     const rnd = prng.random();
     const t = std.testing;
-    transformer.downred_override = true;
-    defer transformer.downred_override = null;
+    downred_override = true;
+    defer downred_override = null;
 
     // Two geometries: a small one, and Laguna XS's real decode shape. The fused
     // kernel reduces each row over 8 lanes, the composed chain over 32, so the
@@ -398,8 +400,8 @@ test "moe down+reduce fused: no worse than gatherQmv + multiply + sum vs fp32 tr
 test "moe down+reduce fused: a second expert width at the same top-k and N runs its own width" {
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0xD0A1);
-    transformer.downred_override = true;
-    defer transformer.downred_override = null;
+    downred_override = true;
+    defer downred_override = null;
     const affine4 = [_]ParityQuant{.{ .nvfp4 = false, .bits = 4, .gs = 32 }};
     try moeDownReduceParityCase(s, prng.random(), std.testing, 16, 8, 64, 32, &affine4);
     try moeDownReduceParityCase(s, prng.random(), std.testing, 16, 8, 128, 32, &affine4);
@@ -567,8 +569,8 @@ test "moe down+reduce fused: declines outside its envelope" {
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0xD09F);
     const rnd = prng.random();
-    transformer.downred_override = true;
-    defer transformer.downred_override = null;
+    downred_override = true;
+    defer downred_override = null;
 
     const TOPK: c_int = 8;
     const KIN: c_int = 64;

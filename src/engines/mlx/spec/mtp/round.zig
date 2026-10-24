@@ -49,6 +49,7 @@ const sampleRowsAnySeed = @import("../../sampling/lazy.zig").sampleRowsAnySeed;
 const sampleRowsHomogeneous = @import("../../sampling/lazy.zig").sampleRowsHomogeneous;
 const specDecodeUnsupported = @import("../verify.zig").specDecodeUnsupported;
 const verifyArgmax = @import("../verify.zig").verifyArgmax;
+const verify_projection = @import("../../../../sdk/blocks/linear/verify_projection.zig");
 
 /// A speculative round between its draft chain and its verdict. `mtpRoundBegin`
 /// builds it, `mtpRoundVerify` (solo) or the scheduler's group verify fills the
@@ -1067,8 +1068,8 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
     group_planner.enabled_override = true;
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    const coarse_before = transformer_mod.mtp_coarse_pair_dispatches;
-    const verify_kernel_before = transformer_mod.mtp_verify_kernel_calls;
+    const coarse_before = verify_projection.mtp_coarse_pair_dispatches;
+    const verify_kernel_before = verify_projection.mtp_verify_kernel_calls;
     var config = try model_mod.parseConfig(io, a, std.mem.span(model_dir));
     defer if (config.ngram_table_path) |path| a.free(path);
     var weights = try model_mod.loadWeights(io, a, std.mem.span(model_dir));
@@ -1183,11 +1184,11 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
         }
     }
     if (transformer_mod.verifySharedHardware()) {
-        try testing.expect(transformer_mod.mtp_coarse_pair_dispatches > coarse_before);
+        try testing.expect(verify_projection.mtp_coarse_pair_dispatches > coarse_before);
         inline for (.{ .dense_tiles, .hc_rows, .route_pack }, 0..) |lever, i| {
             {
-                try testing.expect(transformer_mod.mtp_verify_kernel_calls[i] > verify_kernel_before[i]);
-                std.debug.print("[verify kernel] {s} calls={d}\n", .{ @tagName(lever), transformer_mod.mtp_verify_kernel_calls[i] - verify_kernel_before[i] });
+                try testing.expect(verify_projection.mtp_verify_kernel_calls[i] > verify_kernel_before[i]);
+                std.debug.print("[verify kernel] {s} calls={d}\n", .{ @tagName(lever), verify_projection.mtp_verify_kernel_calls[i] - verify_kernel_before[i] });
             }
         }
     }

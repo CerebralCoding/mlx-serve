@@ -67,6 +67,7 @@ pub fn slotMtpGroupable(slot: *const Slot) bool {
 }
 
 pub const Planner = @import("mtp_group_planner.zig");
+const qmv_rows = @import("../../../sdk/blocks/linear/qmv_rows.zig");
 
 pub fn plannerShape(slots: []const *Slot, widths: []const u8) group_cost_mod.GroupShape {
     const xfm = slots[0].model.transformer.?;
@@ -491,7 +492,7 @@ fn runBatchedMtpHeadTick(sch: *Scheduler, group: []*Slot) !void {
     cost_xfm.cost_trace_active = cost_xfm.qwen4Host().qwen4 != null;
     cost_xfm.cost_attention = 0;
     cost_xfm.cost_moe = 0;
-    const head_calls_before = transformer_mod.mtp_head_row_dispatches;
+    const head_calls_before = qmv_rows.mtp_head_row_dispatches;
     defer cost_xfm.cost_trace_active = false;
     defer for (group) |slot| {
         if (slot.legacy_gen) |*gen| gen.mtp_batch_head = false;
@@ -960,7 +961,7 @@ fn observeGroupRound(live: []*Slot, states: []const Generator.MtpRoundState, exp
         .head_format = if (xfm.qwen4Host().qwen4_mtp) |head| cacheCostFormat(head.cache.config) else 0,
         .attention = xfm.cost_attention,
         .moe = xfm.cost_moe,
-        .head_calls = @intCast(@min(std.math.maxInt(u16), transformer_mod.mtp_head_row_dispatches -% head_calls_before)),
+        .head_calls = @intCast(@min(std.math.maxInt(u16), qmv_rows.mtp_head_row_dispatches -% head_calls_before)),
     };
     for (live, states, 0..) |slot, st, i| {
         const chain = st.chain;

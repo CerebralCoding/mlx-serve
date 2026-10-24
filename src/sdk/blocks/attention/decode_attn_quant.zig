@@ -64,7 +64,7 @@ pub const DECODE_ATTN_QUANT_DEFAULT = true;
 /// form (dsv4 comp_in: one duplicated paragraph on 1/7 greedy prompts,
 /// 2026-08-01); laguna's clean characterization keeps the plain default.
 pub fn decodeAttnQuantExplicit() bool {
-    if (transformer.decode_attn_quant_override) |v| return v; // test seam counts as explicit
+    if (decode_attn_quant_override) |v| return v; // test seam counts as explicit
     return transformer.cli().decode_attn_quant_flag orelse false;
 }
 
@@ -76,7 +76,7 @@ pub fn attnDqRequantEnabled() bool {
 }
 
 pub fn decodeAttnQuantEnabled() bool {
-    if (transformer.decode_attn_quant_override) |v| return v;
+    if (decode_attn_quant_override) |v| return v;
     return transformer.cli().decode_attn_quant_flag orelse DECODE_ATTN_QUANT_DEFAULT;
 }
 
@@ -170,6 +170,8 @@ pub fn buildAttnDqCopy(s: mlx.mlx_stream, w: mlx.mlx_array, nvfp4: bool) !?AttnD
     return copy;
 }
 
+pub var decode_attn_quant_override: ?bool = null; // test seam
+
 // ── tests ──
 
 test "decode-attn-quant: eligibility is the dispatch's own conditions" {
@@ -192,8 +194,8 @@ test "decode-attn-quant: ships ON (measured); the override seam reaches the gate
     // The shipped default is a single constant the Swift ServerOptions default
     // mirrors — flip both together.
     try t.expect(DECODE_ATTN_QUANT_DEFAULT == true);
-    transformer.decode_attn_quant_override = false;
-    defer transformer.decode_attn_quant_override = null;
+    decode_attn_quant_override = false;
+    defer decode_attn_quant_override = null;
     try t.expect(!decodeAttnQuantEnabled());
 }
 

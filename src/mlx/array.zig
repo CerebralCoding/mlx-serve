@@ -3,9 +3,7 @@
 
 const std = @import("std");
 const mlx = @import("ffi.zig");
-const testing = @import("../engines/mlx/kv/cache.zig").testing;
-const ssmConcatAxis0 = @import("../engines/mlx/ssm/group.zig").ssmConcatAxis0;
-const Transformer = @import("../engines/mlx/transformer.zig").Transformer;
+const testing = std.testing;
 const mlxSettledActiveBytes = @import("../sdk/testing/parity.zig").mlxSettledActiveBytes;
 
 /// take_axis + materialized copy: quantized kernels (dequantize included)
@@ -44,7 +42,12 @@ pub fn materializedOwnedCopy(s: mlx.mlx_stream, x: mlx.mlx_array) !mlx.mlx_array
 }
 
 pub fn concatAxis0(s: mlx.mlx_stream, parts: []const mlx.mlx_array) !mlx.mlx_array {
-    return ssmConcatAxis0(s, parts);
+    const vec = mlx.mlx_vector_array_new_data(parts.ptr, parts.len);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 0, s));
+    return out;
 }
 
 /// Index `i` of `arr` along `axis` as an owned view handle (the axis keeps size 1).
@@ -79,19 +82,6 @@ pub fn concatRows(parts: []const mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_arra
     try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 0, s));
     try mlx.check(mlx.mlx_array_eval(out));
     return out;
-}
-
-/// A module arch's token ids on the host.
-pub fn hostIds(self: *Transformer, token_ids: mlx.mlx_array) ![]u32 {
-    var ids32 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(ids32);
-    try mlx.check(mlx.mlx_astype(&ids32, token_ids, .int32, self.s));
-    try mlx.check(mlx.mlx_array_eval(ids32));
-    const n = mlx.mlx_array_size(ids32);
-    const data = mlx.mlx_array_data_int32(ids32) orelse return error.NoData;
-    const ids = try self.allocator.alloc(u32, n);
-    for (ids, data[0..n]) |*o, id| o.* = @intCast(id);
-    return ids;
 }
 
 // ── tests ──

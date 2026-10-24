@@ -4,7 +4,7 @@
 const mlx = @import("../../mlx/ffi.zig");
 const ModelConfig = @import("../../engines/mlx/model.zig").ModelConfig;
 const QuantMode = @import("../../engines/mlx/model.zig").QuantMode;
-const testing = @import("../../engines/mlx/kv/cache.zig").testing;
+const testing = @import("std").testing;
 const detectQuantBits = @import("../../engines/mlx/load/weights.zig").detectQuantBits;
 
 // ── Quantization params cache ──

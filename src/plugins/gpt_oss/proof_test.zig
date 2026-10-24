@@ -90,16 +90,16 @@ test "gpt_oss plugin: a 4-bit pack (sinks, biases, YaRN, biased experts) is bit-
 }
 
 test "gpt_oss plugin: a bf16 pack is bit-equal to the legacy forward with decode-attn-quant off" {
-    const was = transformer.decode_attn_quant_override;
-    defer transformer.decode_attn_quant_override = was;
-    transformer.decode_attn_quant_override = false;
+    const was = decode_attn_quant.decode_attn_quant_override;
+    defer decode_attn_quant.decode_attn_quant_override = was;
+    decode_attn_quant.decode_attn_quant_override = false;
     try case(false, 0x9056);
 }
 
 test "gpt_oss plugin: a bf16 pack with decode-attn-quant on (its decode side copies) is bit-equal to the legacy forward" {
-    const was = transformer.decode_attn_quant_override;
-    defer transformer.decode_attn_quant_override = was;
-    transformer.decode_attn_quant_override = true;
+    const was = decode_attn_quant.decode_attn_quant_override;
+    defer decode_attn_quant.decode_attn_quant_override = was;
+    decode_attn_quant.decode_attn_quant_override = true;
     try case(false, 0x9057);
 }
 
@@ -129,6 +129,7 @@ test "gpt_oss plugin: under a launch override it serves through the plugin, the 
 const mlx = @import("../../mlx/ffi.zig");
 const gguf_kernels = @import("../../sdk/quant/gguf/kernels.zig");
 const GgmlType = @import("../../sdk/quant/gguf/quants.zig").GgmlType;
+const decode_attn_quant = @import("../../sdk/blocks/attention/decode_attn_quant.zig");
 
 /// `<base>.weight` and its sentinel as the GGUF loader leaves a block-quantized tensor (`sdk/quant/gguf/weights.zig`):
 /// valid random q8_0 (an f16 scale, 32 int8) or mxfp4 (an e8m0 scale, 16 nibble bytes) blocks, split rows packed as the

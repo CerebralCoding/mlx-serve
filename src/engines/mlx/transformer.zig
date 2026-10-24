@@ -423,18 +423,6 @@ pub const prefillDqGemmEnabled = @import("../../sdk/blocks/linear/prefill_dq_gem
 // Vars other files reach as `transformer.X`: Zig cannot alias a var, so they stay here
 // and the code that moved out reads them qualified.
 
-/// Test seam: pin the GPU generation every generation-keyed plan reads (null = the device's).
-pub var device_gen_override: ?DeviceGen = null;
-
-/// Test seam: force the NAX availability probe (null = real probe). Only
-/// ever force FALSE on non-G17 machines — forcing true would let dispatch
-/// build a kernel whose matmul2d pipeline cannot be created off M5-class
-/// hardware.
-pub var vqmm_nax_probe_override: ?bool = null;
-
-/// Test seam: forces BOTH hd-256 kernel arms on/off.
-pub var fused256_override: ?bool = null;
-
 pub var qsa_gather_override: ?bool = null;
 
 pub var qsa_gather_min_kv_override: ?c_int = null;
@@ -444,10 +432,6 @@ pub var qsa_decode_gather_override: ?bool = null;
 pub var qsa_batched_gather_override: ?bool = null;
 
 pub var qsa_history_share_override: ?bool = null;
-
-pub var mtp_coarse_pair_dispatches: u64 = 0;
-
-pub var mtp_verify_kernel_calls: [3]u64 = @splat(0);
 
 pub var qsa_score_fused_override: ?bool = null;
 
@@ -472,20 +456,7 @@ pub inline fn cli() *CliState {
     return cli_shared.get();
 }
 
-pub var decode_attn_quant_override: ?bool = null; // test seam
-
 pub var hc_fused_override: ?bool = null;
-
-pub var gqmv_gateup_override: ?bool = null;
-
-pub var moe_rows_fused_override: ?bool = null;
-
-pub var downred_override: ?bool = null;
-
-pub var mtp_head_row_dispatches: usize = 0;
-
-/// Test seam: forces the route on/off without the environment.
-pub var prefill_dq_gemm_override: ?bool = null;
 
 const model_mod = @import("model.zig");
 const log = @import("../../host/log.zig");

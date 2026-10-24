@@ -80,7 +80,7 @@ fn getAttn256Kernel() !mlx.mlx_fast_metal_kernel {
 
 
 pub fn fused256Enabled() bool {
-    return transformer.fused256_override orelse true;
+    return fused256_override orelse true;
 }
 
 /// Plain-CAUSAL dispatch mode. Default `.all` since the kv-chunk dispatch
@@ -139,7 +139,7 @@ pub fn fused256KvChunkLen(batch: i64, hq: i64, ql: i64, kl: i64, budget: i64) c_
 pub var fused256_last_dispatch_count: u32 = 0;
 
 pub fn fused256CausalMode() Fused256CausalMode {
-    if (transformer.fused256_override) |v| return if (v) .all else .off;
+    if (fused256_override) |v| return if (v) .all else .off;
     return if (fused256Enabled()) .all else .off;
 }
 
@@ -479,6 +479,9 @@ pub fn attn256MaxDiff(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !f3
     return max_diff;
 }
 
+/// Test seam: forces BOTH hd-256 kernel arms on/off.
+pub var fused256_override: ?bool = null;
+
 // ── tests ──
 
 // ── fused hd-256 prefill attention parity ──
@@ -584,8 +587,8 @@ pub fn attn256Cosine(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !f32
 
 test "fusedSdpa256Prefill: causal parity vs composed SDPA (GQA, ragged shapes, chunk offset)" {
     const s = mlx.gpuStream();
-    transformer.fused256_override = true;
-    defer transformer.fused256_override = null;
+    fused256_override = true;
+    defer fused256_override = null;
     // The causal arm yields to the stock fused kernel on NAX silicon, so on an
     // M5-class Mac this parity check would DECLINE instead of running — the
     // kernel under test would never be exercised. Pin the arm, not the host.
@@ -621,8 +624,8 @@ test "fusedSdpa256Prefill: causal parity vs composed SDPA (GQA, ragged shapes, c
 
 test "fusedSdpa256Masked: QSA bool-mask parity vs composed 'array' SDPA (GQA, ragged tiles, kv chunking)" {
     const s = mlx.gpuStream();
-    transformer.fused256_override = true;
-    defer transformer.fused256_override = null;
+    fused256_override = true;
+    defer fused256_override = null;
     qsa_fused_override = true;
     defer qsa_fused_override = null;
     var prng = std.Random.DefaultPrng.init(0x45a45a);
@@ -681,8 +684,8 @@ test "fusedSdpa256Masked: a last-axis slice with an unaligned base declines and 
     // (`qsaMaskArm`, the same arm production takes) must serve the shape.
     // `[0,256)` is the aligned twin: it keeps the fused kernel.
     const s = mlx.gpuStream();
-    transformer.fused256_override = true;
-    defer transformer.fused256_override = null;
+    fused256_override = true;
+    defer fused256_override = null;
     qsa_fused_override = true;
     defer qsa_fused_override = null;
     var prng = std.Random.DefaultPrng.init(0x5E7_5E7);
@@ -726,8 +729,8 @@ test "fusedSdpa256Masked: a last-axis slice with an unaligned base declines and 
 
 test "fusedSdpa256Prefill: sliding-band parity vs composed 'array' mask (Gemma local layers)" {
     const s = mlx.gpuStream();
-    transformer.fused256_override = true;
-    defer transformer.fused256_override = null;
+    fused256_override = true;
+    defer fused256_override = null;
     var prng = std.Random.DefaultPrng.init(0xBA9D);
     const rnd = prng.random();
 
@@ -781,8 +784,8 @@ test "fusedSinkAttnPrefill: q/k 192, v 128 with sinks matches MLX sdpa (causal a
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x5191);
     const rnd = prng.random();
-    transformer.fused256_override = true;
-    defer transformer.fused256_override = null;
+    fused256_override = true;
+    defer fused256_override = null;
     const Hq: c_int = 16;
     const Hk: c_int = 2;
     const qL: c_int = 96;
@@ -833,8 +836,8 @@ test "fusedSdpa256Prefill: declines cleanly outside its envelope" {
     const q128_shape = [_]c_int{ 1, 4, 64, 128 };
     const q128 = try attn256RandBf16(rnd, &q128_shape, s);
     defer _ = mlx.mlx_array_free(q128);
-    transformer.fused256_override = true;
-    defer transformer.fused256_override = null;
+    fused256_override = true;
+    defer fused256_override = null;
     try std.testing.expect((try fusedSdpa256Prefill(s, q128, q128, q128, 1.0, 0)) == null);
 
     // Decode/verify shapes (q_len < 16) -> null (sdpa_vector owns hd 256
@@ -858,7 +861,7 @@ test "fusedSdpa256Prefill: declines cleanly outside its envelope" {
     try std.testing.expect((try fusedSdpa256Prefill(s, q15, k1, k1, 1.0, 0)) == null);
 
     // Kill switch -> null even for a conforming call.
-    transformer.fused256_override = false;
+    fused256_override = false;
     const q_shape = [_]c_int{ 1, 4, 64, 256 };
     const q = try attn256RandBf16(rnd, &q_shape, s);
     defer _ = mlx.mlx_array_free(q);
@@ -875,7 +878,7 @@ test "fusedSdpa256Prefill: both arms FUSED off NAX, causal yields to stock ON NA
     // preemption class — with the kv-chunk dispatch budget it wins live
     // (2026-07-22 same-session A/B: +2.9%/+2.3%/+4.6% at 8K/16K/32K on the
     // 27B), so causal is default-on now.
-    std.debug.assert(transformer.fused256_override == null);
+    std.debug.assert(fused256_override == null);
     const q_shape = [_]c_int{ 1, 6, 64, 256 };
     const q = try attn256RandBf16(rnd, &q_shape, s);
     defer _ = mlx.mlx_array_free(q);
@@ -926,8 +929,8 @@ test "fused256KvChunkLen: BK alignment, one-block floor, kl cap, budget-off" {
 
 test "fusedSdpa256Prefill: budgeted kv chunking engages and is exact vs single dispatch" {
     const s = mlx.gpuStream();
-    transformer.fused256_override = true;
-    defer transformer.fused256_override = null;
+    fused256_override = true;
+    defer fused256_override = null;
     // Causal arm: declines on NAX silicon unless the preference is pinned.
     sdpa.nax_sdpa_override = false;
     defer sdpa.nax_sdpa_override = null;
@@ -976,8 +979,8 @@ test "fusedSdpa256Prefill: budgeted kv chunking engages and is exact vs single d
 
 test "fusedSdpa256Prefill: band arm never chunks (single dispatch under a tiny budget)" {
     const s = mlx.gpuStream();
-    transformer.fused256_override = true;
-    defer transformer.fused256_override = null;
+    fused256_override = true;
+    defer fused256_override = null;
     fused256_budget_override = 1; // would force max chunking on the causal arm
     defer fused256_budget_override = null;
     var prng = std.Random.DefaultPrng.init(0xBA9D2);
@@ -1029,8 +1032,8 @@ test "fusedSdpa256Prefill: band arm never chunks (single dispatch under a tiny b
 
 test "fusedSdpa256Prefill: causal parity at Qwen 24q/4kv geometry (gqa 6, ragged 64-row tile)" {
     const s = mlx.gpuStream();
-    transformer.fused256_override = true;
-    defer transformer.fused256_override = null;
+    fused256_override = true;
+    defer fused256_override = null;
     // Causal arm: declines on NAX silicon unless the preference is pinned.
     sdpa.nax_sdpa_override = false;
     defer sdpa.nax_sdpa_override = null;

@@ -8,7 +8,7 @@ const log = @import("../../../host/log.zig");
 const ModelConfig = @import("../../../engines/mlx/model.zig").ModelConfig;
 const Weights = @import("../../../engines/mlx/model.zig").Weights;
 const transformer = @import("../../../engines/mlx/transformer.zig");
-const testing = @import("../../../engines/mlx/kv/cache.zig").testing;
+const testing = std.testing;
 const KernelCfgCache = @import("../../../mlx/kernel_cache.zig").KernelCfgCache;
 const firstRowExactMiss = @import("../../quant/ternary.zig").firstRowExactMiss;
 const testRandWeightBf16 = @import("../../testing/parity.zig").testRandWeightBf16;
@@ -121,7 +121,7 @@ pub fn msvQmvRows(
     defer _ = mlx.mlx_vector_array_free(outputs_vec);
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, config, s));
     if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
-    transformer.mtp_head_row_dispatches += 1;
+    mtp_head_row_dispatches += 1;
     if (!msv_qmv_rows_logged[bits]) {
         msv_qmv_rows_logged[bits] = true;
         log.info("[mtp] row-axis projection engaged: rows={d} K={d} N={d} bits={d} gs={d}\n", .{ nrows, K, Nout, bits, group_size });
@@ -139,6 +139,8 @@ pub fn msvQmvRows(
     _ = mlx.mlx_array_free(y2);
     return y;
 }
+
+pub var mtp_head_row_dispatches: usize = 0;
 
 // ── tests ──
 

@@ -20,7 +20,7 @@ const mxfp8_qmv = @import("../qmm/mxfp8_qmv.zig");
 const prefill_dq_gemm = @import("prefill_dq_gemm.zig");
 const qmv_rows = @import("qmv_rows.zig");
 const transformer = @import("../../../engines/mlx/transformer.zig");
-const testing = @import("../../../engines/mlx/kv/cache.zig").testing;
+const testing = std.testing;
 const lastDim = @import("../../../engines/mlx/load/weights.zig").lastDim;
 const transposeBf16Weight = @import("../../../engines/mlx/load/weights.zig").transposeBf16Weight;
 const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
@@ -41,6 +41,7 @@ const prefillDqGemm = @import("prefill_dq_gemm.zig").prefillDqGemm;
 const VqmmTile = @import("verify_qmm.zig").VqmmTile;
 const verifyQmm = @import("verify_qmm.zig").verifyQmm;
 const verifyQmmTile = @import("verify_qmm_nax.zig").verifyQmmTile;
+const device_vars = @import("../../../mlx/device.zig");
 
 // ── Core ops ──
 
@@ -362,8 +363,8 @@ test "qmatmul: a ternary 2-bit pack routes through qmv2; without the flag it sta
     defer _ = mlx.mlx_array_free(x);
     try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
 
-    transformer.device_gen_override = .{ .gen = 13, .phone = false };
-    defer transformer.device_gen_override = null;
+    device_vars.device_gen_override = .{ .gen = 13, .phone = false };
+    defer device_vars.device_gen_override = null;
     var xfm: Transformer = undefined;
     xfm.s = s;
     xfm.rht = null;
@@ -561,15 +562,15 @@ fn expectDqRoute(mode: QuantMode, bits: u32, gs: u32) !void {
     const on: usize = @intCast(M * N);
 
     // Stock qmm (route forced off).
-    transformer.prefill_dq_gemm_override = false;
+    prefill_dq_gemm.prefill_dq_gemm_override = false;
     const stock = try qmatmulBits(x, wq, wsc, wbi, bits, gs, mode, s);
     defer _ = mlx.mlx_array_free(stock);
     const stock_f = try evalToF32(al, stock, on, s);
     defer al.free(stock_f);
 
     // Routed (default on): engagement must be COUNTED.
-    transformer.prefill_dq_gemm_override = true;
-    defer transformer.prefill_dq_gemm_override = null;
+    prefill_dq_gemm.prefill_dq_gemm_override = true;
+    defer prefill_dq_gemm.prefill_dq_gemm_override = null;
     const before = prefill_dq_gemm.prefill_dq_gemm_engaged;
     const routed = try qmatmulBits(x, wq, wsc, wbi, bits, gs, mode, s);
     defer _ = mlx.mlx_array_free(routed);

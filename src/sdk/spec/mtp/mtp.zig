@@ -6025,7 +6025,7 @@ test "mtp: row-axis coarse logits equal each solo readout" {
     defer fx.deinit();
     var rc = buildRerankCoarse(s, &fx.xfm, 3) orelse return error.CoarseBuildDeclined;
     defer rc.deinit();
-    const tx = @import("../../../engines/mlx/transformer.zig");
+    const tx = @import("../../blocks/linear/qmv_rows.zig");
     {
         for ([_]usize{ 2, 4, 8, 17 }) |n| {
             var parts: [32]mlx.mlx_array = @splat(.{ .ctx = null });

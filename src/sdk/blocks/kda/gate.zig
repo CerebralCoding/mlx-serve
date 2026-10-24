@@ -4,7 +4,7 @@
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const model_mod = @import("../../../engines/mlx/model.zig");
-const testing = @import("../../../engines/mlx/kv/cache.zig").testing;
+const testing = std.testing;
 const qwen4ReadF32 = @import("../../testing/parity.zig").qwen4ReadF32;
 
 /// KDA forget gate (fla/ops/kda/fused_recurrent.py, the USE_LOWER_BOUND arm):

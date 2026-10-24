@@ -9092,10 +9092,10 @@ test "dsv4: comp_in decode requant rides --decode-attn-quant (DSV4_MINI)" {
     defer for (dense_logits[0..n_steps]) |l| allocator.free(l);
 
     defer {
-        transformer.decode_attn_quant_override = null;
+        decode_attn_quant.decode_attn_quant_override = null;
     }
     for ([_]bool{ false, true }) |quant_arm| {
-        transformer.decode_attn_quant_override = quant_arm;
+        decode_attn_quant.decode_attn_quant_override = quant_arm;
         const dw = try loadDsv4Weights(allocator, &cfg, &weights);
         const s = mlx.gpuStream();
         defer _ = mlx.mlx_stream_free(s);

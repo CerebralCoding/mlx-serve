@@ -553,7 +553,7 @@ pub fn moeMLP2WithRouter(self: *Transformer, router_x: mlx.mlx_array, expert_x_i
             defer _ = mlx.mlx_array_free(k_arr);
             try mlx.check(mlx.mlx_floor_divide(&lhs_idx, order, k_arr, self.s));
         } else if (verify_route) {
-            transformer.mtp_verify_kernel_calls[2] +%= 1;
+            verify_projection.mtp_verify_kernel_calls[2] +%= 1;
             const Once = struct {
                 var logged = false;
             };

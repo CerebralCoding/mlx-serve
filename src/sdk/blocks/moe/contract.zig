@@ -2845,12 +2845,12 @@ fn registerFp4(set: *kc.Set) !void {
 test "kernel contract moe: each declared launch is the shipped wrapper's, byte for byte" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const a = std.testing.allocator;
-    transformer.gqmv_gateup_override = true;
-    defer transformer.gqmv_gateup_override = null;
-    transformer.moe_rows_fused_override = true;
-    defer transformer.moe_rows_fused_override = null;
-    transformer.downred_override = true;
-    defer transformer.downred_override = null;
+    gq.gqmv_gateup_override = true;
+    defer gq.gqmv_gateup_override = null;
+    gqr.moe_rows_fused_override = true;
+    defer gqr.moe_rows_fused_override = null;
+    dr.downred_override = true;
+    defer dr.downred_override = null;
     var set = kc.Set.init(a);
     defer set.deinit();
     try registerGathers(&set);

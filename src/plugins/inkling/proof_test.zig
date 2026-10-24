@@ -8,6 +8,7 @@ const plugin = @import("plugin.zig");
 const both = @import("../../engines/mlx/plugin/both.zig");
 const fixture = @import("../../sdk/bases/proof/fixture.zig");
 const transformer = @import("../../engines/mlx/transformer.zig");
+const decode_attn_quant = @import("../../sdk/blocks/attention/decode_attn_quant.zig");
 
 const H = 128;
 const HD = 64;
@@ -110,16 +111,16 @@ test "inkling plugin: a 4-bit pack is bit-equal to the legacy forward" {
 }
 
 test "inkling plugin: a bf16 pack is bit-equal to the legacy forward with decode-attn-quant off" {
-    const was = transformer.decode_attn_quant_override;
-    defer transformer.decode_attn_quant_override = was;
-    transformer.decode_attn_quant_override = false;
+    const was = decode_attn_quant.decode_attn_quant_override;
+    defer decode_attn_quant.decode_attn_quant_override = was;
+    decode_attn_quant.decode_attn_quant_override = false;
     try case(false, 0x1a2);
 }
 
 test "inkling plugin: a bf16 pack with decode-attn-quant on (its decode side copies) is bit-equal to the legacy forward" {
-    const was = transformer.decode_attn_quant_override;
-    defer transformer.decode_attn_quant_override = was;
-    transformer.decode_attn_quant_override = true;
+    const was = decode_attn_quant.decode_attn_quant_override;
+    defer decode_attn_quant.decode_attn_quant_override = was;
+    decode_attn_quant.decode_attn_quant_override = true;
     try case(false, 0x1a3);
 }
 

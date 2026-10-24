@@ -8,7 +8,7 @@ const mlx = @import("../../../mlx/ffi.zig");
 const mamba2_decode = @import("../ssm/mamba2_decode.zig");
 const add_norm = @import("add_norm.zig");
 const log = @import("../../../host/log.zig");
-const testing = @import("../../../engines/mlx/kv/cache.zig").testing;
+const testing = std.testing;
 const testReadF32 = @import("../../testing/parity.zig").testReadF32;
 const ShapeKey = @import("../moe/router_kernel.zig").ShapeKey;
 

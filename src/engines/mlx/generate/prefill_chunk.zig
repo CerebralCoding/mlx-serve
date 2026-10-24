@@ -7,6 +7,7 @@ const mtp_mod = @import("../../../sdk/spec/mtp/mtp.zig");
 const testing = std.testing;
 const generate_mod = @import("../generate.zig");
 const WIDE_PREFILL_CHUNK = @import("../generate.zig").WIDE_PREFILL_CHUNK;
+const attn256 = @import("../../../sdk/blocks/attention/attn256.zig");
 
 
 /// `--prefill-chunk` for an embedded engine's u32 chunk (ds4): 0 = the engine's default.
@@ -774,8 +775,8 @@ test "boundedPrefillChunk: caps hd-256 long context even with the fused kernel a
     // still scales the MoE-gather / KV-concat transients — measured +22 GB
     // peak for +3% speed at a 99K prompt. The cap deliberately ignores
     // prefillHeadDimFused (see the fn doc); pin that with the override ON.
-    transformer_mod.fused256_override = true;
-    defer transformer_mod.fused256_override = null;
+    attn256.fused256_override = true;
+    defer attn256.fused256_override = null;
     try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(8192, 256, 16, 100_000, true, false, false));
 }
 
@@ -811,8 +812,8 @@ test "boundedPrefillChunk: a 192-wide MLA score is budgeted, and the hd-256 poli
     // The two hd-256-measured policies must NOT adopt this arch:
     // - the fused-kernel branch (no score tensor) is hd-256-only,
     // - the 2048 composed cap was tuned on a 27B's own prefill ladder.
-    transformer_mod.fused256_override = true;
-    defer transformer_mod.fused256_override = null;
+    attn256.fused256_override = true;
+    defer attn256.fused256_override = null;
     // With the fused override on, a real hd-256 MoE takes the 4096 branch...
     try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 32, 8192, false, true, false));
     // ...and the 192-wide arch still gets its honest full chunk at the same shape.
@@ -855,7 +856,7 @@ test "boundedPrefillChunk: fused-causal (default) non-sliding hd-256 — MoE cap
     // qwen3_5/3_6 class — and its old shrink to 1024 at 64K starved the
     // dequant+GEMM qmm route (engages at M >= 2048): the 64K rung was the
     // ladder's weakest for exactly this reason.
-    std.debug.assert(transformer_mod.fused256_override == null);
+    std.debug.assert(attn256.fused256_override == null);
     // DENSE hybrids (Qwen3.6-27B class): no expert-gather transients, and a
     // full-size chunk halves per-chunk dequant sweeps — chunk 8192 measured
     // +1.4% over 4096 at the 8K rung (M4 Max, 2026-07-30), flat at 32K.
@@ -901,7 +902,7 @@ test "effectivePrefillChunk: an arch with no prefill score tensor defaults to th
 }
 
 test "boundedPrefillChunk: a long-context-gated MoE hd-256 arch offers the 8192 rung, an ungated one caps at 4096" {
-    std.debug.assert(transformer_mod.fused256_override == null);
+    std.debug.assert(attn256.fused256_override == null);
     try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 24, 8192, false, true, true));
     try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 24, 140_000, false, true, true));
     try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 24, 400_000, false, true, true));
@@ -917,8 +918,8 @@ test "boundedPrefillChunk: composed-causal keeps the 2048 cap + score formula" {
     // prompt 225 -> 235.8 tok/s at chunk 2048 (peak 28.9 -> 19.8 GB).
     // Chunking IS block-level causal skipping for composed attention, and
     // the score transient shrinks with it.
-    transformer_mod.fused256_override = false;
-    defer transformer_mod.fused256_override = null;
+    attn256.fused256_override = false;
+    defer attn256.fused256_override = null;
     try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 256, 24, 8192, false, false, false));
     try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 256, 24, 32768, false, false, false));
     // The scores-budget formula still wins BELOW the cap: 64K on 24 heads

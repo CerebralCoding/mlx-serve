@@ -23,6 +23,7 @@ const hcReadFused = @import("hc_fused.zig").hcReadFused;
 const hcReadJoined = @import("hc_fused.zig").hcReadJoined;
 const HcWeights = @import("weights.zig").HcWeights;
 const PleWeights = @import("weights.zig").PleWeights;
+const verify_projection = @import("../../sdk/blocks/linear/verify_projection.zig");
 
 /// qwen4_exp: compile the four hyper-connection elementwise tails.
 pub fn compileQwen4Hc(self: *Transformer) void {
@@ -217,7 +218,7 @@ pub fn hcReadVerifyRows(self: *Transformer, rows: anytype, w: *const HcWeights) 
             row.pending = null;
         }
     }
-    transformer.mtp_verify_kernel_calls[1] +%= 1;
+    verify_projection.mtp_verify_kernel_calls[1] +%= 1;
     const Once = struct {
         var logged = false;
     };

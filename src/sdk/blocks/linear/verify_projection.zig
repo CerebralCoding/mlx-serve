@@ -11,7 +11,7 @@ const log = @import("../../../host/log.zig");
 const transformer = @import("../../../engines/mlx/transformer.zig");
 const verify_qmm = @import("verify_qmm.zig");
 const MAX_BATCH_ROWS = @import("../../../engines/mlx/batched/layered.zig").MAX_BATCH_ROWS;
-const testing = @import("../../../engines/mlx/kv/cache.zig").testing;
+const testing = std.testing;
 const lastDim = @import("../../../engines/mlx/load/weights.zig").lastDim;
 const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
 const concatAxis0 = @import("../../../mlx/array.zig").concatAxis0;
@@ -164,7 +164,7 @@ pub fn mtpCoarsePairs(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc:
     var result = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(result);
     try mlx.check(mlx.mlx_vector_array_get(&result, ov, 0));
-    transformer.mtp_coarse_pair_dispatches +%= 1;
+    mtp_coarse_pair_dispatches +%= 1;
     const Once = struct {
         var logged = false;
     };
@@ -315,7 +315,7 @@ fn verifyJoinedProjection(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array,
     if (total != xs[1] or total > (if (wide) @as(c_int, 12) else 24)) return null;
     if (total == 12 and n >= 2560 and qp.bits == 8 and qp.group_size == 64) {
         if (try verifyWideProjection(s, x, w, sc, bi, 6)) |value| {
-            transformer.mtp_verify_kernel_calls[0] +%= 1;
+            mtp_verify_kernel_calls[0] +%= 1;
             const Once = struct {
                 var logged = false;
             };
@@ -333,6 +333,9 @@ fn verifyJoinedProjection(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array,
     try mlx.check(mlx.mlx_quantized_matmul(&result, x, w, sc, bi, true, mlx.mlx_optional_int.some(@intCast(qp.group_size)), mlx.mlx_optional_int.some(@intCast(qp.bits)), "affine", s));
     return result;
 }
+
+pub var mtp_coarse_pair_dispatches: u64 = 0;
+pub var mtp_verify_kernel_calls: [3]u64 = @splat(0);
 
 // ── tests ──
 

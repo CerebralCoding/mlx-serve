@@ -240,14 +240,16 @@ fn readF32(a: mlx.mlx_array, s: mlx.mlx_stream) ![]f32 {
 test "moe affine-4 decode: no worse than the per-slot gather kernels against the f32 truth (Flash Next geometry, K not a whole block)" {
     const s = mlx.gpuStream();
     const xfm = @import("../../engines/mlx/transformer.zig");
+    const gather_qmv_vars = @import("../../sdk/blocks/moe/gather_qmv.zig");
+    const down_reduce_vars = @import("../../sdk/blocks/moe/down_reduce.zig");
     var prng = std.Random.DefaultPrng.init(0xA4E0);
     const rnd = prng.random();
     override = true;
     defer override = null;
-    xfm.gqmv_gateup_override = true;
-    defer xfm.gqmv_gateup_override = null;
-    xfm.downred_override = true;
-    defer xfm.downred_override = null;
+    gather_qmv_vars.gqmv_gateup_override = true;
+    defer gather_qmv_vars.gqmv_gateup_override = null;
+    down_reduce_vars.downred_override = true;
+    defer down_reduce_vars.downred_override = null;
 
     const E: c_int = 16;
     const H: c_int = 2560; // hidden: 5 whole blocks

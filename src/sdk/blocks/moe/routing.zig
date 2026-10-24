@@ -3,7 +3,7 @@
 
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
-const testing = @import("../../../engines/mlx/kv/cache.zig").testing;
+const testing = @import("std").testing;
 const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
 const RouterGate = @import("router_kernel.zig").RouterGate;
 const moeRouterTopK = @import("router_kernel.zig").moeRouterTopK;

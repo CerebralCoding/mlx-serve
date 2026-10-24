@@ -4,7 +4,7 @@
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const ForwardCtx = @import("../../engines/mlx/forward_ctx.zig").ForwardCtx;
-const testing = @import("../../engines/mlx/kv/cache.zig").testing;
+const testing = std.testing;
 const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
 
 /// Splice vision embeddings into text embeddings at image_token_id positions.

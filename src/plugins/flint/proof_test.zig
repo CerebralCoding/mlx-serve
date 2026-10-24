@@ -12,6 +12,7 @@ const ops = @import("../../mlx/ops.zig");
 const family = @import("../laguna/family.zig");
 const cache_ops = @import("../../engines/mlx/kv/cache_ops.zig");
 const KVCache = @import("../../engines/mlx/kv/cache.zig").KVCache;
+const decode_attn_quant = @import("../../sdk/blocks/attention/decode_attn_quant.zig");
 
 const H = 128;
 const HD = 128;
@@ -107,16 +108,16 @@ test "flint plugin: a 4-bit pack (sinks, NoPE, routed experts) is bit-equal to t
 }
 
 test "flint plugin: a bf16 pack is bit-equal to the legacy forward with decode-attn-quant off" {
-    const was = transformer.decode_attn_quant_override;
-    defer transformer.decode_attn_quant_override = was;
-    transformer.decode_attn_quant_override = false;
+    const was = decode_attn_quant.decode_attn_quant_override;
+    defer decode_attn_quant.decode_attn_quant_override = was;
+    decode_attn_quant.decode_attn_quant_override = false;
     try case(false, 0xf11b);
 }
 
 test "flint plugin: a bf16 pack with decode-attn-quant on (its decode side copies) is bit-equal to the legacy forward" {
-    const was = transformer.decode_attn_quant_override;
-    defer transformer.decode_attn_quant_override = was;
-    transformer.decode_attn_quant_override = true;
+    const was = decode_attn_quant.decode_attn_quant_override;
+    defer decode_attn_quant.decode_attn_quant_override = was;
+    decode_attn_quant.decode_attn_quant_override = true;
     try case(false, 0xf11c);
 }
 
