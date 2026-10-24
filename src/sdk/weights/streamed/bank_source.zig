@@ -15,6 +15,9 @@ const G = ops.MlxOps;
 const T = mlx.mlx_array;
 
 pub const Geometry = bank_mod.Geometry;
+pub const Bank = bank_mod.Bank;
+/// The rows a wide call borrows beside every layer's slot rows (one set for the stream).
+pub const transient_rows: u32 = stream_mod.transient_rows;
 /// A call's distinct experts fit one route.
 pub const max_route_ids: usize = stream_mod.max_route_ids;
 /// Routed pairs a call takes at most (`Fetched`'s buffers).
@@ -59,7 +62,9 @@ pub const Mxfp4 = struct {
         self.* = .{ .a = a, .bank = bank, .sdk_bank = undefined, .stream = undefined, .source = undefined, .g = undefined, .rows = rows };
         self.sdk_bank = try bank_mod.SDKBank.init(a, &self.bank);
         errdefer self.sdk_bank.deinit();
-        self.stream = try stream_mod.Stream.init(a, &self.sdk_bank, stream_mod.options(rows, .{ .mlx = s }));
+        var opts = stream_mod.options(rows, .{ .mlx = s });
+        opts.lookahead = stream_mod.lookahead;
+        self.stream = try stream_mod.Stream.init(a, &self.sdk_bank, opts);
         errdefer self.stream.deinit();
         self.source = stream_mod.StreamSource.init(self.stream);
         self.g = try ops.MlxOps.init(a, s);
@@ -81,7 +86,7 @@ pub const Mxfp4 = struct {
     /// Model layer `layer`'s routed pairs `ids` (the router's flat order) made resident: one route over their distinct
     /// experts, its reads waited on the host. The released routes are unpinned first (`ids` came from an eval that
     /// consumed them); this call's slots stay pinned until the next `fetch` or `settle`.
-    pub fn fetch(self: *Mxfp4, layer: u32, ids: []const u16) !Fetched {
+    pub fn fetch(self: *Mxfp4, layer: u32, ids: []const u16, scores: []const f32) !Fetched {
         if (ids.len > max_call_ids) return error.StreamedCallTooWide;
         try self.source.flush();
         var distinct: [max_route_ids]u16 = undefined;
@@ -93,7 +98,7 @@ pub const Mxfp4 = struct {
             distinct[n] = e;
             n += 1;
         }
-        const call = try self.source.route(layer, distinct[0..n], &.{});
+        const call = try self.source.route(layer, distinct[0..n], scores);
         const sv = self.source.served(call);
         for (0..sv.n_parts) |p| {
             try self.source.waitGu(call, @intCast(p));

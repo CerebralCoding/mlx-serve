@@ -18,7 +18,7 @@ pub fn forwardMlxStream(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
     return logits;
 }
 
-/// A pack mlx-stream serves (DeepSeek-V4.1's EXL3 repack, a MiMo stream pack or a GLM-5.3 pack): the plugin's module.
+/// A pack mlx-stream serves (DeepSeek-V4.1's EXL3 repack, a GLM-5.3 or a GLM-5.3-Flash pack): the plugin's module.
 pub fn initMlxStream(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, s: mlx.mlx_stream) !Transformer {
     const m = try mlx_stream_mod.open(allocator, io, s, &config);
     errdefer mlx_stream_mod.close(m);

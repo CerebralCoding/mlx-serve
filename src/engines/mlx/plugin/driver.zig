@@ -112,7 +112,9 @@ pub fn loadSettings(buf: []u8, config: *const ModelConfig) []const u8 {
     if (headMxfp8Setting(config)) |on| w.print("\"lm_head_mxfp8\":{s}", .{if (on) "true" else "false"}) catch unreachable;
     if (config.mtp_override) |on| w.print("{s}\"mtp\":{s}", .{ if (w.end > 1) "," else "", if (on) "true" else "false" }) catch unreachable;
     if (config.int8_prefill_override) |on| w.print("{s}\"int8_prefill\":{s}", .{ if (w.end > 1) "," else "", if (on) "true" else "false" }) catch unreachable;
-    if (config.stream_experts_override) |st| {
+    const stream_experts: ?@import("../../../sdk/weights/streamed.zig").Setting = config.stream_experts_override orelse
+        if (config.expert_bank) .{ .rows = @import("../admission/bills.zig").expertBankFillRows(config) } else null;
+    if (stream_experts) |st| {
         if (w.end > 1) w.writeByte(',') catch unreachable;
         switch (st) {
             .on => w.writeAll("\"stream_experts\":true") catch unreachable,

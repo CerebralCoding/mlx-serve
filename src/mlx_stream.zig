@@ -1,5 +1,5 @@
 //! mlx-stream: the native streaming stack as one plugin: GLM-5.3's arch, the EXL3 quant (the routed experts' kernels
-//! over the package's pinned registry) and the EXL3 expert source that streams them; MiMo-V2.6-Flash and GLM-5.3-Flash
+//! over the package's pinned registry) and the EXL3 expert source that streams them; GLM-5.3 and GLM-5.3-Flash
 //! over the same expert reader, and the bank sources a resident trunk streams its experts from. Built only where the
 //! macOS-only sources are. Absorbed from davidtai's mlx-stream: the archs live in `plugins/<model>/stream/`, the EXL3
 //! lanes in `sdk/quant/exl3/stream/`, the expert streamer in `sdk/weights/streamed/`. The module imports its own `sdk`
@@ -16,25 +16,6 @@ pub const plugin = sdk.Plugin{
     .provides = .{ .arch = @import("plugins/glm_moe_dsa/stream/plugin.zig") },
 };
 
-/// MiMo-V2.6-Flash's prepared MXFP4 streaming pack: the package's second arch, over the same expert reader.
-pub const plugin_mimo = sdk.Plugin{
-    .name = "mlx-stream-mimo",
-    .api = .{ .major = 2, .minor = 0 },
-    .mlx = "v0.32.3",
-    .macos_only = true,
-    .provides = .{ .arch = @import("plugins/mimo_v2/stream/root.zig") },
-};
-
-/// What the host's glue calls for the second arch: its entry points, the context a load bills when the model sets
-/// none, and the positions a request may generate past that context (none: MiMo reserves generation inside it).
-pub const mimo = struct {
-    pub const arch = @import("plugins/mimo_v2/stream/root.zig");
-    pub const default_context: u64 = @import("plugins/mimo_v2/stream/settings.zig").fill_reserve_tokens;
-    pub const generation_headroom: u64 = 0;
-    /// The FP8 residents' kernels (`sdk/quant/fp8_block128.zig` is held bit-equal to their prompt route).
-    pub const fp8_linear = @import("plugins/mimo_v2/stream/fp8_linear.zig");
-};
-
 /// What the host's glue calls for the third arch: GLM-5.3's entry points, the context a load bills when the model sets
 /// none (the standard request) and the generation a request may take past it until a parse has read the model's
 /// `max_output` (its default, 128K: the glue reads the arch's `maxOutput` once it has the model's settings).
@@ -46,7 +27,7 @@ pub const glm = struct {
 
 /// What the host's glue calls for the fourth arch: GLM-5.3-Flash (`glm5_next`, the NVFP4 pack): its entry points, the
 /// context a load bills when the model sets none (the standard request: 16,384 prompt tokens and 1,024 generated) and
-/// the positions a request may generate past it (none: the context holds the generation, as MiMo's does).
+/// the positions a request may generate past it (none: the context holds the generation).
 pub const glm5_next = struct {
     pub const arch = @import("plugins/glm5_next/stream/root.zig");
     pub const default_context: u64 = @import("plugins/glm5_next/stream/settings.zig").fill_reserve_tokens;
@@ -54,7 +35,7 @@ pub const glm5_next = struct {
 };
 
 /// Every arch the package serves through the SDK's table (`sdk.Arch.of`), in claim order (the conformance suite's list;
-/// the host's glue binds each arch by its own entry: `mimo`, `glm` and `glm5_next`).
+/// the host's glue binds each arch by its own entry: `glm` and `glm5_next`).
 pub const archs = .{@import("plugins/glm_moe_dsa/stream/plugin.zig")};
 pub const sdk = @import("sdk");
 /// The expert bank source a resident trunk streams its routed experts from (`sdk/weights/streamed.zig` `Streamed`).
@@ -66,5 +47,4 @@ pub const exl3_source = @import("sdk/weights/streamed/exl3_source.zig");
 /// The streamed halves of the dupes parity harnesses (test builds only): each arch's trunk over a pack, for the main
 /// test module's `plugins/<model>/stream/dupes_test.zig` to compare against the resident arch.
 pub const dupes = if (@import("builtin").is_test) struct {
-    pub const mimo_v2 = @import("plugins/mimo_v2/stream/dupes.zig");
 } else struct {};

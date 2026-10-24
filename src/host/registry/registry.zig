@@ -1128,7 +1128,7 @@ pub const ModelRegistry = struct {
 
     /// What every ready model except a stream pack whose module reads the value holds: the plugin bills only its own
     /// bytes, and its footprint reads are the whole process's. GLM-5.3's module reads it, so its
-    /// packs are left out; a MiMo or GLM-5.3-Flash stream pack's bytes are foreign to them. One reader pack at a time
+    /// packs are left out; a GLM-5.3-Flash stream pack's or an expert-bank pack's bytes are foreign to them. One reader pack at a time
     /// (`foreignReaderVictimLocked`): with two, each one's bound would leave out the other's residents. Caller holds
     /// `mutex`.
     pub fn streamForeignBytesLocked(self: *ModelRegistry) u64 {
@@ -1878,9 +1878,9 @@ test "ModelRegistry: the streaming pack's foreign bytes are every other ready mo
     defer stream.config = null; // borrowed: the registry frees the configs it owns
     _ = try makeReadyStub(reg, "krea", 14_730_000_000);
     _ = try reg.registerStub("yue2", "yue2", 4_000_000_000); // discovered, never loaded
-    // A second stream pack (MiMo) is foreign: its module does not read the value.
+    // A pack streaming its expert bank through the plugin (MiMo) is foreign: it does not read the value.
     var mimo_cfg = ModelConfig{};
-    mimo_cfg.mimo_stream = true;
+    mimo_cfg.expert_bank = true;
     const mimo = try makeReadyStub(reg, "mimo", 9_000_000_000);
     mimo.config = &mimo_cfg;
     defer mimo.config = null;
@@ -2551,7 +2551,7 @@ test "ModelRegistry: a second stream pack that reads the foreign bytes unloads a
     var glm_cfg = ModelConfig{};
     glm_cfg.glm_stream = true;
     var mimo_cfg = ModelConfig{};
-    mimo_cfg.mimo_stream = true;
+    mimo_cfg.expert_bank = true;
     const plain = ModelConfig{};
     const glm = try beginLoad(reg, "glm", 100);
 

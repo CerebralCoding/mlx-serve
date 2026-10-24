@@ -126,7 +126,13 @@ pub const Moe = struct {
 };
 
 /// Routed experts streamed from an SSD bank (`sdk/weights/streamed.zig`): model layer `layer`'s through `routed`.
-pub const Streamed = struct { routed: routed.Routed, layer: u32 };
+pub const Streamed = struct {
+    routed: routed.Routed,
+    layer: u32,
+    /// The next routed layer's router (dense f32 `[hidden, experts]`) and selection bias: a decode call's
+    /// `sigmoid(x @ router) + bias` starts that layer's likely reads (`Routed.trunk`'s scores); null = none.
+    next: ?struct { router: Array, bias: Array } = null,
+};
 
 /// A model's one-kernel MoE at up to `rows` rows (GLM's `moeDecode`): the routed sum plus the shared expert in `x`'s
 /// shape, or null to take the block's arms. `limit` is the model's SwiGLU limit as its kernel reads it.
@@ -617,8 +623,24 @@ fn hostIds(g: *Graph, inds: Array) ![]u16 {
     return ids;
 }
 
+/// A decode call's prediction of the next routed layer (`Streamed.next`) as host f32, evaluated with the routes;
+/// empty past the decode lane's rows or without a predictor.
+fn nextScores(st: *const Streamed, g: *Graph, x: Array, inds: Array) ![]const f32 {
+    const nx = st.next orelse return &.{};
+    const xs = ops.shape(x);
+    const rows = xs[0] * xs[1];
+    if (rows > 8) return &.{};
+    const sc = try g.add(try g.sigmoid(try g.matmul(try g.astype(try g.reshape(x, &.{ rows, xs[2] }), .float32), nx.router)), nx.bias);
+    try ops.evalMany(&.{ sc, inds });
+    return (mlx.mlx_array_data_float32(sc) orelse return error.NoData)[0..mlx.mlx_array_size(sc)];
+}
+
 fn fetchSlots(w: *const Moe.Weights, st: *const Streamed, ids: []const u16) !Slots {
-    const f = try st.routed.math.trunk(st.routed.ctx, st.layer, ids);
+    return fetchSlotsWith(w, st, ids, &.{});
+}
+
+fn fetchSlotsWith(w: *const Moe.Weights, st: *const Streamed, ids: []const u16, scores: []const f32) !Slots {
+    const f = try st.routed.math.trunk(st.routed.ctx, st.layer, ids, scores);
     var out: Slots = .{ .kind = f.kind, .row = f.row };
     for (f.banks, &out.banks) |maybe, *o| if (maybe) |bk| {
         o.* = .{
@@ -656,19 +678,20 @@ fn streamedRouted(w: *const Moe.Weights, st: *const Streamed, g: *Graph, x: Arra
     }
     if (cuda) return error.StreamedArmUnsupported;
     if (w.gate.expert_scale.ctx != null or w.up.expert_scale.ctx != null) return error.StreamedExpertScales;
+    const scores = try nextScores(st, g, x, r.inds);
     const ids = try hostIds(g, r.inds);
     defer g.a.free(ids);
     const n: usize = ids.len;
     const gq = w.gate.qp;
     if (moe_decode.moeFp4DecodeEligible(B * S, false, w.clamp, ops.dtype(x), gq.mode, w.up.qp.mode, w.down.qp.mode)) {
-        const sl = try fetchSlots(w, st, ids);
+        const sl = try fetchSlotsWith(w, st, ids, scores);
         if (try fp4DecodeSlots(w, g, x, r, &sl, fp4_shared)) |y| return .{ .out = y, .reduced = true, .shared_fused = fp4_shared != null };
         return slotArms(w, g, x, r, &sl, shared_down, n);
     }
     const one_row = B * S == 1;
     const rows_arm = gather_qmv_rows.moeDecodeDispatchArm(B, S, K, false, (w.clamp orelse 1) != 0) == .rows;
     if (!one_row and !rows_arm) return sortedGroups(w, st, g, x, r, ids, B, S, D, K);
-    if (distinctCount(ids) <= routed.max_call_experts) return slotArms(w, g, x, r, &(try fetchSlots(w, st, ids)), shared_down, n);
+    if (distinctCount(ids) <= routed.max_call_experts) return slotArms(w, g, x, r, &(try fetchSlotsWith(w, st, ids, scores)), shared_down, n);
     return rowChunks(w, st, g, x, r, ids, B, S, D, K);
 }
 

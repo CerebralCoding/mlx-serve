@@ -2655,7 +2655,7 @@ fn fetchSlots(sc: *Scope, src: streamed.Routed, li: usize, idx: A) !Slots {
     const ids = try sc.a.alloc(u16, n);
     defer sc.a.free(ids);
     for (ids, ids_u32) |*d, v| d.* = @intCast(v);
-    const f = try src.math.trunk(src.ctx, @intCast(li), ids);
+    const f = try src.math.trunk(src.ctx, @intCast(li), ids, &.{});
     var out: Slots = .{ .kind = f.kind, .row = f.row };
     const rows = try sc.a.alloc(u32, n);
     defer sc.a.free(rows);

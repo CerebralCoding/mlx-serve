@@ -9,6 +9,7 @@ const block = @import("block.zig");
 const params = @import("params.zig");
 const sushi_pack = @import("exl3/sushi_pack.zig");
 const modelopt_pack = @import("nvfp4/modelopt_pack.zig");
+const fp8_block128 = @import("fp8_block128.zig");
 const qmatmulBits = @import("../blocks/linear/qmatmul.zig").qmatmulBits;
 const gatherExpertMm = @import("../blocks/moe/experts.zig").gatherExpertMm;
 const transposeBf16Weight = @import("../../mlx/array.zig").transposeBf16Weight;
@@ -17,8 +18,9 @@ const Str = abi.Str;
 const Verdict = abi.Verdict;
 const QuantMode = @import("params.zig").QuantMode;
 
-/// `Weight.layout`: dense (pre-transposed `[in, out]`), an MLX mode, or row-scaled e4m3 (`sushi_pack.fp8Linear`).
-pub const Layout = enum(u8) { dense, affine, nvfp4, mxfp4, mxfp8, fp8_rows };
+/// `Weight.layout`: dense (pre-transposed `[in, out]`), an MLX mode, row-scaled e4m3 (`sushi_pack.fp8Linear`), or
+/// e4m3 on a 64 x 128 scale grid (`fp8_block128.linear`).
+pub const Layout = enum(u8) { dense, affine, nvfp4, mxfp4, mxfp8, fp8_rows, fp8_block128 };
 
 /// The per-load state: the block's declaration as the engine's resolver reads it.
 pub const State = struct {
@@ -99,6 +101,16 @@ pub fn loadInto(ctx: *const abi.LoadCtx, base: []const u8, in_dim: u32, out: *ab
     const bi = tensor(ctx, base, "biases");
     out.* = .{};
     errdefer release(out);
+    const grid = tensor(ctx, base, "weight_scale_inv");
+    if (sc.ctx == null and fp8_block128.isBlockScaled(w, grid)) {
+        out.w = wrap(try share(w));
+        out.scales = wrap(try share(grid));
+        out.layout = @intFromEnum(Layout.fp8_block128);
+        out.bits = 8;
+        out.group_size = fp8_block128.block_cols;
+        out.block = fp8_block128.block_rows;
+        return;
+    }
     if (sc.ctx == null) {
         out.w = wrap(try transposeBf16Weight(w, stream(ctx.stream)));
         out.layout = @intFromEnum(Layout.dense);
@@ -143,7 +155,7 @@ pub fn matmul(w: *const abi.Weight, x: abi.Array, s: abi.Stream, out: *abi.Array
 }
 
 pub fn moe(bank: *const abi.Weight, x: abi.Array, lhs: abi.Array, rhs: abi.Array, sorted: bool, s: abi.Stream, out: *abi.Array) callconv(.c) Verdict {
-    if (bank.layout == @intFromEnum(Layout.fp8_rows)) return Verdict.refuse(.unsupported, "fp8: row-scaled e4m3 expert banks");
+    if (bank.layout == @intFromEnum(Layout.fp8_rows) or bank.layout == @intFromEnum(Layout.fp8_block128)) return Verdict.refuse(.unsupported, "fp8: e4m3 expert banks");
     var res = mlx.mlx_array_new();
     gatherExpertMm(&res, arr(x), arr(bank.w), arr(bank.scales), arr(bank.biases), arr(lhs), arr(rhs), bank.bits, bank.group_size, modeOf(bank), sorted, stream(s)) catch |e| {
         _ = mlx.mlx_array_free(res);

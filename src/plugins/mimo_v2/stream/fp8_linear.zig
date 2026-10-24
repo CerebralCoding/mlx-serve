@@ -51,10 +51,10 @@ const scale_cols: u32 = mimo.fp8_scale_cols;
 
 pub const texts = struct {
     pub const manifest = @embedFile("kernels/manifest-fp8res.json");
-    pub const header = @embedFile("kernels/header_fp8res.metal");
-    pub const gemv = @embedFile("kernels/mimo_fp8_gemv.metal");
+    pub const header = @embedFile("../../../kernels/linear/fp8_block128_header.metal");
+    pub const gemv = @embedFile("../../../kernels/linear/fp8_block128_gemv.metal");
     /// The installed prompt route's weight writer.
-    pub const dequant = @embedFile("kernels/mimo_fp8_dequant_bf16.metal");
+    pub const dequant = @embedFile("../../../kernels/linear/fp8_block128_dequant.metal");
 };
 /// sha256 of kernels/manifest-fp8res.json, which records every text's sha256 (checked against `text_pins` by a CPU test).
 pub const manifest_sha256 = "cca35a908631a91cacc6e34554b5fb3abb36180a35ae005b5f7206aaa6541e30";
@@ -70,31 +70,13 @@ pub fn checkPins() !void {
 
 // ---- geometry (host arithmetic; CPU-tested at the real shapes) ----
 
-/// Codes per lane per step and the step (32 lanes): a 256-column step, two release blocks; each lane's 8 codes lie in
-/// one 128-column block (one scale per lane per step).
-pub const gemv_kv: u32 = 8;
-pub const gemv_step: u32 = 32 * gemv_kv;
-/// The simdgroups that fill the GPU once (the M5 Max: 40 cores x ~24 resident simdgroups): a site with fewer rows
-/// splits K (KS) until it has them. Derived from the device shape and the real N.
-pub const gemv_target_simdgroups: u32 = 1024;
-
-/// One site's GEMV geometry: R rows per simdgroup (one 64-row scale row: 64 % R == 0), KS K partitions per row group
-/// (summed in order through threadgroup memory), RG row groups per threadgroup. Fixed per (N, K) for every M: the
-/// order of an output's sum depends on KS (and the text), never on M.
-pub const Gemv = struct { r: c_int = 4, ks: c_int = 1, rg: c_int = 4 };
-
-/// The plan for an [n, k] projection, or null when the text does not cover the shape.
-pub fn gemvPlan(n: u32, k: u32) ?Gemv {
-    const r: u32 = 4;
-    if (n % scale_rows != 0 or k % scale_cols != 0 or k % gemv_step != 0 or n % r != 0) return null;
-    var ks: u32 = 1;
-    while (ks < 8 and (n / r) * ks < gemv_target_simdgroups and (k / gemv_step) % (ks * 2) == 0) ks *= 2;
-    var rg: u32 = @max(1, 4 / ks);
-    while (rg > 1 and n % (r * rg) != 0) rg /= 2;
-    return .{ .r = @intCast(r), .ks = @intCast(ks), .rg = @intCast(rg) };
-}
-
-pub const Launch = struct { grid: [3]c_int, tg: [3]c_int };
+const gemv_plan = @import("mlx_host").fp8_block128_gemv;
+pub const gemv_kv: u32 = gemv_plan.kv;
+pub const gemv_step: u32 = gemv_plan.step;
+pub const gemv_target_simdgroups: u32 = gemv_plan.target_simdgroups;
+pub const Gemv = gemv_plan.Gemv;
+pub const gemvPlan = gemv_plan.plan;
+pub const Launch = gemv_plan.Launch;
 
 /// X18 (mimo/dequant-audit; fp8res2's "M = 4 k / v fix"): which GEMV plan a call of M rows runs, fixed at install
 /// (`settings.fp8_gemv_plan`). `"fixed"` (the control) runs the site's plan at every M. `"by_rows"` (the default) changes
@@ -115,26 +97,10 @@ pub const Launch = struct { grid: [3]c_int, tg: [3]c_int };
 pub const GemvRoute = enum { fixed, by_rows, invalid };
 
 pub fn gemvPlanAt(route: GemvRoute, site: Gemv, n: u32, k: u32, m: u32) Gemv {
-    if (route != .by_rows) return site;
-    const r: c_int = switch (m) {
-        4 => 2,
-        5, 6 => if (site.ks == 1 and k == 4096) 1 else site.r,
-        else => site.r,
-    };
-    var p = site;
-    p.r = r;
-    // The text's static asserts hold for every entry at the real shapes (CPU test); a shape where they would not keeps the
-    // site plan.
-    if (n % @as(u32, @intCast(p.r * p.rg)) != 0 or @rem(64, p.r) != 0) return site;
-    return p;
+    return if (route == .by_rows) gemv_plan.planAt(site, n, k, m) else site;
 }
 
-/// Threadgroups of RG x KS simdgroups (32 x (RG * KS) threads); grid y = one threadgroup per R * RG rows.
-pub fn gemvLaunch(p: Gemv, n: c_int) Launch {
-    const groups = @divExact(n, p.r * p.rg);
-    return .{ .grid = .{ 32, groups * p.rg * p.ks, 1 }, .tg = .{ 32, p.rg * p.ks, 1 } };
-}
-
+pub const gemvLaunch = gemv_plan.launch;
 
 // ---- kernels and the bound route ----
 
@@ -411,26 +377,10 @@ pub fn e4m3(code: u8) ?f32 {
     return if (code & 0x80 != 0) -mag else mag;
 }
 
-/// The kernels' decode, emulated: (code & 127) << 7 with the sign at bit 15, read as a half and widened (e4m3 / 256).
-pub fn decodeHalf(code: u8) f32 {
-    const bits: u16 = (@as(u16, code & 0x7F) << 7) | (@as(u16, code & 0x80) << 8);
-    return @floatCast(@as(f16, @bitCast(bits)));
-}
-
-/// The GEMV's weight (and the converter's): f32 code x scale, one rounding, as the kernel forms it.
-pub fn weight32(code: u8, scale: f32) f32 {
-    return decodeHalf(code) * (scale * 256);
-}
-
-pub fn bf16ToF32(b: u16) f32 {
-    return @bitCast(@as(u32, b) << 16);
-}
-
-/// Round to nearest even (no NaN reaches here).
-pub fn f32ToBf16(v: f32) u16 {
-    const r: u32 = @bitCast(v);
-    return @truncate((r +% 0x7fff +% ((r >> 16) & 1)) >> 16);
-}
+pub const decodeHalf = gemv_plan.decodeHalf;
+pub const weight32 = gemv_plan.weight32;
+pub const bf16ToF32 = gemv_plan.bf16ToF32;
+pub const f32ToBf16 = gemv_plan.f32ToBf16;
 
 /// f64 -> BF16 with one rounding: round to odd into f32 (24 >= 8 + 2 bits: no double-rounding error), then RNE.
 pub fn f64ToBf16(v: f64) u16 {
@@ -469,32 +419,7 @@ pub fn hostGemvDot(plan: Gemv, xr: []const u16, codes: []const u8, srow: []const
 }
 
 /// `hostGemvDot` over a precomputed weight row (`weightRow`).
-pub fn hostGemvDotW(plan: Gemv, xr: []const u16, w: []const f32) f32 {
-    const k = xr.len;
-    const ks: usize = @intCast(plan.ks);
-    const kp = k / ks;
-    var total: f32 = 0;
-    for (0..ks) |p| {
-        var lanes: [32]f32 = undefined;
-        for (0..32) |l| {
-            var acc: f32 = 0;
-            const k0 = p * kp + gemv_kv * l;
-            var st: usize = 0;
-            while (st < kp / gemv_step) : (st += 1) {
-                const kk = k0 + st * gemv_step;
-                for (0..gemv_kv) |i| acc = @mulAdd(f32, bf16ToF32(xr[kk + i]), w[kk + i], acc);
-            }
-            lanes[l] = acc;
-        }
-        for ([_]usize{ 16, 8, 4, 2, 1 }) |off| {
-            var next: [32]f32 = undefined;
-            for (0..32) |l| next[l] = lanes[l] + lanes[l ^ off];
-            lanes = next;
-        }
-        total = if (p == 0) lanes[0] else total + lanes[0];
-    }
-    return total;
-}
+pub const hostGemvDotW = gemv_plan.hostDot;
 
 /// The exact reference: sum of x * (code x scale) in f64 (every product exact: 8 x 24 bits), and sum |x * w| (the f32
 /// summation error bound's scale).

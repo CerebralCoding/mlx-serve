@@ -4,6 +4,7 @@
 const std = @import("std");
 const abi = @import("../../abi/quant.zig");
 const common = @import("../../abi/common.zig");
+const fp8_grid = @import("fp8_block128_gemv.zig");
 const sushi_exl3 = @import("sushi_exl3");
 
 const Str = abi.Str;
@@ -174,7 +175,7 @@ fn validateMlx(block_json: Str, _: Str, _: *const abi.PackDir) callconv(.c) Verd
     while (it.next()) |kv| {
         if (kv.value_ptr.* != .object) continue;
         const m = kv.value_ptr.object.get("mode") orelse continue;
-        if (m == .string and !mlxMode(m.string)) return Verdict.refuse(.unsupported, "a per-weight quantization mode other than affine, nvfp4, mxfp4, mxfp8");
+        if (m == .string and !mlxMode(m.string) and !fp8_grid.isEntry(kv.value_ptr.object)) return Verdict.refuse(.unsupported, "a per-weight quantization mode other than affine, nvfp4, mxfp4, mxfp8, fp8_block128");
     }
     if (std.mem.eql(u8, d.mode, "affine") and d.bits != 0 and !affineBits(d.bits))
         return Verdict.refuse(.unsupported, "affine quantization outside 2, 3, 4, 5, 6, 8 bits");

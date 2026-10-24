@@ -116,6 +116,17 @@ pub const Streamed = struct {
         return .{ .experts = b.expert_bytes, .slots = b.slotBytes(@min(rows orelse b.n_experts, b.n_experts)) };
     }
 
+    /// What a stream of the expert bank in `dir` holds: `rows` slot rows per layer (null: every expert) and the
+    /// transient rows a wide call borrows.
+    pub fn bankBytes(a: std.mem.Allocator, io: std.Io, dir: []const u8, rows: ?u32) !u64 {
+        if (comptime !build_options.mlx_stream) return error.StreamedWeightsUnsupported;
+        var b = try plugin.bank_source.Bank.open(a, io, dir);
+        defer b.deinit();
+        const g = b.geometry;
+        const per_layer: u64 = @min(rows orelse g.num_experts, g.num_experts);
+        return (per_layer * g.num_moe_layers + plugin.bank_source.transient_rows) * g.record_bytes;
+    }
+
     pub fn close(self: *Streamed) void {
         if (comptime build_options.mlx_stream) switch (self.src) {
             inline else => |x| x.deinit(),
@@ -134,11 +145,11 @@ pub const Streamed = struct {
     pub fn routedSource(self: *Streamed) Routed {
         if (comptime !build_options.mlx_stream) unreachable;
         const C = struct {
-            fn fetch(comptime Src: type) fn (*anyopaque, u32, []const u16) anyerror!Fetched {
+            fn fetch(comptime Src: type) fn (*anyopaque, u32, []const u16, []const f32) anyerror!Fetched {
                 return struct {
-                    fn f(ctx: *anyopaque, layer: u32, ids: []const u16) anyerror!Fetched {
+                    fn f(ctx: *anyopaque, layer: u32, ids: []const u16, scores: []const f32) anyerror!Fetched {
                         const src: *Src = @ptrCast(@alignCast(ctx));
-                        const got = try src.fetch(layer, ids);
+                        const got = if (comptime Src == Mxfp4) try src.fetch(layer, ids, scores) else try src.fetch(layer, ids);
                         var banks: [3]?Banks = @splat(null);
                         for (got.banks, &banks) |b, *o| if (b) |x| {
                             o.* = .{ .gate = proj(x.gate), .up = proj(x.up), .down = proj(x.down) };

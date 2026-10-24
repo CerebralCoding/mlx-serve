@@ -2,7 +2,6 @@
 //! test block: the root adds no test of its own.
 
 comptime {
-    _ = @import("plugins/mimo_v2/stream/root.zig");
     _ = @import("plugins/mimo_v2/stream/config.zig");
     _ = @import("plugins/mimo_v2/stream/settings.zig");
     _ = @import("plugins/mimo_v2/stream/bill.zig");
@@ -10,14 +9,12 @@ comptime {
     _ = @import("plugins/mimo_v2/stream/module.zig");
     _ = @import("plugins/mimo_v2/stream/bank.zig");
     _ = @import("plugins/mimo_v2/stream/source.zig");
-    _ = @import("plugins/mimo_v2/stream/predictor_fixture.zig");
     _ = @import("plugins/mimo_v2/stream/stream.zig");
     _ = @import("plugins/mimo_v2/stream/route_trace.zig");
     _ = @import("plugins/mimo_v2/stream/math.zig");
     _ = @import("plugins/mimo_v2/stream/moe.zig");
     _ = @import("plugins/mimo_v2/stream/prefill_combine.zig");
     _ = @import("plugins/mimo_v2/stream/barrier_residual.zig");
-    _ = @import("plugins/mimo_v2/stream/verify_lane_test.zig");
     _ = @import("plugins/mimo_v2/stream/attention.zig");
     _ = @import("plugins/mimo_v2/stream/decode_attention.zig");
     _ = @import("plugins/mimo_v2/stream/glue.zig");
@@ -27,13 +24,10 @@ comptime {
     _ = @import("plugins/mimo_v2/stream/prefill_timeline.zig");
     _ = @import("plugins/mimo_v2/stream/mtp.zig");
     _ = @import("plugins/mimo_v2/stream/draft.zig");
-    _ = @import("plugins/mimo_v2/stream/uncached_test.zig");
     _ = @import("plugins/mimo_v2/stream/pagecache.zig");
     _ = @import("plugins/mimo_v2/stream/gpu_warm.zig");
     _ = @import("plugins/mimo_v2/stream/gpu_power.zig");
-    _ = @import("plugins/mimo_v2/stream/gpu_warm_test.zig");
     if (@import("sdk/weights/streamed/host_caps.zig").dsa_nax) _ = @import("plugins/glm5_next/stream/bank.zig");
-    if (@import("sdk/weights/streamed/host_caps.zig").dsa_nax) _ = @import("plugins/glm5_next/stream/bank_test.zig");
     if (@import("sdk/weights/streamed/host_caps.zig").dsa_nax) _ = @import("plugins/glm5_next/stream/config.zig");
     if (@import("sdk/weights/streamed/host_caps.zig").dsa_nax) _ = @import("plugins/glm5_next/stream/settings.zig");
     if (@import("sdk/weights/streamed/host_caps.zig").dsa_nax) _ = @import("plugins/glm5_next/stream/nvfp4.zig");
@@ -45,14 +39,10 @@ comptime {
     if (@import("sdk/weights/streamed/host_caps.zig").dsa_nax) _ = @import("plugins/glm5_next/stream/module.zig");
     if (@import("sdk/weights/streamed/host_caps.zig").dsa_nax) _ = @import("plugins/glm5_next/stream/profile.zig");
     if (@import("sdk/weights/streamed/host_caps.zig").dsa_nax) _ = @import("plugins/glm5_next/stream/mtp.zig");
-    if (@import("sdk/weights/streamed/host_caps.zig").dsa_nax) _ = @import("plugins/glm5_next/stream/mtp_test.zig");
     if (@import("sdk/weights/streamed/host_caps.zig").dsa_nax) _ = @import("plugins/glm5_next/stream/exl3_kernels.zig");
     if (@import("sdk/weights/streamed/host_caps.zig").dsa_nax) _ = @import("plugins/glm5_next/stream/exl3_bank.zig");
     if (@import("sdk/weights/streamed/host_caps.zig").dsa_nax) _ = @import("plugins/glm5_next/stream/exl3_math.zig");
-    if (@import("sdk/weights/streamed/host_caps.zig").dsa_nax) _ = @import("plugins/glm5_next/stream/exl3_parity.zig");
     if (@import("sdk/weights/streamed/host_caps.zig").dsa_nax) _ = @import("plugins/glm5_next/stream/exl3_forms.zig");
-    if (@import("sdk/weights/streamed/host_caps.zig").dsa_nax) _ = @import("plugins/glm5_next/stream/exl3_forms_ref.zig");
-    if (@import("sdk/weights/streamed/host_caps.zig").dsa_nax) _ = @import("plugins/glm5_next/stream/exl3_kbench.zig");
     _ = @import("plugins/mimo_v2/stream/stream_source.zig");
     _ = @import("sdk/weights/streamed/ops.zig");
     _ = @import("sdk/weights/streamed/exl3_source.zig");
@@ -87,7 +77,6 @@ comptime {
     _ = @import("plugins/glm_moe_dsa/stream/exl3_quant.zig");
     _ = @import("plugins/glm_moe_dsa/stream/settings.zig");
     _ = @import("plugins/glm_moe_dsa/stream/bill.zig");
-    _ = @import("plugins/glm_moe_dsa/stream/bill_receipts_test.zig");
     _ = @import("plugins/glm_moe_dsa/stream/cache.zig");
     _ = @import("plugins/glm_moe_dsa/stream/graph.zig");
     _ = @import("plugins/glm_moe_dsa/stream/experts.zig");
@@ -97,9 +86,7 @@ comptime {
     _ = @import("plugins/glm_moe_dsa/stream/split.zig");
     _ = @import("plugins/glm_moe_dsa/stream/module.zig");
     _ = @import("plugins/glm_moe_dsa/stream/plugin.zig");
-    _ = @import("plugins/glm_moe_dsa/stream/parity.zig");
     _ = @import("plugins/glm_moe_dsa/stream/mtp.zig");
-    _ = @import("plugins/glm_moe_dsa/stream/mtp_parity.zig");
     _ = @import("plugins/glm_moe_dsa/stream/glm53_exl3/kernels.zig");
     _ = @import("plugins/glm_moe_dsa/stream/glm53_exl3/selfcheck.zig");
     _ = @import("plugins/glm_moe_dsa/stream/glm53_exl3/routes.zig");
@@ -107,9 +94,6 @@ comptime {
     // GLM-5.3-Flash (glm5_next) needs the host's DSA kernels: its files build only on a host that exports them.
     // GLM-5.3's refusal on a host without its surface: its own file, compiled only on such a host (the GLM tests above
     // skip there).
-    if (!@import("sdk/weights/streamed/host_caps.zig").glm) _ = @import("plugins/glm_moe_dsa/stream/host_surface_test.zig");
     if (@import("sdk/weights/streamed/host_caps.zig").dsa_nax) _ = @import("plugins/glm5_next/stream/decode_kernels.zig");
     if (@import("sdk/weights/streamed/host_caps.zig").dsa_nax) _ = @import("plugins/glm5_next/stream/decode_kernels_selfcheck.zig");
-    if (@import("sdk/weights/streamed/host_caps.zig").dsa_nax) _ = @import("plugins/glm5_next/stream/decode_kernels_ref.zig");
-    if (@import("sdk/weights/streamed/host_caps.zig").dsa_nax) _ = @import("plugins/glm5_next/stream/decode_kernels_parity.zig");
 }

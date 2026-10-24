@@ -343,8 +343,8 @@ pub const ModelConfig = struct {
     /// config does.
     ngram_table_path: ?[]const u8 = null,
     /// The pack's directory: deepseek_v41's Engram tables sit beside the
-    /// weights, and an mlx-stream pack (DeepSeek-V4.1, `mimo_stream`,
-    /// `glm_stream` or `glm5_stream`) loads from it. Set by `parseConfig`.
+    /// weights, an mlx-stream pack (DeepSeek-V4.1, `glm_stream` or `glm5_stream`) loads from it, and an `expert_bank`
+    /// pack streams its experts from it. Set by `parseConfig`.
     pack_dir: ?[]const u8 = null,
 
     // Laguna: softplus per-head attention output gate. self_attn.g_proj →
@@ -482,9 +482,10 @@ pub const ModelConfig = struct {
     dsv41_engram_compressed_vocab: u32 = 0,
     dsv41_dspark_experts: u32 = 0,
     dsv41_dspark_top_k: u32 = 0,
-    /// A MiMo pack prepared for mlx-stream (its config declares `expert_streaming`): mlx-stream serves it
-    /// (`arch/mlx_stream.zig`) and loads its weights. Set by `parseConfig`.
-    mimo_stream: bool = false,
+    /// The pack's routed experts are an mlx-stream `experts.bin` bank (a MiMo pack whose config declares
+    /// `expert_streaming`): the plugin streams them into slot rows (`stream_experts`, else the fill,
+    /// `bills.expertBankFillRows`). Set by `parseConfig`.
+    expert_bank: bool = false,
     /// A GLM-5.3 pack (`glm_moe_dsa`, its routed experts in an `experts.bin` bank): mlx-stream serves it
     /// (`arch/mlx_stream.zig`) and loads its weights. Set by `parseConfig`.
     glm_stream: bool = false,
@@ -1206,9 +1207,9 @@ pub const ModelConfig = struct {
         return std.mem.eql(u8, self.model_type, "mimo_v2");
     }
 
-    /// The pack is mlx-stream's (`arch/mlx_stream.zig`): a MiMo stream pack or a GLM-5.3 pack.
+    /// The pack is mlx-stream's (`arch/mlx_stream.zig`): a GLM-5.3 or GLM-5.3-Flash pack.
     pub fn mlxStream(self: *const ModelConfig) bool {
-        return self.mimo_stream or self.glm_stream or self.glm5_stream;
+        return self.glm_stream or self.glm5_stream;
     }
 
     pub fn isMoe(self: *const ModelConfig) bool {
@@ -1691,7 +1692,7 @@ fn parseConfigWith(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     if (config.isDsv41()) config.pack_dir = try allocator.dupe(u8, model_dir);
     if (config.isMimo() and declaresExpertStreaming(allocator, content)) {
         config.pack_dir = try allocator.dupe(u8, model_dir);
-        config.mimo_stream = true;
+        config.expert_bank = true;
     }
     if (config.isGlm5() and declaresExpertStreaming(allocator, content)) {
         config.pack_dir = try allocator.dupe(u8, model_dir);
@@ -7324,7 +7325,7 @@ test "deepseek_v41 bills its compressed caches per token, the window per slot" {
     try testing.expectEqual(@as(u64, 32), config.prefillAttnKeys(32));
 }
 
-test "parseConfig: a MiMo pack that declares expert_streaming is mlx-stream's; an upstream MiMo checkpoint is not" {
+test "parseConfig: a MiMo pack that declares expert_streaming streams its expert bank; an upstream MiMo checkpoint does not" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7333,17 +7334,14 @@ test "parseConfig: a MiMo pack that declares expert_streaming is mlx-stream's; a
     const dir = buf[0..try tmp.dir.realPath(io, &buf)];
     var upstream = try parseConfig(io, testing.allocator, dir);
     defer upstream.deinit(testing.allocator);
-    try testing.expect(upstream.isMimo() and !upstream.mimo_stream and !upstream.mlxStream());
+    try testing.expect(upstream.isMimo() and !upstream.expert_bank);
     const marked = try std.mem.replaceOwned(u8, testing.allocator, mimo_v2_pack_json, "\"model_type\": \"mimo_v2\",", "\"model_type\": \"mimo_v2_flash\", \"expert_streaming\": {\"family\": \"mlx-stream\", \"format\": \"mlx-stream-mxfp4-expert-bank-v1\", \"manifest\": \"expert-manifest.json\"},");
     defer testing.allocator.free(marked);
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = marked });
     var pack = try parseConfig(io, testing.allocator, dir);
     defer pack.deinit(testing.allocator);
-    try testing.expect(pack.isMimo() and pack.mimo_stream and pack.mlxStream());
+    try testing.expect(pack.isMimo() and pack.expert_bank and !pack.mlxStream());
     try testing.expectEqualStrings(dir, pack.pack_dir.?);
-    var w = try loadModelWeights(io, testing.allocator, dir, &pack, false);
-    defer w.deinit();
-    try testing.expectEqual(@as(u32, 0), w.count());
 }
 
 test "parseConfig: a glm5_next pack that declares expert_streaming is mlx-stream's; a resident glm5_next config is the host's" {
@@ -7362,7 +7360,7 @@ test "parseConfig: a glm5_next pack that declares expert_streaming is mlx-stream
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = marked });
     var pack = try parseConfig(io, testing.allocator, dir);
     defer pack.deinit(testing.allocator);
-    try testing.expect(pack.isGlm5() and pack.glm5_stream and pack.mlxStream() and !pack.mimo_stream and !pack.glm_stream);
+    try testing.expect(pack.isGlm5() and pack.glm5_stream and pack.mlxStream() and !pack.expert_bank and !pack.glm_stream);
     try testing.expectEqualStrings(dir, pack.pack_dir.?);
     var w = try loadModelWeights(io, testing.allocator, dir, &pack, false);
     defer w.deinit();
@@ -7401,7 +7399,7 @@ test "parseConfig: a glm_moe_dsa pack with an experts.bin bank is mlx-stream's; 
     try tmp.dir.writeFile(io, .{ .sub_path = "experts.bin", .data = "" });
     var pack = try parseConfig(io, testing.allocator, dir);
     defer pack.deinit(testing.allocator);
-    try testing.expect(pack.glm_stream and pack.mlxStream() and !pack.mimo_stream);
+    try testing.expect(pack.glm_stream and pack.mlxStream() and !pack.expert_bank);
     try testing.expectEqualStrings(dir, pack.pack_dir.?);
     var w = try loadModelWeights(io, testing.allocator, dir, &pack, false);
     defer w.deinit();

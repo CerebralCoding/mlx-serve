@@ -10,6 +10,7 @@ const mlx = @import("../../mlx/ffi.zig");
 const ops = @import("../../mlx/ops.zig");
 const fixture = @import("../../sdk/bases/proof/fixture.zig");
 const both = @import("../../engines/mlx/plugin/both.zig");
+const driver = @import("../../engines/mlx/plugin/driver.zig");
 const moe = @import("../../sdk/bases/blocks/moe.zig");
 const moe_fp4 = @import("../../sdk/blocks/moe/moe_fp4.zig");
 const streamed = @import("../../sdk/weights/streamed.zig");
@@ -74,10 +75,17 @@ fn configJson(a: std.mem.Allocator, n: u32) ![]const u8 {
     return std.mem.replaceOwned(u8, a, sized, "\"eos_token_id\":[2,151645]}", "\"eos_token_id\":[2,151645],\"quantization\":{\"group_size\":32,\"bits\":4,\"mode\":\"mxfp4\"}}");
 }
 
-/// Every MoE layer's hook set to `r` (null: the in-memory banks).
+/// Every MoE layer's hook set to `r` (null: the in-memory banks), each decode call predicting the next layer's reads
+/// with its router as the plugin installs it.
 fn hook(m: *mimo.Loaded, r: ?streamed.Routed) void {
     for (m.layers, 0..) |*L, i| switch (L.mlp) {
-        .second => |*w| w.streamed = if (r) |x| .{ .routed = x, .layer = @intCast(i) } else null,
+        .second => |*w| {
+            w.streamed = if (r) |x| .{ .routed = x, .layer = @intCast(i) } else null;
+            if (r != null and i + 1 < m.layers.len and m.layers[i + 1].mlp == .second) {
+                const nx = &m.layers[i + 1].mlp.second;
+                if (nx.router.s.ctx == null) w.streamed.?.next = .{ .router = nx.router.w, .bias = nx.route.sigmoid_bias.expert_bias };
+            }
+        },
         .first => {},
     };
 }
@@ -174,6 +182,8 @@ fn parity(n_experts: u32) !void {
         std.debug.print("mimo_v2 streamed ({d} experts, {s}): {d} routes, {d} hits, {d} misses, {d} evictions\n", .{ n_experts, if (rows == null) "every expert resident" else if (rows.?[0] == 3) "3 rows a layer" else "2/3 of the experts a layer", st.route_calls, st.expert_cache_hits, st.expert_cache_misses, st.expert_cache_evictions });
         // With three rows a layer, decode reads pairs from more than one slot bank.
         if (rows != null and rows.?[0] == 3) try testing.expect(st.expert_cache_evictions > 0 and moe_fp4.banked_dispatches != banked);
+        // Short of every expert, decode calls read the next layer's predicted experts ahead.
+        if (rows != null) try testing.expect(st.spec_issued > 0);
     }
 }
 
@@ -186,6 +196,89 @@ test "mimo_v2 streamed: the resident's experts through the Routed hook from an e
     try parity(8);
     try parity(32);
     try parity(96);
+}
+
+/// Every layer's q/k/v and layer 0's dense MLP as fp8res packs them: e4m3 codes (no NaN code) beside an f32 scale per
+/// 64 x 128 tile (`fp8_block128`).
+fn fp8Residents(p: *fixture.Pack, seed: u64) !void {
+    var rnd = std.Random.DefaultPrng.init(seed);
+    var buf: [96]u8 = undefined;
+    for (0..4) |i| for ([_][]const u8{ "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj" }) |leaf| {
+        const base = try std.fmt.bufPrint(&buf, "model.layers.{d}.{s}", .{ i, leaf });
+        var old = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(old);
+        const z = try std.fmt.allocPrintSentinel(testing.allocator, "{s}.weight", .{base}, 0);
+        defer testing.allocator.free(z);
+        if (mlx.mlx_map_string_to_array_get(&old, p.map, z.ptr) != 0 or old.ctx == null) continue;
+        const sh = mlx.getShape(old);
+        const n: usize = @intCast(sh[0]);
+        const k: usize = @intCast(sh[1]);
+        const codes = try testing.allocator.alloc(u8, n * k);
+        defer testing.allocator.free(codes);
+        for (codes) |*c| c.* = rnd.random().int(u8) & 0xf7;
+        const sc = try testing.allocator.alloc(f32, (n / 64) * (k / 128));
+        defer testing.allocator.free(sc);
+        for (sc) |*v| v.* = std.math.ldexp(1.0 + rnd.random().float(f32), -12);
+        const w = mlx.mlx_array_new_data(codes.ptr, &[_]c_int{ sh[0], sh[1] }, 2, .uint8);
+        defer _ = mlx.mlx_array_free(w);
+        const g = mlx.mlx_array_new_data(sc.ptr, &[_]c_int{ @intCast(n / 64), @intCast(k / 128) }, 2, .float32);
+        defer _ = mlx.mlx_array_free(g);
+        try p.put(z, w);
+        try p.put(try std.fmt.bufPrint(&buf, "model.layers.{d}.{s}.weight_scale_inv", .{ i, leaf }), g);
+    };
+}
+
+/// `p`'s tensors but the routed experts (`switch_mlp`), as `dir/model.safetensors`.
+fn saveResidents(p: *const fixture.Pack, dir: []const u8) !void {
+    const map = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(map);
+    const it = mlx.mlx_map_string_to_array_iterator_new(p.map);
+    defer _ = mlx.mlx_map_string_to_array_iterator_free(it);
+    while (true) {
+        var key: ?[*:0]const u8 = null;
+        var v = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(v);
+        if (mlx.mlx_map_string_to_array_iterator_next(&key, &v, it) != 0 or key == null) break;
+        if (std.mem.indexOf(u8, std.mem.span(key.?), "switch_mlp") == null) try mlx.check(mlx.mlx_map_string_to_array_insert(map, key.?, v));
+    }
+    const file = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/model.safetensors", .{dir}, 0);
+    defer testing.allocator.free(file);
+    const meta = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(meta);
+    try mlx.check(mlx.mlx_save_safetensors(file.ptr, map, meta));
+}
+
+test "mimo_v2 streaming pack: fp8 residents and experts read from its experts.bin serve the in-memory pack's logits bit for bit" {
+    if (!build_options.mlx_stream or mlx.noGpuBackend()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = testing.io;
+    const bank = try Bank.init(a, 0x5715, 8);
+    var p = fixture.Pack.init(0x5716);
+    defer p.deinit();
+    try writePack(&p, &bank, 8);
+    try fp8Residents(&p, 0x5717);
+    const mem_json = try configJson(a, 8);
+    var mem = try both.Both.openAs(&mimo.table, &p, mem_json, false, .none);
+    defer mem.close();
+    const want = try logits(&mem, a, null);
+
+    // The streaming pack: the residents, the bank and its manifest, and the config's expert_streaming block.
+    var tmp = testing.tmpDir(.{});
+    var buf: [512]u8 = undefined;
+    const dir = try testing.allocator.dupe(u8, buf[0..try tmp.dir.realPath(io, &buf)]);
+    try saveResidents(&p, dir);
+    try stream.bank_source.writeBank(a, io, tmp.dir, bank.geo, bank.bytes, "synthetic/mimo-tiny", "0000000000000000000000000000000000000000");
+    const js = try std.mem.replaceOwned(u8, a, mem_json, "\"quantization\":{", "\"residents_format\":\"fp8_block128\",\"expert_streaming\":{\"family\":\"mlx-stream\",\"format\":\"mlx-stream-mxfp4-expert-bank-v1\",\"manifest\":\"expert-manifest.json\"},\"quantization\":{");
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = js });
+    var cfg = try both.parse(&mimo.table, dir, js);
+    const xfm = try driver.load(std.Io.Threaded.global_single_threaded.io(), testing.allocator, &cfg, dir, fixture.stream());
+    var b: both.Both = .{ .lg = null, .tmp = tmp, .dir = dir, .cfg = cfg, .xfm = xfm };
+    defer b.close();
+    const m: *mimo.Loaded = @ptrCast(@alignCast(b.xfm.plugin.?.model));
+    try testing.expect(m.experts != null and m.layers[FIRST_MOE].mlp.second.streamed != null);
+    try testing.expectEqualSlices(u32, want, try logits(&b, a, m.experts.?.routedSource()));
 }
 
 /// One expert projection of `bank` (model layer 0) dequantized to f32 `[out, in]`, owned by `g`.
@@ -210,7 +303,7 @@ fn relRms(got: []const f32, truth: []const f64) f64 {
     return @sqrt(se / st);
 }
 
-test "mimo_v2 streamed experts at the release's 4096 / 2048: the hook's decode MoE (the resident's kernels) and the stream module's, each against fp32 truth" {
+test "mimo_v2 streamed experts at the release's 4096 / 2048: the hook's decode MoE against fp32 truth" {
     if (!build_options.mlx_stream or mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -254,7 +347,6 @@ test "mimo_v2 streamed experts at the release's 4096 / 2048: the hook's decode M
         const xs = try a.alloc(f32, n * H);
         for (xs) |*v| v.* = 0.05 * rnd.random().floatNorm(f32);
         const ids = try a.alloc(u32, n * K);
-        const ids16 = try a.alloc(u16, n * K);
         const wts = try a.alloc(f32, n * K);
         for (0..n) |t| {
             var perm: [E]u32 = .{ 0, 1, 2, 3, 4, 5, 6, 7 };
@@ -262,7 +354,6 @@ test "mimo_v2 streamed experts at the release's 4096 / 2048: the hook's decode M
             var sum: f32 = 0;
             for (0..K) |k| {
                 ids[t * K + k] = perm[k];
-                ids16[t * K + k] = @intCast(perm[k]);
                 wts[t * K + k] = 0.1 + rnd.random().float(f32);
                 sum += wts[t * K + k];
             }
@@ -277,14 +368,6 @@ test "mimo_v2 streamed experts at the release's 4096 / 2048: the hook's decode M
         try mlx.check(mlx.mlx_array_eval(hook_y));
         try src.settle();
         const hooked = try a.dupe(f32, (mlx.mlx_array_data_float32(hook_y) orelse return error.NoData)[0 .. n * H]);
-
-        // The stream module's served decode MoE on the same slots.
-        const sy = try stream.dupes.mimo_v2.decodeSum(src, 0, x, ids16, wf);
-        const sf = try g.astype(sy, .float32);
-        try mlx.check(mlx.mlx_array_eval(sf));
-        const streamed_y = try a.dupe(f32, (mlx.mlx_array_data_float32(sf) orelse return error.NoData)[0 .. n * H]);
-        src.g.reset();
-        try src.settle();
 
         // fp32 truth: each expert dequantized, silu(gate x) * up x, down, weighted in f64 on the host.
         const truth = try a.alloc(f64, n * H);
@@ -308,16 +391,7 @@ test "mimo_v2 streamed experts at the release's 4096 / 2048: the hook's decode M
                 for (0..H) |j| truth[t * H + j] += @as(f64, wts[t * K + k]) * d[t * H + j];
             };
         }
-        var max_diff: f32 = 0;
-        var differ: usize = 0;
-        for (hooked, streamed_y) |h, v| {
-            max_diff = @max(max_diff, @abs(h - v));
-            differ += @intFromBool(h != v);
-        }
-        const e_hook = relRms(hooked, truth);
-        const e_stream = relRms(streamed_y, truth);
-        std.debug.print("mimo_v2 experts at 4096/2048, {d} token(s): rel rms vs fp32 truth, hook {e:.3}, stream {e:.3}; hook vs stream {d}/{d} differ, max {e:.3}\n", .{ n, e_hook, e_stream, differ, hooked.len, max_diff });
-        // Both are bf16-output paths of one function: each within bf16's class of the truth.
-        try testing.expect(e_hook < 1e-2 and e_stream < 1e-2);
+        // A bf16-output path of the function: within bf16's class of the truth.
+        try testing.expect(relRms(hooked, truth) < 1e-2);
     }
 }
