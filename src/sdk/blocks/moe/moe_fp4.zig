@@ -9,7 +9,7 @@ const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const fused_activations = @import("../mlp/fused_activations.zig");
 const parity = @import("../../testing/parity.zig");
-const moe_affine4 = @import("../../../plugins/qwen4_exp/moe_affine4.zig");
+const moe_affine4 = @import("moe_affine4.zig");
 const QuantMode = @import("../../quant/params.zig").QuantMode;
 
 pub const ROWS: c_int = 4;

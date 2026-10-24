@@ -38,7 +38,7 @@ const routing = @import("routing.zig");
 const vk = @import("verify_kernels.zig");
 const experts = @import("experts.zig");
 const vp = @import("../linear/verify_projection.zig");
-const moe_affine4 = @import("../../../plugins/qwen4_exp/moe_affine4.zig");
+const moe_affine4 = @import("moe_affine4.zig");
 const QuantMode = @import("../../quant/params.zig").QuantMode;
 
 const spec = kc.spec;

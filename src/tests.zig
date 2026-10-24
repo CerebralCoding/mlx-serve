@@ -72,7 +72,7 @@ test {
     _ = @import("sdk/blocks/qmm/qmv2.zig");
     _ = @import("sdk/blocks/qmm/qmv_cuda.zig");
     _ = @import("sdk/blocks/moe/moe_gather_ubench.zig");
-    _ = @import("plugins/qwen4_exp/moe_affine4.zig");
+    _ = @import("sdk/blocks/moe/moe_affine4.zig");
     _ = @import("sdk/blocks/hc/hc_decode2.zig");
     _ = @import("sdk/blocks/hc/hc_cuda.zig");
     _ = @import("sdk/blocks/moe/moe_cuda.zig");

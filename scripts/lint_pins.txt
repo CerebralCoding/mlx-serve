@@ -56,7 +56,7 @@ src/engines/mlx/admission/context.zig	pinPrefillChunk(config)	the prefill width 
 # Batching, KV and prefix cache.
 src/engines/mlx/batching/verdict.zig	t.ownsModuleDecodeState()	exclusive decode asks the transformer, never one hardcoded arch
 src/engines/mlx/batching/verdict.zig	!return t.dsv4 != null;	exclusive decode asks the transformer, never one hardcoded arch
-src/engines/mlx/cache/kv_quant.zig	!mlx_repeat_axis	quantized attention reshapes Q for GQA, never repeats the K/V triples
+src/sdk/blocks/attention/kv_quant.zig	!mlx_repeat_axis	quantized attention reshapes Q for GQA, never repeats the K/V triples
 src/engines/mlx/cache/prefix_cache.zig	[hot-cache] hybrid miss	the no-match lookup arm reports why (missKind), never returns silently
 # Commit ownership (were source-scan tests in commit.zig).
 src/engines/mlx/commit.zig	dflashContextCoversPrefix(dc.absLen(), total_len)	a DFlash payload is committed only when it spans the trunk prefix

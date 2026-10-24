@@ -2,7 +2,7 @@
 //! Owns MoeMlpWeights.
 
 const mlx = @import("../../../mlx/ffi.zig");
-const moe_affine4 = @import("../../../plugins/qwen4_exp/moe_affine4.zig");
+const moe_affine4 = @import("moe_affine4.zig");
 
 pub const MoeMlpWeights = struct {
     router_w: mlx.mlx_array,

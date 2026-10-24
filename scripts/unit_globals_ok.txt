@@ -51,8 +51,8 @@ plugins.glm5_next.stream.kda_percore.prompt
 plugins.glm5_next.stream.kda_prologue.prompt
 plugins.ltx.diffvae_forward.tile_budget_cached
 plugins.minimax_h3.glue.enabled_cache
-plugins.qwen4_exp.moe_affine4.env_enabled
-plugins.qwen4_exp.moe_affine4.views_enabled
+sdk.blocks.moe.moe_affine4.env_enabled
+sdk.blocks.moe.moe_affine4.views_enabled
 plugins.qwen4_exp.ple_gpu.dispatches
 plugins.qwen4_exp.qsa.gather.qsa_nax_os_cached
 plugins.qwen4_exp.qsa.pooled.qsa_pool_rope_tpl_count

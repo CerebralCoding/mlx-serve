@@ -5,10 +5,10 @@
 //! memory, and the down kernel accumulates every expert of a token in registers. The affine
 //! bias rides a per-group sum of x: `sum((s*q + b) * x) = s * dot(q, x) + b * sum(x)`.
 const std = @import("std");
-const env = @import("../../env.zig");
-const kernelSource = @import("../../mlx/kernels.zig").source;
-const mlx = @import("../../mlx/ffi.zig");
-const log = @import("../../host/log.zig");
+const env = @import("../../../env.zig");
+const kernelSource = @import("../../../mlx/kernels.zig").source;
+const mlx = @import("../../../mlx/ffi.zig");
+const log = @import("../../../host/log.zig");
 
 /// One output row a simdgroup: more rows share the x registers but their live state cuts occupancy.
 const ROWS: c_int = 1;
@@ -239,9 +239,9 @@ fn readF32(a: mlx.mlx_array, s: mlx.mlx_stream) ![]f32 {
 
 test "moe affine-4 decode: no worse than the per-slot gather kernels against the f32 truth (Flash Next geometry, K not a whole block)" {
     const s = mlx.gpuStream();
-    const xfm = @import("../../engines/mlx/transformer.zig");
-    const gather_qmv_vars = @import("../../sdk/blocks/moe/gather_qmv.zig");
-    const down_reduce_vars = @import("../../sdk/blocks/moe/down_reduce.zig");
+    const xfm = @import("../../../engines/mlx/transformer.zig");
+    const gather_qmv_vars = @import("gather_qmv.zig");
+    const down_reduce_vars = @import("down_reduce.zig");
     var prng = std.Random.DefaultPrng.init(0xA4E0);
     const rnd = prng.random();
     override = true;
@@ -401,7 +401,7 @@ test "moe affine-4 decode: an ungated shared expert folded into both kernels is 
 
 fn ungatedFoldCase(comptime H: c_int, comptime I: c_int, comptime SI: c_int, comptime TOPK: c_int) !void {
     const s = mlx.gpuStream();
-    const xfm = @import("../../engines/mlx/transformer.zig");
+    const xfm = @import("../../../engines/mlx/transformer.zig");
     var prng = std.Random.DefaultPrng.init(0xF117 + @as(u64, @intCast(H)));
     const rnd = prng.random();
     const E: c_int = TOPK + 2;
