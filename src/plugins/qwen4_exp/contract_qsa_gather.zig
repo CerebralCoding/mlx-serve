@@ -9,7 +9,7 @@
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const kc = @import("../../sdk/testing/kernel_contract/root.zig");
-const hostq = @import("../../sdk/testing/kernel_contract/hostq.zig");
+const host = @import("../../sdk/testing/kernel_contract/host.zig");
 const gather = @import("qsa/gather.zig");
 
 const spec = kc.spec;
@@ -181,7 +181,7 @@ const Gather = struct {
         self.k = try a.alloc(f64, HK * self.cap() * BD);
         self.v = try a.alloc(f64, HK * self.cap() * BD);
         for ([_][]f64{ self.q, self.k, self.v }) |x| for (x) |*e| {
-            e.* = hostq.round(.bfloat16, rng.floatNorm(f64));
+            e.* = host.rt(.bfloat16, rng.floatNorm(f64));
         };
         self.blocks = try a.alloc(f64, shape.rows * shape.k);
         @memset(self.blocks, SENTINEL);
@@ -282,7 +282,7 @@ const Gather = struct {
                 const v = self.vrow(h, r);
                 for (&o, 0..) |*x, i| x.* += @as(V8, @splat(w)) * lanes(v, i);
             }
-            const l: V8 = @splat(hostq.sum(p));
+            const l: V8 = @splat(host.sum(p));
             for (o, 0..) |x, i| out[8 * i ..][0..8].* = x / l;
             return;
         };
@@ -382,7 +382,7 @@ const Gather = struct {
                 if (spec.classOf(x) != .finite) planted += 1;
             }
             var why: [200]u8 = undefined;
-            if (hostq.within(&why, if (at == .nonfinite) .repeat else at, &got, &want, &allow)) |w| {
+            if (host.within(&why, if (at == .nonfinite) .repeat else at, &got, &want, &allow)) |w| {
                 return std.fmt.bufPrint(&self.msg, "token {d} head {d}: {s}", .{ s, h, w }) catch &self.msg;
             }
         };

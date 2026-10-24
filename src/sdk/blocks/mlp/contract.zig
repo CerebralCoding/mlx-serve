@@ -12,7 +12,7 @@ const scalarOf = @import("../../../mlx/array.zig").scalarOf;
 
 const spec = kc.spec;
 const metal = kc.metal;
-const hostq = kc.hostq;
+const host = kc.host;
 const Shape = spec.Shape;
 
 /// The clamp a `swiglu_limit` model (GLM-5-Next) serves, as the wrapper takes it.
@@ -79,8 +79,8 @@ const Gated = struct {
             defer _ = mlx.mlx_array_free(half);
             const chain = try fa.geluErfChain(vals, one, half, s);
             defer _ = mlx.mlx_array_free(chain);
-            break :blk try hostq.values(self.rig.a, chain);
-        } else try hostq.values(self.rig.a, try fa.swigluSigTable(s, self.dt, std.heap.c_allocator));
+            break :blk try host.read(self.rig.a, chain, s);
+        } else try host.read(self.rig.a, try fa.swigluSigTable(s, self.dt, std.heap.c_allocator), s);
         self.table = t;
     }
 
@@ -99,8 +99,8 @@ const Gated = struct {
         var prng = std.Random.DefaultPrng.init(seed);
         const rng = prng.random();
         const reach: f64 = if (self.arm == .clamp) 16 else 8;
-        hostq.uniform(rng, self.gate, -reach, reach, self.dt);
-        hostq.uniform(rng, self.up, -reach, reach, self.dt);
+        host.uniformInto(rng, self.gate, -reach, reach, self.dt);
+        host.uniformInto(rng, self.up, -reach, reach, self.dt);
         if (fill == .nonfinite) {
             const k = shape.k;
             const nan = std.math.nan(f64);
@@ -165,7 +165,7 @@ const Gated = struct {
 
     /// `act(g) * u` with the activation read from the table (MLX's own value), rounded at each op of the chain.
     pub fn reference(self: *const Gated, want: []f64, mag: []f64) !void {
-        const elem = hostq.elemOf(self.dt);
+        const elem = host.elemOf(self.dt);
         for (want, mag, self.gate, self.up) |*y, *m, g0, up0| {
             const g = if (self.arm == .clamp) clampNaN(g0, -std.math.inf(f64), LIMIT) else g0;
             const u = if (self.arm == .clamp) clampNaN(up0, -LIMIT, LIMIT) else up0;
@@ -228,7 +228,7 @@ fn gatedSpec(comptime name: []const u8, dt: mlx.mlx_dtype, replaces: []const u8,
         .name = name,
         .accum = .none,
         .depth = none,
-        .out = hostq.elemOf(dt),
+        .out = host.elemOf(dt),
         .replaces = replaces,
         // The flat element count against the 256-thread group; rows 1 at the edges.
         .tiles = .{ .{}, .{}, .{ .size = 256 } },

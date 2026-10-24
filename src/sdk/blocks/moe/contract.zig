@@ -43,7 +43,7 @@ const QuantMode = @import("../../quant/params.zig").QuantMode;
 
 const spec = kc.spec;
 const metal = kc.metal;
-const hostq = kc.hostq;
+const host = kc.host;
 const Shape = spec.Shape;
 
 /// Experts in a bank unless a registration needs more: at least the widest top-k a gate draws.
@@ -102,7 +102,7 @@ const down_rows_launches = [2]metal.Launch{
 /// a 16-group, no biases) or MXFP4 (one e8m0 scale a 32-group).
 const Bank = struct {
     fmt: Fmt,
-    aff: hostq.Affine,
+    aff: host.Affine,
     codes: []u8 = &.{},
     sc: []u8 = &.{},
     words: []f64 = &.{},
@@ -128,7 +128,7 @@ const Bank = struct {
             if (!stress) return;
             reflect(b.aff.codes, rows, k);
             a.free(b.aff.words);
-            b.aff.words = try hostq.packAffine(a, b.aff.codes, rows, k, b.aff.bits);
+            b.aff.words = try host.packAffine(a, b.aff.codes, rows, k, b.aff.bits);
             return;
         }
         b.deinit(a);
@@ -145,9 +145,9 @@ const Bank = struct {
             reflect(b.codes, rows, k);
             @memset(b.sc, if (nv) 0x38 else 127);
         } else for (b.sc) |*s| {
-            s.* = if (nv) hostq.e4m3Code(rng, -4, 0, false) else 121 + rng.uintLessThan(u8, 7);
+            s.* = if (nv) host.e4m3Code(rng, -4, 0, false) else 121 + rng.uintLessThan(u8, 7);
         }
-        b.words = try hostq.packNibbles(a, b.codes);
+        b.words = try host.packNibbles(a, b.codes);
         b.scf = try a.alloc(f64, b.sc.len);
         for (b.scf, b.sc) |*o, s| o.* = @floatFromInt(s);
     }
@@ -160,9 +160,9 @@ const Bank = struct {
             return @as(f64, @floatFromInt(b.aff.codes[at])) * b.aff.scales[g] + b.aff.biases[g];
         }
         const s = b.sc[at / b.aff.gs];
-        if (b.fmt == .mxfp4) return hostq.e2m1(b.codes[at]) * hostq.e8m0(s);
+        if (b.fmt == .mxfp4) return host.e2m1(b.codes[at]) * host.e8m0(s);
         if (s & 0x7f == 0x7f) return std.math.nan(f64);
-        return hostq.e2m1(b.codes[at]) * hostq.e4m3(s);
+        return host.e2m1(b.codes[at]) * host.e4m3(s);
     }
 
     /// |q s| + |b| (affine) or |w|: the term's magnitude through its dequant.
@@ -205,11 +205,11 @@ fn reflect(codes: []u8, rows: usize, k: usize) void {
     }
 }
 
-/// Stress x: `hostq.mirroredWide`'s values with each row's second half reversed, so x[k-1-j] = -x[j] (+1 at j in
+/// Stress x: `host.mirroredWide`'s values with each row's second half reversed, so x[k-1-j] = -x[j] (+1 at j in
 /// 32..39). Against reflected codes the row's terms cancel to at most 8; a lower-precision sum meets each term's
 /// negative in another order, so its rounding errors do not cancel.
 fn stressX(rng: std.Random, v: []f64, k: usize) void {
-    hostq.mirroredWide(rng, v, k);
+    host.mirroredWide(rng, v, k);
     const h = k / 2;
     for (0..v.len / k) |r| std.mem.reverse(f64, v[r * k + h ..][0 .. k - h]);
 }
@@ -220,10 +220,6 @@ fn modeOf(f: Fmt) QuantMode {
         .nvfp4 => .nvfp4,
         .mxfp4 => .mxfp4,
     };
-}
-
-fn rT(dt: mlx.mlx_dtype, v: f64) f64 {
-    return hostq.round(dt, v);
 }
 
 fn gamma32(d: usize) f64 {
@@ -393,14 +389,14 @@ const Gather = struct {
             a.free(p.*);
             p.* = &.{};
         }
-        if (self.table.len == 0 and self.twoBanks()) self.table = try hostq.values(a, try fa.swigluSigTable(self.rig.stream(), self.dt, std.heap.c_allocator));
+        if (self.table.len == 0 and self.twoBanks()) self.table = try host.read(a, try fa.swigluSigTable(self.rig.stream(), self.dt, std.heap.c_allocator), self.rig.stream());
         var prng = std.Random.DefaultPrng.init(seed);
         const rng = prng.random();
         const k = shape.k;
         const stress = fill == .stress;
         for (self.banks[0..if (self.twoBanks()) 2 else 1]) |*b| try b.fill(a, rng, self.ne * shape.n, k, self.dt, stress);
         self.x = try a.alloc(f64, self.xrows() * k);
-        if (stress) stressX(rng, self.x, k) else hostq.uniform(rng, self.x, -2, 2, self.dt);
+        if (stress) stressX(rng, self.x, k) else host.uniformInto(rng, self.x, -2, 2, self.dt);
         // Each row of slots picks distinct experts.
         self.inds = try a.alloc(f64, self.slots());
         const per = if (self.rowsKind()) TOPK else shape.rows;
@@ -412,9 +408,9 @@ const Gather = struct {
             for (0..per) |j| self.inds[r * per + j] = @floatFromInt(perm[j]);
         }
         self.scores = try a.alloc(f64, self.slots());
-        for (self.scores) |*s| s.* = if (stress) 1 else rT(self.dt, 0.05 + 0.25 * rng.float(f64));
+        for (self.scores) |*s| s.* = if (stress) 1 else host.rt(self.dt, 0.05 + 0.25 * rng.float(f64));
         self.gsc = try a.alloc(f64, self.ne);
-        for (self.gsc) |*s| s.* = if (stress) 1 else rT(self.dt, 0.5 + 1.5 * rng.float(f64));
+        for (self.gsc) |*s| s.* = if (stress) 1 else host.rt(self.dt, 0.5 + 1.5 * rng.float(f64));
         if (fill == .nonfinite) self.plant(k);
         try self.bind();
         return true;
@@ -534,8 +530,8 @@ const Gather = struct {
             const xr = self.x[self.xrow(s) * k ..][0..k];
             for (w[2 * k ..], xr) |*o, v| o.* = @abs(v);
             const at = (bi * self.slots() + s) * n + j;
-            self.dv[at] = hostq.dot(xr, w[0..k])[0];
-            self.dm[at] = hostq.dot(w[2 * k ..], w[k .. 2 * k])[0];
+            self.dv[at] = host.dot(xr, w[0..k])[0];
+            self.dm[at] = host.dot(w[2 * k ..], w[k .. 2 * k])[0];
         };
     }
 
@@ -563,15 +559,15 @@ const Gather = struct {
             },
             .gateup, .gateup_rows => for (want, allow, 0..) |*y, *l, at| {
                 const s = at / n;
-                var gt = rT(dt, dv[at]);
-                var u = rT(dt, dv[sn + at]);
-                if (self.gscale) gt = rT(dt, gt * self.gsc[self.expert(s)]);
+                var gt = host.rt(dt, dv[at]);
+                var u = host.rt(dt, dv[sn + at]);
+                if (self.gscale) gt = host.rt(dt, gt * self.gsc[self.expert(s)]);
                 if (self.limit > 0) {
                     const lim: f64 = @floatFromInt(self.limit);
                     gt = clampNaN(gt, -std.math.inf(f64), lim);
                     u = clampNaN(u, -lim, lim);
                 }
-                y.* = rT(dt, gt * self.table[self.pattern(gt)]) * u;
+                y.* = host.rt(dt, gt * self.table[self.pattern(gt)]) * u;
                 l.* = 0; // replaced: gate 3 compares bits
             },
             .down, .down_rows => for (want, allow, 0..) |*y, *l, at| {
@@ -635,7 +631,7 @@ const Gather = struct {
         self.epilogue(self.dv, self.dm, buf[0..n], buf[n .. 2 * n]);
         const out = self.rig.outputBytes();
         for (buf[2 * n ..], 0..) |*g, i| g.* = spec.read(self.sp.out, out, i);
-        return hostq.within(&self.msg, at, buf[2 * n ..], buf[0..n], buf[n .. 2 * n]);
+        return host.within(&self.msg, at, buf[2 * n ..], buf[0..n], buf[n .. 2 * n]);
     }
 
     fn mode(self: *const Gather) QuantMode {
@@ -750,7 +746,7 @@ fn gatherSpec(comptime name: []const u8, g: Gather, served: []const Shape, repla
         .depth = depthK,
         .ops = if (g.act2) 1 else 0,
         .mids = if (g.act2) 2 else 0,
-        .out = hostq.elemOf(g.dt),
+        .out = host.elemOf(g.dt),
         .replaces = replaces,
         // n: the 8-simdgroup (or ROWS-row) tile; k: one pass of the lanes over their packs.
         .tiles = .{ .{}, n_tile, .{ .size = lanes * vpw, .step = g.gs(), .min = g.gs() } },
@@ -909,7 +905,7 @@ const Fp4 = struct {
             a.free(p.*);
             p.* = &.{};
         }
-        if (self.table.len == 0) self.table = try hostq.values(a, try fa.swigluSigTable(self.rig.stream(), self.dt, std.heap.c_allocator));
+        if (self.table.len == 0) self.table = try host.read(a, try fa.swigluSigTable(self.rig.stream(), self.dt, std.heap.c_allocator), self.rig.stream());
         var prng = std.Random.DefaultPrng.init(seed);
         const rng = prng.random();
         const h = self.hidden(shape);
@@ -923,8 +919,8 @@ const Fp4 = struct {
             stressX(rng, self.x, h);
             stressX(rng, self.act, i);
         } else {
-            hostq.uniform(rng, self.x, -2, 2, self.dt);
-            hostq.uniform(rng, self.act, -2, 2, self.dt);
+            host.uniformInto(rng, self.x, -2, 2, self.dt);
+            host.uniformInto(rng, self.act, -2, 2, self.dt);
         }
         self.inds = try a.alloc(f64, self.slots());
         var perm: [TOPK]u8 = undefined;
@@ -934,16 +930,16 @@ const Fp4 = struct {
             for (perm, 0..) |p, j| self.inds[r * TOPK + j] = @floatFromInt(p);
         }
         self.scores = try a.alloc(f64, self.slots());
-        for (self.scores) |*v| v.* = if (stress) 1 else rT(self.dt, 0.05 + 0.25 * rng.float(f64));
+        for (self.scores) |*v| v.* = if (stress) 1 else host.rt(self.dt, 0.05 + 0.25 * rng.float(f64));
         self.gsc = try a.alloc(f64, TOPK);
         self.usc = try a.alloc(f64, TOPK);
         for (self.gsc, self.usc) |*g, *u| {
-            g.* = if (stress) 1 else rT(self.dt, 0.5 + 1.5 * rng.float(f64));
-            u.* = if (stress) 1 else rT(self.dt, 0.5 + 1.5 * rng.float(f64));
+            g.* = if (stress) 1 else host.rt(self.dt, 0.5 + 1.5 * rng.float(f64));
+            u.* = if (stress) 1 else host.rt(self.dt, 0.5 + 1.5 * rng.float(f64));
         }
         self.sdown = try a.alloc(f64, h);
-        for (self.sdown) |*v| v.* = if (stress) 0 else rT(self.dt, -1 + 2 * rng.float(f64));
-        self.glog = rT(self.dt, -3 + 6 * rng.float(f64));
+        for (self.sdown) |*v| v.* = if (stress) 0 else host.rt(self.dt, -1 + 2 * rng.float(f64));
+        self.glog = host.rt(self.dt, -3 + 6 * rng.float(f64));
         if (fill == .nonfinite) {
             // Token 0's x (or its first expert's activation) takes NaN, token 1's +Inf, token 2's -Inf.
             const v = if (self.part == .gateup) self.x else self.act;
@@ -1021,8 +1017,8 @@ const Fp4 = struct {
             const xr = if (self.part == .gateup) self.x[(s / TOPK) * k ..][0..k] else self.act[s * k ..][0..k];
             for (w[2 * k ..], xr) |*o, v| o.* = @abs(v);
             const at = (bi * self.slots() + s) * n + j;
-            self.dv[at] = hostq.dot(xr, w[0..k])[0];
-            self.dm[at] = hostq.dot(w[2 * k ..], w[k .. 2 * k])[0];
+            self.dv[at] = host.dot(xr, w[0..k])[0];
+            self.dm[at] = host.dot(w[2 * k ..], w[k .. 2 * k])[0];
         };
     }
 
@@ -1062,7 +1058,7 @@ const Fp4 = struct {
             const sig = 1 / (1 + @exp(-self.glog));
             const sd = self.sdown[j];
             if (!exact) {
-                y.* = rT(dt, v) + rT(dt, rT(dt, sig) * sd);
+                y.* = host.rt(dt, v) + host.rt(dt, host.rt(dt, sig) * sd);
                 l.* = 0;
                 continue;
             }
@@ -1087,15 +1083,15 @@ const Fp4 = struct {
             const gm: f64 = if (self.gscale) self.gsc[e] else 1;
             const um: f64 = if (self.uscale) self.usc[e] else 1;
             if (!exact) {
-                var gt = rT(dt, dv[at]);
-                var u = rT(dt, dv[sn + at]);
-                if (self.gscale) gt = rT(dt, gt * gm);
-                if (self.uscale) u = rT(dt, u * um);
+                var gt = host.rt(dt, dv[at]);
+                var u = host.rt(dt, dv[sn + at]);
+                if (self.gscale) gt = host.rt(dt, gt * gm);
+                if (self.uscale) u = host.rt(dt, u * um);
                 if (self.clamp > 0) {
                     gt = clampNaN(gt, -std.math.inf(f64), lim);
                     u = clampNaN(u, -lim, lim);
                 }
-                y.* = rT(dt, gt * self.table[self.pattern(gt)]) * u;
+                y.* = host.rt(dt, gt * self.table[self.pattern(gt)]) * u;
                 l.* = 0;
                 continue;
             }
@@ -1165,7 +1161,7 @@ const Fp4 = struct {
         self.epilogue(self.dv, self.dm, at == .shapes, buf[0..n], buf[n .. 2 * n]);
         const out = self.rig.outputBytes();
         for (buf[2 * n ..], 0..) |*g, i| g.* = spec.read(self.sp.out, out, i);
-        return hostq.within(&self.msg, at, buf[2 * n ..], buf[0..n], buf[n .. 2 * n]);
+        return host.within(&self.msg, at, buf[2 * n ..], buf[0..n], buf[n .. 2 * n]);
     }
 
     /// Both dispatches through the declared launches (this one and its twin), then `moe_fp4.decode` on the same
@@ -1211,7 +1207,7 @@ fn fp4Spec(comptime name: []const u8, f: Fp4, served: []const Shape, known: ?spe
         .name = name,
         .accum = .f32,
         .depth = depthFp4,
-        .out = hostq.elemOf(f.dt),
+        .out = host.elemOf(f.dt),
         // n: two simdgroups of four rows; k: one pass of the 32 lanes' 16 values.
         .tiles = .{ .{}, .{ .size = 8, .step = 8, .min = 8 }, .{ .size = 512, .step = f.gs(), .min = f.gs() } },
         .served = served,
@@ -1338,14 +1334,14 @@ const Router = struct {
         const e = shape.k;
         self.logits = try a.alloc(f64, shape.rows * e);
         // Spread wide enough that the top-k boundary is never an exact tie (the chain's set is then defined).
-        for (self.logits, 0..) |*v, i| v.* = hostq.round(self.dt, (rng.float(f64) - 0.5) * 8 + @as(f64, @floatFromInt(i % 7)) * 0.011);
+        for (self.logits, 0..) |*v, i| v.* = host.rt(self.dt, (rng.float(f64) - 0.5) * 8 + @as(f64, @floatFromInt(i % 7)) * 0.011);
         self.bias = try a.alloc(f64, e);
-        for (self.bias) |*v| v.* = hostq.round(.float32, (rng.float(f64) - 0.5) * 0.2);
+        for (self.bias) |*v| v.* = host.rt(.float32, (rng.float(f64) - 0.5) * 0.2);
         if (self.mode == .softmax_gate) {
             self.gx = try a.alloc(f64, shape.rows * self.gk);
             self.gw = try a.alloc(f64, self.gk);
-            hostq.uniform(rng, self.gx, -2, 2, .bfloat16);
-            hostq.uniform(rng, self.gw, -0.2, 0.2, .bfloat16);
+            host.uniformInto(rng, self.gx, -2, 2, .bfloat16);
+            host.uniformInto(rng, self.gw, -0.2, 0.2, .bfloat16);
         }
         if (fill == .nonfinite) {
             self.nan_at = e / 3;
@@ -1417,7 +1413,7 @@ const Router = struct {
         const ours = self.rig.outputBytes();
         const nk = self.count();
         const k = self.shape.n;
-        const wsz = spec.size(hostq.elemOf(self.out_dt));
+        const wsz = spec.size(host.elemOf(self.out_dt));
         const out = &self.rig.scratch;
         out.clearRetainingCapacity();
         try out.appendSlice(a, theirs[0 .. 4 * nk + wsz * nk]);
@@ -1448,7 +1444,7 @@ const Router = struct {
     }
 
     fn weightAt(self: *const Router, bytes: []const u8, i: usize) f64 {
-        return spec.read(hostq.elemOf(self.out_dt), bytes[4 * self.count() ..], i);
+        return spec.read(host.elemOf(self.out_dt), bytes[4 * self.count() ..], i);
     }
 
     fn fail(self: *Router, comptime f: []const u8, args: anytype) []const u8 {
@@ -1480,7 +1476,7 @@ const Router = struct {
                 if ((softmax or self.mode == .logit_bias) and r == 1 and self.idAt(out, r * k) != e / 2) return self.fail("row 1 did not pick its +Inf expert first", .{});
             }
             if (self.mode == .softmax_gate) for (0..self.shape.rows) |r| {
-                const g = spec.read(hostq.elemOf(self.out_dt), out[(4 + spec.size(hostq.elemOf(self.out_dt))) * self.count() ..], r);
+                const g = spec.read(host.elemOf(self.out_dt), out[(4 + spec.size(host.elemOf(self.out_dt))) * self.count() ..], r);
                 if (!std.math.isFinite(g)) return self.fail("row {d}: gate logit {e} from finite x", .{ r, g });
             };
             return null;
@@ -1493,19 +1489,19 @@ const Router = struct {
             const id = self.idAt(out, r * k + j);
             const s = self.slotOf(theirs, r, id) orelse return self.fail("row {d}: id {d} is not in the chain's top-{d}", .{ r, id, k });
             const got = self.weightAt(out, r * k + j);
-            const want = spec.read(hostq.elemOf(self.out_dt), theirs[4 * self.count() ..], s);
+            const want = spec.read(host.elemOf(self.out_dt), theirs[4 * self.count() ..], s);
             if (@as(u64, @bitCast(got)) != @as(u64, @bitCast(want))) return self.fail("row {d} id {d}: weight {e} where the chain gives {e}", .{ r, id, got, want });
         };
-        const gl = out[(4 + spec.size(hostq.elemOf(self.out_dt))) * self.count() ..];
+        const gl = out[(4 + spec.size(host.elemOf(self.out_dt))) * self.count() ..];
         const tg: usize = @intCast(rk.moeRouterThreadGroup(@intCast(e)));
         // A thread's strided chain over the gate width, the 32-lane sum, the simdgroups' sum.
         const depth = (self.gk + tg - 33) / (tg - 32) + 5 + tg / 32;
         for (0..self.shape.rows) |r| {
-            const d = hostq.dot(self.gx[r * self.gk ..][0..self.gk], self.gw);
+            const d = host.dot(self.gx[r * self.gk ..][0..self.gk], self.gw);
             var mag: f64 = 0;
             for (self.gx[r * self.gk ..][0..self.gk], self.gw) |x, w| mag += @abs(x * w);
             const allow = spec.gamma(@floatFromInt(depth), 0x1p-24) * mag + 0x1p-8 * (@abs(d[0]) + 1e-30);
-            const got = spec.read(hostq.elemOf(self.out_dt), gl, r);
+            const got = spec.read(host.elemOf(self.out_dt), gl, r);
             if (!(@abs(got - d[0]) <= allow)) return self.fail("row {d}: gate logit {e} where float64 gives {e} ({d:.2} of its bound)", .{ r, got, d[0], @abs(got - d[0]) / allow });
         }
         return null;
@@ -1545,7 +1541,7 @@ fn routerSpec(comptime name: []const u8, r: Router, served: []const Shape, repla
         // uint32 ids, which gate 4 cannot read as weights.
         .accum = .none,
         .depth = routerDepth,
-        .out = hostq.elemOf(r.out_dt),
+        .out = host.elemOf(r.out_dt),
         .replaces = replaces,
         .nan = .{ .stated = if (r.sigmoidArm()) sigmoid_rule else softmax_rule },
         // k: the experts against the threadgroup (one thread an expert up to 256, then strided).
@@ -1679,7 +1675,7 @@ const Reuse = struct {
         self.ne = @max(8, shape.rows / 3 + 1);
         try self.bank.fill(a, rng, self.ne * shape.n, shape.k, .bfloat16, fill == .stress);
         self.x = try a.alloc(f64, shape.rows * shape.k);
-        if (fill == .stress) stressX(rng, self.x, shape.k) else hostq.uniform(rng, self.x, -2, 2, .bfloat16);
+        if (fill == .stress) stressX(rng, self.x, shape.k) else host.uniformInto(rng, self.x, -2, 2, .bfloat16);
         // Sorted runs of 1..6 rows, ascending experts.
         self.ids = try a.alloc(f64, shape.rows);
         var e: usize = 0;
@@ -1822,9 +1818,9 @@ const Reduce = struct {
         const rng = prng.random();
         const m = shape.rows * shape.k;
         self.down = try a.alloc(f64, m * shape.n);
-        hostq.uniform(rng, self.down, -2, 2, .bfloat16);
+        host.uniformInto(rng, self.down, -2, 2, .bfloat16);
         self.scores = try a.alloc(f64, m);
-        hostq.uniform(rng, self.scores, 0, 1, .bfloat16);
+        host.uniformInto(rng, self.scores, 0, 1, .bfloat16);
         const perm = try a.alloc(u32, m);
         defer a.free(perm);
         for (perm, 0..) |*p, i| p.* = @intCast(i);
@@ -2381,7 +2377,7 @@ const GqmmNax = struct {
             a.free(p.*);
             p.* = &.{};
         }
-        if (self.table.len == 0 and self.kind == .paired) self.table = try hostq.values(a, try hc_prefill.sigmoidTable(self.rig.stream()));
+        if (self.table.len == 0 and self.kind == .paired) self.table = try host.read(a, try hc_prefill.sigmoidTable(self.rig.stream()), self.rig.stream());
         var prng = std.Random.DefaultPrng.init(seed);
         const rng = prng.random();
         const stress = fill == .stress;
@@ -2391,7 +2387,7 @@ const GqmmNax = struct {
         raggedIds(self.ids, self.ne);
         const xr = shape.rows;
         self.x = try a.alloc(f64, xr * shape.k);
-        if (stress) stressX(rng, self.x, shape.k) else hostq.uniform(rng, self.x, -1, 1, .bfloat16);
+        if (stress) stressX(rng, self.x, shape.k) else host.uniformInto(rng, self.x, -1, 1, .bfloat16);
         if (fill == .nonfinite) plantRows(self.x, shape.k);
         self.rmap = try a.alloc(f64, self.m);
         for (self.rmap, 0..) |*v, i| v.* = @floatFromInt((i * 73 + 11) % xr);
@@ -2464,8 +2460,8 @@ const GqmmNax = struct {
         defer a.free(w);
         for (0..self.nb()) |bi| for (0..self.m) |r| for (0..n) |j| {
             const e: usize = @intFromFloat(self.ids[r]);
-            for (w, 0..) |*o, i| o.* = hostq.round(.bfloat16, self.banks[bi].w(e * n + j, i));
-            const d = hostq.dot(self.xrow(r), w);
+            for (w, 0..) |*o, i| o.* = host.rt(.bfloat16, self.banks[bi].w(e * n + j, i));
+            const d = host.dot(self.xrow(r), w);
             self.dv[bi * cnt + r * n + j] = d[0];
             self.dm[bi * cnt + r * n + j] = d[1];
         };
@@ -2477,13 +2473,13 @@ const GqmmNax = struct {
         const cnt = want.len;
         const lim: f64 = @floatFromInt(self.limit);
         for (want, 0..) |*y, i| {
-            var g = hostq.round(.bfloat16, dv[i]);
-            var u = hostq.round(.bfloat16, dv[cnt + i]);
+            var g = host.rt(.bfloat16, dv[i]);
+            var u = host.rt(.bfloat16, dv[cnt + i]);
             if (self.limit > 0) {
                 g = clampNaN(g, -std.math.inf(f64), lim);
                 u = clampNaN(u, -lim, lim);
             }
-            y.* = hostq.round(.bfloat16, g * self.table[spec.toBf16(@floatCast(g))]) * u;
+            y.* = host.rt(.bfloat16, g * self.table[spec.toBf16(@floatCast(g))]) * u;
         }
     }
 

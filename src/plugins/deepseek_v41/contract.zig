@@ -16,7 +16,7 @@ const Fill = kit.Fill;
 const Sum = kit.Sum;
 const nan = kit.nan;
 const inf = kit.inf;
-const rt = kit.rt;
+const rt = kc.host.rt;
 
 /// fp32's unit roundoff.
 const u = 0x1p-24;
@@ -1074,7 +1074,7 @@ const RopeTail = struct {
         const buf = try a.alloc(f64, 3 * n);
         defer a.free(buf);
         const got = buf[0..n];
-        k.outputs(kit.elemOf(k.p.ot), got);
+        k.outputs(kc.host.elemOf(k.p.ot), got);
         if (at == .nonfinite) {
             try compute(k, buf[n .. 2 * n], buf[2 * n ..], .{});
             return classes(&k.msg, got, buf[n .. 2 * n]);

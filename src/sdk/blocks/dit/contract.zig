@@ -17,7 +17,7 @@ const w8 = @import("w8a8.zig");
 
 const spec = kc.spec;
 const metal = kc.metal;
-const hostq = kc.hostq;
+const host = kc.host;
 const Shape = spec.Shape;
 
 fn gamma(d: f64) f64 {
@@ -130,9 +130,9 @@ const Qkv = struct {
                 s.* = t[1];
             }
         } else {
-            hostq.uniform(rng, self.y, -3, 3, self.dt);
-            hostq.uniform(rng, self.qn, 0.5, 1.5, self.dt);
-            hostq.uniform(rng, self.kn, 0.5, 1.5, self.dt);
+            host.uniformInto(rng, self.y, -3, 3, self.dt);
+            host.uniformInto(rng, self.qn, 0.5, 1.5, self.dt);
+            host.uniformInto(rng, self.kn, 0.5, 1.5, self.dt);
             for (self.cs, self.sn) |*c, *s| {
                 const th = rng.float(f64) * 2 * std.math.pi;
                 c.* = spec.roundTo(.f32, @cos(th));
@@ -160,7 +160,7 @@ const Qkv = struct {
     }
 
     fn rt(self: *const Qkv, v: f64) f64 {
-        return hostq.round(self.dt, v);
+        return host.rt(self.dt, v);
     }
 
     /// Every output, with each head's sum of squares in `acc` (null: float64); `flip` the spread a q/k output can
@@ -185,7 +185,7 @@ const Qkv = struct {
                 continue;
             }
             for (&sq, src) |*q, v| q.* = v * v;
-            const ss = if (acc) |ac| spec.sumIn(ac, order, &sq) else hostq.sum(&sq);
+            const ss = if (acc) |ac| spec.sumIn(ac, order, &sq) else host.sum(&sq);
             const inv = 1 / @sqrt(ss / 128 + self.eps);
             const w = if (is_q) self.qn else self.kn;
             for (0..3) |e| {
@@ -242,7 +242,7 @@ const Qkv = struct {
         const s = qkvSpec("");
         for (got, 0..) |*g, i| g.* = spec.read(s.out, self.rig.outputBytes(), i);
         for (mag, want, flip) |*m, w, f| m.* = spec.bound(s, s.out, self.shape, w, m.*) + f;
-        return hostq.within(&self.msg, at, got, want, mag);
+        return host.within(&self.msg, at, got, want, mag);
     }
 
     fn wrapper(self: *Qkv) ![]const u8 {
@@ -350,19 +350,19 @@ const Quant = struct {
         self.mean = try a.alloc(f64, h * self.d);
         var prng = std.Random.DefaultPrng.init(seed);
         const rng = prng.random();
-        hostq.uniform(rng, self.x, -4, 4, self.dt);
+        host.uniformInto(rng, self.x, -4, 4, self.dt);
         // A per-channel offset, so the mean the K arm subtracts is not near zero.
         for (0..h) |hh| for (0..self.d) |c| {
-            const off = hostq.round(self.dt, rng.float(f64) * 4 - 2);
+            const off = host.rt(self.dt, rng.float(f64) * 4 - 2);
             for (0..l) |t| {
                 const at = (hh * l + t) * self.d + c;
-                self.x[at] = hostq.round(self.dt, self.x[at] + off);
+                self.x[at] = host.rt(self.dt, self.x[at] + off);
             }
         };
         for (0..h) |hh| for (0..self.d) |c| {
             var s: f64 = 0;
             for (0..l) |t| s += self.x[(hh * l + t) * self.d + c];
-            self.mean[hh * self.d + c] = hostq.round(self.dt, s / @as(f64, @floatFromInt(l)));
+            self.mean[hh * self.d + c] = host.rt(self.dt, s / @as(f64, @floatFromInt(l)));
         };
         if (fill == .nonfinite) plant(self.x, h * l, self.d, .{ 3, 5, 7, 9 });
         try self.bind();
@@ -437,7 +437,7 @@ const Quant = struct {
             if (at != .shapes) continue;
             for (0..nr) |t| for (0..self.d) |c| {
                 const i = (hh * l + r0 + t) * self.d + c;
-                const code = hostq.intsOf(.int8, out, i);
+                const code = host.intsOf(.int8, out, i);
                 const v = self.value(hh, r0 + t, c);
                 if (!codeOk(code, v / got, 0x1p-21, 0)) return fmtMsg(&self.msg, "value {d}: code {d} where {e} / {e} rounds to {d}", .{ i, code, v, got, @round(v / got) });
             };
@@ -530,7 +530,7 @@ const VPrep = struct {
         self.v = try a.alloc(f64, shape.n * shape.rows * 128);
         self.vm = try a.alloc(f64, shape.n * 128);
         var prng = std.Random.DefaultPrng.init(seed);
-        hostq.uniform(prng.random(), self.v, -4, 4, self.dt);
+        host.uniformInto(prng.random(), self.v, -4, 4, self.dt);
         if (fill == .nonfinite) plant(self.v, shape.n * shape.rows, 128, .{ 3, 5, 7, 9 });
         // The channel max |v| as the wrapper's MLX max forms it (a NaN stays NaN).
         for (0..shape.n) |h| for (0..128) |c| {
@@ -571,7 +571,7 @@ const VPrep = struct {
                 continue;
             }
             const sc = @max(vm, 1e-20) / 127;
-            const code = hostq.intsOf(.int8, out, i);
+            const code = host.intsOf(.int8, out, i);
             if (!codeOk(code, x / sc, 0x1p-21, 0)) return fmtMsg(&self.msg, "value {d}: code {d} where {e} / {e} rounds to {d}", .{ i, code, x, sc, @round(x / sc) });
         }
         if (at == .nonfinite and skipped == 0) return "no non-finite value planted: no proof";
@@ -647,12 +647,12 @@ const Attn = struct {
         }
         var prng = std.Random.DefaultPrng.init(seed);
         const rng = prng.random();
-        hostq.ints(rng, self.qi, -127, 127);
-        hostq.ints(rng, self.ki, -127, 127);
-        hostq.ints(rng, self.vi, -127, 127);
-        hostq.uniform(rng, self.qs, 0.001, 0.004, .float32);
-        hostq.uniform(rng, self.ks, 0.001, 0.004, .float32);
-        hostq.uniform(rng, self.vm, 0.5, 4, .float32);
+        host.intsInto(rng, self.qi, -127, 127);
+        host.intsInto(rng, self.ki, -127, 127);
+        host.intsInto(rng, self.vi, -127, 127);
+        host.uniformInto(rng, self.qs, 0.001, 0.004, .float32);
+        host.uniformInto(rng, self.ks, 0.001, 0.004, .float32);
+        host.uniformInto(rng, self.vm, 0.5, 4, .float32);
         self.scale = spec.roundTo(.f32, 1.0 / @sqrt(128.0) * std.math.log2e);
         if (fill == .nonfinite) {
             // The float inputs: one row's q scale, one channel's max (Inf; NaN when asked).
@@ -701,7 +701,7 @@ const Attn = struct {
                 const c0 = self.qs[h * lq + r] * self.scale;
                 var m = -std.math.inf(f64);
                 for (s, 0..) |*o, j| {
-                    const dot = hostq.dot(qrow, self.ki[(kvh * l + j) * 128 ..][0..128])[0];
+                    const dot = host.dot(qrow, self.ki[(kvh * l + j) * 128 ..][0..128])[0];
                     o.* = dot * c0 * self.ks[kvh * nb(l) + j / BK];
                     m = @max(m, o.*);
                 }
@@ -755,7 +755,7 @@ const Attn = struct {
         defer a.free(buf);
         try self.outputs(buf[0..n], buf[n .. 2 * n]);
         for (buf[2 * n ..], 0..) |*g, i| g.* = spec.read(.bf16, self.rig.outputBytes(), i);
-        return hostq.within(&self.msg, at, buf[2 * n ..], buf[0..n], buf[n .. 2 * n]);
+        return host.within(&self.msg, at, buf[2 * n ..], buf[0..n], buf[n .. 2 * n]);
     }
 
     /// The wrapper from float q, k, v; the same call through the prep wrappers and this launch.
@@ -765,14 +765,14 @@ const Attn = struct {
         const rng = prng.random();
         const lq = self.shape.rows;
         const l = self.shape.k;
-        var host = try a.alloc(f64, (self.heads * lq + 2 * self.kv * l) * 128);
-        defer a.free(host);
-        hostq.uniform(rng, host, -2, 2, .bfloat16);
+        var vals = try a.alloc(f64, (self.heads * lq + 2 * self.kv * l) * 128);
+        defer a.free(vals);
+        host.uniformInto(rng, vals, -2, 2, .bfloat16);
         var scratch = metal.Rig.init(a);
         defer scratch.deinit();
-        const q = try scratch.input(.bfloat16, &.{ 1, @intCast(self.heads), @intCast(lq), 128 }, host[0 .. self.heads * lq * 128]);
-        const k = try scratch.input(.bfloat16, &.{ 1, @intCast(self.kv), @intCast(l), 128 }, host[self.heads * lq * 128 ..][0 .. self.kv * l * 128]);
-        const v = try scratch.input(.bfloat16, &.{ 1, @intCast(self.kv), @intCast(l), 128 }, host[(self.heads * lq + self.kv * l) * 128 ..]);
+        const q = try scratch.input(.bfloat16, &.{ 1, @intCast(self.heads), @intCast(lq), 128 }, vals[0 .. self.heads * lq * 128]);
+        const k = try scratch.input(.bfloat16, &.{ 1, @intCast(self.kv), @intCast(l), 128 }, vals[self.heads * lq * 128 ..][0 .. self.kv * l * 128]);
+        const v = try scratch.input(.bfloat16, &.{ 1, @intCast(self.kv), @intCast(l), 128 }, vals[(self.heads * lq + self.kv * l) * 128 ..]);
         const sc: f32 = 1.0 / @sqrt(128.0);
         const theirs_arr = (try ia.attention(q, k, v, sc, s)) orelse return error.Declined;
         defer _ = mlx.mlx_array_free(theirs_arr);
@@ -790,7 +790,7 @@ const Attn = struct {
         var vp = VPrep.init(a);
         defer vp.deinit();
         vp.shape = .{ .rows = l, .n = self.kv, .k = 128 };
-        const vhost = try hostq.values(a, v);
+        const vhost = try host.read(a, v, s);
         defer a.free(vhost);
         vp.v = try a.dupe(f64, vhost);
         vp.vm = try a.alloc(f64, self.kv * 128);
@@ -802,12 +802,12 @@ const Attn = struct {
         vp.args[0] = try vp.rig.input(.bfloat16, &.{ 1, @intCast(self.kv), @intCast(l), 128 }, vp.v);
         vp.args[1] = try vp.rig.input(.float32, &.{ 1, @intCast(self.kv), 128 }, vp.vm);
         try vp.run();
-        const vi = try hostq.values(a, vp.rig.output(0));
+        const vi = try host.read(a, vp.rig.output(0), s);
         defer a.free(vi);
         for ([_]*[]f64{ &self.qi, &self.qs, &self.ki, &self.ks }, [_]mlx.mlx_array{ qp[0], qp[1], kp[0], kp[1] }) |dst, src| {
             a.free(dst.*);
             dst.* = &.{};
-            dst.* = try hostq.values(a, src);
+            dst.* = try host.read(a, src, s);
         }
         a.free(self.vi);
         self.vi = &.{};
@@ -891,9 +891,9 @@ const Rq = struct {
         self.x = try a.alloc(f64, shape.rows * shape.k);
         // The served signs: every activation and weight of one width is rotated by the same vector.
         const signs = try w8.signsFor(@intCast(shape.k), self.dt, self.rig.stream());
-        self.signs = try hostq.values(a, signs);
+        self.signs = try host.read(a, signs, self.rig.stream());
         var prng = std.Random.DefaultPrng.init(seed);
-        hostq.uniform(prng.random(), self.x, -4, 4, self.dt);
+        host.uniformInto(prng.random(), self.x, -4, 4, self.dt);
         if (fill == .nonfinite) plant(self.x, shape.rows, shape.k, .{ 3, 300, 600, 900 });
         self.rig.reset();
         self.args[0] = try self.rig.input(self.dt, &.{ @intCast(shape.rows), @intCast(shape.k) }, self.x);
@@ -935,8 +935,8 @@ const Rq = struct {
             for (0..k / 256) |b| {
                 const blk = v[b * 256 ..][0..256];
                 for (blk, 0..) |*o, j| o.* = self.x[r * k + b * 256 + j] * self.signs[b * 256 + j];
-                err_v[b] = gamma(8) * hostq.magnitude(blk) / 16;
-                hostq.fwht(blk);
+                err_v[b] = gamma(8) * host.sumAbs(blk) / 16;
+                host.fwht(blk);
                 for (blk) |*o| {
                     o.* /= 16;
                     if (std.math.isNan(o.*)) nan = true;
@@ -952,7 +952,7 @@ const Rq = struct {
             if (@abs(got - want) > emax / 127 + 0x1p-22 * want) return fmtMsg(&self.msg, "row {d}: scale {e} where float64 gives {e}", .{ r, got, want });
             if (at != .shapes) continue;
             for (v, 0..) |x, i| {
-                const code = hostq.intsOf(.int8, out, r * k + i);
+                const code = host.intsOf(.int8, out, r * k + i);
                 if (!codeOk(code, x / got, 0x1p-21, err_v[i / 256] / got)) return fmtMsg(&self.msg, "row {d} value {d}: code {d} where {e} / {e} rounds to {d}", .{ r, i, code, x, got, @round(x / got) });
             }
         }
@@ -1041,13 +1041,13 @@ const Gemm = struct {
         }
         var prng = std.Random.DefaultPrng.init(seed);
         const rng = prng.random();
-        hostq.ints(rng, self.xq, -127, 127);
-        hostq.ints(rng, self.wq, -127, 127);
+        host.intsInto(rng, self.xq, -127, 127);
+        host.intsInto(rng, self.wq, -127, 127);
         // Scales that put an output near N(0, 2): a SwiGLU gate stays within the bound's amplification (past -88 the
         // epilogue's exp(-g) overflows fp32 and silu flushes to -0, where the true value is a normal under 1e-36).
         const sk = 2 / (73 * 73 * @sqrt(@as(f64, @floatFromInt(shape.k))));
-        hostq.uniform(rng, self.xs, 0.5 * sk, 1.5 * sk, .float32);
-        hostq.uniform(rng, self.ws, 0.5, 1.5, .float32);
+        host.uniformInto(rng, self.xs, 0.5 * sk, 1.5 * sk, .float32);
+        host.uniformInto(rng, self.ws, 0.5, 1.5, .float32);
         if (fill == .nonfinite) {
             self.xs[0] = std.math.nan(f64);
             self.xs[1] = std.math.inf(f64);
@@ -1075,7 +1075,7 @@ const Gemm = struct {
 
     fn acc(self: *const Gemm, m: usize, n: usize) f64 {
         const k = self.shape.k;
-        return hostq.dot(self.xq[m * k ..][0..k], self.wq[n * k ..][0..k])[0] * self.xs[m] * self.ws[n];
+        return host.dot(self.xq[m * k ..][0..k], self.wq[n * k ..][0..k])[0] * self.xs[m] * self.ws[n];
     }
 
     pub fn reference(self: *const Gemm, want: []f64, mag: []f64) !void {

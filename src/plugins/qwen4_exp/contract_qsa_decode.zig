@@ -8,7 +8,7 @@
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const kc = @import("../../sdk/testing/kernel_contract/root.zig");
-const hostq = @import("../../sdk/testing/kernel_contract/hostq.zig");
+const host = @import("../../sdk/testing/kernel_contract/host.zig");
 const qsa_decode = @import("qsa_decode.zig");
 
 const spec = kc.spec;
@@ -100,9 +100,9 @@ const Operands = struct {
         o.q = try a.alloc(f64, hq * BD);
         o.k = try a.alloc(f64, HK * o.cap() * BD);
         o.v = try a.alloc(f64, HK * o.cap() * BD);
-        for (o.q) |*x| x.* = hostq.round(.bfloat16, rng.floatNorm(f64));
-        for (o.k) |*x| x.* = hostq.round(.bfloat16, rng.floatNorm(f64));
-        for (o.v) |*x| x.* = hostq.round(.bfloat16, rng.floatNorm(f64));
+        for (o.q) |*x| x.* = host.rt(.bfloat16, rng.floatNorm(f64));
+        for (o.k) |*x| x.* = host.rt(.bfloat16, rng.floatNorm(f64));
+        for (o.v) |*x| x.* = host.rt(.bfloat16, rng.floatNorm(f64));
         const nb = kv / RATIO;
         const pool = try a.alloc(usize, nb);
         defer a.free(pool);
@@ -172,7 +172,7 @@ const Operands = struct {
     fn score(o: *const Operands, h: usize, j: usize) [2]f64 {
         const g = h / (o.hq / HK);
         const row = (g * o.cap() + o.pos(j)) * BD;
-        const d = hostq.dot(o.q[h * BD ..][0..BD], o.k[row..][0..BD]);
+        const d = host.dot(o.q[h * BD ..][0..BD], o.k[row..][0..BD]);
         const c = @as(f64, SCALE) * LOG2E;
         return .{ d[0] * c, spec.gamma(SCORE_DEPTH, 0x1p-24) * d[1] * c };
     }
@@ -258,10 +258,10 @@ pub const Parts = struct {
             const g = (h / (o.hq / HK)) * o.cap();
             for (0..BD) |d| {
                 for (t[0..terms], p[0..terms], lo..hi) |*x, w, j| x.* = w * o.v[(g + o.pos(j)) * BD + d];
-                out[row * BD + d] = if (acc) |ac| spec.sumIn(ac, order, t[0..terms]) else hostq.sum(t[0..terms]);
+                out[row * BD + d] = if (acc) |ac| spec.sumIn(ac, order, t[0..terms]) else host.sum(t[0..terms]);
             }
             out[n_acc + 2 * row] = m;
-            out[n_acc + 2 * row + 1] = if (acc) |ac| spec.sumIn(ac, order, p[0..terms]) else hostq.sum(p[0..terms]);
+            out[n_acc + 2 * row + 1] = if (acc) |ac| spec.sumIn(ac, order, p[0..terms]) else host.sum(p[0..terms]);
         };
     }
 
@@ -348,7 +348,7 @@ pub const Parts = struct {
                 if (spec.classOf(x) != .finite) planted += 1;
             }
             var why_buf: [200]u8 = undefined;
-            if (hostq.within(&why_buf, if (at == .nonfinite) .repeat else at, got, w, allow)) |why| {
+            if (host.within(&why_buf, if (at == .nonfinite) .repeat else at, got, w, allow)) |why| {
                 return std.fmt.bufPrint(&self.msg, "head {d} split {d}: {s}", .{ h, s, why }) catch &self.msg;
             }
         };
@@ -425,10 +425,10 @@ pub const Merge = struct {
         for (0..shape.rows) |h| for (0..ns) |s| {
             const r = h * ns + s;
             const empty = s + 1 == ns and ns > 1;
-            const l: f64 = if (fill == .stress) 1 else hostq.round(.float32, 1 + 63 * rng.float(f64));
-            self.ml[2 * r] = if (empty) -3.0e38 else if (fill == .stress) 0 else hostq.round(.float32, -4 + 28 * rng.float(f64));
+            const l: f64 = if (fill == .stress) 1 else host.rt(.float32, 1 + 63 * rng.float(f64));
+            self.ml[2 * r] = if (empty) -3.0e38 else if (fill == .stress) 0 else host.rt(.float32, -4 + 28 * rng.float(f64));
             self.ml[2 * r + 1] = if (empty) 0 else l;
-            for (self.acc[r * BD ..][0..BD]) |*x| x.* = if (empty) 0 else hostq.round(.float32, l * (2 * rng.float(f64) - 1));
+            for (self.acc[r * BD ..][0..BD]) |*x| x.* = if (empty) 0 else host.rt(.float32, l * (2 * rng.float(f64) - 1));
         };
         if (fill == .stress) {
             // Down each column's splits: B_i + r_i, then -B_(i+1). No two terms in one strided lane or one half
@@ -496,7 +496,7 @@ pub const Merge = struct {
                     x.* = wj * self.acc[(h * ns + s) * BD + d];
                     mag += @abs(x.*);
                 }
-                const num = if (acc) |ac| spec.sumIn(ac, order, t) else hostq.sum(t);
+                const num = if (acc) |ac| spec.sumIn(ac, order, t) else host.sum(t);
                 const y = num / z;
                 want[h * BD + d] = y;
                 // exp2 on each weight, the column's and Z's sums, the division and the bf16 output.
@@ -525,7 +525,7 @@ pub const Merge = struct {
         try self.outputs(null, .sequential, buf[0..n], buf[n .. 2 * n]);
         const out = self.rig.outputBytes();
         for (buf[2 * n ..], 0..) |*g, i| g.* = spec.read(.bf16, out, i);
-        return hostq.within(&self.msg, at, buf[2 * n ..], buf[0..n], buf[n .. 2 * n]);
+        return host.within(&self.msg, at, buf[2 * n ..], buf[0..n], buf[n .. 2 * n]);
     }
 };
 
