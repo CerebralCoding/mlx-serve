@@ -235,3 +235,14 @@ test "laguna plugin: a pack with a DFlash sidecar serves through the plugin and 
     defer b.close();
     try both.expectDflashRecorded(&b.xfm, "applegpu_g17d", &.{ 61, 76, 58, 71, 89, 126, 10, 72, 50, 35, 4, 120, 28, 28, 53, 126 }, &.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0 });
 }
+
+test "laguna plugin: a served pack reports its dense attention projections to /props as the legacy load does" {
+    inline for (.{ false, true }) |quantized| {
+        var p = fixture.Pack.init(0xda01);
+        defer p.deinit();
+        try writePack(&p, quantized);
+        var b = try both.Both.openAs(&plugin.table, &p, configJson(quantized), true, .none);
+        defer b.close();
+        try std.testing.expectEqual(!quantized, b.xfm.dense_attn_proj);
+    }
+}

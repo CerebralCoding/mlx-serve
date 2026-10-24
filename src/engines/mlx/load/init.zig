@@ -602,7 +602,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
         .cache = cache,
         .s = s,
         .allocator = allocator,
-        .dense_attn_proj = attnProjRouted(&config, moe_layers != null) and weightsHaveDenseAttnProj(weights),
+        .dense_attn_proj = denseAttnProj(&config, moe_layers != null, weights),
         .emb_w = emb_w,
         .emb_s = emb_s_arr,
         .emb_b = emb_b_arr,
@@ -656,6 +656,11 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
         .mtp_uniform_affine_trunk = mtp_uniform_affine_trunk,
         .mtp_oqe_affine_trunk = mtp_oqe_affine_trunk,
     };
+}
+
+/// What `/props` `decode_attn_quant` reports: a MoE forward's dense attention projections (the plugin load sets it too).
+pub fn denseAttnProj(config: *const ModelConfig, moe_forward: bool, weights: *const Weights) bool {
+    return attnProjRouted(config, moe_forward) and weightsHaveDenseAttnProj(weights);
 }
 
 /// `attnProj` is reached only from the MoE/qwen4 forward, and not by its MLA or Gemma 4 arms.

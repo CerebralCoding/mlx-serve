@@ -192,6 +192,7 @@ pub fn loadWith(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_di
     const trunk = (caps.dflash_capture or has_head) and adoptTrunkWeights(&xfm, b.table, m);
     if (trunk) try adoptRotations(&xfm, b.table, m);
     intree.lendTrunk(&xfm);
+    xfm.dense_attn_proj = @import("../load/init.zig").denseAttnProj(&xfm.config, xfm.config.num_experts > 0, &res.weights);
     // The engine's row-exact sampling reads coverage off the config, measured over the pack as the legacy load does.
     if (trunk and xfm.config.rowExactArch()) {
         const gather_only: Array = if (xfm.lm_head_w.ctx == xfm.emb_w.ctx) .{ .ctx = null } else xfm.emb_w;
