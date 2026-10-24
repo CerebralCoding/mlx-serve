@@ -103,7 +103,7 @@ def main():
     log = [sum(v[i] for k, v in fams.items() if k.startswith("log.")) for i in (0, 1)]
     print(f"\n== Writer.print: {wp[1]} instances, {mb(wp[0])} of __text")
     print(f"== Io.Writer.print* + fmt.*: {fmt[1]} functions, {mb(fmt[0])}")
-    print(f"== log.* (src/host/log.zig and std.log): {log[1]} functions, {mb(log[0])}")
+    print(f"== log.* (src/sdk/util/log.zig and std.log): {log[1]} functions, {mb(log[0])}")
     for k, (s, c) in sorted(fams.items(), key=lambda kv: -kv[1][1]):
         if k.startswith("log.") and c > 1:
             print(f"   {c:6d}  {mb(s)}  {k}")

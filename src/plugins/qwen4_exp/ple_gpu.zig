@@ -6,7 +6,7 @@
 const std = @import("std");
 const kernelSource = @import("../../mlx/kernels.zig").source;
 const mlx = @import("../../mlx/ffi.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const qwen4 = @import("qwen4_exp.zig");
 const qwen4_ple = @import("ple_table.zig");
 

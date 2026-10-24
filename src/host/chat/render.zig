@@ -3,7 +3,7 @@
 const std = @import("std");
 const env = @import("../../env.zig");
 const jinja_c = @import("jinja_c");
-const log = @import("../log.zig");
+const log = @import("../../sdk/util/log.zig");
 const testing = std.testing;
 
 const ToolCall = @import("types.zig").ToolCall;

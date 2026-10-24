@@ -3,7 +3,7 @@
 const std = @import("std");
 const model_mod = @import("../../engines/mlx/model.zig");
 const mrope_mod = @import("../../sdk/vision/mrope.zig");
-const log = @import("../log.zig");
+const log = @import("../../sdk/util/log.zig");
 
 const MediaItem = @import("placeholders.zig").MediaItem;
 const MropeData = @import("encode.zig").MropeData;

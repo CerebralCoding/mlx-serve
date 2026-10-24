@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const model_discovery = @import("../../host/registry/discovery.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const round = @import("round.zig");
 
 /// The flags (`--ds4-mtp`, `--dspark`, `--ssd-streaming`, `--prefill-chunk`); the adapter's `settings_json`.

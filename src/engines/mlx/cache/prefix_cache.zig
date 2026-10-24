@@ -22,7 +22,7 @@ const model_mod = @import("../model.zig");
 const kv_quant = @import("kv_quant.zig");
 const kv_disk_cache = @import("ssd/disk_tier.zig");
 const io_util = @import("../../../sdk/util/io_util.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../../sdk/util/log.zig");
 const restore_dump = @import("restore_dump.zig");
 
 const KVCache = transformer_mod.KVCache;

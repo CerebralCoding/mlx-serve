@@ -4,7 +4,7 @@
 const std = @import("std");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../util/log.zig");
 
 pub const MAX_ROWS: c_int = 8;
 const SGS: c_int = 4;

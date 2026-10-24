@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const arch_llama = if (@import("build_options").llama_engine) @import("bridge.zig") else @import("stub.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 
 const Message = @import("../../host/chat/types.zig").Message;
 const ChatConfig = @import("../../host/chat/types.zig").ChatConfig;

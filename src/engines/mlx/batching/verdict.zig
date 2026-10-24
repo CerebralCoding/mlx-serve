@@ -4,7 +4,7 @@ const std = @import("std");
 const transformer_mod = @import("../transformer.zig");
 const model_mod = @import("../model.zig");
 const model_registry_mod = @import("../../../host/registry/registry.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../../sdk/util/log.zig");
 const KVCache = transformer_mod.KVCache;
 const testing = std.testing;
 

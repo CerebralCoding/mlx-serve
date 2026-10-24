@@ -109,7 +109,7 @@ pub fn attention(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.m
     try mlx.check(mlx.mlx_vector_array_get(&out, outs, 0));
     if (!engaged) {
         engaged = true;
-        @import("../../../host/log.zig").info("[attn] split-K decode attention engaged: rows={d} heads={d}/{d} keys={d} splits={d}\n", .{ rows, hq, hk, n, splits });
+        @import("../../util/log.zig").info("[attn] split-K decode attention engaged: rows={d} heads={d}/{d} keys={d} splits={d}\n", .{ rows, hq, hk, n, splits });
     }
     return out;
 }

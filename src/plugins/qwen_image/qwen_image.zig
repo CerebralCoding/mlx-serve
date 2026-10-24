@@ -22,7 +22,7 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const sse = @import("../../host/media_jobs/sse.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const tok_mod = @import("../../host/tokenizer/tokenizer.zig");

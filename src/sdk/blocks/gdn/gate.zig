@@ -3,7 +3,7 @@
 
 const mlx = @import("../../../mlx/ffi.zig");
 const gdn_decode = @import("decode.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../util/log.zig");
 
 /// MoE routing chain (negate→argpartition→slice→softmax→take→sum→expand→divide).
 /// Free-function variant of `Transformer.moeRoutingUncompiled` so unit tests can

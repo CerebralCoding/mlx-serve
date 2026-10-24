@@ -16,7 +16,7 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const ltx = @import("video.zig");
 const geom = @import("diffvae.zig");
 const na = @import("diffvae_kernel.zig");

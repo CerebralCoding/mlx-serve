@@ -12,9 +12,9 @@
 //! write is swallowed (logging must never take the server down).
 
 const std = @import("std");
-const os_mutex = @import("../sdk/util/os_mutex.zig");
-const crt = @import("../sdk/util/crt.zig");
-const rtfmt = @import("../sdk/util/rtfmt.zig");
+const os_mutex = @import("os_mutex.zig");
+const crt = @import("crt.zig");
+const rtfmt = @import("rtfmt.zig");
 const builtin = @import("builtin");
 
 pub const Level = enum {
@@ -61,7 +61,7 @@ const SinksState = struct {
     /// Flip it locally (see the file-sink test) when a test must assert on logging.
     stderr_enabled: bool = !builtin.is_test,
 };
-const sinks_shared = @import("../sdk/util/shared.zig").Shared(SinksState, "log_state", .{});
+const sinks_shared = @import("shared.zig").Shared(SinksState, "log_state", .{});
 inline fn sinks() *SinksState {
     return sinks_shared.get();
 }

@@ -11,7 +11,7 @@ const std = @import("std");
 const env = @import("../../env.zig");
 const kernelSource = @import("../../mlx/kernels.zig").source;
 const mlx = @import("../../mlx/ffi.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const h3_glue = @import("glue.zig");
 const Scope = @import("../../mlx/scope.zig").Scope;
 

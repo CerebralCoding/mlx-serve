@@ -1,7 +1,7 @@
 //! Adaptive MTP serial switching: price window, votes, probes, head release.
 const std = @import("std");
 const env = @import("../../../../env.zig");
-const log = @import("../../../../host/log.zig");
+const log = @import("../../../../sdk/util/log.zig");
 const round_cost = @import("../round_cost.zig");
 const testing = std.testing;
 const Generator = @import("../../generate/generator.zig").Generator;

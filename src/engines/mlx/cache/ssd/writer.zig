@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const crt = @import("../../../../sdk/util/crt.zig");
-const log = @import("../../../../host/log.zig");
+const log = @import("../../../../sdk/util/log.zig");
 
 /// One staged file; both buffers are owned by the queue once `submit` accepts them.
 pub const Blob = struct {

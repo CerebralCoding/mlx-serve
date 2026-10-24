@@ -23,7 +23,7 @@ const weights_mod = @import("../../engines/mlx/load/weights.zig");
 const activations = @import("../../sdk/blocks/mlp/activations.zig");
 const fused_activations = @import("../../sdk/blocks/mlp/fused_activations.zig");
 const params_mod = @import("../../sdk/quant/params.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 
 /// OPENAI_CLIP_MEAN / OPENAI_CLIP_STD, the processor's normalization.
 const MEAN = [3]f32{ 0.48145466, 0.4578275, 0.40821073 };

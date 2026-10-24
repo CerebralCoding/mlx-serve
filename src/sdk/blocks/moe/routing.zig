@@ -2,7 +2,7 @@
 //! Owns MoeRouting, and 6 more.
 
 const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../util/log.zig");
 const testing = @import("std").testing;
 const RouterGate = @import("router_kernel.zig").RouterGate;
 const moeRouterTopK = @import("router_kernel.zig").moeRouterTopK;

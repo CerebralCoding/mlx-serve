@@ -3,7 +3,7 @@
 const std = @import("std");
 const arch_ds4 = if (@import("build_options").ds4_engine) @import("bridge.zig") else @import("stub.zig");
 const ds4_ffi = if (@import("build_options").ds4_engine) @import("ffi.zig") else @import("ffi_stub.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const testing = std.testing;
 
 const ToolCall = @import("../../host/chat/types.zig").ToolCall;

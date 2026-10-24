@@ -1,7 +1,7 @@
 //! Tokenizer loading: tokenizer.json and tiktoken files, the pre-tokenizer regex probes.
 
 const std = @import("std");
-const log = @import("../log.zig");
+const log = @import("../../sdk/util/log.zig");
 const mlx_gguf = @import("../../sdk/quant/gguf/claim.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
 

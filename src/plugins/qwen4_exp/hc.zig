@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const ple = @import("ple.zig");
 const transformer = @import("../../engines/mlx/transformer.zig");
 const applyClosure = @import("../../engines/mlx/compiled.zig").applyClosure;

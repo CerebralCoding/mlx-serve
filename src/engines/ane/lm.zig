@@ -12,7 +12,7 @@
 
 const std = @import("std");
 const env = @import("../../env.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const rt = @import("rt.zig");
 const q35 = @import("qwen35.zig");
 const pack_mod = @import("pack.zig");

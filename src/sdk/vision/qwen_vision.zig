@@ -13,7 +13,7 @@ const std = @import("std");
 const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const Weights = @import("../weights/resident.zig").Weights;
-const log = @import("../../host/log.zig");
+const log = @import("../util/log.zig");
 
 /// Qwen3VLImageProcessor fallbacks (processing_qwen3_vl.py:96-98). Checkpoint
 /// processor metadata overrides these when present.

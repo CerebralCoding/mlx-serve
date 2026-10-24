@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const env = @import("../../../env.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../../sdk/util/log.zig");
 const ModelConfig = @import("../model.zig").ModelConfig;
 const FUSED256_MIN_Q_LEN = @import("../../../sdk/blocks/attention/attn256.zig").FUSED256_MIN_Q_LEN;
 const fused256Enabled = @import("../../../sdk/blocks/attention/attn256.zig").fused256Enabled;

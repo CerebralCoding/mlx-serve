@@ -7,7 +7,7 @@ const std = @import("std");
 const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../util/log.zig");
 const errVsTruth = @import("qmv2.zig").errVsTruth;
 
 pub const MAX_ROWS = 8;

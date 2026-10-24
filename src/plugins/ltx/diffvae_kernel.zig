@@ -23,7 +23,7 @@
 const std = @import("std");
 const kernelSource = @import("../../mlx/kernels.zig").source;
 const mlx = @import("../../mlx/ffi.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const geom = @import("diffvae.zig");
 
 const S = mlx.mlx_stream;

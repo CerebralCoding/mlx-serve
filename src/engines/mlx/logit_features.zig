@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const generate_mod = @import("generate.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const Generator = generate_mod.Generator;
 
 const finishSlot = @import("finish.zig").finishSlot;

@@ -5,7 +5,7 @@
 const std = @import("std");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../util/log.zig");
 const hc_decode2 = @import("hc_decode2.zig");
 
 /// Down rows a block owns, one per warp.

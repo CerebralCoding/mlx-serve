@@ -22,7 +22,7 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const stb = @import("stb");
 const qvis = @import("../../sdk/vision/qwen_vision.zig");
 const sse = @import("../../host/media_jobs/sse.zig");

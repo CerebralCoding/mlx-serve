@@ -5,7 +5,7 @@ const mlx = @import("../../mlx/ffi.zig");
 const transformer_mod = @import("../../engines/mlx/transformer.zig");
 const glm_mtp = @import("mtp.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const Transformer = transformer_mod.Transformer;
 
 /// The GLM-5.3-Flash MTP layer in `weights`, with its coarse draft readout bound; null when the pack ships none.

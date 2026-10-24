@@ -9,7 +9,7 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const ltx = @import("../ltx/video.zig");
 const tokenizer_mod = @import("../../host/tokenizer/tokenizer.zig");
 

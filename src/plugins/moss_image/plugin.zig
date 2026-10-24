@@ -9,7 +9,7 @@ const image_request = @import("../../sdk/media/image_request.zig");
 const image_pixels = @import("../../sdk/media/image_pixels.zig");
 const LoraSet = @import("../../sdk/media/lora_set.zig").LoraSet;
 const mlx = @import("../../mlx/ffi.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const moss = @import("moss_image.zig");
 pub const config = @import("config.zig");
 

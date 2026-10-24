@@ -3,7 +3,7 @@
 
 const mlx = @import("../../../mlx/ffi.zig");
 const gdn_decode = @import("decode.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../util/log.zig");
 const kda_recurrence = @import("../kda/recurrence.zig");
 const decode_fused = @import("decode_fused.zig");
 const env = @import("../../../env.zig");

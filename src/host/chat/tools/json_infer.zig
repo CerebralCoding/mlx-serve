@@ -1,7 +1,7 @@
 //! Bare JSON call inference, self-closing tool tags, and truncated JSON call names.
 
 const std = @import("std");
-const log = @import("../../log.zig");
+const log = @import("../../../sdk/util/log.zig");
 const testing = std.testing;
 
 const ParsedToolCall = @import("parse.zig").ParsedToolCall;

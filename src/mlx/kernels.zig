@@ -9,7 +9,7 @@
 const std = @import("std");
 const env = @import("../env.zig");
 const crt = @import("../sdk/util/crt.zig");
-const log = @import("../host/log.zig");
+const log = @import("../sdk/util/log.zig");
 
 /// The file's bytes, comptime-known and typed like a string literal, so `++` and `std.fmt` compose them.
 pub inline fn source(comptime path: []const u8) @TypeOf(@embedFile("../" ++ path)) {

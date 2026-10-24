@@ -27,7 +27,7 @@
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const h3 = @import("h3.zig");
 const geometry = @import("geometry.zig");
 pub const DecCfg = geometry.DecCfg;

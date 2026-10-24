@@ -16,7 +16,7 @@
 const std = @import("std");
 const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const scope_mod = @import("../../mlx/scope.zig");
 

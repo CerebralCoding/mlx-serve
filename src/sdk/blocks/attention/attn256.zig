@@ -5,7 +5,7 @@ const std = @import("std");
 const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../util/log.zig");
 const sdpa = @import("sdpa.zig");
 const naxSdpaPreferred = @import("sdpa.zig").naxSdpaPreferred;
 

@@ -1,7 +1,7 @@
 //! The Gemma 4 tool-call dialect.
 
 const std = @import("std");
-const log = @import("../../log.zig");
+const log = @import("../../../sdk/util/log.zig");
 const testing = std.testing;
 
 const parseToolCalls = @import("parse.zig").parseToolCalls;

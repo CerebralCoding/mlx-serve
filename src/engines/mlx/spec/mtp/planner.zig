@@ -1,7 +1,7 @@
 //! MTP round planner entry points, width trials and the EV round update.
 const depth_bounds = @import("../mtp_depth_bounds.zig");
 const std = @import("std");
-const log = @import("../../../../host/log.zig");
+const log = @import("../../../../sdk/util/log.zig");
 const mtp_mod = @import("../../../../sdk/spec/mtp/mtp.zig");
 const round_cost = @import("../round_cost.zig");
 const group_cost = @import("../mtp_group_cost.zig");

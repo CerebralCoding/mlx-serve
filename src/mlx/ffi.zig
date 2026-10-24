@@ -7,7 +7,7 @@ const env = @import("../env.zig");
 const crt = @import("../sdk/util/crt.zig");
 const os_mutex = @import("../sdk/util/os_mutex.zig");
 const builtin = @import("builtin");
-const log = @import("../host/log.zig");
+const log = @import("../sdk/util/log.zig");
 const kernels = @import("kernels.zig");
 
 // ── Opaque handle types ──

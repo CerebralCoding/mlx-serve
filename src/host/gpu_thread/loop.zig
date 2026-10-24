@@ -1,7 +1,7 @@
 //! The inference loop: work-pending checks, side-queue drains, the main loop.
 
 const std = @import("std");
-const log = @import("../log.zig");
+const log = @import("../../sdk/util/log.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
 const mlx_stream = if (@import("build_options").mlx_stream) @import("../../engines/mlx/modules/stream_glue.zig") else @import("../../engines/mlx/modules/stream_stub.zig");
 const sleep_inhibit = @import("sleep_inhibit.zig");

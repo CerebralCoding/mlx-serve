@@ -3,7 +3,7 @@
 const std = @import("std");
 const crt = @import("../../../sdk/util/crt.zig");
 const chat_mod = @import("../chat.zig");
-const log = @import("../../log.zig");
+const log = @import("../../../sdk/util/log.zig");
 const http_server = @import("../../http/server.zig");
 
 const jsonEscape = @import("../../api/format.zig").jsonEscape;

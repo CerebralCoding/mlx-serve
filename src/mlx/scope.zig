@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const mlx = @import("ffi.zig");
-const log = @import("../host/log.zig");
+const log = @import("../sdk/util/log.zig");
 const params = @import("../sdk/quant/params.zig");
 
 const S = mlx.mlx_stream;

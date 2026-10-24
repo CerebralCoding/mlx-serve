@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const chat_mod = @import("../chat/chat.zig");
-const log = @import("../log.zig");
+const log = @import("../../sdk/util/log.zig");
 const testing = std.testing;
 
 const placeholdersMatch = @import("placeholders.zig").placeholdersMatch;

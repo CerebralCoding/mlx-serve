@@ -1,7 +1,7 @@
 //! responses, HTTP logging, SSE headers
 
 const std = @import("std");
-const log = @import("../log.zig");
+const log = @import("../../sdk/util/log.zig");
 const lan_mod = @import("../lan/lan.zig");
 const testing = std.testing;
 

@@ -17,7 +17,7 @@ pub const Model = struct {
 };
 
 fn refuse(config: *const ModelConfig) error{MlxStreamNotBuilt} {
-    @import("../../../host/log.zig").err("{s}: this pack streams its experts on mlx-stream, which only the macOS build includes\n", .{config.model_type});
+    @import("../../../sdk/util/log.zig").err("{s}: this pack streams its experts on mlx-stream, which only the macOS build includes\n", .{config.model_type});
     return error.MlxStreamNotBuilt;
 }
 

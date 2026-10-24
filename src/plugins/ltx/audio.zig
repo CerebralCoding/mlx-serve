@@ -22,7 +22,7 @@
 const std = @import("std");
 const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const ltx = @import("video.zig");
 
 const S = mlx.mlx_stream;

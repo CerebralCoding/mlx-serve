@@ -31,7 +31,7 @@ const model = @import("../../engines/mlx/model.zig");
 const transformer = @import("../../engines/mlx/transformer.zig");
 const decode_attn_quant = @import("../../sdk/blocks/attention/decode_attn_quant.zig");
 const params_mod = @import("../../sdk/quant/params.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 
 const ModelConfig = model.ModelConfig;
 const QuantParams = params_mod.QuantParams;

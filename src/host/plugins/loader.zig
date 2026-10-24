@@ -9,7 +9,7 @@ const builtin = @import("builtin");
 const common = @import("../../abi/common.zig");
 const dylib_abi = @import("../../abi/dylib.zig");
 const sdk_plugin = @import("../../sdk/plugin.zig");
-const log = @import("../log.zig");
+const log = @import("../../sdk/util/log.zig");
 const FsPackDir = @import("../registry/pack_dir.zig").FsPackDir;
 
 const Allocator = std.mem.Allocator;

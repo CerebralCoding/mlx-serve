@@ -51,7 +51,7 @@ comptime {
     if (@import("builtin").os.tag == .macos) @export(&info_plist, .{ .name = "mlx_serve_info_plist", .section = "__TEXT,__info_plist" });
 }
 const launch_mod = @import("host/launch/launch.zig");
-pub const log = @import("host/log.zig");
+pub const log = @import("sdk/util/log.zig");
 const metrics_mod = @import("host/metrics/metrics.zig");
 const sleep_inhibit_mod = @import("host/gpu_thread/sleep_inhibit.zig");
 const version_mod = @import("version.zig");

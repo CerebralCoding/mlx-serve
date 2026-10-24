@@ -6,7 +6,7 @@ const mlx = @import("../../mlx/ffi.zig");
 const ops = @import("../../mlx/ops.zig");
 const flux = @import("flux.zig");
 const tok_mod = @import("../../host/tokenizer/tokenizer.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const sse = @import("../../host/media_jobs/sse.zig");
 const image_request = @import("../../sdk/media/image_request.zig");
 

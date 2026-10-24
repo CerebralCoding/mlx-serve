@@ -2,7 +2,7 @@
 
 const mlx = @import("../../../mlx/ffi.zig");
 const gdn_decode = @import("../../../sdk/blocks/gdn/decode.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../../sdk/util/log.zig");
 const Transformer = @import("../transformer.zig").Transformer;
 const gdnChainGateDtype = @import("../../../sdk/blocks/gdn/gate.zig").gdnChainGateDtype;
 const gdnGateChain = @import("../../../sdk/blocks/gdn/gate.zig").gdnGateChain;

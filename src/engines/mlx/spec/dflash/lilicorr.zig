@@ -10,7 +10,7 @@
 
 const std = @import("std");
 const mlx = @import("../../../../mlx/ffi.zig");
-const log = @import("../../../../host/log.zig");
+const log = @import("../../../../sdk/util/log.zig");
 const linear = @import("../../../../plugins/glm5_next/vision.zig").linear;
 const scalarOf = @import("../../transformer.zig").scalarOf;
 const model_mod = @import("../../model.zig");

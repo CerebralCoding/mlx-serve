@@ -138,7 +138,7 @@ pub fn recur(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_a
     const out = try launch(s, q, k, v, a_c, beta_c, alog, dtb, lb, state, plan);
     if (!engaged) {
         engaged = true;
-        @import("../../../host/log.zig").info("[kda] per-core prefill recurrence engaged ({d} threadgroups x {d} rows)\n", .{ plan.ntg, plan.rows });
+        @import("../../util/log.zig").info("[kda] per-core prefill recurrence engaged ({d} threadgroups x {d} rows)\n", .{ plan.ntg, plan.rows });
     }
     return out;
 }
@@ -293,14 +293,14 @@ fn decodeRows(s: mlx.mlx_stream, proj: mlx.mlx_array, off_ga: c_int, off_fa: c_i
             inline for (.{ out.y, out.conv_state, out.state, out.state_seq }) |a| {
                 _ = mlx.mlx_array_free(a);
             }
-            @import("../../../host/log.zig").info("[kda] decode step declined: this GPU launches fewer than {d} threads per threadgroup\n", .{decode_threads});
+            @import("../../util/log.zig").info("[kda] decode step declined: this GPU launches fewer than {d} threads per threadgroup\n", .{decode_threads});
             return null;
         };
         launchable_at.* = true;
     }
     if (!decode_engaged) {
         decode_engaged = true;
-        @import("../../../host/log.zig").info("[kda] decode step engaged (T={d}, gate bits {d})\n", .{ t, f_b.bits });
+        @import("../../util/log.zig").info("[kda] decode step engaged (T={d}, gate bits {d})\n", .{ t, f_b.bits });
     }
     return out;
 }

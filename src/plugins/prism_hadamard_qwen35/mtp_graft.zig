@@ -11,7 +11,7 @@ const crt = @import("../../sdk/util/crt.zig");
 const build_options = @import("build_options");
 const model_mod = @import("../../engines/mlx/model.zig");
 const mtp_mod = @import("../../sdk/spec/mtp/mtp.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 
 const DONOR_REPO = "ddalcu/Qwen3.8-27B-MLX-Serve-4bit";
 const SIDECAR = "mtp.safetensors";

@@ -3,7 +3,7 @@
 const std = @import("std");
 const env = @import("../env.zig");
 const mlx = @import("ffi.zig");
-const log = @import("../host/log.zig");
+const log = @import("../sdk/util/log.zig");
 const metrics = @import("../sdk/util/system.zig");
 const testing = std.testing;
 

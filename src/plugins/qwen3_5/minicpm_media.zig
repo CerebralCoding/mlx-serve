@@ -5,7 +5,7 @@ const chat_mod = @import("../../host/chat/chat.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const minicpm_vision = @import("minicpm_vision.zig");
 const minicpm_canvas = @import("minicpm_canvas.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const testing = std.testing;
 
 const MediaItem = @import("../../host/media/placeholders.zig").MediaItem;

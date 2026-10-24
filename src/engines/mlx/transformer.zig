@@ -455,7 +455,7 @@ pub inline fn cli() *CliState {
 pub var hc_fused_override: ?bool = null;
 
 const model_mod = @import("model.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const io_util_mod = @import("../../sdk/util/io_util.zig");
 const round_cost_mod = @import("spec/round_cost.zig");
 const group_cost_mod = @import("spec/mtp_group_cost.zig");

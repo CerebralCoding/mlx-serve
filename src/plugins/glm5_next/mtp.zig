@@ -8,7 +8,7 @@
 //! drafter, which `tests/dump_glm5_next_fixtures.py` records as the oracle).
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const transformer_mod = @import("../../engines/mlx/transformer.zig");
 const forward_ctx = @import("../../engines/mlx/forward_ctx.zig");

@@ -7,7 +7,7 @@ const model_mod = @import("model.zig");
 const vision_mod = @import("vision_encoder.zig");
 const radio_vision = @import("../../plugins/nemotron_h/radio_vision.zig");
 const model_registry_mod = @import("../../host/registry/registry.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const VisionEncoder = vision_mod.VisionEncoder;
 
 const Scheduler = @import("scheduler.zig").Scheduler;

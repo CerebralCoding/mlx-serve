@@ -12,7 +12,7 @@ const std = @import("std");
 const env = @import("../../env.zig");
 const crt = @import("../../sdk/util/crt.zig");
 const os_mutex = @import("../../sdk/util/os_mutex.zig");
-const log = @import("../log.zig");
+const log = @import("../../sdk/util/log.zig");
 const lan = @import("../lan/lan.zig");
 const agent_budget = @import("../launch/budget.zig");
 

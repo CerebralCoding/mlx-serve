@@ -3,7 +3,7 @@
 const std = @import("std");
 const env = @import("../../env.zig");
 const generate_mod = @import("../../engines/mlx/generate.zig");
-const log = @import("../log.zig");
+const log = @import("../../sdk/util/log.zig");
 const Generator = generate_mod.Generator;
 const testing = std.testing;
 

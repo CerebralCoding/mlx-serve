@@ -6,7 +6,7 @@ pub const mlx = @import("mlx/ffi.zig");
 pub const io_util = @import("sdk/util/io_util.zig");
 pub const shared = @import("sdk/util/shared.zig");
 pub const mtp_acceptance = @import("engines/mlx/spec/mtp_acceptance.zig");
-pub const log = @import("host/log.zig");
+pub const log = @import("sdk/util/log.zig");
 pub const dsa_nax = @import("plugins/glm5_next/dsa_nax.zig");
 pub const exl3 = @import("sdk/quant/exl3/format.zig");
 pub const env = @import("env.zig");
@@ -19,7 +19,7 @@ test {
     _ = @import("engines/ds4/engine.zig");
     _ = @import("plugins/registry.zig");
     _ = @import("host/plugins/loader.zig");
-    _ = @import("host/log.zig");
+    _ = @import("sdk/util/log.zig");
     _ = @import("host/plugin_host_impl.zig");
     _ = @import("sdk/util/os_mutex.zig");
     _ = @import("sdk/util/crt.zig");

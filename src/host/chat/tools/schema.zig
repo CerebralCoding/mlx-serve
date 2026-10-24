@@ -1,7 +1,7 @@
 //! Tool arguments against the declared schema: coercion, buried-param hoist, the inferred filter.
 
 const std = @import("std");
-const log = @import("../../log.zig");
+const log = @import("../../../sdk/util/log.zig");
 const testing = std.testing;
 
 const parseToolCalls = @import("parse.zig").parseToolCalls;

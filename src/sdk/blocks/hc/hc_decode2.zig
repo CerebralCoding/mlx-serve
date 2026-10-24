@@ -9,7 +9,7 @@ const std = @import("std");
 const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../util/log.zig");
 
 /// A deferred hcWrite the norm launch applies itself: stream + out * inj.
 pub const Pending = struct { out: mlx.mlx_array, inj: mlx.mlx_array };

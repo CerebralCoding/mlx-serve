@@ -3,7 +3,7 @@
 const std = @import("std");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../util/log.zig");
 
 const Weights = @import("../../weights/resident.zig").Weights;
 const indexShardSet = @import("../../weights/resident.zig").indexShardSet;

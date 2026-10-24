@@ -6,7 +6,7 @@ const std = @import("std");
 const env = @import("../../env.zig");
 const kernelSource = @import("../../mlx/kernels.zig").source;
 const mlx = @import("../../mlx/ffi.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 
 // grid (kv), one thread a token. `blocks` is sorted ascending with INT_MAX sentinels, so a binary
 // search finds a token's block; a sentinel never equals a block id.

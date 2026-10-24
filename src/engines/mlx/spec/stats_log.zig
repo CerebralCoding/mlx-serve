@@ -1,7 +1,7 @@
 //! The [spec-stats] and QSA arm log lines.
 const std = @import("std");
 const mlx_stream = if (@import("build_options").mlx_stream) @import("../modules/stream_glue.zig") else @import("../modules/stream_stub.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../../sdk/util/log.zig");
 const plugin_settle = @import("../plugin/settle.zig");
 const round_cost = @import("round_cost.zig");
 const Generator = @import("../generate/generator.zig").Generator;

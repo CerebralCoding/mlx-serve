@@ -4,7 +4,7 @@
 const std = @import("std");
 const kernelSource = @import("../../mlx/kernels.zig").source;
 const mlx = @import("../../mlx/ffi.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 const swigluFusedEnabled = @import("../../sdk/blocks/mlp/fused_activations.zig").swigluFusedEnabled;
 const QuantParams = @import("../../sdk/quant/params.zig").QuantParams;
 

@@ -7,7 +7,7 @@ const std = @import("std");
 const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../../host/log.zig");
+const log = @import("../../util/log.zig");
 
 /// `rms_norm_small`'s launch for a row: 64 threads, 8 values per load.
 const THREADS = 64;

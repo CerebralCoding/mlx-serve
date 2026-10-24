@@ -6,7 +6,7 @@
 const std = @import("std");
 const kernelSource = @import("../../mlx/kernels.zig").source;
 const mlx = @import("../../mlx/ffi.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 
 /// oMLX `patches/glm_moe_dsa/indexer_nax.py` (Apache-2.0, see NOTICE): the indexer's
 /// head-summed `relu(q . k) * w` per (query, pool) on the tensor units, the causal pool mask

@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const log = @import("../log.zig");
+const log = @import("../../sdk/util/log.zig");
 const media_mod = @import("../media_jobs/gen.zig");
 const instr = @import("../metrics/metrics.zig");
 const lan_mod = @import("../lan/lan.zig");

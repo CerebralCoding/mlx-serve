@@ -11,7 +11,7 @@
 const std = @import("std");
 const env = @import("../../env.zig");
 const ffi = @import("ffi.zig");
-const log = @import("../../host/log.zig");
+const log = @import("../../sdk/util/log.zig");
 
 /// The llama shim's log sink: llama.cpp's warnings and errors stay visible, the rest
 /// (the loader's metadata dump, backend probing) is debug.

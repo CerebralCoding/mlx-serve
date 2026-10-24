@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const log = @import("../log.zig");
+const log = @import("../../sdk/util/log.zig");
 const scheduler_mod = @import("../../engines/mlx/scheduler.zig");
 const instr = @import("../metrics/metrics.zig");
 const testing = std.testing;
