@@ -1,5 +1,5 @@
 //! engines/mlx/compiled, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns compileGelu, compileGeglu, gegluClosureCallback, compileSoftcap, softcapClosureCallback, and 7 more.
+//! Owns compileGelu, compileGeglu, gegluClosureCallback, and 7 more.
 
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../sdk/util/log.zig");
@@ -67,45 +67,6 @@ pub fn gegluClosureCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_ar
     return 0;
 }
 
-/// Compile logit softcap: tanh(x/cap) * cap → single fused kernel.
-pub fn compileSoftcap(self: *Transformer) void {
-    const raw_closure = mlx.mlx_closure_new_func_payload(
-        &softcapClosureCallback,
-        @ptrCast(self),
-        null,
-    );
-    var compiled = mlx.mlx_closure{ .ctx = null };
-    const rc = mlx.mlx_compile(&compiled, raw_closure, true);
-    _ = mlx.mlx_closure_free(raw_closure);
-    if (rc == 0 and compiled.ctx != null) {
-        self.compiled_softcap = compiled;
-        log.info("Softcap compiled (kernel fusion enabled)\n", .{});
-    }
-}
-
-pub fn softcapClosureCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
-    const self: *Transformer = @ptrCast(@alignCast(payload.?));
-    var x = mlx.mlx_array_new();
-    if (mlx.mlx_vector_array_get(&x, input, 0) != 0) return -1;
-    defer _ = mlx.mlx_array_free(x);
-
-    const cap = self.softcap_scalar orelse return -1;
-    // tanh(x / cap) * cap
-    var scaled = mlx.mlx_array_new();
-    mlx.check(mlx.mlx_divide(&scaled, x, cap, self.s)) catch return -1;
-    defer _ = mlx.mlx_array_free(scaled);
-    var tanh_val = mlx.mlx_array_new();
-    mlx.check(mlx.mlx_tanh(&tanh_val, scaled, self.s)) catch return -1;
-    defer _ = mlx.mlx_array_free(tanh_val);
-    var result = mlx.mlx_array_new();
-    mlx.check(mlx.mlx_multiply(&result, tanh_val, cap, self.s)) catch return -1;
-
-    const out_arr = [_]mlx.mlx_array{result};
-    res.* = mlx.mlx_vector_array_new_data(&out_arr, 1);
-    _ = mlx.mlx_array_free(result);
-    return 0;
-}
-
 pub fn geluClosureCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
     const self: *Transformer = @ptrCast(@alignCast(payload.?));
     var x = mlx.mlx_array_new();
@@ -150,7 +111,7 @@ pub fn applyClosure(compiled: ?mlx.mlx_closure, inputs: []const mlx.mlx_array) !
 }
 
 /// Free compiled JIT closures (compiled_gelu /
-/// compiled_geglu / compiled_softcap / compiled_moe_routing). They get
+/// compiled_geglu / compiled_moe_routing). They get
 /// bound to the calling thread's mlx GPU stream at compile time; once
 /// inference moves to a different thread (Phase 2 scheduler) calls
 /// against them fail with "no Stream(gpu, N) in current thread". Clear
@@ -165,10 +126,6 @@ pub fn clearCompiledClosures(self: *Transformer) void {
     if (self.compiled_geglu) |c| {
         _ = mlx.mlx_closure_free(c);
         self.compiled_geglu = null;
-    }
-    if (self.compiled_softcap) |c| {
-        _ = mlx.mlx_closure_free(c);
-        self.compiled_softcap = null;
     }
     if (self.compiled_moe_routing) |c| {
         _ = mlx.mlx_closure_free(c);

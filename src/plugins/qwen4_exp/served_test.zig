@@ -167,7 +167,7 @@ test "qwen4_exp served: the plugin claims the pack and the engine config is the 
     try testing.expect(p.served.plugin != null and p.served.qwen4Trunk().?.qwen4_mtp != null);
     // load.zig compiles nothing on a served shell, and every test here forwards through shells like this one.
     const x = &p.served;
-    try testing.expect(x.compiled_gdn_gate == null and x.compiled_moe_routing == null and x.compiled_gelu == null and x.compiled_softcap == null);
+    try testing.expect(x.compiled_gdn_gate == null and x.compiled_moe_routing == null and x.compiled_gelu == null);
 }
 
 test "qwen4_exp served: captured steps and a pipelined greedy decode equal the legacy path bit for bit" {
