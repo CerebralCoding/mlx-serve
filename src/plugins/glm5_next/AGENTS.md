@@ -58,7 +58,7 @@ Batched verify rows (`batched_rows`, rows > 1) are refused by name: the engine k
 - With a vocab under 16384 rows the engine's served-head readout builds a 3-bit
   draft head the legacy GLM head never built (drafts only, never output): needs a `SpecFacts` fact.
 - Kernel contracts for the 20 `kernels/*.metal` rows are not registered.
-- No `[dtype-trace]`, `MLX_SERVE_GLM_PROFILE` or layer-cap diagnostics on the table forward.
+- No `[dtype-trace]` or layer-cap diagnostics on the table forward.
 - The dense layer's one-row decode takes the unclamped joined SwiGLU (`Model.denseMlp`), as the legacy forward did,
   though the config declares `swiglu_limit`; wider rows clamp. Kept for bit-equality; unverified against the reference.
 - Not ported (no GLM or Ling pack uses them): the ternary 2-bit arm of `qmatmul`, the RHT arms, ANE prefill.
