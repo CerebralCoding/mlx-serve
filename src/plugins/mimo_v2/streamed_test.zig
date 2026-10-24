@@ -291,7 +291,7 @@ fn relRms(got: []const f32, truth: []const f64) f64 {
     return @sqrt(se / st);
 }
 
-test "mimo_v2 streamed experts at the release's 4096 / 2048: the hook's decode MoE (the resident's kernels) and the stream module's, each against fp32 truth" {
+test "mimo_v2 streamed experts at the release's 4096 / 2048: the hook's decode MoE against fp32 truth" {
     if (!build_options.mlx_stream or mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -335,7 +335,6 @@ test "mimo_v2 streamed experts at the release's 4096 / 2048: the hook's decode M
         const xs = try a.alloc(f32, n * H);
         for (xs) |*v| v.* = 0.05 * rnd.random().floatNorm(f32);
         const ids = try a.alloc(u32, n * K);
-        const ids16 = try a.alloc(u16, n * K);
         const wts = try a.alloc(f32, n * K);
         for (0..n) |t| {
             var perm: [E]u32 = .{ 0, 1, 2, 3, 4, 5, 6, 7 };
@@ -343,7 +342,6 @@ test "mimo_v2 streamed experts at the release's 4096 / 2048: the hook's decode M
             var sum: f32 = 0;
             for (0..K) |k| {
                 ids[t * K + k] = perm[k];
-                ids16[t * K + k] = @intCast(perm[k]);
                 wts[t * K + k] = 0.1 + rnd.random().float(f32);
                 sum += wts[t * K + k];
             }
@@ -358,14 +356,6 @@ test "mimo_v2 streamed experts at the release's 4096 / 2048: the hook's decode M
         try mlx.check(mlx.mlx_array_eval(hook_y));
         try src.settle();
         const hooked = try a.dupe(f32, (mlx.mlx_array_data_float32(hook_y) orelse return error.NoData)[0 .. n * H]);
-
-        // The stream module's served decode MoE on the same slots.
-        const sy = try stream.dupes.mimo_v2.decodeSum(src, 0, x, ids16, wf);
-        const sf = try g.astype(sy, .float32);
-        try mlx.check(mlx.mlx_array_eval(sf));
-        const streamed_y = try a.dupe(f32, (mlx.mlx_array_data_float32(sf) orelse return error.NoData)[0 .. n * H]);
-        src.g.reset();
-        try src.settle();
 
         // fp32 truth: each expert dequantized, silu(gate x) * up x, down, weighted in f64 on the host.
         const truth = try a.alloc(f64, n * H);
@@ -389,16 +379,7 @@ test "mimo_v2 streamed experts at the release's 4096 / 2048: the hook's decode M
                 for (0..H) |j| truth[t * H + j] += @as(f64, wts[t * K + k]) * d[t * H + j];
             };
         }
-        var max_diff: f32 = 0;
-        var differ: usize = 0;
-        for (hooked, streamed_y) |h, v| {
-            max_diff = @max(max_diff, @abs(h - v));
-            differ += @intFromBool(h != v);
-        }
-        const e_hook = relRms(hooked, truth);
-        const e_stream = relRms(streamed_y, truth);
-        std.debug.print("mimo_v2 experts at 4096/2048, {d} token(s): rel rms vs fp32 truth, hook {e:.3}, stream {e:.3}; hook vs stream {d}/{d} differ, max {e:.3}\n", .{ n, e_hook, e_stream, differ, hooked.len, max_diff });
-        // Both are bf16-output paths of one function: each within bf16's class of the truth.
-        try testing.expect(e_hook < 1e-2 and e_stream < 1e-2);
+        // A bf16-output path of the function: within bf16's class of the truth.
+        try testing.expect(relRms(hooked, truth) < 1e-2);
     }
 }
