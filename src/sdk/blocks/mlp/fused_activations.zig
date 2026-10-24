@@ -13,7 +13,6 @@ const testReadF32 = @import("../../testing/parity.zig").testReadF32;
 const attn256MaxDiff = @import("../attention/attn256.zig").attn256MaxDiff;
 const gdnParityRand = @import("../gdn/decode_fused.zig").gdnParityRand;
 const sliceQkvPart = @import("../linear/fused_rows.zig").sliceQkvPart;
-const qmatmulBits = @import("../linear/qmatmul.zig").qmatmulBits;
 const cachedScalarInt = @import("../linear/verify_qmm.zig").cachedScalarInt;
 const ShapeKey = @import("../moe/router_kernel.zig").ShapeKey;
 const clampedSwiGLU = @import("activations.zig").clampedSwiGLU;
@@ -360,6 +359,8 @@ pub fn fusedGeluErfMul(s: mlx.mlx_stream, gate: mlx.mlx_array, up: mlx.mlx_array
 }
 
 // ── tests ──
+
+const qmatmulBits = @import("../linear/qmatmul.zig").qmatmulBits;
 
 const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
 

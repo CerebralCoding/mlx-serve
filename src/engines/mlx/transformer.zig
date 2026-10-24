@@ -854,21 +854,21 @@ pub const Transformer = struct {
     // sdk/blocks/attention/batched.zig
     pub const BATCHED_PER_SLOT_ATTN_MIN_KV = @import("../../sdk/blocks/attention/batched.zig").BATCHED_PER_SLOT_ATTN_MIN_KV;
     pub const batchedAttnPerSlot = @import("../../sdk/blocks/attention/batched.zig").batchedAttnPerSlot;
-    pub const stackedBatchedAttn = @import("../../sdk/blocks/attention/batched.zig").stackedBatchedAttn;
-    pub const perSlotBatchedAttn = @import("../../sdk/blocks/attention/batched.zig").perSlotBatchedAttn;
-    pub const padAndStackBatchedKV = @import("../../sdk/blocks/attention/batched.zig").padAndStackBatchedKV;
-    pub const buildBatchedDecodeMask = @import("../../sdk/blocks/attention/batched.zig").buildBatchedDecodeMask;
+    pub const stackedBatchedAttn = @import("methods/batched_attn.zig").stackedBatchedAttn;
+    pub const perSlotBatchedAttn = @import("methods/batched_attn.zig").perSlotBatchedAttn;
+    pub const padAndStackBatchedKV = @import("methods/batched_attn.zig").padAndStackBatchedKV;
+    pub const buildBatchedDecodeMask = @import("methods/batched_attn.zig").buildBatchedDecodeMask;
     // engines/mlx/prompt_cache.zig
     pub const resetCache = @import("prompt_cache.zig").resetCache;
     pub const tryRestoreCache = @import("prompt_cache.zig").tryRestoreCache;
     pub const savePromptCache = @import("prompt_cache.zig").savePromptCache;
     // sdk/blocks/gdn/gated_delta_net.zig
-    pub const gatedDeltaNet = @import("../../sdk/blocks/gdn/gated_delta_net.zig").gatedDeltaNet;
-    pub const gatedDeltaNetProjected = @import("../../sdk/blocks/gdn/gated_delta_net.zig").gatedDeltaNetProjected;
-    pub const gdnCheckFused = @import("../../sdk/blocks/gdn/gated_delta_net.zig").gdnCheckFused;
+    pub const gatedDeltaNet = @import("methods/gated_delta_net.zig").gatedDeltaNet;
+    pub const gatedDeltaNetProjected = @import("methods/gated_delta_net.zig").gatedDeltaNetProjected;
+    pub const gdnCheckFused = @import("methods/gated_delta_net.zig").gdnCheckFused;
     pub const GdnProj = @import("../../sdk/blocks/gdn/gated_delta_net.zig").GdnProj;
-    pub const gdnProjGpu = @import("../../sdk/blocks/gdn/gated_delta_net.zig").gdnProjGpu;
-    pub const gdnProjArrays = @import("../../sdk/blocks/gdn/gated_delta_net.zig").gdnProjArrays;
+    pub const gdnProjGpu = @import("methods/gated_delta_net.zig").gdnProjGpu;
+    pub const gdnProjArrays = @import("methods/gated_delta_net.zig").gdnProjArrays;
     // sdk/blocks/mlp/dense.zig
     pub const residualTail = @import("../../sdk/blocks/mlp/dense.zig").residualTail;
     pub const standardMlp = @import("../../sdk/blocks/mlp/dense.zig").standardMlp;
@@ -911,9 +911,9 @@ pub const Transformer = struct {
     pub const applyClosure = @import("compiled.zig").applyClosure;
     pub const clearCompiledClosures = @import("compiled.zig").clearCompiledClosures;
     // sdk/blocks/gdn/gate.zig
-    pub const compileGdnGate = @import("../../sdk/blocks/gdn/gate.zig").compileGdnGate;
-    const gdnGateClosureCallback = @import("../../sdk/blocks/gdn/gate.zig").gdnGateClosureCallback;
-    pub const computeGdnGate = @import("../../sdk/blocks/gdn/gate.zig").computeGdnGate;
+    pub const compileGdnGate = @import("methods/gdn_gate.zig").compileGdnGate;
+    const gdnGateClosureCallback = @import("methods/gdn_gate.zig").gdnGateClosureCallback;
+    pub const computeGdnGate = @import("methods/gdn_gate.zig").computeGdnGate;
     // plugins/qwen4_exp/hc.zig
     pub const compileQwen4Hc = @import("../../plugins/qwen4_exp/hc.zig").compileQwen4Hc;
     const hcSiluCallback = @import("../../plugins/qwen4_exp/hc.zig").hcSiluCallback;
@@ -941,12 +941,12 @@ pub const Transformer = struct {
     pub const computeHy3Routing = @import("../../sdk/blocks/moe/routing.zig").computeHy3Routing;
     pub const computeMoeRouting = @import("../../sdk/blocks/moe/routing.zig").computeMoeRouting;
     // sdk/blocks/linear/qmatmul.zig
-    pub const qmatmul = @import("../../sdk/blocks/linear/qmatmul.zig").qmatmul;
-    pub const lmHeadProject = @import("../../sdk/blocks/linear/qmatmul.zig").lmHeadProject;
-    pub const quantParamsFor = @import("../../sdk/blocks/linear/qmatmul.zig").quantParamsFor;
-    pub const quantParamsHinted = @import("../../sdk/blocks/linear/qmatmul.zig").quantParamsHinted;
-    pub const qmatmulAddBias = @import("../../sdk/blocks/linear/qmatmul.zig").qmatmulAddBias;
-    pub const qmatmulMaybeBias = @import("../../sdk/blocks/linear/qmatmul.zig").qmatmulMaybeBias;
+    pub const qmatmul = @import("methods/qmatmul.zig").qmatmul;
+    pub const lmHeadProject = @import("methods/qmatmul.zig").lmHeadProject;
+    pub const quantParamsFor = @import("methods/qmatmul.zig").quantParamsFor;
+    pub const quantParamsHinted = @import("methods/qmatmul.zig").quantParamsHinted;
+    pub const qmatmulAddBias = @import("methods/qmatmul.zig").qmatmulAddBias;
+    pub const qmatmulMaybeBias = @import("methods/qmatmul.zig").qmatmulMaybeBias;
     // engines/mlx/diag/proj_bench.zig
     pub const projLadderFits = @import("diag/proj_bench.zig").projLadderFits;
     const ProjRung = @import("diag/proj_bench.zig").ProjRung;
@@ -973,18 +973,18 @@ pub const Transformer = struct {
     pub const spliceVisionRows = @import("../../sdk/vision/splice.zig").spliceVisionRows;
     pub const applyVisionEmbeddingsWith = @import("methods/vision_splice.zig").applyVisionEmbeddingsWith;
     // sdk/blocks/mlp/activations.zig
-    pub const gelu = @import("../../sdk/blocks/mlp/activations.zig").gelu;
-    pub const geluUncompiled = @import("../../sdk/blocks/mlp/activations.zig").geluUncompiled;
-    pub const silu = @import("../../sdk/blocks/mlp/activations.zig").silu;
-    pub const mlpActivation = @import("../../sdk/blocks/mlp/activations.zig").mlpActivation;
-    pub const geluErf = @import("../../sdk/blocks/mlp/activations.zig").geluErf;
-    pub const reluSquared = @import("../../sdk/blocks/mlp/activations.zig").reluSquared;
-    pub const geluTanhTable = @import("../../sdk/blocks/mlp/activations.zig").geluTanhTable;
-    pub const fusedGeluTanhMul = @import("../../sdk/blocks/mlp/activations.zig").fusedGeluTanhMul;
-    pub const computeGeglu = @import("../../sdk/blocks/mlp/activations.zig").computeGeglu;
-    pub const computeClampedSwiGLU = @import("../../sdk/blocks/mlp/activations.zig").computeClampedSwiGLU;
-    pub const applySoftcap = @import("../../sdk/blocks/mlp/activations.zig").applySoftcap;
-    pub const swiglu = @import("../../sdk/blocks/mlp/activations.zig").swiglu;
+    pub const gelu = @import("methods/activations.zig").gelu;
+    pub const geluUncompiled = @import("methods/activations.zig").geluUncompiled;
+    pub const silu = @import("methods/activations.zig").silu;
+    pub const mlpActivation = @import("methods/activations.zig").mlpActivation;
+    pub const geluErf = @import("methods/activations.zig").geluErf;
+    pub const reluSquared = @import("methods/activations.zig").reluSquared;
+    pub const geluTanhTable = @import("methods/activations.zig").geluTanhTable;
+    pub const fusedGeluTanhMul = @import("methods/activations.zig").fusedGeluTanhMul;
+    pub const computeGeglu = @import("methods/activations.zig").computeGeglu;
+    pub const computeClampedSwiGLU = @import("methods/activations.zig").computeClampedSwiGLU;
+    pub const applySoftcap = @import("methods/activations.zig").applySoftcap;
+    pub const swiglu = @import("methods/activations.zig").swiglu;
     // sdk/blocks/conv/conv1d_cache.zig
     pub const conv1dWithCache = @import("../../sdk/blocks/conv/conv1d_cache.zig").conv1dWithCache;
     // sdk/blocks/moe/experts.zig

@@ -8,7 +8,6 @@ const ModelConfig = @import("../../../engines/mlx/model.zig").ModelConfig;
 const QuantMode = @import("../../quant/params.zig").QuantMode;
 const Weights = @import("../../weights/resident.zig").Weights;
 const transformer = @import("../../../engines/mlx/transformer.zig");
-const qmatmulBits = @import("../linear/qmatmul.zig").qmatmulBits;
 const attn256MaxDiff = @import("attn256.zig").attn256MaxDiff;
 const attn256RandBf16 = @import("attn256.zig").attn256RandBf16;
 
@@ -173,6 +172,8 @@ pub fn buildAttnDqCopy(s: mlx.mlx_stream, w: mlx.mlx_array, nvfp4: bool) !?AttnD
 pub var decode_attn_quant_override: ?bool = null; // test seam
 
 // ── tests ──
+
+const qmatmulBits = @import("../linear/qmatmul.zig").qmatmulBits;
 
 test "decode-attn-quant: eligibility is the dispatch's own conditions" {
     const t = std.testing;

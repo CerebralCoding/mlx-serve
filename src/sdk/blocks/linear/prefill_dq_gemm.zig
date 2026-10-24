@@ -9,7 +9,6 @@ const testing = std.testing;
 const lastDim = @import("../../../mlx/array.zig").lastDim;
 const naxAvailable = @import("../../../mlx/device.zig").naxAvailable;
 const testRandWeightBf16 = @import("../../testing/parity.zig").testRandWeightBf16;
-const qmatmulBits = @import("qmatmul.zig").qmatmulBits;
 const dualDieArch = @import("verify_projection.zig").dualDieArch;
 const verifyArch = @import("verify_projection.zig").verifyArch;
 
@@ -97,6 +96,8 @@ pub fn prefillDqGemm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: 
 pub var prefill_dq_gemm_override: ?bool = null;
 
 // ── tests ──
+
+const qmatmulBits = @import("qmatmul.zig").qmatmulBits;
 
 test "prefillDqGemmRowFloor: on the Ultra the floor follows min(N, K) from 4096, the rest keep theirs" {
     // M5 Ultra crossovers, stock NAX qmm vs dequant+GEMM: K 640 and 2560 win from 2048

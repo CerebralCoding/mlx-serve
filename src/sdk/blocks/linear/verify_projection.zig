@@ -18,7 +18,6 @@ const gpuArchitecture = @import("../../../mlx/device.zig").gpuArchitecture;
 const QsaCfgCache = @import("../../../mlx/kernel_cache.zig").QsaCfgCache;
 const affineParamsFromGeometry = @import("../../quant/params.zig").affineParamsFromGeometry;
 const attn256RandBf16 = @import("../attention/attn256.zig").attn256RandBf16;
-const qmatmulBits = @import("qmatmul.zig").qmatmulBits;
 const qmvBatchLimit = @import("qmatmul.zig").qmvBatchLimit;
 const msvQmvRows = @import("qmv_rows.zig").msvQmvRows;
 const cachedScalarInt = @import("verify_qmm.zig").cachedScalarInt;
@@ -336,6 +335,8 @@ pub var mtp_coarse_pair_dispatches: u64 = 0;
 pub var mtp_verify_kernel_calls: [3]u64 = @splat(0);
 
 // ── tests ──
+
+const qmatmulBits = @import("qmatmul.zig").qmatmulBits;
 
 const model_mod = @import("../../../engines/mlx/model.zig");
 const qsaArraysAllEqual = @import("../../../plugins/qwen4_exp/qsa/select.zig").qsaArraysAllEqual;
