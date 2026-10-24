@@ -237,7 +237,6 @@ test {
     _ = config;
     _ = bill_mod;
     _ = media;
-    _ = @import("proof_test.zig");
     _ = @import("contract.zig");
     _ = intree;
 }

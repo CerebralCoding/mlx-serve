@@ -16,6 +16,44 @@ comptime {
 }
 
 test {
+    _ = @import("plugins/spark2_5/proof_test.zig");
+    _ = @import("plugins/spark2_5/bases_test.zig");
+    _ = @import("plugins/laguna/proof_test.zig");
+    _ = @import("plugins/embedding_gemma/proof_test.zig");
+    _ = @import("plugins/kolibri1/proof_test.zig");
+    _ = @import("plugins/gpt_oss/proof_test.zig");
+    _ = @import("plugins/qwen3_next/proof_test.zig");
+    _ = @import("plugins/hy_v3/proof_test.zig");
+    _ = @import("plugins/hy_v3/mtp_head_test.zig");
+    _ = @import("plugins/gemma3/proof_test.zig");
+    _ = @import("plugins/inkling/proof_test.zig");
+    _ = @import("plugins/nemotron_h/proof_test.zig");
+    _ = @import("plugins/nemotron_h/mtp_head_test.zig");
+    _ = @import("plugins/gemma4/proof_test.zig");
+    _ = @import("plugins/k2_horizon/proof_test.zig");
+    _ = @import("plugins/embedding_gemma2/proof_test.zig");
+    _ = @import("plugins/lfm2/proof_test.zig");
+    _ = @import("plugins/qwen3/proof_test.zig");
+    _ = @import("plugins/prism_hadamard_qwen35/proof_test.zig");
+    _ = @import("plugins/mimo_v2/proof_test.zig");
+    _ = @import("plugins/mimo_v2/mtp_head_test.zig");
+    _ = @import("plugins/mimo_v2/sushi_test.zig");
+    _ = @import("plugins/mimo_v2/streamed_test.zig");
+    _ = @import("plugins/bert/proof_test.zig");
+    _ = @import("plugins/deepseek_v4/proof_test.zig");
+    _ = @import("plugins/deepseek_v4/served_test.zig");
+    _ = @import("plugins/deepseek_v41/proof_test.zig");
+    _ = @import("plugins/muse_glimmer/proof_test.zig");
+    _ = @import("plugins/qwen3_asr/proof_test.zig");
+    _ = @import("plugins/qwen3_5/proof_test.zig");
+    _ = @import("plugins/qwen3_5/served_test.zig");
+    _ = @import("plugins/qwen3_5/mtp_test.zig");
+    _ = @import("plugins/flint/proof_test.zig");
+    _ = @import("plugins/llama/proof_test.zig");
+    _ = @import("engines/mlx/kv/cache_ops.zig");
+    _ = @import("sdk/bases/proof/dense_test.zig");
+    _ = @import("sdk/bases/proof/layered_test.zig");
+    _ = @import("sdk/bases/proof/attention_test.zig");
     _ = @import("engines/ds4/engine.zig");
     _ = @import("plugins/registry.zig");
     _ = @import("host/plugins/loader.zig");

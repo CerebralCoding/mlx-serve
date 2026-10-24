@@ -218,8 +218,6 @@ test {
     _ = bill_mod;
     _ = fixture;
     _ = @import("model_config.zig");
-    _ = @import("proof_test.zig");
-    _ = @import("served_test.zig");
     _ = @import("contract.zig");
     _ = @import("contract_kit.zig");
 }
