@@ -90,7 +90,7 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
 
     const text = body.str("input") orelse body.str("text") orelse return bad("missing 'input'");
     if (text.len == 0) return bad("empty 'input'");
-    // A reference the model cannot use, or cannot read, falls back to the plain voice (logged), as before.
+    // A reference that cannot be used is refused, never answered in a different voice.
     var ref: ?[]f32 = null;
     defer if (ref) |r| gpa.free(r);
     switch (refSamples(&body)) {
@@ -99,10 +99,10 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
             ref = smp;
         } else {
             gpa.free(smp);
-            log.warn("[audio] model has no speaker encoder — ignoring ref_audio\n", .{});
+            return bad("ref_audio requires a model with a speaker encoder");
         },
-        .bad_base64 => log.warn("[audio] ref_audio base64 decode failed — plain voice\n", .{}),
-        .bad_wav => log.warn("[audio] ref_audio WAV decode failed — plain voice\n", .{}),
+        .bad_base64 => return bad("ref_audio is not valid base64"),
+        .bad_wav => return bad("ref_audio is not a decodable WAV"),
     }
     const out = e.synth.synthesizeWav(text, max_frames, job.progressOf(progress), ref) catch |err| return switch (err) {
         error.Cancelled => job.client_left,
@@ -289,6 +289,30 @@ test "qwen3_tts plugin: a seeded job on the tiny pack is a deterministic WAV; mi
     try testing.expectEqualSlices(u8, first, (try pack.run(pack.fx.body)).ok);
     try testing.expectEqualStrings("this model has no speaker encoder; nothing to warm", (try pack.run("{\"warm_only\":true}")).refused.why.slice());
     try testing.expectEqualStrings("missing 'input'", (try pack.run("{}")).refused.why.slice());
+}
+
+test "qwen3_tts plugin: an unusable ref_audio is refused by name, not synthesized in the plain voice" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+    var pack = try MediaPack.open(al);
+    defer pack.close();
+    const std_b64 = std.base64.standard.Encoder;
+    const tone = try wav.encodePcm16Mono(al, &[_]f32{ 0, 0.25, -0.25, 0 }, 24000);
+    const good = try al.alloc(u8, std_b64.calcSize(tone.len));
+    _ = std_b64.encode(good, tone);
+    const junk = try al.alloc(u8, std_b64.calcSize(8));
+    _ = std_b64.encode(junk, "notawave");
+    const cases = [_]struct { ref: []const u8, why: []const u8 }{
+        .{ .ref = "%%%", .why = "ref_audio is not valid base64" },
+        .{ .ref = junk, .why = "ref_audio is not a decodable WAV" },
+        .{ .ref = good, .why = "ref_audio requires a model with a speaker encoder" },
+    };
+    for (cases) |c| {
+        const body = try std.fmt.allocPrint(al, "{{\"input\":\"hi\",\"ref_audio\":\"{s}\"}}", .{c.ref});
+        try testing.expectEqualStrings(c.why, (try pack.run(body)).refused.why.slice());
+    }
+    try testing.expectEqualStrings("RIFF", (try pack.run("{\"input\":\"hi\",\"ref_audio\":\"\"}")).ok[0..4]);
 }
 
 const MediaPack = @import("../../sdk/testing/media_pack.zig").MediaPack(@This());

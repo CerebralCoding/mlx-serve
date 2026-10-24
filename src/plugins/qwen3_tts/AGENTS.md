@@ -11,7 +11,7 @@ ECAPA-TDNN speaker encoder for zero-shot cloning. Packs: `mlx-community/Qwen3-TT
 
 ## Request contract
 `input` (or `text`), `ref_audio` (base64 24 kHz mono PCM16 WAV: clones on a checkpoint with a speaker encoder; an
-unusable one falls back to the plain voice, logged), `warm_only` (embed + cache `ref_audio` without synthesizing;
+unusable one (bad base64, undecodable WAV, no speaker encoder) is a named 400, empty or absent = the plain voice), `warm_only` (embed + cache `ref_audio` without synthesizing;
 answers `{"warmed":true,"cache":"hit"|"miss"}`). Generation stops at codec EOS or 2048 frames.
 
 ## Rules
