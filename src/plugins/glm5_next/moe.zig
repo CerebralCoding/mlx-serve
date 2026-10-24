@@ -73,7 +73,7 @@ pub fn weightsOf(xfm: *Transformer, mw: *const MoeMlpWeights) !moe.Moe.Weights {
         .bank_views = mw.bank_views,
         .top_k = @intCast(cfg.num_experts_per_tok),
         .experts = @intCast(cfg.num_experts),
-        .clamp = swigluClampLimit(cfg),
+        .clamp = swigluClampLimit(cfg.swiglu_limit, cfg.swiglu_clamp),
         .clamp_limit = if (cfg.swiglu_clamp) cfg.swiglu_limit else 0,
         .route_scale = mw.per_expert_scale orelse .{ .ctx = null },
     };

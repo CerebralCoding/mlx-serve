@@ -3,7 +3,6 @@
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const ModelConfig = @import("../../../engines/mlx/model.zig").ModelConfig;
 const fused_activations = @import("fused_activations.zig");
 const bf16Scalar = @import("../../../mlx/array.zig").bf16Scalar;
 const scalarOf = @import("../../../mlx/array.zig").scalarOf;
@@ -134,10 +133,10 @@ pub fn gptOssSwiGLU(s: mlx.mlx_stream, gate: mlx.mlx_array, up: mlx.mlx_array, l
 /// included, keeps stock gather and cannot regress.
 /// The `swiglu_limit` the fused SwiGLU epilogues clamp at: 0 for none, the limit when it is a
 /// whole-number clamp (GLM-5-Next's 10), null for any other limited activation (gpt_oss).
-pub fn swigluClampLimit(cfg: *const ModelConfig) ?u32 {
-    if (cfg.swiglu_limit <= 0.0) return 0;
-    if (!cfg.swiglu_clamp or @round(cfg.swiglu_limit) != cfg.swiglu_limit or cfg.swiglu_limit > 1 << 16) return null;
-    return @intFromFloat(cfg.swiglu_limit);
+pub fn swigluClampLimit(swiglu_limit: f32, swiglu_clamp: bool) ?u32 {
+    if (swiglu_limit <= 0.0) return 0;
+    if (!swiglu_clamp or @round(swiglu_limit) != swiglu_limit or swiglu_limit > 1 << 16) return null;
+    return @intFromFloat(swiglu_limit);
 }
 
 pub const HiddenAct = enum { gelu_approx, gelu, silu, relu_sq };

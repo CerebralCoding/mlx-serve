@@ -444,7 +444,7 @@ pub fn moeMLP2WithRouter(self: *Transformer, router_x: mlx.mlx_array, expert_x_i
             .up = .{ .trellis = mw.switch_up_w, .suh = mw.switch_up_s, .svh = mw.switch_up_b },
             .down = .{ .trellis = mw.switch_down_w, .suh = mw.switch_down_s, .svh = mw.switch_down_b },
         };
-        const clamp = swigluClampLimit(cfg) orelse return error.Exl3SwigluLimitUnsupported;
+        const clamp = swigluClampLimit(cfg.swiglu_limit, cfg.swiglu_clamp) orelse return error.Exl3SwigluLimitUnsupported;
         const y = try exl3.routed(self.s, expert_x, bank, inds, norm_scores, spec, .{ .limit = @intCast(clamp), .verify_rows = skip_shared and router_override != null });
         if (skip_shared) return y;
         if (mw.shared_ungated) return self.moeAddUngatedShared(y, expert_x, mw);
@@ -500,13 +500,13 @@ pub fn moeMLP2WithRouter(self: *Transformer, router_x: mlx.mlx_array, expert_x_i
     const cuda_fmt = if (mlx.cudaAvailable()) moeCudaFormat(B * S, gate_qp.mode, up_qp.mode, down_qp.mode, cfg.hidden_act == .silu, false, mw.up_expert_scale.ctx != null, cfg.swiglu_clamp or cfg.swiglu_limit > 0.0) else null;
     const ungated_a4: ?moe_affine4.Ungated = if (skip_shared or B * S != 1) null else self.ungatedSharedA4(mw, gate_qp.group_size);
     const fp4_shared: ?moe_affine4.Shared = if (B * S == 1) if (shared_down) |sd| .{ .down = sd, .logit = routed.gate_logit } else null else null;
-    if (moeFp4DecodeEligible(B * S, false, swigluClampLimit(&self.config), mlx.mlx_array_dtype(expert_x), gate_qp.mode, up_qp.mode, down_qp.mode) and
+    if (moeFp4DecodeEligible(B * S, false, swigluClampLimit(self.config.swiglu_limit, self.config.swiglu_clamp), mlx.mlx_array_dtype(expert_x), gate_qp.mode, up_qp.mode, down_qp.mode) and
         try self.moeFp4Decode(&down_out, expert_x, inds, norm_scores, mw, gate_qp.mode, gate_qp.group_size, fp4_shared))
     {
         moe_reduced = true;
         shared_fused = fp4_shared != null;
         cost_arm = 1;
-    } else if (B * S == 1 and (swigluClampLimit(&self.config) orelse 1) == 0 and cfg.hidden_act == .silu and
+    } else if (B * S == 1 and (swigluClampLimit(self.config.swiglu_limit, self.config.swiglu_clamp) orelse 1) == 0 and cfg.hidden_act == .silu and
         gate_qp.mode == .affine and up_qp.mode == .affine and down_qp.mode == .affine and
         gate_qp.bits == 4 and up_qp.bits == 4 and down_qp.bits == 4 and gate_qp.group_size == up_qp.group_size and gate_qp.group_size == down_qp.group_size and
         try self.moeAffine4Decode(&down_out, expert_x, inds, norm_scores, mw, gate_qp.group_size, if (shared_down) |sd| .{ .down = sd, .logit = routed.gate_logit } else null, ungated_a4))
@@ -514,7 +514,7 @@ pub fn moeMLP2WithRouter(self: *Transformer, router_x: mlx.mlx_array, expert_x_i
         moe_reduced = true;
         shared_fused = shared_down != null or ungated_a4 != null;
         cost_arm = 1;
-    } else if (moeDecodeDispatchArm(B, S, K, false, (swigluClampLimit(&self.config) orelse 1) != 0) == .rows and
+    } else if (moeDecodeDispatchArm(B, S, K, false, (swigluClampLimit(self.config.swiglu_limit, self.config.swiglu_clamp) orelse 1) != 0) == .rows and
         useGatherQmvDecode(self, gate_qp, up_qp) and mw.switch_gate_s.ctx != null and mw.switch_up_s.ctx != null and mw.switch_down_s.ctx != null and
         try self.moeDecodeGatherQmvRows(&down_out, expert_x, inds, norm_scores, &moe_reduced, mw, gate_qp, up_qp, down_qp, D, K, B, S))
     {
@@ -607,7 +607,7 @@ pub fn moeMLP2WithRouter(self: *Transformer, router_x: mlx.mlx_array, expert_x_i
             var row_map = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(row_map);
             try mlx.check(mlx.mlx_astype(&row_map, lhs_idx, .uint32, self.s));
-            const clamp = swigluClampLimit(cfg);
+            const clamp = swigluClampLimit(cfg.swiglu_limit, cfg.swiglu_clamp);
             if (self.compiled_geglu == null and swigluFusedEnabled() and cfg.hidden_act == .silu and clamp != null and
                 mw.gate_expert_scale.ctx == null and mw.up_expert_scale.ctx == null and
                 gate_qp.bits == up_qp.bits and gate_qp.group_size == up_qp.group_size)

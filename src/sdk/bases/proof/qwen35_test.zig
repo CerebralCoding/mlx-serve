@@ -233,7 +233,7 @@ pub fn moeWeights(lg: *fixture.Legacy, mw: *const MoeMlpWeights, route_fn: *@imp
         .bank_views = mw.bank_views,
         .top_k = @intCast(cfg.num_experts_per_tok),
         .experts = @intCast(cfg.num_experts),
-        .clamp = swigluClampLimit(cfg),
+        .clamp = swigluClampLimit(cfg.swiglu_limit, cfg.swiglu_clamp),
         .clamp_limit = if (cfg.swiglu_clamp) cfg.swiglu_limit else 0,
     };
     if (mw.shared_expert_gate_w) |seg| w.shared = .{

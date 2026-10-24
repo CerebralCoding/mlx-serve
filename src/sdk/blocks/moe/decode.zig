@@ -129,7 +129,7 @@ pub fn moeDecodeGatherQmv(
             gate_qp.bits,
             gate_qp.group_size,
             gate_qp.mode,
-            swigluClampLimit(&self.config).?,
+            swigluClampLimit(self.config.swiglu_limit, self.config.swiglu_clamp).?,
         )) |fused| {
             _ = mlx.mlx_array_free(act_2d);
             act_2d = fused; // [K, inter], activation already applied
@@ -242,7 +242,7 @@ pub fn moeFp4Decode(self: *Transformer, out: *mlx.mlx_array, expert_x: mlx.mlx_a
     const scales: moe_fp4.Scales = .{
         .gate = if (mw.gate_expert_scale.ctx != null) mw.gate_expert_scale else null,
         .up = if (mw.up_expert_scale.ctx != null) mw.up_expert_scale else null,
-        .clamp = swigluClampLimit(&self.config) orelse return false,
+        .clamp = swigluClampLimit(self.config.swiglu_limit, self.config.swiglu_clamp) orelse return false,
     };
     const y = (try moe_fp4.decode(self.s, x2, Bank{ .w = mw.switch_gate_w, .s = mw.switch_gate_s }, Bank{ .w = mw.switch_up_w, .s = mw.switch_up_s }, Bank{ .w = mw.switch_down_w, .s = mw.switch_down_s }, mw.bank_views, scales, shared, ind_u, sc2, sigtab, mode, group_size)) orelse return false;
     defer _ = mlx.mlx_array_free(y);
@@ -397,7 +397,7 @@ pub fn useGatherQmvDecode(self: *const Transformer, gate_qp: QuantParams, up_qp:
     if (gate_qp.mode == .gguf) return false; // raw ggml blocks: gatherExpertMm has their kernel
     if (self.config.hidden_act != .silu) return false;
     // The fused kernel bakes in silu(gate)*up, clamped at a whole-number limit; others stay composed.
-    if (swigluClampLimit(&self.config) == null) return false;
+    if (swigluClampLimit(self.config.swiglu_limit, self.config.swiglu_clamp) == null) return false;
     if (!gatherQmvGateUpEnabled()) return false;
     return gate_qp.bits == up_qp.bits and
         gate_qp.group_size == up_qp.group_size and
@@ -419,10 +419,10 @@ test "moe fp4 decode: expert biases or a clamp no kernel serves keep the compose
     var cfg: ModelConfig = undefined;
     cfg.swiglu_limit = 0;
     cfg.swiglu_clamp = false;
-    try testing.expectEqual(@as(?u32, 0), swigluClampLimit(&cfg));
+    try testing.expectEqual(@as(?u32, 0), swigluClampLimit(cfg.swiglu_limit, cfg.swiglu_clamp));
     cfg.swiglu_limit = 10;
     cfg.swiglu_clamp = true;
-    try testing.expectEqual(@as(?u32, 10), swigluClampLimit(&cfg));
+    try testing.expectEqual(@as(?u32, 10), swigluClampLimit(cfg.swiglu_limit, cfg.swiglu_clamp));
     try testing.expect(moeFp4DecodeEligible(1, false, 0, .bfloat16, .mxfp4, .mxfp4, .mxfp4));
     try testing.expect(!moeFp4DecodeEligible(1, true, 0, .bfloat16, .mxfp4, .mxfp4, .mxfp4));
     try testing.expect(moeFp4DecodeEligible(1, false, 10, .bfloat16, .nvfp4, .nvfp4, .nvfp4));
