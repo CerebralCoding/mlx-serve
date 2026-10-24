@@ -76,12 +76,8 @@ const GenYield = struct {
     }
 };
 
-/// `MLX_SERVE_GEN_YIELD=1` forces interleaving on, `=0` off; otherwise on except on CUDA.
-pub fn genYieldEnabled(cuda: bool, env: ?[]const u8) bool {
-    if (env) |e| {
-        if (std.mem.eql(u8, e, "1")) return true;
-        if (std.mem.eql(u8, e, "0")) return false;
-    }
+/// Chat interleaves with media jobs except on CUDA, where a decode inside a job faulted the context.
+pub fn genYieldEnabled(cuda: bool) bool {
     return !cuda;
 }
 
@@ -221,10 +217,7 @@ test "runGenJobs: a latch the job raised is dropped, one from before the job sta
     try testing.expectEqualStrings("earlier failure", mlx.takeError(&buf).?);
 }
 
-test "genYieldEnabled: off on CUDA unless asked for, on elsewhere" {
-    try std.testing.expect(!genYieldEnabled(true, null));
-    try std.testing.expect(genYieldEnabled(true, "1"));
-    try std.testing.expect(genYieldEnabled(false, null));
-    try std.testing.expect(!genYieldEnabled(false, "0"));
-    try std.testing.expect(!genYieldEnabled(true, ""));
+test "genYieldEnabled: off on CUDA, on elsewhere" {
+    try std.testing.expect(!genYieldEnabled(true));
+    try std.testing.expect(genYieldEnabled(false));
 }

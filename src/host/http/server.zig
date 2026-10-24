@@ -555,10 +555,9 @@ pub fn serve(
     } else {
         log.info("Concurrency: --max-concurrent={d}, batched decode off (arch: {s}); concurrent requests interleave serially\n", .{ max_concurrent, config.model_type });
     }
-    const gen_yield_env: ?[]const u8 = env.span(.MLX_SERVE_GEN_YIELD);
-    scheduler_mod.gen_yield_enabled = scheduler_mod.genYieldEnabled(mlx.cudaAvailable(), gen_yield_env);
-    if (!scheduler_mod.gen_yield_enabled and mlx.cudaAvailable())
-        log.info("chat does not interleave with media jobs on CUDA: a chat waits for the running image/audio job (MLX_SERVE_GEN_YIELD=1 interleaves)\n", .{});
+    scheduler_mod.gen_yield_enabled = scheduler_mod.genYieldEnabled(mlx.cudaAvailable());
+    if (!scheduler_mod.gen_yield_enabled)
+        log.info("chat does not interleave with media jobs on CUDA: a chat waits for the running image/audio job\n", .{});
     // Install signal handlers for graceful shutdown (POSIX; on Windows Ctrl+C ends the process).
     if (comptime builtin.os.tag != .windows) {
         const sigact = std.posix.Sigaction{

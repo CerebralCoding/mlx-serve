@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # test_gen_chat_mix.sh — release battery: two agents keep working while every media modality runs on one server
-# (scratch HOME, --max-resident-models = the set size, MLX_SERVE_GEN_YIELD=1). Chat: Qwen3.8-27B 4-bit + its DFlash2
+# (scratch HOME, --max-resident-models = the set size; Metal only, chat never interleaves with media on CUDA). Chat: Qwen3.8-27B 4-bit + its DFlash2
 # drafter, two pi-shaped agents (streaming, tools, low effort; one alternating with plain turns). Media: FLUX klein,
 # Qwen3-TTS, ACE-Step, and a textured res-320 Hunyuan3D job when the pack + paint/ exist.
 # [1] every model loads eviction-free, the drafter binds; [2] solo references (a dflash-engaged agent turn, a seeded
@@ -39,12 +39,13 @@ total=0
 for m in "${MODELS[@]}"; do total=$((total + $(model_gb "$m"))); done
 [ "$total" -le "$(max_model_gb)" ] || { echo "SKIP: the set is ${total} GB, this box admits $(max_model_gb) GB"; exit 0; }
 
+[ "$(uname)" = Darwin ] || { echo "SKIP: chat does not interleave with media jobs on CUDA"; exit 0; }
+
 TMP=$(mktemp -d)
 LOG="$TMP/server.log"
 mkdir -p "$TMP/home"
 # The default cap of 3 resident models would evict the set into churn mid-mix.
-# Interleaving is opt-in on CUDA (off by default there); the mix asserts it engages.
-HOME="$TMP/home" MLX_SERVE_GEN_YIELD=1 "$BIN" --serve --port "$PORT" --log-level debug --max-resident-models "${#MODELS[@]}" >"$LOG" 2>&1 &
+HOME="$TMP/home" "$BIN" --serve --port "$PORT" --log-level debug --max-resident-models "${#MODELS[@]}" >"$LOG" 2>&1 &
 SRV=$!
 trap 'kill $(jobs -p) 2>/dev/null; wait $SRV 2>/dev/null' EXIT
 srv_wait_health "http://127.0.0.1:$PORT" 60 1 "$SRV" || kill -0 "$SRV" 2>/dev/null || { echo "FAIL: server did not start"; tail -5 "$LOG"; exit 1; }
