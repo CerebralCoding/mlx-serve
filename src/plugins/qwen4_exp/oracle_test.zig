@@ -1,6 +1,5 @@
-//! A qwen4_exp proof's expected values: the legacy forward's while it is present, else the proof's tape
-//! (`fixtures/<name>.tape`, `engines/mlx/plugin/tape.zig`). `MLX_SERVE_PROOF_RECORD=<repo root>` records the legacy
-//! values to the tape.
+//! A qwen4_exp proof's expected values: the tape the legacy forward recorded (`fixtures/<name>.tape`,
+//! `engines/mlx/plugin/tape.zig`), and a reference forward's value where the proof has one.
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
@@ -13,19 +12,14 @@ pub const Oracle = struct {
     tape: tape_mod.Tape,
 
     pub fn open(comptime name: []const u8) !Oracle {
-        if (tape_mod.recordRoot()) |root| return .{ .tape = try tape_mod.Tape.recorder(root, "src/plugins/qwen4_exp/fixtures/" ++ name ++ ".tape") };
-        const bytes = @embedFile("fixtures/" ++ name ++ ".tape");
-        return .{ .tape = if (bytes.len == 0) .{} else try tape_mod.Tape.player(bytes) };
+        return .{ .tape = try tape_mod.Tape.player(@embedFile("fixtures/" ++ name ++ ".tape")) };
     }
 
-    /// `got` (the plugin's) against `want` (the legacy forward's, when present) and the tape; `tokens`: a greedy run,
+    /// `got` against `want` (a reference forward's, when the proof has one) and the tape; `tokens`: a greedy run,
     /// compared only on the recording's device.
     pub fn check(o: *Oracle, got: Array, want: ?Array, tokens: bool) !void {
-        if (want) |w| {
-            try ops.expectBitEqual(got, w);
-            if (o.tape.recording()) return o.tape.put(w);
-        }
-        if (o.tape.playing()) try o.tape.expectNext(got, tokens);
+        if (want) |w| try ops.expectBitEqual(got, w);
+        try o.tape.expectNext(got, tokens);
     }
 
     /// `check` on host ids (a token run, accepted counts).
@@ -39,10 +33,9 @@ pub const Oracle = struct {
         try o.check(g, w, true);
     }
 
-    /// The playback read every value; a recording is written.
+    /// The playback read every value.
     pub fn close(o: *Oracle) !void {
         try o.tape.expectDone();
-        try o.tape.finish();
     }
 };
 

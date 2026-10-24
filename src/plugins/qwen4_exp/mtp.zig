@@ -2448,7 +2448,6 @@ fn singleVerifyTestRound(shell: *@import("../../engines/mlx/transformer.zig").Tr
 }
 
 test "single-stream verify optimizations preserve native outputs and captures (QWEN4_TEST_MODEL)" {
-    const transformer = @import("../../engines/mlx/transformer.zig");
     const path = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const a = testing.allocator;
@@ -2456,14 +2455,10 @@ test "single-stream verify optimizations preserve native outputs and captures (Q
     const old_features = verify_projection.single_verify_test_features;
     defer verify_projection.single_verify_test_features = old_features;
     var config = try model_mod.parseConfig(io, a, std.mem.span(path));
-    defer if (config.ngram_table_path) |name| a.free(name);
-    var weights = try model_mod.loadWeights(io, a, std.mem.span(path));
-    defer weights.deinit();
-    model_mod.resolveWeightPrefix(&config, &weights);
-    var shell = try transformer.Transformer.init(io, a, config, &weights);
+    defer config.deinit(a);
+    var shell = try @import("../../engines/mlx/plugin/driver.zig").load(io, a, &config, std.mem.span(path), mlx.gpuStream());
     defer shell.deinit();
-    const xfm = shell.qwen4.?;
-    xfm.prepare();
+    const xfm = shell.qwen4Trunk().?;
     const prefix_len = if (std.c.getenv("SINGLE_MTP_TEST_CONTEXT")) |value| try std.fmt.parseInt(usize, std.mem.span(value), 10) else 4101;
     const ids = try a.alloc(i32, prefix_len + 64);
     defer a.free(ids);

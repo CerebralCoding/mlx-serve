@@ -331,13 +331,13 @@ test "verify MoE rows preserve every value with fewer graph operations" {
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(path));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    // qwen4_exp's trunk module is the one grouped verify reader.
+    var xfm = try @import("../../../plugins/qwen4_exp/trunk.zig").Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
-    try testing.expect(xfm.qwen4 != null);
     xfm.compileMoeRouting();
     var prng = std.Random.DefaultPrng.init(924);
     for ([_]usize{ 0, config.num_hidden_layers / 2, config.num_hidden_layers - 1 }) |layer| {
-        const mw = &xfm.moe_layers.?[layer].mlp.moe;
+        const mw = &xfm.moe_layers[layer].mlp.moe;
         for ([_]usize{ 2, 4 }) |n| for ([_][4]c_int{ .{ 2, 2, 2, 2 }, .{ 5, 5, 5, 5 }, .{ 5, 3, 2, 4 } }) |lengths| {
             var inputs: [4]mlx.mlx_array = undefined;
             defer for (inputs[0..n]) |input| {

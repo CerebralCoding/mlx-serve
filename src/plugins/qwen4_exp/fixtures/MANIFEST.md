@@ -1,9 +1,8 @@
 # qwen4_exp fixtures
 
 - Plugin proofs: `fixture.zig` writes tiny random packs (bf16 and 4-bit, QSA budget 8, PLE on a GDN layer,
-  raw bf16 `ngram_table.bin`); the oracle is `*.tape` here, recorded from the legacy forward on an M5 Ultra
-  (`proof_test.zig`, `served_test.zig`, `oracle_test.zig`; `MLX_SERVE_PROOF_RECORD=<repo root>` re-records while a
-  legacy forward exists).
+  raw bf16 `ngram_table.bin`); the oracle is `*.tape` here, recorded from the legacy forward on an M5 Ultra before
+  it was deleted (`proof_test.zig`, `served_test.zig`, `oracle_test.zig`); the tapes cannot be re-recorded.
 - Parse: `src/fixtures/model-configs/qwen4_exp-iq-mlx-4.7bpw.json` (ddalcu/Qwen3.8-Flash-Next-MLX-Serve-iQ-MLX-4.7bpw)
   and `qwen4_exp-nvidia-fp4.json` (NVIDIA's ModelOpt FP4), against the engine's `parseConfig` (`model_config.zig`).
 - HF reference (env-gated, `forward.zig`): `tests/dump_qwen4_exp_fixtures.py build|dump` writes a tiny HF model,

@@ -639,8 +639,6 @@ pub fn ssmLiveAux(e: *const SSMCacheEntry) mlx.mlx_array {
 }
 
 pub fn ssmGroupDrop(self: *Transformer, entries: []SSMCacheEntry) void {
-    // A legacy qwen4_exp shell's batched group lives on its trunk module.
-    if (self.qwen4) |t| return t.ssmGroupDrop(entries);
     ssmGroupDropMember(&self.ssm_group, self.s, entries) catch {};
 }
 
@@ -648,7 +646,6 @@ pub fn ssmGroupDrop(self: *Transformer, entries: []SSMCacheEntry) void {
 /// MTP solo arms): a member's live row goes back to its own entries before the
 /// solo path reads or writes them. A no-op for a slot that is not bound.
 pub fn ssmGroupRelease(self: *Transformer, ctx: *ForwardCtx) !void {
-    if (self.qwen4) |t| return t.ssmGroupRelease(ctx);
     try ssmGroupReleaseCtx(&self.ssm_group, self.s, ctx);
 }
 
@@ -1057,7 +1054,6 @@ test "persistent group: drop a member does not free kinds the adopt still reads"
     var ctxs = [_]*ForwardCtx{ &slots[0].ctx, &slots[1].ctx };
     var xfm: Transformer = undefined;
     xfm.rht = null;
-    xfm.qwen4 = null;
     xfm.s = s;
     xfm.allocator = alloc;
     xfm.ssm_group = .{ .allocator = alloc };
@@ -1074,7 +1070,6 @@ test "persistent group: drop a member does not free kinds the adopt still reads"
 fn ssmTickStubXfm(alloc: std.mem.Allocator, s: mlx.mlx_stream, persist: bool) Transformer {
     var xfm: Transformer = undefined;
     xfm.rht = null;
-    xfm.qwen4 = null;
     xfm.s = s;
     xfm.allocator = alloc;
     xfm.persistent_group_state_override = persist;
@@ -1547,7 +1542,6 @@ test "persistent group: forwardWith releases a bound member between batched tick
     }
     p_xfm.mlx_stream_ext = null;
     p_xfm.plugin = null;
-    p_xfm.qwen4 = null;
     p_xfm.moe_layers = null;
     p_xfm.emb_w = .{ .ctx = null };
     p_xfm.config = std.mem.zeroes(ModelConfig);

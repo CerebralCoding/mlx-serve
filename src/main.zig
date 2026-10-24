@@ -1733,10 +1733,6 @@ pub fn main(init: std.process.Init) !void {
         if (config.linear_num_key_heads > 0) {
             xfm.compileGdnGate();
         }
-        if (xfm.qwen4) |t| {
-            t.compileMoeRouting();
-            t.compileGdnGate();
-        }
         log.info("Model ready.\n", .{});
 
         // Qwen native MTP head — auto-load when the model ships one (sidecar

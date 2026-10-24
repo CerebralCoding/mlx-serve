@@ -72,13 +72,14 @@ pub fn mtpHeadRowsFit(widths: []const c_int, hc: u32) bool {
     return true;
 }
 
+/// Only qwen4_exp's trunk module runs the single-stream verify arms (its own copy of this gate).
 pub fn verifyFeatureEnabled(self: *const Transformer, comptime feature: SingleVerifyFeature, grouped: bool, batch: c_int, width: c_int) bool {
-    if (self.qwen4 == null) return false;
-    if (grouped) return true;
-    if (@import("builtin").is_test and !single_verify_test_features[@backingInt(feature)]) return false;
-    // Capture marks speculative verification. A short prefill tail has the
-    // same shape but must keep the ordinary forward path and shared expert.
-    return self.spec_capture_ssm and batch == 1 and width >= 2 and width <= 6;
+    _ = self;
+    _ = feature;
+    _ = grouped;
+    _ = batch;
+    _ = width;
+    return false;
 }
 
 pub fn mtpProjectionRows(self: *Transformer, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, lm_head: bool) !mlx.mlx_array {

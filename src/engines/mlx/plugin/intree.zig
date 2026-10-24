@@ -63,6 +63,13 @@ fn isQwen4(table: *const abi.ModelTable) bool {
     return table.load == qwen4.table.load;
 }
 
+/// A lossy load setting the plugin serves itself (`LoadCtx.settings_json`). qwen4_exp builds its MXFP8 head; int8
+/// prefill runs only on Hadamard-rotated projections, which no qwen4_exp pack has, so it changes nothing there.
+pub fn servesLossy(table: *const abi.ModelTable, what: enum { int8_prefill, lm_head_mxfp8 }) bool {
+    _ = what;
+    return isQwen4(table);
+}
+
 /// The plugin's own trunk module behind a served qwen4_exp shell; null for every other model.
 pub fn inner(xfm: *const Transformer) ?*Qwen4Trunk {
     const b = xfm.plugin orelse return null;
@@ -70,11 +77,8 @@ pub fn inner(xfm: *const Transformer) ?*Qwen4Trunk {
     return &@as(*qwen4.Model, @ptrCast(@alignCast(b.model))).trunk;
 }
 
-/// qwen4_exp's trunk module (state `qwen4`, head `qwen4_mtp`): the plugin's when served, the legacy shell's
-/// otherwise; null for every other model.
-pub fn trunk(xfm: *const Transformer) ?*Qwen4Trunk {
-    return inner(xfm) orelse xfm.qwen4;
-}
+/// qwen4_exp's trunk module (state `qwen4`, head `qwen4_mtp`); null for every other model.
+pub const trunk = inner;
 
 /// Lends the shell the inner trunk's embedding table and head (borrowed, as `adoptTrunkWeights` does): the
 /// generator's draft readouts read them off the target.

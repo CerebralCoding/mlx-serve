@@ -128,9 +128,8 @@ pub fn forwardRowAxisVerify(
 ) !void {
     std.debug.assert(token_rows.len == ctxs.len);
     std.debug.assert(out_logits.len >= token_rows.len and out_last.len >= token_rows.len and out_all.len >= token_rows.len);
-    // qwen4_exp's verify runs on its trunk module (a served one's single row keeps the plugin forward below), owed
-    // PLE work settled first on the served path.
-    if (self.qwen4) |t| return t.forwardRowAxisVerify(token_rows, ctxs, out_logits, out_last, out_all, row_ns, rollback_out);
+    // qwen4_exp's grouped verify runs on its trunk module (a single row keeps the plugin forward below), owed PLE work
+    // settled first.
     if (token_rows.len > 1) if (intree.inner(self)) |t| {
         try self.flushDeferredPleGroup(ctxs);
         return t.forwardRowAxisVerify(token_rows, ctxs, out_logits, out_last, out_all, row_ns, rollback_out);
@@ -287,10 +286,9 @@ test "row-axis verify: every row of a group verify is byte-identical to its solo
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Qwen4Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
-    try testing.expect(xfm.qwen4 != null);
-    xfm.qwen4.?.prepare();
+    xfm.prepare();
     const n_layers = config.num_hidden_layers;
 
     var ids: [640]i32 = undefined;
@@ -448,10 +446,9 @@ test "per-row rollback: different accept counts across rows restore exactly the 
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Qwen4Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
-    try testing.expect(xfm.qwen4 != null);
-    xfm.qwen4.?.prepare();
+    xfm.prepare();
     const n_layers = config.num_hidden_layers;
 
     var ids: [640]i32 = undefined;
@@ -585,10 +582,9 @@ test "group round: a row's own argmax and budget decide it, and nothing else doe
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Qwen4Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
-    try testing.expect(xfm.qwen4 != null);
-    xfm.qwen4.?.prepare();
+    xfm.prepare();
     const n_layers = config.num_hidden_layers;
 
     var ids: [640]i32 = undefined;
@@ -699,10 +695,9 @@ test "N=4 rollback: rejects, partial accepts and full accept restore solo states
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Qwen4Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
-    try testing.expect(xfm.qwen4 != null);
-    xfm.qwen4.?.prepare();
+    xfm.prepare();
     const n_layers = config.num_hidden_layers;
 
     var ids: [640]i32 = undefined;

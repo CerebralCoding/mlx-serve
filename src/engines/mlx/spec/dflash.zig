@@ -175,7 +175,7 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
     // On the moe/GDN path positions come from moe_seq_offset (cache.step
     // is a bookkeeping counter the model never reads there — same rule as
     // nextMtp); the standard path keeps cache.step as the anchor.
-    const moe_path = self.xfm.moe_layers != null or self.xfm.qwen4 != null or plugin_driver.positionsOf(self.xfm) == .gdn;
+    const moe_path = self.xfm.moe_layers != null or plugin_driver.positionsOf(self.xfm) == .gdn;
     // A hybrid trunk (LFM2 DSpark) positions from moe_seq_offset too, but
     // its cache.step IS genuine (every token passes the attention layers),
     // so it keeps the truncate and only needs the offset + conv-state
@@ -494,7 +494,7 @@ pub fn dflashVerify(self: *Generator, allocator: std.mem.Allocator, r: VerifyIn)
     const s = xfm.s;
     const model = self.dflash.?;
     const dctx = &self.dflash_ctx.?;
-    const moe_path = xfm.moe_layers != null or xfm.qwen4 != null or plugin_driver.positionsOf(xfm) == .gdn;
+    const moe_path = xfm.moe_layers != null or plugin_driver.positionsOf(xfm) == .gdn;
     const hybrid_path = plugin_driver.positionsOf(xfm) == .hybrid;
     const t1 = r.t1;
     const m = r.m;

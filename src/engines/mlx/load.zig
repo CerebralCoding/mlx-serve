@@ -258,7 +258,6 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         if (params.config.linear_num_key_heads > 0) {
             xfm_ptr.compileGdnGate();
         }
-        if (xfm_ptr.qwen4) |t| t.prepare();
     }
 
     // Vision encoder if requested. `MissingVisionWeights` is a benign opt-out

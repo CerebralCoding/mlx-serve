@@ -23,6 +23,7 @@ const fixture = @import("fixture.zig");
 const toModelConfig = @import("model_config.zig").toModelConfig;
 const trunk_load = @import("trunk_load.zig");
 const distributed = @import("../../engines/mlx/cluster/distributed.zig");
+const lmHeadMxfp8On = @import("../../sdk/quant/mxfp8.zig").lmHeadMxfp8On;
 pub const config = @import("config.zig");
 
 pub const plugin = sdk.Plugin{
@@ -153,6 +154,16 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     };
 }
 
+/// `lm_head_mxfp8` as the load settings state it; null = the default (on for a quantized pack on an integrated CUDA
+/// GPU).
+fn headMxfp8Setting(settings_json: []const u8) ?bool {
+    if (settings_json.len == 0) return null;
+    const S = struct { lm_head_mxfp8: ?bool = null };
+    const parsed = std.json.parseFromSlice(S, gpa, settings_json, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    return parsed.value.lm_head_mxfp8;
+}
+
 /// The trunk module keeps the loader's whole map (folds and n-gram shards included): the engine's own when the
 /// driver loaded it with this config (`Resident.take`), else read here. The vision tower stays the engine's.
 fn loadModel(ctx: *const abi.LoadCtx) !*Model {
@@ -174,7 +185,9 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Model {
         .remote => {},
     };
     model.resolveWeightPrefix(&m.cfg, &m.weights);
-    m.trunk = try trunk_load.load(io, gpa, &m.cfg, &m.weights, .{});
+    m.trunk = try trunk_load.load(io, gpa, &m.cfg, &m.weights, .{
+        .head_mxfp8 = lmHeadMxfp8On(headMxfp8Setting(ctx.settings_json.slice()), null, mlx.cudaIntegrated(), true, m.cfg.quant_bits),
+    });
     m.trunk.prepare();
     return m;
 }

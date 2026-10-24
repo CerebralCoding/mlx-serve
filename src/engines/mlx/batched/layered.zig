@@ -131,7 +131,6 @@ pub fn forwardMoeBatchedRows(
     hidden_last: ?*mlx.mlx_array,
     hidden_all: ?*mlx.mlx_array,
 ) !mlx.mlx_array {
-    if (self.qwen4) |t| return t.forwardMoeBatchedRows(token_arr, ctxs, rope_offsets, capture_ssm, hidden_last, hidden_all);
     const N: c_int = @intCast(ctxs.len);
     std.debug.assert(ctxs.len == rope_offsets.len);
     std.debug.assert(N >= 1);

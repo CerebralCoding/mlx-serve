@@ -3,8 +3,6 @@
 
 const std = @import("std");
 const env = @import("../../../env.zig");
-const Qwen4Trunk = @import("../../../plugins/qwen4_exp/trunk.zig").Trunk;
-const qwen4_trunk_load = @import("../../../plugins/qwen4_exp/trunk_load.zig");
 const distributed_mod = @import("../cluster/distributed.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const rht = @import("../../../sdk/quant/hadamard/rht.zig");
@@ -34,7 +32,6 @@ const MoeLayerWeights = @import("../forward/layered.zig").MoeLayerWeights;
 const KVCache = @import("../kv/cache.zig").KVCache;
 const LayerWeights = @import("../layer_weights.zig").LayerWeights;
 const initMlxStream = @import("../modules/mlx_stream.zig").initMlxStream;
-const moduleShell = @import("../modules/shell.zig").moduleShell;
 const mtpNaxCalibratedModelFrom = @import("../spec/mtp_nax_profile.zig").mtpNaxCalibratedModelFrom;
 const mtpNaxOqeAffineTrunkFrom = @import("../spec/mtp_nax_profile.zig").mtpNaxOqeAffineTrunkFrom;
 const mtpNaxUniformAffineTrunkFrom = @import("../spec/mtp_nax_profile.zig").mtpNaxUniformAffineTrunkFrom;
@@ -67,8 +64,8 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
     var name_buf: [256]u8 = undefined;
 
     // Bidirectional decoder archs (EmbeddingGemma) load through the standard arm and dispatch to
-    // forwardGemma3EncoderWith. LFM2, Nemotron-H and DeepSeek-V4/V4.1's MLX packs run on their plugins only.
-    if (config.has_hybrid_layers or std.mem.eql(u8, config.model_type, "deepseek_v4") or (config.isDsv41() and !config.dsv41_stream)) {
+    // forwardGemma3EncoderWith. LFM2, Nemotron-H, DeepSeek-V4/V4.1's MLX packs and qwen4_exp run on their plugins only.
+    if (config.has_hybrid_layers or std.mem.eql(u8, config.model_type, "deepseek_v4") or (config.isDsv41() and !config.dsv41_stream) or config.isQwen4()) {
         log.err("[load] {s}: its plugin does not serve this pack and the legacy forward is gone\n", .{config.model_type});
         return error.PluginDeclinedNoLegacy;
     }
@@ -76,7 +73,6 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
     if (config.glm_stream) return initMlxStream(io, allocator, config, s);
     if (config.glm5_stream) return initMlxStream(io, allocator, config, s);
     if (config.dsv41_stream) return initMlxStream(io, allocator, config, s);
-    if (config.isQwen4()) return initQwen4(io, allocator, config, weights, s);
 
     // Embeddings: the table's own name is the checkpoint's, not a family
     // trait — one lookup table, three call sites (weight/scales/biases)
@@ -665,32 +661,4 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
         .mtp_uniform_affine_trunk = mtp_uniform_affine_trunk,
         .mtp_oqe_affine_trunk = mtp_oqe_affine_trunk,
     };
-}
-
-/// qwen4_exp on the legacy path (a pack its plugin declines): a shell whose forwards, head and verify run on the
-/// plugin's trunk module, which it owns; the shell lends the trunk's table and head to the drafters.
-fn initQwen4(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights, s: mlx.mlx_stream) !Transformer {
-    var xfm = try moduleShell(allocator, config, s);
-    errdefer xfm.deinit();
-    xfm.cache.deinit();
-    xfm.cache = try KVCache.init(allocator, config.num_hidden_layers);
-    const entries = try allocator.alloc(SSMCacheEntry, config.num_hidden_layers);
-    for (entries) |*e| e.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
-    xfm.ssm_entries = entries;
-    const t = try allocator.create(Qwen4Trunk);
-    errdefer allocator.destroy(t);
-    t.* = try qwen4_trunk_load.load(io, allocator, &config, weights, .{
-        .head_mxfp8 = lmHeadMxfp8On(config.lm_head_mxfp8_override, transformer.cli().lm_head_mxfp8_cli, mlx.cudaIntegrated(), true, config.quant_bits),
-    });
-    xfm.qwen4 = t;
-    xfm.emb_w = t.emb_w;
-    xfm.emb_s = t.emb_s;
-    xfm.emb_b = t.emb_b;
-    xfm.lm_head_w = t.lm_head_w;
-    xfm.lm_head_s = t.lm_head_s;
-    xfm.lm_head_b = t.lm_head_b;
-    xfm.dense_attn_proj = attnProjRouted(&config, true) and weightsHaveDenseAttnProj(weights);
-    xfm.mtp_uniform_affine_trunk = t.mtp_uniform_affine_trunk;
-    xfm.mtp_oqe_affine_trunk = t.mtp_oqe_affine_trunk;
-    return xfm;
 }

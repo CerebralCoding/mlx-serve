@@ -802,7 +802,6 @@ pub const MtpChainTestSlot = struct {
 /// A loaded qwen4_exp pack and a byte tokenizer for generator-level lazy pre-draft runs.
 const LazyRig = struct {
     config: model_mod.ModelConfig,
-    weights: model_mod.Weights,
     xfm: Transformer,
     tok: Tokenizer,
 
@@ -812,10 +811,7 @@ const LazyRig = struct {
         const rig = try a.create(LazyRig);
         errdefer a.destroy(rig);
         rig.config = try model_mod.parseConfig(io, a, std.mem.span(model_dir));
-        rig.weights = try model_mod.loadWeights(io, a, std.mem.span(model_dir));
-        model_mod.resolveWeightPrefix(&rig.config, &rig.weights);
-        rig.xfm = try Transformer.init(io, a, rig.config, &rig.weights);
-        rig.xfm.qwen4.?.prepare();
+        rig.xfm = try @import("../../plugin/driver.zig").load(io, a, &rig.config, std.mem.span(model_dir), mlx.gpuStream());
         rig.tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
         return rig;
     }
@@ -823,8 +819,7 @@ const LazyRig = struct {
     fn deinit(rig: *LazyRig, a: std.mem.Allocator) void {
         rig.tok.deinit();
         rig.xfm.deinit();
-        rig.weights.deinit();
-        if (rig.config.ngram_table_path) |p| a.free(p);
+        rig.config.deinit(a);
         a.destroy(rig);
     }
 

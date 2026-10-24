@@ -12,7 +12,6 @@ const Transformer = @import("../transformer.zig").Transformer;
 /// the batched path merges? MiMo's attention + MoE trunk carries none.
 pub fn hasRecurrentLayers(self: *const Transformer) bool {
     if (self.plugin) |b| return b.positions != .kv_step;
-    if (self.qwen4 != null) return true;
     const ml = self.moe_layers orelse return false;
     for (ml) |*lw| if (lw.is_linear or lw.ple != null) return true;
     return false;
@@ -26,7 +25,6 @@ pub fn batchedGdnReady(self: *const Transformer, ctxs: []const *ForwardCtx) bool
         }
         return true;
     }
-    if (self.qwen4) |t| return t.batchedGdnReady(ctxs);
     const ml = self.moe_layers orelse return false;
     if (!self.hasRecurrentLayers()) return true;
     for (ctxs) |c| {
@@ -55,7 +53,7 @@ pub fn supportsBatchedGdnDecode(self: *const Transformer) bool {
     // --max-concurrent clamp so the two cannot disagree about whether
     // this model batches.
     if (!self.config.supportsBatchedGdnDecode()) return false;
-    if (self.plugin != null or self.qwen4 != null) return true;
+    if (self.plugin != null) return true;
     // Built-state question: this path reads `moe_layers` and the GDN
     // ssm entries, so the trunk must actually be that shape.
     if (self.moe_layers == null) return false;

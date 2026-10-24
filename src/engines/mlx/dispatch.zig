@@ -42,7 +42,7 @@ pub const module_owned_state_fields = [_][]const u8{"mlx_stream_ext"};
 /// pooled blocks), so slots interleave AND batch freely. The one
 /// module-owned piece on this arch is the MTP head's cache, and the
 /// scheduler makes the SLOT that uses it exclusive (`slotExclusiveDecode`).
-pub const module_shared_readonly_fields = [_][]const u8{"qwen4"};
+pub const module_shared_readonly_fields = [_][]const u8{};
 
 /// A served model's caps; null on the legacy path.
 fn servedCaps(self: *const Transformer) ?abi.Caps {
@@ -105,8 +105,7 @@ pub fn moduleStateSpecRollback(self: *const Transformer) bool {
     // qwen4_exp: GDN per-position capture + PLE window/token capture +
     // positional QSA key histories (`ssmRollbackFromCapture`), so the MTP
     // head's verify can rewind. dsv4 cannot.
-    const t = self.qwen4 orelse return false;
-    return t.qwen4_mtp != null;
+    return false;
 }
 
 /// Is this arch's MTP head the checkpoint's OWN trained layer AND measured
@@ -131,7 +130,6 @@ pub fn forwardWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_arra
     if (self.mlx_stream_ext) |m| return forwardMlxStream(self, ctx, token_ids, m);
     // EmbeddingGemma (a bidirectional gemma3 trunk) never runs causal decode.
     if (self.config.use_bidirectional_attention) return self.forwardGemma3EncoderWith(ctx, token_ids);
-    if (self.qwen4) |t| return t.forwardWith(ctx, token_ids);
     if (self.config.isGlm5()) return self.forwardGlm5With(ctx, token_ids);
     if (self.moe_layers != null) return self.forwardMoeWith(ctx, token_ids);
     return self.forwardStandardWith(ctx, token_ids);
@@ -169,19 +167,10 @@ test "ownsModuleDecodeState covers every module-owned arch" {
     t.plugin = null;
     t.rht = null;
     t.mlx_stream_ext = null;
-    t.qwen4 = null;
     try testing.expect(!t.ownsModuleDecodeState());
 
     var fake_ext: mlx_stream_mod.Model = undefined;
     t.mlx_stream_ext = &fake_ext;
-    try testing.expect(t.ownsModuleDecodeState());
-    t.mlx_stream_ext = null;
-    var trunk: @import("../../plugins/qwen4_exp/trunk.zig").Trunk = undefined;
-    trunk.dist_peer = null;
-    t.qwen4 = &trunk;
-    try testing.expect(!t.ownsModuleDecodeState());
-    var fake_peer: distributed_mod.Peer = undefined;
-    trunk.dist_peer = &fake_peer;
     try testing.expect(t.ownsModuleDecodeState());
 }
 
