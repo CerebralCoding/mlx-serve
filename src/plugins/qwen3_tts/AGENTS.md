@@ -24,7 +24,7 @@ answers `{"warmed":true,"cache":"hit"|"miss"}`). Generation stops at codec EOS o
 - `sdk/blocks/mlp/gelu.geluErf` (ConvNeXt GELU), `sdk/blocks/vae/snake.snakeBetaLog` (decoder SnakeBeta).
 
 ## Levers
-`MLX_SERVE_TTS_{GPU_PREDICT,COMPILE,CP_CACHE,ASYNC_STRIDE,ADD_RMSNORM,SPK_CACHE}` (kill switches; P5 moves them).
+Diag `tts-trace` only.
 
 ## Fixtures
 - `conformanceFixture`: talker + predictor at hidden 32 (one layer each), byte-level tokenizer, decoder at latent

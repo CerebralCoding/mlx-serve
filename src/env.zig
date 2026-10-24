@@ -317,7 +317,6 @@ pub const vars = struct {
     pub const MLX_SERVE_SSD_WRITE_THROUGH: Var = .{ .kind = .public, .type = .flag, .default = "writeThroughEnabledFromEnv(null)", .owner = "engines/mlx", .since = "26.9.2", .doc = "SSD tier write-through at commit" };
 
     // ── tuning numbers ──
-    pub const DFLASH_GATE_WARMUP: Var = .{ .kind = .tuning, .type = .int, .default = "DFLASH_GATE_WARMUP", .owner = "engines/mlx/spec", .since = "26.8.6", .doc = "rounds before the DFlash yield gate decides" };
     pub const MLX_SERVE_LAYA_BATCH_WINDOW_US: Var = .{ .kind = .public, .type = .int, .default = "0", .owner = "host/media_jobs", .since = "26.9.6", .doc = "Laya decision batch window, microseconds" };
     pub const MLX_SERVE_LAYA_MAX_INPUT_TOKENS: Var = .{ .kind = .public, .type = .int, .default = "DecisionLimits default", .owner = "host/media_jobs", .since = "26.9.6", .doc = "Laya input token limit" };
     pub const MLX_SERVE_LAYA_MAX_QUESTIONS: Var = .{ .kind = .public, .type = .int, .default = "DecisionLimits default", .owner = "host/media_jobs", .since = "26.9.6", .doc = "Laya questions per request limit" };
