@@ -1,9 +1,14 @@
-//! The dense QSA visibility mask from block picks, and the MTP head's placed-row positions and visibility.
+//! The dense key mask of block picks, and the masked attention arm that reads it.
 
 const std = @import("std");
-const mlx = @import("../../../mlx/ffi.zig");
-const qsa_row_mask = @import("../qsa_mask.zig");
-const Trunk = @import("../trunk.zig").Trunk;
+const mlx = @import("../../../../mlx/ffi.zig");
+const qsa_row_mask = @import("row_mask.zig");
+const ops = @import("../../../../mlx/ops.zig");
+const Graph = ops.Graph;
+const Blocks = @import("params.zig").Blocks;
+const scalarOf = @import("../../../../mlx/array.zig").scalarOf;
+const fusedSdpa256Masked = @import("../attn256.zig").fusedSdpa256Masked;
+const splitMaskedSdpa256 = @import("../sdpa.zig").splitMaskedSdpa256;
 
 /// Dense [B,1,S,kv] bool mask equivalent to a block selection (fallback arm
 /// + fixture trace): the selected blocks' tokens ∪ each row's own incomplete
@@ -41,84 +46,6 @@ pub fn qsaMaskFromBlocks(s: mlx.mlx_stream, blocks: mlx.mlx_array, kv: c_int, ra
 /// selected blocks' tokens (zero-padded to kv) ∪ each query's own incomplete
 /// tail (tokens at/after ratio*floor((p+1)/ratio) — always visible), ∧ the
 /// causal bound. `offset` is the cache position of row 0.
-/// `[1]` int32 RoPE position of a placed draft row: `live_end + (slot - dead_end)`, with the
-/// head's absolute origin folded into `shift` (`pos_base + slot - dead_end`).
-pub fn headPlaceRopePos(s: mlx.mlx_stream, p: *const Trunk.HeadPlace, shift: c_int) !mlx.mlx_array {
-    const shift_v = mlx.mlx_array_new_int(shift);
-    defer _ = mlx.mlx_array_free(shift_v);
-    var pos = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(pos);
-    try mlx.check(mlx.mlx_add(&pos, p.live_end, shift_v, s));
-    var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_reshape(&out, pos, &[_]c_int{1}, 1, s));
-    return out;
-}
-
-/// Block scores with every block that reaches a dead row (or lies past one) at -inf, so a
-/// dead row's pooled key can never win or displace a top-k pick.
-pub fn headPlaceScores(s: mlx.mlx_stream, scores: mlx.mlx_array, p: *const Trunk.HeadPlace, ratio: c_int, nb: c_int) !mlx.mlx_array {
-    const ratio_v = mlx.mlx_array_new_int(ratio);
-    defer _ = mlx.mlx_array_free(ratio_v);
-    var eligible_n = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(eligible_n);
-    try mlx.check(mlx.mlx_floor_divide(&eligible_n, p.live_end, ratio_v, s));
-    var blk = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(blk);
-    try mlx.check(mlx.mlx_arange(&blk, 0, @floatFromInt(nb), 1, .int32, s));
-    var eligible = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(eligible);
-    try mlx.check(mlx.mlx_less(&eligible, blk, eligible_n, s));
-    const floor_v = mlx.mlx_array_new_float(-std.math.inf(f32));
-    defer _ = mlx.mlx_array_free(floor_v);
-    var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_where(&out, eligible, scores, floor_v, s));
-    return out;
-}
-
-/// Key visibility `[1,1,1,kv]` for a placed draft row: every row but the dead ones, narrowed
-/// by the QSA selection when there is one. Rows from the first block that reaches a dead row
-/// on stay visible, since `headPlaceScores` keeps those blocks out of the selection.
-pub fn headPlaceVisibility(s: mlx.mlx_stream, qsa_mask: mlx.mlx_array, p: *const Trunk.HeadPlace, ratio: c_int, kv: c_int) !mlx.mlx_array {
-    var r = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(r);
-    try mlx.check(mlx.mlx_arange(&r, 0, @floatFromInt(kv), 1, .int32, s));
-    var live = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(live);
-    try mlx.check(mlx.mlx_less(&live, r, p.live_end, s));
-    const dead_end_v = mlx.mlx_array_new_int(p.dead_end);
-    defer _ = mlx.mlx_array_free(dead_end_v);
-    var past = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(past);
-    try mlx.check(mlx.mlx_greater_equal(&past, r, dead_end_v, s));
-    var not_dead = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(not_dead);
-    try mlx.check(mlx.mlx_logical_or(&not_dead, live, past, s));
-    var vis = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(vis);
-    if (qsa_mask.ctx == null) {
-        try mlx.check(mlx.mlx_array_set(&vis, not_dead));
-    } else {
-        const ratio_v = mlx.mlx_array_new_int(ratio);
-        defer _ = mlx.mlx_array_free(ratio_v);
-        var blocks = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(blocks);
-        try mlx.check(mlx.mlx_floor_divide(&blocks, p.live_end, ratio_v, s));
-        var recent_from = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(recent_from);
-        try mlx.check(mlx.mlx_multiply(&recent_from, blocks, ratio_v, s));
-        var recent = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(recent);
-        try mlx.check(mlx.mlx_greater_equal(&recent, r, recent_from, s));
-        var picked = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(picked);
-        try mlx.check(mlx.mlx_logical_or(&picked, qsa_mask, recent, s));
-        try mlx.check(mlx.mlx_logical_and(&vis, picked, not_dead, s));
-    }
-    var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_reshape(&out, vis, &[_]c_int{ 1, 1, 1, kv }, 4, s));
-    return out;
-}
-
 pub fn qsaMaskFromBlockSel(s: mlx.mlx_stream, blk_sel: mlx.mlx_array, offset: c_int, seq_len: c_int, kv: c_int, nb: c_int, ratio: c_int, batch: c_int) !mlx.mlx_array {
     var pos_col = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(pos_col);
@@ -184,4 +111,40 @@ pub fn qsaMaskFromBlockSel(s: mlx.mlx_stream, blk_sel: mlx.mlx_array, offset: c_
     var mask = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_reshape(&mask, mask3, &[_]c_int{ batch, 1, seq_len, kv }, 4, s));
     return mask;
+}
+
+/// The key mask of picks `[1, lists * rows, K]` for the last `rows` queries of a `kv`-key cache: each list's blocks
+/// and the rows' tails, `[1, 1, rows, kv]` with one list, else `[1, heads, rows, kv]` with q head h reading list
+/// h / (heads / lists).
+pub fn picksMask(a: std.mem.Allocator, s: mlx.mlx_stream, b: Blocks, picks: mlx.mlx_array, rows: c_int, kv: c_int, heads: c_int) !mlx.mlx_array {
+    var g = Graph.init(a, s);
+    defer g.deinit();
+    const ps = ops.shape(picks);
+    const lists = @divExact(ps[1], rows);
+    const m = try g.adopt(try qsaMaskFromBlocks(s, try g.reshape(picks, &.{ lists, rows, ps[2] }), kv, @intCast(b.size)));
+    if (lists == 1) return g.escape(m);
+    const per = @divExact(heads, lists);
+    const wide = try g.broadcast(try g.reshape(m, &.{ 1, lists, 1, rows, kv }), &.{ 1, lists, per, rows, kv });
+    return g.escape(try g.reshape(wide, &.{ 1, heads, rows, kv }));
+}
+
+/// The dense-mask arm: the fused masked kernel, the split vector sdpa, then stock sdpa.
+pub fn qsaMaskArm(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, mask: mlx.mlx_array) !mlx.mlx_array {
+    if (try fusedSdpa256Masked(s, q, k, v, scale, mask)) |o| return o;
+    if (try splitMaskedSdpa256(s, q, k, v, scale, mask)) |o| return o;
+    // MLX's CUDA SDPA turns a bool mask into 0 / -inf after broadcasting it over the heads, three
+    // [B, H, S, kv] arrays; the same values over one head reach cuDNN as a broadcast view.
+    var additive = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(additive);
+    if (mlx.cudaAvailable() and mlx.mlx_array_dtype(mask) == .bool_) {
+        const zero = try scalarOf(0, mlx.mlx_array_dtype(q), s);
+        defer _ = mlx.mlx_array_free(zero);
+        const neg_inf = try scalarOf(-std.math.inf(f32), mlx.mlx_array_dtype(q), s);
+        defer _ = mlx.mlx_array_free(neg_inf);
+        try mlx.check(mlx.mlx_where(&additive, mask, zero, neg_inf, s));
+    } else try mlx.check(mlx.mlx_array_set(&additive, mask));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out, q, k, v, scale, "array", additive, .{ .ctx = null }, false, s));
+    return out;
 }

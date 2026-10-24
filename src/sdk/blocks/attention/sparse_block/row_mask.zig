@@ -3,13 +3,13 @@
 //! launches per attention layer; the mask is just "this token's block is in the sorted selection, or
 //! the token is in the incomplete tail" (every key of a one-row step is causal-visible).
 const std = @import("std");
-const kernelSource = @import("../../mlx/kernels.zig").source;
-const mlx = @import("../../mlx/ffi.zig");
-const log = @import("../../sdk/util/log.zig");
+const kernelSource = @import("../../../../mlx/kernels.zig").source;
+const mlx = @import("../../../../mlx/ffi.zig");
+const log = @import("../../../util/log.zig");
 
 // grid (kv), one thread a token. `blocks` is sorted ascending with INT_MAX sentinels, so a binary
 // search finds a token's block; a sentinel never equals a block id.
-pub const SOURCE = kernelSource("plugins/qwen4_exp/kernels/qsa_mask.metal");
+pub const SOURCE = kernelSource("kernels/attention/qsa_mask.metal");
 
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
 var engaged = false;
@@ -64,7 +64,6 @@ pub fn rowMask(s: mlx.mlx_stream, blocks: mlx.mlx_array, kv: c_int, ratio: c_int
 const testing = std.testing;
 
 test "qsa mask: the one-row kernel equals the op chain for sorted selections with sentinels and tails" {
-    const xfm = @import("../../engines/mlx/transformer.zig");
     defer override = null;
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x9A5C);
@@ -94,7 +93,7 @@ test "qsa mask: the one-row kernel equals the op chain for sorted selections wit
         defer _ = mlx.mlx_array_free(blocks);
 
         override = false;
-        const want = try xfm.qsaMaskFromBlocks(s, blocks, c.kv, ratio);
+        const want = try @import("mask.zig").qsaMaskFromBlocks(s, blocks, c.kv, ratio);
         override = true;
         const got = (try rowMask(s, blocks, c.kv, ratio)) orelse return error.KernelDeclined;
         defer _ = mlx.mlx_array_free(want);

@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const transformer_mod = @import("../transformer.zig");
+const sparse_score = @import("../../../sdk/blocks/attention/sparse_block/score.zig");
 const generate_mod = @import("../generate.zig");
 const model_mod = @import("../model.zig");
 const prefix_cache_mod = @import("../cache/prefix_cache.zig");
@@ -75,10 +76,10 @@ pub fn longCtxTestConfig() model_mod.ModelConfig {
 /// 2 KV heads (13,056 B/tok at 8-bit); a 128-wide QSA indexer at ratio 4.
 pub fn qsaScoreFusedOffGuard() struct {
     pub fn deinit(_: @This()) void {
-        transformer_mod.qsa_score_fused_override = null;
+        sparse_score.qsa_score_fused_override = null;
     }
 } {
-    transformer_mod.qsa_score_fused_override = false;
+    sparse_score.qsa_score_fused_override = false;
     return .{};
 }
 
@@ -290,19 +291,19 @@ test "an explicit --prefill-chunk is the chunk that gets BILLED" {
 }
 
 test "qwen4RequestTestConfig does not leak qsa_score_fused_override" {
-    const saved = transformer_mod.qsa_score_fused_override;
-    defer transformer_mod.qsa_score_fused_override = saved;
-    transformer_mod.qsa_score_fused_override = null;
+    const saved = sparse_score.qsa_score_fused_override;
+    defer sparse_score.qsa_score_fused_override = saved;
+    sparse_score.qsa_score_fused_override = null;
     _ = qwen4RequestTestConfig();
-    try std.testing.expectEqual(@as(?bool, null), transformer_mod.qsa_score_fused_override);
+    try std.testing.expectEqual(@as(?bool, null), sparse_score.qsa_score_fused_override);
 }
 
 test "a warm append is billed the rows it ALLOCATES, not the rows it already holds" {
     // Bar: a checked-out restore credits the rows it holds even when the append outgrows the
     // buffer; the grow bills the new capacity plus one eval window of old buffers.
     const t = std.testing;
-    transformer_mod.qsa_score_fused_override = false;
-    defer transformer_mod.qsa_score_fused_override = null;
+    sparse_score.qsa_score_fused_override = false;
+    defer sparse_score.qsa_score_fused_override = null;
     const mb: u64 = 1024 * 1024;
     const cfg = qwen4ExpLive364kConfig();
     const kv_bits: u64 = 8;
@@ -1076,11 +1077,11 @@ pub fn qwen4ExpOomConfig() model_mod.ModelConfig {
 }
 
 test "qwen4ExpOomConfig does not leak qsa_score_fused_override" {
-    const saved = transformer_mod.qsa_score_fused_override;
-    defer transformer_mod.qsa_score_fused_override = saved;
-    transformer_mod.qsa_score_fused_override = null;
+    const saved = sparse_score.qsa_score_fused_override;
+    defer sparse_score.qsa_score_fused_override = saved;
+    sparse_score.qsa_score_fused_override = null;
     _ = qwen4ExpOomConfig();
-    try std.testing.expectEqual(@as(?bool, null), transformer_mod.qsa_score_fused_override);
+    try std.testing.expectEqual(@as(?bool, null), sparse_score.qsa_score_fused_override);
 }
 
 test "the 458k prefill's two unbilled terms are billed: retained checkpoints and reserved capacity" {
@@ -1180,8 +1181,8 @@ fn oomBillFor(cfg: *const model_mod.ModelConfig, seq: u64, chunk: u64, terms: Pr
 
 test "an omitted max_tokens reserves a generation HEADROOM, not the rest of the context" {
     const t = std.testing;
-    transformer_mod.qsa_score_fused_override = false;
-    defer transformer_mod.qsa_score_fused_override = null;
+    sparse_score.qsa_score_fused_override = false;
+    defer sparse_score.qsa_score_fused_override = null;
     // A 383,067-token prompt with no `max_tokens` was admitted by eviction and then refused on
     // the inference thread: `clampMaxTokens` made the reservation cover the whole context
     // (~13 GB for a generation that would never run). The reservation exists to stop buffer
@@ -1224,8 +1225,8 @@ test "an omitted max_tokens reserves a generation HEADROOM, not the rest of the 
 test "the QSA history is billed at the copies a slot HOLDS: one with the commit handoff, two with a lever off, plus the score bank" {
     const t = std.testing;
     const cfg = qwen4ExpOomConfig();
-    transformer_mod.qsa_score_fused_override = false;
-    defer transformer_mod.qsa_score_fused_override = null;
+    sparse_score.qsa_score_fused_override = false;
+    defer sparse_score.qsa_score_fused_override = null;
     const one = cfg.qsaHistoryBytesPerToken();
     const bank = cfg.qsaScoreBankBytesPerToken();
     try t.expect(one > 0);
@@ -1316,8 +1317,8 @@ const CheckoutCase = struct {
 
 test "the warm KV credit fires ONLY where the restore checked its entry out" {
     const t = std.testing;
-    transformer_mod.qsa_score_fused_override = false;
-    defer transformer_mod.qsa_score_fused_override = null;
+    sparse_score.qsa_score_fused_override = false;
+    defer sparse_score.qsa_score_fused_override = null;
     // `KVCache.restore` binds by refcount and mlx donates only at `use_count() == 1`, so on a
     // shared restore the first `writeAtOffset` copies the whole prefix: the credited bytes are
     // allocated. Only the checkout makes the credit true; it used to fire on `matched > 0` alone.
@@ -1573,8 +1574,8 @@ test "a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's
     // of the bill was 32 SSM checkpoints; a warm prefill forwards a 3,730-token tail and captures
     // at most one, and the entry's own checkpoints are already resident and merged at commit.
     const t = std.testing;
-    transformer_mod.qsa_score_fused_override = false;
-    defer transformer_mod.qsa_score_fused_override = null;
+    sparse_score.qsa_score_fused_override = false;
+    defer sparse_score.qsa_score_fused_override = null;
     const cfg = qwen4ExpLive364kConfig();
     const mb: u64 = 1024 * 1024;
     const per_cp = cfg.ssmCheckpointBytes();

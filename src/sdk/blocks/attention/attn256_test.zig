@@ -15,7 +15,7 @@ const fusedSdpa256Masked = attn256.fusedSdpa256Masked;
 const fusedSdpa256Prefill = attn256.fusedSdpa256Prefill;
 const fusedSinkAttnPrefill = attn256.fusedSinkAttnPrefill;
 const attn256QsaMask = @import("../../../plugins/qwen4_exp/qsa/gather.zig").attn256QsaMask;
-const qsaMaskArm = @import("../../../plugins/qwen4_exp/qsa/sparse_attn.zig").qsaMaskArm;
+const qsaMaskArm = @import("sparse_block/mask.zig").qsaMaskArm;
 
 // ── fused hd-256 prefill attention parity ──
 

@@ -7,9 +7,9 @@
 //! n = pooled blocks, k = K.
 
 const std = @import("std");
-const mlx = @import("../../mlx/ffi.zig");
-const kc = @import("../../sdk/testing/kernel_contract/root.zig");
-const select = @import("qsa/select.zig");
+const mlx = @import("../../../../mlx/ffi.zig");
+const kc = @import("../../../testing/kernel_contract/root.zig");
+const select = @import("select.zig");
 
 const spec = kc.spec;
 const metal = kc.metal;
@@ -248,7 +248,7 @@ fn wrapper(k: *Select, split: bool) ![]const u8 {
     return k.rig.bytesOf(&.{out});
 }
 
-test "kernel contract qwen4_exp: qsa_select's declared launches, chained, are the shipped wrapper's bytes" {
+test "kernel contract sparse_block: qsa_select's declared launches, chained, are the shipped wrapper's bytes" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const a = std.testing.allocator;
     var single = Select.init(a, .single);

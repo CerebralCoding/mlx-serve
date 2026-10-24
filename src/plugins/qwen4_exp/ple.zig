@@ -29,7 +29,7 @@ const qwen4ReadF32 = @import("../../sdk/testing/parity.zig").qwen4ReadF32;
 const Qwen4TestSlot = @import("forward.zig").Qwen4TestSlot;
 const Qwen4Trace = @import("mtp.zig").Qwen4Trace;
 const ssmFreeQsaState = @import("qsa/history.zig").ssmFreeQsaState;
-const qsaArraysAllEqual = @import("qsa/select.zig").qsaArraysAllEqual;
+const qsaArraysAllEqual = @import("../../sdk/testing/parity.zig").qsaArraysAllEqual;
 const PleWeights = @import("weights.zig").PleWeights;
 
 pub var verify_fault_after_ple_row: ?usize = null;

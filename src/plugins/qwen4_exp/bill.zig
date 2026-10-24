@@ -4,7 +4,7 @@
 const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
 const gather_mod = @import("qsa/gather.zig");
-const score_mod = @import("qsa/score.zig");
+const score_mod = @import("../../sdk/blocks/attention/sparse_block/score.zig");
 const attn256 = @import("../../sdk/blocks/attention/attn256.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const qconfig = @import("config.zig");
@@ -109,26 +109,26 @@ test "qsaMaskBytes: a qwen4_exp twin bills the QSA mask and steps a rung the qwe
     try t.expectEqual(@as(u64, 4 * 8 * 25000 * 5 / 4), qsaMaskBytes(&q4, 8, 25000));
     transformer_mod.qsa_gather_override = true;
     defer transformer_mod.qsa_gather_override = null;
-    const saved_fused = transformer_mod.qsa_score_fused_override;
+    const saved_fused = score_mod.qsa_score_fused_override;
     const saved_nax = verify_qmm_nax.vqmm_nax_probe_override;
     defer {
-        transformer_mod.qsa_score_fused_override = saved_fused;
+        score_mod.qsa_score_fused_override = saved_fused;
         verify_qmm_nax.vqmm_nax_probe_override = saved_nax;
     }
     verify_qmm_nax.vqmm_nax_probe_override = false;
-    transformer_mod.qsa_score_fused_override = true;
+    score_mod.qsa_score_fused_override = true;
     const gathered_composed = qsaMaskBytes(&q4, 4096, 250_000);
     try t.expect(gathered_composed > 0);
     try t.expect(gathered_composed < 4 * 4096 * 250_000);
     try t.expectEqual(score_mod.qsaPrefillTransientBytes(4, 4096, 250_000, 4, 128), gathered_composed);
     verify_qmm_nax.vqmm_nax_probe_override = null;
-    transformer_mod.qsa_score_fused_override = true;
+    score_mod.qsa_score_fused_override = true;
     const gathered_fused = qsaMaskBytes(&q4, 4096, 250_000);
     try t.expectEqual(score_mod.qsaPrefillTransientBytes(4, 4096, 250_000, 4, 128), gathered_fused);
     if (score_mod.qsaScoreFusedActive()) {
         try t.expect(gathered_fused < gathered_composed);
     }
-    transformer_mod.qsa_score_fused_override = false;
+    score_mod.qsa_score_fused_override = false;
     verify_qmm_nax.vqmm_nax_probe_override = false;
     const gathered = qsaMaskBytes(&q4, 4096, 250_000);
     try t.expectEqual(gathered_composed, gathered);

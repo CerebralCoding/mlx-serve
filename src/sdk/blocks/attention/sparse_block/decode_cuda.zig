@@ -5,23 +5,23 @@
 //! the value sum stay in f32. Not MLX's summation order: held to no more error than the masked SDPA
 //! against an f64 truth.
 const std = @import("std");
-const kernelSource = @import("../../mlx/kernels.zig").source;
-const mlx = @import("../../mlx/ffi.zig");
+const kernelSource = @import("../../../../mlx/kernels.zig").source;
+const mlx = @import("../../../../mlx/ffi.zig");
 
 const CH: c_int = 32; // visible keys per warp, a multiple of 8 and of RATIO
 const BD: c_int = 256;
 /// Verify widths the row grid serves (the dense mask arm takes wider blocks).
 pub const MAX_ROWS: c_int = 16;
 
-const HEADER = kernelSource("plugins/qwen4_exp/kernels/qsa_decode_header.cu");
+const HEADER = kernelSource("kernels/attention/qsa_decode_header.cu");
 
 // Grid (NS splits, Hk, rows): a block of GQA warps, warp w the q head hk * GQA + w. Row r is the
 // cache position kv - rows + r: it sees its own picks that are complete blocks before it, and its
 // own incomplete tail.
-const PARTS_SOURCE = kernelSource("plugins/qwen4_exp/kernels/qsa_decode_parts.cu");
+const PARTS_SOURCE = kernelSource("kernels/attention/qsa_decode_parts.cu");
 
 // Block per (head, row), thread per dim. An empty split writes l = 0, the skip flag.
-const MERGE_SOURCE = kernelSource("plugins/qwen4_exp/kernels/qsa_decode_merge.cu");
+const MERGE_SOURCE = kernelSource("kernels/attention/qsa_decode_merge.cu");
 
 var parts_kernel: ?mlx.mlx_fast_cuda_kernel = null;
 var merge_kernel: ?mlx.mlx_fast_cuda_kernel = null;
@@ -111,7 +111,7 @@ pub fn attend(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_
 
 const testing = std.testing;
 
-fn randomBf16(s: mlx.mlx_stream, shape: []const c_int, seed: u64) !mlx.mlx_array {
+pub fn randomBf16(s: mlx.mlx_stream, shape: []const c_int, seed: u64) !mlx.mlx_array {
     var key = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(key);
     try mlx.check(mlx.mlx_random_key(&key, seed));
@@ -124,7 +124,7 @@ fn randomBf16(s: mlx.mlx_stream, shape: []const c_int, seed: u64) !mlx.mlx_array
     return b;
 }
 
-fn hostF32(s: mlx.mlx_stream, a: mlx.mlx_array) !struct { arr: mlx.mlx_array, data: []const f32 } {
+pub fn hostF32(s: mlx.mlx_stream, a: mlx.mlx_array) !struct { arr: mlx.mlx_array, data: []const f32 } {
     var f = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(f);
     try mlx.check(mlx.mlx_astype(&f, a, .float32, s));
@@ -133,113 +133,9 @@ fn hostF32(s: mlx.mlx_stream, a: mlx.mlx_array) !struct { arr: mlx.mlx_array, da
     return .{ .arr = f, .data = p[0..mlx.mlx_array_size(f)] };
 }
 
-test "qsa decode cuda: the one-token kernel is no worse than the gathered SDPA against the f64 truth" {
-    if (!mlx.cudaAvailable()) return error.SkipZigTest;
-    const xfm = @import("../../engines/mlx/transformer.zig");
-    const s = mlx.gpuStream();
-    const hq: usize = 24;
-    const hk: usize = 2;
-    const gqa = hq / hk;
-    const kb: usize = 512;
-    const ratio: usize = 4;
-    const cap: usize = 12288;
-    const scale: f32 = 1.0 / 16.0;
-    var prng = std.Random.DefaultPrng.init(0xDEC0DE);
-    const rnd = prng.random();
-    for ([_]usize{ 2052, 2055, 4099, 8076, 11000 }, 0..) |kv, case| {
-        const q = try randomBf16(s, &[_]c_int{ 1, @intCast(hq), 1, BD }, 100 + case);
-        defer _ = mlx.mlx_array_free(q);
-        const kfull = try randomBf16(s, &[_]c_int{ 1, @intCast(hk), @intCast(cap), BD }, 200 + case);
-        defer _ = mlx.mlx_array_free(kfull);
-        const vfull = try randomBf16(s, &[_]c_int{ 1, @intCast(hk), @intCast(cap), BD }, 300 + case);
-        defer _ = mlx.mlx_array_free(vfull);
-        // The cache views a decode step sees: a leading slice of a larger buffer.
-        var kview = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(kview);
-        var vview = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(vview);
-        const lo = [_]c_int{ 0, 0, 0, 0 };
-        const hi = [_]c_int{ 1, @intCast(hk), @intCast(kv), BD };
-        const st = [_]c_int{ 1, 1, 1, 1 };
-        try mlx.check(mlx.mlx_slice(&kview, kfull, &lo, 4, &hi, 4, &st, 4, s));
-        try mlx.check(mlx.mlx_slice(&vview, vfull, &lo, 4, &hi, 4, &st, 4, s));
-
-        const nb = kv / ratio;
-        const pool = try testing.allocator.alloc(i32, nb);
-        defer testing.allocator.free(pool);
-        for (pool, 0..) |*p, i| p.* = @intCast(i);
-        rnd.shuffle(i32, pool);
-        const sel = try testing.allocator.dupe(i32, pool[0..kb]);
-        defer testing.allocator.free(sel);
-        std.mem.sort(i32, sel, {}, std.sort.asc(i32));
-        const blocks = mlx.mlx_array_new_data(sel.ptr, &[_]c_int{ 1, 1, @intCast(kb) }, 3, .int32);
-        defer _ = mlx.mlx_array_free(blocks);
-
-        // f64 truth over the same bf16 values.
-        const qh = try hostF32(s, q);
-        defer _ = mlx.mlx_array_free(qh.arr);
-        const kh = try hostF32(s, kview);
-        defer _ = mlx.mlx_array_free(kh.arr);
-        const vh = try hostF32(s, vview);
-        defer _ = mlx.mlx_array_free(vh.arr);
-        var pos_list: std.ArrayList(usize) = .empty;
-        defer pos_list.deinit(testing.allocator);
-        for (sel) |b| for (0..ratio) |r| try pos_list.append(testing.allocator, @as(usize, @intCast(b)) * ratio + r);
-        var t = nb * ratio;
-        while (t < kv) : (t += 1) try pos_list.append(testing.allocator, t);
-        const truth = try testing.allocator.alloc(f64, hq * BD);
-        defer testing.allocator.free(truth);
-        const sc = try testing.allocator.alloc(f64, pos_list.items.len);
-        defer testing.allocator.free(sc);
-        for (0..hq) |h| {
-            const g = h / gqa;
-            var mx: f64 = -std.math.inf(f64);
-            for (pos_list.items, 0..) |pos, i| {
-                var dot: f64 = 0;
-                for (0..BD) |d| dot += @as(f64, qh.data[h * BD + d]) * @as(f64, kh.data[(g * kv + pos) * BD + d]);
-                sc[i] = dot * scale;
-                mx = @max(mx, sc[i]);
-            }
-            var z: f64 = 0;
-            for (sc) |*x| {
-                x.* = @exp(x.* - mx);
-                z += x.*;
-            }
-            for (0..BD) |d| {
-                var o: f64 = 0;
-                for (pos_list.items, 0..) |pos, i| o += sc[i] * @as(f64, vh.data[(g * kv + pos) * BD + d]);
-                truth[h * BD + d] = o / z;
-            }
-        }
-
-        const got = (try attend(s, q, kview, vview, blocks, @intCast(ratio), scale)) orelse return error.KernelDeclined;
-        defer _ = mlx.mlx_array_free(got);
-        // The arm it replaces on CUDA: gather the picks and the tail, then the masked SDPA.
-        var view: xfm.DenseKVView = .{ .k = kview, .v = vview, .owned = false };
-        const stock = (try xfm.qsaDecodeGatherAttn(s, q, &view, blocks, @intCast(ratio), scale)) orelse return error.StockDeclined;
-        defer _ = mlx.mlx_array_free(stock);
-        const gh = try hostF32(s, got);
-        defer _ = mlx.mlx_array_free(gh.arr);
-        const sh = try hostF32(s, stock);
-        defer _ = mlx.mlx_array_free(sh.arr);
-        try testing.expectEqual(hq * BD, gh.data.len);
-        var e_got: f64 = 0;
-        var e_stock: f64 = 0;
-        for (truth, 0..) |tv, i| {
-            try testing.expect(std.math.isFinite(gh.data[i]));
-            e_got += (@as(f64, gh.data[i]) - tv) * (@as(f64, gh.data[i]) - tv);
-            e_stock += (@as(f64, sh.data[i]) - tv) * (@as(f64, sh.data[i]) - tv);
-        }
-        const rms_got = @sqrt(e_got / @as(f64, @floatFromInt(truth.len)));
-        const rms_stock = @sqrt(e_stock / @as(f64, @floatFromInt(truth.len)));
-        std.debug.print("[qsa-dec cuda parity] kv={d} rms_err kernel={e:.3} stock={e:.3}\n", .{ kv, rms_got, rms_stock });
-        try testing.expect(rms_got <= rms_stock);
-    }
-}
-
 test "qsa decode cuda: verify rows are no worse than the dense mask arm against the f64 truth" {
     if (!mlx.cudaAvailable()) return error.SkipZigTest;
-    const xfm = @import("../../engines/mlx/transformer.zig");
+    const mask_mod = @import("mask.zig");
     const s = mlx.gpuStream();
     const a = testing.allocator;
     const hq: usize = 24;
@@ -323,9 +219,9 @@ test "qsa decode cuda: verify rows are no worse than the dense mask arm against 
         const got = (try attend(s, q, k, v, blocks, @intCast(ratio), scale)) orelse return error.KernelDeclined;
         defer _ = mlx.mlx_array_free(got);
         // The arm it replaces on CUDA: the dense [S, kv] mask, then SDPA.
-        const mask = try xfm.qsaMaskFromBlocks(s, blocks, @intCast(c.kv), @intCast(ratio));
+        const mask = try mask_mod.qsaMaskFromBlocks(s, blocks, @intCast(c.kv), @intCast(ratio));
         defer _ = mlx.mlx_array_free(mask);
-        const stock = try xfm.qsaMaskArm(s, q, k, v, scale, mask);
+        const stock = try mask_mod.qsaMaskArm(s, q, k, v, scale, mask);
         defer _ = mlx.mlx_array_free(stock);
         const gh = try hostF32(s, got);
         defer _ = mlx.mlx_array_free(gh.arr);

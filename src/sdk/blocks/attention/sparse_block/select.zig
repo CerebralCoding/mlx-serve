@@ -2,20 +2,20 @@
 //! at decode.
 
 const std = @import("std");
-const kernelSource = @import("../../../mlx/kernels.zig").source;
-const mlx = @import("../../../mlx/ffi.zig");
-const log = @import("../../../sdk/util/log.zig");
-const mtp = @import("../mtp.zig");
-const testing = @import("../../../engines/mlx/kv/cache.zig").testing;
-const Transformer = @import("../trunk.zig").Trunk;
-const QsaCfgCache = @import("../../../mlx/kernel_cache.zig").QsaCfgCache;
-const attn256MaxDiff = @import("../../../sdk/blocks/attention/attn256.zig").attn256MaxDiff;
-const OneShotBits = @import("arms.zig").OneShotBits;
-const qsaWidthBucket = @import("arms.zig").qsaWidthBucket;
-const headPlaceScores = @import("mask.zig").headPlaceScores;
-const headPlaceVisibility = @import("mask.zig").headPlaceVisibility;
-const qsaAllBlocksVisible = @import("pooled.zig").qsaAllBlocksVisible;
-const qsaSelectComposedOps = @import("score.zig").qsaSelectComposedOps;
+const kernelSource = @import("../../../../mlx/kernels.zig").source;
+const mlx = @import("../../../../mlx/ffi.zig");
+const log = @import("../../../util/log.zig");
+const QsaCfgCache = @import("../../../../mlx/kernel_cache.zig").QsaCfgCache;
+const attn256MaxDiff = @import("../attn256.zig").attn256MaxDiff;
+const OneShotBits = @import("one_shot.zig").OneShotBits;
+const qsaWidthBucket = @import("one_shot.zig").widthBucket;
+const Blocks = @import("params.zig").Blocks;
+const ops = @import("../../../../mlx/ops.zig");
+const Graph = ops.Graph;
+const testing = std.testing;
+
+/// The block geometry the select tests run at (Qwen3.8-Flash-Next's).
+const blocks4: Blocks = .{ .size = 4, .top_k = 512 };
 
 // ── Fused QSA top-k block select (msv_qsa_select) ──
 //
@@ -25,7 +25,7 @@ const qsaSelectComposedOps = @import("score.zig").qsaSelectComposedOps;
 // `qsaChunkSelect`'s: top-K visible blocks per row, ties to the LOWER index (torch.topk),
 // emitted ascending, INT_MAX past the row's count. The tie rule is exact where the composed
 // arm's `b * 1e-7` bias only approximates it.
-pub const QSA_SELECT_KERNEL_HEADER = kernelSource("plugins/qwen4_exp/kernels/qsa_select_header.metal");
+pub const QSA_SELECT_KERNEL_HEADER = kernelSource("kernels/attention/qsa_select_header.metal");
 
 /// One threadgroup per query row. 1. MSD radix select over the 32-bit ordinal (the DIGITS
 /// template picks 11/11/10-bit digits at prefill widths or four 8-bit digits at decode widths,
@@ -35,20 +35,20 @@ pub const QSA_SELECT_KERNEL_HEADER = kernelSource("plugins/qwen4_exp/kernels/qsa
 /// selected elements with a smaller index (a simd prefix scan per chunk), so the output is
 /// born sorted. 3. Rows with `bounds[row] <= K` are `0 .. bounds-1` then INT_MAX.
 /// Threadgroup memory ~8.3 KiB at 2048 bins, ~1.3 KiB at 256.
-const QSA_SELECT_SHARED = kernelSource("plugins/qwen4_exp/kernels/qsa_select_shared.metal");
+const QSA_SELECT_SHARED = kernelSource("kernels/attention/qsa_select_shared.metal");
 
 // One radix-select body composed into three kernels (single row, row slice, merge) so a
 // fix to the digit walk or the tie rule lands once; the kernels differ only in setup.
-const QSA_SELECT_RADIX_BODY = kernelSource("plugins/qwen4_exp/kernels/qsa_select_radix_body.metal");
+const QSA_SELECT_RADIX_BODY = kernelSource("kernels/attention/qsa_select_radix_body.metal");
 
-const QSA_SELECT_SINGLE_SETUP = kernelSource("plugins/qwen4_exp/kernels/qsa_select_single_setup.metal");
+const QSA_SELECT_SINGLE_SETUP = kernelSource("kernels/attention/qsa_select_single_setup.metal");
 
-const QSA_SELECT_SLICE_SETUP = kernelSource("plugins/qwen4_exp/kernels/qsa_select_slice_setup.metal");
+const QSA_SELECT_SLICE_SETUP = kernelSource("kernels/attention/qsa_select_slice_setup.metal");
 
 // Candidates arrive ascending by ORIGINAL index with SENTINEL slots skipped, never sorted
 // in; that is what resolves a cross-slice tie at the K-th ordinal to the lowest index. Every
 // simd reduction below runs in a uniform base-stepped loop: a divergent simd_sum is undefined.
-const QSA_SELECT_MERGE_SETUP = kernelSource("plugins/qwen4_exp/kernels/qsa_select_merge_setup.metal");
+const QSA_SELECT_MERGE_SETUP = kernelSource("kernels/attention/qsa_select_merge_setup.metal");
 
 pub const QSA_SELECT_KERNEL_SOURCE = std.fmt.comptimePrint("{s}{s}{s}", .{ QSA_SELECT_SHARED, QSA_SELECT_SINGLE_SETUP, QSA_SELECT_RADIX_BODY });
 pub const QSA_SELECT_SPLIT_LOCAL_SOURCE = std.fmt.comptimePrint("{s}{s}{s}", .{ QSA_SELECT_SHARED, QSA_SELECT_SLICE_SETUP, QSA_SELECT_RADIX_BODY });
@@ -104,22 +104,6 @@ pub var qsa_select_kernel_override: ?bool = null;
 /// Fused QSA block select; the test seam's false runs the argpartition chain.
 pub fn qsaSelectKernelEnabled() bool {
     return qsa_select_kernel_override orelse true;
-}
-
-/// Per-row first-not-fully-visible block index (`b < (p+1)/ratio`). `all_vis` is the caller's
-/// own `qsaAllBlocksVisible` claim, honored verbatim so both arms answer the same question.
-pub fn qsaVisibleBoundsHost(out: []i32, row0: c_int, rows: c_int, nb: c_int, ratio: c_int, all_vis: bool) void {
-    const n: usize = @intCast(rows);
-    var r: usize = 0;
-    while (r < n) : (r += 1) {
-        if (all_vis) {
-            out[r] = nb;
-            continue;
-        }
-        const p: c_int = row0 + @as(c_int, @intCast(r));
-        const complete: c_int = if (p < 0) 0 else @divTrunc(p + 1, ratio);
-        out[r] = @min(nb, complete);
-    }
 }
 
 /// Fused replacement for the composed selection tail: f32 `[1, rows, nb]` scores + int32
@@ -178,7 +162,6 @@ pub fn qsaSelectTopBlocks(
     if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
-    mtp.qsa_index_select_graphs += 1;
     if (qsa_select_engaged_bits.take(qsaWidthBucket(rows))) {
         log.info(
             "[qsa-select] engaged (S={d} nb={d} k={d} tg={d})\n",
@@ -186,6 +169,121 @@ pub fn qsaSelectTopBlocks(
         );
     }
     return out;
+}
+
+// ── The composed selection arm (the kernel's reference) ──
+// Free functions so the parity test can run both arms on the same scores.
+
+/// argpartition of the visibility-masked scores; a tiny index-ascending bias reproduces
+/// torch.topk's lower-index-wins. A null-ctx `vis3` skips the mask op (all visible).
+pub fn qsaTopBlocksOps(s: mlx.mlx_stream, scores: mlx.mlx_array, vis3: mlx.mlx_array, tie_bias: mlx.mlx_array, nb: c_int, block_topk: c_int) !mlx.mlx_array {
+    var biased = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(biased);
+    try mlx.check(mlx.mlx_subtract(&biased, scores, tie_bias, s));
+    if (vis3.ctx == null) {
+        var part_all = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_argpartition_axis(&part_all, biased, nb - block_topk, -1, s));
+        return part_all;
+    }
+    const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+    defer _ = mlx.mlx_array_free(neg_inf);
+    var masked = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(masked);
+    try mlx.check(mlx.mlx_where(&masked, vis3, biased, neg_inf, s));
+    var part = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_argpartition_axis(&part, masked, nb - block_topk, -1, s));
+    return part;
+}
+
+/// Sort a `[1, rows, kb]` pick list ascending, mapping rejected picks to INT_MAX first.
+pub fn qsaSortWithInvisible(s: mlx.mlx_stream, top_idx: mlx.mlx_array, vis3: mlx.mlx_array, all_vis: bool) !mlx.mlx_array {
+    var sorted = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(sorted);
+    if (all_vis) {
+        try mlx.check(mlx.mlx_sort_axis(&sorted, top_idx, -1, s));
+        return sorted;
+    }
+    const int_max = mlx.mlx_array_new_int(std.math.maxInt(i32));
+    defer _ = mlx.mlx_array_free(int_max);
+    var picked_vis = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(picked_vis);
+    try mlx.check(mlx.mlx_take_along_axis(&picked_vis, vis3, top_idx, -1, s));
+    var sel = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sel);
+    try mlx.check(mlx.mlx_where(&sel, picked_vis, top_idx, int_max, s));
+    try mlx.check(mlx.mlx_sort_axis(&sorted, sel, -1, s));
+    return sorted;
+}
+
+/// The composed arm the fused kernel replaces, end to end.
+pub fn qsaSelectComposedOps(s: mlx.mlx_stream, scores: mlx.mlx_array, vis3: mlx.mlx_array, tie_bias: mlx.mlx_array, rows: c_int, nb: c_int, kb: c_int, block_topk: c_int, all_vis: bool) !mlx.mlx_array {
+    const strides3 = [_]c_int{ 1, 1, 1 };
+    const part = try qsaTopBlocksOps(s, scores, vis3, tie_bias, nb, block_topk);
+    defer _ = mlx.mlx_array_free(part);
+    var tail = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(tail);
+    try mlx.check(mlx.mlx_slice(&tail, part, &[_]c_int{ 0, 0, nb - kb }, 3, &[_]c_int{ 1, rows, nb }, 3, &strides3, 3, s));
+    var top_idx = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(top_idx);
+    try mlx.check(mlx.mlx_astype(&top_idx, tail, .int32, s));
+    return qsaSortWithInvisible(s, top_idx, vis3, all_vis);
+}
+
+// ── Picks under any `Blocks` ──
+
+/// f32 `[nb]` `b * 1e-7`: the index-ascending bias the composed chain breaks ties with (torch.topk's lower index).
+pub fn tieBias(s: mlx.mlx_stream, nb: c_int) !mlx.mlx_array {
+    var idx = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(idx);
+    try mlx.check(mlx.mlx_arange(&idx, 0, @floatFromInt(nb), 1.0, .float32, s));
+    const eps = mlx.mlx_array_new_float(1e-7);
+    defer _ = mlx.mlx_array_free(eps);
+    var bias = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_multiply(&bias, idx, eps, s));
+    return bias;
+}
+
+/// Picks `[1, lists * rows, min(top_k, nb)]` int32 of score rows `[1, lists * rows, nb]` f32 (list-major; row r of a
+/// list is the query at `row0 + r`): forced blocks win, ties go to the lower index, each row ascending with INT_MAX
+/// past its count, and a pick of the query's incomplete block dropped (its keys are the tail).
+pub fn selectPicks(a: std.mem.Allocator, s: mlx.mlx_stream, b: Blocks, scores: mlx.mlx_array, row0: c_int, rows: c_int) !mlx.mlx_array {
+    var g = Graph.init(a, s);
+    defer g.deinit();
+    const sh = ops.shape(scores);
+    const n = sh[1];
+    const nb = sh[2];
+    const lists = @divExact(n, rows);
+    const kb = @min(@as(c_int, @intCast(b.top_k)), nb);
+    const per: usize = @intCast(rows);
+    const bounds_host = try a.alloc(i32, @intCast(n));
+    defer a.free(bounds_host);
+    b.selectBounds(bounds_host[0..per], row0, nb, false);
+    for (1..@intCast(lists)) |l| @memcpy(bounds_host[l * per ..][0..per], bounds_host[0..per]);
+    const bounds = try g.fromSlice(i32, bounds_host, &.{n});
+    const pos = try g.reshape(try g.arange(@floatFromInt(row0), @floatFromInt(row0 + rows), 1, .int32), &.{ 1, rows, 1 });
+    const col = try g.reshape(try g.arange(0, @floatFromInt(nb), 1, .int32), &.{ 1, 1, nb });
+    const size = try g.adopt(mlx.mlx_array_new_int(@intCast(b.size)));
+    var sc = scores;
+    if (b.init > 0 or b.local > 0) {
+        const own = try g.call(mlx.mlx_floor_divide, .{ pos, size });
+        const after = try g.greater(col, try g.sub(own, try g.adopt(mlx.mlx_array_new_int(@intCast(b.local)))));
+        const local = try g.call(mlx.mlx_logical_and, .{ try g.call(mlx.mlx_less_equal, .{ col, own }), after });
+        const forced = try g.call(mlx.mlx_logical_or, .{ local, try g.less(col, try g.adopt(mlx.mlx_array_new_int(@intCast(b.init)))) });
+        const by_list = try g.reshape(scores, &.{ lists, rows, nb });
+        sc = try g.reshape(try g.where(forced, try g.scalar(std.math.inf(f32), .float32), by_list), &.{ 1, n, nb });
+    }
+    var picks = if (try qsaSelectTopBlocks(s, sc, bounds, kb)) |k| try g.adopt(k) else blk: {
+        const vis = try g.less(col, try g.reshape(bounds, &.{ 1, n, 1 }));
+        const tie = try g.adopt(try tieBias(s, nb));
+        break :blk try g.adopt(try qsaSelectComposedOps(s, sc, vis, tie, n, nb, kb, kb, false));
+    };
+    if (b.local > 0) {
+        const complete = try g.call(mlx.mlx_floor_divide, .{ try g.add(pos, try g.adopt(mlx.mlx_array_new_int(1))), size });
+        const by_list = try g.reshape(picks, &.{ lists, rows, kb });
+        const tail = try g.call(mlx.mlx_greater_equal, .{ by_list, complete });
+        picks = try g.reshape(try g.where(tail, try g.adopt(mlx.mlx_array_new_int(std.math.maxInt(i32))), by_list), &.{ 1, n, kb });
+    }
+    return g.escape(picks);
 }
 
 // One threadgroup per row is latency-bound at decode widths (0.72 ms at 215k blocks; ~20x
@@ -345,8 +443,6 @@ fn qsaSelectTopBlocksSplit(
     return out;
 }
 
-pub const qsaArraysAllEqual = @import("../../../sdk/testing/parity.zig").qsaArraysAllEqual;
-
 // ── tests ──
 
 pub fn qsaSelectCfgBuilds() usize {
@@ -357,259 +453,10 @@ pub fn qsaSelectSplitCfgBuilds() usize {
     return qsa_select_split_cfgs.builds;
 }
 
-test "head place: blocks reaching a dead row never score, and only dead rows are hidden" {
-    // Bar: live_end 9, dead_end 12, ratio 4: blocks 0..1 keep their scores, 2.. are -inf; rows 9..11 hidden, 8 recent.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const t = std.testing;
-    const s = mlx.gpuStream();
-    var place: Transformer.HeadPlace = .{ .live_end = mlx.mlx_array_new_int(9), .dead_end = 12 };
-    defer _ = mlx.mlx_array_free(place.live_end);
-
-    const raw = [_]f32{ 1, 2, 30, 40 };
-    const scores = mlx.mlx_array_new_data(&raw, &[_]c_int{ 1, 1, 4 }, 3, .float32);
-    defer _ = mlx.mlx_array_free(scores);
-    const got = try headPlaceScores(s, scores, &place, 4, 4);
-    defer _ = mlx.mlx_array_free(got);
-    try mlx.check(mlx.mlx_array_eval(got));
-    const g = mlx.mlx_array_data_float32(got).?[0..4];
-    try t.expectEqual(@as(f32, 1), g[0]);
-    try t.expectEqual(@as(f32, 2), g[1]);
-    try t.expect(std.math.isNegativeInf(g[2]) and std.math.isNegativeInf(g[3]));
-
-    // Selection picks block 0 only; rows 8.. are the recent run, 9..11 dead, 12..13 drafts.
-    var sel_raw: [14]bool = @splat(false);
-    for (0..4) |i| sel_raw[i] = true;
-    const sel = mlx.mlx_array_new_data(&sel_raw, &[_]c_int{ 1, 1, 1, 14 }, 4, .bool_);
-    defer _ = mlx.mlx_array_free(sel);
-    const want = [_]bool{ true, true, true, true, false, false, false, false, true, false, false, false, true, true };
-    const vis = try headPlaceVisibility(s, sel, &place, 4, 14);
-    defer _ = mlx.mlx_array_free(vis);
-    try mlx.check(mlx.mlx_array_eval(vis));
-    try t.expectEqualSlices(bool, &want, mlx.mlx_array_data_bool(vis).?[0..14]);
-
-    const dense = try headPlaceVisibility(s, .{ .ctx = null }, &place, 4, 14);
-    defer _ = mlx.mlx_array_free(dense);
-    try mlx.check(mlx.mlx_array_eval(dense));
-    const want_dense = [_]bool{ true, true, true, true, true, true, true, true, true, false, false, false, true, true };
-    try t.expectEqualSlices(bool, &want_dense, mlx.mlx_array_data_bool(dense).?[0..14]);
-}
-
-// ── The QSA all-visible identity skip at the engagement boundary ──
-
-/// Random f32 score sheet (the reference's own dtype).
-fn qsaRandScoresF32(rnd: std.Random, shape: []const c_int) !mlx.mlx_array {
-    var n: usize = 1;
-    for (shape) |d| n *= @intCast(d);
-    const data = try std.testing.allocator.alloc(f32, n);
-    defer std.testing.allocator.free(data);
-    // relu output: many exact zeros.
-    for (data) |*x| {
-        const v = rnd.float(f32) - 0.35;
-        x.* = if (v > 0) v else 0.0;
-    }
-    return mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
-}
-
-test "qsa mask: the all-visible skip must not hand a NULL sheet to an mlx op (kv just past the budget)" {
-    // `mlx_logical_and(&blk_sel, picked, vis3)` in the nb > block_topk arm passed the null
-    // all-visible sheet straight to mlx-c and killed the process. At decode width all-visible
-    // is always true, so every generated token past kv = (block_topk + 1) * ratio crashed.
-    // Bar: where the predicate claims all-visible, the real sheet is all-true and the null-sheet
-    // arm produces the same mask.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const s = mlx.gpuStream();
-    const ratio: c_int = 4;
-    const batch: c_int = 1;
-    var prng = std.Random.DefaultPrng.init(0x2068_B0DE);
-    const rnd = prng.random();
-
-    var checked_skip: usize = 0;
-    // 2049..2051 sit just below the selection boundary; 2052 is the first kv that can crash.
-    for ([_]c_int{ 2049, 2052, 2068, 2100, 4100 }) |kv| {
-        // `nb` is the complete-block count, floor(kv/ratio).
-        const nb = @divTrunc(kv, ratio);
-        for ([_]c_int{ 1, 31, 1024 }) |seq_len| {
-            if (seq_len > kv) continue;
-            const offset = kv - seq_len;
-            var topk_buf: [11]c_int = undefined;
-            topk_buf[0] = nb;
-            topk_buf[1] = nb + 4;
-            for (1..9) |d| topk_buf[1 + d] = nb - @as(c_int, @intCast(d));
-            topk_buf[10] = 512;
-
-            for (topk_buf) |block_topk| {
-                if (block_topk <= 0) continue;
-                const scores = try qsaRandScoresF32(rnd, &[_]c_int{ batch, seq_len, nb });
-                defer _ = mlx.mlx_array_free(scores);
-                const tie = try qsaTieBiasForTest(s, nb);
-                defer _ = mlx.mlx_array_free(tie);
-                const sheet = try qsaVisSheetForTest(s, offset, seq_len, nb, ratio);
-                defer _ = mlx.mlx_array_free(sheet);
-
-                const ref = try Transformer.qsaSelectMaskOps(std.testing.allocator, s, scores, sheet, tie, offset, seq_len, kv, nb, ratio, block_topk, batch);
-                defer _ = mlx.mlx_array_free(ref);
-                try mlx.check(mlx.mlx_array_eval(ref));
-
-                if (!qsaAllBlocksVisible(offset, nb, ratio)) continue;
-                var ones = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(ones);
-                try mlx.check(mlx.mlx_ones(&ones, &[_]c_int{ 1, seq_len, nb }, 3, .bool_, s));
-                try std.testing.expect(try qsaArraysAllEqual(sheet, ones, s));
-                const null_vis = mlx.mlx_array{ .ctx = null };
-                const got = try Transformer.qsaSelectMaskOps(std.testing.allocator, s, scores, null_vis, tie, offset, seq_len, kv, nb, ratio, block_topk, batch);
-                defer _ = mlx.mlx_array_free(got);
-                try std.testing.expect(try qsaArraysAllEqual(got, ref, s));
-                checked_skip += 1;
-            }
-        }
-    }
-    std.debug.print("[qsa-boundary] all-visible skip exercised in {d} cases\n", .{checked_skip});
-    try std.testing.expect(checked_skip >= 8);
-}
-
-test "qsa selection: the mask arm and the gather path use ONE tie rule" {
-    // Two selection paths with two different tie rules would let two slots with identical
-    // scores attend different blocks. The signal: the mask arm now dispatches the select kernel.
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const s = mlx.gpuStream();
-    const ta = std.testing.allocator;
-    const ratio: c_int = 4;
-    const batch: c_int = 1;
-    // All-visible at width S needs S <= (kv % ratio) + 1, so kv must not be a multiple of ratio.
-    const seq_len: c_int = 4;
-    const kv: c_int = 4099;
-    const nb = @divTrunc(kv, ratio);
-    // 511 so this test owns a config key no other test builds.
-    const block_topk: c_int = 511;
-    var prng = std.Random.DefaultPrng.init(0x71E5_10FF);
-    const rnd = prng.random();
-
-    const scores = try qsaRandScoresF32(rnd, &[_]c_int{ batch, seq_len, nb });
-    defer _ = mlx.mlx_array_free(scores);
-    const tie = try qsaTieBiasForTest(s, nb);
-    defer _ = mlx.mlx_array_free(tie);
-    const offset = kv - seq_len;
-    try std.testing.expect(qsaAllBlocksVisible(offset, nb, ratio));
-    const null_vis = mlx.mlx_array{ .ctx = null };
-
-    const before = qsaSelectCfgBuilds();
-    const got = try Transformer.qsaSelectMaskOps(ta, s, scores, null_vis, tie, offset, seq_len, kv, nb, ratio, block_topk, batch);
-    defer _ = mlx.mlx_array_free(got);
-    try mlx.check(mlx.mlx_array_eval(got));
-    // A build, not a hit: this key is unique to this test, so the counter moving IS the dispatch.
-    try std.testing.expect(qsaSelectCfgBuilds() > before);
-
-    try std.testing.expectEqual(@as(usize, 4), @as(usize, @intCast(mlx.mlx_array_ndim(got))));
-    const gsh = mlx.getShape(got);
-    try std.testing.expectEqual(batch, gsh[0]);
-    try std.testing.expectEqual(seq_len, gsh[2]);
-    try std.testing.expectEqual(kv, gsh[3]);
-
-    // With the kernel off both arms fall to the chain: still one rule.
-    qsa_select_kernel_override = false;
-    defer qsa_select_kernel_override = null;
-    const chain = try Transformer.qsaSelectMaskOps(ta, s, scores, null_vis, tie, offset, seq_len, kv, nb, ratio, block_topk, batch);
-    defer _ = mlx.mlx_array_free(chain);
-    try mlx.check(mlx.mlx_array_eval(chain));
-    try std.testing.expectEqual(kv, mlx.getShape(chain)[3]);
-}
-
-test "qsa boundary: past (block_topk+1)*ratio EVERY decode step reaches the all-visible skip" {
-    // At decode width offset = kv-1 and nb = floor(kv/ratio), so the all-visible claim holds at
-    // every kv and the skip is gated by `nb > block_topk` alone.
-    const ratio: c_int = 4;
-    const block_topk: c_int = 512; // budget 2048 / ratio
-    const first: c_int = (block_topk + 1) * ratio; // 2052
-    var kv: c_int = 1;
-    while (kv <= 6000) : (kv += 1) {
-        const nb = @divTrunc(kv, ratio);
-        try std.testing.expect(qsaAllBlocksVisible(kv - 1, nb, ratio));
-        try std.testing.expectEqual(kv >= first, nb > block_topk);
-    }
-    var kv2: c_int = 1;
-    while (kv2 < first) : (kv2 += 1) {
-        try std.testing.expect(!(@divTrunc(kv2, ratio) > block_topk));
-    }
-    // A prefill chunk's first row can sit far below the last complete block.
-    try std.testing.expect(!qsaAllBlocksVisible(1028, @divTrunc(@as(c_int, 2052), ratio), ratio));
-}
-
-test "qsa visibility: decode width is ALWAYS all-visible; a prefill chunk's FIRST row decides" {
-    const ratio: c_int = 4;
-    // Decode (S == 1): all-visible for every ragged tail.
-    var kv: c_int = 2049;
-    while (kv <= 2400) : (kv += 1) {
-        const nb = @divTrunc(kv, ratio);
-        try testing.expect(qsaAllBlocksVisible(kv - 1, nb, ratio));
-    }
-    try testing.expect(qsaAllBlocksVisible(2051, 513, ratio));
-    try testing.expect(!qsaAllBlocksVisible(2050, 513, ratio));
-    try testing.expect(!qsaAllBlocksVisible(0, 513, ratio));
-    try testing.expect(qsaAllBlocksVisible(0, 0, ratio));
-}
-
-test "qsa visibility skip: bit-identical selection where it is an identity, and a REAL difference where it is not" {
-    // Where every block is visible the two arms must agree bit for bit; where they are not,
-    // the arms must differ (else a blanket "always skip" would pass).
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const s = mlx.gpuStream();
-
-    var t: Transformer = undefined;
-
-    t.s = s;
-    t.allocator = testing.allocator;
-    t.config = .{};
-    t.qsa_consts = .{};
-    defer t.qsa_consts.deinit();
-
-    const ratio: c_int = 4;
-    const nb: c_int = 24;
-    const block_topk: c_int = 8;
-    const rows: c_int = 6;
-    var prng = std.Random.DefaultPrng.init(0x5EED_9E11);
-    const rnd = prng.random();
-    var sc_buf: [@as(usize, @intCast(rows)) * @as(usize, @intCast(nb))]f32 = undefined;
-    for (&sc_buf) |*v| v.* = if (rnd.boolean()) 0.0 else rnd.float(f32) * 4.0;
-    const sc_shape = [_]c_int{ 1, rows, nb };
-    const scores = mlx.mlx_array_new_data(&sc_buf, &sc_shape, 3, .float32);
-    defer _ = mlx.mlx_array_free(scores);
-    const none = mlx.mlx_array{ .ctx = null };
-
-    const row0_all: c_int = nb * ratio - 1;
-    try testing.expect(qsaAllBlocksVisible(row0_all, nb, ratio));
-    const a = try t.qsaChunkSelect(scores, none, row0_all, rows, nb, ratio, block_topk, block_topk, true);
-    defer _ = mlx.mlx_array_free(a);
-    const b = try t.qsaChunkSelect(scores, none, row0_all, rows, nb, ratio, block_topk, block_topk, false);
-    defer _ = mlx.mlx_array_free(b);
-    try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(a, b, s));
-
-    // One row earlier is not all-visible: the two arms must disagree.
-    const row0_partial: c_int = 4;
-    try testing.expect(!qsaAllBlocksVisible(row0_partial, nb, ratio));
-    const c = try t.qsaChunkSelect(scores, none, row0_partial, rows, nb, ratio, block_topk, block_topk, true);
-    defer _ = mlx.mlx_array_free(c);
-    const d = try t.qsaChunkSelect(scores, none, row0_partial, rows, nb, ratio, block_topk, block_topk, false);
-    defer _ = mlx.mlx_array_free(d);
-    try testing.expect(try attn256MaxDiff(c, d, s) > 0.0);
-
-    // The `nb <= block_topk` arm takes the same skip.
-    var ar = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(ar);
-    try mlx.check(mlx.mlx_arange(&ar, 0, @floatFromInt(nb), 1.0, .int32, s));
-    var canonical = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(canonical);
-    try mlx.check(mlx.mlx_reshape(&canonical, ar, &[_]c_int{ 1, 1, nb }, 3, s));
-    const e = try t.qsaChunkSelect(scores, canonical, row0_all, rows, nb, ratio, nb, nb, true);
-    defer _ = mlx.mlx_array_free(e);
-    const f = try t.qsaChunkSelect(scores, canonical, row0_all, rows, nb, ratio, nb, nb, false);
-    defer _ = mlx.mlx_array_free(f);
-    try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(e, f, s));
-}
-
 // ── Fused QSA block select (msv_qsa_select) ──
 
 /// The `[1, rows, nb]` bool visibility sheet the composed arm masks with, free of a Transformer.
-fn qsaVisSheetForTest(s: mlx.mlx_stream, row0: c_int, rows: c_int, nb: c_int, ratio: c_int) !mlx.mlx_array {
+pub fn qsaVisSheetForTest(s: mlx.mlx_stream, row0: c_int, rows: c_int, nb: c_int, ratio: c_int) !mlx.mlx_array {
     var blk_end = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(blk_end);
     try mlx.check(mlx.mlx_arange(&blk_end, @floatFromInt(ratio - 1), @floatFromInt(nb * ratio), @floatFromInt(ratio), .int32, s));
@@ -628,30 +475,6 @@ fn qsaVisSheetForTest(s: mlx.mlx_stream, row0: c_int, rows: c_int, nb: c_int, ra
     var vis3 = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_expand_dims(&vis3, vis, 0, s));
     return vis3;
-}
-
-/// `QsaBlockConsts.tie_bias` without the cache: `b * 1e-7`.
-pub fn qsaTieBiasForTest(s: mlx.mlx_stream, nb: c_int) !mlx.mlx_array {
-    var idx = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(idx);
-    try mlx.check(mlx.mlx_arange(&idx, 0, @floatFromInt(nb), 1.0, .float32, s));
-    const eps = mlx.mlx_array_new_float(1e-7);
-    defer _ = mlx.mlx_array_free(eps);
-    var bias = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_multiply(&bias, idx, eps, s));
-    return bias;
-}
-
-test "qsaVisibleBoundsHost: the first NOT-fully-visible block per row" {
-    var out: [6]i32 = undefined;
-    qsaVisibleBoundsHost(&out, 0, 6, 700, 4, false);
-    try testing.expectEqualSlices(i32, &[_]i32{ 0, 0, 0, 1, 1, 1 }, &out);
-    qsaVisibleBoundsHost(&out, 2799, 6, 700, 4, false);
-    try testing.expectEqualSlices(i32, &[_]i32{ 700, 700, 700, 700, 700, 700 }, &out);
-    qsaVisibleBoundsHost(&out, 2044, 6, 700, 4, false);
-    try testing.expectEqualSlices(i32, &[_]i32{ 511, 511, 511, 512, 512, 512 }, &out);
-    qsaVisibleBoundsHost(&out, 4, 6, 24, 4, true);
-    try testing.expectEqualSlices(i32, &[_]i32{ 24, 24, 24, 24, 24, 24 }, &out);
 }
 
 /// The reference both arms are measured against: per row, the top-`k` visible blocks by
@@ -756,10 +579,10 @@ test "qsa select kernel: the fused radix-select IS the exact top-k, and so is th
 
         const row0s = [_]c_int{ 0, 2044, 2000, c.nb * ratio };
         for (row0s) |row0| {
-            const all_vis = qsaAllBlocksVisible(row0, c.nb, ratio);
+            const all_vis = blocks4.allSee(row0, c.nb);
             const bounds_host = try ta.alloc(i32, rowsu);
             defer ta.free(bounds_host);
-            qsaVisibleBoundsHost(bounds_host, row0, c.rows, c.nb, ratio, all_vis);
+            blocks4.selectBounds(bounds_host, row0, c.nb, all_vis);
             const want = try qsaExactTopHost(ta, buf, c.rows, c.nb, bounds_host, k);
             defer ta.free(want);
 
@@ -773,7 +596,7 @@ test "qsa select kernel: the fused radix-select IS the exact top-k, and so is th
                 _ = mlx.mlx_array_free(vis3);
             };
             if (!all_vis) vis3 = try qsaVisSheetForTest(s, row0, c.rows, c.nb, ratio);
-            const bias = try qsaTieBiasForTest(s, c.nb);
+            const bias = try tieBias(s, c.nb);
             defer _ = mlx.mlx_array_free(bias);
             const chain = try qsaSelectComposedOps(s, scores, vis3, bias, c.rows, c.nb, k, k, all_vis);
             defer _ = mlx.mlx_array_free(chain);
@@ -837,7 +660,7 @@ test "qsa select kernel: past the bias's f32 resolution the chain's tie rule is 
     const scores = mlx.mlx_array_new_data(buf.ptr, &sc_shape, 3, .float32);
     defer _ = mlx.mlx_array_free(scores);
     const row0: c_int = nb * ratio;
-    try testing.expect(qsaAllBlocksVisible(row0, nb, ratio));
+    try testing.expect(blocks4.allSee(row0, nb));
 
     const bounds_host = try ta.alloc(i32, @intCast(rows));
     defer ta.free(bounds_host);
@@ -854,7 +677,7 @@ test "qsa select kernel: past the bias's f32 resolution the chain's tie rule is 
 
     // The chain may only ever be wrong about a tie: the bar is the selected score multiset per row.
     const none = mlx.mlx_array{ .ctx = null };
-    const bias = try qsaTieBiasForTest(s, nb);
+    const bias = try tieBias(s, nb);
     defer _ = mlx.mlx_array_free(bias);
     const chain = try qsaSelectComposedOps(s, scores, none, bias, rows, nb, k, k, true);
     defer _ = mlx.mlx_array_free(chain);
@@ -903,9 +726,9 @@ test "qsa select kernel: on a near-tie the exact rule and the bias trick DISAGRE
     defer _ = mlx.mlx_array_free(scores);
 
     const row0: c_int = nb * ratio; // all-visible
-    try testing.expect(qsaAllBlocksVisible(row0, nb, ratio));
+    try testing.expect(blocks4.allSee(row0, nb));
     const none = mlx.mlx_array{ .ctx = null };
-    const bias = try qsaTieBiasForTest(s, nb);
+    const bias = try tieBias(s, nb);
     defer _ = mlx.mlx_array_free(bias);
     const chain = try qsaSelectComposedOps(s, scores, none, bias, 1, nb, k, k, true);
     defer _ = mlx.mlx_array_free(chain);
@@ -1173,10 +996,10 @@ test "qsa select split: the fused radix-select IS the exact top-k" {
 
         const row0s = [_]c_int{ 0, 2044, 2000, c.nb * ratio };
         for (row0s) |row0| {
-            const all_vis = qsaAllBlocksVisible(row0, c.nb, ratio);
+            const all_vis = blocks4.allSee(row0, c.nb);
             const bounds_host = try ta.alloc(i32, rowsu);
             defer ta.free(bounds_host);
-            qsaVisibleBoundsHost(bounds_host, row0, c.rows, c.nb, ratio, all_vis);
+            blocks4.selectBounds(bounds_host, row0, c.nb, all_vis);
             const want = try qsaExactTopHost(ta, buf, c.rows, c.nb, bounds_host, k);
             defer ta.free(want);
 
