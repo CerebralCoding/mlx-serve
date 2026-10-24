@@ -2,7 +2,7 @@
 //! slot's stable id, a deferred decode step leaves what the plugin says it owes and the engine settles it where the
 //! legacy deferred-PLE path did (an owed input right after the build, owed history at the next forward or never), a
 //! batched tick settles its slots in one call, the slot's meters are logged and its id released with the generator.
-//! Decoded tokens stay bit-equal to the legacy forward.
+//! Decoded tokens stay bit-equal to the plain served model's.
 
 const std = @import("std");
 const abi = @import("../../../abi/plugin.zig");
@@ -91,12 +91,13 @@ fn decode(x: *Transformer, out: []u32) !void {
 
 // ── tests ──
 
-test "plugin settle: deferred decode steps settle where the legacy path did, ids stay put, meters log, the slot is released" {
-    var b = try proof.Both.open(.{ .quantized = true }, 0x5e77);
+test "plugin settle: deferred decode steps settle where the plain served path does, ids stay put, meters log, the slot is released" {
+    var b: proof.Served = undefined;
+    try b.open(.{ .quantized = true }, 0x5e77);
     defer b.close();
-    b.xfm.plugin.?.table = &test_table;
     var want: [10]u32 = undefined;
-    try decode(&b.lg.xfm, &want);
+    try decode(&b.xfm, &want);
+    b.xfm.plugin.?.table = &test_table;
 
     // An owed input settles right after every deferred build, one slot at a time.
     seen = .{ .owes = .input };
@@ -122,7 +123,8 @@ test "plugin settle: deferred decode steps settle where the legacy path did, ids
 
 test "plugin settle: a batched tick settles its slots in one call" {
     const a = testing.allocator;
-    var b = try proof.Both.open(.{ .quantized = true }, 0x5e78);
+    var b: proof.Served = undefined;
+    try b.open(.{ .quantized = true }, 0x5e78);
     defer b.close();
     b.xfm.plugin.?.table = &test_table;
     seen = .{ .owes = .input, .one_slot = false };

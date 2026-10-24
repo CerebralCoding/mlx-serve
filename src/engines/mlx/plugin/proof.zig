@@ -1,7 +1,7 @@
-//! The served path proven against the legacy one on tiny random llama packs written to disk: `parseConfig` hands
-//! the pack to the llama plugin, `driver.load` builds the shell, and every forward the engine makes (prefill, decode,
-//! verify, the lazy pipelined decode step, captures, batched rows) is bit-equal to the legacy `Transformer`'s on the
-//! same pack. Discovery's facts and the generic `ModelConfig` fields equal the legacy reading.
+//! The served path on tiny random llama packs written to disk: `parseConfig` hands the pack to the llama plugin,
+//! `driver.load` builds the shell, and every forward the engine makes (prefill, decode, verify, the lazy pipelined
+//! decode step, captures, batched rows) is bit-equal to the legacy `Transformer`'s on the same pack (recorded to
+//! `fixtures/`). Discovery's facts and the generic `ModelConfig` fields equal the legacy reading.
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
@@ -11,19 +11,15 @@ const driver = @import("driver.zig");
 const plugin_config = @import("config.zig");
 const fixture = @import("../../../sdk/bases/proof/fixture.zig");
 const discovery = @import("../../../host/registry/discovery.zig");
-const lazyForward = @import("../generate/step.zig").lazyForward;
 const KVCache = @import("../kv/cache.zig").KVCache;
 const ForwardCtx = @import("../forward_ctx.zig").ForwardCtx;
-const CaptureLayers = @import("../forward_ctx.zig").CaptureLayers;
 const Transformer = @import("../transformer.zig").Transformer;
 const abi = @import("../../../abi/plugin.zig");
 const quant_abi = @import("../../../abi/quant.zig");
 const llama = @import("../../../plugins/llama/plugin.zig");
 const HotPrefixCache = @import("../cache/prefix_cache.zig").HotPrefixCache;
 const cache_ops = @import("../kv/cache_ops.zig");
-const dflash_mod = @import("../spec/dflash/dflash.zig");
-const Generator = @import("../generate/generator.zig").Generator;
-const Tokenizer = @import("../../../sdk/tokenizer/tokenizer.zig").Tokenizer;
+const both = @import("both.zig");
 
 const testing = std.testing;
 const Array = mlx.mlx_array;
@@ -78,15 +74,15 @@ fn writePack(p: *fixture.Pack, g: Geo) !void {
     }
 }
 
-/// The same pack served both ways: the legacy `Transformer` and the plugin's shell.
-pub const Both = struct {
-    lg: *fixture.Legacy,
+/// The pack served through `parseConfig` and `driver.load`, as the engine loads it.
+pub const Served = struct {
+    tmp: testing.TmpDir,
     dir: []u8,
     cfg: model.ModelConfig,
     xfm: Transformer,
     layers: u32,
 
-    pub fn open(g: Geo, seed: u64) !Both {
+    pub fn open(sv: *Served, g: Geo, seed: u64) !void {
         const a = testing.allocator;
         const io = std.Io.Threaded.global_single_threaded.io();
         var p = fixture.Pack.init(seed);
@@ -94,24 +90,24 @@ pub const Both = struct {
         try writePack(&p, g);
         const json = try configJson(a, g);
         defer a.free(json);
-        const lg = try p.load(json);
-        errdefer lg.deinit();
-        try lg.tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = json });
+        sv.* = .{ .tmp = testing.tmpDir(.{}), .dir = &.{}, .cfg = undefined, .xfm = undefined, .layers = g.layers };
+        errdefer sv.tmp.cleanup();
+        try sv.tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = json });
         var path_buf: [512]u8 = undefined;
-        const dir = try a.dupe(u8, path_buf[0..try lg.tmp.dir.realPath(io, &path_buf)]);
-        errdefer a.free(dir);
-        var cfg = try model.parseConfig(io, a, dir);
-        errdefer cfg.deinit(a);
-        if (cfg.plugin == null) return error.TestExpectedServedPack;
-        const xfm = try driver.load(io, a, &cfg, dir, fixture.stream());
-        return .{ .lg = lg, .dir = dir, .cfg = cfg, .xfm = xfm, .layers = g.layers };
+        sv.dir = try a.dupe(u8, path_buf[0..try sv.tmp.dir.realPath(io, &path_buf)]);
+        errdefer a.free(sv.dir);
+        try p.save(sv.dir);
+        sv.cfg = try model.parseConfig(io, a, sv.dir);
+        errdefer sv.cfg.deinit(a);
+        if (sv.cfg.plugin == null) return error.TestExpectedServedPack;
+        sv.xfm = try driver.load(io, a, &sv.cfg, sv.dir, fixture.stream());
     }
 
-    pub fn close(b: *Both) void {
-        b.xfm.deinit();
-        b.cfg.deinit(testing.allocator);
-        testing.allocator.free(b.dir);
-        b.lg.deinit();
+    pub fn close(sv: *Served) void {
+        sv.xfm.deinit();
+        sv.cfg.deinit(testing.allocator);
+        testing.allocator.free(sv.dir);
+        sv.tmp.cleanup();
     }
 };
 
@@ -130,172 +126,65 @@ pub const Slot = struct {
     }
 };
 
-const steps = [_]struct { ids: []const i32, verify: bool = false }{
-    .{ .ids = &.{ 3, 17, 42, 99, 7, 250, 1 } },
-    .{ .ids = &.{88} },
-    .{ .ids = &.{ 5, 61, 200 }, .verify = true },
-    .{ .ids = &.{12} },
-    .{ .ids = &.{ 9, 33, 77, 140, 2 }, .verify = true },
-    .{ .ids = &.{64} },
-};
-
-/// Prefill, decode and verify steps on caches of their own: logits, the last hidden row and the captured layers
-/// bit-equal.
-fn expectSteps(b: *Both) !void {
-    var ls: Slot = undefined;
-    try ls.init(b.layers);
-    defer ls.deinit();
-    var ps: Slot = undefined;
-    try ps.init(b.layers);
-    defer ps.deinit();
-    for (steps) |st| {
-        var g = ops.Graph.init(testing.allocator, b.lg.xfm.s);
-        defer g.deinit();
-        const ids = try fixture.tokens(&g, st.ids);
-        var outs: [2][3]Array = undefined;
-        for ([_]*Transformer{ &b.lg.xfm, &b.xfm }, [_]*Slot{ &ls, &ps }, 0..) |x, s, k| {
-            var hidden = mlx.mlx_array_new();
-            var caps: [2]Array = .{ mlx.mlx_array_new(), mlx.mlx_array_new() };
-            var cl: CaptureLayers = .{ .ids = &.{ 0, 1 }, .out = &caps };
-            s.ctx.capture_layers = &cl;
-            s.ctx.spec_verify = st.verify;
-            defer s.ctx.capture_layers = null;
-            const logits = try g.adopt(try x.forwardWithCapture(&s.ctx, ids, &hidden));
-            _ = try g.adopt(hidden);
-            _ = try g.adopt(caps[0]);
-            _ = try g.adopt(caps[1]);
-            outs[k] = .{ logits, hidden, caps[1] };
-        }
-        for (0..3) |i| try ops.expectBitEqual(outs[1][i], outs[0][i]);
-    }
-}
-
-/// Greedy decode through the pipelined step (`lazyForward`: the next token stays a lazy argmax), tokens bit-equal.
-fn expectGreedy(b: *Both) !void {
-    var tokens: [2][8]u32 = undefined;
-    for ([_]*Transformer{ &b.lg.xfm, &b.xfm }, 0..) |x, k| {
-        var s: Slot = undefined;
-        try s.init(b.layers);
-        defer s.deinit();
-        var g = ops.Graph.init(testing.allocator, b.lg.xfm.s);
-        defer g.deinit();
-        var logits = try g.adopt(try x.forwardWith(&s.ctx, try fixture.tokens(&g, &.{ 7, 8, 9, 10 })));
-        for (&tokens[k]) |*t| {
-            const sh = ops.shape(logits);
-            const last = try g.reshape(try g.sliceAxis(logits, 1, sh[1] - 1, sh[1]), &.{ 1, sh[2] });
-            const next = try g.argmax(last, -1, false);
-            logits = try g.adopt(try lazyForward(x, &s.ctx, next));
-            const host = try g.astype(next, .uint32);
-            try mlx.check(mlx.mlx_array_eval(host));
-            t.* = mlx.mlx_array_data_uint32(host).?[0];
-        }
-    }
-    try testing.expectEqualSlices(u32, &tokens[0], &tokens[1]);
-}
-
-/// Two slots prefilled apart, then decoded together: each slot's logits bit-equal to the legacy batched tick's.
-fn expectBatched(b: *Both) !void {
+/// The pack of `g` through the llama table on the legacy parse's config (as `parseConfig` builds it), against the
+/// legacy forward's values recorded to `fixtures/<seed>.tape`.
+fn openProof(p: *fixture.Pack, g: Geo, comptime seed: u64) !both.Both {
     const a = testing.allocator;
-    var slots: [2][2]Slot = undefined;
-    for (&slots) |*pair| for (pair) |*s| try s.init(b.layers);
-    defer for (&slots) |*pair| for (pair) |*s| s.deinit();
-    const prompts = [_][]const i32{ &.{ 4, 8, 15, 16, 23 }, &.{ 42, 101, 7 } };
-    const xs = [_]*Transformer{ &b.lg.xfm, &b.xfm };
-    var positions: [2]u32 = undefined;
-    for (prompts, 0..) |pr, i| {
-        var g = ops.Graph.init(a, b.lg.xfm.s);
-        defer g.deinit();
-        for (xs, 0..) |x, k| _ = try g.adopt(try x.forwardWith(&slots[k][i].ctx, try fixture.tokens(&g, pr)));
-        positions[i] = @intCast(pr.len);
-    }
-    for ([_][2]u32{ .{ 77, 3 }, .{ 190, 64 } }) |next| {
-        var g = ops.Graph.init(a, b.lg.xfm.s);
-        defer g.deinit();
-        var rows: [2][]Array = undefined;
-        for (xs, 0..) |x, k| {
-            const ctxs = [_]*ForwardCtx{ &slots[k][0].ctx, &slots[k][1].ctx };
-            rows[k] = try x.forwardBatchedDecode(&next, &ctxs, &positions);
-            for (rows[k]) |r| _ = try g.adopt(r);
-        }
-        defer for (rows) |r| a.free(r);
-        for (rows[0], rows[1]) |want, got| try ops.expectBitEqual(got, want);
-        for (&positions) |*p| p.* += 1;
-    }
+    try writePack(p, g);
+    const json = try configJson(a, g);
+    defer a.free(json);
+    const name = std.fmt.comptimePrint("fixtures/{x}.tape", .{seed});
+    return both.Both.proof(&llama.table, p, json, true, "src/engines/mlx/plugin/" ++ name, @embedFile(name));
+}
+
+fn proofCase(g: Geo, comptime seed: u64) !void {
+    var p = fixture.Pack.init(seed);
+    defer p.deinit();
+    var b = try openProof(&p, g, seed);
+    defer b.close();
+    try testing.expect(b.xfm.plugin != null);
+    if (g.llama3) try testing.expectEqualStrings("llama3-rope-v1", b.cfg.cacheLayoutNamespace().?);
+    try b.expectSteps(&both.steps);
+    try b.expectGreedy();
+    try b.expectBatched(.dense);
+    try b.expectDone();
 }
 
 // ── tests ──
 
 test "plugin driver: a llama 4-bit pack served by its plugin is bit-equal to the legacy forward (steps, greedy, batched)" {
-    var b = try Both.open(.{ .quantized = true }, 0x11a3a);
-    defer b.close();
-    try testing.expect(b.xfm.plugin != null and b.lg.xfm.plugin == null);
-    try expectSteps(&b);
-    try expectGreedy(&b);
-    try expectBatched(&b);
+    try proofCase(.{ .quantized = true }, 0x11a3a);
 }
 
 test "plugin driver: a llama bf16 pack with the llama3 rope and a tied head is bit-equal to the legacy forward" {
-    var b = try Both.open(.{ .llama3 = true, .tied = true }, 0x5eed3);
-    defer b.close();
-    try testing.expectEqualStrings("llama3-rope-v1", b.cfg.cacheLayoutNamespace().?);
-    try expectSteps(&b);
-    try expectGreedy(&b);
-    try expectBatched(&b);
-}
-
-/// A greedy DFlash run on `xfm` with the tiny assistant at `asst`: every emitted token and each round's accepted count.
-fn dflashRun(xfm: *Transformer, asst: []const u8, tokens: []u32, accepted: *std.ArrayList(u32)) !void {
-    const a = testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var dm = try dflash_mod.loadDflash(io, a, fixture.stream(), asst);
-    defer dm.deinit();
-    try dm.bind(xfm);
-    var tok_dummy: Tokenizer = undefined; // never read by the Generator
-    const prompt = [_]u32{ 3, 7, 1, 12, 30, 5, 9, 22, 4, 17, 2, 28 };
-    var gen = try Generator.initWithOptions(io, a, xfm, &tok_dummy, &prompt, @intCast(tokens.len), .{ .temperature = 0.0 }, &.{}, .{
-        .dflash_enabled = true,
-        .dflash = &dm,
-        .dflash_min_accepted_per_round = 0,
-    });
-    defer gen.deinit(a);
-    var n: usize = 0;
-    while (try gen.nextDflash(a)) |res| {
-        defer a.free(res.tokens);
-        @memcpy(tokens[n..][0..res.tokens.len], res.tokens);
-        n += res.tokens.len;
-        try accepted.append(a, res.accepted_tokens);
-    }
-    try testing.expectEqual(tokens.len, n);
-    try testing.expect(gen.dflash_attempted > 0);
+    try proofCase(.{ .llama3 = true, .tied = true }, 0x5eed3);
 }
 
 test "plugin driver: a DFlash drafter on a served llama trunk reads its embedding and head and emits the legacy stream" {
     const a = testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
     // The tiny assistant's geometry (`dflash.TinyFix`): hidden 64, targets layers 0 and 2, mask id 127.
-    var b = try Both.open(.{ .hidden = 64, .head_dim = 16, .inter = 128, .vocab = 128, .layers = 4, .tied = true }, 0xdf1a5);
+    var p = fixture.Pack.init(0xdf1a5);
+    defer p.deinit();
+    var b = try openProof(&p, .{ .hidden = 64, .head_dim = 16, .inter = 128, .vocab = 128, .layers = 4, .tied = true }, 0xdf1a5);
     defer b.close();
-    try testing.expect(b.xfm.supportsLayerCapture() and !b.lg.xfm.config.dflash_bound);
-    {
-        var g = ops.Graph.init(a, b.lg.xfm.s);
-        defer g.deinit();
-        const ids = try fixture.tokens(&g, &.{ 4, 90, 127, 0, 33 });
-        const hidden = try g.reshape(try g.adopt(try b.lg.xfm.rawEmbedding(ids)), &.{ 1, 5, 64 });
-        try ops.expectBitEqual(try g.adopt(try b.xfm.rawEmbedding(ids)), try g.adopt(try b.lg.xfm.rawEmbedding(ids)));
-        try ops.expectBitEqual(try g.adopt(try b.xfm.lmHeadForDraft(hidden)), try g.adopt(try b.lg.xfm.lmHeadForDraft(hidden)));
-    }
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const asst = buf[0..try tmp.dir.realPath(io, &buf)];
-    try dflash_mod.TinyFix.writeAssistant(io, tmp.dir, asst, fixture.stream());
+    try testing.expect(b.xfm.supportsLayerCapture());
+    var g = ops.Graph.init(a, fixture.stream());
+    defer g.deinit();
+    const ids = try fixture.tokens(&g, &.{ 4, 90, 127, 0, 33 });
+    const hidden = try g.reshape(try g.adopt(try b.xfm.rawEmbedding(ids)), &.{ 1, 5, 64 });
+    const lg: ?*Transformer = if (b.lg) |l| &l.xfm else null;
+    try b.check(try g.adopt(try b.xfm.rawEmbedding(ids)), if (lg) |x| try g.adopt(try x.rawEmbedding(ids)) else null, false);
+    try b.check(try g.adopt(try b.xfm.lmHeadForDraft(hidden)), if (lg) |x| try g.adopt(try x.lmHeadForDraft(hidden)) else null, false);
     var tokens: [2][16]u32 = undefined;
     var accepted: [2]std.ArrayList(u32) = .{ .empty, .empty };
     defer for (&accepted) |*l| l.deinit(a);
-    try dflashRun(&b.lg.xfm, asst, &tokens[0], &accepted[0]);
-    try dflashRun(&b.xfm, asst, &tokens[1], &accepted[1]);
-    try testing.expectEqualSlices(u32, &tokens[0], &tokens[1]);
-    try testing.expectEqualSlices(u32, accepted[0].items, accepted[1].items);
+    try both.dflashRun(&b.xfm, &tokens[1], &accepted[1]);
+    if (lg) |x| try both.dflashRun(x, &tokens[0], &accepted[0]);
+    for ([_][]const u32{ &tokens[1], accepted[1].items }, [_][]const u32{ &tokens[0], accepted[0].items }) |got, want| {
+        const ga = try g.fromSlice(u32, got, &.{@intCast(got.len)});
+        try b.check(ga, if (lg != null) try g.fromSlice(u32, want, &.{@intCast(want.len)}) else null, true);
+    }
+    try b.expectDone();
 }
 
 /// Fields the forward alone reads: the plugin keeps them, the adapter leaves their defaults.
@@ -370,7 +259,7 @@ test "plugin config: an unserved type or a declined shape keeps the legacy parse
     const io = std.Io.Threaded.global_single_threaded.io();
     const q4 = try configJson(a, .{ .quantized = true });
     defer a.free(q4);
-    const sliding = try std.mem.concat(a, u8, &.{ q4[0 .. q4.len - 1], ",\"layer_types\":[\"full_attention\",\"full_attention\"]}" });
+    const sliding = try std.mem.concat(a, u8, &.{ q4[0 .. q4.len - 1], ",\"layer_types\":[\"full_attention\",\"sliding_attention\"]}" });
     defer a.free(sliding);
     const cases = [_]struct { json: []const u8, drafter: bool = false, legacy: bool = true }{
         .{ .json = "{\"model_type\":\"qwen3\",\"hidden_size\":128,\"num_attention_heads\":4}" },
@@ -407,13 +296,14 @@ test "plugin config: an unserved type or a declined shape keeps the legacy parse
 test "plugin config: a served pack's engine config is the legacy parse with the binding attached" {
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    var b = try Both.open(.{ .quantized = true }, 0xc0f6);
+    var b: Served = undefined;
+    try b.open(.{ .quantized = true }, 0xc0f6);
     defer b.close();
     try testing.expect(b.cfg.plugin != null);
     var legacy = try model.parseConfigLegacy(io, a, b.dir);
     defer legacy.deinit(a);
     try testing.expect(legacy.plugin == null);
-    try @import("both.zig").expectGenericFieldsEqual(&b.cfg, &legacy, &.{});
+    try both.expectGenericFieldsEqual(&b.cfg, &legacy, &.{});
 }
 
 test "plugin load: a trunk_weight that refuses serves the model without drafters" {
@@ -429,7 +319,8 @@ test "plugin load: a trunk_weight that refuses serves the model without drafters
             break :blk t;
         };
     };
-    var b = try Both.open(.{ .quantized = true }, 0x7e5f);
+    var b: Served = undefined;
+    try b.open(.{ .quantized = true }, 0x7e5f);
     defer b.close();
     try testing.expect(b.xfm.plugin.?.drafters);
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -452,11 +343,12 @@ test "plugin load: a tower map takes the pack's vision tower tensors, a text loa
     try p.norm("multi_modal_projector.norm.weight", 32);
     const json = try configJson(a, g);
     defer a.free(json);
-    const lg = try p.load(json);
-    defer lg.deinit();
-    try lg.tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = json });
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = json });
     var path_buf: [512]u8 = undefined;
-    const dir = path_buf[0..try lg.tmp.dir.realPath(io, &path_buf)];
+    const dir = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    try p.save(dir);
     var cfg = try model.parseConfig(io, a, dir);
     defer cfg.deinit(a);
     var tower = model.Weights.init(a);
@@ -486,7 +378,8 @@ test "plugin cache: a module-owned state's resume point and resident bytes come 
             break :blk t;
         };
     };
-    var b = try Both.open(.{}, 0x2e5a);
+    var b: Served = undefined;
+    try b.open(.{}, 0x2e5a);
     defer b.close();
     const prompt = [_]u32{ 4, 8, 15, 16 };
     try testing.expectEqual(@as(?u64, null), driver.resumePrompt(&b.xfm, &prompt, null));
@@ -516,17 +409,18 @@ test "plugin forward: a module-owned model's prompt reads only the last row's lo
             break :blk t;
         };
     };
-    var b = try Both.open(.{ .quantized = true }, 0x30d5);
+    var b: Served = undefined;
+    try b.open(.{ .quantized = true }, 0x30d5);
     defer b.close();
-    b.xfm.plugin.?.table = &T.table;
-    b.xfm.config.plugin.?.parsed.caps.owns_decode_state = true;
     var s: [2]Slot = undefined;
     for (&s) |*x| try x.init(b.layers);
     defer for (&s) |*x| x.deinit();
-    var g = ops.Graph.init(testing.allocator, b.lg.xfm.s);
+    var g = ops.Graph.init(testing.allocator, fixture.stream());
     defer g.deinit();
     const ids = try fixture.tokens(&g, &.{ 7, 8, 9, 10, 11 });
-    const want = try g.adopt(try b.lg.xfm.forwardWith(&s[0].ctx, ids));
+    const want = try g.adopt(try b.xfm.forwardWith(&s[0].ctx, ids));
+    b.xfm.plugin.?.table = &T.table;
+    b.xfm.config.plugin.?.parsed.caps.owns_decode_state = true;
     const got = try g.adopt(try b.xfm.forwardWith(&s[1].ctx, ids));
     try testing.expectEqualSlices(c_int, &.{ 1, 1, 256 }, ops.shape(got));
     try ops.expectBitEqual(got, try g.sliceAxis(want, 1, 4, 5));
@@ -534,7 +428,8 @@ test "plugin forward: a module-owned model's prompt reads only the last row's lo
 }
 
 test "plugin caps: module decode state, readonly sharing, spec rollback, whole-prompt prefill and the prefix cache read the served caps" {
-    var b = try Both.open(.{}, 0xca95);
+    var b: Served = undefined;
+    try b.open(.{}, 0xca95);
     defer b.close();
     const caps = &b.xfm.config.plugin.?.parsed.caps;
     try testing.expect(!b.xfm.ownsModuleDecodeState() and !b.xfm.moduleSpecWiring() and !b.xfm.prefillsWholePrompt());

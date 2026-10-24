@@ -1,7 +1,8 @@
 //! Parity proof for the qwen3_5 plugin: the table's forward over its own load of a tiny random pack (2 GDN + 2 gated
 //! attention layers, hd-128 linear heads, hd-256 attention) is bit-equal to the legacy layered forward — prompt chunks
 //! cold and warm, decode, captured verify rows — on logits and every recurrent state and capture, and two slots
-//! batched (decode, verify rows, decode) bit-equal to the legacy GDN batched driver. Dense and MoE, 4-bit and bf16.
+//! batched (decode, verify rows, decode) bit-equal to the legacy GDN batched driver; the legacy values recorded to
+//! `fixtures/twin-<seed>.tape`. Dense and MoE, 4-bit and bf16.
 
 const std = @import("std");
 const fixture = @import("../../sdk/bases/proof/fixture.zig");
@@ -25,31 +26,35 @@ const solo = [_]twin.Step{
     .{ .mode = .decode, .ids = &.{17} },
 };
 
-fn open(p: *fixture.Pack, comptime moe: bool, comptime quantized: bool, comptime experts: c_int) !*T {
+fn open(p: *fixture.Pack, comptime moe: bool, comptime quantized: bool, comptime experts: c_int, comptime seed: u64) !*T {
     try pack.writePack(p, moe, quantized, experts);
-    const t = try T.open(p, pack.config(moe, quantized, experts), &.{});
-    t.lg.xfm.compileGdnGate();
-    if (moe) t.lg.xfm.compileMoeRouting();
+    const name = std.fmt.comptimePrint("fixtures/twin-{x}.tape", .{seed});
+    const t = try T.open(p, pack.config(moe, quantized, experts), &.{}, "src/plugins/qwen3_5/" ++ name, @embedFile(name));
+    if (t.lg) |lg| {
+        lg.xfm.compileGdnGate();
+        if (moe) lg.xfm.compileMoeRouting();
+    }
     return t;
 }
 
-fn soloCase(comptime moe: bool, comptime quantized: bool, comptime experts: c_int, seed: u64) !void {
+fn soloCase(comptime moe: bool, comptime quantized: bool, comptime experts: c_int, comptime seed: u64) !void {
     var p = fixture.Pack.init(seed);
     defer p.deinit();
-    const t = try open(&p, moe, quantized, experts);
+    const t = try open(&p, moe, quantized, experts, seed);
     defer t.close();
     const l = try t.lane();
     defer l.deinit();
     for (solo) |st| try t.step(l, st);
+    try t.expectDone();
 }
 
-fn batchedCase(comptime moe: bool, seed: u64) !void {
+fn batchedCase(comptime moe: bool, comptime seed: u64) !void {
     var p = fixture.Pack.init(seed);
     defer p.deinit();
-    const t = try open(&p, moe, true, 8);
+    const t = try open(&p, moe, true, 8, seed);
     defer t.close();
     // Split the merged states back after every tick, so each slot's states can be compared.
-    t.lg.xfm.persistent_group_state_override = false;
+    if (t.lg) |lg| lg.xfm.persistent_group_state_override = false;
     const lanes = [2]*twin.Lane{ try t.lane(), try t.lane() };
     defer for (lanes) |l| l.deinit();
     try t.step(lanes[0], .{ .mode = .prefill, .ids = &twin.seq(20, 3) });
@@ -57,6 +62,7 @@ fn batchedCase(comptime moe: bool, seed: u64) !void {
     try t.batched(lanes, .{ &.{77}, &.{3} }, true);
     try t.batched(lanes, .{ &.{ 5, 61, 200 }, &.{ 9, 33, 140 } }, true);
     try t.batched(lanes, .{ &.{190}, &.{64} }, true);
+    try t.expectDone();
 }
 
 test "qwen3_5 plugin: a dense 4-bit pack through the table is bit-equal to the legacy layered forward" {

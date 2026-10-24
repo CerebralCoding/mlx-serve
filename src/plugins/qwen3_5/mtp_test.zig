@@ -161,32 +161,29 @@ pub fn expectHead(table: *const @import("../../abi/plugin.zig").ModelTable, pk: 
 /// `expectHead` with a dense head of geometry `geo`, its tape under `family`.
 pub fn expectHeadAt(table: *const @import("../../abi/plugin.zig").ModelTable, pk: *fixture.Pack, json: []const u8, comptime moe: bool, geo: Geo, comptime family: []const u8, comptime tape: []const u8) !void {
     const a = testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
     const s = fixture.stream();
     var p: served_test.Pair = undefined;
     // Without layer capture: the head reads the trunk the shell borrows for it alone.
-    try p.openWith(table, pk, json, &noCapture);
+    try p.openWith(table, pk, json, &noCapture, try served_test.oracle(family, tape));
     defer p.close();
-    p.oracle = try served_test.oracle(family, tape);
     try testing.expect(!p.xfm.plugin.?.drafters and p.xfm.plugin.?.trunk);
     if (moe) try writeMoeHead(p.dir) else try writeHead(p.dir, geo);
 
-    var legacy = try mtp_mod.loadMtp(io, a, s, p.dir);
-    defer legacy.deinit();
-    try legacy.bind(&p.lg.xfm);
-    const served = plugin_head.load(io, a, &p.xfm, p.dir) orelse return error.HeadNotLoaded;
-    defer plugin_head.destroy(served, a);
+    var heads = try Heads.open(&p);
+    defer heads.deinit();
     const loaded: *qwen3_5.Loaded = @ptrCast(@alignCast(p.xfm.plugin.?.model));
-    try testing.expectEqual(moe, legacy.mlp == .moe);
     try testing.expectEqual(moe, loaded.head.?.moe != null);
-    try testing.expectEqual(legacy.draft_head != null, served.draft_head != null);
-    try testing.expectEqual(legacy.rerank_coarse != null, served.rerank_coarse != null);
+    if (heads.legacy) |*lm| {
+        try testing.expectEqual(moe, lm.mlp == .moe);
+        try testing.expectEqual(lm.draft_head != null, heads.served.draft_head != null);
+        try testing.expectEqual(lm.rerank_coarse != null, heads.served.rerank_coarse != null);
+    }
 
-    const heads = [_]MtpHeadRef{ .{ .qwen = &legacy }, .{ .plugin = served } };
+    const hs = heads.refs();
     const xs = p.shells();
     var caches: [2]MtpCacheRef = undefined;
-    for (heads, &caches) |h, *c| c.* = try h.makeCache(a);
-    defer for (&caches) |*c| c.deinit();
+    for (hs, caches[0..hs.len]) |h, *c| c.* = try h.makeCache(a);
+    defer for (caches[0..hs.len]) |*c| c.deinit();
     {
         var g = ops.Graph.init(a, s);
         defer g.deinit();
@@ -197,7 +194,7 @@ pub fn expectHeadAt(table: *const @import("../../abi/plugin.zig").ModelTable, pk
         const one = try hiddenRows(&g, 1, width, dt, 3);
         const many = try hiddenRows(&g, 3, width, dt, 4);
         var outs: [2][5]Array = undefined;
-        for (heads, xs, &caches, 0..) |h, x, *c, k| {
+        for (hs, xs, caches[0..hs.len], 0..) |h, x, *c, k| {
             try h.appendHistory(x, c, &.{ 5, 9, 40 }, hist, 0, null, a);
             const merged = try h.forward(x, c, try idArr(&g, &.{ 7, 11 }), step, 3, .logits, null, null);
             const mixed = try h.forward(x, c, try idArr(&g, &.{60}), one, 5, .mixed, null, null);
@@ -205,7 +202,7 @@ pub fn expectHeadAt(table: *const @import("../../abi/plugin.zig").ModelTable, pk
             outs[k] = .{ try g.adopt(merged.logits), try g.adopt(merged.hidden_next), try g.adopt(mixed.hidden_next), try g.adopt(rows.hidden_next), try g.adopt(try h.draftSelect(x, mixed.hidden_next, null)) };
             try testing.expectEqual(@as(usize, 9), c.step());
         }
-        for (outs[0], outs[1]) |want, got| try p.oracle.check(got, want, false);
+        try served_test.checkRows(&p, &outs, xs.len);
     }
 
     depth_bounds.active = .{ .min = 2, .max = 2 };
@@ -213,11 +210,44 @@ pub fn expectHeadAt(table: *const @import("../../abi/plugin.zig").ModelTable, pk
     var tokens: [2][16]u32 = undefined;
     var accepted: [2]std.ArrayList(u32) = .{ .empty, .empty };
     defer for (&accepted) |*l| l.deinit(a);
-    for (heads, xs, 0..) |h, x, k| try mtpRun(x, h, &tokens[k], &accepted[k]);
-    try p.oracle.stream(&tokens[1], &tokens[0]);
-    try p.oracle.stream(accepted[1].items, accepted[0].items);
+    for (hs, xs, 0..) |h, x, k| try mtpRun(x, h, &tokens[k], &accepted[k]);
+    const last = xs.len - 1;
+    try p.oracle.stream(&tokens[last], if (last == 1) &tokens[0] else null);
+    try p.oracle.stream(accepted[last].items, if (last == 1) accepted[0].items else null);
     try p.oracle.done();
 }
+
+/// The served head beside the pair's shell, and the legacy sidecar arm bound to the legacy shell while recording.
+const Heads = struct {
+    legacy: ?mtp_mod.MtpModel,
+    served: *plugin_head.Head,
+    buf: [2]MtpHeadRef = undefined,
+
+    fn open(p: *served_test.Pair) !Heads {
+        const a = testing.allocator;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var legacy: ?mtp_mod.MtpModel = null;
+        if (p.lg) |lg| {
+            legacy = try mtp_mod.loadMtp(io, a, fixture.stream(), p.dir);
+            errdefer legacy.?.deinit();
+            try legacy.?.bind(&lg.xfm);
+        }
+        errdefer if (legacy) |*lm| lm.deinit();
+        const served = plugin_head.load(io, a, &p.xfm, p.dir) orelse return error.HeadNotLoaded;
+        return .{ .legacy = legacy, .served = served };
+    }
+
+    fn deinit(h: *Heads) void {
+        plugin_head.destroy(h.served, testing.allocator);
+        if (h.legacy) |*lm| lm.deinit();
+    }
+
+    /// The heads in `Pair.shells` order: the legacy arm first while recording, the served one last.
+    fn refs(h: *Heads) []const MtpHeadRef {
+        h.buf = .{ if (h.legacy) |*lm| .{ .qwen = lm } else .{ .plugin = h.served }, .{ .plugin = h.served } };
+        return if (h.legacy != null) &h.buf else h.buf[1..];
+    }
+};
 
 /// A dense head in the measured layout: bf16 fc and norms, every projection 4-bit/gs64.
 fn writeQuantHead(path: []const u8) !void {
@@ -245,44 +275,40 @@ fn writeQuantHead(path: []const u8) !void {
 const nax_profile = @import("../../engines/mlx/spec/mtp_nax_profile.zig");
 
 test "qwen3_5 MTP head: the measured-cost fingerprint, trunk projections and profile are the legacy sidecar arm's" {
-    const a = testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
     var pk = fixture.Pack.init(0x47a4);
     defer pk.deinit();
     try pack.writePack(&pk, false, true, 8);
     var p: served_test.Pair = undefined;
-    try p.openWith(&qwen3_5.table, &pk, pack.config(false, true, 8), &noCapture);
-    p.oracle = .{};
+    try p.openWith(&qwen3_5.table, &pk, pack.config(false, true, 8), &noCapture, try served_test.oracle("qwen3_5", "mtp-profile"));
     defer p.close();
     try writeQuantHead(p.dir);
-    var legacy = try mtp_mod.loadMtp(io, a, fixture.stream(), p.dir);
-    defer legacy.deinit();
-    try legacy.bind(&p.lg.xfm);
-    const served = plugin_head.load(io, a, &p.xfm, p.dir) orelse return error.HeadNotLoaded;
-    defer plugin_head.destroy(served, a);
-
-    const c = &p.lg.xfm.config;
-    const want = legacy.m5NaxHeadFingerprint(.{ .hidden = c.hidden_size, .heads = c.num_attention_heads, .kv_heads = c.num_key_value_heads, .head_dim = c.head_dim, .intermediate = c.intermediate_size }) orelse return error.TestExpectedFingerprint;
-    try testing.expectEqual(mtp_mod.HeadFingerprint{ .bits = 4, .group_size = 64 }, want);
-    try testing.expectEqual(@as(?mtp_mod.HeadFingerprint, want), served.fingerprint);
-    try testing.expectEqual(legacy.m5NaxCostProfile(&p.lg.xfm), served.m5NaxCostProfile(&p.xfm));
-    try testing.expectEqual(legacy.draft_head != null, served.draft_head != null);
-    try testing.expectEqual(legacy.rerank_coarse != null, served.rerank_coarse != null);
-
-    // The served shell reads the trunk off the pack's tensors, the legacy one off its layers: the same projections.
-    const by_layers: nax_profile.TrunkSource = .{ .layers = p.lg.xfm.moe_layers };
-    const by_names: nax_profile.TrunkSource = .{ .weights = .{ .w = &p.lg.weights, .prefix = c.weight_prefix } };
-    for (0..c.num_hidden_layers) |i| {
-        const x = by_layers.at(c, i) orelse return error.TestExpectedLayer;
-        const y = by_names.at(c, i) orelse return error.TestExpectedLayer;
-        try testing.expectEqual(x.linear, y.linear);
-        const n: usize = if (x.linear) 5 else 4;
-        for (x.attn[0..n], y.attn[0..n]) |u, v| try expectProj(u, v);
-        for (x.mlp, y.mlp) |u, v| try expectProj(u, v);
+    var heads = try Heads.open(&p);
+    defer heads.deinit();
+    const served = heads.served;
+    try testing.expectEqual(@as(?mtp_mod.HeadFingerprint, .{ .bits = 4, .group_size = 64 }), served.fingerprint);
+    const got = [_]u32{ @intFromEnum(served.m5NaxCostProfile(&p.xfm)), @intFromBool(served.draft_head != null), @intFromBool(served.rerank_coarse != null), @intFromBool(p.xfm.mtp_uniform_affine_trunk), @intFromBool(p.xfm.mtp_oqe_affine_trunk) };
+    var want: ?[5]u32 = null;
+    if (heads.legacy) |*legacy| {
+        const lg = p.lg.?;
+        const c = &lg.xfm.config;
+        const fp = legacy.m5NaxHeadFingerprint(.{ .hidden = c.hidden_size, .heads = c.num_attention_heads, .kv_heads = c.num_key_value_heads, .head_dim = c.head_dim, .intermediate = c.intermediate_size }) orelse return error.TestExpectedFingerprint;
+        try testing.expectEqual(served.fingerprint, fp);
+        want = .{ @intFromEnum(legacy.m5NaxCostProfile(&lg.xfm)), @intFromBool(legacy.draft_head != null), @intFromBool(legacy.rerank_coarse != null), @intFromBool(lg.xfm.mtp_uniform_affine_trunk), @intFromBool(lg.xfm.mtp_oqe_affine_trunk) };
+        // The served shell reads the trunk off the pack's tensors, the legacy one off its layers: the same projections.
+        const by_layers: nax_profile.TrunkSource = .{ .layers = lg.xfm.moe_layers };
+        const by_names: nax_profile.TrunkSource = .{ .weights = .{ .w = &lg.weights, .prefix = c.weight_prefix } };
+        for (0..c.num_hidden_layers) |i| {
+            const x = by_layers.at(c, i) orelse return error.TestExpectedLayer;
+            const y = by_names.at(c, i) orelse return error.TestExpectedLayer;
+            try testing.expectEqual(x.linear, y.linear);
+            const n: usize = if (x.linear) 5 else 4;
+            for (x.attn[0..n], y.attn[0..n]) |u, v| try expectProj(u, v);
+            for (x.mlp, y.mlp) |u, v| try expectProj(u, v);
+        }
+        inline for (.{ false, true }) |oqe| try testing.expectEqual(nax_profile.trunkMatches(c, by_layers, oqe), nax_profile.trunkMatches(c, by_names, oqe));
     }
-    inline for (.{ false, true }) |oqe| try testing.expectEqual(nax_profile.trunkMatches(c, by_layers, oqe), nax_profile.trunkMatches(c, by_names, oqe));
-    try testing.expectEqual(p.lg.xfm.mtp_uniform_affine_trunk, p.xfm.mtp_uniform_affine_trunk);
-    try testing.expectEqual(p.lg.xfm.mtp_oqe_affine_trunk, p.xfm.mtp_oqe_affine_trunk);
+    try p.oracle.stream(&got, if (want) |*w| w else null);
+    try p.oracle.done();
 }
 
 fn expectProj(want: anytype, got: anytype) !void {
@@ -330,25 +356,20 @@ const Slot = struct {
 
 /// Two requests' draft chains built as lanes of one head forward (`mtpChainBuildLanes`) on each arm: the same drafts
 /// and the same chained hidden rows, two rounds deep (the second merges each request's committed history first).
-fn expectLanes(comptime moe: bool, seed: u64) !void {
+fn expectLanes(comptime moe: bool, comptime seed: u64) !void {
     const a = testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
     var pk = fixture.Pack.init(seed);
     defer pk.deinit();
     try pack.writePack(&pk, moe, true, 8);
     var p: served_test.Pair = undefined;
-    try p.openWith(&qwen3_5.table, &pk, pack.config(moe, true, 8), &noCapture);
-    p.oracle = .{};
+    try p.openWith(&qwen3_5.table, &pk, pack.config(moe, true, 8), &noCapture, try served_test.oracle("qwen3_5", std.fmt.comptimePrint("mtp-lanes-{x}", .{seed})));
     defer p.close();
     if (moe) try writeMoeHead(p.dir) else try writeHead(p.dir, .{});
-    var legacy = try mtp_mod.loadMtp(io, a, fixture.stream(), p.dir);
-    defer legacy.deinit();
-    try legacy.bind(&p.lg.xfm);
-    const served = plugin_head.load(io, a, &p.xfm, p.dir) orelse return error.HeadNotLoaded;
-    defer plugin_head.destroy(served, a);
-    const heads = [_]MtpHeadRef{ .{ .qwen = &legacy }, .{ .plugin = served } };
+    var hb = try Heads.open(&p);
+    defer hb.deinit();
+    const heads = hb.refs();
     for (heads) |h| try testing.expect(h.lanesWith(h));
-    try testing.expect(!heads[1].lanesWith(heads[0]));
+    if (heads.len == 2) try testing.expect(!heads[1].lanesWith(heads[0]));
 
     var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
     defer tok.deinit();
@@ -360,13 +381,13 @@ fn expectLanes(comptime moe: bool, seed: u64) !void {
     for (heads, xs, 0..) |h, x, k| for (prompts, 0..) |pr, r| {
         slots[k][r] = try Slot.init(a, x, &tok, h, pr);
     };
-    defer for (slots) |arm| for (arm) |sl| sl.deinit(a);
+    defer for (slots[0..xs.len]) |arm| for (arm) |sl| sl.deinit(a);
     var g = ops.Graph.init(a, fixture.stream());
     defer g.deinit();
     for (0..2) |_| {
         var drafts: [2][2][2]Array = undefined;
         var hidden: [2][2]Array = undefined;
-        for (0..2) |k| {
+        for (0..xs.len) |k| {
             var gens: [2]*Generator = undefined;
             var opens: [2]Generator.MtpRoundOpen = undefined;
             var chains: [2]Generator.MtpPreDraft = undefined;
@@ -394,10 +415,15 @@ fn expectLanes(comptime moe: bool, seed: u64) !void {
             }
         }
         for (0..2) |r| {
-            for (0..2) |d| try ops.expectBitEqual(drafts[1][r][d], drafts[0][r][d]);
-            try ops.expectBitEqual(hidden[1][r], hidden[0][r]);
+            for (0..2) |d| {
+                const col = [2]Array{ drafts[0][r][d], drafts[1][r][d] };
+                try p.check(col[0..xs.len]);
+            }
+            const col = [2]Array{ hidden[0][r], hidden[1][r] };
+            try p.check(col[0..xs.len]);
         }
     }
+    try p.oracle.done();
 }
 
 test "qwen3_5 MTP head: a group drafts as lanes of one head forward, equal to the legacy sidecar's lanes" {
@@ -410,21 +436,16 @@ test "qwen3_5 MTP head: a MoE trunk's head drafts lanes equal to the legacy arm'
 
 test "qwen3_5 MTP head: an image turn's steps rope as the legacy arm ropes them, inside and past the M-RoPE table" {
     const a = testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
     var pk = fixture.Pack.init(0x47a7);
     defer pk.deinit();
     try pack.writePack(&pk, false, true, 8);
     var p: served_test.Pair = undefined;
-    try p.openWith(&qwen3_5.table, &pk, pack.config(false, true, 8), &noCapture);
-    p.oracle = .{};
+    try p.openWith(&qwen3_5.table, &pk, pack.config(false, true, 8), &noCapture, try served_test.oracle("qwen3_5", "mtp-image"));
     defer p.close();
     try writeHead(p.dir, .{});
-    var legacy = try mtp_mod.loadMtp(io, a, fixture.stream(), p.dir);
-    defer legacy.deinit();
-    try legacy.bind(&p.lg.xfm);
-    const served = plugin_head.load(io, a, &p.xfm, p.dir) orelse return error.HeadNotLoaded;
-    defer plugin_head.destroy(served, a);
-    const heads = [_]MtpHeadRef{ .{ .qwen = &legacy }, .{ .plugin = served } };
+    var hb = try Heads.open(&p);
+    defer hb.deinit();
+    const heads = hb.refs();
     const xs = p.shells();
     for (xs) |x| x.config.mrope_section = .{ 11, 11, 10 };
 
@@ -432,8 +453,8 @@ test "qwen3_5 MTP head: an image turn's steps rope as the legacy arm ropes them,
     const table = [_]i32{ 0, 1, 2, 2, 2, 3 } ++ [_]i32{ 0, 1, 2, 3, 3, 4 } ++ [_]i32{ 0, 1, 2, 3, 4, 5 };
     const mctx: mtp_mod.MropeContext = .{ .pos = &table, .total = 6, .delta = -2 };
     var caches: [2]MtpCacheRef = undefined;
-    for (heads, &caches) |h, *c| c.* = try h.makeCache(a);
-    defer for (&caches) |*c| c.deinit();
+    for (heads, caches[0..heads.len]) |h, *c| c.* = try h.makeCache(a);
+    defer for (caches[0..heads.len]) |*c| c.deinit();
     var g = ops.Graph.init(a, fixture.stream());
     defer g.deinit();
     const width = p.cfg.hidden_size;
@@ -443,7 +464,7 @@ test "qwen3_5 MTP head: an image turn's steps rope as the legacy arm ropes them,
     const one = try hiddenRows(&g, 1, width, dt, 13);
     const many = try hiddenRows(&g, 3, width, dt, 14);
     var outs: [2][5]Array = undefined;
-    for (heads, xs, &caches, 0..) |h, x, *c, k| {
+    for (heads, xs, caches[0..heads.len], 0..) |h, x, *c, k| {
         try h.appendHistory(x, c, &.{ 5, 9, 40, 7 }, hist, 0, mctx, a);
         // Rows 4 and 5 sit inside the table, row 6 past it.
         const merged = try h.forward(x, c, try idArr(&g, &.{ 11, 12, 13 }), straddle, 4, .logits, mctx, null);
@@ -452,5 +473,6 @@ test "qwen3_5 MTP head: an image turn's steps rope as the legacy arm ropes them,
         outs[k] = .{ try g.adopt(merged.logits), try g.adopt(merged.hidden_next), try g.adopt(mixed.hidden_next), try g.adopt(rows.hidden_next), try g.adopt(try h.draftSelect(x, mixed.hidden_next, null)) };
         try testing.expectEqual(@as(usize, 11), c.step());
     }
-    for (outs[0], outs[1]) |want, got| try ops.expectBitEqual(got, want);
+    try served_test.checkRows(&p, &outs, xs.len);
+    try p.oracle.done();
 }

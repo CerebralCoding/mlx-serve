@@ -1,7 +1,7 @@
 //! Parity proof for the hy_v3 plugin: tiny random packs (4-bit; bf16, whose dense attention decodes through the
 //! requantized side copies) with a dense first layer, experts under both container names, one layer without a
-//! selection bias and an ungated shared expert, served by the table bit-equal to the legacy `forwardMoeWith` at every
-//! step, and `parse` equal to the engine's parse.
+//! selection bias and an ungated shared expert, served bit-equal to the legacy `forwardMoeWith`'s values (recorded to
+//! `fixtures/`) at every step, and `parse` equal to the engine's parse.
 
 const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
@@ -109,43 +109,51 @@ const wide_steps = [_]proof.Step{
     .{ .mode = .decode, .ids = &.{64} },
 };
 
-fn case(comptime quantized: bool, seed: u64) !void {
+/// The legacy forward's values on the legacy parse's config, recorded to `fixtures/<seed>.tape`.
+fn open(p: *fixture.Pack, json: []const u8, comptime seed: u64) !both.Both {
+    const name = std.fmt.comptimePrint("fixtures/{x}.tape", .{seed});
+    return both.Both.proof(&hy3.table, p, json, true, "src/plugins/hy_v3/" ++ name, @embedFile(name));
+}
+
+fn case(comptime quantized: bool, comptime seed: u64) !void {
     var p = fixture.Pack.init(seed);
     defer p.deinit();
     try writePack(&p, quantized);
-    var t = try proof.Twin(hy3).open(&p, configJson(quantized), &.{});
-    defer t.close();
-    try t.expectSteps(&(proof.steps ++ wide_steps));
+    var b = try open(&p, configJson(quantized), seed);
+    defer b.close();
+    try b.expectSteps(&(proof.steps ++ wide_steps));
+    try b.expectDone();
 }
 
 /// Served: the driver's shell on the legacy parse's config, steps past a chunk and the pipelined greedy decode.
-fn servedCase(comptime quantized: bool, seed: u64) !void {
+fn servedCase(comptime quantized: bool, comptime seed: u64) !void {
     var p = fixture.Pack.init(seed);
     defer p.deinit();
     try writePack(&p, quantized);
-    var b = try both.Both.openOnLegacyConfig(&hy3.table, &p, configJson(quantized));
+    var b = try open(&p, configJson(quantized), seed);
     defer b.close();
     try b.expectSteps(&both.long_steps);
     try b.expectGreedy();
+    try b.expectDone();
 }
 
 /// A shape the plugin once declined (`extra` joins the config's keys) binds to the plugin and is served bit-equal on
 /// the legacy config: steps past a chunk, greedy decode, and image rows spliced at token 250 under a `vision_config`.
-fn shapeCase(comptime q: Quant, qk_norm: bool, comptime extra: []const u8, seed: u64) !void {
+fn shapeCase(comptime q: Quant, qk_norm: bool, comptime extra: []const u8, comptime seed: u64) !void {
     const json = configAs(q, extra);
     try expectBinds(json);
     var p = fixture.Pack.init(seed);
     defer p.deinit();
     try writePackAs(&p, q, qk_norm);
-    var b = try both.Both.openOnLegacyConfig(&hy3.table, &p, json);
+    var b = try open(&p, json, seed);
     defer b.close();
-    // Both sides took the same 2-bit arm: qmv2's kernels for a ternary pack, stock qmm otherwise.
+    // The 2-bit arm: qmv2's kernels for a ternary pack, stock qmm otherwise.
     const m: *const hy3.Loaded = @ptrCast(@alignCast(b.xfm.plugin.?.model));
-    try testing.expectEqual(q == .ternary, b.lg.?.xfm.ternary_2bit);
     try testing.expectEqual(q == .ternary, m.layers[0].mixer.q.lin.ternary and m.base.weights.head.ternary);
     try b.expectSteps(&both.long_steps);
     try b.expectGreedy();
     if (std.mem.indexOf(u8, extra, "vision_config") != null) try b.expectMedia(250, H);
+    try b.expectDone();
 }
 
 fn expectBinds(json: []const u8) !void {
@@ -217,9 +225,9 @@ test "hy_v3 served: lm_head_mxfp8 (LOSSY) quantizes a bf16 pack's head as the le
     var p = fixture.Pack.init(0x4a7);
     defer p.deinit();
     try writePack(&p, false);
-    var b = try both.Both.openAs(&hy3.table, &p, configJson(false), true, .{ .legacy = "src/plugins/hy_v3/fixtures/mxfp8-4a7.tape" });
+    var b = try both.Both.proof(&hy3.table, &p, configJson(false), true, "src/plugins/hy_v3/fixtures/mxfp8-4a7.tape", @embedFile("fixtures/mxfp8-4a7.tape"));
     defer b.close();
-    try testing.expect(b.lg.?.xfm.lm_head_s.ctx != null and b.xfm.lm_head_s.ctx != null);
+    try testing.expect(b.xfm.lm_head_s.ctx != null);
     try b.expectSteps(&both.long_steps);
     try b.expectGreedy();
     try b.expectDone();

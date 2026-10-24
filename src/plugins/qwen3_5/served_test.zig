@@ -27,43 +27,53 @@ const tape_mod = @import("../../engines/mlx/plugin/tape.zig");
 const tree_mod = @import("../../engines/mlx/spec/tree.zig");
 const lane_qmm = @import("../../sdk/blocks/qmm/lane_qmm.zig");
 const naxAvailable = @import("../../mlx/device.zig").naxAvailable;
+const dflash_mod = @import("../../engines/mlx/spec/dflash/dflash.zig");
 
 const testing = std.testing;
 const Array = mlx.mlx_array;
 
-/// The legacy shell and the served shell over one pack, the served one bound to `table`.
+/// The served shell over one pack, bound to `table`, and the legacy shell beside it while its tape records.
 pub const Pair = struct {
-    lg: *fixture.Legacy,
+    lg: ?*fixture.Legacy,
     dir: []u8,
     cfg: model.ModelConfig,
     xfm: Transformer,
-    /// The legacy values every proof compares (`Oracle`).
-    oracle: Oracle = .{},
+    /// The values every proof compares (`Oracle`).
+    oracle: Oracle,
+    tmp: testing.TmpDir,
+    sides: [2]*Transformer = undefined,
 
-    pub fn open(p: *Pair, table: *const abi.ModelTable, pk: *fixture.Pack, json: []const u8) !void {
-        return p.openWith(table, pk, json, null);
+    pub fn open(p: *Pair, table: *const abi.ModelTable, pk: *fixture.Pack, json: []const u8, o: Oracle) !void {
+        return p.openAs(table, pk, json, null, null, o);
     }
 
     /// `open`, with `edit` applied to the plugin's parse.
-    pub fn openWith(p: *Pair, table: *const abi.ModelTable, pk: *fixture.Pack, json: []const u8, edit: ?*const fn (*abi.Parsed) void) !void {
-        return p.openAs(table, pk, json, edit, null);
+    pub fn openWith(p: *Pair, table: *const abi.ModelTable, pk: *fixture.Pack, json: []const u8, edit: ?*const fn (*abi.Parsed) void, o: Oracle) !void {
+        return p.openAs(table, pk, json, edit, null, o);
     }
 
     /// `open`, with `settings` applied to both sides' config before they load (a per-model load setting).
-    pub fn openSettings(p: *Pair, table: *const abi.ModelTable, pk: *fixture.Pack, json: []const u8, settings: *const fn (*model.ModelConfig) void) !void {
-        return p.openAs(table, pk, json, null, settings);
+    pub fn openSettings(p: *Pair, table: *const abi.ModelTable, pk: *fixture.Pack, json: []const u8, settings: *const fn (*model.ModelConfig) void, o: Oracle) !void {
+        return p.openAs(table, pk, json, null, settings, o);
     }
 
-    fn openAs(p: *Pair, table: *const abi.ModelTable, pk: *fixture.Pack, json: []const u8, edit: ?*const fn (*abi.Parsed) void, settings: ?*const fn (*model.ModelConfig) void) !void {
+    fn openAs(p: *Pair, table: *const abi.ModelTable, pk: *fixture.Pack, json: []const u8, edit: ?*const fn (*abi.Parsed) void, settings: ?*const fn (*model.ModelConfig) void, o: Oracle) !void {
         const a = testing.allocator;
         const io = std.Io.Threaded.global_single_threaded.io();
-        p.lg = try pk.loadEdited(json, settings);
-        errdefer p.lg.deinit();
-        p.lg.xfm.compileGdnGate();
-        p.lg.xfm.compileMoeRouting();
+        p.* = .{ .lg = null, .dir = &.{}, .cfg = undefined, .xfm = undefined, .oracle = o, .tmp = testing.tmpDir(.{}) };
+        errdefer p.tmp.cleanup();
+        if (o.tape.recording()) {
+            const lg = try pk.loadEdited(json, settings);
+            lg.xfm.compileGdnGate();
+            lg.xfm.compileMoeRouting();
+            p.lg = lg;
+        }
+        errdefer if (p.lg) |lg| lg.deinit();
         var buf: [512]u8 = undefined;
-        p.dir = try a.dupe(u8, buf[0..try p.lg.tmp.dir.realPath(io, &buf)]);
+        const dir_h = if (p.lg) |lg| lg.tmp.dir else p.tmp.dir;
+        p.dir = try a.dupe(u8, buf[0..try dir_h.realPath(io, &buf)]);
         errdefer a.free(p.dir);
+        if (p.lg == null) try pk.save(p.dir);
         const b = try a.create(plugin_config.Binding);
         b.* = .{ .table = table };
         const mem: sdk.fixture.MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = json }} };
@@ -87,24 +97,35 @@ pub const Pair = struct {
         p.xfm.deinit();
         p.cfg.deinit(testing.allocator);
         testing.allocator.free(p.dir);
-        p.lg.deinit();
+        if (p.lg) |lg| lg.deinit();
+        p.tmp.cleanup();
     }
 
-    pub fn shells(p: *Pair) [2]*Transformer {
-        return .{ &p.lg.xfm, &p.xfm };
+    /// The shells to run: the legacy one first while recording, the served one last.
+    pub fn shells(p: *Pair) []const *Transformer {
+        p.sides = .{ if (p.lg) |lg| &lg.xfm else &p.xfm, &p.xfm };
+        return if (p.lg != null) &p.sides else p.sides[1..];
+    }
+
+    /// One value per shell (`shells` order): the served one's against the legacy's or the tape.
+    pub fn check(p: *Pair, vals: []const Array) !void {
+        try p.oracle.check(vals[vals.len - 1], if (vals.len == 2) vals[0] else null, false);
+    }
+
+    /// Every recurrent state of the served lane (last) equal to the legacy lane's, while recording.
+    pub fn entries(_: *Pair, lanes: []const Lane) !void {
+        if (lanes.len == 2) try fixture.expectEntries(lanes[0].ssm, lanes[1].ssm);
     }
 };
 
-/// What a proof compares, recorded from the legacy forward for when it is deleted (`tape.zig`): with
-/// `MLX_SERVE_PROOF_RECORD=<repo root>` every legacy value is written to the tape at `rel`; a recorded tape played
-/// back checks the plugin's values against it beside the live legacy shell.
+/// What a proof compares, recorded from the legacy forward (`tape.zig`): a proof whose tape is still empty records it
+/// with `MLX_SERVE_PROOF_RECORD=<repo root>` beside the legacy shell; every other run plays it back.
 pub const Oracle = struct {
     tape: tape_mod.Tape = .{},
 
-    pub fn open(comptime rel: []const u8, recorded: ?[]const u8) !Oracle {
-        if (tape_mod.recordRoot()) |root| return .{ .tape = try tape_mod.Tape.recorder(root, rel) };
-        if (recorded) |bytes| return .{ .tape = try tape_mod.Tape.player(bytes) };
-        return .{};
+    pub fn open(comptime rel: []const u8, recorded: []const u8) !Oracle {
+        if (tape_mod.records(recorded)) return .{ .tape = try tape_mod.Tape.recorder(tape_mod.recordRoot().?, rel) };
+        return .{ .tape = try tape_mod.Tape.player(recorded) };
     }
 
     pub fn finish(o: *Oracle) void {
@@ -116,28 +137,25 @@ pub const Oracle = struct {
         try o.tape.expectDone();
     }
 
-    /// `got` (the plugin's) bit-equal to `want` (the legacy's) and to the tape.
-    pub fn check(o: *Oracle, got: Array, want: Array, greedy: bool) !void {
-        try ops.expectBitEqual(got, want);
-        if (o.tape.recording()) try o.tape.put(want);
+    /// `got` (the plugin's) bit-equal to `want` (the legacy's, recorded) or to the tape.
+    pub fn check(o: *Oracle, got: Array, want: ?Array, greedy: bool) !void {
+        if (want) |w| {
+            try ops.expectBitEqual(got, w);
+            if (o.tape.recording()) try o.tape.put(w);
+        }
         if (o.tape.playing()) try o.tape.expectNext(got, greedy);
     }
 
     /// A greedy run's tokens.
-    pub fn stream(o: *Oracle, got: []const u32, want: []const u32) !void {
-        try testing.expectEqualSlices(u32, want, got);
-        if (o.tape.path == null and !o.tape.playing()) return;
+    pub fn stream(o: *Oracle, got: []const u32, want: ?[]const u32) !void {
+        if (want) |w| try testing.expectEqualSlices(u32, w, got);
         const g = mlx.mlx_array_new_data(got.ptr, &[_]c_int{@intCast(got.len)}, 1, .uint32);
         defer _ = mlx.mlx_array_free(g);
-        const w = mlx.mlx_array_new_data(want.ptr, &[_]c_int{@intCast(want.len)}, 1, .uint32);
-        defer _ = mlx.mlx_array_free(w);
+        const w: ?Array = if (want) |wv| mlx.mlx_array_new_data(wv.ptr, &[_]c_int{@intCast(wv.len)}, 1, .uint32) else null;
+        defer if (w) |x| {
+            _ = mlx.mlx_array_free(x);
+        };
         try o.check(g, w, true);
-    }
-
-    /// Every recurrent state and verify capture (`fixture.expectEntries`), live only: the logits and captures that
-    /// follow carry them onto the tape at a fraction of the bytes.
-    pub fn entries(_: *Oracle, want: []const SSMCacheEntry, got: []const SSMCacheEntry) !void {
-        try fixture.expectEntries(want, got);
     }
 };
 
@@ -195,12 +213,18 @@ const steps = [_]Step{
 /// The solo steps (every one capturing layers 0 and 1, as a DFlash drafter reads them) and the prompt-lookup round
 /// loop, served vs legacy.
 pub fn expectSolo(p: *Pair) !void {
+    try soloSteps(p);
+    try p.oracle.done();
+}
+
+fn soloSteps(p: *Pair) !void {
     const a = testing.allocator;
     const s = fixture.stream();
     const xs = p.shells();
-    var lanes: [2]Lane = undefined;
-    for (&lanes, xs) |*l, x| try l.init(x);
-    defer for (&lanes) |*l| l.deinit();
+    var lane_buf: [2]Lane = undefined;
+    const lanes = lane_buf[0..xs.len];
+    for (lanes, xs) |*l, x| try l.init(x);
+    defer for (lanes) |*l| l.deinit();
     const recurrent = driver.positionsOf(&p.xfm) != .kv_step;
     for (steps) |st| {
         var g = ops.Graph.init(a, s);
@@ -211,8 +235,9 @@ pub fn expectSolo(p: *Pair) !void {
         defer for (caps) |pair| for (pair) |c| if (c.ctx != null) {
             _ = mlx.mlx_array_free(c);
         };
-        const before = lanes[0].off;
-        for (&lanes, xs, &outs, &caps) |*l, x, *o, *cv| {
+        // A trunk positioned off the KV step leaves `off` to the scheduler.
+        const before = if (recurrent) lanes[0].off else lanes[0].kv.step;
+        for (lanes, xs, outs[0..xs.len], caps[0..xs.len]) |*l, x, *o, *cv| {
             for (cv) |*c| c.* = mlx.mlx_array_new();
             var cl: CaptureLayers = .{ .ids = &.{ 0, 1 }, .out = cv };
             l.ctx.capture_ssm_seq = st.verify;
@@ -223,13 +248,17 @@ pub fn expectSolo(p: *Pair) !void {
             }
             o.* = try g.adopt(try x.forwardWith(&l.ctx, t));
         }
-        try p.oracle.check(outs[1], outs[0], false);
-        for (caps[0], caps[1]) |want, got| try p.oracle.check(got, want, false);
+        try p.check(outs[0..xs.len]);
+        for (0..2) |c| {
+            var col: [2]Array = undefined;
+            for (caps[0..xs.len], col[0..xs.len]) |cv, *x| x.* = cv[c];
+            try p.check(col[0..xs.len]);
+        }
         // A trunk the driver positions off the KV step leaves `moe_seq_offset` to the scheduler.
-        if (recurrent) try testing.expectEqual(lanes[0].off, lanes[1].off);
-        try p.oracle.entries(lanes[0].ssm, lanes[1].ssm);
+        if (recurrent) try testing.expectEqual(lanes[0].off, lanes[xs.len - 1].off);
+        try p.entries(lanes);
         if (st.accept) |acc| {
-            for (&lanes) |*l| {
+            for (lanes) |*l| {
                 const keep = before + 1 + acc;
                 const step_keep = l.kv.step;
                 try l.kv.truncate(keep, s);
@@ -241,14 +270,14 @@ pub fn expectSolo(p: *Pair) !void {
                 }
                 l.off = keep;
             }
-            try p.oracle.entries(lanes[0].ssm, lanes[1].ssm);
+            try p.entries(lanes);
         }
     }
 
     var tok_dummy: Tokenizer = undefined; // never read by the Generator
     const prompt = [_]u32{ 3, 7, 1, 12, 30, 5, 9, 22, 3, 7, 1, 12, 30, 5, 9, 22, 3, 7, 1 };
     var streams: [2][24]u32 = undefined;
-    for (xs, &streams) |x, *out| {
+    for (xs, streams[0..xs.len]) |x, *out| {
         var gen = try Generator.initWithOptions(std.Io.Threaded.global_single_threaded.io(), a, x, &tok_dummy, &prompt, out.len, .{ .temperature = 0.0 }, &.{}, .{ .pld_enabled = true });
         defer gen.deinit(a);
         var n: usize = 0;
@@ -259,7 +288,63 @@ pub fn expectSolo(p: *Pair) !void {
         }
         try testing.expectEqual(out.len, n);
     }
-    try p.oracle.stream(&streams[1], &streams[0]);
+    try p.oracle.stream(&streams[xs.len - 1], if (xs.len == 2) &streams[0] else null);
+}
+
+/// A greedy DFlash run on `xfm` with the tiny assistant at `asst`: every emitted token and each round's accepted count.
+pub fn dflashRun(xfm: *Transformer, asst: []const u8, tokens: []u32, accepted: *std.ArrayList(u32)) !void {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dm = try dflash_mod.loadDflash(io, a, fixture.stream(), asst);
+    defer dm.deinit();
+    try dm.bind(xfm);
+    var tok_dummy: Tokenizer = undefined; // never read by the Generator
+    const prompt = [_]u32{ 3, 7, 1, 12, 30, 5, 9, 22, 4, 17, 2, 28 };
+    var gen = try Generator.initWithOptions(io, a, xfm, &tok_dummy, &prompt, @intCast(tokens.len), .{ .temperature = 0.0 }, &.{}, .{
+        .dflash_enabled = true,
+        .dflash = &dm,
+        .dflash_min_accepted_per_round = 0,
+    });
+    defer gen.deinit(a);
+    var n: usize = 0;
+    while (try gen.nextDflash(a)) |res| {
+        defer a.free(res.tokens);
+        @memcpy(tokens[n..][0..res.tokens.len], res.tokens);
+        n += res.tokens.len;
+        try accepted.append(a, res.accepted_tokens);
+    }
+    try testing.expectEqual(tokens.len, n);
+    try testing.expect(gen.dflash_attempted > 0);
+}
+
+/// What a DFlash drafter reads of the trunk (the embedding of five ids, the `head` readout of those rows), then a
+/// greedy DFlash run with the assistant at `asst`: its tokens and each round's accepted count, served against the
+/// legacy shell or the tape.
+pub fn expectDflash(p: *Pair, asst: []const u8, hidden: c_int, comptime head: []const u8) !void {
+    const a = testing.allocator;
+    const xs = p.shells();
+    try testing.expect(p.xfm.plugin.?.drafters and p.xfm.supportsLayerCapture());
+    {
+        var g = ops.Graph.init(a, fixture.stream());
+        defer g.deinit();
+        const t = try fixture.tokens(&g, &.{ 4, 90, 127, 0, 33 });
+        const rows = try g.reshape(try g.adopt(try xs[0].rawEmbedding(t)), &.{ 1, 5, hidden });
+        var emb: [2]Array = undefined;
+        var out: [2]Array = undefined;
+        for (xs, emb[0..xs.len], out[0..xs.len]) |x, *e, *o| {
+            e.* = try g.adopt(try x.rawEmbedding(t));
+            o.* = try g.adopt(try @field(Transformer, head)(x, rows));
+        }
+        try p.check(emb[0..xs.len]);
+        try p.check(out[0..xs.len]);
+    }
+    var tokens: [2][16]u32 = undefined;
+    var accepted: [2]std.ArrayList(u32) = .{ .empty, .empty };
+    defer for (&accepted) |*l| l.deinit(a);
+    for (xs, 0..) |x, k| try dflashRun(x, asst, &tokens[k], &accepted[k]);
+    const last = xs.len - 1;
+    try p.oracle.stream(&tokens[last], if (last == 1) &tokens[0] else null);
+    try p.oracle.stream(accepted[last].items, if (last == 1) accepted[0].items else null);
     try p.oracle.done();
 }
 
@@ -300,24 +385,25 @@ fn expectVerifyEqualsSerial(x: *Transformer) !void {
 pub fn expectBatched(p: *Pair) !void {
     const a = testing.allocator;
     const s = fixture.stream();
-    try testing.expect(p.xfm.supportsBatchedGdnDecode() and p.lg.xfm.supportsBatchedGdnDecode());
+    for (p.shells()) |x| try testing.expect(x.supportsBatchedGdnDecode());
     // The legacy tick splits its merged states back after every tick, so each slot's states can be compared.
-    p.lg.xfm.persistent_group_state_override = false;
+    if (p.lg) |lg| lg.xfm.persistent_group_state_override = false;
     const xs = p.shells();
-    var lanes: [2][2]Lane = undefined;
-    for (&lanes, xs) |*pair, x| for (pair) |*l| try l.init(x);
-    defer for (&lanes) |*pair| for (pair) |*l| l.deinit();
+    var lane_buf: [2][2]Lane = undefined;
+    const lanes = lane_buf[0..xs.len];
+    for (lanes, xs) |*pair, x| for (pair) |*l| try l.init(x);
+    defer for (lanes) |*pair| for (pair) |*l| l.deinit();
     for ([_][]const i32{ &ids(20, 3), &ids(7, 9) }, 0..) |pr, j| {
         var g = ops.Graph.init(a, s);
         defer g.deinit();
-        for (&lanes, xs) |*pair, x| _ = try g.adopt(try x.forwardWith(&pair[j].ctx, try fixture.tokens(&g, pr)));
+        for (lanes, xs) |*pair, x| _ = try g.adopt(try x.forwardWith(&pair[j].ctx, try fixture.tokens(&g, pr)));
     }
-    for (&lanes, xs) |*pair, x| try testing.expect(x.batchedGdnReady(&.{ &pair[0].ctx, &pair[1].ctx }));
+    for (lanes, xs) |*pair, x| try testing.expect(x.batchedGdnReady(&.{ &pair[0].ctx, &pair[1].ctx }));
     for ([_][2]u32{ .{ 77, 3 }, .{ 190, 64 } }) |next| {
         var g = ops.Graph.init(a, s);
         defer g.deinit();
         var outs: [2][4]Array = undefined;
-        for (&lanes, xs, &outs) |*pair, x, *o| {
+        for (lanes, xs, outs[0..xs.len]) |*pair, x, *o| {
             const ctxs = [_]*ForwardCtx{ &pair[0].ctx, &pair[1].ctx };
             const offs = [_]u32{ @intCast(pair[0].off), @intCast(pair[1].off) };
             var hidden: ?[]Array = null;
@@ -327,14 +413,14 @@ pub fn expectBatched(p: *Pair) !void {
             o.* = .{ try g.adopt(rows[0]), try g.adopt(rows[1]), try g.adopt(hidden.?[0]), try g.adopt(hidden.?[1]) };
             for (pair) |*l| l.off += 1;
         }
-        for (outs[0], outs[1]) |want, got| try p.oracle.check(got, want, false);
-        for (&lanes[0], &lanes[1]) |*w, *gl| try p.oracle.entries(w.ssm, gl.ssm);
+        try checkRows(p, &outs, xs.len);
+        try slotEntries(lanes);
     }
     var g = ops.Graph.init(a, s);
     defer g.deinit();
     const t = try g.adopt(mlx.mlx_array_new_data(&[_]i32{ 5, 61, 200, 9, 33, 77 }, &[_]c_int{ 2, 3 }, 2, .int32));
     var outs: [2][3]Array = undefined;
-    for (&lanes, xs, &outs) |*pair, x, *o| {
+    for (lanes, xs, outs[0..xs.len]) |*pair, x, *o| {
         const ctxs = [_]*ForwardCtx{ &pair[0].ctx, &pair[1].ctx };
         const offs = [_]u32{ @intCast(pair[0].off), @intCast(pair[1].off) };
         var last = mlx.mlx_array_new();
@@ -342,9 +428,23 @@ pub fn expectBatched(p: *Pair) !void {
         const logits = try x.forwardMoeBatchedVerify(t, &ctxs, &offs, &last, &all);
         o.* = .{ try g.adopt(logits), try g.adopt(last), try g.adopt(all) };
     }
-    for (outs[0], outs[1]) |want, got| try p.oracle.check(got, want, false);
-    for (&lanes[0], &lanes[1]) |*w, *gl| try p.oracle.entries(w.ssm, gl.ssm);
+    try checkRows(p, &outs, xs.len);
+    try slotEntries(lanes);
     try p.oracle.done();
+}
+
+/// Row `i` of each shell's outputs (`outs[side][i]`), the served side's against the legacy's or the tape.
+pub fn checkRows(p: anytype, outs: anytype, sides: usize) !void {
+    for (0..outs[0].len) |i| {
+        var col: [2]Array = undefined;
+        for (outs[0..sides], col[0..sides]) |o, *x| x.* = o[i];
+        try p.check(col[0..sides]);
+    }
+}
+
+/// Each slot's recurrent states, served against legacy, while recording.
+fn slotEntries(lanes: []const [2]Lane) !void {
+    if (lanes.len == 2) for (&lanes[0], &lanes[1]) |*w, *gl| try fixture.expectEntries(w.ssm, gl.ssm);
 }
 
 /// 4 text tokens, a 2x3 image (id 250), 3 text tokens on the M-RoPE table; the rows splice across a chunk boundary,
@@ -369,15 +469,16 @@ pub fn expectImage(p: *Pair) !void {
     defer g0.deinit();
     const rows = try g0.astype(try g0.adopt(try fixtureRows(6, @intCast(p.cfg.hidden_size), 9)), p.cfg.actDtype());
     const xs = p.shells();
-    var lanes: [2]Lane = undefined;
-    for (&lanes, xs) |*l, x| {
+    var lane_buf: [2]Lane = undefined;
+    const lanes = lane_buf[0..xs.len];
+    for (lanes, xs) |*l, x| {
         try l.init(x);
         l.ctx.mrope_pos = &table;
         l.ctx.mrope_total = T;
         l.ctx.mrope_delta = 10 - T;
         l.ctx.vision_embeddings = rows;
     }
-    defer for (&lanes) |*l| l.deinit();
+    defer for (lanes) |*l| l.deinit();
     const chunks = [_]struct { ids: []const i32, offset: usize = 0, verify: bool = false }{
         .{ .ids = tokens[0..7] },
         .{ .ids = tokens[7..], .offset = 3 },
@@ -390,14 +491,14 @@ pub fn expectImage(p: *Pair) !void {
         defer g.deinit();
         const t = try fixture.tokens(&g, ch.ids);
         var outs: [2]Array = undefined;
-        for (&lanes, xs, &outs) |*l, x, *o| {
+        for (lanes, xs, outs[0..xs.len]) |*l, x, *o| {
             l.ctx.vision_splice_offset = ch.offset;
             l.ctx.capture_ssm_seq = ch.verify;
             defer l.ctx.capture_ssm_seq = false;
             o.* = try g.adopt(try x.forwardWith(&l.ctx, t));
         }
-        try p.oracle.check(outs[1], outs[0], false);
-        try p.oracle.entries(lanes[0].ssm, lanes[1].ssm);
+        try p.check(outs[0..xs.len]);
+        try p.entries(lanes);
     }
     try p.oracle.done();
 }
@@ -426,18 +527,25 @@ fn treePath(r: usize, out: *[4]i32) []const i32 {
 /// every tree row equals serial decode along its own ancestors, and the committed state the serial state after the
 /// kept path (a bf16 matmul's bits follow its row count).
 fn expectTree(p: *Pair, exact: bool) !void {
+    try treeSteps(p, exact);
+    try p.oracle.done();
+}
+
+fn treeSteps(p: *Pair, exact: bool) !void {
     const a = testing.allocator;
     const s = fixture.stream();
     const xs = p.shells();
     for (xs) |x| try testing.expect(x.specTreeSupported());
-    var lanes: [2]Lane = undefined;
-    for (&lanes, xs) |*l, x| try l.init(x);
-    defer for (&lanes) |*l| l.deinit();
+    var lane_buf: [2]Lane = undefined;
+    const lanes = lane_buf[0..xs.len];
+    for (lanes, xs) |*l, x| try l.init(x);
+    defer for (lanes) |*l| l.deinit();
     var g = ops.Graph.init(a, s);
     defer g.deinit();
     const prompt = try fixture.tokens(&g, &ids(19, 7));
-    for (&lanes, xs) |*l, x| _ = try g.adopt(try x.forwardWith(&l.ctx, prompt));
+    for (lanes, xs) |*l, x| _ = try g.adopt(try x.forwardWith(&l.ctx, prompt));
     const anchor = lanes[0].off;
+    const last = xs.len - 1;
 
     const tree = tree_mod.specTreeFor(&tree_parents, &tree_depth, 3);
     defer tree.deinit();
@@ -446,7 +554,7 @@ fn expectTree(p: *Pair, exact: bool) !void {
     defer for (caps) |pair| for (pair) |c| if (c.ctx != null) {
         _ = mlx.mlx_array_free(c);
     };
-    for (&lanes, xs, &outs, &caps) |*l, x, *o, *cv| {
+    for (lanes, xs, outs[0..xs.len], caps[0..xs.len]) |*l, x, *o, *cv| {
         for (cv) |*c| c.* = mlx.mlx_array_new();
         var cl: CaptureLayers = .{ .ids = &.{ 0, 1 }, .out = cv };
         l.ctx.capture_layers = &cl;
@@ -462,14 +570,14 @@ fn expectTree(p: *Pair, exact: bool) !void {
         }
         o.* = try g.adopt(try x.forwardWith(&l.ctx, try fixture.tokens(&g, &tree_toks)));
     }
-    try ops.expectBitEqual(outs[1], outs[0]);
-    for (caps[0], caps[1]) |want, got| try ops.expectBitEqual(got, want);
-    try fixture.expectEntries(lanes[0].ssm, lanes[1].ssm);
-    try expectTreeCaptures(lanes[0].ssm, lanes[1].ssm);
-    try testing.expect(lanes[1].ssm[0].spec_prework.k.ctx != null);
+    try p.check(outs[0..xs.len]);
+    try checkRows(p, &caps, xs.len);
+    try p.entries(lanes);
+    if (xs.len == 2) try expectTreeCaptures(lanes[0].ssm, lanes[1].ssm);
+    try testing.expect(lanes[last].ssm[0].spec_prework.k.ctx != null);
 
     // Every row against serial decode along its ancestors, from the prompt's state.
-    const vocab = ops.shape(outs[1])[2];
+    const vocab = ops.shape(outs[last])[2];
     for (0..if (exact) tree_toks.len else 0) |r| {
         var buf: [4]i32 = undefined;
         const path = treePath(r, &buf);
@@ -477,10 +585,10 @@ fn expectTree(p: *Pair, exact: bool) !void {
         try ser.init(&p.xfm);
         defer ser.deinit();
         _ = try g.adopt(try p.xfm.forwardWith(&ser.ctx, prompt));
-        var last: Array = undefined;
-        for (path) |t| last = try g.adopt(try p.xfm.forwardWith(&ser.ctx, try fixture.tokens(&g, &.{t})));
+        var serial: Array = undefined;
+        for (path) |t| serial = try g.adopt(try p.xfm.forwardWith(&ser.ctx, try fixture.tokens(&g, &.{t})));
         const rc: c_int = @intCast(r);
-        try ops.expectBitEqual(try g.slice(outs[1], &.{ 0, rc, 0 }, &.{ 1, rc + 1, vocab }), last);
+        try ops.expectBitEqual(try g.slice(outs[last], &.{ 0, rc, 0 }, &.{ 1, rc + 1, vocab }), serial);
     }
 
     // The commit (`dflash_tree.zig`): the kept rows' KV moved to consecutive positions, the states replayed.
@@ -492,7 +600,7 @@ fn expectTree(p: *Pair, exact: bool) !void {
     }
     var kept: [tree_kept.len]i32 = undefined;
     for (tree_kept, &kept) |r, *k| k.* = @intCast(r);
-    for (&lanes) |*l| {
+    for (lanes) |*l| {
         const step = l.kv.step;
         try l.kv.compactRows(anchor, tree_kept[1..], s);
         try l.kv.truncate(anchor + tree_kept.len, s);
@@ -503,17 +611,17 @@ fn expectTree(p: *Pair, exact: bool) !void {
         }
         l.off = anchor + tree_kept.len;
     }
-    try fixture.expectEntries(lanes[0].ssm, lanes[1].ssm);
+    try p.entries(lanes);
     var next: [2]Array = undefined;
-    for (&lanes, xs, &next) |*l, x, *o| o.* = try g.adopt(try x.forwardWith(&l.ctx, try fixture.tokens(&g, &.{17})));
-    try ops.expectBitEqual(next[1], next[0]);
+    for (lanes, xs, next[0..xs.len]) |*l, x, *o| o.* = try g.adopt(try x.forwardWith(&l.ctx, try fixture.tokens(&g, &.{17})));
+    try p.check(next[0..xs.len]);
     if (!exact) return;
     var ser: Lane = undefined;
     try ser.init(&p.xfm);
     defer ser.deinit();
     _ = try g.adopt(try p.xfm.forwardWith(&ser.ctx, prompt));
     for (tree_kept) |r| _ = try g.adopt(try p.xfm.forwardWith(&ser.ctx, try fixture.tokens(&g, &.{tree_toks[r]})));
-    try ops.expectBitEqual(next[1], try g.adopt(try p.xfm.forwardWith(&ser.ctx, try fixture.tokens(&g, &.{17}))));
+    try ops.expectBitEqual(next[last], try g.adopt(try p.xfm.forwardWith(&ser.ctx, try fixture.tokens(&g, &.{17}))));
 }
 
 /// What a tree verify leaves for the commit to replay from (the round's input state, every row's prework), bit-equal.
@@ -527,13 +635,12 @@ fn expectTreeCaptures(want: []const SSMCacheEntry, got: []const SSMCacheEntry) !
     };
 }
 
-/// The dense pack (4-bit or bf16) with no proof tape, a drafter bound on both shells.
-fn openBound(p: *Pair, comptime quantized: bool, seed: u64) !void {
+/// The dense pack (4-bit or bf16), a drafter bound on every shell; tape `fixtures/tree-<seed>.tape`.
+fn openBound(p: *Pair, comptime quantized: bool, comptime seed: u64) !void {
     var pk = fixture.Pack.init(seed);
     defer pk.deinit();
     try pack.writePack(&pk, false, quantized, 8);
-    try p.open(&qwen3_5.table, &pk, pack.config(false, quantized, 8));
-    p.oracle = .{};
+    try p.open(&qwen3_5.table, &pk, pack.config(false, quantized, 8), try oracle("qwen3_5", std.fmt.comptimePrint("tree-{x}", .{seed})));
     for (p.shells()) |x| x.config.dflash_bound = true;
 }
 
@@ -549,8 +656,7 @@ fn openPack(p: *Pair, comptime moe: bool, comptime quantized: bool, comptime exp
     var pk = fixture.Pack.init(seed);
     defer pk.deinit();
     try pack.writePack(&pk, moe, quantized, experts);
-    try p.open(&qwen3_5.table, &pk, json);
-    p.oracle = try oracle("qwen3_5", std.fmt.comptimePrint("served-{x}", .{seed}));
+    try p.open(&qwen3_5.table, &pk, json, try oracle("qwen3_5", std.fmt.comptimePrint("served-{x}", .{seed})));
 }
 
 /// The pack's config with an image tower: id 250 and interleaved M-RoPE sections [11,11,10].
@@ -599,7 +705,7 @@ test "qwen3_5 served: lm_head_mxfp8 (LOSSY) quantizes a bf16 pack's head as the 
     var p: Pair = undefined;
     try openPack(&p, false, false, 8, 0x5e0a, pack.config(false, false, 8));
     defer p.close();
-    try testing.expect(p.lg.xfm.lm_head_s.ctx != null and p.xfm.lm_head_s.ctx != null);
+    try testing.expect(p.xfm.lm_head_s.ctx != null);
     try expectSolo(&p);
 }
 
@@ -659,7 +765,7 @@ test "qwen3_5 served: trunk projections tiled in place for the lane give the leg
     var p: Pair = undefined;
     try openBound(&p, true, 0x5e0b);
     defer p.close();
-    try testing.expect(try p.lg.xfm.tileLaneWeights() > 0);
+    if (p.lg) |lg| try testing.expect(try lg.xfm.tileLaneWeights() > 0);
     _ = try p.xfm.tileLaneWeights();
     const m: *qwen3_5.Loaded = @ptrCast(@alignCast(p.xfm.plugin.?.model));
     const o = &m.body.dense.layers[1].mixer.second.o.lin;
@@ -667,7 +773,7 @@ test "qwen3_5 served: trunk projections tiled in place for the lane give the leg
     defer g.deinit();
     const x = try g.astype(try g.adopt(try fixtureRows(1, ops.shape(o.w)[1] * 8, 3)), .bfloat16);
     try testing.expect(try lane_qmm.tiledQmm(x, o.w, fixture.stream()) != null);
-    try expectSolo(&p);
+    try soloSteps(&p);
     for (p.shells()) |sh| try expectVerifyEqualsSerial(sh);
     try expectTree(&p, true);
 }

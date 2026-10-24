@@ -44,20 +44,23 @@ fn writePack(p: *fixture.Pack, quantized: bool) !void {
 /// Fields only the plugin's forward reads; the adapter leaves their defaults.
 const owned = [_][]const u8{ "rms_norm_eps", "rope_theta", "rope_local_base_freq", "rope_llama3", "tie_word_embeddings", "query_pre_attn_scalar", "norm_groups" };
 
-fn case(comptime quantized: bool, seed: u64) !void {
+fn case(comptime quantized: bool, comptime seed: u64) !void {
     return caseOn(quantized, seed, false);
 }
 
-fn caseOn(comptime quantized: bool, seed: u64, legacy_config: bool) !void {
+/// The legacy forward's values, recorded to `fixtures/`.
+fn caseOn(comptime quantized: bool, comptime seed: u64, comptime legacy_config: bool) !void {
     var p = fixture.Pack.init(seed);
     defer p.deinit();
     try writePack(&p, quantized);
-    var b = try both.Both.openWith(&plugin.table, &p, configJson(quantized), legacy_config);
+    const name = std.fmt.comptimePrint("fixtures/{x}{s}.tape", .{ seed, if (legacy_config) "-lc" else "" });
+    var b = try both.Both.proof(&plugin.table, &p, configJson(quantized), legacy_config, "src/plugins/k2_horizon/" ++ name, @embedFile(name));
     defer b.close();
     if (b.lg) |lg| try std.testing.expectEqual(@as(u32, 4), lg.config.norm_groups);
     try b.expectSteps(&both.steps);
     try b.expectGreedy();
     try b.expectBatched(.dense);
+    try b.expectDone();
 }
 
 // ── tests ──

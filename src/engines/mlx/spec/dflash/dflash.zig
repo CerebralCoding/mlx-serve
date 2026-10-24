@@ -33,6 +33,7 @@ const mlx = @import("../../../../mlx/ffi.zig");
 const log = @import("../../../../sdk/util/log.zig");
 const model_mod = @import("../../model.zig");
 const transformer_mod = @import("../../transformer.zig");
+const plugin_driver = @import("../../plugin/driver.zig");
 // The chunked row requantizer + its packed-triple handle are shared with the
 // MTP head — both sidecars shrink the SAME trunk lm_head for drafts only, and
 // one requantizer with one chunking discipline is the point.
@@ -3630,10 +3631,8 @@ test "dflash own head: dense and affine projections preserve trained logits and 
     const trunk_path = trunk_buf[0..try trunk.dir.realPath(io, &trunk_buf)];
     try TinyFix.writeTrunk(io, trunk.dir, trunk_path, s);
     var config = try model_mod.parseConfig(io, allocator, trunk_path);
-    var weights = try model_mod.loadWeights(io, allocator, trunk_path);
-    defer weights.deinit();
-    model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer config.deinit(allocator);
+    var xfm = try plugin_driver.load(io, allocator, &config, trunk_path, s);
     defer xfm.deinit();
     const ids = mlx.mlx_array_new_data(&[_]i32{ 2, 3, 7 }, &[_]c_int{ 1, 3 }, 2, .int32);
     defer _ = mlx.mlx_array_free(ids);
@@ -4274,10 +4273,8 @@ test "dflash: the draft-only lm_head shrinks the draft read and leaves verify al
     try TinyFix.writeAssistant(io, tmp_asst.dir, asst_path, s);
 
     var config = try model_mod.parseConfig(io, allocator, trunk_path);
-    var weights = try model_mod.loadWeights(io, allocator, trunk_path);
-    defer weights.deinit();
-    model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer config.deinit(allocator);
+    var xfm = try plugin_driver.load(io, allocator, &config, trunk_path, s);
     defer xfm.deinit();
 
     const bits: u32 = 3;
@@ -4340,7 +4337,7 @@ test "dflash: quantGroupFor picks the widest divisor, declines what affine canno
     try testing.expectEqual(@as(?u32, null), quantGroupFor(0));
 }
 
-test "standard forward: skip_lm_head hands back the hidden the head reads, never logits" {
+test "served forward: skip_lm_head hands back the hidden the head reads, never logits" {
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -4350,12 +4347,9 @@ test "standard forward: skip_lm_head hands back the hidden the head reads, never
     const dir_path = path_buf[0..try tmp_dir.dir.realPath(io, &path_buf)];
     try TinyFix.writeTrunk(io, tmp_dir.dir, dir_path, s);
     var config = try model_mod.parseConfig(io, allocator, dir_path);
-    var weights = try model_mod.loadWeights(io, allocator, dir_path);
-    defer weights.deinit();
-    model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer config.deinit(allocator);
+    var xfm = try plugin_driver.load(io, allocator, &config, dir_path, s);
     defer xfm.deinit();
-    try testing.expect(xfm.usesStandardForward());
 
     const prompt = [_]i32{ 3, 7, 1, 12, 30, 5, 9, 22 };
     const ids = mlx.mlx_array_new_data(&prompt, &[_]c_int{ 1, prompt.len }, 2, .int32);
@@ -4393,10 +4387,8 @@ test "dflash: trunk capture_layers = hidden_states[i+1], consistent across chunk
     try TinyFix.writeTrunk(io, tmp_dir.dir, dir_path, s);
 
     var config = try model_mod.parseConfig(io, allocator, dir_path);
-    var weights = try model_mod.loadWeights(io, allocator, dir_path);
-    defer weights.deinit();
-    model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer config.deinit(allocator);
+    var xfm = try plugin_driver.load(io, allocator, &config, dir_path, s);
     defer xfm.deinit();
 
     const prompt = [_]i32{ 3, 7, 1, 12, 30, 5, 9, 22 };
@@ -4427,9 +4419,11 @@ test "dflash: trunk capture_layers = hidden_states[i+1], consistent across chunk
     // the post-final-norm capture_hidden_all — the capture sits exactly one
     // final_norm before it.
     {
+        var pack = try model_mod.loadWeights(io, allocator, dir_path);
+        defer pack.deinit();
         var manual = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(manual);
-        try mlx.check(mlx.mlx_fast_rms_norm(&manual, full_out[1], xfm.final_norm, xfm.config.rms_norm_eps, s));
+        try mlx.check(mlx.mlx_fast_rms_norm(&manual, full_out[1], pack.get("model.norm.weight").?, xfm.config.rms_norm_eps, s));
         const a = try TinyFix.readF32(manual, allocator, s);
         defer allocator.free(a);
         const b = try TinyFix.readF32(all_hidden, allocator, s);
@@ -4487,10 +4481,8 @@ test "dflash: trunk rawEmbedding is the bare table row" {
     try TinyFix.writeTrunk(io, tmp_dir.dir, dir_path, s);
 
     var config = try model_mod.parseConfig(io, allocator, dir_path);
-    var weights = try model_mod.loadWeights(io, allocator, dir_path);
-    defer weights.deinit();
-    model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer config.deinit(allocator);
+    var xfm = try plugin_driver.load(io, allocator, &config, dir_path, s);
     defer xfm.deinit();
 
     const ids = [_]i32{ 4, 31 };

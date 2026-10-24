@@ -20,75 +20,89 @@ const testing = std.testing;
 const Array = mlx.mlx_array;
 const AneLayer = ane_prefill.AneLayer;
 
-fn openPair(p: *served.Pair, comptime moe: bool, seed: u64) !void {
+fn openPair(p: *served.Pair, comptime moe: bool, comptime seed: u64) !void {
     var pk = fixture.Pack.init(seed);
     defer pk.deinit();
     try pack.writePack(&pk, moe, true, 8);
-    try p.open(&qwen3_5.table, &pk, pack.config(moe, true, 8));
-    p.oracle = .{};
+    try p.open(&qwen3_5.table, &pk, pack.config(moe, true, 8), try served.oracle("qwen3_5", std.fmt.comptimePrint("ane-{x}", .{seed})));
 }
 
-fn expectHostEqual(x: [2]*Transformer, w: [2][3]Array, in_dim: u32, out_dim: u32) !void {
+/// What the build reads off shell `x`, in order: the plan at four shares and unit counts, then per layer which programs
+/// it offers, each program's dequantized weights and the GPU rest slices of the 0.25 plan. `rests` keeps those alive.
+fn buildInputs(x: *Transformer, g: *ops.Graph, out: *std.ArrayList(Array), rests: *std.ArrayList(ane_prefill.AneChanRest)) !ane_prefill.AnePlan {
     const a = testing.allocator;
-    const want = try x[0].dequantToHostF32(a, w[0][0], w[0][1], w[0][2], in_dim, out_dim);
-    defer a.free(want);
-    const got = try x[1].dequantToHostF32(a, w[1][0], w[1][1], w[1][2], in_dim, out_dim);
-    defer a.free(got);
-    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(got));
-}
-
-fn expectArraysEqual(want: anytype, got: anytype) !void {
-    inline for (want, got) |w, g| {
-        try testing.expectEqual(w.ctx == null, g.ctx == null);
-        if (w.ctx != null) try ops.expectBitEqual(g, w);
+    const layers = (try x.aneLayers(a)) orelse return error.PluginOffersNoAneLayers;
+    defer a.free(layers);
+    const cfg = &x.config;
+    for ([_]f32{ 0.25, 0.5 }) |share| for ([_]u32{ 1, 2 }) |units| {
+        const pl = ane_prefill.anePlan(cfg, layers, share, units);
+        const v = [_]u32{ @intCast(pl.dense_layers), @intCast(pl.gdn_layers), pl.eng_ffn, pl.eng_qkv, pl.eng_z, pl.qkv_out, pl.z_out, @intCast(pl.rest_bytes) };
+        try out.append(a, try g.fromSlice(u32, &v, &.{v.len}));
+    };
+    const plan = ane_prefill.anePlan(cfg, layers, 0.25, 1);
+    const h = cfg.hidden_size;
+    const ffn = cfg.intermediate_size;
+    for (layers) |*l| {
+        try out.append(a, try g.fromSlice(u32, &.{ @intFromBool(l.mlp != null), @intFromBool(l.gdn != null) }, &.{2}));
+        if (l.mlp) |*m| {
+            try out.append(a, try hostWeights(x, g, .{ m.gate_w, m.gate_s, m.gate_b }, h, ffn));
+            try out.append(a, try hostWeights(x, g, .{ m.up_w, m.up_s, m.up_b }, h, ffn));
+            try out.append(a, try hostWeights(x, g, .{ m.down_w, m.down_s, m.down_b }, ffn, h));
+            try rests.append(a, .{ .mlp = try x.aneBuildMlpRest(m, plan.eng_ffn, ffn) });
+            const r = rests.items[rests.items.len - 1].mlp.?;
+            try appendSet(g, out, .{ r.gate_w, r.gate_s, r.gate_b, r.up_w, r.up_s, r.up_b, r.down_w, r.down_s, r.down_b });
+        }
+        if (l.gdn) |*gd| {
+            try out.append(a, try hostWeights(x, g, .{ gd.qkv_w, gd.qkv_s, gd.qkv_b }, h, plan.qkv_out));
+            try out.append(a, try hostWeights(x, g, .{ gd.z_w, gd.z_s, gd.z_b }, h, plan.z_out));
+            try rests.append(a, .{});
+            const r = &rests.items[rests.items.len - 1];
+            try x.aneBuildGdnRest(r, gd, plan.eng_qkv, plan.eng_z);
+            try appendSet(g, out, .{ r.gdn_qkv_w, r.gdn_qkv_s, r.gdn_qkv_b, r.gdn_z_w, r.gdn_z_s, r.gdn_z_b });
+        }
     }
+    return plan;
 }
 
-/// Both shells' `aneLayers`: the same coverage, dequantized program inputs, rest slices and plan.
+/// A program's weights dequantized to f32 on the host, as the build hands them to the compiler.
+fn hostWeights(x: *Transformer, g: *ops.Graph, w: [3]Array, in_dim: u32, out_dim: u32) !Array {
+    const v = try x.dequantToHostF32(testing.allocator, w[0], w[1], w[2], in_dim, out_dim);
+    defer testing.allocator.free(v);
+    return g.fromSlice(f32, v, &.{@intCast(v.len)});
+}
+
+/// The set's present arrays after a mask of which are.
+fn appendSet(g: *ops.Graph, out: *std.ArrayList(Array), set: anytype) !void {
+    const a = testing.allocator;
+    var mask: [set.len]u32 = undefined;
+    inline for (set, &mask) |x, *m| m.* = @intFromBool(x.ctx != null);
+    try out.append(a, try g.fromSlice(u32, &mask, &.{set.len}));
+    inline for (set) |x| if (x.ctx != null) try out.append(a, x);
+}
+
+/// Every shell's build inputs equal, the served one's against the legacy shell's or the tape.
 fn expectSameInputs(p: *served.Pair, dense: u64, gdn: u64) !void {
     const a = testing.allocator;
     const xs = p.shells();
-    const want = (try xs[0].aneLayers(a)).?;
-    defer a.free(want);
-    const got = (try xs[1].aneLayers(a)) orelse return error.PluginOffersNoAneLayers;
-    defer a.free(got);
-    try testing.expectEqual(want.len, got.len);
-    const cfg = &xs[0].config;
-    const plan = ane_prefill.anePlan(cfg, want, 0.25, 1);
-    try testing.expectEqual(dense, plan.dense_layers);
-    try testing.expectEqual(gdn, plan.gdn_layers);
-    try testing.expect(plan.eng_qkv > 0 and plan.eng_z > 0 and (dense == 0 or plan.eng_ffn > 0));
-    for ([_]f32{ 0.25, 0.5 }) |share| for ([_]u32{ 1, 2 }) |units|
-        try testing.expectEqual(ane_prefill.anePlan(cfg, want, share, units), ane_prefill.anePlan(&xs[1].config, got, share, units));
-    const h = cfg.hidden_size;
-    const ffn = cfg.intermediate_size;
-    for (want, got) |*w, *g| {
-        try testing.expectEqual(w.mlp == null, g.mlp == null);
-        try testing.expectEqual(w.gdn == null, g.gdn == null);
-        if (w.mlp) |*wm| {
-            const gm = &g.mlp.?;
-            try expectHostEqual(xs, .{ .{ wm.gate_w, wm.gate_s, wm.gate_b }, .{ gm.gate_w, gm.gate_s, gm.gate_b } }, h, ffn);
-            try expectHostEqual(xs, .{ .{ wm.up_w, wm.up_s, wm.up_b }, .{ gm.up_w, gm.up_s, gm.up_b } }, h, ffn);
-            try expectHostEqual(xs, .{ .{ wm.down_w, wm.down_s, wm.down_b }, .{ gm.down_w, gm.down_s, gm.down_b } }, ffn, h);
-            var rests: [2]ane_prefill.AneChanRest = .{ .{ .mlp = try xs[0].aneBuildMlpRest(wm, plan.eng_ffn, ffn) }, .{ .mlp = try xs[1].aneBuildMlpRest(gm, plan.eng_ffn, ffn) } };
-            defer for (&rests) |*r| r.deinit();
-            const rw = rests[0].mlp.?;
-            const rg = rests[1].mlp.?;
-            try expectArraysEqual(.{ rw.gate_w, rw.gate_s, rw.gate_b, rw.up_w, rw.up_s, rw.up_b, rw.down_w, rw.down_s, rw.down_b }, .{ rg.gate_w, rg.gate_s, rg.gate_b, rg.up_w, rg.up_s, rg.up_b, rg.down_w, rg.down_s, rg.down_b });
-        }
-        if (w.gdn) |*wg| {
-            const gg = &g.gdn.?;
-            try expectHostEqual(xs, .{ .{ wg.qkv_w, wg.qkv_s, wg.qkv_b }, .{ gg.qkv_w, gg.qkv_s, gg.qkv_b } }, h, plan.qkv_out);
-            try expectHostEqual(xs, .{ .{ wg.z_w, wg.z_s, wg.z_b }, .{ gg.z_w, gg.z_s, gg.z_b } }, h, plan.z_out);
-            var rests: [2]ane_prefill.AneChanRest = .{ .{}, .{} };
-            defer for (&rests) |*r| r.deinit();
-            try xs[0].aneBuildGdnRest(&rests[0], wg, plan.eng_qkv, plan.eng_z);
-            try xs[1].aneBuildGdnRest(&rests[1], gg, plan.eng_qkv, plan.eng_z);
-            const rw = rests[0];
-            const rg = rests[1];
-            try expectArraysEqual(.{ rw.gdn_qkv_w, rw.gdn_qkv_s, rw.gdn_qkv_b, rw.gdn_z_w, rw.gdn_z_s, rw.gdn_z_b }, .{ rg.gdn_qkv_w, rg.gdn_qkv_s, rg.gdn_qkv_b, rg.gdn_z_w, rg.gdn_z_s, rg.gdn_z_b });
-        }
+    var g = ops.Graph.init(a, fixture.stream());
+    defer g.deinit();
+    var lists: [2]std.ArrayList(Array) = .{ .empty, .empty };
+    defer for (&lists) |*l| l.deinit(a);
+    var rests: std.ArrayList(ane_prefill.AneChanRest) = .empty;
+    defer {
+        for (rests.items) |*r| r.deinit();
+        rests.deinit(a);
     }
+    for (xs, lists[0..xs.len]) |x, *l| {
+        const plan = try buildInputs(x, &g, l, &rests);
+        try testing.expectEqual(dense, plan.dense_layers);
+        try testing.expectEqual(gdn, plan.gdn_layers);
+        try testing.expect(plan.eng_qkv > 0 and plan.eng_z > 0 and (dense == 0 or plan.eng_ffn > 0));
+    }
+    if (xs.len == 2) try testing.expectEqual(lists[0].items.len, lists[1].items.len);
+    const last = xs.len - 1;
+    for (lists[last].items, 0..) |got, i| try p.oracle.check(got, if (last == 1) lists[0].items[i] else null, false);
+    try p.oracle.done();
 }
 
 /// An offload that computes what the legacy seam's GPU arm computes from its input, counting calls per layer.
@@ -132,17 +146,10 @@ const Probe = struct {
     }
 };
 
-/// A prompt chunk through the table with `probe` as the offload, against the legacy forward of the same chunk.
-fn expectSeam(p: *served.Pair, probe: *Probe, equal: bool) !void {
+/// A prompt chunk's logits through the table with `probe` as the offload, into `g`.
+fn seamLogits(p: *served.Pair, probe: *Probe, g: *ops.Graph) !Array {
     const a = testing.allocator;
     const n = p.cfg.num_hidden_layers;
-    const ids = [_]i32{ 3, 17, 42, 99, 7, 250, 1, 64, 12, 9, 33, 77, 140, 2, 5, 61, 200, 88, 6, 30 };
-    var g = ops.Graph.init(a, fixture.stream());
-    defer g.deinit();
-    var lane: served.Lane = undefined;
-    try lane.init(&p.lg.xfm);
-    defer lane.deinit();
-    const want = try fixture.rows2(&g, try g.adopt(try p.lg.xfm.forwardWith(&lane.ctx, try fixture.tokens(&g, &ids))));
 
     var kv = try KVCache.init(a, n);
     defer kv.deinit();
@@ -150,36 +157,50 @@ fn expectSeam(p: *served.Pair, probe: *Probe, equal: bool) !void {
     defer fixture.freeEntries(ssm);
     var slot: cache_ops.Slot = .{ .kv = &kv, .ssm = ssm };
     const handles = [_]abi.Handle{slot.handle()};
-    var host: [ids.len]u32 = undefined;
-    for (ids, &host) |x, *y| y.* = @intCast(x);
+    var host: [seam_ids.len]u32 = undefined;
+    for (seam_ids, &host) |x, *y| y.* = @intCast(x);
     const pos = [_]u32{0};
     const off = probe.offload();
     var out: abi.ForwardOut = .{};
-    const v = qwen3_5.table.forward(p.xfm.plugin.?.model, &.{ .mode = .prefill, .logits = .all_rows, .rows = ids.len, .tokens = .of(&host), .positions = .of(&pos), .caches = .of(&handles), .cache_ops = &cache_ops.ops, .offload = &off }, &out);
+    const v = qwen3_5.table.forward(p.xfm.plugin.?.model, &.{ .mode = .prefill, .logits = .all_rows, .rows = seam_ids.len, .tokens = .of(&host), .positions = .of(&pos), .caches = .of(&handles), .cache_ops = &cache_ops.ops, .offload = &off }, &out);
     if (!v.isOk()) {
         std.debug.print("forward: {s}\n", .{v.why.slice()});
         return error.PluginForward;
     }
-    const got = try g.adopt(.{ .ctx = out.logits.ctx });
-    if (equal) return ops.expectBitEqual(got, want);
-    try testing.expect(try maxAbsDiffF32(got, want, fixture.stream()) > 0);
+    return g.adopt(.{ .ctx = out.logits.ctx });
 }
 
-fn seamCase(comptime moe: bool, seed: u64) !void {
+const seam_ids = [_]i32{ 3, 17, 42, 99, 7, 250, 1, 64, 12, 9, 33, 77, 140, 2, 5, 61, 200, 88, 6, 30 };
+
+/// A prompt chunk with the probe as the offload equals the legacy forward of the chunk (or its tape); with the probe
+/// handing back zeros it differs.
+fn seamCase(comptime moe: bool, comptime seed: u64) !void {
+    const a = testing.allocator;
     var p: served.Pair = undefined;
     try openPair(&p, moe, seed);
     defer p.close();
     try testing.expect(p.cfg.plugin.?.parsed.caps.ane_prefill);
-    const layers = (try p.xfm.aneLayers(testing.allocator)).?;
-    defer testing.allocator.free(layers);
+    const layers = (try p.xfm.aneLayers(a)).?;
+    defer a.free(layers);
     var probe: Probe = .{ .xfm = &p.xfm, .layers = layers };
-    try expectSeam(&p, &probe, true);
+    var g = ops.Graph.init(a, fixture.stream());
+    defer g.deinit();
+    const got = try seamLogits(&p, &probe, &g);
+    var want: ?Array = null;
+    if (p.lg) |lg| {
+        var lane: served.Lane = undefined;
+        try lane.init(&lg.xfm);
+        defer lane.deinit();
+        want = try fixture.rows2(&g, try g.adopt(try lg.xfm.forwardWith(&lane.ctx, try fixture.tokens(&g, &seam_ids))));
+    }
+    try p.oracle.check(got, want, false);
+    try p.oracle.done();
     // Layers 0 and 2 are linear attention; a MoE trunk has no dense MLP to offload.
     try testing.expectEqualSlices(u32, &.{ 1, 0, 1, 0 }, &probe.gdn);
     try testing.expectEqualSlices(u32, if (moe) &.{ 0, 0, 0, 0 } else &.{ 1, 1, 1, 1 }, &probe.mlp);
     if (moe) return;
     probe.zero_mlp = true;
-    try expectSeam(&p, &probe, false);
+    try testing.expect(try maxAbsDiffF32(try seamLogits(&p, &probe, &g), got, fixture.stream()) > 0);
 }
 
 test "qwen3_5 ANE prefill: the served shell gives the build the legacy shell's layers, weights, rest slices and plan" {
