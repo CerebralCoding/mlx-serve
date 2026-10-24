@@ -114,7 +114,7 @@ fn loadSettings(buf: []u8, config: *const ModelConfig) []const u8 {
     var w: std.Io.Writer = .fixed(buf);
     w.writeByte('{') catch unreachable;
     if (headMxfp8Setting(config)) |head| w.print("\"lm_head_mxfp8\":{s}", .{if (head) "true" else "false"}) catch unreachable;
-    if (config.stream_experts_override) |st| {
+    if (config.streamExperts()) |st| {
         if (w.end > 1) w.writeByte(',') catch unreachable;
         switch (st) {
             .on => w.writeAll("\"stream_experts\":true") catch unreachable,

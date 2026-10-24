@@ -15,6 +15,9 @@ const G = ops.MlxOps;
 const T = mlx.mlx_array;
 
 pub const Geometry = bank_mod.Geometry;
+pub const Bank = bank_mod.Bank;
+/// The rows a wide call borrows beside every layer's slot rows (one set for the stream).
+pub const transient_rows: u32 = stream_mod.transient_rows;
 /// A call's distinct experts fit one route.
 pub const max_route_ids: usize = stream_mod.max_route_ids;
 /// Routed pairs a call takes at most (`Fetched`'s buffers).

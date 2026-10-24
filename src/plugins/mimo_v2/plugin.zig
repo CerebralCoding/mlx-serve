@@ -109,7 +109,13 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
     errdefer gpa.destroy(m);
     m.* = .{ .base = .{ .weights = undefined, .shared = bases.Shared.init(c.rms_norm_eps, c.rms_norm_eps), .a = gpa, .s = r.s } };
     errdefer m.release();
-    if (c.streamed) m.experts = try streamed.Streamed.open(gpa, std.Io.Threaded.global_single_threaded.io(), ctx.model_dir.slice(), r.s, .{});
+    if (c.streamed) {
+        // The slot rows per routed layer: the model's `stream_experts` (the host stamps a quarter when it sets none).
+        const rows = try gpa.alloc(u32, c.num_hidden_layers - c.first_k_dense);
+        defer gpa.free(rows);
+        @memset(rows, if (streamed.Setting.parse(ctx.settings_json.slice())) |st| st.slotRows(c.experts) else c.experts);
+        m.experts = try streamed.Streamed.open(gpa, std.Io.Threaded.global_single_threaded.io(), ctx.model_dir.slice(), r.s, .{ .rows = rows });
+    }
     m.layers = try gpa.alloc(Model.Layer, c.num_hidden_layers);
     for (m.layers, 0..) |*L, i| L.* = try loadLayer(m, &r, if (xr) |*x| x else null, c, @intCast(i));
 

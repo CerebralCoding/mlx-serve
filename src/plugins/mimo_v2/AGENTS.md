@@ -27,8 +27,9 @@ mlx-lm's layout (`tests/convert_mimo_v2.py`, mlx-community's mxfp4-q8 packs).
 - Streaming packs (`expert_streaming`: mlx-stream's MXFP4 bank, docs/mlx-stream/mimo-pack.md): the routed experts
   come from `experts.bin` through `sdk/weights/streamed.zig` (`Moe.Weights.streamed`, the trunk's own MoE math), the
   residents from the index (`fp8_block128` q/k/v and dense MLP: the shared Linear's e4m3 arm), the MTP heads from
-  `mtp-heads.safetensors`. The engine still routes these packs to `stream/` (`ModelConfig.mimo_stream`) until the
-  fold's GPU gate.
+  `mtp-heads.safetensors`. The engine serves them here (`ModelConfig.expert_bank`): slot rows per routed layer are the
+  model's `stream_experts` setting, a quarter of the experts when it sets none; the load bills the residents and
+  those rows (`preflight.shardResidentBytes`).
 - Parse declines (`unsupported`): another `expert_streaming` bank or `residents_format`, `n_group` > 1, a layer span. The original release (a `quantization_config` with a `quant_method` and no `expert_quant`) FAILS by
   name: convert it with `tests/convert_mimo_v2.py`.
 - Sushi packs (`expert_quant`): the engine's loader adapts the shards (`sushi_pack.adapt`: the fused e4m3 QKV split
@@ -65,7 +66,7 @@ In `served.zig` (`mimo_v2`, `mimo_v2_flash`), the legacy forward deleted (`legac
 legacy parse's `ModelConfig`. Proofs replay tapes recorded from the legacy forward: steps, greedy and layered batched
 decode; the engine's head calls (history, a `.none` opening, `.mixed`/`.logits` drafts, a partial-accept truncate and
 a reopen); a pinned-depth MTP round loop with its tokens and accepted counts. Sushi packs too (`sushi_test.zig`: e4m3
-QKV, e4m3 MLPs, EXL3 banks). mlx-stream packs keep their own module (`load/init.zig` `initMlxStream`). The config parse
+QKV, e4m3 MLPs, EXL3 banks). The config parse
 and `round.zig`/`round_finish.zig`'s `isMimo` rollback stay (the served shell's config keys them).
 
 ## Fixtures

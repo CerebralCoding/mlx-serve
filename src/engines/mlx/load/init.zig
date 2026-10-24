@@ -68,7 +68,6 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
         log.err("[load] {s}: its plugin does not serve this pack and the legacy forward is gone\n", .{config.model_type});
         return error.PluginDeclinedNoLegacy;
     }
-    if (config.mimo_stream) return initMlxStream(io, allocator, config, s);
     if (config.glm_stream) return initMlxStream(io, allocator, config, s);
     if (config.glm5_stream) return initMlxStream(io, allocator, config, s);
     if (config.dsv41_stream) return initMlxStream(io, allocator, config, s);

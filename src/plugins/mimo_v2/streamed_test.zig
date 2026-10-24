@@ -257,7 +257,7 @@ test "mimo_v2 streaming pack: fp8 residents and experts read from its experts.bi
     var buf: [512]u8 = undefined;
     const dir = try testing.allocator.dupe(u8, buf[0..try tmp.dir.realPath(io, &buf)]);
     try saveResidents(&p, dir);
-    try stream.dsv41_streamed.writeBank(a, io, tmp.dir, bank.geo, bank.bytes, "synthetic/mimo-tiny", "0000000000000000000000000000000000000000");
+    try stream.bank_source.writeBank(a, io, tmp.dir, bank.geo, bank.bytes, "synthetic/mimo-tiny", "0000000000000000000000000000000000000000");
     const js = try std.mem.replaceOwned(u8, a, mem_json, "\"quantization\":{", "\"residents_format\":\"fp8_block128\",\"expert_streaming\":{\"family\":\"mlx-stream\",\"format\":\"mlx-stream-mxfp4-expert-bank-v1\",\"manifest\":\"expert-manifest.json\"},\"quantization\":{");
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = js });
     var cfg = try both.parse(&mimo.table, dir, js);

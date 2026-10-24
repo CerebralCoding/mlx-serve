@@ -137,6 +137,8 @@ fn shardResidentBytes(allocator: std.mem.Allocator, io: std.Io, model_dir: []con
     if (config.exl3 != null and (config.isGlm5() or config.isMimo())) return sushi_pack.residentBytes(io, std.heap.page_allocator, model_dir, config);
     const total = modelDiskBytes(io, model_dir);
     if (config.mlxStream()) return mlx_stream.loadBytes(allocator, io, config);
+    // An expert bank's index names the residents alone; its slot rows are resident too.
+    if (config.expert_bank) return total +| try streamed.Streamed.bankBytes(allocator, io, model_dir, config.streamExperts().?.slotRows(config.num_experts));
     if (config.stream_experts_override) |st| {
         // The routed experts stay on disk; their slot rows are resident.
         const b = try streamed.Streamed.packBytes(allocator, model_dir, st.slotRows(config.num_experts));
@@ -425,6 +427,26 @@ test "residentModelDiskBytes: with stream_experts a pack bills its residents and
     try std.testing.expectEqual(modelDiskBytes(io, dir) - b.experts + b.slots, try residentModelDiskBytes(std.testing.allocator, io, dir, &config));
     config.stream_experts_override = null;
     try std.testing.expectEqual(modelDiskBytes(io, dir), try residentModelDiskBytes(std.testing.allocator, io, dir, &config));
+}
+
+test "residentModelDiskBytes: an expert bank pack bills its residents, its slot rows (a quarter of the experts unless set) and the transient rows" {
+    if (!@import("build_options").mlx_stream) return error.SkipZigTest;
+    const bank_source = @import("mlx_stream").bank_source;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    var buf: [512]u8 = undefined;
+    const dir = buf[0..try td.dir.realPath(io, &buf)];
+    const geo = try bank_source.Geometry.init(64, 32, 8, 1, 2);
+    const bytes = try std.testing.allocator.alloc(u8, geo.total_bytes);
+    defer std.testing.allocator.free(bytes);
+    @memset(bytes, 0);
+    try bank_source.writeBank(std.testing.allocator, io, td.dir, geo, bytes, "synthetic/bank", "0000000000000000000000000000000000000000");
+    var config: model_mod.ModelConfig = .{ .num_experts = 8, .expert_bank = true };
+    const transient = @as(u64, bank_source.transient_rows) * geo.record_bytes;
+    try std.testing.expectEqual(modelDiskBytes(io, dir) + 2 * 2 * geo.record_bytes + transient, try residentModelDiskBytes(std.testing.allocator, io, dir, &config));
+    config.stream_experts_override = .{ .rows = 8 };
+    try std.testing.expectEqual(modelDiskBytes(io, dir) + 8 * 2 * geo.record_bytes + transient, try residentModelDiskBytes(std.testing.allocator, io, dir, &config));
 }
 
 test "residentModelDiskBytes: deepseek_v41 bills neither the vision tower nor DSpark stages that will not load" {

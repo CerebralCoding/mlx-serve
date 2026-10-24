@@ -2,7 +2,6 @@
 //! test block: the root adds no test of its own.
 
 comptime {
-    _ = @import("plugins/mimo_v2/stream/root.zig");
     _ = @import("plugins/mimo_v2/stream/config.zig");
     _ = @import("plugins/mimo_v2/stream/settings.zig");
     _ = @import("plugins/mimo_v2/stream/bill.zig");

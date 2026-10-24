@@ -1,9 +1,8 @@
 //! The streaming packs on mlx-stream (module `mlx_stream`, rooted at `src/mlx_stream.zig`): DeepSeek-V4.1's EXL3 repack (`ModelConfig.dsv41_stream`),
-//! MiMo-V2.6-Flash's prepared MXFP4 pack (`ModelConfig.mimo_stream`), GLM-5.3's pack (`ModelConfig.glm_stream`) and
-//! GLM-5.3-Flash's NVFP4 pack (`ModelConfig.glm5_stream`).
+//! GLM-5.3's pack (`ModelConfig.glm_stream`) and GLM-5.3-Flash's NVFP4 pack (`ModelConfig.glm5_stream`).
 //! The plugin owns each arch, its kernels and the expert streamer, and loads its own weights; the host parses the
 //! config, renders the template, samples and schedules. The plugin exports one glue surface per arch (`arch`,
-//! `default_context`, `generation_headroom`): the root's for DeepSeek-V4.1, `mimo`'s for MiMo, `glm`'s for GLM-5.3.
+//! `default_context`, `generation_headroom`): the root's for DeepSeek-V4.1, `glm`'s for GLM-5.3, `glm5_next`'s for GLM-5.3-Flash.
 //! An entry point an arch does not declare (prefix restore, decode handover, request end) is left out at comptime.
 //! GLM-5.3 alone takes the model's model-settings.json entry, and generates past its billed context as far as its
 //! arch's `maxOutput`.
@@ -27,12 +26,11 @@ pub fn setForeignBytes(n: u64) void {
 }
 
 /// The plugin's arches this host serves.
-const Kind = enum { dsv41, mimo, glm, glm5 };
+const Kind = enum { dsv41, glm, glm5 };
 
 fn Side(comptime k: Kind) type {
     return switch (k) {
         .dsv41 => plugin,
-        .mimo => plugin.mimo,
         .glm => plugin.glm,
         .glm5 => plugin.glm5_next,
     };
@@ -41,7 +39,7 @@ fn Side(comptime k: Kind) type {
 fn kindOf(config: *const ModelConfig) Kind {
     if (config.glm_stream) return .glm;
     if (config.glm5_stream) return .glm5;
-    return if (config.mimo_stream) .mimo else .dsv41;
+    return .dsv41;
 }
 
 fn Bound(comptime k: Kind) type {
@@ -52,7 +50,7 @@ fn Bound(comptime k: Kind) type {
 pub const Model = struct {
     gpa: std.mem.Allocator,
     /// The arch's config and module (it keeps references into `weights`).
-    arch: union(Kind) { dsv41: Bound(.dsv41), mimo: Bound(.mimo), glm: Bound(.glm), glm5: Bound(.glm5) },
+    arch: union(Kind) { dsv41: Bound(.dsv41), glm: Bound(.glm), glm5: Bound(.glm5) },
     /// The trunk the module binds.
     weights: sdk.Weights,
     /// The request `begin` started: its prompt pass's shape, then its decode handover.
@@ -405,7 +403,7 @@ pub fn laneReceipt(m: *Model, buf: []u8) ?[]const u8 {
 
 const testing = std.testing;
 
-test "mlx_stream: a GLM-5.3-Flash request spans the billed context (its generation inside it, as MiMo's)" {
+test "mlx_stream: a GLM-5.3-Flash request spans the billed context (its generation inside it)" {
     try testing.expectEqual(@as(u64, 0), plugin.glm5_next.generation_headroom);
     var config: ModelConfig = .{ .model_type = "glm5_next", .pack_dir = "/packs/glm-5.3-flash", .glm5_stream = true, .ctx_override = 32768 };
     try testing.expectEqual(Kind.glm5, kindOf(&config));

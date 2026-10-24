@@ -6,7 +6,6 @@ const std = @import("std");
 const sdk = @import("sdk");
 const sdk_ext = @import("sdk/weights/streamed/sdk_ext.zig");
 const plugin = @import("mlx_stream.zig").plugin;
-const plugin_mimo = @import("mlx_stream.zig").plugin_mimo;
 
 
 
@@ -78,51 +77,9 @@ test "mlx-stream conformance: every arch the glue dispatches declines what is no
     try std.testing.expect(glm.spec == .draft_lane and glm.caps.owns_decode_state);
     // The archs share the process's one reader: a load of one refuses another's claim by name.
     const v41 = comptime sdk.Arch.of(@import("plugins/deepseek_v41/stream/plugin.zig"));
-    const mimo = comptime sdk.Arch.of(plugin_mimo.provides.arch.?);
     try v41.claim_process.?();
     try std.testing.expectError(error.ExpertReaderInUse, glm.claim_process.?());
     v41.release_process.?();
-    try mimo.claim_process.?();
-    try std.testing.expectError(error.ExpertReaderInUse, glm.claim_process.?());
-    mimo.release_process.?();
-}
-
-test "mlx-stream conformance: MiMo is a second macOS-only arch from the same package" {
-    var buf: [64]u8 = undefined;
-    try sdk.negotiate(plugin_mimo, try sdk.host(&buf));
-    try std.testing.expectEqualStrings("mlx-stream-mimo", plugin_mimo.name);
-    try std.testing.expect(plugin_mimo.macos_only);
-    try std.testing.expect(plugin_mimo.provides.arch != null and plugin_mimo.provides.source == null and plugin_mimo.provides.engine == null);
-    try std.testing.expectEqualStrings("mimo_v2_flash", plugin_mimo.provides.arch.?.name);
-}
-
-test "mlx-stream conformance: each arch claims only its own pack" {
-    const dsv = comptime sdk.Arch.of(plugin.provides.arch.?);
-    const mimo = comptime sdk.Arch.of(plugin_mimo.provides.arch.?);
-    const mimo_pack = @embedFile("sdk/weights/streamed/fixtures/mimo_v2_flash_q4_config.json");
-    const dsv_pack = @embedFile("sdk/weights/streamed/fixtures/dsv41_dspark_mini_config.json");
-    // MiMo declines DeepSeek-V4.1, GLM-5.3 and an upstream (resident) mimo_v2 config with no expert_streaming marker.
-    try sdk.testing.expectClaims(mimo.claims, &.{
-        .{ .config = mimo_pack, .want = .native },
-        .{ .config = dsv_pack, .want = null },
-        .{ .config = "{\"model_type\":\"deepseek_v41\",\"expert_streaming\":{\"family\":\"mlx-stream\",\"format\":\"mlx-stream-mxfp4-expert-bank-v1\",\"manifest\":\"expert-manifest.json\"}}", .want = null },
-        .{ .config = "{\"model_type\":\"mimo_v2_flash\"}", .want = null },
-        .{ .config = "{\"model_type\":\"mimo_v2\"}", .want = null },
-        .{ .config = "{\"model_type\":\"glm_moe_dsa\"}", .want = null },
-    });
-    // DeepSeek-V4.1 declines the MiMo pack.
-    try sdk.testing.expectClaims(dsv.claims, &.{ .{ .config = mimo_pack, .want = null }, .{ .config = dsv_pack, .want = .native } });
-}
-
-test "mlx-stream conformance: both arches share one expert reader claim" {
-    const dsv = comptime sdk.Arch.of(plugin.provides.arch.?);
-    const mimo = comptime sdk.Arch.of(plugin_mimo.provides.arch.?);
-    try dsv.claim_process.?();
-    try std.testing.expectError(error.ExpertReaderInUse, mimo.claim_process.?());
-    dsv.release_process.?();
-    try mimo.claim_process.?();
-    try std.testing.expectError(error.ExpertReaderInUse, dsv.claim_process.?());
-    mimo.release_process.?();
 }
 
 // Declared last so it runs after every other conformance test (the CPU lane's bar).
