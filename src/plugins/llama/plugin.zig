@@ -7,6 +7,7 @@ const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 const mlx = @import("../../mlx/ffi.zig");
+const computeLlama3Freqs = @import("../../sdk/blocks/rope/rope.zig").computeLlama3Freqs;
 const bases = @import("../../sdk/bases/bases.zig");
 const run_mod = @import("../../sdk/bases/run.zig");
 pub const loader = @import("load.zig");
@@ -68,20 +69,6 @@ pub fn Loaded(comptime D: type) type {
     };
 }
 
-/// HF `_compute_llama3_parameters` as mlx_fast_rope denominators. copied_from: sdk/blocks/rope/rope.zig
-/// (`computeLlama3Freqs`; that one takes the engine's config type).
-fn llama3Freqs(out: []f64, head_dim: u32, base: f64, l3: config.Llama3) void {
-    const window = l3.original_max_position_embeddings;
-    for (out, 0..) |*o, i| {
-        const period = std.math.pow(f64, base, @as(f64, @floatFromInt(2 * i)) / @as(f64, @floatFromInt(head_dim)));
-        const wavelen = 2.0 * std.math.pi * period;
-        o.* = if (wavelen < window / l3.high_freq_factor) period else if (wavelen > window / l3.low_freq_factor) period * l3.factor else blk: {
-            const smooth = (window / wavelen - l3.low_freq_factor) / (l3.high_freq_factor - l3.low_freq_factor);
-            break :blk period / ((1.0 - smooth) / l3.factor + smooth);
-        };
-    }
-}
-
 fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     return loadDense(Dense, ctx, plainNorm) catch |e| {
         out.* = .{ .code = .failed, .why = abi.Str.of(@errorName(e)) };
@@ -117,7 +104,7 @@ pub fn loadDense(comptime D: type, ctx: *const abi.LoadCtx, comptime normOf: any
         var f64s: [256]f64 = undefined;
         var f32s: [256]f32 = undefined;
         const half = c.head_dim / 2;
-        llama3Freqs(f64s[0..half], c.head_dim, c.rope_theta, l3);
+        computeLlama3Freqs(f64s[0..half], c.head_dim, c.rope_theta, l3);
         for (f64s[0..half], f32s[0..half]) |v, *x| x.* = @floatCast(v);
         freqs = mlx.mlx_array_new_data(&f32s, &[_]c_int{@intCast(half)}, 1, .float32);
         try o.own(freqs);

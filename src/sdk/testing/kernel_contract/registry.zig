@@ -25,6 +25,7 @@ const areas = .{
     @import("../../../engines/mlx/spec/contract.zig"),
     @import("../../../plugins/gemma4/contract.zig"),
     @import("../../../plugins/qwen4_exp/contract.zig"),
+    @import("../../blocks/attention/sparse_block/contract.zig"),
     @import("../../../plugins/minimax_h3/contract.zig"),
     @import("../../../plugins/ltx/contract.zig"),
     @import("../../quant/gguf/contract.zig"),

@@ -4,10 +4,10 @@
 //! blocks. Rows = query rows (the h4 layout from 128), n = pooled blocks, k = the 128 indexer dims.
 
 const std = @import("std");
-const mlx = @import("../../mlx/ffi.zig");
-const kc = @import("../../sdk/testing/kernel_contract/root.zig");
-const host = @import("../../sdk/testing/kernel_contract/host.zig");
-const score = @import("qsa/score.zig");
+const mlx = @import("../../../../mlx/ffi.zig");
+const kc = @import("../../../testing/kernel_contract/root.zig");
+const host = @import("../../../testing/kernel_contract/host.zig");
+const score = @import("score.zig");
 
 const spec = kc.spec;
 const metal = kc.metal;
@@ -179,7 +179,7 @@ pub fn register(set: *kc.Set) !void {
 
 // ── tests ──
 
-test "kernel contract qwen4_exp: the declared qsa_score launch is the shipped wrapper's, byte for byte" {
+test "kernel contract sparse_block: the declared qsa_score launch is the shipped wrapper's, byte for byte" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const a = std.testing.allocator;
     var k = Score.init(a);

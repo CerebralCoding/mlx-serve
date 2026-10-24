@@ -6,10 +6,10 @@
 //! `qsa_decode.attend`'s bytes, over a strided cache view as the decode step binds it.
 
 const std = @import("std");
-const mlx = @import("../../mlx/ffi.zig");
-const kc = @import("../../sdk/testing/kernel_contract/root.zig");
-const host = @import("../../sdk/testing/kernel_contract/host.zig");
-const qsa_decode = @import("qsa_decode.zig");
+const mlx = @import("../../../../mlx/ffi.zig");
+const kc = @import("../../../testing/kernel_contract/root.zig");
+const host = @import("../../../testing/kernel_contract/host.zig");
+const qsa_decode = @import("decode.zig");
 
 const spec = kc.spec;
 const metal = kc.metal;
@@ -562,7 +562,7 @@ pub fn register(set: *kc.Set) !void {
 
 // ── tests ──
 
-test "kernel contract qwen4_exp: the qsa_decode launches, chained over a strided cache view, are attend's bytes" {
+test "kernel contract sparse_block: the qsa_decode launches, chained over a strided cache view, are attend's bytes" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const a = std.testing.allocator;
     var p = Parts.init(a);

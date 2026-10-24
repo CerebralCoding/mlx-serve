@@ -5,6 +5,7 @@ const std = @import("std");
 const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
+const sparse_score = @import("../../../sdk/blocks/attention/sparse_block/score.zig");
 const generate_mod = @import("../generate.zig");
 const model_mod = @import("../model.zig");
 const dsv4_mod = @import("../../../plugins/deepseek_v4/deepseek_v4.zig");
@@ -587,8 +588,8 @@ test "an auto boot sizes the SAME context whatever the cache ask (live check #6)
 test "the clamp bills the context that will be SERVED, not the placeholder" {
     // With a placeholder context the clamp hands back nearly the whole ask.
     const t = std.testing;
-    transformer_mod.qsa_score_fused_override = false;
-    defer transformer_mod.qsa_score_fused_override = null;
+    sparse_score.qsa_score_fused_override = false;
+    defer sparse_score.qsa_score_fused_override = null;
     var cfg = qwen4RequestTestConfig();
     cfg.mtp_override = false; // the trunk's bill; the head term has its own test
     const kv_bits: u64 = 8;
@@ -787,8 +788,8 @@ test "the load-time session bill is billed at the boot's --kv-quant, not bf16" {
     const MiB: u64 = 1 << 20;
     transformer_mod.qsa_history_share_override = true;
     defer transformer_mod.qsa_history_share_override = null;
-    transformer_mod.qsa_score_fused_override = false;
-    defer transformer_mod.qsa_score_fused_override = null;
+    sparse_score.qsa_score_fused_override = false;
+    defer sparse_score.qsa_score_fused_override = null;
     try t.expectEqual(@as(u64, 2_304), statePerTokenBilled(&cfg));
     try t.expectEqual(@as(u64, 13_056), kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8));
     try t.expectEqual(@as(u64, 24_576), kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 16));
@@ -933,8 +934,8 @@ test "the per-token widths the request chooser is built on" {
     try t.expectEqual(@as(u64, 13_056), kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8));
     transformer_mod.qsa_history_share_override = true;
     defer transformer_mod.qsa_history_share_override = null;
-    transformer_mod.qsa_score_fused_override = false;
-    defer transformer_mod.qsa_score_fused_override = null;
+    sparse_score.qsa_score_fused_override = false;
+    defer sparse_score.qsa_score_fused_override = null;
     try t.expectEqual(@as(u64, 768), cfg.qsaHistoryBytesPerToken());
     try t.expectEqual(@as(u64, 1_536), cfg.qsaScoreBankBytesPerToken());
     try t.expectEqual(@as(u64, 2_304), statePerTokenBilled(&cfg));
@@ -946,8 +947,8 @@ test "a 512k QSA session drops the raw-key overbill and bills the ring once" {
     const t = std.testing;
     transformer_mod.qsa_history_share_override = true;
     defer transformer_mod.qsa_history_share_override = null;
-    transformer_mod.qsa_score_fused_override = false;
-    defer transformer_mod.qsa_score_fused_override = null;
+    sparse_score.qsa_score_fused_override = false;
+    defer sparse_score.qsa_score_fused_override = null;
     const cfg = qwen4ExpOomConfig();
     const seq: u64 = 512 * 1024;
     const short = prefillRequestTerms(&cfg, 1024, 2048, 8, 4096, .{});
@@ -965,8 +966,8 @@ test "a 512k QSA session drops the raw-key overbill and bills the ring once" {
 test "chooseRequestPrefillChunk: the machine's chunk cap bounds the per-request width" {
     // Flash Next on CUDA chose 8192 past the 2048 cap and MLX's expert gather failed at that width.
     const t = std.testing;
-    transformer_mod.qsa_score_fused_override = false;
-    defer transformer_mod.qsa_score_fused_override = null;
+    sparse_score.qsa_score_fused_override = false;
+    defer sparse_score.qsa_score_fused_override = null;
     const saved = generate_mod.machine_prefill_chunk_cap;
     defer generate_mod.machine_prefill_chunk_cap = saved;
     generate_mod.machine_prefill_chunk_cap = autoPrefillChunkCap(true);
@@ -980,8 +981,8 @@ test "chooseRequestPrefillChunk: an ordinary prompt buys the wide chunk a 1M ses
     // `--ctx-size 1048576` with no chunk or cache flags must still prefill ordinary prompts at
     // the wide chunk; load-time sizing reserved for the whole session (rung 1024 for the boot).
     const t = std.testing;
-    transformer_mod.qsa_score_fused_override = false;
-    defer transformer_mod.qsa_score_fused_override = null;
+    sparse_score.qsa_score_fused_override = false;
+    defer sparse_score.qsa_score_fused_override = null;
     const cfg = qwen4RequestTestConfig();
     const kv_bits: u64 = 8;
     const MiB: u64 = 1 << 20;
@@ -1665,8 +1666,8 @@ test "a WARM turn is not billed for the prefix it is about to SHARE (786,707 @ 1
     // by name; the restore hands over the entry's buffers without a second copy, so those
     // ~14.5 GB were already inside `mlx_get_active_memory` and `needed` billed them again.
     const cfg = qwen4ExpOomConfig();
-    transformer_mod.qsa_score_fused_override = false;
-    defer transformer_mod.qsa_score_fused_override = null;
+    sparse_score.qsa_score_fused_override = false;
+    defer sparse_score.qsa_score_fused_override = null;
     const seq: u64 = 786_707;
     const chunk: u64 = 512; // the width the ladder came down to that evening
     const kv_bits: u64 = 8;
@@ -1755,8 +1756,8 @@ test "the live 364k session's admission numbers reproduce, to the megabyte" {
     // The anchor: fed the deployed config and the incident's prompt lengths, the estimator prints
     // the incident's own numbers (Turn A admitted at 16,233 MB; Turn B refused at 13,664 MB).
     const t = std.testing;
-    transformer_mod.qsa_score_fused_override = false;
-    defer transformer_mod.qsa_score_fused_override = null;
+    sparse_score.qsa_score_fused_override = false;
+    defer sparse_score.qsa_score_fused_override = null;
     const cfg = qwen4ExpLive364kConfig();
     const mb: u64 = 1024 * 1024;
     const kv_bits: u64 = 8;

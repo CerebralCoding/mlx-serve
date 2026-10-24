@@ -10,8 +10,8 @@ const AttnVerifyInputs = @import("trunk/verify.zig").AttnVerifyInputs;
 const qwen4Standin = @import("../../sdk/diag/standin.zig").qwen4Standin;
 const Qwen4Trace = @import("mtp.zig").Qwen4Trace;
 const Qwen4AttnProf = @import("prof.zig").Qwen4AttnProf;
-const headPlaceVisibility = @import("qsa/mask.zig").headPlaceVisibility;
-const qsaMaskFromBlocks = @import("qsa/mask.zig").qsaMaskFromBlocks;
+const headPlaceVisibility = @import("qsa/head_place.zig").headPlaceVisibility;
+const qsaMaskFromBlocks = @import("../../sdk/blocks/attention/sparse_block/mask.zig").qsaMaskFromBlocks;
 
 /// Full-attention layer with the QSA mask threaded through
 /// `gatedFullAttnWith` (q-gate, QK norm, partial RoPE, KV cache all shared).

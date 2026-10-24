@@ -6,25 +6,25 @@
 //! key `lane >> 2` on lanes `4k..4k+3` (9 shuffles, not 8 x 5). More heads per simdgroup lose to
 //! register pressure.
 const std = @import("std");
-const kernelSource = @import("../../mlx/kernels.zig").source;
-const mlx = @import("../../mlx/ffi.zig");
+const kernelSource = @import("../../../../mlx/kernels.zig").source;
+const mlx = @import("../../../../mlx/ffi.zig");
 
 const CH: c_int = 32; // visible keys per simdgroup, a multiple of 8 and of RATIO
 const BD: c_int = 256;
 
-pub const HEADER = kernelSource("plugins/qwen4_exp/kernels/qsa_decode_header.metal");
+pub const HEADER = kernelSource("kernels/attention/qsa_decode_header.metal");
 
-pub const PARTS_SOURCE = kernelSource("plugins/qwen4_exp/kernels/qsa_decode_parts.metal");
+pub const PARTS_SOURCE = kernelSource("kernels/attention/qsa_decode_parts.metal");
 
 // One threadgroup a head. An empty split writes l = 0, the skip flag.
-pub const MERGE_SOURCE = kernelSource("plugins/qwen4_exp/kernels/qsa_decode_merge.metal");
+pub const MERGE_SOURCE = kernelSource("kernels/attention/qsa_decode_merge.metal");
 
 var parts_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var merge_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 const Key = struct { hq: c_int, hk: c_int, kb: c_int, ratio: c_int };
 const Cfgs = struct { key: Key, parts: mlx.mlx_fast_metal_kernel_config, merge: mlx.mlx_fast_metal_kernel_config };
-var cfgs: ?Cfgs = null;
+var decode_cfgs: ?Cfgs = null;
 
 fn newKernel(name: [*:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0]const u8, source: [*:0]const u8) !mlx.mlx_fast_metal_kernel {
     const in_vec = mlx.mlx_vector_string_new_data(ins.ptr, ins.len);
@@ -38,11 +38,11 @@ fn newKernel(name: [*:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0
 }
 
 fn configsFor(key: Key, ns: c_int) !Cfgs {
-    if (cfgs) |c| {
+    if (decode_cfgs) |c| {
         if (std.meta.eql(c.key, key)) return c;
         _ = mlx.mlx_fast_metal_kernel_config_free(c.parts);
         _ = mlx.mlx_fast_metal_kernel_config_free(c.merge);
-        cfgs = null;
+        decode_cfgs = null;
     }
     const gqa = @divExact(key.hq, key.hk);
     const parts = mlx.mlx_fast_metal_kernel_config_new();
@@ -62,8 +62,8 @@ fn configsFor(key: Key, ns: c_int) !Cfgs {
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(merge, BD, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(merge, "T", .bfloat16));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(merge, "NS", ns));
-    cfgs = .{ .key = key, .parts = parts, .merge = merge };
-    return cfgs.?;
+    decode_cfgs = .{ .key = key, .parts = parts, .merge = merge };
+    return decode_cfgs.?;
 }
 
 /// `[1, Hq, 1, 256]` bf16 attention of one query row `q` over the keys `blocks` `[1, 1, kb]` int32
@@ -147,7 +147,7 @@ fn hostF32(s: mlx.mlx_stream, a: mlx.mlx_array) !struct { arr: mlx.mlx_array, da
 }
 
 test "qsa decode: the one-token kernel is no worse than the masked SDPA against the f64 truth" {
-    const xfm = @import("../../engines/mlx/transformer.zig");
+    const mask_mod = @import("mask.zig");
     const s = mlx.gpuStream();
     const hq: usize = 24;
     const hk: usize = 2;
@@ -227,9 +227,9 @@ test "qsa decode: the one-token kernel is no worse than the masked SDPA against 
 
         const got = (try attend(s, q, kview, vview, blocks, @intCast(ratio), scale)) orelse return error.KernelDeclined;
         defer _ = mlx.mlx_array_free(got);
-        const mask = try xfm.qsaMaskFromBlocks(s, blocks, @intCast(kv), @intCast(ratio));
+        const mask = try mask_mod.qsaMaskFromBlocks(s, blocks, @intCast(kv), @intCast(ratio));
         defer _ = mlx.mlx_array_free(mask);
-        const stock = try xfm.qsaMaskArm(s, q, kview, vview, scale, mask);
+        const stock = try mask_mod.qsaMaskArm(s, q, kview, vview, scale, mask);
         defer _ = mlx.mlx_array_free(stock);
         const gh = try hostF32(s, got);
         defer _ = mlx.mlx_array_free(gh.arr);

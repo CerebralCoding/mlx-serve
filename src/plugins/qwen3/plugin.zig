@@ -8,6 +8,7 @@ const abi = @import("../../abi/plugin.zig");
 const quant_abi = @import("../../abi/quant.zig");
 const sdk = @import("../../sdk/root.zig");
 const mlx = @import("../../mlx/ffi.zig");
+const computeLlama3Freqs = @import("../../sdk/blocks/rope/rope.zig").computeLlama3Freqs;
 const bases = @import("../../sdk/bases/bases.zig");
 const run_mod = @import("../../sdk/bases/run.zig");
 const compiled = @import("../../sdk/bases/blocks/compiled.zig");
@@ -117,17 +118,7 @@ fn llama3Table(m: *Loaded, c: *const config.Config) !Array {
     var f64s: [256]f64 = undefined;
     var f32s: [256]f32 = undefined;
     const half = c.head_dim / 2;
-    const window = l3.original_max_position_embeddings;
-    // HF `_compute_llama3_parameters` as mlx_fast_rope denominators. copied_from: sdk/blocks/rope/rope.zig
-    // (`computeLlama3Freqs`, which takes the engine's config type).
-    for (f64s[0..half], 0..) |*o, i| {
-        const period = std.math.pow(f64, c.rope_theta, @as(f64, @floatFromInt(2 * i)) / @as(f64, @floatFromInt(c.head_dim)));
-        const wavelen = 2.0 * std.math.pi * period;
-        o.* = if (wavelen < window / l3.high_freq_factor) period else if (wavelen > window / l3.low_freq_factor) period * l3.factor else blk: {
-            const smooth = (window / wavelen - l3.low_freq_factor) / (l3.high_freq_factor - l3.low_freq_factor);
-            break :blk period / ((1.0 - smooth) / l3.factor + smooth);
-        };
-    }
+    computeLlama3Freqs(f64s[0..half], c.head_dim, c.rope_theta, l3);
     for (f64s[0..half], f32s[0..half]) |v, *o| o.* = @floatCast(v);
     const freqs = mlx.mlx_array_new_data(&f32s, &[_]c_int{@intCast(half)}, 1, .float32);
     try m.owned.own(freqs);
