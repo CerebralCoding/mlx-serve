@@ -798,6 +798,9 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
         .link_libcpp = true,
         .imports = &.{
             .{ .name = "build_options", .module = ios_options.createModule() },
+            .{ .name = "mlx_steel_sources", .module = b.createModule(.{ .root_source_file = b.path("lib/mlx_steel_sources.zig") }) },
+            .{ .name = "agent_skills", .module = b.createModule(.{ .root_source_file = b.path("skills/agent_skills.zig") }) },
+            .{ .name = "opencode2_plugin", .module = b.createModule(.{ .root_source_file = b.path("lib/opencode2_plugin.zig") }) },
         },
     });
     _ = addExl3Module(b, mod, ios_target, .ReleaseFast);
@@ -844,6 +847,7 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
         .name = "mlxserve",
         .root_module = mod,
         .linkage = .static,
+        .zig_lib_dir = iosZigLibDir(b),
     });
     lib.bundle_compiler_rt = true;
 
@@ -852,6 +856,25 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
     });
     const step = b.step(slice.step, b.fmt("Build the iOS engine static lib ({s})", .{slice.sdk}));
     step.dependOn(&install.step);
+}
+
+/// Zig 0.17.0's std does not compile for iOS: `Io.Threaded`'s process replace reads `null_file.fd`, a field its iOS
+/// `NullFile` lacks. The iOS slices compile against the toolchain's lib dir with iOS moved to the `NullFile` arm that
+/// has one (the spawn it serves is never called there); the step fails once a toolchain no longer needs the patch.
+fn iosZigLibDir(b: *std.Build) std.Build.LazyPath {
+    const lib = b.pathJoin(&.{ std.fs.path.dirname(b.graph.zig_exe).?, "lib" });
+    const script =
+        \\set -e
+        \\lib=$1 out=$2 arm='    .wasi, .ios, .tvos, .visionos, .watchos => struct {'
+        \\grep -qxF "$arm" "$lib/std/Io/Threaded.zig" || { echo "std's iOS NullFile changed: drop iosZigLibDir" >&2; exit 1; }
+        \\for e in "$lib"/*; do [ "$(basename "$e")" = std ] || ln -sf "$e" "$out/"; done
+        \\rm -rf "$out/std" && cp -R "$lib/std" "$out/std"
+        \\sed "s/^    \.wasi, \.ios, \.tvos,/    .wasi, .tvos,/" "$lib/std/Io/Threaded.zig" > "$out/std/Io/Threaded.zig"
+    ;
+    const patch = b.addSystemCommand(&.{ "sh", "-c", script, "sh", lib });
+    const out = patch.addOutputDirectoryArg("zig-lib");
+    patch.addFileInput(.{ .cwd_relative = b.pathJoin(&.{ lib, "std/Io/Threaded.zig" }) });
+    return out;
 }
 
 /// Translates a single C header into an importable module (`@import("name")`
