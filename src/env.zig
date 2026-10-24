@@ -317,25 +317,14 @@ pub const vars = struct {
     pub const MLX_SERVE_GDN_STATE_F32: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "engines/mlx", .since = "26.10.2", .doc = "f32 GDN recurrent state (=0: bf16)" };
     pub const MLX_SERVE_GEN_YIELD: Var = .{ .kind = .kill, .type = .flag, .default = "off on CUDA, on elsewhere", .owner = "host/http", .since = "26.10.3", .doc = "chat interleaves with media jobs" };
     pub const MLX_SERVE_H3_RESIDENT: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/minimax_h3", .since = "26.10.2", .doc = "H3 DiT resident between requests" };
-    pub const MLX_SERVE_HC_DECODE2: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "sdk/blocks/hc", .since = "26.10.2", .doc = "two-launch hyper-connection decode read" };
-    pub const MLX_SERVE_HC_PREFILL_CUDA: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "sdk/blocks/hc", .since = "26.10.3", .doc = "fused hyper-connection prefill on CUDA" };
-    pub const MLX_SERVE_MOE_AFFINE4: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/qwen4_exp", .since = "26.10.2", .doc = "qwen4 one-token affine-4 MoE kernels" };
-    pub const MLX_SERVE_MOE_BANK_VIEWS: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/qwen4_exp", .since = "26.10.2", .doc = "one-expert bank views for the affine-4 MoE kernels" };
-    pub const MLX_SERVE_MOE_CUDA: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "sdk/blocks/moe", .since = "26.10.3", .doc = "fused MoE decode on CUDA" };
-    pub const MLX_SERVE_MOE_PREFILL_CUDA: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "sdk/blocks/moe", .since = "26.10.3", .doc = "fused MoE prefill on CUDA" };
-    pub const MLX_SERVE_PLE_LAZY_SETTLE: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/qwen4_exp", .since = "26.10.2", .doc = "qwen4 GPU PLE settles its n-gram history lazily (=0 settles per forward)" };
-    pub const MLX_SERVE_QSA_DEC_KERNEL: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/qwen4_exp", .since = "26.10.2", .doc = "QSA split+merge decode attention kernel" };
-    pub const MLX_SERVE_QSA_MASK_KERNEL: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/qwen4_exp", .since = "26.10.2", .doc = "QSA one-launch row mask kernel" };
     pub const MLX_SERVE_ROUND_COST_PERSIST: Var = .{ .kind = .public, .type = .flag, .default = "off", .owner = "engines/mlx/spec", .since = "26.8.10", .doc = "=1: persist the measured round-cost table" };
     pub const MLX_SERVE_SSD_WRITE_THROUGH: Var = .{ .kind = .public, .type = .flag, .default = "writeThroughEnabledFromEnv(null)", .owner = "engines/mlx", .since = "26.9.2", .doc = "SSD tier write-through at commit" };
 
     // ── tuning numbers ──
     pub const DFLASH_GATE_WARMUP: Var = .{ .kind = .tuning, .type = .int, .default = "DFLASH_GATE_WARMUP", .owner = "engines/mlx/spec", .since = "26.8.6", .doc = "rounds before the DFlash yield gate decides" };
-    pub const MLX_SERVE_HC_DECODE2_ROWS: Var = .{ .kind = .tuning, .type = .int, .default = "16", .owner = "sdk/blocks/hc", .since = "26.10.2", .doc = "rows the two-launch HC decode read takes (1..16)" };
     pub const MLX_SERVE_LAYA_BATCH_WINDOW_US: Var = .{ .kind = .public, .type = .int, .default = "0", .owner = "host/media_jobs", .since = "26.9.6", .doc = "Laya decision batch window, microseconds" };
     pub const MLX_SERVE_LAYA_MAX_INPUT_TOKENS: Var = .{ .kind = .public, .type = .int, .default = "DecisionLimits default", .owner = "host/media_jobs", .since = "26.9.6", .doc = "Laya input token limit" };
     pub const MLX_SERVE_LAYA_MAX_QUESTIONS: Var = .{ .kind = .public, .type = .int, .default = "DecisionLimits default", .owner = "host/media_jobs", .since = "26.9.6", .doc = "Laya questions per request limit" };
-    pub const MLX_SERVE_SIMD_QMM_DECODE: Var = .{ .kind = .tuning, .type = .int, .default = "per GPU tile", .owner = "sdk/blocks/linear", .since = "26.10.2", .doc = "row floor for simd_qmm batched projections (0: off)" };
 
     // ── diagnostics ──
     pub const ANE_DRAFT_DEBUG: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "engines/ane", .since = "26.10.3", .doc = "keeps the ANE drafter program's intermediate tensors for the parity test" };

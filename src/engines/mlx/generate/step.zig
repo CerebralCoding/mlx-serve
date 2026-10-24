@@ -14,7 +14,6 @@ const Constraint = @import("../grammar/constraint.zig").Constraint;
 const Generator = @import("generator.zig").Generator;
 const applyGrammarMask = @import("../sampling/sampler.zig").applyGrammarMask;
 const computeLogprobs = @import("../sampling/logprobs.zig").computeLogprobs;
-const pleLazySettleOff = @import("../../../plugins/qwen4_exp/ple_generate.zig").pleLazySettleOff;
 const sampleToken = @import("../sampling/sampler.zig").sampleToken;
 const tokenStops = @import("stops.zig").tokenStops;
 
@@ -667,7 +666,7 @@ pub fn lazyForward(xfm: *Transformer, ctx: *ForwardCtx, lazy_token: mlx.mlx_arra
     // Every array of an async batch carries that batch's END event, so the GPU PLE arm sends
     // the sampled token out as its own batch: its deferred history settle then waits on the
     // sampler, not on the forward built on it.
-    if (plugin_settle.defersHost(xfm) and !pleLazySettleOff()) {
+    if (plugin_settle.defersHost(xfm)) {
         const tv = mlx.mlx_vector_array_new_value(reshaped);
         defer _ = mlx.mlx_vector_array_free(tv);
         try mlx.check(mlx.mlx_async_eval(tv));
@@ -686,8 +685,7 @@ pub fn lazyForward(xfm: *Transformer, ctx: *ForwardCtx, lazy_token: mlx.mlx_arra
     // The GPU arm owes only the host history, and its ids are the token this very forward
     // waits on; settling now would idle the GPU for the round trip. The next PLE embedding
     // (or the slot's drain / finish) settles it, when those ids are long evaluated.
-    const settle_now = !Transformer.deferredPleOnGpu(ctx) or pleLazySettleOff();
-    if (settle_now) xfm.flushDeferredPle(ctx) catch |e| {
+    if (!Transformer.deferredPleOnGpu(ctx)) xfm.flushDeferredPle(ctx) catch |e| {
         xfm.discardDeferredPle(ctx);
         _ = mlx.mlx_array_free(logits);
         return e;

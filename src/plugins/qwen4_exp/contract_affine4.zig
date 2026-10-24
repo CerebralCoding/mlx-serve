@@ -433,8 +433,6 @@ pub const Affine4 = struct {
         const B = moe_affine4.Bank;
         const shared: ?moe_affine4.Shared = if (self.shared == .gated) .{ .down = dn[6], .logit = dn[7] } else null;
         const ungated: ?moe_affine4.Ungated = if (self.shared == .ungated) .{ .gate = B{ .w = gu[9], .s = gu[10], .b = gu[11] }, .up = B{ .w = gu[12], .s = gu[13], .b = gu[14] }, .down = B{ .w = dn[8], .s = dn[9], .b = dn[10] } } else null;
-        moe_affine4.override = true;
-        defer moe_affine4.override = null;
         const y = (try moe_affine4.decode(self.rig.stream(), gu[0], B{ .w = gu[1], .s = gu[2], .b = gu[3] }, B{ .w = gu[4], .s = gu[5], .b = gu[6] }, B{ .w = dn[1], .s = dn[2], .b = dn[3] }, null, shared, ungated, gu[7], dn[5], gu[8], GS)) orelse return error.Declined;
         defer _ = mlx.mlx_array_free(y);
         return .{ ours, try self.rig.bytesOf(&.{y}) };

@@ -4,7 +4,6 @@
 //! summed over the streams in order in bf16 (`col_reduce_small`) and scaled by bf16(1/hc). Every op
 //! is MLX's functor in the order of the compiled closures it replaces, so the outputs are bit-identical.
 const std = @import("std");
-const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../util/log.zig");
@@ -27,20 +26,8 @@ var norm_kernel: ?mlx.mlx_fast_cuda_kernel = null;
 var mix_kernel: ?mlx.mlx_fast_cuda_kernel = null;
 var engaged = false;
 
-/// `MLX_SERVE_HC_PREFILL_CUDA=0` keeps the composed chain.
-pub fn enabled() bool {
-    const Env = struct {
-        var on: ?bool = null;
-    };
-    if (Env.on == null) {
-        const raw = env.get(.MLX_SERVE_HC_PREFILL_CUDA);
-        Env.on = raw == null or raw.?[0] != '0';
-    }
-    return Env.on.?;
-}
-
 fn served(hc: c_int, hidden: c_int) bool {
-    return mlx.cudaAvailable() and enabled() and hc >= 1 and hc <= 8 and @rem(hidden, THREADS * READS) == 0 and hidden <= THREADS * READS * 8;
+    return mlx.cudaAvailable() and hc >= 1 and hc <= 8 and @rem(hidden, THREADS * READS) == 0 and hidden <= THREADS * READS * 8;
 }
 
 fn kernel(slot: *?mlx.mlx_fast_cuda_kernel, name: [*:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0]const u8, source: [:0]const u8) !mlx.mlx_fast_cuda_kernel {
@@ -106,7 +93,7 @@ pub fn norm(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, eps: mlx.mlx_
     if (pending != null) try mlx.check(mlx.mlx_vector_array_get(&stream, o, 1)) else try mlx.check(mlx.mlx_array_set(&stream, x));
     if (!engaged) {
         engaged = true;
-        log.info("[hc-prefill] CUDA hyper-connection read engaged: hc={d} hidden={d} (MLX_SERVE_HC_PREFILL_CUDA=0 restores the chain)\n", .{ hc, hidden });
+        log.info("[hc-prefill] CUDA hyper-connection read engaged: hc={d} hidden={d}\n", .{ hc, hidden });
     }
     return .{ .normalized = normalized, .stream = stream };
 }

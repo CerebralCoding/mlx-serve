@@ -549,7 +549,7 @@ pub fn qsaMaskFromQk(self: *Trunk, ctx: *ForwardCtx, qk: mlx.mlx_array, fa: *con
     // A placed draft row takes the mask arm: its dead rows are masked, which no gatherer reads.
     const want_blocks = qsaWantsBlocks(batch, kv, seq_len, ctx.cache.config.scheme == .affine) and ctx.head_place == null;
     // A solo decode row on dense KV hands its picks to `qsa_decode` at every kv; the mask arm needs none.
-    const dec_row = solo and batch == 1 and seq_len == 1 and ctx.head_place == null and !ctx.cache.config.isQuant() and qsa_decode.enabled();
+    const dec_row = solo and batch == 1 and seq_len == 1 and ctx.head_place == null and !ctx.cache.config.isQuant();
     if (want_blocks or dec_row) {
         // Prefill: sorted per-row block indices for the gather kernel;
         // the dense [S, kv] mask is never built. Decode (S==1): the same

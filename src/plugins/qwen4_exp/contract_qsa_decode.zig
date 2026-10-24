@@ -369,8 +369,6 @@ pub const Parts = struct {
         try self.rig.launch(&merge_launch, Merge.geometryAt(.{ .rows = self.ops.hq, .n = BD, .k = splits(KB) }).?, &.{ pa, pm });
         const ours = try a.dupe(u8, self.rig.outputBytes());
         errdefer a.free(ours);
-        qsa_decode.override = true;
-        defer qsa_decode.override = null;
         const y = (try qsa_decode.attend(self.rig.stream(), self.args[0], self.args[3], self.args[4], self.args[2], RATIO, SCALE)) orelse return error.Declined;
         defer _ = mlx.mlx_array_free(y);
         return .{ ours, try self.rig.bytesOf(&.{y}) };

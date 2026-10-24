@@ -495,11 +495,8 @@ test "spec-verify width sweep µbench (MLX_SERVE_VERIFY_WIDTH_UBENCH=1)" {
     }
 }
 
-test "simd_qmm decode rows: from 8 where the verify lanes stop at 7, off beside a tile, env overrides" {
-    try testing.expectEqual(@as(c_int, 8), simdQmmDecodeMinRows(null, .off));
-    try testing.expectEqual(@as(c_int, 0), simdQmmDecodeMinRows(null, .nax));
-    try testing.expectEqual(@as(c_int, 0), simdQmmDecodeMinRows(null, .shader));
-    try testing.expectEqual(@as(c_int, 0), simdQmmDecodeMinRows("0", .off));
-    try testing.expectEqual(@as(c_int, 6), simdQmmDecodeMinRows("6", .nax));
-    try testing.expectEqual(@as(c_int, 0), simdQmmDecodeMinRows("x", .off));
+test "simd_qmm decode rows: from 8 where the verify lanes stop at 7, off beside a tile" {
+    try testing.expectEqual(@as(c_int, 8), simdQmmDecodeMinRows(.off));
+    try testing.expectEqual(@as(c_int, 0), simdQmmDecodeMinRows(.nax));
+    try testing.expectEqual(@as(c_int, 0), simdQmmDecodeMinRows(.shader));
 }
