@@ -15,6 +15,7 @@ const log = @import("../../../host/log.zig");
 const FsPackDir = @import("../../../host/registry/pack_dir.zig").FsPackDir;
 const dflash = @import("../spec/dflash/dflash.zig");
 const intree = @import("intree.zig");
+const outside = @import("../../../host/plugins/loader.zig");
 
 const ModelConfig = model.ModelConfig;
 
@@ -22,6 +23,8 @@ const ModelConfig = model.ModelConfig;
 pub const Binding = struct {
     table: *const abi.ModelTable,
     parsed: abi.Parsed = .{},
+    /// An outside plugin's (`host/plugins`): the legacy parse knows nothing of its packs.
+    outside: bool = false,
 
     pub fn destroy(b: *Binding, a: std.mem.Allocator) void {
         b.table.free_parsed(&b.parsed);
@@ -29,8 +32,10 @@ pub const Binding = struct {
     }
 };
 
-/// The registry's claimant of the pack, when its type is served; null otherwise (two claimants at one rank too).
+/// The pack's claimant: a loaded outside plugin that wins it over the built-ins, else the registry's when its type is
+/// served; null otherwise (two claimants at one rank too).
 pub fn claimant(model_type: []const u8, config_json: []const u8, dir: *const abi.PackDir) ?*const abi.ModelTable {
+    if (outside.winner(model_type, config_json, dir)) |p| if (p.entry().model) |t| return t;
     return claimantIn(&registry.entries, model_type, config_json, dir);
 }
 
@@ -110,13 +115,14 @@ pub fn resolve(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, raw_json
     // The plugin parses what the legacy parse reads: the overrides land in both.
     const config_json = try withOverrides(arena.allocator(), raw_json);
     const model_type = try sdk_plugin.modelTypeOf(arena.allocator(), config_json);
-    if (!served.serves(model_type)) return .{ .legacy = "type not served" };
+    if (!served.serves(model_type) and outside.loaded().len == 0) return .{ .legacy = "type not served" };
     var fs = FsPackDir.open(io, model_dir) catch return .{ .legacy = "pack dir unreadable" };
     defer fs.close();
     const dir = fs.packDir();
-    const table = claimant(model_type, config_json, &dir) orelse return .{ .legacy = "no single claimant" };
+    const table = claimant(model_type, config_json, &dir) orelse
+        return .{ .legacy = if (served.serves(model_type)) "no single claimant" else "type not served" };
     const b = try a.create(Binding);
-    b.* = .{ .table = table };
+    b.* = .{ .table = table, .outside = outside.ownerOf(table) != null };
     const v = table.parse(&dir, abi.Str.of(config_json), .{}, null, false, &b.parsed);
     if (!v.isOk()) {
         a.destroy(b);
@@ -124,7 +130,7 @@ pub fn resolve(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, raw_json
     }
     // A drafter sidecar the plugin cannot serve stays with the legacy path while one exists; a type whose legacy
     // forward is gone serves without drafters (the load skips the sidecar by name).
-    if (servesDflash(table, &b.parsed) or served.legacyRemoved(model_type)) {} else if (dflash.resolveInDirDrafter(io, a, model_dir)) |p| {
+    if (servesDflash(table, &b.parsed) or served.legacyRemoved(model_type) or b.outside) {} else if (dflash.resolveInDirDrafter(io, a, model_dir)) |p| {
         a.free(p);
         table.free_parsed(&b.parsed);
         a.destroy(b);
@@ -153,7 +159,7 @@ pub fn stubOf(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, raw_json:
     defer arena.deinit();
     const config_json = withOverrides(arena.allocator(), raw_json) catch return null;
     const model_type = sdk_plugin.modelTypeOf(arena.allocator(), config_json) catch return null;
-    if (!served.serves(model_type)) return null;
+    if (!served.serves(model_type) and outside.loaded().len == 0) return null;
     var fs = FsPackDir.open(io, model_dir) catch return null;
     defer fs.close();
     const dir = fs.packDir();

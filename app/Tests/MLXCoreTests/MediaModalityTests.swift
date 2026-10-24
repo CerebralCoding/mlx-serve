@@ -209,6 +209,19 @@ final class MediaModelResolutionTests: XCTestCase {
         XCTAssertEqual(ModelBrowserUse.mediaModel(atPath: "/m/mesh", in: models)?.modality, .mesh)
     }
 
+    func testTheServersRowDecidesThePaneOfAPackItLists() {
+        // An outside plugin's pack: the app's own map has never heard of its type; the server's row names its pane.
+        let models = [local("toy_sound", path: "/m/t/snd"), local("acestep", path: "/m/t/music")]
+        XCTAssertNil(ModelBrowserUse.mediaModel(atPath: "/m/t/snd", in: models))
+        let rows = [APIClient.parseModelInfo(["id": "t/snd", "modality": "sound"]),
+                    APIClient.parseModelInfo(["id": "t/music", "modality": "music"])]
+        XCTAssertEqual(ModelBrowserUse.mediaModel(atPath: "/m/t/snd", in: models, rows: rows)?.modality, .sound)
+        XCTAssertEqual(ModelBrowserUse.mediaModel(atPath: "/m/t/music", in: models, rows: rows)?.modality, .music)
+        XCTAssertEqual(MediaModality(served: "3d"), .mesh)
+        XCTAssertEqual(MediaModality(served: "speech"), .voice)
+        XCTAssertNil(MediaModality(served: "decisions"))
+    }
+
     func testADecisionCheckpointResolvesToItsOwnUse() {
         // Decisions are the third half of the catalogue: My Models offers a Use for them,
         // so a Discover row on the same checkpoint must resolve it too.

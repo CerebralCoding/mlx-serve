@@ -8,6 +8,7 @@ const sdk_plugin = @import("../../../sdk/plugin.zig");
 const registry = @import("../../../plugins/registry.zig");
 const FsPackDir = @import("../../registry/pack_dir.zig").FsPackDir;
 const log = @import("../../log.zig");
+const outside = @import("../../plugins/loader.zig");
 
 pub const MediaTable = abi.MediaTable;
 
@@ -46,6 +47,9 @@ fn entryOf(comptime n: []const u8) @TypeOf(registry.entries[0]) {
 /// The served table for `model_type` (the type `claimType` reports for a pack), or null: a table's own type, else the
 /// first served table that claims the type.
 pub fn byName(model_type: []const u8) ?*const MediaTable {
+    if (model_type.len > 0) for (outside.entries()) |e| if (e.media) |t| {
+        if (std.mem.eql(u8, typeOf(t), model_type) or t.claims(.of(model_type), &no_files) == .by_type) return t;
+    };
     for (tables, types) |t, ty| if (std.mem.eql(u8, ty, model_type)) return t;
     if (model_type.len == 0) return null;
     for (tables) |t| if (t.claims(.of(model_type), &no_files) == .by_type) return t;
@@ -66,9 +70,10 @@ const NoFiles = struct {
     }
 };
 
-/// The model type a served table reports for its packs.
+/// The model type a served table reports for its packs (an outside plugin's: its first declared type).
 pub fn typeOf(t: *const MediaTable) []const u8 {
     for (tables, types) |x, ty| if (x == t) return ty;
+    if (outside.ownerOf(t)) |p| if (p.manifest.claims.len > 0) return p.manifest.claims.slice()[0].slice();
     return t.name.slice();
 }
 
@@ -100,6 +105,10 @@ fn claimWith(a: std.mem.Allocator, dir: *const common.PackDir) ?Claimed {
         break :blk dir.readFile("config.json", buf, &why) orelse "";
     };
     const mt = sdk_plugin.modelTypeOf(a, cfg) catch "";
+    if (outside.winner(mt, cfg, dir)) |p| if (p.entry().media) |t| {
+        var one: [1]common.Claim = undefined;
+        return .{ .t = t, .model_type = if (sdk_plugin.claimsOf(&.{p.entry()}, mt, cfg, dir, &one)[0] == .by_type) mt else typeOf(t) };
+    };
     var claims_buf: [registry.entries.len]common.Claim = undefined;
     const claims = sdk_plugin.claimsOf(&registry.entries, mt, cfg, dir, &claims_buf);
     const i = (common.pick(claims) catch {

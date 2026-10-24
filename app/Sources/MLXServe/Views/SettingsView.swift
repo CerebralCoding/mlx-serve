@@ -123,6 +123,10 @@ struct SettingsView: View {
         ) {
             ModelFoldersSectionContent()
             ServerSectionContent()
+            // The Mac App Store build loads no plugins (its sandbox forbids it).
+            if !BuildFeatures.current.isMAS {
+                PluginsSectionContent()
+            }
         }
         SettingsSection(
             category: .memory,
@@ -1961,6 +1965,45 @@ private struct ProviderModelPickerSheet: View {
         }
         self.error = lastError
         loading = false
+    }
+}
+
+/// Outside plugins: one switch for all of them, then one per installed plugin with its version, signer and hash
+/// (`OutsidePlugins`). Read by the server at startup.
+private struct PluginsSectionContent: View {
+    @State private var switches = OutsidePlugins.loadSwitches()
+    @State private var receipts = OutsidePlugins.receipts()
+    @State private var saveError: String?
+
+    var body: some View {
+        SettingsRow(title: "Outside plugins",
+                    explainer: "Model, media and quant-format plugins you installed with `mlx-serve plugin install` (in ~/.mlx-serve/plugins). A plugin is native code that runs with your rights. Restart the server to apply.") {
+            Toggle("", isOn: Binding(get: { switches.enabled }, set: { switches.enabled = $0; save() }))
+                .labelsHidden()
+                .toggleStyle(.switch)
+        }
+        ForEach(receipts) { r in
+            SettingsRow(title: r.name, explainer: OutsidePlugins.summary(r)) {
+                Toggle("", isOn: Binding(get: { switches.isOn(r.name) }, set: { switches.set(r.name, on: $0); save() }))
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .disabled(!switches.enabled)
+            }
+        }
+        if let saveError {
+            Text(saveError)
+                .font(.app(.caption))
+                .foregroundStyle(.red)
+        }
+    }
+
+    private func save() {
+        do {
+            try OutsidePlugins.save(switches)
+            saveError = nil
+        } catch {
+            saveError = error.localizedDescription
+        }
     }
 }
 

@@ -8,6 +8,9 @@ const c = @import("mlx_c");
 const abi = kit.abi.plugin;
 pub const config = @import("config.zig");
 
+/// Shown at install and in Settings.
+pub const version = "0.1.0";
+
 pub const plugin = kit.sdk.Plugin{
     .name = "_example",
     .kind = .model,
@@ -77,9 +80,9 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     var name_buf: [128]u8 = undefined;
     var ok = take(src, "model.embed_tokens.weight", &m.embed) and take(src, "model.norm.weight", &m.norm);
     for (layers, 0..) |*l, i| inline for (.{
-        .{ "ln1", "input_layernorm" },       .{ "q", "self_attn.q_proj" },        .{ "k", "self_attn.k_proj" },
-        .{ "v", "self_attn.v_proj" },        .{ "o", "self_attn.o_proj" },        .{ "ln2", "post_attention_layernorm" },
-        .{ "gate", "mlp.gate_proj" },        .{ "up", "mlp.up_proj" },            .{ "down", "mlp.down_proj" },
+        .{ "ln1", "input_layernorm" }, .{ "q", "self_attn.q_proj" }, .{ "k", "self_attn.k_proj" },
+        .{ "v", "self_attn.v_proj" },  .{ "o", "self_attn.o_proj" }, .{ "ln2", "post_attention_layernorm" },
+        .{ "gate", "mlp.gate_proj" },  .{ "up", "mlp.up_proj" },     .{ "down", "mlp.down_proj" },
     }) |w| {
         const name = std.fmt.bufPrint(&name_buf, "model.layers.{d}.{s}.weight", .{ i, w[1] }) catch unreachable;
         ok = ok and take(src, name, &@field(l, w[0]));
@@ -216,10 +219,11 @@ fn decoder(m: *Model, g: *Graph, ops: *const abi.CacheOps, cache: abi.Handle, to
     return g.reshape(normed, &.{ t, @intCast(k.hidden_size) });
 }
 
-/// The tiny pack the conformance suite runs: vocab 32, width 16, two layers, GQA 2/1, seeded random weights.
+/// The tiny pack the conformance suite runs, complete enough to serve (`mlx-serve plugin fixture`): the 256 bytes
+/// plus four specials, width 16, two layers, GQA 2/1, seeded random weights, a role-tag chat template.
 pub fn conformanceFixture(a: std.mem.Allocator) !kit.sdk.fixture.Fixture {
     const fx = kit.sdk.fixture;
-    const v, const h, const ff, const q, const kv = .{ 32, 16, 32, 16, 8 };
+    const v, const h, const ff, const q, const kv = .{ 260, 16, 32, 16, 8 };
     var tensors: std.ArrayList(fx.Tensor) = .empty;
     const ones = try a.alloc(f32, h);
     @memset(ones, 1);
@@ -228,10 +232,10 @@ pub fn conformanceFixture(a: std.mem.Allocator) !kit.sdk.fixture.Fixture {
     for (0..2) |i| {
         const seed: u64 = 10 + 10 * i;
         inline for (.{
-            .{ "input_layernorm", &[_]u64{h}, 0 },              .{ "self_attn.q_proj", &[_]u64{ q, h }, 1 },
-            .{ "self_attn.k_proj", &[_]u64{ kv, h }, 2 },       .{ "self_attn.v_proj", &[_]u64{ kv, h }, 3 },
-            .{ "self_attn.o_proj", &[_]u64{ h, q }, 4 },        .{ "post_attention_layernorm", &[_]u64{h}, 0 },
-            .{ "mlp.gate_proj", &[_]u64{ ff, h }, 5 },          .{ "mlp.up_proj", &[_]u64{ ff, h }, 6 },
+            .{ "input_layernorm", &[_]u64{h}, 0 },        .{ "self_attn.q_proj", &[_]u64{ q, h }, 1 },
+            .{ "self_attn.k_proj", &[_]u64{ kv, h }, 2 }, .{ "self_attn.v_proj", &[_]u64{ kv, h }, 3 },
+            .{ "self_attn.o_proj", &[_]u64{ h, q }, 4 },  .{ "post_attention_layernorm", &[_]u64{h}, 0 },
+            .{ "mlp.gate_proj", &[_]u64{ ff, h }, 5 },    .{ "mlp.up_proj", &[_]u64{ ff, h }, 6 },
             .{ "mlp.down_proj", &[_]u64{ h, ff }, 7 },
         }) |w| {
             var n: usize = 1;
@@ -243,9 +247,17 @@ pub fn conformanceFixture(a: std.mem.Allocator) !kit.sdk.fixture.Fixture {
             });
         }
     }
+    const specials = [_]kit.sdk.byte_tokenizer.Special{
+        .{ .id = 256, .content = "<|end|>" },  .{ .id = 257, .content = "<|system|>" },
+        .{ .id = 258, .content = "<|user|>" }, .{ .id = 259, .content = "<|assistant|>" },
+    };
     return .{ .files = try a.dupe(fx.File, &.{
-        .{ .name = "config.json", .bytes = "{\"model_type\":\"_example\",\"vocab_size\":32,\"hidden_size\":16,\"intermediate_size\":32,\"num_hidden_layers\":2,\"num_attention_heads\":2,\"num_key_value_heads\":1,\"rms_norm_eps\":1e-5,\"tie_word_embeddings\":true}" },
+        .{ .name = "config.json", .bytes = "{\"model_type\":\"_example\",\"vocab_size\":260,\"hidden_size\":16,\"intermediate_size\":32,\"num_hidden_layers\":2,\"num_attention_heads\":2,\"num_key_value_heads\":1,\"rms_norm_eps\":1e-5,\"tie_word_embeddings\":true,\"eos_token_id\":256}" },
         .{ .name = "generation_config.json", .bytes = "{\"temperature\":0.7}" },
+        .{ .name = "tokenizer.json", .bytes = try kit.sdk.byte_tokenizer.json(a, &specials) },
+        .{ .name = "tokenizer_config.json", .bytes =
+        \\{"eos_token":"<|end|>","chat_template":"{% for m in messages %}<|{{ m.role }}|>{{ m.content }}<|end|>{% endfor %}{% if add_generation_prompt %}<|assistant|>{% endif %}"}
+        },
         .{ .name = "model.safetensors", .bytes = try fx.safetensors(a, tensors.items) },
     }) };
 }

@@ -15,37 +15,48 @@ const examples = [_][]const u8{ "_example", "_example_media", "_example_quant" }
 
 const testing = std.testing;
 
-/// The scratch plugins folder with every example installed, and the loaded set.
+/// The scratch plugins folder with every example installed, their receipts, and the loaded set.
 const Installed = struct {
     tmp: testing.TmpDir,
-    set: loader.Set,
+    arena: *std.heap.ArenaAllocator,
+    receipts: [examples.len]loader.Receipt = undefined,
+    set: loader.Set = .{},
 
     fn init() !Installed {
         const built = std.mem.span(env.get(.MLX_SERVE_KIT_PLUGINS) orelse return error.SkipZigTest);
-        var tmp = testing.tmpDir(.{});
-        errdefer tmp.cleanup();
-        var buf: [std.fs.max_path_bytes]u8 = undefined;
-        const root = buf[0..try tmp.dir.realPath(testing.io, &buf)];
-        const dir = try std.fs.path.join(testing.allocator, &.{ root, "plugins" });
-        defer testing.allocator.free(dir);
-        for (examples) |ex| {
-            const src = try std.fmt.allocPrint(testing.allocator, "{s}/{s}/lib/lib{s}.dylib", .{ built, ex, ex });
-            defer testing.allocator.free(src);
-            const got = try cli.install(testing.io, testing.allocator, src, dir, false);
-            switch (got) {
-                .ok => |p| testing.allocator.free(p.path),
+        const arena = try testing.allocator.create(std.heap.ArenaAllocator);
+        arena.* = .init(testing.allocator);
+        var self: Installed = .{ .tmp = testing.tmpDir(.{}), .arena = arena };
+        errdefer self.deinit();
+        const a = arena.allocator();
+        const dir = try self.path("plugins");
+        for (examples, &self.receipts) |ex, *r| {
+            const src = try std.fmt.allocPrint(a, "{s}/{s}/lib/lib{s}.dylib", .{ built, ex, ex });
+            switch (try cli.install(testing.io, a, src, dir, &yes)) {
+                .ok => |got| r.* = got,
                 .refused => |why| {
                     std.debug.print("install {s}: {s}\n", .{ ex, why });
-                    testing.allocator.free(why);
                     return error.Refused;
                 },
             }
         }
-        return .{ .tmp = tmp, .set = try loader.loadDir(testing.io, testing.allocator, dir, .{ .enabled = true }, @import("mlx_stamp").bytes) };
+        self.set = try loader.loadDir(testing.io, testing.allocator, dir, .{ .enabled = true }, @import("mlx_stamp").bytes);
+        return self;
+    }
+    fn yes(_: std.Io, _: cli.Pending) bool {
+        return true;
+    }
+    /// `rel` under the scratch folder (in the arena).
+    fn path(self: *Installed, rel: []const u8) ![]const u8 {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const root = buf[0..try self.tmp.dir.realPath(testing.io, &buf)];
+        return std.fs.path.join(self.arena.allocator(), &.{ root, rel });
     }
     fn deinit(self: *Installed) void {
         self.set.deinit(testing.allocator);
         self.tmp.cleanup();
+        self.arena.deinit();
+        testing.allocator.destroy(self.arena);
     }
 };
 
@@ -60,16 +71,20 @@ test "kit examples: built from the kit, installed with receipts, loaded, negotia
         try cli.checkPlugin(testing.io, testing.allocator, p);
     }
     try testing.expectEqual(dylib_abi.Kind.media, inst.set.plugins.items[1].manifest.kind);
+    // The receipt Settings lists: the plugin's own version and the file's signer beside its hash.
+    for (inst.receipts, inst.set.plugins.items) |r, p| {
+        try testing.expectEqualStrings("0.1.0", r.version);
+        if (p.manifest.kind != .quant) try testing.expectEqualStrings(p.name(), r.model_types[0]);
+        try testing.expectEqualStrings(&p.sha256, r.sha256);
+        try testing.expect(r.signature.len > 0);
+    }
     try testing.expect(inst.set.entries.items[0].model != null and inst.set.entries.items[2].quant != null);
 }
 
 test "kit examples: a changed install is refused by its receipt; a disabled one is not opened" {
     var inst = try Installed.init();
     defer inst.deinit();
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = buf[0..try inst.tmp.dir.realPath(testing.io, &buf)];
-    const dir = try std.fs.path.join(testing.allocator, &.{ root, "plugins" });
-    defer testing.allocator.free(dir);
+    const dir = try inst.path("plugins");
     // Another plugin's bytes under this name: the hash no longer matches the receipt.
     var plugins = try inst.tmp.dir.openDir(testing.io, "plugins", .{});
     defer plugins.close(testing.io);
@@ -128,6 +143,35 @@ test "kit examples: the model plugin's cache crosses the boundary (prefill then 
     defer testing.allocator.free(whole);
     const stepped = try lastLogits(&pack, &tokens, 2);
     defer testing.allocator.free(stepped);
-    try testing.expectEqual(@as(usize, 32), whole.len);
+    try testing.expectEqual(@as(usize, 260), whole.len);
     for (whole, stepped) |x, y| try testing.expectApproxEqAbs(x, y, 1e-4);
+}
+
+test "kit examples: the model plugin's fixture written as a pack is one it claims and parses" {
+    var inst = try Installed.init();
+    defer inst.deinit();
+    const a = inst.arena.allocator();
+    const p = inst.set.plugins.items[0];
+    const pack = try inst.path("pack");
+    try cli.writeFixture(testing.io, a, p, pack);
+    for ([_][]const u8{ "config.json", "tokenizer.json", "tokenizer_config.json", "model.safetensors" }) |f|
+        try inst.tmp.dir.access(testing.io, try std.fs.path.join(a, &.{ "pack", f }), .{});
+    try testing.expectEqualStrings("_example, 2 layers, hidden 16, vocab 260 (by_type)", try cli.checkPack(testing.io, a, p, pack));
+    // The media example claims nothing of a model pack.
+    try testing.expectError(error.NotClaimed, cli.checkPack(testing.io, a, inst.set.plugins.items[1], pack));
+}
+
+test "kit examples: the model plugin's fixture pack tokenizes and renders its chat template as the server will" {
+    var inst = try Installed.init();
+    defer inst.deinit();
+    const a = inst.arena.allocator();
+    const pack = try inst.path("pack");
+    try cli.writeFixture(testing.io, a, inst.set.plugins.items[0], pack);
+    var tok = try @import("../tokenizer/load.zig").loadTokenizer(testing.io, a, pack);
+    defer tok.deinit();
+    try testing.expectEqualSlices(u32, &.{ 258, 'h', 'i', 256 }, try tok.encode(a, "<|user|>hi<|end|>"));
+    const chat_config = try @import("../chat/template_load.zig").loadChatConfig(testing.io, a, pack);
+    const Message = @import("../chat/types.zig").Message;
+    const prompt = try @import("../chat/render.zig").renderChatTemplate(a, &[_]Message{.{ .role = "user", .content = "hi" }}, &chat_config, null, null, false, null, false);
+    try testing.expectEqualStrings("<|user|>hi<|end|><|assistant|>", prompt);
 }
