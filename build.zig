@@ -976,7 +976,7 @@ fn readLlamaTag(b: *std.Build) ?[]const u8 {
 
 /// mlx-stream (absorbed from davidtai/mlx-stream): the streamed packs' archs (`src/plugins/<model>/stream/`), their
 /// EXL3 lanes (`src/sdk/quant/exl3/stream/`) and the expert streamer (`src/sdk/weights/streamed/`), one module rooted at
-/// `src/mlx_stream.zig` (`src/sdk/weights/streamed/glue.zig` binds it). Its contract types are its own `sdk` module;
+/// `src/mlx_stream.zig` (`src/engines/mlx/modules/stream_glue.zig` binds it). Its contract types are its own `sdk` module;
 /// both reach the host through `mlx_host`.
 /// A `-Dunits` object's module rooted at `root`: the exe module's imports and include dirs, its own pair of absorbed
 /// modules (they import their host root), and no C sources (the exe links those once).

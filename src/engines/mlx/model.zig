@@ -624,7 +624,7 @@ pub const ModelConfig = struct {
     // transformer tower, vision is a single patch embedder
     // (LN → Dense → LN → +factorized 2D posemb → LN → RMSNorm → Linear) and
     // audio is raw 640-sample frames projected straight to text space. Set
-    // when model_type is gemma4_unified*. See src/sdk/vision/encoder.zig (UnifiedEmbedder).
+    // when model_type is gemma4_unified*. See src/engines/mlx/vision_encoder.zig (UnifiedEmbedder).
     is_gemma4_unified: bool = false,
     vision_mm_embed_dim: u32 = 0, // unified: mm_embed_dim (3840 for 12B = text hidden)
     vision_model_patch_size: u32 = 0, // unified: 48px merged "model patch" (16px teacher × 3 pool)
@@ -2914,7 +2914,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // to 31B Dense without per-arch fan-out.
         // Detect the unified (12B encoder-free multimodal) variant before we
         // collapse the tag — drives vision_embedder/embed_audio weight loading
-        // and the encoder-free forward in src/sdk/vision/encoder.zig.
+        // and the encoder-free forward in src/engines/mlx/vision_encoder.zig.
         config.is_gemma4_unified = std.mem.indexOf(u8, model_type, "unified") != null;
         config.model_type = "gemma4";
         config.weight_prefix = "language_model.model";
@@ -6180,7 +6180,7 @@ test "shouldKeepWeightKey: Super projector follows the global vision gate" {
 test "shouldKeepWeightKey keeps Gemma 4 12B unified embedder weights when vision enabled" {
     // gemma4_unified is encoder-free: vision_embedder.* (patch embedder),
     // embed_vision.* and embed_audio.* (raw projections) ARE wired in
-    // src/sdk/vision/encoder.zig (UnifiedEmbedder), so they must be kept under load_vision.
+    // src/engines/mlx/vision_encoder.zig (UnifiedEmbedder), so they must be kept under load_vision.
     // The heavy SigLIP-era conformer audio_tower.* stays dropped.
     try testing.expect(shouldKeepWeightKey("vision_embedder.patch_dense.weight", true));
     try testing.expect(shouldKeepWeightKey("embed_vision.embedding_projection.weight", true));

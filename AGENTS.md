@@ -52,7 +52,7 @@ Generation defaults for omitted fields: body > model `generation_defaults` > glo
 - First-time: `./scripts/fetch-zig.sh` stages the pinned Zig at `.zig-toolchain/`.
 - Zig caches configure-time subprocess output: after a toolchain/SDK change `rm -rf .zig-cache` or the link references a ghost path.
 - **ALWAYS `zig build -Doptimize=ReleaseFast`, never bare `zig build`** (Debug 2–4× slower ⇒ fake regressions). `zig build test` does NOT refresh `zig-out/bin/mlx-serve` — rebuild before any live A/B.
-- **Edit loop: `zig build check`** (35 s, Sema only) → `zig build test` (8 parallel shards, `-Dtest-shards=N`; a `sharded:` test splits its own work) → ReleaseFast only to RUN or MEASURE. ReleaseFast is single-threaded LLVM `-O3` per object that no flag tunes (`-mllvm`, `-fstrip`, `-fincremental`, `-fno-llvm` tried); less code or `-Dunits` helps.
+- **Edit loop: `zig build check`** (35 s, Sema only) → `zig build test` (8 parallel shards, `-Dtest-shards=N`; a `sharded:` test splits its own work) → ReleaseFast only to RUN or MEASURE. ReleaseFast is single-threaded LLVM `-O3` per object (no flag tunes it): a plugin edit rebuilds in 0:30 with `-Dunits`, 3:30 without.
 - **`-Dunits=true`** (off by default; `test`/`check` run without it) builds the host and 8 plugin groups as parallel objects; a plugin edit rebuilds its group only while `zig build unit-closure` holds (the plugin's imports stay in `sdk/`, `mlx/`, `abi/`, `kernels/`).
   A unit copies every global it reaches: host state is `Shared` / `SharedThreadLocal` (`sdk/util/shared.zig`), checked by `zig build units-check -Dunits=true` (data AND thread-local sections).
 - **Every kernel registers with the kernel contract** (`sdk/testing/kernel_contract/REGISTERING.md`: one `contract.zig`

@@ -347,7 +347,7 @@ pub fn shouldKeepWeightKey(key: []const u8, load_vision: bool) bool {
     // patch embedder (`vision_embedder.*` + `embed_vision.*`) and a raw-waveform
     // audio projection (`embed_audio.*`) instead of the SigLIP vision tower and
     // conformer audio tower of earlier Gemma 4 variants. Those embedders are
-    // wired in src/sdk/vision/encoder.zig (UnifiedEmbedder), so keep them under the same
+    // wired in src/engines/mlx/vision_encoder.zig (UnifiedEmbedder), so keep them under the same
     // `load_vision` gate as the SigLIP weights (`--no-vision` → text only).
     const is_vision = std.mem.startsWith(u8, key, "vision_tower.") or
         std.mem.startsWith(u8, key, "vision_model.") or

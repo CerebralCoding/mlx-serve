@@ -7,24 +7,22 @@ an in-checkpoint MTP layer, a Qwen3-VL tower. Packs, oracle: `docs/reference.md`
 - Table: `config.zig` (MLX-free claims + parse; `Config` carries `ModelConfig`'s names, `model_config.zig` maps them
   one to one, pinned against `parseConfigLegacy` on both shipped packs), `bill.zig`, `plugin.zig` (load + forward),
   `contract.zig` (kernel contract).
-- SERVED by the driver (`served.zig`). The plugin wraps the engine's `Transformer` (`forwardQwen4With`, the batched
-  GDN tick, `forwardMoeBatchedVerify`) on the driver's slot caches; it adopts the driver's map (`Resident.take`, no
-  second load). Hooks: `forward_settle` (deferred PLE: `Owed.input` on the host gather, `.history` on `--ple-gpu`),
-  `release_slot` (`ssmGroupDrop`, QSA marks), `meters` (`[qsa-arms]`). Proofs: `proof_test.zig` (the table against
-  legacy), `served_test.zig` (load as the scheduler loads, then captured steps, pipelined greedy, batched rows and
-  verify, MTP rounds at auto and pinned depth with equal tokens AND accepted counts, host and GPU PLE, an image prompt
-  on the M-RoPE table), all bit-equal.
+- SERVED by the driver (`served.zig`); the legacy forward is deleted (`served.legacy_removed`, refused by name). The
+  plugin owns its `Trunk` (`trunk.zig`, `trunk/`, `trunk_load.zig`: weights, config, module state, MTP head), copied
+  from the SDK/engine code it used with `copied_from` headers and cut to qwen4's arms; a layout an arm it dropped
+  would read is refused at load (`trunk_load.unservedLayout`). It adopts the driver's map (`Resident.take`, no second
+  load). Hooks: `forward_settle` (deferred PLE), `release_slot` (`ssmGroupDrop`, QSA marks), `meters` (`[qsa-arms]`);
+  `lm_head_mxfp8` arrives through `LoadCtx.settings_json`; int8 prefill is inert (Hadamard packs only). Proofs:
+  `proof_test.zig` and `served_test.zig` replay tapes recorded from the legacy forward (`fixtures/*.tape`, frozen),
+  `oracle_test.zig`; ModelOpt/combined-GDN/ternary arms have their own tests (fixture layouts the tapes lack).
 - P8 DEBT, `engines/mlx/plugin/intree.zig` (in-tree only, delete when the ABI carries these): the MTP head, group
-  lanes and the grouped verify run on the plugin's inner `Transformer` through the legacy `.qwen4` arm
-  (`MtpHeadRef{ .qwen4 = inner }`, `Transformer.qwen4Host()` at every engine site that touches `qwen4`/`qwen4_mtp`);
-  the plugin builds its inner trunk's `ModelConfig` from its facts (`toModelConfig`, field-equal to the legacy parse
-  the engine serves it with). An ABI-clean head needs: (1) `ForwardOut.next`, the chained hidden
-  apart from the projected one; (2) a fact that the trunk's hidden is the pre-mixer stream; (3) a placed head forward
-  (dead history rows); (4) `HeadHooks.mark` with a length; (5) head snapshot / bytes / serialize for the prefix cache
-  and SSD; (6) group lanes and the grouped verify on the plugin arm; (7) the rerank on the head's mixer output. Beside
-  the head: (8) the slot's whole M-RoPE table (pooled QSA keys rope at block starts the chunk does not carry;
-  `intree.enter` hands the engine's ctx); (9) a `dist` hook (a Thunderbolt pair keeps the legacy path,
-  `driver.declinePlanned`). The vision tower loads into the engine's map like any served pack's (`driver.loadWith`).
+  lanes and the grouped verify run on the plugin's `Trunk` through `MtpHeadRef.qwen4`; the cluster worker runs a
+  bare `Trunk` and the plugin reads the Thunderbolt plan (`caps.cluster_plan`). An ABI-clean head needs:
+  (1) `ForwardOut.next`, the chained hidden apart from the projected one; (2) a fact that the trunk's hidden is the
+  pre-mixer stream; (3) a placed head forward (dead history rows); (4) `HeadHooks.mark` with a length; (5) head
+  snapshot / bytes / serialize for the prefix cache and SSD; (6) group lanes and the grouped verify on the plugin arm;
+  (7) the rerank on the head's mixer output; (8) the slot's whole M-RoPE table (`intree.enter` hands the engine's ctx,
+  `plugin.engineCtx`, a `SharedThreadLocal`).
 - Unserved hooks: `cache.aux` (QSA history + PLE prev in checkpoints/SSD ride the engine's SSM entries),
   `capture_stream_all` (no caller on this arch).
 - Kernel contract: every Metal kernel registered (`contract*.zig`); the multi-launch ones (qsa_decode, qsa_select's

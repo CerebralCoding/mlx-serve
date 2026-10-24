@@ -1856,7 +1856,7 @@ const logResolveGgufError = model_discovery.logResolveGgufError;
 /// `deepseek4` + the antirez-style MLA key, or a ds4-only arch (V4.1, Qwen3.8
 /// Flash Next, GLM 5.x) → ds4; everything else → llama.cpp.
 /// Issue #15 — the previous basename heuristic mis-routed two real-world
-/// files; see `src/host/registry/engine_pick.zig` for the rule.
+/// files; see `src/sdk/quant/gguf/engine_pick.zig` for the rule.
 ///
 /// On any inspection failure (file unreadable, malformed header, etc.) we
 /// default to llama.cpp and log the reason. Caller still gets a sane attempt
