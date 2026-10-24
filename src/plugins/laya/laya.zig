@@ -10,7 +10,7 @@
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../sdk/util/log.zig");
-const ltx = @import("../ltx/video.zig");
+const ltx = @import("../ltx/component.zig");
 const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
 
 const S = mlx.mlx_stream;
