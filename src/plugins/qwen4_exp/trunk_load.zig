@@ -40,7 +40,7 @@ pub fn unservedLayout(config: *const model.ModelConfig, layers: []const MoeLayer
     if (config.hidden_act != .silu) return "a non-SiLU activation";
     if (config.scale_embeddings) return "scaled embeddings";
     for (layers) |*lw| {
-        if (lw.shared_mlp != null or lw.mhc_attn != null or lw.mhc_ffn != null) return "another family's layer blocks";
+        if (lw.shared_mlp != null) return "another family's layer blocks";
         switch (lw.mlp) {
             .moe => |*mw| {
                 if (mw.expert_bias != null) return "an expert selection bias";
@@ -48,10 +48,6 @@ pub fn unservedLayout(config: *const model.ModelConfig, layers: []const MoeLayer
                 if (mw.shared_ungated) return "an ungated shared expert";
             },
             .dense => {},
-        }
-        switch (lw.attn) {
-            .linear => |*la| if (la.a2.w.ctx != null or la.z2.w.ctx != null) return "KDA low-rank gates",
-            .full => {},
         }
     }
     return null;
@@ -257,7 +253,7 @@ pub fn load(io: std.Io, a: std.mem.Allocator, config: *const model.ModelConfig, 
 
     // Prism's ternary codec writes every affine bias as exactly -scale; only then do the 2-bit kernels serve.
     var ternary_2bit = false;
-    if (ternaryKernelCandidate(config)) {
+    if (ternaryKernelCandidate(config.hadamard_block, .of(config))) {
         // An embedding that is not also the lm_head is only ever gathered.
         const gather_only = if (lm_head_b.ctx == emb_b.ctx) mlx.mlx_array{ .ctx = null } else emb_b;
         if (try firstNonTernaryBias(weights, gather_only, s)) |key| {

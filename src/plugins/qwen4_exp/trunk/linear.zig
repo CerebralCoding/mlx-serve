@@ -294,7 +294,6 @@ pub fn lmHeadForeign(self: *const Trunk, x: mlx.mlx_array) !mlx.mlx_array {
     return self.lmHeadProject(xc);
 }
 test "trunk qmatmul: a ternary 2-bit pack routes through qmv2; without the flag it stays stock" {
-    const transformer = @import("../../../engines/mlx/transformer.zig");
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const n: c_int = 2048;
@@ -326,8 +325,8 @@ test "trunk qmatmul: a ternary 2-bit pack routes through qmv2; without the flag 
     defer _ = mlx.mlx_array_free(x);
     try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
 
-    transformer.device_gen_override = .{ .gen = 13, .phone = false };
-    defer transformer.device_gen_override = null;
+    @import("../../../mlx/device.zig").device_gen_override = .{ .gen = 13, .phone = false };
+    defer @import("../../../mlx/device.zig").device_gen_override = null;
     var xfm: Trunk = undefined;
     xfm.s = s;
     xfm.bits_cache = .{};
