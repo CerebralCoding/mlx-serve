@@ -223,3 +223,6 @@ pub const RECURRENCE_EVAL_INTERVAL: usize = 32;
 /// grows by at most TAIL_MERGE_MAX/default_chunk (~6% at 8192) — within the
 /// score-budget slack `boundedPrefillChunk` already carries.
 pub const TAIL_MERGE_MAX: usize = 512;
+
+/// Slots one batched forward carries (twin of `scheduler.MAX_BATCH_GROUP`).
+pub const MAX_BATCH_ROWS = 32;
