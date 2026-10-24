@@ -982,7 +982,7 @@ pub const Transformer = struct {
     pub const applySoftcap = @import("methods/activations.zig").applySoftcap;
     pub const swiglu = @import("methods/activations.zig").swiglu;
     // sdk/blocks/conv/conv1d_cache.zig
-    pub const conv1dWithCache = @import("../../sdk/blocks/conv/conv1d_cache.zig").conv1dWithCache;
+    pub const conv1dWithCache = @import("methods/conv1d_cache.zig").conv1dWithCache;
     // sdk/blocks/moe/experts.zig
     pub const scaleExperts = @import("methods/moe_experts.zig").scaleExperts;
     // engines/mlx/eval_cadence.zig
@@ -1112,11 +1112,11 @@ pub const Transformer = struct {
     pub const yarnScaleQK = @import("../../sdk/blocks/rope/yarn.zig").yarnScaleQK;
     pub const yarnScaleRotated = @import("../../sdk/blocks/rope/yarn.zig").yarnScaleRotated;
     // sdk/blocks/attention/gated_full.zig
-    pub const gatedFullAttnWith = @import("../../sdk/blocks/attention/gated_full.zig").gatedFullAttnWith;
-    pub const gatedFullAttnProjected = @import("../../sdk/blocks/attention/gated_full.zig").gatedFullAttnProjected;
-    pub const gatedAttnTail = @import("../../sdk/blocks/attention/gated_full.zig").gatedAttnTail;
+    pub const gatedFullAttnWith = @import("methods/gated_full_attn.zig").gatedFullAttnWith;
+    pub const gatedFullAttnProjected = @import("methods/gated_full_attn.zig").gatedFullAttnProjected;
+    pub const gatedAttnTail = @import("methods/gated_full_attn.zig").gatedAttnTail;
     // sdk/blocks/attention/mla.zig
-    pub const mlaAttnWith = @import("../../sdk/blocks/attention/mla.zig").mlaAttnWith;
+    pub const mlaAttnWith = @import("methods/mla_attn.zig").mlaAttnWith;
     // sdk/blocks/attention/proj.zig
     pub const qkAngleFor = @import("../../sdk/blocks/attention/proj.zig").qkAngleFor;
     pub const qkAngleRowsFor = @import("../../sdk/blocks/attention/proj.zig").qkAngleRowsFor;
@@ -1133,22 +1133,22 @@ pub const Transformer = struct {
     pub const GdnVerifyInputs = @import("verify/joined_rows.zig").GdnVerifyInputs;
     pub const gdnVerifyRows = @import("verify/joined_rows.zig").gdnVerifyRows;
     // sdk/blocks/moe/moe.zig
-    pub const moeRouterLogits = @import("../../sdk/blocks/moe/moe.zig").moeRouterLogits;
-    pub const moeSharedDown = @import("../../sdk/blocks/moe/moe.zig").moeSharedDown;
-    pub const moeSharedProject = @import("../../sdk/blocks/moe/moe.zig").moeSharedProject;
-    pub const moeSharedGateTail = @import("../../sdk/blocks/moe/moe.zig").moeSharedGateTail;
-    pub const ungatedSharedA4 = @import("../../sdk/blocks/moe/moe.zig").ungatedSharedA4;
-    pub const moeAddUngatedShared = @import("../../sdk/blocks/moe/moe.zig").moeAddUngatedShared;
-    pub const moeAddGatedShared = @import("../../sdk/blocks/moe/moe.zig").moeAddGatedShared;
-    pub const moeAddSharedDown = @import("../../sdk/blocks/moe/moe.zig").moeAddSharedDown;
-    pub const moeAddSharedGateRows = @import("../../sdk/blocks/moe/moe.zig").moeAddSharedGateRows;
-    pub const moeSharedDownRows = @import("../../sdk/blocks/moe/moe.zig").moeSharedDownRows;
-    pub const moeVerifyRowsSolo = @import("../../sdk/blocks/moe/moe.zig").moeVerifyRowsSolo;
-    pub const moeVerifyRows = @import("../../sdk/blocks/moe/moe.zig").moeVerifyRows;
-    pub const moeMLP = @import("../../sdk/blocks/moe/moe.zig").moeMLP;
-    pub const moeTensorParallel = @import("../../sdk/blocks/moe/moe.zig").moeTensorParallel;
-    pub const moeExpertsRouted = @import("../../sdk/blocks/moe/moe.zig").moeExpertsRouted;
-    pub const moeMLP2WithRouter = @import("../../sdk/blocks/moe/moe.zig").moeMLP2WithRouter;
+    pub const moeRouterLogits = @import("methods/moe.zig").moeRouterLogits;
+    pub const moeSharedDown = @import("methods/moe.zig").moeSharedDown;
+    pub const moeSharedProject = @import("methods/moe.zig").moeSharedProject;
+    pub const moeSharedGateTail = @import("methods/moe.zig").moeSharedGateTail;
+    pub const ungatedSharedA4 = @import("methods/moe.zig").ungatedSharedA4;
+    pub const moeAddUngatedShared = @import("methods/moe.zig").moeAddUngatedShared;
+    pub const moeAddGatedShared = @import("methods/moe.zig").moeAddGatedShared;
+    pub const moeAddSharedDown = @import("methods/moe.zig").moeAddSharedDown;
+    pub const moeAddSharedGateRows = @import("methods/moe.zig").moeAddSharedGateRows;
+    pub const moeSharedDownRows = @import("methods/moe.zig").moeSharedDownRows;
+    pub const moeVerifyRowsSolo = @import("methods/moe.zig").moeVerifyRowsSolo;
+    pub const moeVerifyRows = @import("methods/moe.zig").moeVerifyRows;
+    pub const moeMLP = @import("methods/moe.zig").moeMLP;
+    pub const moeTensorParallel = @import("methods/moe.zig").moeTensorParallel;
+    pub const moeExpertsRouted = @import("methods/moe.zig").moeExpertsRouted;
+    pub const moeMLP2WithRouter = @import("methods/moe.zig").moeMLP2WithRouter;
     // sdk/blocks/moe/decode.zig
     pub const glmMoeDecode = @import("methods/moe_decode.zig").glmMoeDecode;
     pub const moeDecodeGatherQmv = @import("methods/moe_decode.zig").moeDecodeGatherQmv;
@@ -1386,7 +1386,7 @@ test {
     _ = @import("../../sdk/vision/splice.zig");
     _ = @import("../../sdk/blocks/attention/gates.zig");
     _ = @import("../../sdk/blocks/mlp/activations.zig");
-    _ = @import("../../sdk/blocks/conv/conv1d_cache.zig");
+    _ = @import("methods/conv1d_cache.zig");
     _ = @import("../../sdk/blocks/moe/experts.zig");
     _ = @import("eval_cadence.zig");
     _ = @import("../../plugins/qwen4_exp/forward.zig");
@@ -1408,15 +1408,15 @@ test {
     _ = @import("../../plugins/gemma3/encoder.zig");
     _ = @import("../../sdk/blocks/rope/mrope.zig");
     _ = @import("../../sdk/blocks/rope/yarn.zig");
-    _ = @import("../../sdk/blocks/attention/gated_full.zig");
-    _ = @import("../../sdk/blocks/attention/mla.zig");
+    _ = @import("methods/gated_full_attn.zig");
+    _ = @import("methods/mla_attn.zig");
     _ = @import("../../sdk/blocks/attention/proj.zig");
     _ = @import("../../plugins/laguna/ubench_test.zig");
     _ = @import("../../plugins/inkling/attention.zig");
     _ = @import("../../plugins/gemma4/attention.zig");
     _ = @import("verify/joined_rows.zig");
     _ = @import("../../plugins/inkling/moe.zig");
-    _ = @import("../../sdk/blocks/moe/moe.zig");
+    _ = @import("methods/moe.zig");
     _ = @import("../../sdk/blocks/moe/decode.zig");
     _ = @import("../../sdk/blocks/attention/masks.zig");
     _ = @import("load/layers_dense.zig");

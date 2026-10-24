@@ -1,17 +1,17 @@
-//! sdk/blocks/conv/conv1d_cache, split out of engines/mlx/transformer.zig (P1, moves only).
+//! engines/mlx/methods/conv1d_cache, the legacy `Transformer`'s methods split out of engines/mlx/transformer.zig.
 //! Owns conv1dWithCache, conv1dTailRetentionDelta, conv1dBitCopy, conv1dTwoChunk, conv1dExpectBitEqual.
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const PREFILL_EVAL_MIN_SEQ = @import("../../bases/run.zig").PREFILL_EVAL_MIN_SEQ;
-const compactConvStateEnabled = @import("depthwise.zig").compactConvStateEnabled;
-const SSMCacheEntry = @import("../../../engines/mlx/ssm/entry.zig").SSMCacheEntry;
-const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
+const PREFILL_EVAL_MIN_SEQ = @import("../../../sdk/bases/run.zig").PREFILL_EVAL_MIN_SEQ;
+const compactConvStateEnabled = @import("../../../sdk/blocks/conv/depthwise.zig").compactConvStateEnabled;
+const SSMCacheEntry = @import("../ssm/entry.zig").SSMCacheEntry;
+const Transformer = @import("../transformer.zig").Transformer;
 const materializedOwnedCopy = @import("../../../mlx/array.zig").materializedOwnedCopy;
-const attn256RandBf16 = @import("../attention/attn256.zig").attn256RandBf16;
-const depthwiseConvCuda = @import("depthwise.zig").depthwiseConvCuda;
-const depthwiseConvStep = @import("depthwise.zig").depthwiseConvStep;
-const depthwise_vars = @import("depthwise.zig");
+const attn256RandBf16 = @import("../../../sdk/blocks/attention/attn256.zig").attn256RandBf16;
+const depthwiseConvCuda = @import("../../../sdk/blocks/conv/depthwise.zig").depthwiseConvCuda;
+const depthwiseConvStep = @import("../../../sdk/blocks/conv/depthwise.zig").depthwiseConvStep;
+const depthwise_vars = @import("../../../sdk/blocks/conv/depthwise.zig");
 
 // ── Conv1d with cache (shared by GatedDeltaNet, LFM2, Mamba2) ──
 

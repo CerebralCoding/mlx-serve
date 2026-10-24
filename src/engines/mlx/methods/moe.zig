@@ -1,45 +1,45 @@
-//! sdk/blocks/moe/moe, split out of engines/mlx/transformer.zig (P1, moves only).
+//! engines/mlx/methods/moe, the legacy `Transformer`'s methods split out of engines/mlx/transformer.zig.
 //! Owns moeRouterLogits, moeSharedDown, moeSharedProject, moeSharedGateTail, ungatedSharedA4, moeAddUngatedShared, and 10 more.
 
-const distributed_mod = @import("../../../engines/mlx/cluster/distributed.zig");
+const distributed_mod = @import("../cluster/distributed.zig");
 const mlx = @import("../../../mlx/ffi.zig");
-const exl3 = @import("../../quant/exl3/format.zig");
-const gather_qmm_nax = @import("gather_qmm_nax.zig");
+const exl3 = @import("../../../sdk/quant/exl3/format.zig");
+const gather_qmm_nax = @import("../../../sdk/blocks/moe/gather_qmm_nax.zig");
 const log = @import("../../../host/log.zig");
-const moe_affine4 = @import("moe_affine4.zig");
+const moe_affine4 = @import("../../../sdk/blocks/moe/moe_affine4.zig");
 const glm5 = @import("../../../plugins/glm5_next/glm5_next.zig");
-const gather_qmv_rows = @import("gather_qmv_rows.zig");
-const profile = @import("../../../engines/mlx/diag/profile.zig");
-const verify_projection = @import("../linear/verify_projection.zig");
-const MAX_BATCH_ROWS = @import("../../bases/run.zig").MAX_BATCH_ROWS;
-const ProfClock = @import("../../../engines/mlx/diag/profile.zig").ProfClock;
-const decodeProfileEnabled = @import("../../../engines/mlx/diag/profile.zig").decodeProfileEnabled;
-const dispatchProbeCount = @import("../../../engines/mlx/diag/profile.zig").dispatchProbeCount;
+const gather_qmv_rows = @import("../../../sdk/blocks/moe/gather_qmv_rows.zig");
+const profile = @import("../diag/profile.zig");
+const verify_projection = @import("../../../sdk/blocks/linear/verify_projection.zig");
+const MAX_BATCH_ROWS = @import("../../../sdk/bases/run.zig").MAX_BATCH_ROWS;
+const ProfClock = @import("../diag/profile.zig").ProfClock;
+const decodeProfileEnabled = @import("../diag/profile.zig").decodeProfileEnabled;
+const dispatchProbeCount = @import("../diag/profile.zig").dispatchProbeCount;
 const lastDim = @import("../../../mlx/array.zig").lastDim;
 const scalarOf = @import("../../../mlx/array.zig").scalarOf;
-const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
-const qwen4Standin = @import("../../diag/standin.zig").qwen4Standin;
-const qmatmulBits = @import("../linear/qmatmul.zig").qmatmulBits;
-const SharedProjKind = @import("../linear/verify_projection.zig").SharedProjKind;
-const sharedGateRowsEligible = @import("../linear/verify_projection.zig").sharedGateRowsEligible;
-const verifySharedProjection = @import("../linear/verify_projection.zig").verifySharedProjection;
-const verifyQmmNaxAvailable = @import("../linear/verify_qmm_nax.zig").verifyQmmNaxAvailable;
-const swigluClampLimit = @import("../mlp/activations.zig").swigluClampLimit;
-const swigluFusedEnabled = @import("../mlp/fused_activations.zig").swigluFusedEnabled;
-const moeFp4DecodeEligible = @import("decode.zig").moeFp4DecodeEligible;
-const useGatherQmvDecode = @import("../../../engines/mlx/methods/moe_decode.zig").useGatherQmvDecode;
-const gatherExpertMm = @import("experts.zig").gatherExpertMm;
-const moeCudaFormat = @import("gather_qmv_rows.zig").moeCudaFormat;
-const moeDecodeDispatchArm = @import("gather_qmv_rows.zig").moeDecodeDispatchArm;
-const RouterGate = @import("router_kernel.zig").RouterGate;
-const moeRouterFusedEnabled = @import("router_kernel.zig").moeRouterFusedEnabled;
-const moePrefillExpertReduce = @import("verify_kernels.zig").moePrefillExpertReduce;
-const moePrefillRoutePack = @import("verify_kernels.zig").moePrefillRoutePack;
-const verifyExpertReduce = @import("verify_kernels.zig").verifyExpertReduce;
-const verifyExpertReuse = @import("verify_kernels.zig").verifyExpertReuse;
-const verifyIndexedExpertInput = @import("verify_kernels.zig").verifyIndexedExpertInput;
-const verifyRoutePack = @import("verify_kernels.zig").verifyRoutePack;
-const MoeMlpWeights = @import("weights.zig").MoeMlpWeights;
+const Transformer = @import("../transformer.zig").Transformer;
+const qwen4Standin = @import("../../../sdk/diag/standin.zig").qwen4Standin;
+const qmatmulBits = @import("../../../sdk/blocks/linear/qmatmul.zig").qmatmulBits;
+const SharedProjKind = @import("../../../sdk/blocks/linear/verify_projection.zig").SharedProjKind;
+const sharedGateRowsEligible = @import("../../../sdk/blocks/linear/verify_projection.zig").sharedGateRowsEligible;
+const verifySharedProjection = @import("../../../sdk/blocks/linear/verify_projection.zig").verifySharedProjection;
+const verifyQmmNaxAvailable = @import("../../../sdk/blocks/linear/verify_qmm_nax.zig").verifyQmmNaxAvailable;
+const swigluClampLimit = @import("../../../sdk/blocks/mlp/activations.zig").swigluClampLimit;
+const swigluFusedEnabled = @import("../../../sdk/blocks/mlp/fused_activations.zig").swigluFusedEnabled;
+const moeFp4DecodeEligible = @import("../../../sdk/blocks/moe/decode.zig").moeFp4DecodeEligible;
+const useGatherQmvDecode = @import("moe_decode.zig").useGatherQmvDecode;
+const gatherExpertMm = @import("../../../sdk/blocks/moe/experts.zig").gatherExpertMm;
+const moeCudaFormat = @import("../../../sdk/blocks/moe/gather_qmv_rows.zig").moeCudaFormat;
+const moeDecodeDispatchArm = @import("../../../sdk/blocks/moe/gather_qmv_rows.zig").moeDecodeDispatchArm;
+const RouterGate = @import("../../../sdk/blocks/moe/router_kernel.zig").RouterGate;
+const moeRouterFusedEnabled = @import("../../../sdk/blocks/moe/router_kernel.zig").moeRouterFusedEnabled;
+const moePrefillExpertReduce = @import("../../../sdk/blocks/moe/verify_kernels.zig").moePrefillExpertReduce;
+const moePrefillRoutePack = @import("../../../sdk/blocks/moe/verify_kernels.zig").moePrefillRoutePack;
+const verifyExpertReduce = @import("../../../sdk/blocks/moe/verify_kernels.zig").verifyExpertReduce;
+const verifyExpertReuse = @import("../../../sdk/blocks/moe/verify_kernels.zig").verifyExpertReuse;
+const verifyIndexedExpertInput = @import("../../../sdk/blocks/moe/verify_kernels.zig").verifyIndexedExpertInput;
+const verifyRoutePack = @import("../../../sdk/blocks/moe/verify_kernels.zig").verifyRoutePack;
+const MoeMlpWeights = @import("../../../sdk/blocks/moe/weights.zig").MoeMlpWeights;
 
 pub fn moeRouterLogits(self: *Transformer, router_x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
     const cfg = &self.config;
@@ -612,7 +612,7 @@ pub fn moeMLP2WithRouter(self: *Transformer, router_x: mlx.mlx_array, expert_x_i
                 mw.gate_expert_scale.ctx == null and mw.up_expert_scale.ctx == null and
                 gate_qp.bits == up_qp.bits and gate_qp.group_size == up_qp.group_size)
             {
-                const sigtab = try @import("../hc/hc_prefill.zig").sigmoidTable(self.s);
+                const sigtab = try @import("../../../sdk/blocks/hc/hc_prefill.zig").sigmoidTable(self.s);
                 if (try gather_qmm_nax.sortedGateUp(x_tok, row_map, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, sorted_inds, sigtab, clamp.?, gate_qp.bits, gate_qp.group_size, gate_qp.mode.isFp4(), nax_available, self.s)) |act3| {
                     // The kernel writes [M, 1, n]; the down gather below takes [M, n] like the squeezed stock path.
                     defer _ = mlx.mlx_array_free(act3);
@@ -642,9 +642,9 @@ pub fn moeMLP2WithRouter(self: *Transformer, router_x: mlx.mlx_array, expert_x_i
             var row_map = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(row_map);
             try mlx.check(mlx.mlx_astype(&row_map, lhs_idx, .uint32, self.s));
-            const fmt: @import("moe_prefill_cuda.zig").Format = if (gate_qp.mode == .nvfp4) .nvfp4 else .mxfp8;
+            const fmt: @import("../../../sdk/blocks/moe/moe_prefill_cuda.zig").Format = if (gate_qp.mode == .nvfp4) .nvfp4 else .mxfp8;
             const gscale: ?mlx.mlx_array = if (mw.gate_expert_scale.ctx != null) mw.gate_expert_scale else null;
-            fused_act = try @import("moe_prefill_cuda.zig").gateUp(self.s, x_flat, row_map, sorted_inds, mw.switch_gate_w, mw.switch_gate_s, mw.switch_up_w, mw.switch_up_s, gscale, fmt);
+            fused_act = try @import("../../../sdk/blocks/moe/moe_prefill_cuda.zig").gateUp(self.s, x_flat, row_map, sorted_inds, mw.switch_gate_w, mw.switch_gate_s, mw.switch_up_w, mw.switch_up_s, gscale, fmt);
         }
         var x_gathered = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(x_gathered);

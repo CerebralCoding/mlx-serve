@@ -1,10 +1,10 @@
-//! sdk/blocks/attention/mla, split out of engines/mlx/transformer.zig (P1, moves only).
+//! engines/mlx/methods/mla_attn, the legacy `Transformer`'s methods split out of engines/mlx/transformer.zig.
 //! Owns mlaAttnWith.
 
 const mlx = @import("../../../mlx/ffi.zig");
-const ForwardCtx = @import("../../../engines/mlx/forward_ctx.zig").ForwardCtx;
-const FullAttnWeights = @import("../../../engines/mlx/layer_weights.zig").FullAttnWeights;
-const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
+const ForwardCtx = @import("../forward_ctx.zig").ForwardCtx;
+const FullAttnWeights = @import("../layer_weights.zig").FullAttnWeights;
+const Transformer = @import("../transformer.zig").Transformer;
 
 // ── Multi-head Latent Attention (bailing_hybrid full-attention layers) ──
 //
