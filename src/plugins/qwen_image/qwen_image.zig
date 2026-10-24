@@ -28,7 +28,7 @@ const model_mod = @import("../../sdk/weights/load.zig");
 const tok_mod = @import("../../sdk/tokenizer/tokenizer.zig");
 const mage_flow = @import("../mage_flow/mage_flow.zig");
 const qwen_image_edit = @import("edit.zig");
-const model_discovery = @import("../../host/registry/discovery.zig");
+const model_discovery = @import("../../sdk/weights/resident.zig");
 const lora_mod = @import("../../sdk/weights/lora.zig");
 
 const Weights = model_mod.Weights;

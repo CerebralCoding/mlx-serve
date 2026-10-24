@@ -7,7 +7,7 @@ const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 const generation = @import("../../sdk/config/generation.zig");
 const quant_config = @import("../../sdk/config/quantization_config.zig");
-const json = @import("json.zig");
+const json = @import("../../sdk/config/json.zig");
 
 /// `lfm2-vl` is mlx-community's spelling (LFM2-VL-1.6B-4bit): the engine reads it as text, never as `lfm2_vl`.
 pub const plugin = @import("../../sdk/plugin.zig").Plugin{

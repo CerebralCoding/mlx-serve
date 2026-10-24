@@ -18,7 +18,7 @@ const row_exact = @import("../../sdk/bases/blocks/row_exact.zig");
 const naxAvailable = @import("../../mlx/device.zig").naxAvailable;
 const rht = @import("../../sdk/quant/hadamard/rht.zig");
 const prism_seam = @import("../prism_hadamard_qwen35/seam.zig");
-const weights_mod = @import("../../engines/mlx/load/weights.zig");
+const weights_mod = @import("../../sdk/weights/load.zig");
 const ld = @import("../qwen3/load.zig");
 const qwen3 = @import("../qwen3/plugin.zig");
 pub const config = @import("config.zig");
@@ -455,7 +455,7 @@ fn sharedGate(m: *Loaded, r: *ld.Reader, c: *const config.Config, i: usize, s: m
         try m.owned.linear(lin);
         return .{ .lin = lin, .vec = .{ .ctx = null } };
     }
-    const t = try weights_mod.transposeBf16Weight(w, s);
+    const t = try @import("../../mlx/array.zig").transposeBf16Weight(w, s);
     try m.owned.own(t);
     var vec: Array = .{ .ctx = null };
     if (mlx.mlx_array_size(t) == c.hidden_size) {

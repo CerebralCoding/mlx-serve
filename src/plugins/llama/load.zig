@@ -11,8 +11,8 @@ const bases = @import("../../sdk/bases/bases.zig");
 const formats = @import("../../sdk/quant/formats.zig");
 const native = @import("../../sdk/quant/native.zig");
 const gguf_format = @import("../../sdk/quant/gguf/format.zig");
-const QuantMode = @import("../../engines/mlx/model.zig").QuantMode;
-const transposeBf16Weight = @import("../../engines/mlx/load/weights.zig").transposeBf16Weight;
+const QuantMode = @import("../../sdk/quant/params.zig").QuantMode;
+const transposeBf16Weight = @import("../../mlx/array.zig").transposeBf16Weight;
 const fuseRowGroup = @import("../../sdk/blocks/linear/fused_rows.zig").fuseRowGroup;
 
 const gpa = std.heap.c_allocator;

@@ -10,7 +10,7 @@ const bases = @import("../../sdk/bases/bases.zig");
 const block = @import("../../sdk/bases/block.zig");
 const run_mod = @import("../../sdk/bases/run.zig");
 const moe = @import("../../sdk/bases/blocks/moe.zig");
-const reader = @import("reader.zig");
+const reader = @import("../../sdk/bases/reader.zig");
 pub const config = @import("config.zig");
 
 pub const plugin = config.plugin;
@@ -283,5 +283,5 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
 
 test {
     _ = config;
-    _ = @import("json.zig");
+    _ = @import("../../sdk/config/json.zig");
 }

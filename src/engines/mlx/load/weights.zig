@@ -17,6 +17,7 @@ const DenseMlpWeights = @import("../../../sdk/blocks/mlp/dense.zig").DenseMlpWei
 const MoeMlpWeights = @import("../../../sdk/blocks/moe/weights.zig").MoeMlpWeights;
 const checkExl3Bank = @import("exl3_bank.zig").checkExl3Bank;
 const affineParamsFromGeometry = @import("../../../sdk/quant/params.zig").affineParamsFromGeometry;
+const weights_load = @import("../../../sdk/weights/load.zig");
 const maxAbsDiffF32 = @import("../../../sdk/testing/parity.zig").maxAbsDiffF32;
 const HybridMlpWeights = @import("../forward/layered.zig").HybridMlpWeights;
 const testing = @import("../kv/cache.zig").testing;
@@ -123,21 +124,7 @@ pub fn weightTriple(weights: *const Weights, base: []const u8, dense_in: ?u32, o
     return .{ .w = wm, .sc = sc, .bi = bi };
 }
 
-/// A tiny affine-quantized tensor rewritten as the dense `[out, in]` a dense
-/// checkpoint ships (untransposed), so the paths keyed on the dense layout
-/// (hc prefill, the fused HC read, the softmax_gate fold) serve it too.
-pub fn dequantizeSmall(w: *mlx.mlx_array, sc: *mlx.mlx_array, bi: *mlx.mlx_array, in_dim: u32, owned: *std.ArrayList(mlx.mlx_array), allocator: std.mem.Allocator, s: mlx.mlx_stream) !void {
-    if (sc.ctx == null or bi.ctx == null) return;
-    const qp = affineParamsFromGeometry(w.*, sc.*, in_dim) orelse return;
-    var d = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(d);
-    try mlx.check(mlx.mlx_dequantize(&d, w.*, sc.*, bi.*, mlx.mlx_optional_int.some(@intCast(qp.group_size)), mlx.mlx_optional_int.some(@intCast(qp.bits)), "affine", .{ .ctx = null }, .{ .value = mlx.mlx_array_dtype(sc.*), .has_value = true }, s));
-    try mlx.check(mlx.mlx_array_eval(d));
-    try owned.append(allocator, d);
-    w.* = d;
-    sc.* = mlx.mlx_array_new();
-    bi.* = mlx.mlx_array_new();
-}
+pub const dequantizeSmall = weights_load.dequantizeSmall;
 
 /// A grouped-norm weight `[hc*hidden]` viewed as `[hc, hidden]` (owned).
 pub fn groupedNormView(weights: *const Weights, name: []const u8, hc: u32, hidden: u32, owned_bf16: *std.ArrayList(mlx.mlx_array), allocator: std.mem.Allocator, s: mlx.mlx_stream) !mlx.mlx_array {

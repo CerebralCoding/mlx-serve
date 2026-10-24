@@ -11,7 +11,7 @@ const ops = @import("../../mlx/ops.zig");
 const bases = @import("../../sdk/bases/bases.zig");
 const run_mod = @import("../../sdk/bases/run.zig");
 const compiled = @import("../../sdk/bases/blocks/compiled.zig");
-const reader = @import("../lfm2/reader.zig");
+const reader = @import("../../sdk/bases/reader.zig");
 pub const config = @import("config.zig");
 
 pub const plugin = config.plugin;
