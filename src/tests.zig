@@ -108,6 +108,10 @@ test {
     _ = @import("sdk/bases/proof/mixers.zig");
     _ = @import("host/chat/chat.zig");
     _ = @import("engines/llama/engine.zig");
+    _ = @import("host/engines/served.zig");
+    _ = @import("host/engines/requests.zig");
+    _ = @import("host/engines/prompt.zig");
+    _ = @import("host/engines/load.zig");
     _ = @import("host/chat/format_corpus_test.zig");
     _ = @import("host/chat/tool_traffic_replay_test.zig");
     _ = @import("engines/mlx/spec/mtp_replay_test.zig");

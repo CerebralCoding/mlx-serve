@@ -23,9 +23,9 @@ const Req = book_mod.Req;
 const Reason = book_mod.Reason;
 const io = book_mod.io;
 
-const bridge = if (build_options.llama_engine) @import("bridge.zig") else @import("stub.zig");
+const bridge = @import("bridge.zig");
 
-/// The table the host loads for llama.cpp.
+/// The table the host loads for llama.cpp (`host/engines/served.table`: builds that carry it).
 pub const table = Adapter(bridge, std.heap.smp_allocator).table;
 
 /// The context a sequence gets when the host names none.
@@ -156,6 +156,7 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
                 .embedding_dims = 0,
                 .eos = abi.span(u32, st.eos),
                 .startup = abi.span(u8, startup),
+                .vocab_size = @intCast(vocab),
             };
             return st;
         }
@@ -262,7 +263,7 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
             end(st, &l, reason, why);
         }
 
-        /// One decode tick (the scheduler arm's `runLlamaDecodeTick`): each request emits the token it drew last
+        /// One decode tick: each request emits the token it drew last
         /// round, then the ones still decoding feed theirs in ONE batched step and draw the next. A request alone
         /// on a context with an MTP head runs an MTP round instead.
         fn tick(st: *State, live: *std.ArrayList(Live)) void {
@@ -294,8 +295,8 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
                 return;
             }
 
-            var seqs: [bridge.MAX_SEQS]*B.LlamaSeq = undefined;
-            var toks: [bridge.MAX_SEQS]i32 = undefined;
+            var seqs: [load.max_seqs]*B.LlamaSeq = undefined;
+            var toks: [load.max_seqs]i32 = undefined;
             for (live.items, seqs[0..n], toks[0..n]) |l, *q, *t| {
                 q.* = l.seq;
                 t.* = l.next;
@@ -501,6 +502,7 @@ test "llama adapter: an EOG id ends a request unemitted; a follow-up reuses its 
     try testing.expectEqualSlices(u32, &.{ 2, 3 }, abi.items(u32, info.eos));
     try testing.expectEqual(@as(u32, 2), info.max_concurrent);
     try testing.expectEqual(default_context, info.context_window);
+    try testing.expectEqual(@as(u32, FakeBridge.vocab), info.vocab_size);
     try testing.expect(info.caps.batches and !info.caps.drafts and !info.caps.penalties);
 
     var prompt: [20]u32 = undefined;
@@ -540,12 +542,12 @@ test "llama adapter: the contract holds on a real GGUF" {
     try contract.run(&R.table, .{ .model_dir = path, .model_type = "gguf", .config_json = "", .prompt = &.{ 1, 2, 3 }, .settings_json = "{\"seqs\":4}", .timeout_ms = 120_000, .gate_ms = 10_000 });
 }
 
-test "llama adapter: greedy tokens equal the scheduler arm's sequence on a real GGUF" {
+test "llama adapter: greedy tokens equal the plain bridge sequence on a real GGUF" {
     if (!build_options.llama_engine) return error.SkipZigTest;
     const path = realGguf() orelse return error.SkipZigTest;
     const R = Adapter(bridge, testing.allocator);
     const n = 16;
-    // The scheduler arm's sequence (`runPrefillLlama` + `runLlamaDecodeTick`, one slot, no MTP): sync, draw,
+    // The plain bridge sequence (one sequence, no MTP): sync, draw,
     // then emit, feed and draw per tick.
     var want: std.ArrayList(u32) = .empty;
     defer want.deinit(testing.allocator);

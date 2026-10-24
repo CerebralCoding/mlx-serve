@@ -19,8 +19,6 @@ const Generator = generate_mod.Generator;
 const dflash_mod = @import("spec/dflash/dflash.zig");
 const testing = std.testing;
 
-const runPrefillDs4 = @import("../ds4/adapter.zig").runPrefillDs4;
-const runPrefillLlama = @import("../llama/adapter.zig").runPrefillLlama;
 const publishHotCacheResidency = @import("cache/budget.zig").publishHotCacheResidency;
 const prefillDecodeShare = @import("prefill_interleave.zig").prefillDecodeShare;
 const InterleaveCtx = @import("prefill_interleave.zig").InterleaveCtx;
@@ -67,16 +65,6 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         sch.inflight_prefill_expected.store(0, .monotonic);
     };
 
-    // ds4-backed model: bypass the MLX prefill path entirely. The ds4
-    // engine owns the chat/tokenizer/KV stack — we just create a session,
-    // sync it to the slot's full prompt (ds4 reuses common prefix against
-    // its live cache internally), and mark the slot decoding.
-    if (slot.model.ds4_engine) |engine| {
-        return runPrefillDs4(sch, slot, engine);
-    }
-    if (slot.model.llama_engine != null) {
-        return runPrefillLlama(sch, slot);
-    }
     const sampling = slot.sampling;
     // Refresh ctx in case slot was relocated (paranoia — slot is heap so no,
     // but cheap).

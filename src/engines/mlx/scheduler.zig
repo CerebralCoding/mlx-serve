@@ -61,9 +61,9 @@ const model_registry_mod = @import("../../host/registry/registry.zig");
 const model_settings = @import("../../host/registry/model_settings.zig");
 const model_discovery = @import("../../host/registry/discovery.zig");
 const gguf_meta = @import("../../sdk/quant/gguf/engine_pick.zig");
-const arch_ds4 = if (@import("build_options").ds4_engine) @import("../ds4/bridge.zig") else @import("../ds4/stub.zig");
-const arch_llama = if (@import("build_options").llama_engine) @import("../llama/bridge.zig") else @import("../llama/stub.zig");
-const arch_ane = @import("../ane/lm.zig");
+const engines_served = @import("../../host/engines/served.zig");
+const engine_requests = @import("../../host/engines/requests.zig");
+const engines_load = @import("../../host/engines/load.zig");
 const mlx_gguf = @import("../../sdk/quant/gguf/claim.zig");
 const log = @import("../../sdk/util/log.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
@@ -91,9 +91,6 @@ const ChatConfig = chat_mod.ChatConfig;
 const ModelRegistry = model_registry_mod.ModelRegistry;
 const LoadedModel = model_registry_mod.LoadedModel;
 
-pub const aneWanted = @import("../ane/adapter.zig").aneWanted;
-pub const aneServes = @import("../ane/adapter.zig").aneServes;
-pub const MAX_LLAMA_DRAFTS = @import("../llama/adapter.zig").MAX_LLAMA_DRAFTS;
 pub const MAX_BATCH_GROUP = @import("batching/verdict.zig").MAX_BATCH_GROUP;
 pub const BatchVerdict = @import("batching/verdict.zig").BatchVerdict;
 pub const configBatchesDecode = @import("batching/verdict.zig").configBatchesDecode;
@@ -140,9 +137,6 @@ const residentGateBytes = @import("../../host/registry/preflight.zig").residentG
 pub const loadRequirementBytes = @import("../../host/registry/preflight.zig").loadRequirementBytes;
 
 test {
-    _ = @import("../ane/adapter.zig");
-    _ = @import("../ds4/adapter.zig");
-    _ = @import("../llama/adapter.zig");
     _ = @import("admission/pending.zig");
     _ = @import("batching/tick.zig");
     _ = @import("batching/verdict.zig");
@@ -356,14 +350,12 @@ pub const Scheduler = struct {
     queue_cond: std.Io.Condition,
     pending: std.ArrayList(*Slot),
     decoding: std.ArrayList(*Slot),
-    /// Slots a Neural Engine worker runs (`runAneSlot`), off the inference thread.
+    /// Slots an engine beside MLX runs on its own threads (`host/engines/requests.zig`), off the inference thread.
     offloaded: std.ArrayList(*Slot) = .empty,
     /// Cold Neural Engine builds running on their own threads (`aneBuildThread`).
     ane_builds: std.atomic.Value(u32) = .init(0),
-    /// Neural Engine requests' live metrics: prompt tokens to feed and fed (`Engine.gauges`), and
-    /// tokens generated so far by the ones still decoding; the sampler adds them to the GPU's.
-    ane_prefill_gauges: arch_ane.PrefillGauges = .{},
-    ane_generated: std.atomic.Value(u64) = .init(0),
+    /// Those engines' live metrics; the sampler adds them to the GPU's.
+    engine_gauges: engines_served.Gauges = .{},
     /// Phase A4: pending vision-encode requests. The inference thread drains
     /// these in the gap before/after each prefill+decode tick. Posting
     /// broadcasts on `queue_cond` to wake an idle inference thread.
@@ -417,9 +409,7 @@ pub const Scheduler = struct {
     inflight_prefill_expected: std.atomic.Value(u64),
     /// Number of slots currently inside `runPrefill`. Set on entry, cleared on
     /// every exit — so the panel can say "prefilling" IMMEDIATELY, rather than
-    /// waiting for the first 8192-token chunk to land (~40 s on a 27B). Also
-    /// covers the ds4/llama engines, whose prefill never reaches the MLX chunk
-    /// loop and therefore never moves `inflight_prefill_tokens`.
+    /// waiting for the first 8192-token chunk to land (~40 s on a 27B).
     requests_prefilling: std.atomic.Value(u64),
     /// Counts `pending.len + decoding.len` for back-pressure.
     in_flight: u32,
@@ -428,7 +418,7 @@ pub const Scheduler = struct {
     /// (matches the legacy `max_queue_size`).
     queue_cap: u32,
     submit_cond: std.Io.Condition,
-    /// Signaled when a persistent engine session (llama) is released in
+    /// Signaled when an engine session (beside MLX) is released in
     /// `complete()`, waking a `submit()` blocked waiting to claim it. Guarded by
     /// `queue_mu` together with `LoadedModel.session_claims`.
     session_cond: std.Io.Condition,
@@ -705,7 +695,7 @@ pub const Scheduler = struct {
         return self.decoding.items.len;
     }
 
-    /// Another request this one could batch with is live. Neural Engine slots never join a group.
+    /// Another request this one could batch with is live. Slots on an engine beside MLX never join a group.
     pub fn hasCompany(self: *Scheduler) bool {
         self.queue_mu.lockUncancelable(self.io);
         defer self.queue_mu.unlock(self.io);
@@ -726,7 +716,10 @@ pub const Scheduler = struct {
         // different architectures (e.g. pure-attention + hybrid SSM)
         // share one scheduler.
         const slot_config: *const ModelConfig = params.model.config orelse return error.ModelNotReady;
-        if (params.model.ane != null and !aneServes(params.sampling, params.logprobs_n, params.prompt_logprobs)) return error.NeuralEngineUnsupported;
+        if (params.model.engine) |e| if (engine_requests.missingCap(e, params)) |cap| {
+            engine_requests.refused = .{ .kind = e.kind, .cap = cap };
+            return error.EngineUnsupported;
+        };
         // Every decode path reads the prompt's last token; `""` on a BOS-less vocab encodes to none.
         if (params.prompt_ids.len == 0) return error.EmptyPrompt;
         const eff_kv_quant = params.kv_quant_config orelse slot_config.kv_quant_override orelse self.kv_quant_config;
@@ -741,10 +734,9 @@ pub const Scheduler = struct {
         }
         if (self.shutdown.load(.acquire)) return error.Shutdown;
 
-        // Persistent-session engines reuse their KV across requests, and each
-        // session (ds4's one, or one llama sequence) serves one request at a
-        // time. Block here until one is free, then claim it (released in
-        // `complete`), so waiting requests never spin the inference thread.
+        // An engine beside MLX serves as many requests at once as it has sessions (ds4's one, a llama.cpp
+        // sequence, a Neural Engine slot), each reusing its KV across requests. Block here until one is free,
+        // then claim it (released in `complete`).
         if (params.model.sessionCapacity()) |cap| {
             while (params.model.session_claims >= cap and !self.shutdown.load(.acquire)) {
                 self.session_cond.waitUncancelable(self.io, &self.queue_mu);
@@ -754,17 +746,14 @@ pub const Scheduler = struct {
             slot.holds_session = true;
         }
 
-        if (params.model.ane) |w| {
-            // The worker holds `in_pass` until it lets the slot go; `complete` waits that out.
-            _ = slot.in_pass.fetchAdd(1, .acq_rel);
+        if (params.model.engine) |e| {
+            // The engine holds `in_pass` until its `finished` event; `complete` waits that out.
             self.offloaded.append(self.allocator, slot) catch |err| {
-                _ = slot.in_pass.fetchSub(1, .release);
                 if (slot.holds_session) self.releaseSessionLocked(slot);
                 return err;
             };
-            w.post(slot) catch |err| {
+            engine_requests.submit(slot, e) catch |err| {
                 _ = self.offloaded.pop();
-                _ = slot.in_pass.fetchSub(1, .release);
                 if (slot.holds_session) self.releaseSessionLocked(slot);
                 return err;
             };
@@ -784,14 +773,10 @@ pub const Scheduler = struct {
         return slot;
     }
 
-    /// Give back the slot's session claim and its llama sequence. Caller holds
-    /// `queue_mu`. A pass still running this slot is the inference thread's,
-    /// which is also the only thread that picks a sequence, so freeing it here
-    /// cannot hand it to another request mid-tick.
+    /// Give back the slot's session claim. Caller holds `queue_mu`.
     fn releaseSessionLocked(self: *Scheduler, slot: *Slot) void {
         slot.model.session_claims -= 1;
         slot.holds_session = false;
-        if (slot.llama_seq) |seq| seq.busy = false;
         self.session_cond.broadcast(self.io);
     }
 
@@ -833,6 +818,7 @@ pub const Scheduler = struct {
         }
         for (self.offloaded.items, 0..) |s, j| if (s == slot) {
             _ = self.offloaded.swapRemove(j);
+            engine_requests.cancel(slot);
             break;
         };
 
@@ -880,7 +866,10 @@ pub const Scheduler = struct {
             for (self.prefilling[self.prefilling_from..self.n_prefilling]) |slot| slot.cancel();
         }
         for (self.decoding.items) |slot| slot.cancel();
-        for (self.offloaded.items) |slot| slot.cancel();
+        for (self.offloaded.items) |slot| {
+            slot.cancel();
+            engine_requests.cancel(slot);
+        }
     }
 
     /// The media residency bill for an entry, or 0 when it is not a media
@@ -984,8 +973,8 @@ pub const Scheduler = struct {
             null;
         const resident_model_bytes = residentGateBytes(validated_model_bytes, entry.bytes_on_disk, mlx_text);
         // A Neural Engine load holds int8 copies of the pack's 4- to 8-bit weights, and its KV.
-        const ane_bytes: ?u64 = if (mlx_text and aneWanted(owned.config, self.ane))
-            (if (arch_ane.archOf(owned.config)) |a| arch_ane.loadBytes(a, self.ane_slots) else |_| null)
+        const ane_bytes: ?u64 = if (mlx_text and engines_served.aneWanted(owned.config, self.ane))
+            engines_load.aneBytes(self.allocator, entry.path, self.ane_slots)
         else
             null;
         const gate_model_bytes: ?u64 = if (ane_bytes) |b| @max(b, resident_model_bytes orelse 0) else resident_model_bytes;
@@ -1121,13 +1110,8 @@ pub const Scheduler = struct {
             .evict_entries = victims_buf[0..n_victims],
             .allocator = self.allocator,
         };
-        // GGUF entry: route through the matching embedded-engine arm in
-        // doLoadOnInferenceThread (issue #59 — discovered/pulled GGUF dirs
-        // cold-load on demand like MLX ones).
-        if (owned.gguf) |g| switch (g.engine) {
-            .ds4 => req.ds4_path = g.path,
-            .llama => req.llama_path = g.path,
-        };
+        // A GGUF entry opens on its engine (issue #59: discovered/pulled GGUF dirs cold-load on demand).
+        req.gguf = owned.gguf;
 
         {
             self.queue_mu.lockUncancelable(self.io);
@@ -1382,10 +1366,6 @@ pub const Scheduler = struct {
         if (slot.sampling.constraint != null) return .grammar;
         if (slot.logprobs_n > 0) return .logprobs;
         if (slot.sampling.penalized()) return .penalty;
-        // Embedded-GGUF slots (ds4 / llama.cpp) have no `ForwardCtx` — they
-        // always fall through to the per-slot decode path (which dispatches
-        // into the engine).
-        if (slot.model.ds4_engine != null or slot.model.llama_engine != null) return .embedded_engine;
         const cfg = slot.model.config orelse return .arch;
         if (modelBatchable(cfg)) return .ok;
         // A GatedDeltaNet trunk is rejected by the pure-config predicate (it is
@@ -1436,7 +1416,7 @@ test "a live MTP slot never ticks regular, an unarmed one always does" {
     try testing.expectEqual(SpecTickMode.regular, specTickMode(true, false, true, false, false, true, false, false));
 }
 
-test "company: a Neural Engine slot never batches, so it does not count" {
+test "company: a slot on an engine beside MLX never batches, so it does not count" {
     var sch: Scheduler = undefined;
     sch.io = testing.io;
     sch.queue_mu = .init;

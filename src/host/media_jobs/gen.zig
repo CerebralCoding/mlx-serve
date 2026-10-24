@@ -200,7 +200,7 @@ pub fn incompleteMediaDir(io: std.Io, allocator: std.mem.Allocator, model_dir: [
 
 // ════════════════════════════════════════════════════════════════════════
 // Engine wrappers — own the backend sub-models. Allocated on the heap so the
-// `?*Engine` slot on `LoadedModel` is a stable pointer (mirrors `ds4_engine`).
+// `?*Engine` slot on `LoadedModel` is a stable pointer (mirrors `engine`).
 // load() + every generate() run on the inference thread.
 // ════════════════════════════════════════════════════════════════════════
 
@@ -641,7 +641,7 @@ pub fn videoStreamCtx(conn: *Conn, allocator: std.mem.Allocator, body: []const u
 // Stub CPU state for a media model. The gen path bypasses the transformer, so
 // `config`/`tokenizer`/`chat_config` on the LoadedModel are minimal stubs that
 // only keep server-side reads of `lm.config.?` / `lm.chat_config.?` from
-// crashing. Mirrors `runDs4Serve`'s stub construction. Used by BOTH the
+// crashing. Mirrors the GGUF stub (`cpu_state.buildGgufStubCpuState`). Used by BOTH the
 // startup gen-primary path and the cold-load (`/v1/load-model`) path.
 // ════════════════════════════════════════════════════════════════════════
 

@@ -35,11 +35,9 @@ const pld_index = @import("../../engines/mlx/spec/pld_index.zig");
 const prefix_cache_mod = @import("../../engines/mlx/cache/prefix_cache.zig");
 const tokenize_cache_mod = @import("../tokenizer/cache.zig");
 const scheduler_mod = @import("../../engines/mlx/scheduler.zig");
-const ds4_ffi = if (@import("build_options").ds4_engine) @import("../../engines/ds4/ffi.zig") else @import("../../engines/ds4/ffi_stub.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const model_discovery = @import("../registry/discovery.zig");
 const mlx_gguf = @import("../../sdk/quant/gguf/claim.zig");
-const arch_llama = if (@import("build_options").llama_engine) @import("../../engines/llama/bridge.zig") else @import("../../engines/llama/stub.zig");
 const media_mod = @import("../media_jobs/gen.zig");
 const transcription_mod = @import("../api/audio/transcription.zig");
 const forced_align_mod = @import("../../plugins/qwen3_asr/forced_align.zig");
@@ -818,17 +816,17 @@ fn sampleGauges(ctx: GaugeSamplerCtx) void {
     // generated so far by still-decoding slots (the scheduler publishes that
     // aggregate atomically once per decode tick — race-free, no per-token
     // write). Non-zero even mid-request, unlike the completion-only counter.
-    const inflight = ctx.scheduler.inflight_generated_tokens.load(.monotonic) + ctx.scheduler.ane_generated.load(.monotonic);
+    const inflight = ctx.scheduler.inflight_generated_tokens.load(.monotonic) + ctx.scheduler.engine_gauges.generated.load(.monotonic);
     ctx.metrics.generation_tokens_live.set(instr.liveGenerationTokens(ctx.metrics, inflight));
 
     // The other phase. Prompt-token counters and the prefill-time histogram
     // only advance at request COMPLETION, so a long prefill was invisible: GPU
     // pinned, decode reading 0, prefill reading "—". This gauge moves per
     // prefill chunk and returns to 0 the moment the prefill ends.
-    // Neural Engine requests count apart: the GPU's prefill stores its absolute progress.
-    ctx.metrics.prefill_tokens_live.set(ctx.scheduler.inflight_prefill_tokens.load(.monotonic) + ctx.scheduler.ane_prefill_gauges.done.load(.monotonic));
-    ctx.metrics.prefill_tokens_expected.set(ctx.scheduler.inflight_prefill_expected.load(.monotonic) + ctx.scheduler.ane_prefill_gauges.todo.load(.monotonic));
-    ctx.metrics.requests_prefilling.set(ctx.scheduler.requests_prefilling.load(.monotonic));
+    // Requests on the engines beside MLX count apart: the GPU's prefill stores its absolute progress.
+    ctx.metrics.prefill_tokens_live.set(ctx.scheduler.inflight_prefill_tokens.load(.monotonic) + ctx.scheduler.engine_gauges.prefill_done.load(.monotonic));
+    ctx.metrics.prefill_tokens_expected.set(ctx.scheduler.inflight_prefill_expected.load(.monotonic) + ctx.scheduler.engine_gauges.prefill_todo.load(.monotonic));
+    ctx.metrics.requests_prefilling.set(ctx.scheduler.requests_prefilling.load(.monotonic) + ctx.scheduler.engine_gauges.prefilling.load(.monotonic));
 }
 
 const IdleEvictCtx = struct {

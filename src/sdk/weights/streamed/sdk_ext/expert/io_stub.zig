@@ -1,6 +1,6 @@
 //! Refusing stand-ins for lib/expert_io's C ABI (the read pool, the event shim) on graphs built
-//! without those sources (every target but macOS: Linux, iOS), like `ds4_ffi_stub.zig`: shared code
-//! type-checks there; the pool and the event gate refuse at start.
+//! without those sources (every target but macOS: Linux, iOS): shared code type-checks there; the pool and the
+//! event gate refuse at start.
 
 const mlx = @import("sdk").mlx;
 const io = @import("io.zig");

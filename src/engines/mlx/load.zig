@@ -32,10 +32,8 @@ const Weights = model_mod.Weights;
 const ModelRegistry = model_registry_mod.ModelRegistry;
 const testing = std.testing;
 
-const aneWanted = @import("../ane/adapter.zig").aneWanted;
-const doLoadAneOnInferenceThread = @import("../ane/adapter.zig").doLoadAneOnInferenceThread;
-const doLoadDs4OnInferenceThread = @import("../ds4/adapter.zig").doLoadDs4OnInferenceThread;
-const doLoadLlamaOnInferenceThread = @import("../llama/adapter.zig").doLoadLlamaOnInferenceThread;
+const engines_served = @import("../../host/engines/served.zig");
+const engines_load = @import("../../host/engines/load.zig");
 const publishHotCacheResidency = @import("cache/budget.zig").publishHotCacheResidency;
 const Scheduler = @import("scheduler.zig").Scheduler;
 const logWiredPolicy = @import("../../host/gpu_thread/load_requests.zig").logWiredPolicy;
@@ -69,35 +67,15 @@ const scheduler_mod = @import("scheduler.zig");
 /// caller decides how to surface (startup → recordLoadError + signal
 /// started; on-demand → req.error_name + done broadcast).
 pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
-    // ── ds4 fast path: when the caller passed `ds4_path`, the model is a
-    //    GGUF served by the embedded ds4 engine. The MLX scaffolding
-    //    (weights/Transformer/vision/drafter/JIT/warmup) is entirely
-    //    irrelevant — we open the engine on this thread (Metal kernels
-    //    bind to the local stream from t0), install it on the entry, and
-    //    mark ready. The stub config/tok/chat_config supplied by main.zig
-    //    is moved onto the entry so server-side reads of `lm.config.?`
-    //    (eos slices, context length, model name) keep working.
-    //
-    //    `params` is anytype — either `LoadParams` (startup) or `*LoadRequest`
-    //    (on-demand cold-load; `ensureLoaded` sets `ds4_path`/`llama_path`
-    //    when the entry resolves to a GGUF). Read from the value type's
-    //    fields after a deref-when-pointer.
+    // ── An engine beside MLX: a GGUF on ds4 or llama.cpp (the stub config/tok/chat_config move onto the entry),
+    //    or an MLX pack on the Neural Engine. `params` is `LoadParams` (startup) or `*LoadRequest` (cold load).
     const Ty = @TypeOf(params);
     const TyInfo = @typeInfo(Ty);
     const Inner = if (TyInfo == .pointer) TyInfo.pointer.child else Ty;
     params.entry.load_progress.start(io_util.nowMsMonotonic(sch.io));
     const ane_declined = if (@hasField(Inner, "ane_declined")) params.ane_declined else false;
-    if (@hasField(Inner, "ane") and aneWanted(params.config, params.ane) and !ane_declined and try doLoadAneOnInferenceThread(sch, params)) return;
-    if (@hasField(Inner, "ds4_path") and params.ds4_path.len > 0) {
-        try doLoadDs4OnInferenceThread(sch, params);
-        return;
-    }
-    // ── llama.cpp fast path: same shape as ds4, for any other GGUF. Fires on
-    //    startup LoadParams AND cold-load LoadRequests carrying `llama_path`.
-    if (@hasField(Inner, "llama_path") and params.llama_path.len > 0) {
-        try doLoadLlamaOnInferenceThread(sch, params);
-        return;
-    }
+    if (params.gguf == null and engines_served.aneWanted(params.config, params.ane) and !ane_declined and engines_load.aneAdmit(sch, params) and try engines_load.aneOpen(sch, params)) return;
+    if (params.gguf) |route| return engines_load.loadGguf(sch, params, route);
     // ── media-gen fast path: the (stub) config's model_type marks an image/
     //    audio/video model (FLUX / Qwen3-TTS / LTX). Build the modality engine
     //    instead of the MLX safetensors path. Works for BOTH the startup
@@ -884,9 +862,8 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         entry.prefix_cache.?.ssm_checkpoint_max = params.ssm_checkpoint_max;
     }
     // Iteration 2 (perf-plan Phase 4 #3): tokenize cache for warm-path
-    // chat-template renders. Applies to MLX, ds4, and llama engines —
-    // they all funnel through `chat_mod.formatChat` /
-    // `encodeChatViaDs4` / `encodeChatViaLlama` at the handler boundary.
+    // chat-template renders. Applies to every engine — they all funnel
+    // through `cachedFormatChat` at the handler boundary.
     // Default capacity is small (4 entries) because chat conversations
     // mutate the messages list every turn; the goal is to catch warm
     // reuse benches and repeated agent-loop probes, not to memoize a

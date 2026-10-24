@@ -1361,12 +1361,6 @@ test "DSV4 fallback: null tools_json with inject_tool_prompt does not synthesize
     try testing.expectEqualStrings("hello", out[0].content);
 }
 
-// ── prepareDs4Prompt: end-to-end unit coverage for the tool-plumbing fix ──
-// These tests guard against the regression where ds4 silently dropped
-// `tools_json` / `tool_choice_instruction` / `role:"tool"` content. If the
-// `encodeChatViaDs4` call sites stop threading `tools_json` through, the
-// catalog won't reach `prep.system` and these tests fail.
-
 test "renderChatTemplate: muse_glimmer shipped template renders byte-identical to python jinja2 (hermetic)" {
     // src/fixtures/muse_chat_template.jinja is the VERBATIM template
     // meta-models/Muse-Glimmer-30B ships; muse_render_reference.txt is python

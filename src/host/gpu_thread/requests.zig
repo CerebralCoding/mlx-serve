@@ -14,6 +14,7 @@ const testing = std.testing;
 
 const BudgetRevise = @import("../../engines/mlx/cache/budget.zig").BudgetRevise;
 const LlamaSettings = @import("../../engines/mlx/scheduler/params.zig").LlamaSettings;
+const GgufRoute = @import("thread.zig").GgufRoute;
 
 /// Plan 05 Phase D: cold-load work item. Posted by `Scheduler.ensureLoaded`
 /// when a request targets an `.unloaded` (or freshly-evicted) entry; the
@@ -122,13 +123,9 @@ pub const LoadRequest = struct {
     done_mu: std.Io.Mutex = .init,
     done_cond: std.Io.Condition = .init,
 
-    /// Mirror `LoadParams.ds4_path` / `LoadParams.llama_path`. Set by
-    /// `ensureLoaded` when the entry's path resolves to a GGUF (issue #59):
-    /// the resolved .gguf file routes the load through the matching
-    /// embedded-engine arm in `doLoadOnInferenceThread` instead of the MLX
-    /// safetensors path. Borrowed from the conn thread until `done`.
-    ds4_path: []const u8 = "",
-    llama_path: []const u8 = "",
+    /// Mirrors `LoadParams.gguf`: set by `ensureLoaded` when the entry's path resolves to a GGUF (issue #59).
+    /// Borrowed from the conn thread until `done`.
+    gguf: ?GgufRoute = null,
 };
 
 /// Media-generation work item. Posted by `runGeneration` from a connection

@@ -22,9 +22,9 @@ const Req = book_mod.Req;
 const Reason = book_mod.Reason;
 const io = book_mod.io;
 
-const bridge = if (build_options.ds4_engine) @import("bridge.zig") else @import("stub.zig");
+const bridge = @import("bridge.zig");
 
-/// The table the host loads for ds4.
+/// The table the host loads for ds4 (`host/engines/served.table`: builds that carry it).
 pub const table = Adapter(bridge, std.heap.smp_allocator).table;
 
 /// Today's probe: a GGUF whose header routes to ds4 (`engine_pick.preferredEngine`).
@@ -160,6 +160,7 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
                 .embedding_dims = 0,
                 .eos = abi.span(u32, st.eos),
                 .startup = abi.span(u8, startup),
+                .vocab_size = @intCast(vocab),
             };
             return st;
         }
@@ -306,7 +307,7 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
                 if (r.logprobs > 0) lp[0] = logits.logprob(f32, raw, tok, top);
                 const before = r.emitted;
                 const why = r.commit(&.{tok}, &lp);
-                // An emitted token goes into the KV, as the scheduler arm always fed it: the next turn's prefix.
+                // An emitted token goes into the KV: the next turn's prefix.
                 if (r.emitted > before) {
                     try st.session.eval(t);
                     if (shaped) try history.add(gpa, tok);
@@ -358,6 +359,9 @@ const FakeBridge = struct {
         }
         pub fn mtpDraftTokens(e: *Ds4Engine) c_int {
             return e.drafts;
+        }
+        pub fn hasMtp(e: *Ds4Engine) bool {
+            return e.drafts > 0;
         }
         pub fn eosToken(_: *Ds4Engine) i32 {
             return 2;
@@ -627,7 +631,7 @@ test "ds4 adapter: the contract holds on a real GGUF" {
     try contract.run(&R.table, .{ .model_dir = path, .model_type = "gguf", .config_json = "", .prompt = &.{ 0, 1, 2 }, .settings_json = "{\"mtp\":false}", .timeout_ms = 600_000, .gate_ms = 60_000 });
 }
 
-test "ds4 adapter: greedy tokens equal the scheduler arm's sequence on a real GGUF" {
+test "ds4 adapter: greedy tokens equal the plain bridge sequence on a real GGUF" {
     if (!build_options.ds4_engine) return error.SkipZigTest;
     const path = realGguf() orelse return error.SkipZigTest;
     const R = Adapter(bridge, testing.allocator);
@@ -650,7 +654,7 @@ test "ds4 adapter: greedy tokens equal the scheduler arm's sequence on a real GG
         if (R.table.submit(e, 1, &req, got.sink()).code != .ok) return error.Refused;
         got.wait();
     }
-    // The scheduler arm's sequence (`runPrefillDs4` + `runDs4DecodeTick`): sync, then argmax and eval, or one
+    // The plain bridge sequence: sync, then argmax and eval, or one
     // speculative round, per tick.
     const engine = try load.open(bridge, io, testing.allocator, path, .{});
     defer engine.close();

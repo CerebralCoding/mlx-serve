@@ -34,7 +34,8 @@ pub const Caps = packed struct(u64) {
     drafts: bool = false,
     prefix_cache: bool = false,
     distributed: bool = false, // reserved: a model served across several Macs
-    _: u47 = 0,
+    prompt_logprobs: bool = false, // logprobs of the prompt's own tokens
+    _: u46 = 0,
 };
 
 /// MLX engines run on the host's one GPU thread (one MLX caller per process); engines with their own GPU runtime
@@ -46,6 +47,16 @@ pub const Host = extern struct {
     ctx: *anyopaque,
     log: *const fn (ctx: *anyopaque, level: u8, msg: Str) callconv(.c) void,
     wake: *const fn (ctx: *anyopaque) callconv(.c) void, // a host_gpu_thread engine has work without a submit
+    progress: ?*const fn (ctx: *anyopaque, what: Progress, n: i64) callconv(.c) void = null,
+};
+
+/// What the host shows while it waits on an engine, reported as deltas from any of the engine's threads.
+pub const Progress = enum(u8) {
+    load_total, // `open`: units of work the load does (a Neural Engine build: its programs)
+    load_done,
+    load_slow, // a unit missed its cache: this load takes minutes (a first compile)
+    prefill_todo, // prompt tokens the engine's requests will feed; taken back when a prefill ends
+    prefill_done,
 };
 
 pub const Open = extern struct {
@@ -58,7 +69,7 @@ pub const Open = extern struct {
     memory_budget: u64, // what the engine may hold: GPU ceiling less memory in use, OS reserve out
     settings_json: Str, // launch flags + Model Settings that shape a load (kv_quant, mtp, drafter, caches, cluster)
     options_json: Str, // Model Settings `engine_options`, verbatim
-    host: *const Host,
+    host: *const Host, // lives until `close`
 };
 
 pub const Info = extern struct {
@@ -72,6 +83,7 @@ pub const Info = extern struct {
     embedding_dims: u32,
     eos: Span(u32), // the engine's stop set; the host merges generation_config's
     startup: Str, // one line the host logs at load (the memory plan, the cluster)
+    vocab_size: u32 = 0, // Caps.owns_tokenizer: the ids a prompt may carry
 };
 
 pub const Sampling = extern struct {
@@ -143,6 +155,7 @@ pub const Request = extern struct {
     background: bool = false,
     options_json: Str = .{}, // enable_mtp, enable_drafter, enable_batch_mtp, kv_quant, draft depths...
     no_drafts: bool = false, // no speculative round of any kind: the plain reference of the exactness contracts
+    prompt_logprobs: bool = false, // Caps.prompt_logprobs
 };
 
 pub const Logprob = extern struct { token: u32, logprob: f32, top: Span(Bias) }; // top: (token, logprob) pairs
@@ -238,6 +251,7 @@ pub fn needs(r: *const Request) Caps {
         .grammar = r.grammar != null,
         .think_budget = r.think != null,
         .tool_gate = r.tool_gate != null,
+        .prompt_logprobs = r.prompt_logprobs,
     };
     for (items(Media, r.media)) |m| switch (m.kind) {
         .image => c.images = true,
@@ -245,6 +259,15 @@ pub fn needs(r: *const Request) Caps {
         .audio => c.audio = true,
     };
     return c;
+}
+
+/// The first capability `need` asks that `have` lacks, by its `Caps` field name; null when served.
+pub fn missing(have: Caps, need: Caps) ?[]const u8 {
+    const info = @typeInfo(Caps).@"struct";
+    inline for (info.field_names, info.field_types) |name, T| {
+        if (T == bool and @field(need, name) and !@field(have, name)) return name;
+    }
+    return null;
 }
 
 /// The refusal for the first capability `need` asks that `have` lacks, naming its `Caps` field; null when served.
@@ -275,9 +298,9 @@ test "engine abi: extern layouts are pinned (64-bit)" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
     try expectLayout(Str, 16, .{ .ptr = 0, .len = 8 });
     try expectLayout(Verdict, 24, .{ .code = 0, .why = 8 });
-    try expectLayout(Host, 32, .{ .size = 0, .ctx = 8, .log = 16, .wake = 24 });
+    try expectLayout(Host, 40, .{ .size = 0, .ctx = 8, .log = 16, .wake = 24, .progress = 32 });
     try expectLayout(Open, 112, .{ .size = 0, .model_dir = 8, .model_type = 24, .config_json = 40, .context = 56, .max_concurrent = 60, .memory_budget = 64, .settings_json = 72, .options_json = 88, .host = 104 });
-    try expectLayout(Info, 96, .{ .size = 0, .name = 8, .version = 24, .caps = 40, .threading = 48, .context_window = 52, .max_concurrent = 56, .embedding_dims = 60, .eos = 64, .startup = 80 });
+    try expectLayout(Info, 104, .{ .size = 0, .name = 8, .version = 24, .caps = 40, .threading = 48, .context_window = 52, .max_concurrent = 56, .embedding_dims = 60, .eos = 64, .startup = 80, .vocab_size = 96 });
     try expectLayout(Sampling, 56, .{ .temperature = 0, .top_p = 4, .top_k = 8, .min_p = 12, .seed = 16, .seeded = 24, .repeat_penalty = 28, .frequency_penalty = 32, .presence_penalty = 36, .logit_bias = 40 });
     try expectLayout(Bias, 8, .{ .token = 0, .bias = 4 });
     try expectLayout(Grammar, 32, .{ .size = 0, .kind = 4, .text = 8, .after = 24 });
@@ -285,7 +308,7 @@ test "engine abi: extern layouts are pinned (64-bit)" {
     try expectLayout(ToolGate, 48, .{ .size = 0, .opener = 8, .names = 24, .think_end = 40 });
     try expectLayout(Media, 40, .{ .kind = 0, .at = 4, .width = 8, .height = 12, .data = 16, .hash = 32 });
     try expectLayout(CacheHint, 24, .{ .history_len = 0, .key = 8, .keep = 16, .cold = 17 });
-    try expectLayout(Request, 208, .{ .size = 0, .prompt = 8, .media = 24, .max_tokens = 40, .sampling = 48, .eos = 104, .logprobs = 120, .grammar = 128, .think = 136, .tool_gate = 144, .cache = 152, .background = 176, .options_json = 184, .no_drafts = 200 });
+    try expectLayout(Request, 208, .{ .size = 0, .prompt = 8, .media = 24, .max_tokens = 40, .sampling = 48, .eos = 104, .logprobs = 120, .grammar = 128, .think = 136, .tool_gate = 144, .cache = 152, .background = 176, .options_json = 184, .no_drafts = 200, .prompt_logprobs = 201 });
     try expectLayout(Logprob, 24, .{ .token = 0, .logprob = 4, .top = 8 });
     try expectLayout(Stats, 80, .{ .size = 0, .rounds = 8, .drafted = 16, .accepted = 24, .prefill_ns = 32, .decode_ns = 40, .spec_mode = 48, .telemetry_json = 64 });
     try expectLayout(Event, 88, .{ .size = 0, .kind = 4, .cached = 8, .tokens = 16, .logprobs = 32, .reason = 48, .stats = 56, .verdict = 64 });
@@ -305,7 +328,7 @@ test "engine abi: every struct carrying `size` has it first, as a u32 defaulting
 }
 
 test "engine abi: Caps bit positions are pinned" {
-    const bits = .{ "penalties", "logit_bias", "logprobs", "grammar", "think_budget", "tool_gate", "images", "video", "audio", "embed", "decide", "owns_tokenizer", "owns_template", "batches", "drafts", "prefix_cache", "distributed" };
+    const bits = .{ "penalties", "logit_bias", "logprobs", "grammar", "think_budget", "tool_gate", "images", "video", "audio", "embed", "decide", "owns_tokenizer", "owns_template", "batches", "drafts", "prefix_cache", "distributed", "prompt_logprobs" };
     inline for (bits, 0..) |name, i| try testing.expectEqual(@as(u16, i), @bitOffsetOf(Caps, name));
     try testing.expectEqual(@as(u64, 1 << 2), @as(u64, @bitCast(Caps{ .logprobs = true })));
 }
@@ -318,6 +341,7 @@ test "engine abi: enum tags and constants are pinned" {
     try testing.expectEqual(@as(u8, 4), @intFromEnum(@FieldType(Grammar, "kind").ebnf));
     try testing.expectEqual(@as(u8, 2), @intFromEnum(@FieldType(Media, "kind").audio));
     try testing.expectEqual(@as(u8, 1), @intFromEnum(Action.stop));
+    try testing.expectEqual(@as(u8, 4), @intFromEnum(Progress.prefill_done));
     try testing.expectEqualStrings("mlx_serve_engine_v1", entry_symbol);
     try testing.expectEqual(@as(u32, 1), version);
 }
@@ -329,7 +353,8 @@ test "engine abi: a field at its neutral value asks for nothing" {
     const media = [_]Media{.{ .kind = .audio, .at = 0, .width = 0, .height = 0, .data = .{}, .hash = 0 }};
     const n = needs(&.{ .prompt = span(u32, &prompt), .max_tokens = 1, .grammar = &g, .logprobs = 2, .sampling = .{ .presence_penalty = 0.5 }, .media = span(Media, &media) });
     try testing.expect(n.grammar and n.logprobs and n.penalties and n.audio);
-    try testing.expect(!n.images and !n.logit_bias and !n.think_budget);
+    try testing.expect(!n.images and !n.logit_bias and !n.think_budget and !n.prompt_logprobs);
+    try testing.expect(needs(&.{ .prompt = span(u32, &prompt), .max_tokens = 1, .prompt_logprobs = true }).prompt_logprobs);
 }
 
 test "engine abi: a refusal names the first missing Caps field, statically" {
@@ -337,4 +362,6 @@ test "engine abi: a refusal names the first missing Caps field, statically" {
     const v = refusal(.{ .logprobs = true }, .{ .logprobs = true, .tool_gate = true }).?;
     try testing.expectEqual(@FieldType(Verdict, "code").unsupported, v.code);
     try testing.expectEqualStrings("Caps.tool_gate is not declared by this engine for this model", items(u8, v.why));
+    try testing.expectEqualStrings("tool_gate", missing(.{ .logprobs = true }, .{ .logprobs = true, .tool_gate = true }).?);
+    try testing.expect(missing(.{ .grammar = true }, .{ .grammar = true }) == null);
 }

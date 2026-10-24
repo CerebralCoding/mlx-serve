@@ -20,8 +20,7 @@ const prefix = @import("prefix.zig");
 const ane = @import("../../sdk/ane/offload.zig");
 const mil = @import("mil.zig");
 const dflash = @import("dflash.zig");
-const load_progress = @import("../../host/registry/load_progress.zig");
-const io_util = @import("../../sdk/util/io_util.zig");
+const abi = @import("../../abi/engine.zig");
 
 pub const P = q35.P;
 const TP = q35.TP;
@@ -66,8 +65,8 @@ pub const Options = struct {
     /// Tests: lanes per layer instead of one per Neural Engine, and tap layers without a drafter.
     lanes: u32 = 0,
     taps: []const u32 = &.{},
-    /// Counts the programs as they are built (the server's load progress).
-    progress: ?*load_progress.Progress = null,
+    /// Hears the programs counted as they are built (`abi.Progress.load_*`).
+    progress: ?*const abi.Host = null,
     /// `Model.suppress_ids` / `defined_vocab`.
     suppress_ids: []const u32 = &.{},
     defined_vocab: u32 = 0,
@@ -422,7 +421,7 @@ pub const Model = struct {
         const lanes: usize = @intCast(std.math.clamp(ane.totalMemBytes() / 8 / @max(biggest, 1), 1, @min(8, cpus)));
         const nunits = self.units.len;
         const B = Build{ .model = self, .io = io, .pfx = pfx, .starts = starts, .threads = @max(1, cpus / lanes), .n = nunits + self.lanes + @as(usize, if (self.dcfg != null) 2 else 1), .progress = opts.progress };
-        if (opts.progress) |p| p.begin(.ane_programs, B.n, io_util.nowMsMonotonic(io));
+        report(opts.progress, .load_total, @intCast(B.n));
         var build = B;
         const workers = try allocator.alloc(std.Thread, lanes - 1);
         defer allocator.free(workers);
@@ -494,13 +493,12 @@ pub const Model = struct {
         mu: std.Io.Mutex = .init,
         done: [512]bool = @splat(false),
         failed: ?anyerror = null,
-        progress: ?*load_progress.Progress = null,
+        progress: ?*const abi.Host = null,
 
         /// One more program ready; a cache miss marks the load as compiling.
         fn built(b: *Build, p: rt.Program) void {
-            const pr = b.progress orelse return;
-            if (!p.cacheHit()) pr.compiling.store(true, .monotonic);
-            pr.add(1);
+            if (!p.cacheHit()) report(b.progress, .load_slow, 1);
+            report(b.progress, .load_done, 1);
         }
 
         fn run(b: *Build) void {
@@ -857,11 +855,12 @@ const Site = struct {
     fused: bool = false,
 };
 
-/// The server's live prefill gauges across engines: prompt tokens still to feed and fed so far.
-pub const PrefillGauges = struct {
-    todo: std.atomic.Value(u64) = .init(0),
-    done: std.atomic.Value(u64) = .init(0),
-};
+/// `n` units of `what` to the host, when it listens.
+fn report(host: ?*const abi.Host, what: abi.Progress, n: i64) void {
+    const h = host orelse return;
+    const f = h.progress orelse return;
+    f(h.ctx, what, n);
+}
 
 pub const Engine = struct {
     allocator: std.mem.Allocator,
@@ -913,8 +912,8 @@ pub const Engine = struct {
     /// The last head call's logits as P contiguous rows, gathered on first use.
     rows: []f16,
     rows_ready: bool = false,
-    /// The server's live gauges (null: none), and what this engine counted into them.
-    gauges: ?*PrefillGauges = null,
+    /// Hears the prompt tokens to feed and fed (`abi.Progress.prefill_*`; null: none), and what this engine counted.
+    gauges: ?*const abi.Host = null,
     gauged: [2]u64 = .{ 0, 0 },
     emb_scratch: []f32,
     cache: ?*prefix.Cache = null,
@@ -1732,16 +1731,14 @@ pub const Engine = struct {
     /// Count `n` prompt tokens into the live gauges: `.todo` once a sync knows what it will feed,
     /// `.done` per block fed.
     fn gauge(self: *Engine, comptime which: enum { todo, done }, n: u64) void {
-        const g = self.gauges orelse return;
-        _ = @field(g, @tagName(which)).fetchAdd(n, .monotonic);
+        report(self.gauges, if (which == .todo) .prefill_todo else .prefill_done, @intCast(n));
         self.gauged[@intFromEnum(which)] += n;
     }
 
     /// Take back what this engine counted into the gauges: its sync is over.
     pub fn ungauge(self: *Engine) void {
-        const g = self.gauges orelse return;
-        _ = g.todo.fetchSub(self.gauged[0], .monotonic);
-        _ = g.done.fetchSub(self.gauged[1], .monotonic);
+        report(self.gauges, .prefill_todo, -@as(i64, @intCast(self.gauged[0])));
+        report(self.gauges, .prefill_done, -@as(i64, @intCast(self.gauged[1])));
         self.gauged = .{ 0, 0 };
     }
 
@@ -2099,8 +2096,7 @@ const Hist = struct {
 pub const CacheLimits = struct { max_bytes: u64, max_states: u32, stride: u32 };
 
 /// The model at `dir` built and loaded once with `opts.slots` engines on it, sharing one prefix cache (none
-/// without `limits`; `max_bytes` 0 is no byte cap). The scheduler arm runs it behind a `Worker`, the engine
-/// adapter on threads of its own.
+/// without `limits`; `max_bytes` 0 is no byte cap), run by the engine adapter (`engine.zig`) on threads of its own.
 pub const Pool = struct {
     model: *Model,
     cache: ?*prefix.Cache,
@@ -2154,99 +2150,6 @@ pub const Pool = struct {
             n += c.max_bytes;
         };
         return n;
-    }
-};
-
-/// `Pool.open` behind one worker.
-pub fn openPool(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, arch: Arch, opts: Options, limits: ?CacheLimits, ctx: *anyopaque, runFn: *const fn (*anyopaque, *Engine, *anyopaque) void) !*Worker {
-    const pool = try Pool.open(allocator, io, dir, arch, opts, limits);
-    errdefer pool.close(allocator);
-    return Worker.start(allocator, io, pool.model, pool.engines, ctx, runFn);
-}
-
-/// One thread per engine, all taking jobs from one queue, in order. The ANE never touches MLX, so
-/// requests run here beside the MLX inference thread instead of taking turns with it.
-pub const Worker = struct {
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    model: *Model,
-    engines: []*Engine,
-    threads: []std.Thread = &.{},
-    ctx: *anyopaque,
-    run: *const fn (ctx: *anyopaque, engine: *Engine, job: *anyopaque) void,
-    mu: std.Io.Mutex = .init,
-    cond: std.Io.Condition = .init,
-    queue: std.ArrayList(*anyopaque) = .empty,
-    stopping: bool = false,
-
-    pub fn start(allocator: std.mem.Allocator, io: std.Io, model: *Model, engines: []*Engine, ctx: *anyopaque, runFn: *const fn (*anyopaque, *Engine, *anyopaque) void) !*Worker {
-        const w = try allocator.create(Worker);
-        errdefer allocator.destroy(w);
-        w.* = .{ .allocator = allocator, .io = io, .model = model, .engines = engines, .ctx = ctx, .run = runFn };
-        const threads = try allocator.alloc(std.Thread, engines.len);
-        errdefer allocator.free(threads);
-        for (threads, 0..) |*t, i| t.* = std.Thread.spawn(.{}, loop, .{ w, i }) catch |err| {
-            w.threads = threads[0..i];
-            w.stop();
-            return err;
-        };
-        w.threads = threads;
-        return w;
-    }
-
-    pub fn post(self: *Worker, job: *anyopaque) !void {
-        self.mu.lockUncancelable(self.io);
-        defer self.mu.unlock(self.io);
-        try self.queue.append(self.allocator, job);
-        self.cond.signal(self.io);
-    }
-
-    /// Finish the posted jobs, join. The engines stay the owner's to close.
-    pub fn deinit(self: *Worker) void {
-        self.stop();
-        self.allocator.free(self.threads);
-        self.queue.deinit(self.allocator);
-        self.allocator.destroy(self);
-    }
-
-    fn pool(self: *const Worker) Pool {
-        return .{ .model = self.model, .cache = self.engines[0].cache, .engines = self.engines };
-    }
-
-    /// What the pool holds beside the weights: every slot's buffers and the prefix cache's byte cap.
-    pub fn stateBytes(self: *const Worker) u64 {
-        return self.pool().stateBytes();
-    }
-
-    /// `deinit`, then the pool: an `openPool` worker.
-    pub fn close(self: *Worker) void {
-        const a = self.allocator;
-        const p = self.pool();
-        self.deinit();
-        p.close(a);
-    }
-
-    fn stop(self: *Worker) void {
-        self.mu.lockUncancelable(self.io);
-        self.stopping = true;
-        self.cond.broadcast(self.io);
-        self.mu.unlock(self.io);
-        for (self.threads) |t| t.join();
-    }
-
-    fn loop(self: *Worker, i: usize) void {
-        while (true) {
-            self.mu.lockUncancelable(self.io);
-            while (self.queue.items.len == 0 and !self.stopping) self.cond.waitUncancelable(self.io, &self.mu);
-            // Stopping still runs what was posted: a dropped job would hold its slot's `in_pass`.
-            if (self.queue.items.len == 0) {
-                self.mu.unlock(self.io);
-                return;
-            }
-            const job = self.queue.orderedRemove(0);
-            self.mu.unlock(self.io);
-            self.run(self.ctx, self.engines[i], job);
-        }
     }
 };
 
@@ -2336,16 +2239,26 @@ test "sampling: without a top-k, only tokens near the top are candidates" {
 }
 
 test "gauges: a sync counts what it will feed and what it fed, and takes both back" {
-    var g: PrefillGauges = .{};
+    const Heard = struct {
+        n: [@typeInfo(abi.Progress).@"enum".field_names.len]i64 = @splat(0),
+        fn on(ctx: *anyopaque, what: abi.Progress, n: i64) callconv(.c) void {
+            const h: *@This() = @ptrCast(@alignCast(ctx));
+            h.n[@intFromEnum(what)] += n;
+        }
+        fn noLog(_: *anyopaque, _: u8, _: abi.Str) callconv(.c) void {}
+        fn noWake(_: *anyopaque) callconv(.c) void {}
+    };
+    var heard: Heard = .{};
+    const host: abi.Host = .{ .ctx = &heard, .log = Heard.noLog, .wake = Heard.noWake, .progress = Heard.on };
     var e: Engine = undefined;
-    e.gauges = &g;
+    e.gauges = &host;
     e.gauged = .{ 0, 0 };
     e.gauge(.todo, 100);
     e.gauge(.done, 64);
-    try testing.expectEqual(@as(u64, 100), g.todo.load(.monotonic));
-    try testing.expectEqual(@as(u64, 64), g.done.load(.monotonic));
+    try testing.expectEqual(@as(i64, 100), heard.n[@intFromEnum(abi.Progress.prefill_todo)]);
+    try testing.expectEqual(@as(i64, 64), heard.n[@intFromEnum(abi.Progress.prefill_done)]);
     e.ungauge();
-    try testing.expectEqual(@as(u64, 0), g.todo.load(.monotonic) + g.done.load(.monotonic));
+    try testing.expectEqual(@as(i64, 0), heard.n[@intFromEnum(abi.Progress.prefill_todo)] + heard.n[@intFromEnum(abi.Progress.prefill_done)]);
 }
 
 test "suppress: reserved ids and padding rows are never drawn" {
@@ -2592,7 +2505,7 @@ test "pack on the ANE: a restored checkpoint continues like the live state (ANE_
     const a = testing.allocator;
     const m = (try testModel(io, 1)) orelse return error.SkipZigTest;
     defer m.deinit();
-    // The cache outlives the engine (whose deinit unpins its node), as in `Worker.close`.
+    // The cache outlives the engine (whose deinit unpins its node), as in `Pool.close`.
     var cache = prefix.Cache.init(a, std.math.maxInt(u64), 64);
     defer cache.deinit();
     const e = try Engine.open(m, io, 0);
