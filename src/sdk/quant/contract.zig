@@ -13,7 +13,7 @@ const sushi = @import("exl3/sushi_pack.zig");
 
 const spec = kc.spec;
 const metal = kc.metal;
-const hostq = kc.hostq;
+const host = kc.host;
 const Shape = spec.Shape;
 
 const rotate_launch = metal.Launch{ .name = "msv_hadamard_block", .inputs = &.{ "x", "signs" }, .outputs = &.{"y"}, .source = rht.KERNEL_SOURCE, .tg_bytes = 4096 * 4, .m1 = 512, .m2 = 512 };
@@ -94,15 +94,15 @@ const Rotate = struct {
         const rng = prng.random();
         for (self.signs) |*s| s.* = if (rng.boolean()) 1 else -1;
         switch (fill) {
-            .random => hostq.uniform(rng, self.x, -3, 3, self.dt),
+            .random => host.uniformInto(rng, self.x, -3, 3, self.dt),
             .nonfinite => {
-                hostq.uniform(rng, self.x, -3, 3, self.dt);
+                host.uniformInto(rng, self.x, -3, 3, self.dt);
                 plant(self.x, shape.rows, shape.k);
             },
             .stress => {
                 // The rotated values v mirror within each block, so each block's first output (all + signs) sums
                 // halves past fp16's range to a small integer; x carries the signs on the input side.
-                hostq.mirroredWide(rng, self.x, self.block);
+                host.mirroredWide(rng, self.x, self.block);
                 if (!self.inv) for (self.x, 0..) |*v, i| {
                     v.* *= self.signs[i % shape.k];
                 };
@@ -140,8 +140,8 @@ const Rotate = struct {
         for (0..self.count() / self.block) |b| {
             const v = want[b * self.block ..][0..self.block];
             self.terms(b, v);
-            const m = hostq.magnitude(v) * self.scale();
-            hostq.fwht(v);
+            const m = host.sumAbs(v) * self.scale();
+            host.fwht(v);
             for (v, 0..) |*o, i| {
                 o.* *= self.scale();
                 if (self.inv) o.* *= self.signs[(b * self.block + i) % k];
@@ -188,7 +188,7 @@ fn rotateSpec(comptime name: []const u8, dt: mlx.mlx_dtype, block: usize) spec.S
         .depth = rotateDepth,
         // rsqrt(block) (fast rsqrt at 512 and 2048, exact at 1024 and 4096) and the product with it.
         .ops = 3,
-        .out = hostq.elemOf(dt),
+        .out = host.elemOf(dt),
         .tiles = .{ .{}, .{}, .{ .size = block, .step = block, .min = block } },
         .served = switch (block) {
             512, 1024 => &.{ .{ .rows = 1, .n = 1, .k = 4096 }, .{ .rows = 8, .n = 1, .k = 4096 }, .{ .rows = 64, .n = 1, .k = 5120 } },
@@ -252,9 +252,9 @@ const NormRotate = struct {
         var prng = std.Random.DefaultPrng.init(seed);
         const rng = prng.random();
         for (self.signs) |*s| s.* = if (rng.boolean()) 1 else -1;
-        hostq.uniform(rng, self.a_v, -3, 3, self.dt);
-        hostq.uniform(rng, self.b_v, -3, 3, self.dt);
-        hostq.uniform(rng, self.w, 0.5, 1.5, self.dt);
+        host.uniformInto(rng, self.a_v, -3, 3, self.dt);
+        host.uniformInto(rng, self.b_v, -3, 3, self.dt);
+        host.uniformInto(rng, self.w, 0.5, 1.5, self.dt);
         self.eps = 1e-6;
         switch (fill) {
             .random => {},
@@ -323,7 +323,7 @@ const NormRotate = struct {
     }
 
     fn rt(self: *const NormRotate, v: f64) f64 {
-        return hostq.round(self.dt, v);
+        return host.rt(self.dt, v);
     }
 
     /// Every output with the sum of squares in `acc` (null: float64); `flip` (when given, two rows x k long) each
@@ -350,7 +350,7 @@ const NormRotate = struct {
                 o.* = if (self.add) self.rt(self.a_v[at] + self.b_v[at]) else self.a_v[at];
                 q.* = o.* * o.*;
             }
-            const ss = if (acc) |ac| spec.sumIn(ac, order, sq) else hostq.sum(sq);
+            const ss = if (acc) |ac| spec.sumIn(ac, order, sq) else host.sum(sq);
             const inv = 1 / @sqrt(ss / hk + self.eps);
             const rot = want[rot_at * n + r * k ..][0..k];
             const spread = if (flip) |f| f[r * k ..][0..k] else rot; // unused without `flip`
@@ -377,13 +377,13 @@ const NormRotate = struct {
             var b: usize = 0;
             while (b < k) : (b += BLOCK) {
                 const blk = rot[b..][0..BLOCK];
-                const m = hostq.magnitude(blk) / 32;
-                hostq.fwht(blk);
+                const m = host.sumAbs(blk) / 32;
+                host.fwht(blk);
                 for (blk) |*o| o.* /= 32;
                 @memset(mag[rot_at * n + r * k + b ..][0..BLOCK], m);
                 if (flip != null) {
                     // A normed value one rounding off moves every output of its block by it / 32.
-                    @memset(moved_row[b..][0..BLOCK], hostq.sum(spread[b..][0..BLOCK]) / 32);
+                    @memset(moved_row[b..][0..BLOCK], host.sum(spread[b..][0..BLOCK]) / 32);
                 }
             }
         }
@@ -421,7 +421,7 @@ const NormRotate = struct {
             const extra = if (i >= n - per) flip[per + i - (n - per)] else if (self.write_normed and i / per == normed_at) flip[i % per] else 0;
             l.* = spec.bound(s, s.out, self.shape, w, l.*) + extra;
         }
-        return hostq.within(&self.msg, at, got, want, allow);
+        return host.within(&self.msg, at, got, want, allow);
     }
 
     fn wrapper(self: *NormRotate) ![]const u8 {
@@ -461,7 +461,7 @@ fn normRotateSpec(comptime name: []const u8, dt: mlx.mlx_dtype) spec.Spec {
         // The mean, + eps, precise rsqrt, the product with the row, the scale.
         .ops = 6,
         .mids = 1,
-        .out = hostq.elemOf(dt),
+        .out = host.elemOf(dt),
         .tiles = .{ .{}, .{}, .{ .size = 1024, .step = 1024, .min = 1024 } },
         .served = &.{ .{ .rows = 1, .n = 1, .k = 4096 }, .{ .rows = 8, .n = 1, .k = 4096 }, .{ .rows = 16, .n = 1, .k = 5120 } },
         // As for the norms: a sum of positive squares rounded in bf16 lands within the normed outputs' own rounding.
@@ -525,7 +525,7 @@ const Fp8 = struct {
             // Integer codes (1..15, either sign) mirrored across K with scale 1, against mirrored integer x. Only x's
             // +1 offsets (32..39) survive the mirror, and the codes there are 1, a, -a, b, -b, c, -c, 0: every output is
             // exactly 1, so a lower-precision sum's miss is measured against the smallest output, never a lucky large one.
-            hostq.mirrored(rng, self.x, shape.k);
+            host.mirrored(rng, self.x, shape.k);
             const h = shape.k / 2;
             for (0..shape.n) |o| {
                 var prev: f64 = 0;
@@ -546,12 +546,12 @@ const Fp8 = struct {
             }
             @memset(self.scales, 1);
         } else {
-            hostq.uniform(rng, self.x, -2, 2, self.dt);
-            for (self.codes) |*c| c.* = @floatFromInt(hostq.e4m3Code(rng, -4, 2, true));
-            hostq.uniform(rng, self.scales, 0.01, 0.05, .float32);
+            host.uniformInto(rng, self.x, -2, 2, self.dt);
+            for (self.codes) |*c| c.* = @floatFromInt(host.e4m3Code(rng, -4, 2, true));
+            host.uniformInto(rng, self.scales, 0.01, 0.05, .float32);
             if (fill == .nonfinite) plant(self.x, shape.rows, shape.k);
         }
-        for (self.w, self.codes, 0..) |*w, c, i| w.* = hostq.e4m3(@intFromFloat(c)) * self.scales[(i / shape.k) * (shape.k / 128) + (i % shape.k) / 128];
+        for (self.w, self.codes, 0..) |*w, c, i| w.* = host.e4m3(@intFromFloat(c)) * self.scales[(i / shape.k) * (shape.k / 128) + (i % shape.k) / 128];
         self.rig.reset();
         const rows: c_int = @intCast(shape.rows);
         const n: c_int = @intCast(shape.n);
@@ -573,7 +573,7 @@ const Fp8 = struct {
         var t: [16]u8 = @splat(0);
         for (1..16) |v| {
             var c: u8 = 0;
-            while (hostq.e4m3(c) != @as(f64, @floatFromInt(v))) c += 1;
+            while (host.e4m3(c) != @as(f64, @floatFromInt(v))) c += 1;
             t[v] = c;
         }
         break :blk t;
@@ -590,7 +590,7 @@ const Fp8 = struct {
     pub fn reference(self: *const Fp8, want: []f64, mag: []f64) !void {
         const k = self.shape.k;
         for (0..self.shape.rows) |m| for (0..self.shape.n) |o| {
-            const d = hostq.dot(self.x[m * k ..][0..k], self.w[o * k ..][0..k]);
+            const d = host.dot(self.x[m * k ..][0..k], self.w[o * k ..][0..k]);
             want[m * self.shape.n + o] = d[0];
             mag[m * self.shape.n + o] = d[1];
         };
@@ -632,7 +632,7 @@ fn fp8Spec(comptime name: []const u8, dt: mlx.mlx_dtype) spec.Spec {
         .name = name,
         .accum = .f32,
         .depth = fp8Depth,
-        .out = hostq.elemOf(dt),
+        .out = host.elemOf(dt),
         // Rows 1..8 (two weight rows a simdgroup past 4), N against 16 rows a group, K against 32 lanes of 16 codes.
         .tiles = .{ .{ .size = 4 }, .{ .size = 16 }, .{ .size = 512, .step = 128, .min = 128 } },
         .served = &.{ .{ .rows = 1, .n = 512, .k = 4096 }, .{ .rows = 4, .n = 512, .k = 4096 }, .{ .rows = 8, .n = 512, .k = 4096 } },

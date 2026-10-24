@@ -12,31 +12,8 @@ const vsa = @import("vsa.zig");
 
 const spec = kc.spec;
 const metal = kc.metal;
+const host = kc.host;
 const Shape = spec.Shape;
-
-/// Uniform values in [lo, hi) rounded to `e`.
-fn uniform(a: std.mem.Allocator, rng: std.Random, n: usize, lo: f64, hi: f64, e: spec.Elem) ![]f64 {
-    const out = try a.alloc(f64, n);
-    for (out) |*v| v.* = spec.roundTo(e, lo + (hi - lo) * rng.float(f64));
-    return out;
-}
-
-/// NaN, +Inf and -Inf at known places of `x` ([rows, width]); row 3 holds both infinities.
-fn plant(x: []f64, rows: usize, width: usize) void {
-    const at = [_][2]usize{ .{ 0, width / 3 }, .{ 1, width / 2 }, .{ 2, width - 1 }, .{ 3, 0 }, .{ 3, width - 1 } };
-    const put = [_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64), std.math.inf(f64), -std.math.inf(f64) };
-    for (at, put) |p, v| if (p[0] < rows) {
-        x[p[0] * width + p[1]] = v;
-    };
-}
-
-fn elemOf(dt: mlx.mlx_dtype) spec.Elem {
-    return switch (dt) {
-        .float32 => .f32,
-        .float16 => .f16,
-        else => .bf16,
-    };
-}
 
 // ── SwiGLU ──
 
@@ -78,8 +55,8 @@ const Swiglu = struct {
         var prng = std.Random.DefaultPrng.init(seed);
         a.free(self.y);
         self.y = &.{};
-        self.y = try uniform(a, prng.random(), shape.rows * 2 * shape.k, -6, 6, elemOf(self.dt));
-        if (fill == .nonfinite) plant(self.y, shape.rows, 2 * shape.k);
+        self.y = try host.uniform(a, prng.random(), shape.rows * 2 * shape.k, -6, 6, self.dt);
+        if (fill == .nonfinite) host.plant(self.y, shape.rows, 2 * shape.k);
         self.rig.reset();
         self.args[0] = try self.rig.input(self.dt, &.{ @intCast(shape.rows), @intCast(2 * shape.k) }, self.y);
         return true;
@@ -96,7 +73,7 @@ const Swiglu = struct {
     /// `msv_sigmoid` (1 / (1 + e^|x|), mirrored), the product with the gate and the up value, each rounded to T but
     /// the last.
     pub fn reference(self: *const Swiglu, want: []f64, mag: []f64) !void {
-        const e = elemOf(self.dt);
+        const e = host.elemOf(self.dt);
         const f = self.shape.k;
         for (0..self.shape.rows) |r| for (0..f) |i| {
             const g = self.y[r * 2 * f + i];
@@ -171,11 +148,11 @@ const QkvPrep = struct {
         const a = self.arena.allocator();
         var prng = std.Random.DefaultPrng.init(seed);
         const rng = prng.random();
-        const e = elemOf(self.dt);
+        const e = host.elemOf(self.dt);
         const width = 3 * shape.n * HD;
-        self.qkv = try uniform(a, rng, shape.rows * width, -3, 3, e);
-        self.qw = try uniform(a, rng, HD, 0.5, 1.5, e);
-        self.kw = try uniform(a, rng, HD, 0.5, 1.5, e);
+        self.qkv = try host.uniform(a, rng, shape.rows * width, -3, 3, self.dt);
+        self.qw = try host.uniform(a, rng, HD, 0.5, 1.5, self.dt);
+        self.kw = try host.uniform(a, rng, HD, 0.5, 1.5, self.dt);
         self.cos = try a.alloc(f64, shape.rows * self.half);
         self.sin = try a.alloc(f64, shape.rows * self.half);
         for (self.cos, self.sin) |*c, *s| {
@@ -185,7 +162,7 @@ const QkvPrep = struct {
         }
         switch (fill) {
             .random => {},
-            .nonfinite => plant(self.qkv, shape.rows, width),
+            .nonfinite => host.plant(self.qkv, shape.rows, width),
             .stress => {
                 // Gate 4: integer rows, sums of squares exact in fp32 past fp16's range; unit weights and the
                 // identity rotation, so the norm is the only rounding left.
@@ -221,7 +198,7 @@ const QkvPrep = struct {
 
     /// Every output, the norm's sum of squares run in `acc` and `order` (null: float64).
     fn outputsIn(self: *const QkvPrep, want: []f64, mag: ?[]f64, acc: ?spec.Accum, order: spec.Order) void {
-        const e = elemOf(self.dt);
+        const e = host.elemOf(self.dt);
         const seq = self.shape.rows;
         const heads = self.shape.n;
         const half = self.half;
@@ -385,7 +362,7 @@ const VsaPool = struct {
         const l = layout(shape);
         self.vbs = try l.validRows(a);
         // Rows past a tile's valid count are NaN: the pool never reads them.
-        self.x = try l.rows(a, rng, self.vbs, elemOf(self.dt), std.math.nan(f64));
+        self.x = try l.rows(a, rng, self.vbs, host.elemOf(self.dt), std.math.nan(f64));
         switch (fill) {
             .random => {},
             .nonfinite => {
@@ -508,15 +485,14 @@ const VsaAssemble = struct {
         const a = self.arena.allocator();
         var prng = std.Random.DefaultPrng.init(seed);
         const rng = prng.random();
-        const e = elemOf(self.dt);
         const h = shape.n;
         const seq = shape.rows;
         const nd = denseRows(shape);
         const nvr = videoRows(shape);
-        self.v.dense = try uniform(a, rng, h * nd * D, -3, 3, e);
-        self.v.video = try uniform(a, rng, h * nvr * D, -3, 3, e);
-        self.v.comp = try uniform(a, rng, h * N_TILES * D, -3, 3, .f32);
-        self.v.gate = try uniform(a, rng, seq * h * D, -2, 2, e);
+        self.v.dense = try host.uniform(a, rng, h * nd * D, -3, 3, self.dt);
+        self.v.video = try host.uniform(a, rng, h * nvr * D, -3, 3, self.dt);
+        self.v.comp = try host.uniform(a, rng, h * N_TILES * D, -3, 3, .float32);
+        self.v.gate = try host.uniform(a, rng, seq * h * D, -2, 2, self.dt);
         // A permutation of every attention row, and each row's tile.
         self.v.src = try a.alloc(f64, seq);
         for (self.v.src, 0..) |*x, i| x.* = @floatFromInt(i);
@@ -524,7 +500,7 @@ const VsaAssemble = struct {
         self.v.tile = try a.alloc(f64, seq);
         for (self.v.tile) |*x| x.* = @floatFromInt(rng.uintLessThan(u32, N_TILES));
         if (fill == .nonfinite) {
-            plant(self.v.gate, seq, h * D);
+            host.plant(self.v.gate, seq, h * D);
             self.v.comp[D + 7] = std.math.nan(f64);
         }
         const rig = &self.rig;
@@ -553,7 +529,7 @@ const VsaAssemble = struct {
 
     /// `out + T(comp * gate)`: the product rounded to T, the sum the output's last rounding.
     pub fn reference(self: *const VsaAssemble, want: []f64, mag: []f64) !void {
-        const e = elemOf(self.dt);
+        const e = host.elemOf(self.dt);
         const h = self.shape.n;
         const nd = denseRows(self.shape);
         const nvr = videoRows(self.shape);
@@ -646,7 +622,7 @@ const VsaAttn = struct {
         var prng = std.Random.DefaultPrng.init(seed);
         const rng = prng.random();
         const l = layout(shape);
-        const e = elemOf(self.dt);
+        const e = host.elemOf(self.dt);
         self.vbs = try l.validRows(a);
         // Padding rows are zero, as `attend` tiles them: the kernel loads key chunks past a tile's valid count and
         // masks their scores, so a P of zero meets those value rows.

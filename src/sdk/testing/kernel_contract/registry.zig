@@ -136,5 +136,4 @@ test {
     _ = @import("limits.zig");
     _ = @import("offline.zig");
     _ = @import("host.zig");
-    _ = @import("hostq.zig");
 }

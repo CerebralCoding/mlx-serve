@@ -20,7 +20,7 @@ const vqn = @import("verify_qmm_nax.zig");
 
 const spec = kc.spec;
 const metal = kc.metal;
-const hostq = kc.hostq;
+const host = kc.host;
 const Shape = spec.Shape;
 
 const Lane = enum { rows, coarse, wide, splitk, msg, nax };
@@ -76,7 +76,7 @@ const Qmm = struct {
     /// |x|, and the float64 outputs and magnitudes of the prepared call (filled on first use).
     ax: []f64 = &.{},
     want: []f64 = &.{},
-    w: hostq.Affine,
+    w: host.Affine,
     args: [6]mlx.mlx_array = undefined,
     n_args: usize = 0,
 
@@ -209,7 +209,7 @@ const Qmm = struct {
         var prng = std.Random.DefaultPrng.init(seed);
         const rng = prng.random();
         try self.w.fill(a, rng, d.n, d.k, self.dt, fill == .stress);
-        if (fill == .stress) hostq.mirrored(rng, self.x, d.k) else hostq.uniform(rng, self.x, -2, 2, self.dt);
+        if (fill == .stress) host.mirrored(rng, self.x, d.k) else host.uniformInto(rng, self.x, -2, 2, self.dt);
         if (fill == .nonfinite) {
             // Input rows: NaN, +Inf, -Inf, both; past four rows the rest stay finite. With fewer rows (M baked at
             // 2..4) a NaN row and NaN scales on a few columns leave the others finite.
@@ -301,7 +301,7 @@ const Qmm = struct {
             }
             return .{ y, mag };
         }
-        return .{ hostq.dot(xr, w)[0], hostq.dot(self.ax[mi * k ..][0..k], wm)[0] };
+        return .{ host.dot(xr, w)[0], host.dot(self.ax[mi * k ..][0..k], wm)[0] };
     }
 
     /// Every output and its magnitude, computed once a prepare.
@@ -325,7 +325,7 @@ const Qmm = struct {
         for (0..d.n) |n| {
             self.w.row(n, w[0..d.k], w[d.k..]);
             if (self.lane == .nax) for (w[0..d.k]) |*v| {
-                v.* = hostq.round(self.dt, v.*);
+                v.* = host.rt(self.dt, v.*);
             };
             for (0..d.m) |mi| {
                 const o = self.output(mi, w[0..d.k], w[d.k..], self.w.codes[n * d.k ..][0..d.k], n);
@@ -451,7 +451,7 @@ fn qmmSpec(comptime name: []const u8, q: Qmm, served: []const Shape, replaces: ?
         .name = name,
         .accum = .f32,
         .depth = depthK,
-        .out = hostq.elemOf(q.dt),
+        .out = host.elemOf(q.dt),
         .replaces = replaces,
         .tiles = tiles,
         .served = served,

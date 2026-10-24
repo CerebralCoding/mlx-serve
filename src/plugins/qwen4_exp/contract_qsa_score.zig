@@ -6,7 +6,7 @@
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const kc = @import("../../sdk/testing/kernel_contract/root.zig");
-const hostq = @import("../../sdk/testing/kernel_contract/hostq.zig");
+const host = @import("../../sdk/testing/kernel_contract/host.zig");
 const score = @import("qsa/score.zig");
 
 const spec = kc.spec;
@@ -66,7 +66,7 @@ pub const Score = struct {
     }
 
     /// Random bf16 operands. Non-finite: a NaN in head 0's row 0, a +Inf in head 1's row 1, a -Inf in pooled block
-    /// 2. Stress: mirrored integer q rows (`hostq.mirroredWide`) against all-ones blocks: every dot a small positive
+    /// 2. Stress: mirrored integer q rows (`host.mirroredWide`) against all-ones blocks: every dot a small positive
     /// integer, its partial sums past fp16 and off bf16's grid, exact in fp32.
     pub fn prepare(self: *Score, shape: Shape, fill: spec.Fill, seed: u64) !bool {
         if (self.geometry(shape) == null) return false;
@@ -79,11 +79,11 @@ pub const Score = struct {
         var prng = std.Random.DefaultPrng.init(seed);
         const rng = prng.random();
         if (fill == .stress) {
-            hostq.mirroredWide(rng, self.q, D);
+            host.mirroredWide(rng, self.q, D);
             @memset(self.pool, 1);
         } else {
-            for (self.q) |*x| x.* = hostq.round(.bfloat16, rng.floatNorm(f64));
-            for (self.pool) |*x| x.* = hostq.round(.bfloat16, rng.floatNorm(f64));
+            for (self.q) |*x| x.* = host.rt(.bfloat16, rng.floatNorm(f64));
+            for (self.pool) |*x| x.* = host.rt(.bfloat16, rng.floatNorm(f64));
         }
         if (fill == .nonfinite) {
             self.q[(0 * shape.rows + 0) * D + 3] = std.math.nan(f64);
@@ -116,10 +116,10 @@ pub const Score = struct {
             for (0..HEADS) |h| {
                 const qr = self.q[(h * self.shape.rows + r) * D ..][0..D];
                 for (&t, qr, self.pool[n * D ..][0..D]) |*x, a, b| x.* = a * b;
-                const d = if (acc) |ac| spec.sumIn(ac, order, &t) else hostq.sum(&t);
+                const d = if (acc) |ac| spec.sumIn(ac, order, &t) else host.sum(&t);
                 const relu = if (std.math.isNan(d)) d else @max(d, 0);
                 v = if (acc) |ac| spec.sumIn(ac, .sequential, &.{ v, relu }) else v + relu;
-                m += hostq.magnitude(&t);
+                m += host.sumAbs(&t);
             }
             want[r * self.shape.n + n] = v;
             mag[r * self.shape.n + n] = m;
