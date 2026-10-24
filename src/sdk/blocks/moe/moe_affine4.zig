@@ -13,18 +13,18 @@ const log = @import("../../util/log.zig");
 const ROWS: c_int = 1;
 const SGS: c_int = 2;
 
-pub const DOT16 = kernelSource("plugins/qwen4_exp/kernels/moe_affine4_dot16.metal");
+pub const DOT16 = kernelSource("kernels/moe/moe_affine4_dot16.metal");
 
 // grid (32, N/ROWS, TOPK + SE), threadgroup (32, SGS, 1): one token, slot e = its e-th expert;
 // slots past TOPK are N-row slices of the ungated shared expert (`sg_*`/`su_*`, SE = its rows / N).
 // GS >= 16 and 16 | GS, so a lane's 16 values share one scale and bias.
-pub const GATEUP_SOURCE = kernelSource("plugins/qwen4_exp/kernels/moe_affine4_gateup.metal");
+pub const GATEUP_SOURCE = kernelSource("kernels/moe/moe_affine4_gateup.metal");
 
 // grid (32, H/ROWS, 1), threadgroup (32, SGS, 1): every expert's down row, weighted by its
 // routing score, accumulated in the same registers. SHARED: the gated shared expert's output
 // (`sdown`, gate logit `glog`) is added in the epilogue. SI > 0: the ungated shared expert's
 // down row (`sd_*`, SI inputs after the routed activations) joins the sum at weight 1.
-pub const DOWNRED_SOURCE = kernelSource("plugins/qwen4_exp/kernels/moe_affine4_downred.metal");
+pub const DOWNRED_SOURCE = kernelSource("kernels/moe/moe_affine4_downred.metal");
 
 var gateup_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var downred_kernel: ?mlx.mlx_fast_metal_kernel = null;
