@@ -514,4 +514,5 @@ test {
     _ = @import("proof_test.zig");
     _ = @import("contract.zig");
     _ = @import("served_test.zig");
+    _ = @import("oracle_test.zig");
 }

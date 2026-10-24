@@ -24,6 +24,7 @@ const ssmFreeQsaState = @import("qsa/history.zig").ssmFreeQsaState;
 const qwen4 = @import("plugin.zig");
 const ple_gpu = @import("ple_gpu.zig");
 const fixture = @import("fixture.zig");
+const Oracle = @import("oracle_test.zig").Oracle;
 
 const testing = std.testing;
 const Array = mlx.mlx_array;
@@ -154,19 +155,18 @@ fn generate(x: *Transformer, head: ?MtpHeadRef, run: *Run) !void {
     try testing.expect(gen.mtp_attempted > 0);
 }
 
-/// Returns the drafts the legacy rounds accepted.
-fn expectSameRuns(p: *Pair, mtp: bool) !u32 {
+/// Returns the drafts the plugin's rounds accepted.
+fn expectSameRuns(p: *Pair, mtp: bool, oracle: *Oracle) !u32 {
     const xs = p.both();
     const heads = [_]?MtpHeadRef{ if (mtp) .{ .qwen4 = &p.legacy } else null, if (mtp) .{ .qwen4 = p.served.qwen4Host() } else null };
     var runs: [2]Run = .{ .{}, .{} };
     defer for (&runs) |*r| r.accepted.deinit(testing.allocator);
     for (xs, heads, &runs) |x, h, *r| try generate(x, h, r);
-    try testing.expect(runs[0].n > 1);
-    try testing.expectEqual(runs[0].n, runs[1].n);
-    try testing.expectEqualSlices(u32, &runs[0].tokens, &runs[1].tokens);
-    try testing.expectEqualSlices(u32, runs[0].accepted.items, runs[1].accepted.items);
+    try testing.expect(runs[1].n > 1);
+    try oracle.checkIds(runs[1].tokens[0..runs[1].n], runs[0].tokens[0..runs[0].n]);
+    if (mtp) try oracle.checkIds(runs[1].accepted.items, runs[0].accepted.items);
     var sum: u32 = 0;
-    for (runs[0].accepted.items) |n| sum += n;
+    for (runs[1].accepted.items) |n| sum += n;
     return sum;
 }
 
@@ -191,6 +191,7 @@ test "qwen4_exp served: captured steps and a pipelined greedy decode equal the l
     for ([_]fixture.Precision{ .bf16, .q4 }) |prec| {
         const p = try Pair.open(prec, 41);
         defer p.close();
+        var oracle = try if (prec == .bf16) Oracle.open("served-steps-bf16") else Oracle.open("served-steps-q4");
         const xs = p.both();
         var slots: [2]Slot = undefined;
         for (&slots) |*s| try s.init(p.lcfg.num_hidden_layers);
@@ -219,7 +220,7 @@ test "qwen4_exp served: captured steps and a pipelined greedy decode equal the l
                 _ = try g.adopt(last);
                 outs[k] = .{ l, try g.adopt(all) };
             }
-            for (outs[0], outs[1]) |want, got| try ops.expectBitEqual(got, want);
+            for (outs[0], outs[1]) |want, got| try oracle.check(got, want, false);
         }
         // The pipelined step: each next token a lazy argmax, the n-gram PLE deferred past the build.
         var toks: [2][6]u32 = undefined;
@@ -237,7 +238,8 @@ test "qwen4_exp served: captured steps and a pipelined greedy decode equal the l
             }
             try x.flushDeferredPle(&s.ctx);
         }
-        try testing.expectEqualSlices(u32, &toks[0], &toks[1]);
+        try oracle.checkIds(&toks[1], &toks[0]);
+        try oracle.close();
     }
 }
 
@@ -246,6 +248,7 @@ test "qwen4_exp served: batched rows and a batched verify equal the legacy tick 
     const a = testing.allocator;
     const p = try Pair.open(.q4, 43);
     defer p.close();
+    var oracle = try Oracle.open("served-batched");
     const xs = p.both();
     var slots: [2][2]Slot = undefined;
     for (&slots) |*pair| for (pair) |*s| try s.init(p.lcfg.num_hidden_layers);
@@ -256,7 +259,7 @@ test "qwen4_exp served: batched rows and a batched verify equal the legacy tick 
         defer g.deinit();
         var outs: [2]Array = undefined;
         for (xs, 0..) |x, k| outs[k] = try g.adopt(try x.forwardWith(&slots[k][i].ctx, try tokens(&g, pr)));
-        try ops.expectBitEqual(outs[1], outs[0]);
+        try oracle.check(outs[1], outs[0], false);
     }
     for ([_][2]u32{ .{ 77, 3 }, .{ 100, 64 }, .{ 11, 12 } }) |next| {
         var g = ops.Graph.init(a, mlx.gpuStream());
@@ -276,8 +279,8 @@ test "qwen4_exp served: batched rows and a batched verify equal the legacy tick 
             a.free(h.?);
         };
         for (rows[0], rows[1], hidden[0].?, hidden[1].?) |w, got, wh, gh| {
-            try ops.expectBitEqual(got, w);
-            try ops.expectBitEqual(gh, wh);
+            try oracle.check(got, w, false);
+            try oracle.check(gh, wh, false);
         }
     }
     var g = ops.Graph.init(a, mlx.gpuStream());
@@ -293,7 +296,8 @@ test "qwen4_exp served: batched rows and a batched verify equal the legacy tick 
         const l = try g.adopt(try x.forwardMoeBatchedVerify(arr, &ctxs, &offs, &last, &all));
         outs[k] = .{ l, try g.adopt(last), try g.adopt(all) };
     }
-    for (outs[0], outs[1]) |want, got| try ops.expectBitEqual(got, want);
+    for (outs[0], outs[1]) |want, got| try oracle.check(got, want, false);
+    try oracle.close();
 }
 
 test "qwen4_exp served: greedy decode and MTP rounds emit the legacy tokens and accepted counts" {
@@ -302,17 +306,23 @@ test "qwen4_exp served: greedy decode and MTP rounds emit the legacy tokens and 
     // agree often, so rounds accept all, some or none of their drafts.
     // The GPU n-gram gather (`--ple-gpu`) leaves the history owed past each decode step (`Owed.history`).
     defer ple_gpu.pleGpu().enabled = false;
-    for ([_]u64{ 47, 51, 51 }, [_]fixture.Opts{ .{}, .{ .sign_head = true }, .{ .sign_head = true } }, [_]bool{ false, false, true }) |seed, opts, gpu| {
+    for ([_]u64{ 47, 51, 51 }, [_]fixture.Opts{ .{}, .{ .sign_head = true }, .{ .sign_head = true } }, [_]bool{ false, false, true }, 0..) |seed, opts, gpu, k| {
         ple_gpu.pleGpu().enabled = gpu;
+        var oracle = try switch (k) {
+            0 => Oracle.open("served-runs-0"),
+            1 => Oracle.open("served-runs-1"),
+            else => Oracle.open("served-runs-2"),
+        };
         const p = try Pair.openWith(.q4, seed, opts);
         if (gpu) try testing.expect(p.legacy.qwen4.?.gpu != null and p.served.qwen4Host().qwen4.?.gpu != null);
         defer p.close();
-        _ = try expectSameRuns(p, false);
-        const auto = try expectSameRuns(p, true);
+        _ = try expectSameRuns(p, false, &oracle);
+        const auto = try expectSameRuns(p, true, &oracle);
         depth_bounds.active = .{ .min = 2, .max = 2 };
         defer depth_bounds.active = .{};
-        const pinned = try expectSameRuns(p, true);
+        const pinned = try expectSameRuns(p, true, &oracle);
         if (opts.sign_head) try testing.expect(auto > 0 and pinned > 0);
+        try oracle.close();
     }
 }
 
@@ -321,6 +331,7 @@ test "qwen4_exp served: an image prompt (M-RoPE table, rows spliced across a chu
     const a = testing.allocator;
     const p = try Pair.openWith(.q4, 53, .{ .vision = true });
     defer p.close();
+    var oracle = try Oracle.open("served-image");
     try testing.expectEqual(@as(u32, fixture.image_id), p.scfg.image_token_id);
     try testing.expect(p.scfg.plugin.?.parsed.mrope.rope_dims == 8);
     // 4 text tokens, a 2x3 image, 6 text tokens: past the image the positions resume after its widest axis.
@@ -375,6 +386,7 @@ test "qwen4_exp served: an image prompt (M-RoPE table, rows spliced across a chu
             }
             o.* = try g.adopt(try x.forwardWith(&s.ctx, t));
         }
-        try ops.expectBitEqual(outs[1], outs[0]);
+        try oracle.check(outs[1], outs[0], false);
     }
+    try oracle.close();
 }

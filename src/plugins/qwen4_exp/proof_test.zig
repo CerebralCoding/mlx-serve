@@ -20,6 +20,7 @@ const nextSsmMemberGen = @import("../../engines/mlx/ssm/group.zig").nextSsmMembe
 const ssmFreeQsaState = @import("qsa/history.zig").ssmFreeQsaState;
 const q4 = @import("plugin.zig");
 const fixture = @import("fixture.zig");
+const Oracle = @import("oracle_test.zig").Oracle;
 
 const testing = std.testing;
 const Array = mlx.mlx_array;
@@ -169,7 +170,7 @@ const steps = [_]Step{
     .{ .mode = .verify, .ids = &.{ 6, 70 } },
 };
 
-fn expectSteps(precision: fixture.Precision, own: bool) !void {
+fn expectSteps(precision: fixture.Precision, own: bool, oracle: *Oracle) !void {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const t = try Twin.open(try fixture.files(arena.allocator(), 5, precision));
@@ -192,31 +193,35 @@ fn expectSteps(precision: fixture.Precision, own: bool) !void {
         var out: abi.ForwardOut = .{ .captured = &captured };
         const got = try t.plugin(if (own) null else &pc, pos, st.mode, st.ids, &out, st.capture);
         defer _ = mlx.mlx_array_free(got);
-        try ops.expectBitEqual(got, want);
+        try oracle.check(got, want, false);
         if (st.capture) {
             const hs: Array = .{ .ctx = out.hidden.ctx };
             defer _ = mlx.mlx_array_free(hs);
             const l2: Array = .{ .ctx = captured[0].ctx };
             defer _ = mlx.mlx_array_free(l2);
-            try ops.expectBitEqual(hs, stream);
-            try ops.expectBitEqual(l2, layer2);
+            try oracle.check(hs, stream, false);
+            try oracle.check(l2, layer2, false);
         }
     }
+    try oracle.close();
 }
 
 test "qwen4_exp plugin: bf16 pack, every step on the engine's slot caches equals the legacy forward bit for bit" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
-    try expectSteps(.bf16, false);
+    var oracle = try Oracle.open("proof-bf16");
+    try expectSteps(.bf16, false, &oracle);
 }
 
 test "qwen4_exp plugin: 4-bit pack, every step on the engine's slot caches equals the legacy forward bit for bit" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
-    try expectSteps(.q4, false);
+    var oracle = try Oracle.open("proof-q4");
+    try expectSteps(.q4, false, &oracle);
 }
 
 test "qwen4_exp plugin: on the model's own slot state every step equals the legacy forward bit for bit" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
-    try expectSteps(.q4, true);
+    var oracle = try Oracle.open("proof-q4-own");
+    try expectSteps(.q4, true, &oracle);
 }
 
 test "qwen4_exp plugin: batched rows equal the legacy batched GDN tick per slot, and a cold group steps serially" {
@@ -225,6 +230,7 @@ test "qwen4_exp plugin: batched rows equal the legacy batched GDN tick per slot,
     defer arena.deinit();
     const t = try Twin.open(try fixture.files(arena.allocator(), 9, .q4));
     defer t.close();
+    var oracle = try Oracle.open("proof-batched");
     const layers = t.cfg.num_hidden_layers;
     var lc: [2]Caches = .{ try Caches.init(layers), try Caches.init(layers) };
     defer for (&lc) |*c| c.deinit(&t.xfm);
@@ -268,13 +274,14 @@ test "qwen4_exp plugin: batched rows equal the legacy batched GDN tick per slot,
             var w2 = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(w2);
             try mlx.check(mlx.mlx_reshape(&w2, w, &[_]c_int{ 1, -1 }, 2, mlx.gpuStream()));
-            try ops.expectBitEqual(row, w2);
+            try oracle.check(row, w2, false);
         }
         for (0..2) |i| {
             lc[i].pos += 1;
             pc[i].pos += 1;
         }
     }
+    try oracle.close();
 }
 
 test "qwen4_exp plugin: a position that does not follow the slot's state is refused by name" {
