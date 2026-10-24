@@ -31,7 +31,9 @@ normalized to −1 dBFS. Packs: `ddalcu/ACE-Step-1.5-XL-Turbo-MLX-Serve-{4bit,8b
 - Guards assert log lines, never output (the model is distilled and seed-stable only per machine).
 
 ## Shared blocks
-See the adoption notes in `.bb/reports/sdk-bases-media.md` (Snake, the encoder layer, timestep features, schedule).
+`sdk/blocks/vae/snake.zig` (`snakeBetaLog`, on its f32 cast), `sdk/blocks/text_encoders/qwen3.zig` (`.fast`, the
+encoder), `sdk/blocks/dit/timestep.zig` (`sinusoid`, f32, t x 1000), `sdk/blocks/schedulers/flow_match.zig`
+(`timeShift`, f32).
 
 ## Fixtures
 - `conformanceFixture`: DiT 64 x 2 layers, encoders at 32, one-layer Qwen3 text encoder, VAE 64 → 4 channels.

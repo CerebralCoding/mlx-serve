@@ -18,7 +18,7 @@ Owns `gemma3` and `gemma3_text` (mlx-lm's layouts): the decoders, with SigLIP im
 ## Facts the table declares
 - `batches_decode` (from the base); thinking off; `caps.images` + `placeholder_ids` with a tower; stop set `{config eos} + {1, 106}` (also `tokenizer.extra_eos`); sampling
   defaults top_k 64 / top_p 0.95; `weights.prefix` `model` (flat) or `language_model.model` (nested).
-- Exactness: drafted no, resumed unverified, concurrent no (`.bb/reports/exactness-declarations.tsv`): none set.
+- Exactness: drafted no, resumed unverified, concurrent no (`docs/known-issues.md`): none set.
 
 ## Rules (moved from root AGENTS.md)
 - `*_text` siblings: accept the tag, collapse to the base type (`gemma3`), prefix by `text_config` presence, force

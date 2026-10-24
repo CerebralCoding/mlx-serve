@@ -43,7 +43,7 @@ packs (`experts.bin`) are refused by name: lib/mlx-stream serves them until P4 m
 - Serial is not exclusive: module-owned state needs admission single-flight.
 - The V4.1 template, like V4's, is byte-pinned (`tests/dsv41_template_ab.py`).
 
-## Known issues (`.bb/backlog/deepseek-v41.md` Context; not fixed here)
+## Known issues
 - Serial + single-flight; prefix cache off (module-owned rings).
 - Serial decode near the memory wall: 720 GB/s of ~1.1 TB/s, so kernel work buys 15-25%, not 2x.
 - Prefill compute-bound at ~16 TFLOPS; the MoE at 2048 rows streams each layer's expert bank 4x per 8192 chunk

@@ -25,7 +25,7 @@ keys) are declined `unsupported`. `bidirectional.zig` is the encoder base of bot
   assistant drafter (and a DFlash sidecar) serve on the plugin path; proven by `expectDrafter` (tokens, acceptance,
   each round's draft logits bit-equal on E-series and 26B-A4B trunks).
 - `batches_decode` (dense packs; a pack with experts decodes serial and declares `moe`), thinking off with the
-  `gemma_channel` dialect, `caps.images`/`audio` + `placeholder_ids` with towers, `exact_resumed` (`.bb/reports/exactness-declarations.tsv`: resumed yes, drafted and concurrent
+  `gemma_channel` dialect, `caps.images`/`audio` + `placeholder_ids` with towers, `exact_resumed` (`docs/known-issues.md`: resumed yes, drafted and concurrent
   no); stop set `{config eos} + {1, 106}`; sampling defaults top_k 64 / top_p 0.95; `weights.prefix`
   `language_model.model`, probed to `model.language_model` / `model` when the pack keeps its tensors there.
 

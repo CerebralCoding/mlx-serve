@@ -27,8 +27,7 @@ over whole packs; default `af_heart`), `speed` in (0, 5], `seed`. Refused by nam
 - Input past the BERT context is spoken window by window (`phonemeWindow`), cut at sentence, clause, then word marks.
 
 ## Shared blocks
-None: Kokoro's Snake (no epsilon, `square`) and its norms are other op sequences than `sdk/blocks` (see
-`.bb/reports/sdk-bases-media.md`).
+None: Kokoro's Snake (no epsilon, `square`) and its norms are other op sequences than `sdk/blocks`.
 
 ## Fixtures
 - `conformanceFixture` (plugin.zig): a seeded random pack at hidden 16, one ALBERT layer, a two-stage generator.
