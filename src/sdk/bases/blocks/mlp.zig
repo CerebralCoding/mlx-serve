@@ -75,6 +75,7 @@ pub const GatedMlp = struct {
     };
 
     pub fn forward(w: *const Weights, c: *Ctx, x: Array) !Array {
+        if (try c.offloadMlp(x)) |y| return y;
         const g = c.g;
         const lane = c.row_exact;
         if (w.gu.built() and row_exact.groupServes(lane, rowsOf(x))) {

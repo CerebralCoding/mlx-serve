@@ -2,6 +2,8 @@
 //! Owns AneChanRest, denseMLPMaybeAne, denseMLPAneSplit, gdnProjMaybeAne, gdnProjAneSplit, anePackPlane, and 10 more.
 
 const std = @import("std");
+const abi = @import("../../abi/plugin.zig");
+const quant_abi = @import("../../abi/quant.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const model_mod = @import("model.zig");
 const log = @import("../../sdk/util/log.zig");
@@ -64,17 +66,24 @@ pub const AneChanRest = struct {
 /// plain GPU chain. Fixed shapes are an ANE constraint — the compiled
 /// programs only accept exactly `eng.rows` rows.
 pub fn denseMLPMaybeAne(self: *Transformer, x: mlx.mlx_array, dw: *const DenseMlpWeights, layer_idx: usize, is_prefill: bool, seq_len: c_int) !mlx.mlx_array {
-    const eng = self.ane_prefill orelse return self.denseMLP(x, dw);
-    if (!is_prefill or seq_len != @as(c_int, @intCast(eng.chunk_rows))) return self.denseMLP(x, dw);
-    if (!eng.mlpReady(layer_idx)) return self.denseMLP(x, dw);
+    if (is_prefill) if (self.aneMlp(x, layer_idx, seq_len)) |y| return y;
+    return self.denseMLP(x, dw);
+}
+
+/// The split dense MLP of a covered layer's full-width prefill chunk `x`; null = the GPU computes the whole layer
+/// (another width, an uncovered layer, no engine, or an ANE failure).
+pub fn aneMlp(self: *Transformer, x: mlx.mlx_array, layer_idx: usize, seq_len: c_int) ?mlx.mlx_array {
+    const eng = self.ane_prefill orelse return null;
+    if (seq_len != @as(c_int, @intCast(eng.chunk_rows))) return null;
+    if (!eng.mlpReady(layer_idx)) return null;
     const xsh = mlx.getShape(x);
-    if (xsh.len != 3 or xsh[0] != 1 or xsh[2] != @as(c_int, @intCast(eng.hidden))) return self.denseMLP(x, dw);
-    const rests = self.ane_chan orelse return self.denseMLP(x, dw);
-    const rest = if (rests[layer_idx].mlp) |*m| m else return self.denseMLP(x, dw);
+    if (xsh.len != 3 or xsh[0] != 1 or xsh[2] != @as(c_int, @intCast(eng.hidden))) return null;
+    const rests = self.ane_chan orelse return null;
+    const rest = if (rests[layer_idx].mlp) |*m| m else return null;
     // An ANE failure is never a request failure — whole chunk on GPU.
-    return self.denseMLPAneChannel(eng, x, dw, rest, layer_idx) catch |err| {
+    return self.denseMLPAneChannel(eng, x, rest, layer_idx) catch |err| {
         log.warn("[ane] channel split failed on layer {d} ({s}) — GPU fallback\n", .{ layer_idx, @errorName(err) });
-        return self.denseMLP(x, dw);
+        return null;
     };
 }
 
@@ -83,18 +92,51 @@ pub fn denseMLPMaybeAne(self: *Transformer, x: mlx.mlx_array, dw: *const DenseMl
 /// full-width prefill chunk of a covered layer; everything else runs the
 /// plain GPU projections.
 pub fn gdnProjMaybeAne(self: *Transformer, x: mlx.mlx_array, la: *const LinearAttnWeights, layer_idx: usize, is_prefill: bool, seq_len: c_int) !GdnProj {
-    const eng = self.ane_prefill orelse return self.gdnProjGpu(x, la);
-    if (!is_prefill or seq_len != @as(c_int, @intCast(eng.chunk_rows))) return self.gdnProjGpu(x, la);
-    if (!eng.gdnReady(layer_idx)) return self.gdnProjGpu(x, la);
+    if (is_prefill) if (self.aneGdnProj(x, layer_idx, seq_len)) |p| return p;
+    return self.gdnProjGpu(x, la);
+}
+
+/// The split q|k|v and z projections of a covered layer's full-width prefill chunk `x`; null = the GPU projects them.
+pub fn aneGdnProj(self: *Transformer, x: mlx.mlx_array, layer_idx: usize, seq_len: c_int) ?GdnProj {
+    const eng = self.ane_prefill orelse return null;
+    if (seq_len != @as(c_int, @intCast(eng.chunk_rows))) return null;
+    if (!eng.gdnReady(layer_idx)) return null;
     const xsh = mlx.getShape(x);
-    if (xsh.len != 3 or xsh[0] != 1 or xsh[2] != @as(c_int, @intCast(eng.hidden))) return self.gdnProjGpu(x, la);
-    const rests = self.ane_chan orelse return self.gdnProjGpu(x, la);
+    if (xsh.len != 3 or xsh[0] != 1 or xsh[2] != @as(c_int, @intCast(eng.hidden))) return null;
+    const rests = self.ane_chan orelse return null;
     const rest = &rests[layer_idx];
-    if (rest.gdn_qkv_w.ctx == null or rest.gdn_z_w.ctx == null) return self.gdnProjGpu(x, la);
-    return self.gdnProjAneChannel(eng, x, la, rest, layer_idx) catch |err| {
+    if (rest.gdn_qkv_w.ctx == null or rest.gdn_z_w.ctx == null) return null;
+    return self.gdnProjAneChannel(eng, x, rest, layer_idx) catch |err| {
         log.warn("[ane] gdn channel split failed on layer {d} ({s}) — GPU fallback\n", .{ layer_idx, @errorName(err) });
-        return self.gdnProjGpu(x, la);
+        return null;
     };
+}
+
+/// The plugin forward's seam (`Forward.offload`) over this shell's ANE programs, at the legacy forward's two sites.
+pub fn aneOffload(self: *Transformer) abi.Offload {
+    return .{ .ctx = self, .mlp = &offloadMlp, .gdn_proj = &offloadGdn };
+}
+
+fn chunkRows(x: mlx.mlx_array) c_int {
+    const sh = mlx.getShape(x);
+    return if (sh.len == 3) sh[1] else 0;
+}
+
+fn offloadMlp(ctx: *anyopaque, layer: u32, x: abi.Array, out: *abi.Array) callconv(.c) bool {
+    const self: *Transformer = @ptrCast(@alignCast(ctx));
+    const xa: mlx.mlx_array = .{ .ctx = x.ctx };
+    const y = self.aneMlp(xa, layer, chunkRows(xa)) orelse return false;
+    out.* = .{ .ctx = y.ctx };
+    return true;
+}
+
+fn offloadGdn(ctx: *anyopaque, layer: u32, x: abi.Array, qkv: *abi.Array, z: *abi.Array) callconv(.c) bool {
+    const self: *Transformer = @ptrCast(@alignCast(ctx));
+    const xa: mlx.mlx_array = .{ .ctx = x.ctx };
+    const p = self.aneGdnProj(xa, layer, chunkRows(xa)) orelse return false;
+    qkv.* = .{ .ctx = p.qkv.ctx };
+    z.* = .{ .ctx = p.z.ctx };
+    return true;
 }
 
 /// Pack a [1, R, H] hidden tensor into an fp16 CHANNEL-major ANE input
@@ -117,8 +159,9 @@ pub fn aneReadPlane(self: *Transformer, plane: [*]f16, width: c_int, rows: c_int
 /// computes output channels [0..k) of gate/up and the matching down
 /// K-slabs (a PARTIAL down sum), the GPU the rest via the stored
 /// complement slices; the two partials ADD at the seam. Same
-/// pack/kick/async/join discipline as the row split.
-pub fn denseMLPAneChannel(self: *Transformer, eng: *ane_offload.AnePrefill, x: mlx.mlx_array, dw: *const DenseMlpWeights, rest: *const DenseMlpWeights, layer_idx: usize) !mlx.mlx_array {
+/// pack/kick/async/join discipline as the row split. null = a unit
+/// failed: the caller recomputes the whole layer on the GPU.
+pub fn denseMLPAneChannel(self: *Transformer, eng: *ane_offload.AnePrefill, x: mlx.mlx_array, rest: *const DenseMlpWeights, layer_idx: usize) !?mlx.mlx_array {
     try self.anePackUnitPlanes(eng, x);
     eng.kickMlp(layer_idx);
     var waited = false;
@@ -139,12 +182,10 @@ pub fn denseMLPAneChannel(self: *Transformer, eng: *ane_offload.AnePrefill, x: m
 
     const ok = eng.waitAll();
     waited = true;
-    if (!ok) {
-        // Failed eval on ANY unit: a subset of the partials is not an
-        // answer — the whole layer recomputes on the GPU from the
-        // original weights.
-        return self.denseMLP(x, dw);
-    }
+    // Failed eval on ANY unit: a subset of the partials is not an
+    // answer — the whole layer recomputes on the GPU from the original
+    // weights.
+    if (!ok) return null;
     // Every unit contributes a PARTIAL down sum over its own channel
     // slice; they add with the GPU's rest partial.
     var acc = try self.aneReadPlane(eng.units[0].mlpOutputBase() orelse return error.AnePlaneMissing, @intCast(eng.hidden), @intCast(eng.rows), mlx.mlx_array_dtype(x));
@@ -172,8 +213,9 @@ pub fn anePackUnitPlanes(self: *Transformer, eng: *ane_offload.AnePrefill, x: ml
 
 /// Channel-mode GDN projections: the ANE computes output channels
 /// [0..kq) of qkv and [0..kz) of z (one fused program), the GPU the
-/// rest; each tensor CONCATENATES on the channel axis.
-pub fn gdnProjAneChannel(self: *Transformer, eng: *ane_offload.AnePrefill, x: mlx.mlx_array, la: *const LinearAttnWeights, rest: *const AneChanRest, layer_idx: usize) !GdnProj {
+/// rest; each tensor CONCATENATES on the channel axis. null = a unit
+/// failed: the caller projects on the GPU.
+pub fn gdnProjAneChannel(self: *Transformer, eng: *ane_offload.AnePrefill, x: mlx.mlx_array, rest: *const AneChanRest, layer_idx: usize) !?GdnProj {
     const rows_a: c_int = @intCast(eng.rows);
     const kq: c_int = @intCast(eng.gdn_qkv_out);
     const kz: c_int = @intCast(eng.gdn_z_out);
@@ -198,7 +240,7 @@ pub fn gdnProjAneChannel(self: *Transformer, eng: *ane_offload.AnePrefill, x: ml
 
     const ok = eng.waitAll();
     waited = true;
-    if (!ok) return self.gdnProjGpu(x, la);
+    if (!ok) return null;
     // Unit u holds channels [u*kq, (u+1)*kq) of qkv and [u*kz, (u+1)*kz)
     // of z, so the units' slices are contiguous and each tensor
     // CONCATENATES: unit 0 ++ unit 1 ++ ... ++ the GPU rest.
@@ -316,6 +358,112 @@ pub fn dequantToHostF32(self: *Transformer, allocator: std.mem.Allocator, w: mlx
     return out;
 }
 
+/// A GatedDeltaNet layer's separate q|k|v and z projections, borrowed.
+pub const GdnIn = struct {
+    qkv_w: mlx.mlx_array,
+    qkv_s: mlx.mlx_array,
+    qkv_b: mlx.mlx_array,
+    z_w: mlx.mlx_array,
+    z_s: mlx.mlx_array,
+    z_b: mlx.mlx_array,
+};
+
+/// What one layer offers the ANE programs, borrowed: a dense MLP, separate GDN projections, both or neither.
+pub const AneLayer = struct { mlp: ?DenseMlpWeights = null, gdn: ?GdnIn = null };
+
+/// Every layer's `AneLayer` (caller frees the slice): the legacy layer list, or a plugin trunk that declares
+/// `Caps.ane_prefill` through its `layer_weight` hook; null = neither serves one.
+pub fn aneLayers(self: *const Transformer, a: std.mem.Allocator) !?[]AneLayer {
+    if (self.moe_layers) |ml| {
+        const out = try a.alloc(AneLayer, ml.len);
+        for (ml, out) |*lw, *o| {
+            o.* = .{};
+            switch (lw.mlp) {
+                .dense => |dw| o.mlp = dw,
+                .moe => {},
+            }
+            switch (lw.attn) {
+                .linear => |*la| if (la.aneGdnServes()) {
+                    o.gdn = .{ .qkv_w = la.qkv_w, .qkv_s = la.qkv_s, .qkv_b = la.qkv_b, .z_w = la.z_w, .z_s = la.z_s, .z_b = la.z_b };
+                },
+                else => {},
+            }
+        }
+        return out;
+    }
+    const b = self.plugin orelse return null;
+    const caps = (self.config.plugin orelse return null).parsed.caps;
+    const get = b.table.weights.layer_weight orelse return null;
+    if (!caps.ane_prefill) return null;
+    const n = self.config.num_hidden_layers;
+    const out = try a.alloc(AneLayer, n);
+    for (out, 0..) |*o, i| {
+        o.* = .{};
+        const li: u32 = @intCast(i);
+        var w: [5]quant_abi.Weight = @splat(.{});
+        var have: [5]bool = undefined;
+        inline for (.{ .mlp_gate, .mlp_up, .mlp_down, .gdn_qkv, .gdn_z }, 0..) |which, k| have[k] = get(b.model, li, which, &w[k]).isOk();
+        const arr = struct {
+            fn of(x: abi.Array) mlx.mlx_array {
+                return .{ .ctx = x.ctx };
+            }
+        }.of;
+        if (have[0] and have[1] and have[2]) o.mlp = .{
+            .gate_w = arr(w[0].w),
+            .gate_s = arr(w[0].scales),
+            .gate_b = arr(w[0].biases),
+            .up_w = arr(w[1].w),
+            .up_s = arr(w[1].scales),
+            .up_b = arr(w[1].biases),
+            .down_w = arr(w[2].w),
+            .down_s = arr(w[2].scales),
+            .down_b = arr(w[2].biases),
+        };
+        if (have[3] and have[4]) o.gdn = .{ .qkv_w = arr(w[3].w), .qkv_s = arr(w[3].scales), .qkv_b = arr(w[3].biases), .z_w = arr(w[4].w), .z_s = arr(w[4].scales), .z_b = arr(w[4].biases) };
+    }
+    return out;
+}
+
+/// The offload's shape over `layers` at `share` across `units`: coverage, the per-unit channel widths, and the
+/// GPU-side down-rest bytes channel mode materializes.
+pub const AnePlan = struct {
+    dense_layers: u64 = 0,
+    gdn_layers: u64 = 0,
+    eng_ffn: u32 = 0,
+    eng_qkv: u32 = 0,
+    eng_z: u32 = 0,
+    /// A GDN layer's full q|k|v and z widths.
+    qkv_out: u32 = 0,
+    z_out: u32 = 0,
+    rest_bytes: u64 = 0,
+};
+
+pub fn anePlan(cfg: *const model_mod.ModelConfig, layers: []const AneLayer, share: f32, units: u32) AnePlan {
+    const ffn = cfg.intermediate_size;
+    // GDN input projections (v2): separate-proj GDN layers only (qwen3_next's combined arm stays GPU).
+    const gdn_qkv_out: u32 = @intCast(2 * cfg.linear_num_key_heads * cfg.linear_key_head_dim + cfg.linear_num_value_heads * cfg.linear_value_head_dim);
+    const gdn_z_out: u32 = @intCast(cfg.linear_num_value_heads * cfg.linear_value_head_dim);
+    var p: AnePlan = .{
+        .eng_ffn = ane_offload.channelSliceWidthUnits(ffn, share, units),
+        .eng_qkv = ane_offload.channelSliceWidthUnits(gdn_qkv_out, share, units),
+        .eng_z = ane_offload.channelSliceWidthUnits(gdn_z_out, share, units),
+        .qkv_out = gdn_qkv_out,
+        .z_out = gdn_z_out,
+    };
+    for (layers) |*l| {
+        if (l.mlp != null) p.dense_layers += 1;
+        if (l.gdn != null and gdn_qkv_out > 0 and gdn_z_out > 0) p.gdn_layers += 1;
+    }
+    if (p.eng_qkv == 0 or p.eng_z == 0) p.gdn_layers = 0;
+    if (p.eng_ffn > 0) for (layers) |*l| if (l.mlp) |*dw| {
+        const down_bytes = mlx.mlx_array_size(dw.down_w) * mlx.mlx_array_itemsize(dw.down_w) +
+            mlx.mlx_array_size(dw.down_s) * mlx.mlx_array_itemsize(dw.down_s) +
+            (if (dw.down_b.ctx != null) mlx.mlx_array_size(dw.down_b) * mlx.mlx_array_itemsize(dw.down_b) else 0);
+        p.rest_bytes += down_bytes * (ffn - units * p.eng_ffn) / ffn;
+    };
+    return p;
+}
+
 /// Build the per-layer ANE MLP programs (`--ane-prefill`). Never fails
 /// the load: every refusal is a NAMED `[ane]` line and the model serves
 /// GPU-only. v1 scope: qwen3_5-family DENSE MLP (data-dependent MoE
@@ -333,10 +481,11 @@ pub fn buildAnePrefill(
         return;
     }
     const cfg = &self.config;
-    const ml = self.moe_layers orelse {
+    const layers = (self.aneLayers(self.allocator) catch null) orelse {
         log.warn("[ane] --ane-prefill: {s} is outside the v1 scope (qwen3_5-family dense MLP) — disabled\n", .{cfg.model_type});
         return;
     };
+    defer self.allocator.free(layers);
     if (!std.mem.eql(u8, cfg.model_type, "qwen3_5_moe")) {
         log.warn("[ane] --ane-prefill: {s} is outside the qwen3_5-family scope — disabled\n", .{cfg.model_type});
         return;
@@ -345,56 +494,32 @@ pub fn buildAnePrefill(
     // ride a fixed-shape ANE graph, and its shared-expert MLP measured a
     // ~5% FLOPs ceiling (A7 spike, 35B-A3B) — but the GDN input
     // projections are per-token dense and a 32% ceiling there, so a MoE
-    // target gets GDN-ONLY coverage (the dense-MLP loop below simply
-    // finds no .dense arms).
+    // target gets GDN-ONLY coverage (no layer offers a dense MLP).
     const hidden = cfg.hidden_size;
     const ffn = cfg.intermediate_size;
-    var dense_layer_count: u64 = 0;
-    for (ml) |*lw| {
-        switch (lw.mlp) {
-            .dense => dense_layer_count += 1,
-            .moe => {},
-        }
-    }
-    // GDN input projections (v2): separate-proj GDN layers only
-    // (qwen3_next's combined arm stays GPU).
-    const gdn_qkv_out: u32 = @intCast(2 * cfg.linear_num_key_heads * cfg.linear_key_head_dim + cfg.linear_num_value_heads * cfg.linear_value_head_dim);
-    const gdn_z_out: u32 = @intCast(cfg.linear_num_value_heads * cfg.linear_value_head_dim);
-    var gdn_target_layers: u64 = if (gdn_qkv_out > 0 and gdn_z_out > 0) blk: {
-        var n: u64 = 0;
-        for (ml) |*lw| {
-            switch (lw.attn) {
-                .linear => |*la| {
-                    if (la.aneGdnServes()) n += 1;
-                },
-                else => {},
-            }
-        }
-        break :blk n;
-    } else 0;
     // Channel split (A1): ALL chunk rows run through OUTPUT-channel slices (the engine widths become the sliced
     // widths and the GPU serves the complement).
     // Dual ANE (on the M3 Ultra, where it was measured):
     // two units pinned to the two dies, each computing HALF the total
     // channel share concurrently.
     const units = ane_offload.unitCount(ane_offload.chipBrand(), ane_offload.dualEnabled());
-    var rows: u32 = undefined;
-    var eng_ffn: u32 = ffn;
-    var eng_qkv: u32 = gdn_qkv_out;
-    var eng_z: u32 = gdn_z_out;
     if (chunk_rows % 32 != 0) {
         log.warn("[ane] --ane-prefill: channel mode needs a 32-multiple prefill chunk (got {d}) — disabled\n", .{chunk_rows});
         return;
     }
-    rows = chunk_rows;
-    eng_ffn = ane_offload.channelSliceWidthUnits(ffn, share, units);
+    const rows: u32 = chunk_rows;
+    const plan = anePlan(cfg, layers, share, units);
+    const dense_layer_count = plan.dense_layers;
+    const eng_ffn = plan.eng_ffn;
+    const eng_qkv = plan.eng_qkv;
+    const eng_z = plan.eng_z;
+    const gdn_qkv_out = plan.qkv_out;
+    const gdn_z_out = plan.z_out;
     if (eng_ffn == 0 and dense_layer_count > 0) {
         log.warn("[ane] --ane-prefill: share {d:.2} of ffn {d} over {d} unit(s) leaves no usable channel slice — disabled\n", .{ share, ffn, units });
         return;
     }
-    eng_qkv = ane_offload.channelSliceWidthUnits(gdn_qkv_out, share, units);
-    eng_z = ane_offload.channelSliceWidthUnits(gdn_z_out, share, units);
-    if (eng_qkv == 0 or eng_z == 0) gdn_target_layers = 0;
+    const gdn_target_layers = plan.gdn_layers;
     const gdn_on = gdn_target_layers > 0;
     // Per-model admission (replaces the v1 flat 96 GB total-RAM gate):
     // bill the int8 copies + fp16 planes THIS config will build — plus,
@@ -403,18 +528,7 @@ pub fn buildAnePrefill(
     // channel and needs a big Mac; a 0.8B bills ~1 GB and runs on a
     // small one.
     {
-        var chan_rest_bytes: u64 = 0;
-        if (eng_ffn > 0) for (ml) |*lw| {
-            switch (lw.mlp) {
-                .dense => |*dw| {
-                    const down_bytes = mlx.mlx_array_size(dw.down_w) * mlx.mlx_array_itemsize(dw.down_w) +
-                        mlx.mlx_array_size(dw.down_s) * mlx.mlx_array_itemsize(dw.down_s) +
-                        (if (dw.down_b.ctx != null) mlx.mlx_array_size(dw.down_b) * mlx.mlx_array_itemsize(dw.down_b) else 0);
-                    chan_rest_bytes += down_bytes * (ffn - units * eng_ffn) / ffn;
-                },
-                .moe => {},
-            }
-        };
+        const chan_rest_bytes = plan.rest_bytes;
         const bill = ane_offload.engineBillBytes(dense_layer_count, gdn_target_layers, hidden, eng_ffn, eng_qkv, eng_z, rows, units) + chan_rest_bytes;
         const total_mem = totalMemBytes();
         var resident: usize = 0;
@@ -482,81 +596,75 @@ pub fn buildAnePrefill(
     // build otherwise stays partial for the whole serve.
     var pass: usize = 0;
     while (pass < 2) : (pass += 1) {
-        for (ml, 0..) |*lw, i| {
-            switch (lw.mlp) {
-                .dense => |*dw| {
-                    if (eng.mlpReady(i)) continue;
-                    const gate = self.dequantToHostF32(self.allocator, dw.gate_w, dw.gate_s, dw.gate_b, hidden, ffn) catch |err| {
-                        log.warn("[ane] layer {d} gate dequant failed ({s}) — layer stays on GPU\n", .{ i, @errorName(err) });
+        for (layers, 0..) |*al, i| {
+            if (al.mlp) |*dw| {
+                if (eng.mlpReady(i)) continue;
+                const gate = self.dequantToHostF32(self.allocator, dw.gate_w, dw.gate_s, dw.gate_b, hidden, ffn) catch |err| {
+                    log.warn("[ane] layer {d} gate dequant failed ({s}) — layer stays on GPU\n", .{ i, @errorName(err) });
+                    continue;
+                };
+                defer self.allocator.free(gate);
+                const up = self.dequantToHostF32(self.allocator, dw.up_w, dw.up_s, dw.up_b, hidden, ffn) catch |err| {
+                    log.warn("[ane] layer {d} up dequant failed ({s}) — layer stays on GPU\n", .{ i, @errorName(err) });
+                    continue;
+                };
+                defer self.allocator.free(up);
+                const down = self.dequantToHostF32(self.allocator, dw.down_w, dw.down_s, dw.down_b, ffn, hidden) catch |err| {
+                    log.warn("[ane] layer {d} down dequant failed ({s}) — layer stays on GPU\n", .{ i, @errorName(err) });
+                    continue;
+                };
+                defer self.allocator.free(down);
+                const k = eng_ffn;
+                if (self.ane_chan.?[i].mlp == null) {
+                    self.ane_chan.?[i].mlp = self.aneBuildMlpRest(dw, k * units, ffn) catch |err| {
+                        log.warn("[ane] layer {d} channel rest slicing failed ({s}) — layer stays on GPU\n", .{ i, @errorName(err) });
                         continue;
                     };
-                    defer self.allocator.free(gate);
-                    const up = self.dequantToHostF32(self.allocator, dw.up_w, dw.up_s, dw.up_b, hidden, ffn) catch |err| {
-                        log.warn("[ane] layer {d} up dequant failed ({s}) — layer stays on GPU\n", .{ i, @errorName(err) });
-                        continue;
+                }
+                // Per-unit slice of the dequant buffers: unit u
+                // owns output channels [u*k, (u+1)*k), so gate/up
+                // rows are a plain host slice and down repacks
+                // that column window.
+                const kh: usize = @as(usize, k) * @as(usize, hidden);
+                const down_slice = self.allocator.alloc(f32, @as(usize, hidden) * k) catch continue;
+                defer self.allocator.free(down_slice);
+                for (0..units) |u| {
+                    const c0: usize = u * @as(usize, k);
+                    for (0..hidden) |r| @memcpy(down_slice[r * k ..][0..k], down[r * ffn + c0 ..][0..k]);
+                    eng.addMlpLayer(u, i, gate[u * kh ..][0..kh], up[u * kh ..][0..kh], down_slice) catch |err| {
+                        log.warn("[ane] layer {d} unit {d} mlp enqueue failed ({s})\n", .{ i, u, @errorName(err) });
+                        break;
                     };
-                    defer self.allocator.free(up);
-                    const down = self.dequantToHostF32(self.allocator, dw.down_w, dw.down_s, dw.down_b, ffn, hidden) catch |err| {
-                        log.warn("[ane] layer {d} down dequant failed ({s}) — layer stays on GPU\n", .{ i, @errorName(err) });
-                        continue;
-                    };
-                    defer self.allocator.free(down);
-                    const k = eng_ffn;
-                    if (self.ane_chan.?[i].mlp == null) {
-                        self.ane_chan.?[i].mlp = self.aneBuildMlpRest(dw, k * units, ffn) catch |err| {
-                            log.warn("[ane] layer {d} channel rest slicing failed ({s}) — layer stays on GPU\n", .{ i, @errorName(err) });
-                            continue;
-                        };
-                    }
-                    // Per-unit slice of the dequant buffers: unit u
-                    // owns output channels [u*k, (u+1)*k), so gate/up
-                    // rows are a plain host slice and down repacks
-                    // that column window.
-                    const kh: usize = @as(usize, k) * @as(usize, hidden);
-                    const down_slice = self.allocator.alloc(f32, @as(usize, hidden) * k) catch continue;
-                    defer self.allocator.free(down_slice);
-                    for (0..units) |u| {
-                        const c0: usize = u * @as(usize, k);
-                        for (0..hidden) |r| @memcpy(down_slice[r * k ..][0..k], down[r * ffn + c0 ..][0..k]);
-                        eng.addMlpLayer(u, i, gate[u * kh ..][0..kh], up[u * kh ..][0..kh], down_slice) catch |err| {
-                            log.warn("[ane] layer {d} unit {d} mlp enqueue failed ({s})\n", .{ i, u, @errorName(err) });
-                            break;
-                        };
-                    }
-                },
-                .moe => {},
+                }
             }
         }
-        if (gdn_on and gdn_qkv_out > 0 and gdn_z_out > 0) for (ml, 0..) |*lw, i| {
-            switch (lw.attn) {
-                .linear => |*la| {
-                    if (!la.aneGdnServes() or eng.gdnReady(i)) continue;
-                    const qkv = self.dequantToHostF32(self.allocator, la.qkv_w, la.qkv_s, la.qkv_b, hidden, gdn_qkv_out) catch |err| {
-                        log.warn("[ane] layer {d} gdn qkv dequant failed ({s}) — projections stay on GPU\n", .{ i, @errorName(err) });
+        if (gdn_on) for (layers, 0..) |*al, i| {
+            if (al.gdn) |*la| {
+                if (eng.gdnReady(i)) continue;
+                const qkv = self.dequantToHostF32(self.allocator, la.qkv_w, la.qkv_s, la.qkv_b, hidden, gdn_qkv_out) catch |err| {
+                    log.warn("[ane] layer {d} gdn qkv dequant failed ({s}) — projections stay on GPU\n", .{ i, @errorName(err) });
+                    continue;
+                };
+                defer self.allocator.free(qkv);
+                const z = self.dequantToHostF32(self.allocator, la.z_w, la.z_s, la.z_b, hidden, gdn_z_out) catch |err| {
+                    log.warn("[ane] layer {d} gdn z dequant failed ({s}) — projections stay on GPU\n", .{ i, @errorName(err) });
+                    continue;
+                };
+                defer self.allocator.free(z);
+                if (self.ane_chan.?[i].gdn_qkv_w.ctx == null) {
+                    self.aneBuildGdnRest(&self.ane_chan.?[i], la, eng_qkv * units, eng_z * units) catch |err| {
+                        log.warn("[ane] layer {d} gdn channel rest slicing failed ({s}) — projections stay on GPU\n", .{ i, @errorName(err) });
                         continue;
                     };
-                    defer self.allocator.free(qkv);
-                    const z = self.dequantToHostF32(self.allocator, la.z_w, la.z_s, la.z_b, hidden, gdn_z_out) catch |err| {
-                        log.warn("[ane] layer {d} gdn z dequant failed ({s}) — projections stay on GPU\n", .{ i, @errorName(err) });
-                        continue;
+                }
+                for (0..units) |u| {
+                    const q0: usize = u * @as(usize, eng_qkv) * hidden;
+                    const z0: usize = u * @as(usize, eng_z) * hidden;
+                    eng.addGdnLayer(u, i, qkv[q0..][0 .. @as(usize, eng_qkv) * hidden], z[z0..][0 .. @as(usize, eng_z) * hidden]) catch |err| {
+                        log.warn("[ane] layer {d} unit {d} gdn enqueue failed ({s})\n", .{ i, u, @errorName(err) });
+                        break;
                     };
-                    defer self.allocator.free(z);
-                    if (self.ane_chan.?[i].gdn_qkv_w.ctx == null) {
-                        self.aneBuildGdnRest(&self.ane_chan.?[i], la, eng_qkv * units, eng_z * units) catch |err| {
-                            log.warn("[ane] layer {d} gdn channel rest slicing failed ({s}) — projections stay on GPU\n", .{ i, @errorName(err) });
-                            continue;
-                        };
-                    }
-                    for (0..units) |u| {
-                        const q0: usize = u * @as(usize, eng_qkv) * hidden;
-                        const z0: usize = u * @as(usize, eng_z) * hidden;
-                        eng.addGdnLayer(u, i, qkv[q0..][0 .. @as(usize, eng_qkv) * hidden], z[z0..][0 .. @as(usize, eng_z) * hidden]) catch |err| {
-                            log.warn("[ane] layer {d} unit {d} gdn enqueue failed ({s})\n", .{ i, u, @errorName(err) });
-                            break;
-                        };
-                    }
-                },
-                else => {},
+                }
             }
         };
         // Compile everything this pass queued. A bank that the runtime
@@ -592,7 +700,7 @@ pub fn buildAnePrefill(
     const secs: f64 = @as(f64, @floatFromInt(@as(u64, @intCast(build_start.untilNow(io, .awake).nanoseconds)))) / 1e9;
     eng.publishLive(share, int8_bytes);
     self.ane_prefill = eng;
-    log.info("[ane] prefill offload ready: units={d} {d}/{d} mlp + {d} gdn layers in {d} banks, rows={d}/{d} (share {d:.2}), int8 ~{d} MB, built in {d:.1}s\n", .{ units, built, ml.len, gdn_built, eng.compiledBanks(), rows, chunk_rows, share, int8_bytes / (1024 * 1024), secs });
+    log.info("[ane] prefill offload ready: units={d} {d}/{d} mlp + {d} gdn layers in {d} banks, rows={d}/{d} (share {d:.2}), int8 ~{d} MB, built in {d:.1}s\n", .{ units, built, layers.len, gdn_built, eng.compiledBanks(), rows, chunk_rows, share, int8_bytes / (1024 * 1024), secs });
     eng.logDualReady();
 }
 
@@ -640,7 +748,7 @@ pub fn aneBuildMlpRest(self: *Transformer, dw: *const DenseMlpWeights, k: u32, f
 
 /// Channel-mode GPU GDN complement: qkv/z rest-channel views written
 /// into the layer's AneChanRest entry (all axis-0, zero-copy).
-pub fn aneBuildGdnRest(self: *Transformer, entry: *AneChanRest, la: *const LinearAttnWeights, kq: u32, kz: u32) !void {
+pub fn aneBuildGdnRest(self: *Transformer, entry: *AneChanRest, la: *const GdnIn, kq: u32, kz: u32) !void {
     errdefer entry.deinitGdn();
     entry.gdn_qkv_w = try self.aneSliceRowsView(la.qkv_w, @intCast(kq));
     entry.gdn_qkv_s = try self.aneSliceRowsView(la.qkv_s, @intCast(kq));

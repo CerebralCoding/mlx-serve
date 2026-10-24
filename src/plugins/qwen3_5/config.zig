@@ -184,9 +184,10 @@ pub fn parseAs(comptime variant: Variant, dir: *const abi.PackDir, config_json: 
     // Qwen3-Next decodes serial: the engine batches only the qwen3_5 MoE trunk's GDN state. An affine dense trunk's
     // verify rows are row-exact (the `.mma` lane, set at load where every projection fits); a bf16 matmul's bits
     // follow its row count. `spec_tree` waits for a tree verify the blocks do not carry. A Hadamard pack's drafter reads
-    // the trunk head in f32 (`lmHeadForeign`): a pack carrying one stays legacy.
+    // the trunk head in f32 (`lmHeadForeign`): a pack carrying one stays legacy. The ANE prefill programs read
+    // unrotated separate GDN projections.
     const exact = !next and !prism and !c.moe() and c.quant.bits > 0 and c.quant.mode == .affine;
-    var p: abi.Parsed = .{ .caps = .{ .batches_decode = !next, .moe = c.moe(), .exact_resumed = true, .dflash_capture = !prism, .exact_drafted = exact } };
+    var p: abi.Parsed = .{ .caps = .{ .batches_decode = !next, .moe = c.moe(), .exact_resumed = true, .dflash_capture = !prism, .exact_drafted = exact, .ane_prefill = !next and !prism } };
     // The grafted head over-speculates in auto mode (`ModelConfig.mtpDepth`).
     if (prism) p.spec.mtp_default_depth = 2;
     const s = &p.shell;

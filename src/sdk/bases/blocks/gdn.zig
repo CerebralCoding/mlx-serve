@@ -2,7 +2,7 @@
 //! written through `CacheOps`: prefill (composed chain, blocked/pipelined recurrence, the wide fused prework where a
 //! pack asks), the fused one-dispatch decode, verify rows with the per-row state capture a partial accept rolls back
 //! to, and batched rows (every slot's state stacked on the batch axis).
-//! copied_from: sdk/blocks/gdn/gated_delta_net.zig (`gatedDeltaNetProjected` without the KDA, low-rank gate, ANE,
+//! copied_from: sdk/blocks/gdn/gated_delta_net.zig (`gatedDeltaNetProjected` without the KDA, low-rank gate,
 //! spec-tree, grouped-verify and diagnostic arms), sdk/blocks/gdn/gate.zig (`computeGdnGate`).
 
 const std = @import("std");
@@ -125,12 +125,15 @@ pub const Gdn = struct {
 /// The four projections in `[B, S, ...]`, each owned by `g`; `all` is the joined matmul's output when one ran.
 const Proj = struct { qkv: Array, z: Array, a: Array, b: Array, all: ?Array = null };
 
-fn project(w: *const Gdn.Weights, lane: row_exact.Lane, g: *Graph, x: Array, batch: c_int, seq: c_int) !Proj {
+fn project(w: *const Gdn.Weights, c: *const Ctx, x: Array, batch: c_int, seq: c_int) !Proj {
+    const lane = c.row_exact;
+    const g = c.g;
     if (w.combined) return projectCombined(w, g, x, batch, seq);
     if (w.in.built() and row_exact.groupServes(lane, batch * seq)) {
         const all = try row_exact.linear(lane, g, &w.in.lin, x);
         return .{ .qkv = try w.in.part(g, all, 0), .z = try w.in.part(g, all, 1), .a = try w.in.part(g, all, 2), .b = try w.in.part(g, all, 3), .all = all };
     }
+    if (try c.offloadGdn(x)) |qz| return .{ .qkv = qz[0], .z = qz[1], .a = try row_exact.linear(lane, g, &w.a, x), .b = try row_exact.linear(lane, g, &w.b, x) };
     const qkv = if (w.qkv.w.ctx != null) try row_exact.linear(lane, g, &w.qkv, x) else blk: {
         var parts: [3]Array = undefined;
         for (&parts, &w.qkv_parts) |*p, *l| p.* = try row_exact.linear(lane, g, l, x);
@@ -200,7 +203,7 @@ fn mix(w: *const Gdn.Weights, c: *Ctx, x: Array) !Array {
     const eps = c.shared.eps_arr;
     const swish = !geo.sigmoid_gate;
 
-    const p = try project(w, c.row_exact, g, x, batch, seq);
+    const p = try project(w, c, x, batch, seq);
     var conv = try state.get(c, .conv);
     var ssm: ?Array = if (conv != null) try state.get(c, .ssm) else null;
 

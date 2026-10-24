@@ -363,8 +363,11 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
     var captured: [64]abi.Array = undefined;
     if (ids.len > captured.len) return error.PluginForwardUnsupported;
     @memset(captured[0..ids.len], .{});
+    const mode: abi.Mode = if (capture) .verify else if (rows == 1) .decode else if (ctx.spec_verify) .verify else .prefill;
+    // The ANE prefill programs (`--ane-prefill`) serve prompt chunks only.
+    const offload: ?abi.Offload = if (mode == .prefill and xfm.ane_prefill != null) xfm.aneOffload() else null;
     const f: abi.Forward = .{
-        .mode = if (capture) .verify else if (rows == 1) .decode else if (ctx.spec_verify) .verify else .prefill,
+        .mode = mode,
         .row_exact = xfm.config.dflash_bound,
         .logits = if (!head) .none else if (module and !capture and !ctx.spec_verify) .last_row else .all_rows,
         .want_hidden = !head or ctx.capture_hidden != null or ctx.capture_hidden_all != null,
@@ -381,6 +384,7 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
         .mrope = .{ .ctx = angles.ctx },
         .cache_ops = &cache_ops.ops,
         .eval_every = evalEvery(&xfm.config, b.positions, rows, base + rows, ctx.cache.config.scheme != .off),
+        .offload = if (offload) |*o| o else null,
     };
     var out: abi.ForwardOut = .{ .captured = &captured };
     intree.enter(ctx);

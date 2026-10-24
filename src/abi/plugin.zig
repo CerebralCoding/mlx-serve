@@ -105,6 +105,7 @@ pub const Caps = packed struct(u64) {
     spec_rollback: bool = false,
     spec_tree: bool = false,
     whole_prompt_prefill: bool = false,
+    /// The forward honours `Forward.offload` and `WeightHooks.layer_weight` lends the offloaded projections.
     ane_prefill: bool = false,
     streamed_weights: bool = false,
     embed: bool = false,
@@ -378,6 +379,19 @@ pub const Forward = extern struct {
     /// A DFlash drafter is bound: projections and attention read the row-exact kernels wherever the model's weights
     /// fit them, so a verify row reproduces serial decode bit for bit (`Caps.exact_drafted`).
     row_exact: bool = false,
+    /// An engine unit computing a prompt chunk's projections beside the GPU (`Caps.ane_prefill`); null = none.
+    offload: ?*const Offload = null,
+};
+
+/// The engine's calls a forward makes at a layer's projections: each returns true with new references in its outputs
+/// when it computed them from input `x` (`[1, rows, hidden]`), false to leave them to the model.
+pub const Offload = extern struct {
+    size: u32 = @sizeOf(Offload),
+    ctx: *anyopaque,
+    /// The dense MLP's output.
+    mlp: *const fn (ctx: *anyopaque, layer: u32, x: Array, out: *Array) callconv(.c) bool,
+    /// A GatedDeltaNet layer's joined q|k|v and z projections.
+    gdn_proj: *const fn (ctx: *anyopaque, layer: u32, x: Array, qkv: *Array, z: *Array) callconv(.c) bool,
 };
 
 /// What a `defer_host` forward left owed (`ForwardOut.owed`), settled by `forward_settle`.
@@ -595,12 +609,17 @@ pub const DistHooks = extern struct {
     serve: *const fn (m: *anyopaque, f: *const Forward, out: *ForwardOut) callconv(.c) Verdict,
 };
 
+/// A layer projection the engine reads beside the forward (`WeightHooks.layer_weight`).
+pub const LayerWeight = enum(u8) { mlp_gate, mlp_up, mlp_down, gdn_qkv, gdn_z };
+
 pub const WeightHooks = extern struct {
     size: u32 = @sizeOf(WeightHooks),
     /// After the weights load: folds, narrows, residents.
     transform: ?*const fn (m: *anyopaque) callconv(.c) Verdict = null,
     /// Whether the loader keeps tensor `key`; null = all.
     keep_key: ?*const fn (p: *const Parsed, key: Str) callconv(.c) bool = null,
+    /// Layer `layer`'s projection `which` as loaded (borrowed until `unload`); refused where the layer has none.
+    layer_weight: ?*const fn (m: *anyopaque, layer: u32, which: LayerWeight, out: *quant.Weight) callconv(.c) Verdict = null,
 };
 
 // ── The table ──
@@ -662,7 +681,7 @@ test "abi plugin: every struct opens with its size, set by default" {
         const v: T = .{};
         try testing.expectEqual(@as(u32, @sizeOf(T)), v.size);
     }
-    inline for (.{ LoadCtx, Forward, CacheOps, AuxHooks, HeadHooks, NativeDrafter, MediaHooks, DistHooks, ModelTable }) |T|
+    inline for (.{ LoadCtx, Forward, Offload, CacheOps, AuxHooks, HeadHooks, NativeDrafter, MediaHooks, DistHooks, ModelTable }) |T|
         try testing.expectEqual(@as(usize, 0), @offsetOf(T, "size"));
 }
 

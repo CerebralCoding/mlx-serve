@@ -33,8 +33,11 @@ run by the engine). `qwen3_next` reuses this plugin's load and forward (`plugins
   `mlp_only_layers`, pooling, `quantization_config.quant_method` / `expert_quant` / `modules` (ModelOpt, EXL3; Hadamard
   outside `prism_hadamard_qwen35`),
   2-bit group-128.
+- ANE prefill (`Caps.ane_prefill`, not Qwen3-Next or Prism): `WeightHooks.layer_weight` lends each dense MLP and
+  joined q|k|v / z to the engine's build; a prompt chunk's `Forward.offload` takes them at the legacy seams
+  (`GatedMlp`, the GDN projections). `ane_test.zig` proves the build's inputs and the seam against the legacy shell.
 - Not carried by the blocks (so not declared): `spec_tree` (the tree verify: drafts chain), grouped-verify
-  `projected` slices, ANE prefill, int8 prefill.
+  `projected` slices, int8 prefill.
 - Prism packs (`plugins/prism_hadamard_qwen35`) are this plugin's dense trunk with `Config.hadamard_block`: the `.prism`
   body (`Prism` base), one `rht.Registry` per model, f16 activations, an f32 GDN state.
 

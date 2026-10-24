@@ -74,7 +74,7 @@ pub const table = abi.ModelTable{
     .forward = &forward,
     .cache = &.{ .layout = &config.layout },
     .spec = &.{ .head = &head_hooks, .trunk_weight = &trunkWeight },
-    .weights = &.{},
+    .weights = &.{ .layer_weight = &layerWeight },
 };
 
 pub const head_hooks: abi.HeadHooks = .{
@@ -494,6 +494,32 @@ pub fn trunkWeight(mp: *anyopaque, which: abi.TrunkWeight, out: *quant_abi.Weigh
             .head => &d.base.weights.head,
         }, out),
     };
+}
+
+/// A dense layer's MLP projections and a linear-attention layer's joined q|k|v and z, borrowed (`Caps.ane_prefill`).
+pub fn layerWeight(mp: *anyopaque, layer: u32, which: abi.LayerWeight, out: *quant_abi.Weight) callconv(.c) Verdict {
+    const m: *Loaded = @ptrCast(@alignCast(mp));
+    const none = Verdict.refuse(.unsupported, "qwen3_5: the layer has no such projection");
+    const l: *const Linear = switch (m.body) {
+        .none => return Verdict.refuse(.failed, "qwen3_5: not loaded"),
+        inline .dense, .moe, .prism => |*d| blk: {
+            if (layer >= d.layers.len) return none;
+            const L = &d.layers[layer];
+            break :blk switch (which) {
+                .mlp_gate, .mlp_up, .mlp_down => if (@TypeOf(L.mlp) != b.mlp.GatedMlp.Weights) return none else switch (which) {
+                    .mlp_gate => &L.mlp.gate,
+                    .mlp_up => &L.mlp.up,
+                    else => &L.mlp.down,
+                },
+                .gdn_qkv, .gdn_z => switch (L.mixer) {
+                    .first => |*g| if (g.combined) return none else if (which == .gdn_qkv) &g.qkv else &g.z,
+                    .second => return none,
+                },
+            };
+        },
+    };
+    if (l.w.ctx == null) return none;
+    return ld.trunkWeight(l, out);
 }
 
 // ── the MTP head: its state is the head's cache, which the engine owns per slot ──

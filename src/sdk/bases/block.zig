@@ -79,6 +79,8 @@ pub const Ctx = struct {
     memo: ?*Memo = null,
     /// The row-exact lane the projections take (`blocks/row_exact.zig`): a bound drafter on a covered model.
     row_exact: @import("blocks/row_exact.zig").Lane = .off,
+    /// The engine's offload of this forward's projections (`Forward.offload`); null = none.
+    offload: ?*const abi.Offload = null,
 
     pub fn stream(c: *const Ctx) ops.Stream {
         return c.g.s;
@@ -112,6 +114,21 @@ pub const Ctx = struct {
         m.vals[m.n] = kept;
         m.n += 1;
         return kept;
+    }
+    /// This layer's dense MLP of `x` as the engine's offload computed it, owned by `g`; null = the block computes it.
+    pub fn offloadMlp(c: *const Ctx, x: Array) !?Array {
+        const o = c.offload orelse return null;
+        var y: abi.Array = .{};
+        if (!o.mlp(o.ctx, c.layer, .{ .ctx = x.ctx }, &y)) return null;
+        return try c.g.adopt(.{ .ctx = y.ctx });
+    }
+    /// This layer's GatedDeltaNet q|k|v and z projections of `x` as the engine's offload computed them, owned by `g`.
+    pub fn offloadGdn(c: *const Ctx, x: Array) !?[2]Array {
+        const o = c.offload orelse return null;
+        var qkv: abi.Array = .{};
+        var z: abi.Array = .{};
+        if (!o.gdn_proj(o.ctx, c.layer, .{ .ctx = x.ctx }, &qkv, &z)) return null;
+        return .{ try c.g.adopt(.{ .ctx = qkv.ctx }), try c.g.adopt(.{ .ctx = z.ctx }) };
     }
     /// `x` as `dt`, cast once per forward.
     pub fn castOnce(c: *const Ctx, x: Array, dt: ops.Dtype) !Array {

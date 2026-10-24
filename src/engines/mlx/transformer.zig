@@ -640,6 +640,10 @@ pub const Transformer = struct {
     // engines/mlx/ane_prefill.zig
     pub const denseMLPMaybeAne = @import("ane_prefill.zig").denseMLPMaybeAne;
     pub const gdnProjMaybeAne = @import("ane_prefill.zig").gdnProjMaybeAne;
+    pub const aneMlp = @import("ane_prefill.zig").aneMlp;
+    pub const aneGdnProj = @import("ane_prefill.zig").aneGdnProj;
+    pub const aneOffload = @import("ane_prefill.zig").aneOffload;
+    pub const aneLayers = @import("ane_prefill.zig").aneLayers;
     pub const anePackPlane = @import("ane_prefill.zig").anePackPlane;
     pub const aneReadPlane = @import("ane_prefill.zig").aneReadPlane;
     pub const denseMLPAneChannel = @import("ane_prefill.zig").denseMLPAneChannel;

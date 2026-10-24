@@ -73,6 +73,7 @@ test {
     _ = @import("plugins/qwen3_5/proof_test.zig");
     _ = @import("plugins/qwen3_5/served_test.zig");
     _ = @import("plugins/qwen3_5/mtp_test.zig");
+    _ = @import("plugins/qwen3_5/ane_test.zig");
     _ = @import("plugins/flint/proof_test.zig");
     _ = @import("plugins/llama/proof_test.zig");
     _ = @import("engines/mlx/kv/cache_ops.zig");
