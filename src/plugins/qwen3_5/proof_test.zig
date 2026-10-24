@@ -29,11 +29,7 @@ const solo = [_]twin.Step{
 fn open(p: *fixture.Pack, comptime moe: bool, comptime quantized: bool, comptime experts: c_int, comptime seed: u64) !*T {
     try pack.writePack(p, moe, quantized, experts);
     const name = std.fmt.comptimePrint("fixtures/twin-{x}.tape", .{seed});
-    const t = try T.open(p, pack.config(moe, quantized, experts), &.{}, "src/plugins/qwen3_5/" ++ name, @embedFile(name));
-    if (t.lg) |lg| {
-        lg.xfm.compileGdnGate();
-        if (moe) lg.xfm.compileMoeRouting();
-    }
+    const t = try T.open(p, pack.config(moe, quantized, experts), &.{}, @embedFile(name));
     return t;
 }
 
@@ -54,14 +50,13 @@ fn batchedCase(comptime moe: bool, comptime seed: u64) !void {
     const t = try open(&p, moe, true, 8, seed);
     defer t.close();
     // Split the merged states back after every tick, so each slot's states can be compared.
-    if (t.lg) |lg| lg.xfm.persistent_group_state_override = false;
     const lanes = [2]*twin.Lane{ try t.lane(), try t.lane() };
     defer for (lanes) |l| l.deinit();
     try t.step(lanes[0], .{ .mode = .prefill, .ids = &twin.seq(20, 3) });
     try t.step(lanes[1], .{ .mode = .prefill, .ids = &.{ 42, 101, 7, 9, 250, 3, 77 } });
-    try t.batched(lanes, .{ &.{77}, &.{3} }, true);
-    try t.batched(lanes, .{ &.{ 5, 61, 200 }, &.{ 9, 33, 140 } }, true);
-    try t.batched(lanes, .{ &.{190}, &.{64} }, true);
+    try t.batched(lanes, .{ &.{77}, &.{3} });
+    try t.batched(lanes, .{ &.{ 5, 61, 200 }, &.{ 9, 33, 140 } });
+    try t.batched(lanes, .{ &.{190}, &.{64} });
     try t.expectDone();
 }
 

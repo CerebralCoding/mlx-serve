@@ -28,13 +28,9 @@ pub const Oracle = @import("../../engines/mlx/plugin/both.zig").Oracle;
 const testing = std.testing;
 const Array = mlx.mlx_array;
 
-/// The same pack served both ways: the legacy `Transformer` (with the activations the engine's load compiles) and
-/// the plugin's shell; or the shell against a tape recorded from the legacy forward (`plugin/tape.zig`).
+/// The plugin's shell against a tape recorded from the legacy forward (`plugin/tape.zig`).
 pub const Both = struct {
-    /// The legacy load; null when the values come from a tape.
-    lg: ?*fixture.Legacy,
-    /// The pack's folder when no legacy load owns one.
-    tmp: ?testing.TmpDir,
+    tmp: testing.TmpDir,
     dir: []u8,
     cfg: model.ModelConfig,
     xfm: Transformer,
@@ -44,47 +40,26 @@ pub const Both = struct {
     tables: [2]?Array,
     declined: [2]bool,
 
-    pub fn open(table: *const abi.ModelTable, p: *fixture.Pack, json: []const u8) !Both {
-        return openAs(table, p, json, .{ .legacy = null });
-    }
-
-    /// `from.legacy` names the tape (a path under the repo root) the legacy values are recorded to.
     pub fn openAs(table: *const abi.ModelTable, p: *fixture.Pack, json: []const u8, from: Oracle) !Both {
         const a = testing.allocator;
         const io = std.Io.Threaded.global_single_threaded.io();
         const tables = fused_act.gelu_tanh_tables;
         const declined = fused_act.gelu_tanh_declined;
-        const lg: ?*fixture.Legacy = if (from == .legacy) try p.load(json) else null;
-        errdefer if (lg) |l| l.deinit();
-        if (lg) |l| if (!mlx.noGpuBackend()) {
-            l.xfm.compileGelu();
-            l.xfm.compileGeglu();
-            if (l.config.final_logit_softcapping > 0) l.xfm.compileSoftcap();
-            if (l.xfm.moe_layers != null) l.xfm.compileMoeRouting();
-        };
-        var tmp: ?testing.TmpDir = if (lg == null) testing.tmpDir(.{}) else null;
-        errdefer if (tmp) |*t| t.cleanup();
-        const dir_h = if (lg) |l| l.tmp.dir else tmp.?.dir;
-        try dir_h.writeFile(io, .{ .sub_path = "config.json", .data = json });
+        var tmp = testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = json });
         var path_buf: [512]u8 = undefined;
-        const dir = try a.dupe(u8, path_buf[0..try dir_h.realPath(io, &path_buf)]);
+        const dir = try a.dupe(u8, path_buf[0..try tmp.dir.realPath(io, &path_buf)]);
         errdefer a.free(dir);
-        if (lg == null) {
-            const file = try std.fmt.allocPrintSentinel(a, "{s}/model.safetensors", .{dir}, 0);
-            defer a.free(file);
-            const meta = mlx.mlx_map_string_to_string_new();
-            defer _ = mlx.mlx_map_string_to_string_free(meta);
-            try mlx.check(mlx.mlx_save_safetensors(file.ptr, p.map, meta));
-        }
+        try p.save(dir);
         var cfg = try bind(a, io, table, dir, json);
         errdefer cfg.deinit(a);
         const xfm = try driver.load(io, a, &cfg, dir, fixture.stream());
         const t: Tape = switch (from) {
             .tape => |bytes| try Tape.player(bytes),
             .none => .{},
-            .legacy => |rel| if (rel) |r| if (tape_mod.recordRoot()) |root| try Tape.recorder(root, r) else .{} else .{},
         };
-        return .{ .lg = lg, .tmp = tmp, .dir = dir, .cfg = cfg, .xfm = xfm, .tape = t, .tables = tables, .declined = declined };
+        return .{ .tmp = tmp, .dir = dir, .cfg = cfg, .xfm = xfm, .tape = t, .tables = tables, .declined = declined };
     }
 
     /// A playback read every recorded value (the last call of a proof).
@@ -92,14 +67,11 @@ pub const Both = struct {
         try b.tape.expectDone();
     }
 
-    /// Writes a recording and frees both loads.
     pub fn close(b: *Both) void {
-        b.tape.finish() catch |e| std.debug.panic("proof tape: {t}", .{e});
         b.xfm.deinit();
         b.cfg.deinit(testing.allocator);
         testing.allocator.free(b.dir);
-        if (b.tmp) |*t| t.cleanup();
-        if (b.lg) |l| l.deinit();
+        b.tmp.cleanup();
         for (&fused_act.gelu_tanh_tables, b.tables) |*t, before| {
             if (t.*) |now| if (before == null) {
                 _ = mlx.mlx_array_free(now);
@@ -109,38 +81,27 @@ pub const Both = struct {
         fused_act.gelu_tanh_declined = b.declined;
     }
 
-    /// The shells to run: the legacy one first when loaded, the plugin's last.
+    /// The shell to run (a slice, as the proofs iterate it).
     pub fn sides(b: *Both, buf: *[2]*Transformer) []const *Transformer {
-        buf[1] = &b.xfm;
-        if (b.lg) |l| {
-            buf[0] = &l.xfm;
-            return buf[0..2];
-        }
-        return buf[1..2];
+        buf[0] = &b.xfm;
+        return buf[0..1];
     }
 
-    /// `got` (the plugin's) against `want` (the legacy's, when loaded) or the tape; `tokens` marks a greedy run.
-    pub fn check(b: *Both, got: Array, want: ?Array, tokens: bool) !void {
-        if (want) |w| {
-            try ops.expectBitEqual(got, w);
-            if (b.tape.recording()) try b.tape.put(w);
-        } else try b.tape.expectNext(got, tokens);
+    /// `got` against the tape; `tokens` marks a greedy run.
+    pub fn check(b: *Both, got: Array, tokens: bool) !void {
+        try b.tape.expectNext(got, tokens);
     }
 
     /// Host values as `check` reads them; `tokens` marks a greedy run.
-    pub fn checkSlice(b: *Both, comptime T: type, got: []const T, want: ?[]const T, tokens: bool) !void {
+    pub fn checkSlice(b: *Both, comptime T: type, got: []const T, tokens: bool) !void {
         const dt: mlx.mlx_dtype = if (T == u32) .uint32 else .float32;
         const g = mlx.mlx_array_new_data(got.ptr, &[_]c_int{@intCast(got.len)}, 1, dt);
         defer _ = mlx.mlx_array_free(g);
-        const w: ?Array = if (want) |x| mlx.mlx_array_new_data(x.ptr, &[_]c_int{@intCast(x.len)}, 1, dt) else null;
-        defer if (w) |x| {
-            _ = mlx.mlx_array_free(x);
-        };
-        try b.check(g, w, tokens);
+        try b.check(g, tokens);
     }
 
-    pub fn checkIds(b: *Both, got: []const u32, want: ?[]const u32) !void {
-        try b.checkSlice(u32, got, want, true);
+    pub fn checkIds(b: *Both, got: []const u32) !void {
+        try b.checkSlice(u32, got, true);
     }
 };
 
@@ -230,7 +191,7 @@ pub fn expectSteps(b: *Both) !void {
             _ = try g.adopt(caps[1]);
             outs[k] = .{ logits, hidden, caps[1] };
         }
-        for (0..3) |i| try b.check(outs[xs.len - 1][i], if (xs.len == 2) outs[0][i] else null, false);
+        for (0..3) |i| try b.check(outs[xs.len - 1][i], false);
     }
 }
 
@@ -256,7 +217,7 @@ pub fn expectGreedy(b: *Both) !void {
             t.* = mlx.mlx_array_data_uint32(host).?[0];
         }
     }
-    try b.checkIds(&tokens[xs.len - 1], if (xs.len == 2) &tokens[0] else null);
+    try b.checkIds(&tokens[xs.len - 1]);
 }
 
 /// A prompt with three media rows at placeholder `img` (the engine's `vision_embeddings`, the shell's `Forward.media`),
@@ -285,7 +246,7 @@ pub fn expectMedia(b: *Both, img: i32) !void {
         outs[k][1] = try g.adopt(try x.forwardWith(&s.ctx, try fixture.tokens(&g, &.{64})));
     }
     const got = outs[xs.len - 1];
-    for (0..2) |i| try b.check(got[i], if (xs.len == 2) outs[0][i] else null, false);
+    for (0..2) |i| try b.check(got[i], false);
     var s: Slot = undefined;
     try s.init(n);
     defer s.deinit();
@@ -325,7 +286,7 @@ pub fn expectBatched(b: *Both) !void {
             for (rows[k]) |r| _ = try g.adopt(r);
         }
         defer for (rows[0..xs.len]) |r| a.free(r);
-        for (rows[xs.len - 1], 0..) |got, i| try b.check(got, if (xs.len == 2) rows[0][i] else null, false);
+        for (rows[xs.len - 1]) |got| try b.check(got, false);
         for (&positions) |*p| p.* += 1;
     }
 }
@@ -451,13 +412,10 @@ const gemma3_bf16 =
 /// (the flip needs them from the cache layout and facts first).
 pub const flip_waived = [_][]const u8{ "has_qk_norm", "has_pre_ff_norm", "hidden_act" };
 
-/// The legacy forward is the oracle, recorded to `fixtures/` (`MLX_SERVE_PROOF_RECORD=<repo root>`) until it is
-/// deleted; then the proofs replay the recording.
-const frozen = true;
 
 fn oracle(comptime name: []const u8) Oracle {
     const rel = "fixtures/" ++ name ++ ".tape";
-    return if (frozen) .{ .tape = @embedFile(rel) } else .{ .legacy = "src/plugins/gemma3/" ++ rel };
+    return .{ .tape = @embedFile(rel) };
 }
 
 test "gemma3 plugin: a 4-bit pack (pattern layers, softcap, rope scale 8) is bit-equal to the legacy forward" {
@@ -509,7 +467,6 @@ test "gemma3 plugin: 2-bit group-128 packs, plain (stock qmm) and ternary (qmv2'
         var b = try Both.openAs(&gemma3.table, &p, json, oracle(cs[1]));
         defer b.close();
         const m: *const gemma3.Loaded = @ptrCast(@alignCast(b.xfm.plugin.?.model));
-        if (b.lg) |lg| try testing.expectEqual(cs[0].ternary, lg.xfm.ternary_2bit);
         try testing.expectEqual(cs[0].ternary, m.base.weights.head.head.ternary);
         try expectSteps(&b);
         try expectGreedy(&b);

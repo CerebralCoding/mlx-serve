@@ -67,9 +67,6 @@ fn writePack(p: *fixture.Pack, two_bit: bool) !void {
     }
 }
 
-/// The legacy forward was the oracle, recorded to `fixtures/` (`MLX_SERVE_PROOF_RECORD=<repo root>`); it is deleted,
-/// so the proofs replay the recording.
-const frozen = true;
 
 /// Hidden rows through the driver's shell on the legacy config (one unmasked sequence, a padded batch under its key
 /// mask), against the recorded `forwardBertWith` (its GELU compiled, as the engine's load compiled it).
@@ -79,9 +76,8 @@ fn servedCase(json: []const u8, two_bit: bool, comptime seed: u64) !void {
     defer p.deinit();
     try writePack(&p, two_bit);
     const name = std.fmt.comptimePrint("fixtures/{x}.tape", .{seed});
-    var b = if (frozen) try both.Both.replay(&bert.table, &p, json, true, @embedFile(name)) else try both.Both.openAs(&bert.table, &p, json, true, .{ .legacy = "src/plugins/bert/" ++ name });
+    var b = try both.Both.replay(&bert.table, &p, json, true, @embedFile(name));
     defer b.close();
-    if (b.lg) |lg| lg.xfm.compileGelu();
     const m: *bert.Loaded = @ptrCast(@alignCast(b.xfm.plugin.?.model));
     try testing.expect(m.gelu.ctx != null);
     var g = ops.Graph.init(a, b.xfm.s);
@@ -91,8 +87,7 @@ fn servedCase(json: []const u8, two_bit: bool, comptime seed: u64) !void {
     const mask = try g.adopt(try buildKeyPadMask(a, &.{ 5, 3 }, 5, b.xfm.s));
     for ([_]mlx.mlx_array{ one, ids }, [_]?mlx.mlx_array{ null, mask }) |x, km| {
         const got = try g.adopt(try b.xfm.forwardEmbeddingMasked(x, km, null));
-        const want: ?mlx.mlx_array = if (b.lg) |lg| try g.adopt(try lg.xfm.forwardEmbeddingMasked(x, km, null)) else null;
-        try b.check(got, want, false);
+        try b.check(got, false);
     }
     // An encoder refuses decode.
     const toks = [_]u32{ 101, 7 };

@@ -99,12 +99,8 @@ fn case(comptime quantized: bool, comptime seed: u64) !void {
     defer std.testing.allocator.free(json);
     const T = twin.Twin(qwen3_next);
     const name = std.fmt.comptimePrint("fixtures/twin-{x}.tape", .{seed});
-    const t = try T.open(&p, json, &.{}, "src/plugins/qwen3_next/" ++ name, @embedFile(name));
+    const t = try T.open(&p, json, &.{}, @embedFile(name));
     defer t.close();
-    if (t.lg) |lg| {
-        lg.xfm.compileGdnGate();
-        lg.xfm.compileMoeRouting();
-    }
     const l = try t.lane();
     defer l.deinit();
     for (steps) |st| try t.step(l, st);

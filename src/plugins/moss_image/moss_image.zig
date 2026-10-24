@@ -1192,7 +1192,6 @@ test "MOSS-Image: the text encoder's served trunk is bit-equal to the engine's o
     const h = try eng.encodePrompt("a red cat on a chair");
     defer _ = mlx.mlx_array_free(h);
     var tape = try tape_mod.Tape.player(@embedFile("fixtures/text_encoder.tape"));
-    defer tape.finish() catch |e| std.debug.panic("proof tape: {t}", .{e});
     try tape.expectNext(h, false);
     try tape.expectDone();
 }

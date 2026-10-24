@@ -1,13 +1,9 @@
-//! A family proof's expected values, recorded from the legacy forward before that forward is deleted: every array a
+//! A family proof's expected values, recorded from the legacy forward before that forward was deleted: every array a
 //! proof compares, in order, with the GPU architecture it ran on. Played back on the same architecture the plugin's
 //! values must equal the recording bit for bit; elsewhere (other kernels, other reduction orders) they must agree to
 //! 2% relative RMS and greedy token runs are not compared. Test-only.
-//!
-//! Record: `MLX_SERVE_PROOF_RECORD=<repo root>` with the legacy forward still present writes
-//! `<root>/<path>` at `Both.close`.
 
 const std = @import("std");
-const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const device = @import("../../../mlx/device.zig");
 
@@ -19,12 +15,6 @@ const magic = "MSVPROOF1";
 pub fn deviceName(buf: []u8) []const u8 {
     if (mlx.noGpuBackend()) return "cpu";
     return device.gpuArchitecture(buf) orelse "unknown";
-}
-
-/// The repo root to record under, when recording.
-pub fn recordRoot() ?[]const u8 {
-    const v = env.get(.MLX_SERVE_PROOF_RECORD) orelse return null;
-    return std.mem.span(v);
 }
 
 /// The bytes of `x`, contiguous and evaluated on the CPU. Owned by the caller.
@@ -84,34 +74,14 @@ fn sample(x: Array) !Array {
     return mlx.mlx_array_new_data(out.ptr, &[_]c_int{@intCast(k)}, 1, mlx.mlx_array_dtype(x));
 }
 
-/// A proof whose tape `recorded` is still empty records it from the legacy forward (`MLX_SERVE_PROOF_RECORD` set);
-/// every other run plays its tape back without the legacy load.
-pub fn records(recorded: []const u8) bool {
-    return recorded.len == 0 and recordRoot() != null;
-}
-
 pub const Tape = struct {
-    /// Recording: the file under the root, and the bytes so far.
-    path: ?[]u8 = null,
-    buf: std.ArrayList(u8) = .empty,
-    /// Playing back: the recording and the read offset.
+    /// The recording and the read offset.
     data: []const u8 = &.{},
     at: usize = 0,
     same_device: bool = true,
     /// Arrays over this many bytes are kept as a digest of their dtype, shape and bytes (compared on the recording's
-    /// device only) and an even sample of `sample_len` elements; 0 = every array whole. Set alike to record and play.
+    /// device only) and an even sample of `sample_len` elements; 0 = every array whole. As it was recorded.
     compact_over: usize = 0,
-
-    pub fn recorder(root: []const u8, rel: []const u8) !Tape {
-        const a = testing.allocator;
-        var t: Tape = .{ .path = try std.fs.path.join(a, &.{ root, rel }) };
-        var dbuf: [64]u8 = undefined;
-        const dev = deviceName(&dbuf);
-        try t.buf.appendSlice(a, magic);
-        try t.buf.append(a, @intCast(dev.len));
-        try t.buf.appendSlice(a, dev);
-        return t;
-    }
 
     pub fn player(bytes: []const u8) !Tape {
         if (bytes.len < magic.len + 1 or !std.mem.eql(u8, bytes[0..magic.len], magic)) return error.NotAProofTape;
@@ -123,39 +93,12 @@ pub const Tape = struct {
         return .{ .data = bytes, .at = magic.len + 1 + n, .same_device = same };
     }
 
-    pub fn recording(t: *const Tape) bool {
-        return t.path != null;
-    }
-
     pub fn playing(t: *const Tape) bool {
         return t.data.len > 0;
     }
 
-    /// Appends `x` (the legacy forward's value) to the recording.
-    pub fn put(t: *Tape, x: Array) !void {
-        if (!t.compacts(x)) return t.putWhole(x);
-        const d = try digest(x);
-        defer _ = mlx.mlx_array_free(d);
-        try t.putWhole(d);
-        const s = try sample(x);
-        defer _ = mlx.mlx_array_free(s);
-        try t.putWhole(s);
-    }
-
     fn compacts(t: *const Tape, x: Array) bool {
         return t.compact_over > 0 and mlx.mlx_array_size(x) * mlx.mlx_array_itemsize(x) > t.compact_over;
-    }
-
-    fn putWhole(t: *Tape, x: Array) !void {
-        const a = testing.allocator;
-        const sh = mlx.getShape(x);
-        try t.buf.append(a, @intCast(@backingInt(mlx.mlx_array_dtype(x))));
-        try t.buf.append(a, @intCast(sh.len));
-        for (sh) |d| try t.buf.appendSlice(a, std.mem.asBytes(&@as(i32, d)));
-        const bytes = try bytesOf(a, x);
-        defer a.free(bytes);
-        try t.buf.appendSlice(a, std.mem.asBytes(&@as(u64, bytes.len)));
-        try t.buf.appendSlice(a, bytes);
     }
 
     fn take(t: *Tape, n: usize) ![]const u8 {
@@ -211,38 +154,4 @@ pub const Tape = struct {
     pub fn expectDone(t: *const Tape) !void {
         if (t.playing()) try testing.expectEqual(t.data.len, t.at);
     }
-
-    /// Writes the recording.
-    pub fn finish(t: *Tape) !void {
-        const a = testing.allocator;
-        const p = t.path orelse return;
-        defer a.free(p);
-        defer t.buf.deinit(a);
-        const io = std.Io.Threaded.global_single_threaded.io();
-        if (std.fs.path.dirname(p)) |d| try std.Io.Dir.cwd().createDirPath(io, d);
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = t.buf.items });
-    }
 };
-
-// ── tests ──
-
-test "proof tape: an array past compact_over is kept as a digest and an even sample, and replays" {
-    const a = testing.allocator;
-    var vals: [1024]f32 = undefined;
-    for (&vals, 0..) |*v, i| v.* = @floatFromInt(i);
-    const x = mlx.mlx_array_new_data(&vals, &[_]c_int{ 4, 256 }, 2, .float32);
-    defer _ = mlx.mlx_array_free(x);
-    var r: Tape = .{ .compact_over = 64 };
-    defer r.buf.deinit(a);
-    var dbuf: [64]u8 = undefined;
-    const dev = deviceName(&dbuf);
-    try r.buf.appendSlice(a, magic);
-    try r.buf.append(a, @intCast(dev.len));
-    try r.buf.appendSlice(a, dev);
-    try r.put(x);
-    try testing.expect(r.buf.items.len < @sizeOf(@TypeOf(vals)) / 2);
-    var p = try Tape.player(r.buf.items);
-    p.compact_over = 64;
-    try p.expectNext(x, false);
-    try p.expectDone();
-}

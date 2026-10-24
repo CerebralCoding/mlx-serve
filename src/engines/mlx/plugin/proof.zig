@@ -134,7 +134,7 @@ fn openProof(p: *fixture.Pack, g: Geo, comptime seed: u64) !both.Both {
     const json = try configJson(a, g);
     defer a.free(json);
     const name = std.fmt.comptimePrint("fixtures/{x}.tape", .{seed});
-    return both.Both.proof(&llama.table, p, json, true, "src/engines/mlx/plugin/" ++ name, @embedFile(name));
+    return both.Both.replay(&llama.table, p, json, true, @embedFile(name));
 }
 
 fn proofCase(g: Geo, comptime seed: u64) !void {
@@ -146,7 +146,7 @@ fn proofCase(g: Geo, comptime seed: u64) !void {
     if (g.llama3) try testing.expectEqualStrings("llama3-rope-v1", b.cfg.cacheLayoutNamespace().?);
     try b.expectSteps(&both.steps);
     try b.expectGreedy();
-    try b.expectBatched(.dense);
+    try b.expectBatched();
     try b.expectDone();
 }
 
@@ -172,18 +172,13 @@ test "plugin driver: a DFlash drafter on a served llama trunk reads its embeddin
     defer g.deinit();
     const ids = try fixture.tokens(&g, &.{ 4, 90, 127, 0, 33 });
     const hidden = try g.reshape(try g.adopt(try b.xfm.rawEmbedding(ids)), &.{ 1, 5, 64 });
-    const lg: ?*Transformer = if (b.lg) |l| &l.xfm else null;
-    try b.check(try g.adopt(try b.xfm.rawEmbedding(ids)), if (lg) |x| try g.adopt(try x.rawEmbedding(ids)) else null, false);
-    try b.check(try g.adopt(try b.xfm.lmHeadForDraft(hidden)), if (lg) |x| try g.adopt(try x.lmHeadForDraft(hidden)) else null, false);
-    var tokens: [2][16]u32 = undefined;
-    var accepted: [2]std.ArrayList(u32) = .{ .empty, .empty };
-    defer for (&accepted) |*l| l.deinit(a);
-    try both.dflashRun(&b.xfm, &tokens[1], &accepted[1]);
-    if (lg) |x| try both.dflashRun(x, &tokens[0], &accepted[0]);
-    for ([_][]const u32{ &tokens[1], accepted[1].items }, [_][]const u32{ &tokens[0], accepted[0].items }) |got, want| {
-        const ga = try g.fromSlice(u32, got, &.{@intCast(got.len)});
-        try b.check(ga, if (lg != null) try g.fromSlice(u32, want, &.{@intCast(want.len)}) else null, true);
-    }
+    try b.check(try g.adopt(try b.xfm.rawEmbedding(ids)), false);
+    try b.check(try g.adopt(try b.xfm.lmHeadForDraft(hidden)), false);
+    var tokens: [16]u32 = undefined;
+    var accepted: std.ArrayList(u32) = .empty;
+    defer accepted.deinit(a);
+    try both.dflashRun(&b.xfm, &tokens, &accepted);
+    for ([_][]const u32{ &tokens, accepted.items }) |got| try b.check(try g.fromSlice(u32, got, &.{@intCast(got.len)}), true);
     try b.expectDone();
 }
 

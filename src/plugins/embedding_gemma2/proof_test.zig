@@ -17,13 +17,10 @@ const embedding_gemma2 = @import("plugin.zig");
 
 const testing = std.testing;
 
-/// The legacy forward is the oracle, recorded to `fixtures/` (`MLX_SERVE_PROOF_RECORD=<repo root>`) until it is
-/// deleted; then the proofs replay the recording.
-const frozen = true;
 
 fn oracle(comptime name: []const u8) gemma_proof.Oracle {
     const rel = "fixtures/" ++ name ++ ".tape";
-    return if (frozen) .{ .tape = @embedFile(rel) } else .{ .legacy = "src/plugins/embedding_gemma2/" ++ rel };
+    return .{ .tape = @embedFile(rel) };
 }
 
 const H = 128;
@@ -93,7 +90,7 @@ fn expectImageRows(b: *Both) !void {
     var outs: [2]mlx.mlx_array = undefined;
     for (xs, 0..) |x, k| outs[k] = try g.adopt(try x.forwardEmbeddingMasked(ids, null, rows));
     const got = outs[xs.len - 1];
-    try b.check(got, if (xs.len == 2) outs[0] else null, false);
+    try b.check(got, false);
     // The rows reach the forward: without them the same prompt reads the placeholder's embedding.
     const plain = try g.adopt(try b.xfm.forwardEmbeddingMasked(ids, null, null));
     const eq = try g.call(mlx.mlx_array_equal, .{ plain, got, false });

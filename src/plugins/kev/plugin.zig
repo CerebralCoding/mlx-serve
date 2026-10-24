@@ -130,7 +130,6 @@ test "kev plugin: the served qwen3_5 trunk scores branches bit-equal to the engi
     };
 
     var tape = try tape_mod.Tape.player(@embedFile("fixtures/trunk.tape"));
-    defer tape.finish() catch |e| std.debug.panic("proof tape: {t}", .{e});
     for (got.out) |x| try tape.expectNext(x, false);
     try tape.expectDone();
 }

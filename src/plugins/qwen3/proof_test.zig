@@ -91,16 +91,15 @@ pub fn writePack(p: *fixture.Pack, g: Geo) !void {
 
 // ── dense, served through the engine's plugin path ──
 
-/// The pack served by its plugin, against the legacy `Transformer` while its tape records.
+/// The pack served by its plugin, against its tape.
 const Both = struct {
-    lg: ?*fixture.Legacy,
     tmp: testing.TmpDir,
     dir: []u8,
     cfg: model.ModelConfig,
     xfm: Transformer,
     layers: u32,
     oracle: served_test.Oracle,
-    sides: [2]*Transformer = undefined,
+    sides: [1]*Transformer = undefined,
 
     fn open(b: *Both, g: Geo, comptime seed: u64) !void {
         const a = testing.allocator;
@@ -110,21 +109,13 @@ const Both = struct {
         try writePack(&p, g);
         const json = try configJson(a, g);
         defer a.free(json);
-        b.* = .{ .lg = null, .tmp = testing.tmpDir(.{}), .dir = &.{}, .cfg = undefined, .xfm = undefined, .layers = g.layers, .oracle = try served_test.oracle("qwen3", std.fmt.comptimePrint("both-{x}", .{seed})) };
+        b.* = .{ .tmp = testing.tmpDir(.{}), .dir = &.{}, .cfg = undefined, .xfm = undefined, .layers = g.layers, .oracle = try served_test.oracle("qwen3", std.fmt.comptimePrint("both-{x}", .{seed})) };
         errdefer b.tmp.cleanup();
-        if (b.oracle.tape.recording()) {
-            const lg = try p.load(json);
-            // The engine's load compiles the router where a GPU runs it; the plugin does too.
-            if (g.experts > 0) lg.xfm.compileMoeRouting();
-            b.lg = lg;
-        }
-        errdefer if (b.lg) |lg| lg.deinit();
-        const dir_h = if (b.lg) |lg| lg.tmp.dir else b.tmp.dir;
-        try dir_h.writeFile(io, .{ .sub_path = "config.json", .data = json });
+        try b.tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = json });
         var path_buf: [512]u8 = undefined;
-        b.dir = try a.dupe(u8, path_buf[0..try dir_h.realPath(io, &path_buf)]);
+        b.dir = try a.dupe(u8, path_buf[0..try b.tmp.dir.realPath(io, &path_buf)]);
         errdefer a.free(b.dir);
-        if (b.lg == null) try p.save(b.dir);
+        try p.save(b.dir);
         b.cfg = try model.parseConfig(io, a, b.dir);
         errdefer b.cfg.deinit(a);
         if (b.cfg.plugin == null) return error.TestExpectedServedPack;
@@ -132,23 +123,21 @@ const Both = struct {
     }
 
     fn close(b: *Both) void {
-        b.oracle.finish();
         b.xfm.deinit();
         b.cfg.deinit(testing.allocator);
         testing.allocator.free(b.dir);
-        if (b.lg) |lg| lg.deinit();
         b.tmp.cleanup();
     }
 
-    /// The shells to run: the legacy one first while recording, the served one last.
+    /// The shell to run (a slice, as the proofs iterate it).
     fn shells(b: *Both) []const *Transformer {
-        b.sides = .{ if (b.lg) |lg| &lg.xfm else &b.xfm, &b.xfm };
-        return if (b.lg != null) &b.sides else b.sides[1..];
+        b.sides = .{&b.xfm};
+        return &b.sides;
     }
 
-    /// One value per shell: the served one's against the legacy's or the tape.
+    /// The shell's value against the tape.
     pub fn check(b: *Both, vals: []const Array) !void {
-        try b.oracle.check(vals[vals.len - 1], if (vals.len == 2) vals[0] else null, false);
+        try b.oracle.check(vals[vals.len - 1], false);
     }
 };
 
@@ -224,7 +213,7 @@ fn expectGreedy(b: *Both) !void {
             t.* = mlx.mlx_array_data_uint32(host).?[0];
         }
     }
-    try b.oracle.stream(&tokens[xs.len - 1], if (xs.len == 2) &tokens[0] else null);
+    try b.oracle.stream(&tokens[xs.len - 1]);
 }
 
 /// Two slots prefilled apart, then decoded together: each slot's logits bit-equal to the legacy batched tick's.
@@ -422,9 +411,8 @@ fn moeCase(g: Geo, comptime seed: u64) !void {
     const json = try configJson(testing.allocator, g);
     defer testing.allocator.free(json);
     const name = std.fmt.comptimePrint("fixtures/twin-{x}.tape", .{seed});
-    const t = try T.open(&p, json, &.{}, "src/plugins/qwen3/" ++ name, @embedFile(name));
+    const t = try T.open(&p, json, &.{}, @embedFile(name));
     defer t.close();
-    if (t.lg) |lg| lg.xfm.compileMoeRouting();
     const l = try t.lane();
     defer l.deinit();
     for (moe_steps) |st| try t.step(l, st);
@@ -479,8 +467,8 @@ fn expectDflash(geo: Geo, comptime seed: u64) !void {
     defer for (&accepted) |*l| l.deinit(a);
     for (xs, 0..) |x, k| try served_test.dflashRun(x, asst, &tokens[k], &accepted[k]);
     const last = xs.len - 1;
-    try b.oracle.stream(&tokens[last], if (last == 1) &tokens[0] else null);
-    try b.oracle.stream(accepted[last].items, if (last == 1) accepted[0].items else null);
+    try b.oracle.stream(&tokens[last]);
+    try b.oracle.stream(accepted[last].items);
     try b.oracle.done();
 }
 

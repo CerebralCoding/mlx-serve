@@ -154,9 +154,6 @@ pub fn rowExactTrunkConfig(buf: []u8) ![]const u8 {
     return configJson(buf, .{ .mamba_heads = 8 });
 }
 
-/// The legacy forward is the oracle, recorded to `fixtures/` (`MLX_SERVE_PROOF_RECORD=<repo root>`), until it is
-/// deleted; then the proofs replay the recording.
-const frozen = true;
 
 /// `sh`'s pack served by the driver on the legacy parse's config (recurrent entries per slot), against its oracle.
 fn openCase(p: *fixture.Pack, sh: Shape, comptime seed: u64) !both.Both {
@@ -164,8 +161,7 @@ fn openCase(p: *fixture.Pack, sh: Shape, comptime seed: u64) !both.Both {
     var cbuf: [4096]u8 = undefined;
     const json = try configJson(&cbuf, sh);
     const name = std.fmt.comptimePrint("fixtures/{x}.tape", .{seed});
-    if (frozen) return both.Both.replay(&nemotron.table, p, json, true, @embedFile(name));
-    return both.Both.openAs(&nemotron.table, p, json, true, .{ .legacy = "src/plugins/nemotron_h/" ++ name });
+    return both.Both.replay(&nemotron.table, p, json, true, @embedFile(name));
 }
 
 /// Steps past a chunk wider than the in-place expert window, then the pipelined greedy decode; `drafter` binds a
@@ -176,10 +172,8 @@ fn servedCase(sh: Shape, drafter: bool, comptime seed: u64) !void {
     defer p.deinit();
     var b = try openCase(&p, sh, seed);
     defer b.close();
-    if (b.lg) |lg| try testing.expectEqual(lg.xfm.config.row_exact_covered, b.xfm.config.row_exact_covered);
     if (drafter) {
         try testing.expect(b.xfm.config.row_exact_covered);
-        if (b.lg) |lg| lg.xfm.config.dflash_bound = true;
         b.xfm.config.dflash_bound = true;
     }
     try b.expectSteps(&(proof.steps ++ wide_steps));
@@ -272,7 +266,6 @@ test "nemotron_h served: 2-bit packs, plain (stock qmm) and ternary (qmv2's kern
         var b = try openCase(&p, .{ .two_bit = two }, seed);
         defer b.close();
         const m: *const nemotron.Loaded = @ptrCast(@alignCast(b.xfm.plugin.?.model));
-        if (b.lg) |lg| try testing.expectEqual(two == .ternary, lg.xfm.ternary_2bit);
         try testing.expectEqual(two == .ternary, m.base.weights.head.ternary);
         try b.expectSteps(&both.long_steps);
         try b.expectGreedy();
@@ -397,7 +390,6 @@ fn writeGgufPack(p: *fixture.Pack, moe: bool) !void {
     }
 }
 
-const frozen_gguf = true;
 
 fn ggufCase(moe: bool, comptime seed: u64) !void {
     var p = fixture.Pack.init(seed);
@@ -406,12 +398,8 @@ fn ggufCase(moe: bool, comptime seed: u64) !void {
     const json = try ggufConfig(moe);
     defer testing.allocator.free(json);
     const name = std.fmt.comptimePrint("fixtures/gguf-{x}.tape", .{seed});
-    var b = if (frozen_gguf) try both.Both.replay(&nemotron.table, &p, json, true, @embedFile(name)) else try both.Both.openAs(&nemotron.table, &p, json, true, .{ .legacy = "src/plugins/nemotron_h/" ++ name });
+    var b = try both.Both.replay(&nemotron.table, &p, json, true, @embedFile(name));
     defer b.close();
-    if (b.lg) |lg| {
-        try testing.expect(lg.config.quant_mode == .gguf);
-        try testing.expectEqual(lg.xfm.config.row_exact_covered, b.xfm.config.row_exact_covered);
-    }
     const m: *const nemotron.Loaded = @ptrCast(@alignCast(b.xfm.plugin.?.model));
     try testing.expect(m.base.weights.head.mode == .gguf and m.base.row_exact == .off);
     try b.expectSteps(&(proof.steps ++ wide_steps));
@@ -523,9 +511,8 @@ fn ggufFileCase(moe: bool, by_file: bool, comptime seed: u64) !void {
     defer g.deinit();
     try writeGgufFile(&g, moe, seed);
     const name = std.fmt.comptimePrint("fixtures/gguf-file-{x}.tape", .{seed});
-    var b = try proof.openGguf(&nemotron.table, &g, by_file, if (frozen_gguf) .{ .tape = @embedFile(name) } else .{ .legacy = "src/plugins/nemotron_h/" ++ name });
+    var b = try proof.openGguf(&nemotron.table, &g, by_file, .{ .tape = @embedFile(name) });
     defer b.close();
-    if (b.lg) |lg| try testing.expect(lg.config.quant_mode == .gguf);
     try b.expectSteps(&(proof.steps ++ wide_steps));
     try b.expectSteps(&both.long_steps);
     try b.expectGreedy();

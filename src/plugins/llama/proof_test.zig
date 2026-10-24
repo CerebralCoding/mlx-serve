@@ -53,13 +53,13 @@ fn writePack(p: *fixture.Pack, quantized: bool, tied: bool, biases: bool) !void 
 
 /// The legacy forward's values, recorded to `fixtures/<name>.tape`.
 fn open(p: *fixture.Pack, json: []const u8, comptime legacy_config: bool, comptime name: []const u8) !both.Both {
-    return both.Both.proof(&plugin.table, p, json, legacy_config, "src/plugins/llama/fixtures/" ++ name ++ ".tape", @embedFile("fixtures/" ++ name ++ ".tape"));
+    return both.Both.replay(&plugin.table, p, json, legacy_config, @embedFile("fixtures/" ++ name ++ ".tape"));
 }
 
 fn expectAll(b: *both.Both) !void {
     try b.expectSteps(&both.steps);
     try b.expectGreedy();
-    try b.expectBatched(.dense);
+    try b.expectBatched();
     try b.expectDone();
 }
 

@@ -170,11 +170,11 @@ fn headCase(comptime quantized: bool, comptime seed: u64) !void {
             return error.PluginForward;
         }
         if (call == .open or call == .draft) {
-            try b.check(try g.adopt(.{ .ctx = out.hidden.ctx }), null, false);
+            try b.check(try g.adopt(.{ .ctx = out.hidden.ctx }), false);
         } else try testing.expect(out.hidden.ctx == null);
         // The engine's history length is the legacy `State.step()`.
         const len: [1]u32 = .{@intCast(ref.kv.step)};
-        try b.check(try g.fromSlice(u32, &len, &.{1}), null, true);
+        try b.check(try g.fromSlice(u32, &len, &.{1}), true);
     }
     try b.expectDone();
 }
@@ -195,7 +195,7 @@ fn servedCase(comptime quantized: bool, comptime seed: u64) !void {
     defer b.close();
     try b.expectSteps(&both.long_steps);
     try b.expectGreedy();
-    try b.expectBatched(.layered);
+    try b.expectBatched();
     try expectServedHeads(&b, seed);
     try b.expectDone();
 }
@@ -235,7 +235,7 @@ pub fn expectServedHeads(b: *both.Both, seed: u64) !void {
         const o4 = try h.forward(x, &cr, try g.fromSlice(i32, &.{77}, &.{1}), o3.hidden_next, 10, .mixed, null, null);
         _ = try g.adopt(q.hidden_next);
         const outs = [_]mlx.mlx_array{ try g.adopt(o0.rerank_x), try g.adopt(o1.logits), try g.adopt(o2.rerank_x), try g.adopt(o3.rerank_x), try g.adopt(o4.rerank_x), try g.adopt(o0.hidden_next), try g.adopt(o1.hidden_next), try g.adopt(o2.hidden_next), try g.adopt(o3.hidden_next), try g.adopt(o4.hidden_next) };
-        for (outs) |got| try b.check(got, null, false);
+        for (outs) |got| try b.check(got, false);
     }
     var tokens: [16]u32 = undefined;
     var accepted: std.ArrayList(u32) = .empty;
@@ -243,7 +243,7 @@ pub fn expectServedHeads(b: *both.Both, seed: u64) !void {
     try mtpRun(x, h, &tokens, &accepted);
     var g = ops.Graph.init(a, b.xfm.s);
     defer g.deinit();
-    for ([_][]const u32{ &tokens, accepted.items }) |got| try b.check(try g.fromSlice(u32, got, &.{@intCast(got.len)}), null, true);
+    for ([_][]const u32{ &tokens, accepted.items }) |got| try b.check(try g.fromSlice(u32, got, &.{@intCast(got.len)}), true);
 }
 
 // ── tests ──

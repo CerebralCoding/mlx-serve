@@ -155,7 +155,6 @@ test "d1 plugin: the served LFM2 trunk scores branches bit-equal to the engine's
     };
 
     var tape = try Tape.player(@embedFile("fixtures/trunk.tape"));
-    defer tape.finish() catch |e| std.debug.panic("proof tape: {t}", .{e});
     for (got.out) |x| try tape.expectNext(x, false);
     try tape.expectDone();
 }

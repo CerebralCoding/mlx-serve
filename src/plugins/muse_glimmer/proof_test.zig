@@ -73,14 +73,10 @@ fn case(comptime nested: bool, comptime quantized: bool, comptime seed: u64) !vo
     return caseOn(nested, quantized, seed, false);
 }
 
-/// The legacy forward is the oracle, recorded to `fixtures/` (`MLX_SERVE_PROOF_RECORD=<repo root>`), until it is
-/// deleted; then the proofs replay the recording.
-const frozen = true;
 
 fn openCase(p: *fixture.Pack, json: []const u8, comptime legacy_config: bool, comptime seed: u64) !both.Both {
     const name = std.fmt.comptimePrint("fixtures/{x}{s}.tape", .{ seed, if (legacy_config) "-lc" else "" });
-    if (frozen) return both.Both.replay(&plugin.table, p, json, legacy_config, @embedFile(name));
-    return both.Both.openAs(&plugin.table, p, json, legacy_config, .{ .legacy = "src/plugins/muse_glimmer/" ++ name });
+    return both.Both.replay(&plugin.table, p, json, legacy_config, @embedFile(name));
 }
 
 fn caseOn(comptime nested: bool, comptime quantized: bool, comptime seed: u64, comptime legacy_config: bool) !void {
@@ -90,11 +86,9 @@ fn caseOn(comptime nested: bool, comptime quantized: bool, comptime seed: u64, c
     var b = try openCase(&p, configJson(nested, quantized), legacy_config, seed);
     defer b.close();
     // The served legacy load compiles the softcap; the plugin carries the same closure.
-    if (b.lg) |lg| lg.xfm.compileSoftcap();
-    if (b.lg) |lg| try std.testing.expect(lg.config.normed_embeddings and lg.config.layerSkipsRope(3) and lg.config.output_multiplier > 0);
     try b.expectSteps(&both.long_steps);
     try b.expectGreedy();
-    try b.expectBatched(.dense);
+    try b.expectBatched();
     try b.expectDone();
 }
 
@@ -122,16 +116,15 @@ test "muse_glimmer plugin: a DFlash drafter reads the bare table and head and em
     try writePackAt(&p, "model.language_model", true, 64, 128);
     var b = try openCase(&p, json2, false, 0x3e60);
     defer b.close();
-    if (b.lg) |lg| lg.xfm.compileSoftcap();
     try testing.expect(b.xfm.supportsLayerCapture());
     {
         var g = ops.Graph.init(a, b.xfm.s);
         defer g.deinit();
         const ids = try fixture.tokens(&g, &.{ 4, 90, 127, 0, 33 });
         const raw = try g.adopt(try b.xfm.rawEmbedding(ids));
-        try b.check(raw, if (b.lg) |lg| try g.adopt(try lg.xfm.rawEmbedding(ids)) else null, false);
+        try b.check(raw, false);
         const hidden = try g.reshape(raw, &.{ 1, 5, 64 });
-        try b.check(try g.adopt(try b.xfm.lmHeadForDraft(hidden)), if (b.lg) |lg| try g.adopt(try lg.xfm.lmHeadForDraft(hidden)) else null, false);
+        try b.check(try g.adopt(try b.xfm.lmHeadForDraft(hidden)), false);
     }
     try b.expectDone();
     // Recorded from the legacy forward, whose drafted stream the plugin's matched.
@@ -152,8 +145,6 @@ test "muse_glimmer plugin: a vision pack's media rows at the root's image id spl
     try writePack(&p, "model", false);
     var b = try openCase(&p, json, true, 0x3e61);
     defer b.close();
-    if (b.lg) |lg| lg.xfm.compileSoftcap();
-    if (b.lg) |lg| try testing.expect(lg.config.image_token_id == 250 and lg.config.muse_vision);
     try testing.expect(b.cfg.has_vision);
     try b.expectMedia(250, H);
     try b.expectDone();
@@ -231,7 +222,6 @@ test "muse_glimmer plugin: the released Muse-Glimmer-30B-MLX-Serve-4bit config a
     try writePack(&p, "model.language_model", true);
     var b = try openCase(&p, json, true, 0x3ea1);
     defer b.close();
-    if (b.lg) |lg| lg.xfm.compileSoftcap();
     try b.expectSteps(&both.long_steps);
     try b.expectGreedy();
     try b.expectDone();

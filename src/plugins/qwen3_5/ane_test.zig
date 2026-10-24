@@ -101,7 +101,7 @@ fn expectSameInputs(p: *served.Pair, dense: u64, gdn: u64) !void {
     }
     if (xs.len == 2) try testing.expectEqual(lists[0].items.len, lists[1].items.len);
     const last = xs.len - 1;
-    for (lists[last].items, 0..) |got, i| try p.oracle.check(got, if (last == 1) lists[0].items[i] else null, false);
+    for (lists[last].items) |got| try p.oracle.check(got, false);
     try p.oracle.done();
 }
 
@@ -186,14 +186,7 @@ fn seamCase(comptime moe: bool, comptime seed: u64) !void {
     var g = ops.Graph.init(a, fixture.stream());
     defer g.deinit();
     const got = try seamLogits(&p, &probe, &g);
-    var want: ?Array = null;
-    if (p.lg) |lg| {
-        var lane: served.Lane = undefined;
-        try lane.init(&lg.xfm);
-        defer lane.deinit();
-        want = try fixture.rows2(&g, try g.adopt(try lg.xfm.forwardWith(&lane.ctx, try fixture.tokens(&g, &seam_ids))));
-    }
-    try p.oracle.check(got, want, false);
+    try p.oracle.check(got, false);
     try p.oracle.done();
     // Layers 0 and 2 are linear attention; a MoE trunk has no dense MLP to offload.
     try testing.expectEqualSlices(u32, &.{ 1, 0, 1, 0 }, &probe.gdn);
