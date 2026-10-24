@@ -16,6 +16,24 @@ comptime {
 }
 
 test {
+    _ = @import("sdk/vision/qwen_vision_test.zig");
+    _ = @import("sdk/blocks/attention/batched_test.zig");
+    _ = @import("sdk/blocks/attention/kv_quant_attn_test.zig");
+    _ = @import("sdk/blocks/attention/sdpa_test.zig");
+    _ = @import("sdk/blocks/gdn/decode_fused_test.zig");
+    _ = @import("sdk/blocks/hc/hc_decode2_test.zig");
+    _ = @import("sdk/blocks/linear/qmatmul_test.zig");
+    _ = @import("sdk/blocks/linear/qmv_rows_test.zig");
+    _ = @import("sdk/blocks/linear/verify_projection_test.zig");
+    _ = @import("sdk/blocks/linear/verify_qmm_test.zig");
+    _ = @import("sdk/blocks/mlp/fused_activations_test.zig");
+    _ = @import("sdk/blocks/moe/decode_test.zig");
+    _ = @import("sdk/blocks/moe/verify_kernels_test.zig");
+    _ = @import("sdk/quant/block_test.zig");
+    _ = @import("sdk/quant/hadamard/format_test.zig");
+    _ = @import("sdk/vision/splice_test.zig");
+    _ = @import("sdk/blocks/kda/gate_test.zig");
+    _ = @import("sdk/blocks/attention/attn256_test.zig");
     _ = @import("plugins/spark2_5/proof_test.zig");
     _ = @import("plugins/spark2_5/bases_test.zig");
     _ = @import("plugins/laguna/proof_test.zig");

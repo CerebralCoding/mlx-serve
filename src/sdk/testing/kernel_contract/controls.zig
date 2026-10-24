@@ -7,7 +7,7 @@ const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const spec = @import("spec.zig");
 const metal = @import("metal.zig");
-const Set = @import("registry.zig").Set;
+const Set = @import("set.zig").Set;
 
 const Shape = spec.Shape;
 

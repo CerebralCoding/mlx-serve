@@ -88,7 +88,7 @@ src/engines/mlx/prompt_cache.zig	!.cache = try 	a live KV cache re-inits through
 src/engines/mlx/scheduler.zig	!.cache = try 	a live KV cache re-inits through KVCache.reinit, which builds before it frees
 src/main.zig	!.cache = try 	a live KV cache re-inits through KVCache.reinit, which builds before it frees
 src/plugins/qwen4_exp/mtp.zig	!.cache = try 	a live KV cache re-inits through KVCache.reinit, which builds before it frees
-src/sdk/blocks/attention/kv_quant_attn.zig	fn composedStridedCase(	composed quantized-KV attention is a parity reference only; serving arms are kernel or dense
+src/sdk/blocks/attention/kv_quant_attn_test.zig	fn composedStridedCase(	composed quantized-KV attention is a parity reference only; serving arms are kernel or dense
 # Load.
 src/engines/mlx/load.zig	effectivePrefillChunk(	the ANE build resolves its tile through effectivePrefillChunk, never the bare pin
 src/engines/mlx/load.zig	qwen4BuildDraftRerank()	the qwen4 coarse rerank head is built at load, gated on mtp_enabled
