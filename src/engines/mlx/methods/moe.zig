@@ -40,6 +40,7 @@ const verifyExpertReuse = @import("../../../sdk/blocks/moe/verify_kernels.zig").
 const verifyIndexedExpertInput = @import("../../../sdk/blocks/moe/verify_kernels.zig").verifyIndexedExpertInput;
 const verifyRoutePack = @import("../../../sdk/blocks/moe/verify_kernels.zig").verifyRoutePack;
 const MoeMlpWeights = @import("../../../sdk/blocks/moe/weights.zig").MoeMlpWeights;
+const transformer = @import("../../../engines/mlx/transformer.zig");
 
 pub fn moeRouterLogits(self: *Transformer, router_x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
     const cfg = &self.config;
@@ -146,137 +147,6 @@ pub fn moeAddSharedDown(self: *Transformer, expert_sum: mlx.mlx_array, expert_x:
     const gate_logit = try qmatmulBits(expert_x, seg_w, mw.shared_expert_gate_s.?, mw.shared_expert_gate_b.?, seg_qp.bits, seg_qp.group_size, seg_qp.mode, self.s);
     defer _ = mlx.mlx_array_free(gate_logit);
     return self.moeSharedGateTail(expert_sum, gate_logit, down);
-}
-
-pub fn moeAddSharedGateRows(self: *Transformer, expert_sum: mlx.mlx_array, joined_input: mlx.mlx_array, inputs: []const mlx.mlx_array, down: mlx.mlx_array, widths: []const c_int, mw: *const MoeMlpWeights) !?mlx.mlx_array {
-    if (!sharedGateRowsEligible(widths) or inputs.len != widths.len) return null;
-    const gate_logit = try self.qmatmul(joined_input, mw.shared_expert_gate_w.?, mw.shared_expert_gate_s.?, mw.shared_expert_gate_b.?);
-    defer _ = mlx.mlx_array_free(gate_logit);
-    const result = try self.moeSharedGateTail(expert_sum, gate_logit, down);
-    verify_projection.mtp_verify_shared_gate_rows_calls +%= 1;
-    const Once = struct {
-        var logged = false;
-    };
-    if (!Once.logged) {
-        Once.logged = true;
-        log.info("[batched] shared-expert gate tail engaged (slots={d})\n", .{inputs.len});
-    }
-    return result;
-}
-
-pub fn moeSharedDownRows(self: *Transformer, joined_input: mlx.mlx_array, widths: []const c_int, mw: *const MoeMlpWeights) !?mlx.mlx_array {
-    const down = (try self.moeSharedDown(.verify_rows, joined_input, mw, widths)) orelse return null;
-    verify_projection.mtp_verify_shared_rows_calls +%= 1;
-    const Once = struct {
-        var logged = false;
-    };
-    if (!Once.logged) {
-        Once.logged = true;
-        log.info("[batched] shared-expert verify projections engaged (slots={d})\n", .{widths.len});
-    }
-    return down;
-}
-
-pub fn moeVerifyRowsSolo(self: *Transformer, inputs: []const mlx.mlx_array, mw: *const MoeMlpWeights) ![]mlx.mlx_array {
-    const out = try self.allocator.alloc(mlx.mlx_array, inputs.len);
-    var built: usize = 0;
-    errdefer {
-        for (out[0..built]) |value| _ = mlx.mlx_array_free(value);
-        self.allocator.free(out);
-    }
-    for (inputs, 0..) |input, row| {
-        out[row] = try self.moeMLP(input, mw);
-        built += 1;
-    }
-    return out;
-}
-
-pub fn moeVerifyRows(self: *Transformer, inputs: []const mlx.mlx_array, mw: *const MoeMlpWeights) ![]mlx.mlx_array {
-    if (self.qwen4 == null or !mlx.streamIsGpu(self.s) or !moeRouterFusedEnabled() or
-        inputs.len < 2 or inputs.len > 8 or self.config.hidden_size < 32 or self.config.num_experts_per_tok >= 32 or
-        mw.shared_ungated or mw.shared_expert_gate_w == null or qwen4Standin().moe_shared or
-        self.config.num_experts == 0 or self.config.num_experts_per_tok == 0 or
-        mw.expert_bias != null or mw.router_scale != null or mw.per_expert_scale != null)
-    {
-        return self.moeVerifyRowsSolo(inputs, mw);
-    }
-    var total_tokens: u64 = 0;
-    var hidden: c_int = 0;
-    for (inputs) |input| {
-        const shape = mlx.getShape(input);
-        if (shape.len != 3 or shape[0] != 1 or shape[1] < 1) return self.moeVerifyRowsSolo(inputs, mw);
-        if (hidden == 0) hidden = shape[2] else if (shape[2] != hidden) return self.moeVerifyRowsSolo(inputs, mw);
-        total_tokens += @intCast(shape[1]);
-    }
-    const total_inds = total_tokens * self.config.num_experts_per_tok;
-    if (total_inds / self.config.num_experts >= 4) return self.moeVerifyRowsSolo(inputs, mw);
-
-    var router_parts: [MAX_BATCH_ROWS]mlx.mlx_array = @splat(.{ .ctx = null });
-    defer {
-        for (router_parts[0..inputs.len]) |part| {
-            if (part.ctx != null) _ = mlx.mlx_array_free(part);
-        }
-    }
-    const router_vec = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(router_vec);
-    const input_vec = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(input_vec);
-    for (inputs, 0..) |input, row| {
-        router_parts[row] = try self.moeRouterLogits(input, mw);
-        _ = mlx.mlx_vector_array_append_value(router_vec, router_parts[row]);
-        _ = mlx.mlx_vector_array_append_value(input_vec, input);
-    }
-    var joined_router = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(joined_router);
-    try mlx.check(mlx.mlx_concatenate_axis(&joined_router, router_vec, 1, self.s));
-    var joined_input = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(joined_input);
-    try mlx.check(mlx.mlx_concatenate_axis(&joined_input, input_vec, 1, self.s));
-    var routed = mw.*;
-    routed.shared_expert_gate_w = null;
-    const joined_sum = try self.moeMLP2WithRouter(joined_input, joined_input, &routed, joined_router, true);
-    defer _ = mlx.mlx_array_free(joined_sum);
-    var widths: [MAX_BATCH_ROWS]c_int = undefined;
-    for (inputs, 0..) |input, i| widths[i] = mlx.getShape(input)[1];
-    const shared_down = try self.moeSharedDownRows(joined_input, widths[0..inputs.len], mw);
-    defer if (shared_down) |value| {
-        _ = mlx.mlx_array_free(value);
-    };
-    const shared_joined = if (shared_down) |down| try self.moeAddSharedGateRows(joined_sum, joined_input, inputs, down, widths[0..inputs.len], mw) else null;
-    defer if (shared_joined) |value| {
-        _ = mlx.mlx_array_free(value);
-    };
-
-    const out = try self.allocator.alloc(mlx.mlx_array, inputs.len);
-    var built: usize = 0;
-    errdefer {
-        for (out[0..built]) |value| _ = mlx.mlx_array_free(value);
-        self.allocator.free(out);
-    }
-    var start: c_int = 0;
-    for (inputs, 0..) |input, row| {
-        const seq = mlx.getShape(input)[1];
-        if (shared_joined) |joined| {
-            out[row] = mlx.mlx_array_new();
-            errdefer _ = mlx.mlx_array_free(out[row]);
-            try mlx.check(mlx.mlx_slice(&out[row], joined, &.{ 0, start, 0 }, 3, &.{ 1, start + seq, hidden }, 3, &.{ 1, 1, 1 }, 3, self.s));
-            built += 1;
-            start += seq;
-            continue;
-        }
-        var expert_row = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(expert_row);
-        try mlx.check(mlx.mlx_slice(&expert_row, joined_sum, &.{ 0, start, 0 }, 3, &.{ 1, start + seq, hidden }, 3, &.{ 1, 1, 1 }, 3, self.s));
-        out[row] = if (shared_down) |down| blk: {
-            var down_row = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(down_row);
-            try mlx.check(mlx.mlx_slice(&down_row, down, &.{ 0, start, 0 }, 3, &.{ 1, start + seq, hidden }, 3, &.{ 1, 1, 1 }, 3, self.s));
-            break :blk try self.moeAddSharedDown(expert_row, input, down_row, mw, null);
-        } else try self.moeAddGatedShared(expert_row, input, mw, null);
-        built += 1;
-        start += seq;
-    }
-    return out;
 }
 
 pub fn moeMLP(self: *Transformer, x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {

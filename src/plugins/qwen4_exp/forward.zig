@@ -30,7 +30,7 @@ const ssmFreeSpecCapture = @import("../../engines/mlx/ssm/entry.zig").ssmFreeSpe
 const ssmRollbackFromCapture = @import("../../engines/mlx/ssm/entry.zig").ssmRollbackFromCapture;
 const nextSsmMemberGen = @import("../../engines/mlx/ssm/group.zig").nextSsmMemberGen;
 const ssmLiveAux = @import("../../engines/mlx/ssm/group.zig").ssmLiveAux;
-const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
+const Trunk = @import("trunk.zig").Trunk;
 const attn256RandBf16 = @import("../../sdk/blocks/attention/attn256.zig").attn256RandBf16;
 const verifyLmHeadProjection = @import("../../sdk/blocks/linear/verify_projection.zig").verifyLmHeadProjection;
 const moeRouterFusedEnabled = @import("../../sdk/blocks/moe/router_kernel.zig").moeRouterFusedEnabled;
@@ -57,7 +57,7 @@ const ssmFreeQsaState = @import("qsa/history.zig").ssmFreeQsaState;
 /// Serial decode and other arches keep `decode_async_ladder`.
 pub const QWEN4_DECODE_ASYNC_LADDER_DEFAULT: u32 = 4;
 
-pub fn qwen4VerifyRowsEligible(self: *Transformer, token_rows: []const mlx.mlx_array, ctxs: []const *ForwardCtx) bool {
+pub fn qwen4VerifyRowsEligible(self: *Trunk, token_rows: []const mlx.mlx_array, ctxs: []const *ForwardCtx) bool {
     // A tensor shard's MoE is half of each expert until `moeTensorParallel` adds the
     // peer's half; the grouped arm calls `moeVerifyRows` directly and would skip it.
     if (self.dist_tp != null) return false;
@@ -67,10 +67,10 @@ pub fn qwen4VerifyRowsEligible(self: *Transformer, token_rows: []const mlx.mlx_a
     {
         return false;
     }
-    if (Transformer.qwen4_trace != null or diagEnvOn("QWEN4_PROFILE_FWD")) return false;
+    if (Trunk.qwen4_trace != null or diagEnvOn("QWEN4_PROFILE_FWD")) return false;
     const si = qwen4Standin();
     if (si.gdn or si.attn or si.mlp or si.gdn_recur or si.gdn_proj or si.attn_qsa or si.attn_sdpa or si.hc or si.moe_shared or si.moe_router or si.moe_gateup or si.moe_down) return false;
-    for (self.moe_layers.?) |lw| switch (lw.mlp) {
+    for (self.moe_layers) |lw| switch (lw.mlp) {
         .moe => |mw| if (mw.expert_bias != null or mw.router_scale != null or mw.per_expert_scale != null) return false,
         else => return false,
     };
@@ -89,7 +89,7 @@ pub fn qwen4VerifyRowsEligible(self: *Transformer, token_rows: []const mlx.mlx_a
 }
 
 pub fn forwardQwen4VerifyRows(
-    self: *Transformer,
+    self: *Trunk,
     token_rows: []const mlx.mlx_array,
     ctxs: []const *ForwardCtx,
     out_logits: []mlx.mlx_array,
@@ -98,7 +98,7 @@ pub fn forwardQwen4VerifyRows(
 ) !void {
     const op_start = mlx.op_count.load(.monotonic);
     const cfg = &self.config;
-    const layers = self.moe_layers.?;
+    const layers = self.moe_layers;
     const hc: c_int = @intCast(cfg.hc_count);
     const Row = struct {
         ctx: *ForwardCtx,
@@ -249,7 +249,7 @@ pub fn forwardQwen4VerifyRows(
         }
     }
 
-    var join_lmhead = !self.embedding_mode;
+    var join_lmhead = true;
     var lmhead_widths: [MAX_BATCH_ROWS]c_int = undefined;
     if (join_lmhead) {
         var total: c_int = 0;
@@ -281,14 +281,14 @@ pub fn forwardQwen4VerifyRows(
         var last = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_slice(&last, row.h, &.{ 0, shape[1] - 1, 0 }, 3, &.{ 1, shape[1], shape[2] }, 3, &.{ 1, 1, 1 }, 3, self.s));
         errdefer _ = mlx.mlx_array_free(last);
-        const mix = try self.hcReadPending(&row.h, &self.qwen4_mixer.?, 1, row.seq, &row.pending);
+        const mix = try self.hcReadPending(&row.h, &self.qwen4_mixer, 1, row.seq, &row.pending);
         _ = mlx.mlx_array_free(row.h);
         row.h = .{ .ctx = null };
         if (mix.inj.ctx != null) _ = mlx.mlx_array_free(mix.inj);
         const logits: mlx.mlx_array = if (join_lmhead) blk: {
             lmhead_inputs[i] = mix.mixed;
             break :blk .{};
-        } else if (self.embedding_mode or row.ctx.skip_lm_head)
+        } else if (row.ctx.skip_lm_head)
             mix.mixed
         else blk: {
             defer _ = mlx.mlx_array_free(mix.mixed);
@@ -336,19 +336,18 @@ pub fn forwardQwen4VerifyRows(
 /// streams; every block reads a gated mix of the streams and writes back
 /// through per-stream scalar gates; the n-gram PLE adds to the streams
 /// before its layer; the final mixer replaces model.norm.
-
 /// A later pipeline rank's forward: its layers over the `[B, L, hc*hidden]`
 /// stream the previous rank handed over, returning the stream for the next one.
-pub fn forwardQwen4Stream(self: *Transformer, ctx: *ForwardCtx, stream: mlx.mlx_array) !mlx.mlx_array {
+pub fn forwardQwen4Stream(self: *Trunk, ctx: *ForwardCtx, stream: mlx.mlx_array) !mlx.mlx_array {
     ctx.stream_in = stream;
     defer ctx.stream_in = null;
     return self.forwardQwen4With(ctx, .{ .ctx = null });
 }
 
-pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
+pub fn forwardQwen4With(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
     const stream_in = ctx.stream_in;
     self.fwd_gen +%= 1; // per-forward QSA scratch key
-    const ml = self.moe_layers.?;
+    const ml = self.moe_layers;
     const cfg = &self.config;
     const offset = ctx.moe_seq_offset.*;
     const entries = ctx.ssm_entries orelse return error.MissingSsmEntries;
@@ -433,8 +432,8 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
         };
         defer _ = mlx.mlx_array_free(attn_out);
         try prof.lap(attn_out, if (lw.attn == .linear) .gdn else .attn);
-        if (layer_idx == 3) if (Transformer.qwen4_trace) |tr| Qwen4Trace.set(&tr.attn3_out, attn_out);
-        if (layer_idx == 0) if (Transformer.qwen4_trace) |tr| {
+        if (layer_idx == 3) if (Trunk.qwen4_trace) |tr| Qwen4Trace.set(&tr.attn3_out, attn_out);
+        if (layer_idx == 0) if (Trunk.qwen4_trace) |tr| {
             Qwen4Trace.set(&tr.mixed_attn, pre.mixed);
             Qwen4Trace.set(&tr.inj_attn, pre.inj);
             Qwen4Trace.set(&tr.attn_out, attn_out);
@@ -452,7 +451,7 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
         };
         defer _ = mlx.mlx_array_free(mlp_out);
         try prof.lap(mlp_out, .mlp);
-        if (layer_idx == 0) if (Transformer.qwen4_trace) |tr| {
+        if (layer_idx == 0) if (Trunk.qwen4_trace) |tr| {
             Qwen4Trace.set(&tr.mixed_mlp, pre2.mixed);
             Qwen4Trace.set(&tr.inj_mlp, pre2.inj);
             Qwen4Trace.set(&tr.mlp_out, mlp_out);
@@ -519,13 +518,13 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
     }
     if (ctx.capture_hidden_all) |target_all| _ = mlx.mlx_array_set(target_all, h);
 
-    const mix = try self.hcReadPending(&h, &self.qwen4_mixer.?, batch, seq_len, &pending);
+    const mix = try self.hcReadPending(&h, &self.qwen4_mixer, batch, seq_len, &pending);
     // The function-scope errdefer reads `h` at unwind time, so surrender the handle where it is released.
     _ = mlx.mlx_array_free(h);
     h = .{ .ctx = null };
     if (mix.inj.ctx != null) _ = mlx.mlx_array_free(mix.inj);
     const final = mix.mixed;
-    if (self.embedding_mode or ctx.skip_lm_head) return final;
+    if (ctx.skip_lm_head) return final;
     errdefer _ = mlx.mlx_array_free(final);
     const logits = try self.lmHeadProject(final);
     _ = mlx.mlx_array_free(final);
@@ -561,7 +560,7 @@ test "qwen4 fixture vision: tower parity, pre-tile splice + M-RoPE prefill/decod
     var weights = try model_mod.loadWeightsWithVision(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
     try testing.expect(xfm.qwen4 != null);
     xfm.qwen4_stream_f32 = true;
@@ -644,7 +643,9 @@ test "qwen4 fixture vision: tower parity, pre-tile splice + M-RoPE prefill/decod
         const shape = [_]c_int{ 1, @intCast(T) };
         const ids = mlx.mlx_array_new_data(@ptrCast(ids_src), &shape, 2, .int32);
         defer _ = mlx.mlx_array_free(ids);
-        var ctx = xfm.defaultCtx();
+        const ctx_slot = try Qwen4TestSlot.init(allocator, config.num_hidden_layers);
+        defer ctx_slot.deinit(allocator);
+        var ctx = ctx_slot.ctx;
         ctx.vision_embeddings = emb;
         ctx.mrope_pos = pos_flat;
         ctx.mrope_total = T;
@@ -666,10 +667,10 @@ test "qwen4 fixture vision: tower parity, pre-tile splice + M-RoPE prefill/decod
         var final_all = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(final_all);
         ctx.capture_hidden_all = &final_all;
-        var trace: Transformer.Qwen4Trace = .{};
+        var trace: Trunk.Qwen4Trace = .{};
         defer trace.deinit();
-        Transformer.qwen4_trace = &trace;
-        defer Transformer.qwen4_trace = null;
+        Trunk.qwen4_trace = &trace;
+        defer Trunk.qwen4_trace = null;
         const logits = try xfm.forwardWith(&ctx, ids);
         defer _ = mlx.mlx_array_free(logits);
         for (0..n_layers) |i| {
@@ -857,7 +858,7 @@ test "qwen4 fixture bf16: residual streams track a bf16 reference (QWEN4_FIXTURE
     var weights = try model_mod.loadModelWeights(io, allocator, std.mem.span(model_dir), &config, false);
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
     xfm.compileQwen4Hc();
     xfm.compileGdnGate();
@@ -872,7 +873,9 @@ test "qwen4 fixture bf16: residual streams track a bf16 reference (QWEN4_FIXTURE
     const tshape = [_]c_int{ 1, @intCast(T) };
     try mlx.check(mlx.mlx_reshape(&ids, ids_arr, &tshape, 2, s));
 
-    var ctx = xfm.defaultCtx();
+    const ctx_slot = try Qwen4TestSlot.init(allocator, config.num_hidden_layers);
+    defer ctx_slot.deinit(allocator);
+    var ctx = ctx_slot.ctx;
     const n_layers: usize = config.num_hidden_layers;
     const cap_ids = try allocator.alloc(u32, n_layers);
     defer allocator.free(cap_ids);
@@ -932,7 +935,7 @@ pub const Qwen4TestSlot = struct {
     ctx: ForwardCtx = undefined,
     /// The MTP head's per-request stash, so a committed-state bar can assert the trunk
     /// verify left it where the solo round did.
-    head: Transformer.Qwen4MtpState,
+    head: Trunk.Qwen4MtpState,
 
     pub fn init(alloc: std.mem.Allocator, n_layers: u32) !*Qwen4TestSlot {
         const sl = try alloc.create(Qwen4TestSlot);
@@ -964,7 +967,7 @@ pub const Qwen4TestSlot = struct {
         sl.cache.deinit();
         alloc.destroy(sl);
     }
-    pub fn forward(sl: *Qwen4TestSlot, xfm: *Transformer, ids: []const i32) !mlx.mlx_array {
+    pub fn forward(sl: *Qwen4TestSlot, xfm: anytype, ids: []const i32) !mlx.mlx_array {
         const shape = [_]c_int{ 1, @intCast(ids.len) };
         const arr = mlx.mlx_array_new_data(@ptrCast(ids.ptr), &shape, 2, .int32);
         defer _ = mlx.mlx_array_free(arr);
@@ -989,9 +992,8 @@ test "qwen4 batched decode: one forwardMoeBatchedDecode tick == two serial ticks
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
-    try testing.expect(xfm.supportsBatchedGdnDecode());
     xfm.qwen4_stream_f32 = true;
     xfm.compileQwen4Hc();
     xfm.compileGdnGate();
@@ -1109,7 +1111,7 @@ test "qwen4 prefill: one lazy 64-token forward gives the same logits every time 
     defer if (config.ngram_table_path) |p| allocator.free(p);
     var weights = try model_mod.loadModelWeights(io, allocator, std.mem.span(model_dir), &config, false);
     defer weights.deinit();
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
     xfm.compileQwen4Hc();
     xfm.compileGdnGate();
@@ -1124,10 +1126,11 @@ test "qwen4 prefill: one lazy 64-token forward gives the same logits every time 
     };
     var differing: usize = 0;
     for (0..5) |_| {
-        try xfm.resetCache();
+        const fresh = try Qwen4TestSlot.init(allocator, config.num_hidden_layers);
+        defer fresh.deinit(allocator);
         const ids = mlx.mlx_array_new_data(&toks, &[_]c_int{ 1, 64 }, 2, .int32);
         defer _ = mlx.mlx_array_free(ids);
-        var ctx = xfm.defaultCtx();
+        var ctx = fresh.ctx;
         const lg = try xfm.forwardWith(&ctx, ids);
         defer _ = mlx.mlx_array_free(lg);
         var f = mlx.mlx_array_new();
@@ -1159,7 +1162,7 @@ test "qwen4 deferred PLE: pipelined decode AND MTP verify widths match the direc
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
     try testing.expect(xfm.qwen4 != null);
     xfm.compileQwen4Hc();
@@ -1322,7 +1325,7 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
     try testing.expect(xfm.qwen4 != null);
     // A `build --yarn` pack carries `rope_type: "yarn"` in its config: the same
@@ -1364,7 +1367,9 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
         const shape = [_]c_int{ 1, @intCast(T) };
         const ids = mlx.mlx_array_new_data(@ptrCast(ids_src), &shape, 2, .int32);
         defer _ = mlx.mlx_array_free(ids);
-        var ctx = xfm.defaultCtx();
+        const ctx_slot = try Qwen4TestSlot.init(allocator, config.num_hidden_layers);
+        defer ctx_slot.deinit(allocator);
+        var ctx = ctx_slot.ctx;
         // Per-layer residual streams (fixture stream_i = INPUT of layer i —
         // stream_0 is the tiled embedding — and stream_{n} = the final mixer
         // output), so our layer-i output is compared with stream_{i+1}.
@@ -1412,10 +1417,10 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
             }
             std.debug.print("[qwen4 fixture] ngram ids: {d}/{d} mismatched (eos {d}, mults {d} {d} {d}, vocab {d} {d} {d} {d})\n", .{ bad, T * nh, st.hash.eos, st.hash.multipliers[0], st.hash.multipliers[1], st.hash.multipliers[2], st.hash.vocab[0], st.hash.vocab[1], st.hash.vocab[2], st.hash.vocab[3] });
         }
-        var trace: Transformer.Qwen4Trace = .{};
+        var trace: Trunk.Qwen4Trace = .{};
         defer trace.deinit();
-        Transformer.qwen4_trace = &trace;
-        defer Transformer.qwen4_trace = null;
+        Trunk.qwen4_trace = &trace;
+        defer Trunk.qwen4_trace = null;
         const logits = try xfm.forwardWith(&ctx, ids);
         defer _ = mlx.mlx_array_free(logits);
         // MTP head: stream rows 0..T-2 + tokens 1..T-1 at positions 1.. → logits for 2..T.

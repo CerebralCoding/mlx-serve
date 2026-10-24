@@ -3,9 +3,7 @@ const crt = @import("../../sdk/util/crt.zig");
 const builtin = @import("builtin");
 const plugin_driver = @import("plugin/driver.zig");
 const mlx_stream_mod = if (@import("build_options").mlx_stream) @import("modules/stream_glue.zig") else @import("modules/stream_stub.zig");
-const qwen4_mod = @import("../../plugins/qwen4_exp/qwen4_exp.zig");
 const distributed_mod = @import("cluster/distributed.zig");
-const ple_gpu = @import("../../plugins/qwen4_exp/ple_gpu.zig");
 // The qwen4_exp MTP head shares the sidecar head's draft-rerank scheme
 // (`mtp.rerankSelect` + `QLinear`), which reads only the TARGET's lm_head and
 // so has no head-shaped state of its own. mtp.zig imports this file back for
@@ -117,37 +115,15 @@ pub const AddNormResult = @import("../../sdk/blocks/norms/residual_norm.zig").Ad
 pub const fusedResidualNorm = @import("../../sdk/blocks/norms/residual_norm.zig").fusedResidualNorm;
 pub const fusedAddRmsNorm = @import("../../sdk/blocks/norms/residual_norm.zig").fusedAddRmsNorm;
 // plugins/qwen4_exp/qsa/gather.zig
-pub const qsaGatherEnabled = @import("../../plugins/qwen4_exp/qsa/gather.zig").qsaGatherEnabled;
-pub const QSA_GATHER_MIN_KV_DEFAULT = @import("../../plugins/qwen4_exp/qsa/gather.zig").QSA_GATHER_MIN_KV_DEFAULT;
-pub const qsaGatherMinKv = @import("../../plugins/qwen4_exp/qsa/gather.zig").qsaGatherMinKv;
-pub const QSA_GATHER_MIN_KV_NAX = @import("../../plugins/qwen4_exp/qsa/gather.zig").QSA_GATHER_MIN_KV_NAX;
-pub const qsaPrefillGatherMinKv = @import("../../plugins/qwen4_exp/qsa/gather.zig").qsaPrefillGatherMinKv;
-pub const QSA_GATHER_BK_DEFAULT = @import("../../plugins/qwen4_exp/qsa/gather.zig").QSA_GATHER_BK_DEFAULT;
-pub const qsaDecodeGatherEnabled = @import("../../plugins/qwen4_exp/qsa/gather.zig").qsaDecodeGatherEnabled;
-pub const qsaBatchedGatherEnabled = @import("../../plugins/qwen4_exp/qsa/gather.zig").qsaBatchedGatherEnabled;
 pub const qsaBatchedGatherOn = @import("../../plugins/qwen4_exp/qsa/gather.zig").qsaBatchedGatherOn;
 pub const qsaBatchedGatherFloor = @import("../../plugins/qwen4_exp/qsa/gather.zig").qsaBatchedGatherFloor;
 pub const qsaHistoryShareEnabled = @import("../../plugins/qwen4_exp/qsa/gather.zig").qsaHistoryShareEnabled;
-pub const qsaNaxEnabled = @import("../../plugins/qwen4_exp/qsa/gather.zig").qsaNaxEnabled;
-pub const qsaNaxEligibleFrom = @import("../../plugins/qwen4_exp/qsa/gather.zig").qsaNaxEligibleFrom;
-pub const qsaNaxEligible = @import("../../plugins/qwen4_exp/qsa/gather.zig").qsaNaxEligible;
-pub const qsaNaxProbeFailed = @import("../../plugins/qwen4_exp/qsa/gather.zig").qsaNaxProbeFailed;
-pub const qsaNaxProbeReset = @import("../../plugins/qwen4_exp/qsa/gather.zig").qsaNaxProbeReset;
-pub const qsaNaxKernelBuilds = @import("../../plugins/qwen4_exp/qsa/gather.zig").qsaNaxKernelBuilds;
-pub const qsaNaxArm = @import("../../plugins/qwen4_exp/qsa/gather.zig").qsaNaxArm;
 pub const gatherQsa256 = @import("../../plugins/qwen4_exp/qsa/gather.zig").gatherQsa256;
 // plugins/qwen4_exp/qsa/select.zig
 pub const qsaSelectTgFor = @import("../../plugins/qwen4_exp/qsa/select.zig").qsaSelectTgFor;
-pub const qsaSelectCfgBuilds = @import("../../plugins/qwen4_exp/qsa/select.zig").qsaSelectCfgBuilds;
-pub const qsaSelectKernelEnabled = @import("../../plugins/qwen4_exp/qsa/select.zig").qsaSelectKernelEnabled;
 pub const qsaSelectTopBlocks = @import("../../plugins/qwen4_exp/qsa/select.zig").qsaSelectTopBlocks;
-pub const QSA_SELECT_SPLIT_MIN_NB = @import("../../plugins/qwen4_exp/qsa/select.zig").QSA_SELECT_SPLIT_MIN_NB;
-pub const QSA_SELECT_SPLIT_MAX_ROWS = @import("../../plugins/qwen4_exp/qsa/select.zig").QSA_SELECT_SPLIT_MAX_ROWS;
 pub const QSA_SELECT_SPLIT_G = @import("../../plugins/qwen4_exp/qsa/select.zig").QSA_SELECT_SPLIT_G;
 pub const qsaSelectDigitBits = @import("../../plugins/qwen4_exp/qsa/select.zig").qsaSelectDigitBits;
-pub const qsaSelectSplitEnabled = @import("../../plugins/qwen4_exp/qsa/select.zig").qsaSelectSplitEnabled;
-pub const qsaSelectSplitServes = @import("../../plugins/qwen4_exp/qsa/select.zig").qsaSelectSplitServes;
-pub const qsaSelectSplitCfgBuilds = @import("../../plugins/qwen4_exp/qsa/select.zig").qsaSelectSplitCfgBuilds;
 // plugins/qwen4_exp/mtp.zig
 pub const Qwen4Mtp = @import("../../plugins/qwen4_exp/mtp.zig").Qwen4Mtp;
 // sdk/blocks/linear/verify_projection.zig
@@ -158,70 +134,16 @@ pub const dualDieArch = @import("../../sdk/blocks/linear/verify_projection.zig")
 pub const verifySharedCapable = @import("../../sdk/blocks/linear/verify_projection.zig").verifySharedCapable;
 pub const verifySharedHardware = @import("../../sdk/blocks/linear/verify_projection.zig").verifySharedHardware;
 // plugins/qwen4_exp/qsa/score.zig
-pub const QsaScoreLayout = @import("../../plugins/qwen4_exp/qsa/score.zig").QsaScoreLayout;
-pub const qsaScoreKernelBuilt = @import("../../plugins/qwen4_exp/qsa/score.zig").qsaScoreKernelBuilt;
-pub const qsaScoreKernelBuilds = @import("../../plugins/qwen4_exp/qsa/score.zig").qsaScoreKernelBuilds;
-pub const qsaScoreFusedEnabled = @import("../../plugins/qwen4_exp/qsa/score.zig").qsaScoreFusedEnabled;
-pub const qsaScoreFusedActive = @import("../../plugins/qwen4_exp/qsa/score.zig").qsaScoreFusedActive;
-pub const qsaScoreFusedProbeFailed = @import("../../plugins/qwen4_exp/qsa/score.zig").qsaScoreFusedProbeFailed;
-pub const qsaScoreFusedProbeReset = @import("../../plugins/qwen4_exp/qsa/score.zig").qsaScoreFusedProbeReset;
-pub const qsaScoreFusedArm = @import("../../plugins/qwen4_exp/qsa/score.zig").qsaScoreFusedArm;
 pub const qsaScoreFusedActiveFor = @import("../../plugins/qwen4_exp/qsa/score.zig").qsaScoreFusedActiveFor;
-pub const qsaScoreFusedEligible = @import("../../plugins/qwen4_exp/qsa/score.zig").qsaScoreFusedEligible;
-pub const qsaScoreSheetComposed = @import("../../plugins/qwen4_exp/qsa/score.zig").qsaScoreSheetComposed;
-pub const qsaScoreK32tFromPooled = @import("../../plugins/qwen4_exp/qsa/score.zig").qsaScoreK32tFromPooled;
-pub const qsaScoreFused = @import("../../plugins/qwen4_exp/qsa/score.zig").qsaScoreFused;
-pub const qsaScoreSheet = @import("../../plugins/qwen4_exp/qsa/score.zig").qsaScoreSheet;
-pub const QSA_SCORE_SHEET_BUDGET_MB_DEFAULT = @import("../../plugins/qwen4_exp/qsa/score.zig").QSA_SCORE_SHEET_BUDGET_MB_DEFAULT;
-pub const qsaScoreSheetBudget = @import("../../plugins/qwen4_exp/qsa/score.zig").qsaScoreSheetBudget;
-pub const qsaScoreRowsPerChunkFor = @import("../../plugins/qwen4_exp/qsa/score.zig").qsaScoreRowsPerChunkFor;
-pub const qsaScoreRowsPerChunkFused = @import("../../plugins/qwen4_exp/qsa/score.zig").qsaScoreRowsPerChunkFused;
-pub const qsaScoreRowsPerChunk = @import("../../plugins/qwen4_exp/qsa/score.zig").qsaScoreRowsPerChunk;
-pub const qsaPrefillTransientBytes = @import("../../plugins/qwen4_exp/qsa/score.zig").qsaPrefillTransientBytes;
 // plugins/qwen4_exp/qsa/sparse_attn.zig
-pub const QSA_ATTN_NSPLIT_DEFAULT = @import("../../plugins/qwen4_exp/qsa/sparse_attn.zig").QSA_ATTN_NSPLIT_DEFAULT;
-pub const QSA_ATTN_MAX_NSPLIT = @import("../../plugins/qwen4_exp/qsa/sparse_attn.zig").QSA_ATTN_MAX_NSPLIT;
-pub const QSA_ATTN_MIN_S_DEFAULT = @import("../../plugins/qwen4_exp/qsa/sparse_attn.zig").QSA_ATTN_MIN_S_DEFAULT;
-pub const QSA_ATTN_BATCHED_MIN_S_DEFAULT = @import("../../plugins/qwen4_exp/qsa/sparse_attn.zig").QSA_ATTN_BATCHED_MIN_S_DEFAULT;
-pub const qsaAttnNSplit = @import("../../plugins/qwen4_exp/qsa/sparse_attn.zig").qsaAttnNSplit;
-pub const qsaAttnMinS = @import("../../plugins/qwen4_exp/qsa/sparse_attn.zig").qsaAttnMinS;
-pub const qsaAttnBatchedMinS = @import("../../plugins/qwen4_exp/qsa/sparse_attn.zig").qsaAttnBatchedMinS;
-pub const qsaSparseAttnServes = @import("../../plugins/qwen4_exp/qsa/sparse_attn.zig").qsaSparseAttnServes;
-pub const qsaFusedVerifyServes = @import("../../plugins/qwen4_exp/qsa/sparse_attn.zig").qsaFusedVerifyServes;
-pub const qsaWantsBlocks = @import("../../plugins/qwen4_exp/qsa/sparse_attn.zig").qsaWantsBlocks;
-pub const QSA_ATTN_BK = @import("../../plugins/qwen4_exp/qsa/sparse_attn.zig").QSA_ATTN_BK;
-pub const qsaAttnBk = @import("../../plugins/qwen4_exp/qsa/sparse_attn.zig").qsaAttnBk;
-pub const qsaAttnKernelEnabled = @import("../../plugins/qwen4_exp/qsa/sparse_attn.zig").qsaAttnKernelEnabled;
-pub const qsaAttnDenseEnabled = @import("../../plugins/qwen4_exp/qsa/sparse_attn.zig").qsaAttnDenseEnabled;
-pub const qsaAttnCfgBuilds = @import("../../plugins/qwen4_exp/qsa/sparse_attn.zig").qsaAttnCfgBuilds;
-pub const qsaSparseAttn = @import("../../plugins/qwen4_exp/qsa/sparse_attn.zig").qsaSparseAttn;
-pub const qsaSparseAttnFloor = @import("../../plugins/qwen4_exp/qsa/sparse_attn.zig").qsaSparseAttnFloor;
-pub const QsaSlotServed = @import("../../plugins/qwen4_exp/qsa/sparse_attn.zig").QsaSlotServed;
-pub const qsaSlotAttn = @import("../../plugins/qwen4_exp/qsa/sparse_attn.zig").qsaSlotAttn;
 pub const qsaMaskArm = @import("../../plugins/qwen4_exp/qsa/sparse_attn.zig").qsaMaskArm;
 // plugins/qwen4_exp/qsa/arms.zig
-pub const OneShotBits = @import("../../plugins/qwen4_exp/qsa/arms.zig").OneShotBits;
-pub const QsaArm = @import("../../plugins/qwen4_exp/qsa/arms.zig").QsaArm;
-pub const qsaWidthBucket = @import("../../plugins/qwen4_exp/qsa/arms.zig").qsaWidthBucket;
-pub const QsaDeclineReason = @import("../../plugins/qwen4_exp/qsa/arms.zig").QsaDeclineReason;
-pub const QsaDecline = @import("../../plugins/qwen4_exp/qsa/arms.zig").QsaDecline;
 pub const QsaArmCounts = @import("../../plugins/qwen4_exp/qsa/arms.zig").QsaArmCounts;
 // mlx/array.zig
 pub const materializedOwnedCopy = @import("../../mlx/array.zig").materializedOwnedCopy;
 // plugins/qwen4_exp/qsa/decode_gather.zig
 pub const qsaDecodeGatherAttn = @import("../../plugins/qwen4_exp/qsa/decode_gather.zig").qsaDecodeGatherAttn;
-pub const qsaBatchedGatherAttn = @import("../../plugins/qwen4_exp/qsa/decode_gather.zig").qsaBatchedGatherAttn;
 // plugins/qwen4_exp/qsa/verify_gather.zig
-pub const qsaVerifyGatherEnabled = @import("../../plugins/qwen4_exp/qsa/verify_gather.zig").qsaVerifyGatherEnabled;
-pub const QSA_VERIFY_GATHER_MIN_KV_DENSE = @import("../../plugins/qwen4_exp/qsa/verify_gather.zig").QSA_VERIFY_GATHER_MIN_KV_DENSE;
-pub const QSA_VERIFY_GATHER_MIN_KV_QUANT = @import("../../plugins/qwen4_exp/qsa/verify_gather.zig").QSA_VERIFY_GATHER_MIN_KV_QUANT;
-pub const qsaVerifyGatherMinKvFor = @import("../../plugins/qwen4_exp/qsa/verify_gather.zig").qsaVerifyGatherMinKvFor;
-pub const QsaVerifyGeom = @import("../../plugins/qwen4_exp/qsa/verify_gather.zig").QsaVerifyGeom;
-pub const QsaVerifyPlan = @import("../../plugins/qwen4_exp/qsa/verify_gather.zig").QsaVerifyPlan;
-pub const qsaVerifyPlanHost = @import("../../plugins/qwen4_exp/qsa/verify_gather.zig").qsaVerifyPlanHost;
-pub const qsaDecodeGatherIdsHost = @import("../../plugins/qwen4_exp/qsa/verify_gather.zig").qsaDecodeGatherIdsHost;
-pub const QsaSlotPlan = @import("../../plugins/qwen4_exp/qsa/verify_gather.zig").QsaSlotPlan;
-pub const qsaBatchedPlanHost = @import("../../plugins/qwen4_exp/qsa/verify_gather.zig").qsaBatchedPlanHost;
 pub const qsaVerifyGatherAttn = @import("../../plugins/qwen4_exp/qsa/verify_gather.zig").qsaVerifyGatherAttn;
 // plugins/qwen4_exp/qsa/mask.zig
 pub const qsaMaskFromBlocks = @import("../../plugins/qwen4_exp/qsa/mask.zig").qsaMaskFromBlocks;
@@ -239,9 +161,7 @@ pub const SLIDING_TRIM_UNBOUNDED = @import("kv/sliding.zig").SLIDING_TRIM_UNBOUN
 pub const slidingTailSpan = @import("kv/sliding.zig").slidingTailSpan;
 pub const slidingViewFor = @import("kv/sliding.zig").slidingViewFor;
 // plugins/qwen4_exp/ple.zig
-pub const claimPleSpecCapture = @import("../../plugins/qwen4_exp/ple.zig").claimPleSpecCapture;
 pub const plePrevAfterAccept = @import("../../plugins/qwen4_exp/ple.zig").plePrevAfterAccept;
-pub const fillPleSpecTokens = @import("../../plugins/qwen4_exp/ple.zig").fillPleSpecTokens;
 pub const PlePending = @import("../../plugins/qwen4_exp/ple.zig").PlePending;
 // engines/mlx/forward_ctx.zig
 pub const SpecTree = @import("forward_ctx.zig").SpecTree;
@@ -259,13 +179,10 @@ pub const ssmCommitTreePath = @import("ssm/entry.zig").ssmCommitTreePath;
 pub const ssmRollbackFromCapture = @import("ssm/entry.zig").ssmRollbackFromCapture;
 // plugins/qwen4_exp/qsa/history.zig
 pub const QSA_RING_ROWS = @import("../../plugins/qwen4_exp/qsa/history.zig").QSA_RING_ROWS;
-pub const QSA_MAX_COMPRESS_RATIO = @import("../../plugins/qwen4_exp/qsa/history.zig").QSA_MAX_COMPRESS_RATIO;
-pub const checkQsaCompressRatio = @import("../../plugins/qwen4_exp/qsa/history.zig").checkQsaCompressRatio;
 pub const QsaHeadMark = @import("../../plugins/qwen4_exp/qsa/history.zig").QsaHeadMark;
 pub const QSA_HEAD_MARKS_MAX = @import("../../plugins/qwen4_exp/qsa/history.zig").QSA_HEAD_MARKS_MAX;
 pub const QsaHeadMarkSet = @import("../../plugins/qwen4_exp/qsa/history.zig").QsaHeadMarkSet;
 pub const ssmFreeQsaState = @import("../../plugins/qwen4_exp/qsa/history.zig").ssmFreeQsaState;
-pub const reserveQsaHistory = @import("../../plugins/qwen4_exp/qsa/history.zig").reserveQsaHistory;
 pub const reserveQsaHistoryWithHead = @import("../../plugins/qwen4_exp/qsa/history.zig").reserveQsaHistoryWithHead;
 pub const qsaTestAppendPool = @import("../../plugins/qwen4_exp/qsa/history.zig").qsaTestAppendPool;
 // engines/mlx/ssm/group.zig
@@ -290,11 +207,6 @@ pub const ssmCheckpointDropIndexLowAnchored = @import("ssm/checkpoint.zig").ssmC
 pub const positionDropIndex = @import("ssm/checkpoint.zig").positionDropIndex;
 pub const positionDropIndexUsize = @import("ssm/checkpoint.zig").positionDropIndexUsize;
 // plugins/qwen4_exp/qsa/pooled.zig
-const QsaPooledRope = @import("../../plugins/qwen4_exp/qsa/pooled.zig").QsaPooledRope;
-const QsaBlockConsts = @import("../../plugins/qwen4_exp/qsa/pooled.zig").QsaBlockConsts;
-pub const qsaIdxRopeFusedEnabled = @import("../../plugins/qwen4_exp/qsa/pooled.zig").qsaIdxRopeFusedEnabled;
-pub const qsaPoolRopePipelineCount = @import("../../plugins/qwen4_exp/qsa/pooled.zig").qsaPoolRopePipelineCount;
-pub const qsaPoolNormRopeFused = @import("../../plugins/qwen4_exp/qsa/pooled.zig").qsaPoolNormRopeFused;
 // plugins/qwen4_exp/qsa/checkpoint.zig
 pub const ssmAuxIsQsaHistory = @import("../../plugins/qwen4_exp/qsa/checkpoint.zig").ssmAuxIsQsaHistory;
 pub const snapshotHasQsaHistory = @import("../../plugins/qwen4_exp/qsa/checkpoint.zig").snapshotHasQsaHistory;
@@ -302,15 +214,11 @@ pub const checkpointHasQsaHistory = @import("../../plugins/qwen4_exp/qsa/checkpo
 pub const checkpointHasQsaPooled = @import("../../plugins/qwen4_exp/qsa/checkpoint.zig").checkpointHasQsaPooled;
 pub const checkpointQsaAuxRows = @import("../../plugins/qwen4_exp/qsa/checkpoint.zig").checkpointQsaAuxRows;
 pub const checkpointQsaCoversPos = @import("../../plugins/qwen4_exp/qsa/checkpoint.zig").checkpointQsaCoversPos;
-pub const qsaEntrySatisfiesForward = @import("../../plugins/qwen4_exp/qsa/checkpoint.zig").qsaEntrySatisfiesForward;
 pub const qsaRestoreSatisfiesForward = @import("../../plugins/qwen4_exp/qsa/checkpoint.zig").qsaRestoreSatisfiesForward;
 pub const checkpointListHasQsaPooled = @import("../../plugins/qwen4_exp/qsa/checkpoint.zig").checkpointListHasQsaPooled;
 pub const attachQsaHistoryToLatest = @import("../../plugins/qwen4_exp/qsa/checkpoint.zig").attachQsaHistoryToLatest;
-pub const QSA_HANDOFF_MAX_SLACK_ROWS = @import("../../plugins/qwen4_exp/qsa/checkpoint.zig").QSA_HANDOFF_MAX_SLACK_ROWS;
 pub const handoffQsaHistoryToLatest = @import("../../plugins/qwen4_exp/qsa/checkpoint.zig").handoffQsaHistoryToLatest;
 pub const attachQsaHistoryOnHandoff = @import("../../plugins/qwen4_exp/qsa/checkpoint.zig").attachQsaHistoryOnHandoff;
-pub const QsaAttachMode = @import("../../plugins/qwen4_exp/qsa/checkpoint.zig").QsaAttachMode;
-pub const qsaHandoffExceedsSlack = @import("../../plugins/qwen4_exp/qsa/checkpoint.zig").qsaHandoffExceedsSlack;
 pub const keepOnlyLatestQsaHistory = @import("../../plugins/qwen4_exp/qsa/checkpoint.zig").keepOnlyLatestQsaHistory;
 pub const entriesHaveQsaHistory = @import("../../plugins/qwen4_exp/qsa/checkpoint.zig").entriesHaveQsaHistory;
 pub const applyQsaHistoryAt = @import("../../plugins/qwen4_exp/qsa/checkpoint.zig").applyQsaHistoryAt;
@@ -322,8 +230,6 @@ const LayerWeights = @import("layer_weights.zig").LayerWeights;
 pub const QW = @import("layer_weights.zig").QW;
 // plugins/glm5_next/weights.zig
 pub const DsaWeights = @import("../../plugins/glm5_next/weights.zig").DsaWeights;
-// plugins/qwen4_exp/weights.zig
-const HcWeights = @import("../../plugins/qwen4_exp/weights.zig").HcWeights;
 // sdk/blocks/mlp/dense.zig
 // engines/mlx/ane_prefill.zig
 const AneChanRest = @import("ane_prefill.zig").AneChanRest;
@@ -403,9 +309,7 @@ pub const gatherQmvGateUp = @import("../../sdk/blocks/moe/gather_qmv.zig").gathe
 pub const gatherQmv = @import("../../sdk/blocks/moe/gather_qmv.zig").gatherQmv;
 pub const gatherQmvAct = @import("../../sdk/blocks/moe/gather_qmv.zig").gatherQmvAct;
 // plugins/qwen4_exp/hc_fused.zig
-pub const HcFusedOut = @import("../../plugins/qwen4_exp/hc_fused.zig").HcFusedOut;
 pub const HcPending = @import("../../plugins/qwen4_exp/hc_fused.zig").HcPending;
-pub const HC_FUSED_MAX_ROWS = @import("../../plugins/qwen4_exp/hc_fused.zig").HC_FUSED_MAX_ROWS;
 pub const hcReadFused = @import("../../plugins/qwen4_exp/hc_fused.zig").hcReadFused;
 // sdk/blocks/moe/gather_qmv_rows.zig
 pub const gatherQmvGateUpRows = @import("../../sdk/blocks/moe/gather_qmv_rows.zig").gatherQmvGateUpRows;
@@ -437,22 +341,16 @@ pub var qsa_score_fused_override: ?bool = null;
 
 pub var qsa_attn_kernel_override: ?bool = null;
 
-pub var qsa_verify_gather_override: ?bool = null;
-
-pub var qsa_verify_gather_min_kv_override: ?c_int = null;
-
 /// Process-wide under `-Dunits` (sdk/util/shared.zig): one copy in the host.
 const CliState = struct {
     /// `--lm-head-mxfp8` / `--no-lm-head-mxfp8`; null = the default below.
     lm_head_mxfp8_cli: ?bool = null,
-    deferred_ple_group_syncs: u64 = 0,
 };
 const cli_shared = @import("../../sdk/util/shared.zig").Shared(CliState, "transformer_cli", .{});
 pub inline fn cli() *CliState {
     return cli_shared.get();
 }
 
-pub var hc_fused_override: ?bool = null;
 
 const model_mod = @import("model.zig");
 const log = @import("../../host/log.zig");
@@ -469,9 +367,6 @@ const QuantMode = model_mod.QuantMode;
 const moe_fp4 = @import("../../sdk/blocks/moe/moe_fp4.zig");
 const hc_decode2 = @import("../../sdk/blocks/hc/hc_decode2.zig");
 const mxfp8_qmv = @import("../../sdk/blocks/qmm/mxfp8_qmv.zig");
-const qsa_row_mask = @import("../../plugins/qwen4_exp/qsa_mask.zig");
-const qsa_decode = @import("../../plugins/qwen4_exp/qsa_decode.zig");
-const moe_affine4 = @import("../../sdk/blocks/moe/moe_affine4.zig");
 const glm5 = @import("../../plugins/glm5_next/glm5_next.zig");
 const glm_mtp = @import("../../plugins/glm5_next/mtp.zig");
 const kda_recurrence = @import("../../sdk/blocks/kda/recurrence.zig");
@@ -510,8 +405,6 @@ pub const Transformer = struct {
 
     /// Layer stride for the decode async-eval ladder (0 = off; tests set it).
     decode_async_ladder: u32 = 0,
-    /// The qwen4_exp batched-decode ladder stride (`QWEN4_DECODE_ASYNC_LADDER_DEFAULT`).
-    decode_async_ladder_qwen4: u32 = 0,
 
     gelu_coeff: ?mlx.mlx_array,
     gelu_inner: ?mlx.mlx_array,
@@ -560,11 +453,6 @@ pub const Transformer = struct {
     cost_attention: u8 = 0,
     cost_moe: u8 = 0,
     verify_laps: VerifyLaps = .{},
-    /// The joined `[1, Σ(1+m_i), V]` logits of the last row-axis verify whose
-    /// lm_head ran once for the whole group, so the accept side can filter the
-    /// block once instead of one slice per row. Null whenever the projection
-    /// ran per row; the next verify releases it.
-    verify_joined_logits: mlx.mlx_array = .{ .ctx = null },
     /// Persistence key of `round_cost` (empty = not persisted).
     round_cost_key_buf: [64]u8 = undefined,
     round_cost_key_len: u8 = 0,
@@ -628,36 +516,6 @@ pub const Transformer = struct {
     /// A pack served through its plugin's table (`engines/mlx/plugin/driver.zig`): every forward goes there.
     plugin: ?*plugin_driver.Bound = null,
 
-    // Qwen3.8-Flash-Next (qwen4_exp): the n-gram hash + mmapped table are
-    // module-owned (serial, spec-off); the trunk itself rides moe_layers
-    // through forwardQwen4With. `qwen4_mixer` is the final hyper-connection
-    // read that replaces model.norm.
-    qwen4: ?*qwen4_mod.Qwen4State = null,
-    /// Pipeline rank 0: the worker holding the trunk's later layers (`distributed.Peer`).
-    dist_peer: ?*distributed_mod.Peer = null,
-    /// Tensor-parallel rank 0: the worker holding the other slice of every expert. Its
-    /// part is stateless, so nothing about scheduling or caching changes.
-    dist_tp: ?*distributed_mod.Peer = null,
-    /// Run the qwen4 residual streams in f32 (QWEN4_STREAM_F32=1, or set by
-    /// the oracle test): the shipped checkpoint is bf16 end to end, the f32
-    /// fixture is the tighter bar for the MATH.
-    qwen4_stream_f32: bool = false,
-    qwen4_mixer: ?HcWeights = null,
-    /// nb-keyed QSA block constants (`QsaBlockConsts`).
-    qsa_consts: QsaBlockConsts = .{},
-    /// QSA pooled-block cos/sin, built once per forward (`QsaPooledRope`).
-    qsa_pooled_rope: QsaPooledRope = .{},
-    /// Bumped by every forward entry that can reach QSA; keys the per-forward QSA scratch.
-    fwd_gen: u64 = 0,
-    /// Test meter: how many times `qsaScoreBank` built or extended the transposed f32 operand.
-    qsa_score_bank_builds: usize = 0,
-    /// qwen4_exp MTP head (one hyper-connected QSA+MoE layer over the trunk's
-    /// pre-mixer stream + next-token embedding). Loaded when the pack carries
-    /// `mtp.*`; served by `qwen4MtpForward`. Not yet wired into spec decode.
-    qwen4_mtp: ?Qwen4Mtp = null,
-    /// Whose per-request state the head currently holds (`qwen4MtpActivate`).
-    qwen4_mtp_owner: ?*Qwen4MtpState = null,
-
     // MoE-specific (null/empty for standard models)
     moe_layers: ?[]MoeLayerWeights,
     /// Construction-validated q4/g64 S=4 routed gate/up verifier lane.
@@ -701,13 +559,6 @@ pub const Transformer = struct {
     compiled_moe_routing: ?mlx.mlx_closure = null, // negate→argpartition→slice→softmax→take→sum→expand→divide → 1 kernel
     compiled_hy3_routing: ?mlx.mlx_closure = null, // hy_v3 sigmoid+bias variant (2 inputs: logits, expert_bias)
     compiled_gdn_gate: ?mlx.mlx_closure = null, // exp(-exp(A_log)·softplus(a+dt_bias)) → 1 kernel (mirrors mlx-lm compute_g)
-    // qwen4_exp hyper-connection elementwise tails, one kernel each (the
-    // `/hc` scalars are folded into the weights at load): silu(down),
-    // mean(σ(up)·normed), 2σ(inject), stream + out·inj.
-    compiled_hc_silu: ?mlx.mlx_closure = null,
-    compiled_hc_mix: ?mlx.mlx_closure = null,
-    compiled_hc_inj: ?mlx.mlx_closure = null,
-    compiled_hc_write: ?mlx.mlx_closure = null,
 
     // GatedDeltaNet per-token decode used to rebuild these on EVERY layer/step
     // (measured dispatch overhead on Qwen 3.6 hybrid). Built lazily on first
@@ -747,50 +598,6 @@ pub const Transformer = struct {
     mtp_oqe_affine_trunk: bool = false,
 
     // ── methods split out by meaning (P1); aliases keep `x.method(...)` call syntax ──
-    // plugins/qwen4_exp/mtp.zig
-    pub const loadQwen4Mtp = @import("../../plugins/qwen4_exp/mtp.zig").loadQwen4Mtp;
-    pub const Qwen4MtpState = @import("../../plugins/qwen4_exp/mtp.zig").Qwen4MtpState;
-    pub const Qwen4MtpLive = @import("../../plugins/qwen4_exp/mtp.zig").Qwen4MtpLive;
-    pub const qwen4MtpLiveState = @import("../../plugins/qwen4_exp/mtp.zig").qwen4MtpLiveState;
-    pub const qwen4MtpLiveModule = @import("../../plugins/qwen4_exp/mtp.zig").qwen4MtpLiveModule;
-    pub const qwen4MtpStateNew = @import("../../plugins/qwen4_exp/mtp.zig").qwen4MtpStateNew;
-    const qwen4MtpSwapState = @import("../../plugins/qwen4_exp/mtp.zig").qwen4MtpSwapState;
-    pub const qwen4MtpActivate = @import("../../plugins/qwen4_exp/mtp.zig").qwen4MtpActivate;
-    pub const qwen4MtpRelease = @import("../../plugins/qwen4_exp/mtp.zig").qwen4MtpRelease;
-    pub const qwen4MtpReset = @import("../../plugins/qwen4_exp/mtp.zig").qwen4MtpReset;
-    pub const qwen4MtpResetOwned = @import("../../plugins/qwen4_exp/mtp.zig").qwen4MtpResetOwned;
-    pub const mtpHeadKvQuantEnabled = @import("../../plugins/qwen4_exp/mtp.zig").mtpHeadKvQuantEnabled;
-    pub const qwen4MtpHeadKvConfig = @import("../../plugins/qwen4_exp/mtp.zig").qwen4MtpHeadKvConfig;
-    pub const qwen4MtpApplyKvQuant = @import("../../plugins/qwen4_exp/mtp.zig").qwen4MtpApplyKvQuant;
-    pub const qwen4MtpMarkQsaLeftover = @import("../../plugins/qwen4_exp/mtp.zig").qwen4MtpMarkQsaLeftover;
-    pub const qwen4MtpMarks = @import("../../plugins/qwen4_exp/mtp.zig").qwen4MtpMarks;
-    pub const Qwen4MtpOut = @import("../../plugins/qwen4_exp/mtp.zig").Qwen4MtpOut;
-    const Qwen4MtpOutBuf = @import("../../plugins/qwen4_exp/mtp.zig").Qwen4MtpOutBuf;
-    pub const Qwen4MtpProject = @import("../../plugins/qwen4_exp/mtp.zig").Qwen4MtpProject;
-    pub const qwen4MtpTruncate = @import("../../plugins/qwen4_exp/mtp.zig").qwen4MtpTruncate;
-    pub const qwen4MtpTruncateOn = @import("../../plugins/qwen4_exp/mtp.zig").qwen4MtpTruncateOn;
-    pub const qwen4MtpTruncateLive = @import("../../plugins/qwen4_exp/mtp.zig").qwen4MtpTruncateLive;
-    pub const qwen4MtpTruncateToMarkLive = @import("../../plugins/qwen4_exp/mtp.zig").qwen4MtpTruncateToMarkLive;
-    pub const qwen4MtpAdopt = @import("../../plugins/qwen4_exp/mtp.zig").qwen4MtpAdopt;
-    pub const qwen4MtpAdvance = @import("../../plugins/qwen4_exp/mtp.zig").qwen4MtpAdvance;
-    pub const qwen4MtpForward = @import("../../plugins/qwen4_exp/mtp.zig").qwen4MtpForward;
-    pub const qwen4MtpForwardOn = @import("../../plugins/qwen4_exp/mtp.zig").qwen4MtpForwardOn;
-    pub const HeadPlace = @import("../../plugins/qwen4_exp/mtp.zig").HeadPlace;
-    pub const qwen4MtpForwardPlacedOn = @import("../../plugins/qwen4_exp/mtp.zig").qwen4MtpForwardPlacedOn;
-    pub const qwen4MtpForwardPlaced = @import("../../plugins/qwen4_exp/mtp.zig").qwen4MtpForwardPlaced;
-    pub const Qwen4MtpBatchRow = @import("../../plugins/qwen4_exp/mtp.zig").Qwen4MtpBatchRow;
-    pub const mtpPadSeq = @import("../../plugins/qwen4_exp/mtp.zig").mtpPadSeq;
-    const mtpHeadForceBatched = @import("../../plugins/qwen4_exp/mtp.zig").mtpHeadForceBatched;
-    pub const mtpMoeRows = @import("../../plugins/qwen4_exp/mtp.zig").mtpMoeRows;
-    pub const qwen4MtpForwardBatched = @import("../../plugins/qwen4_exp/mtp.zig").qwen4MtpForwardBatched;
-    pub const qwen4MtpForwardLive = @import("../../plugins/qwen4_exp/mtp.zig").qwen4MtpForwardLive;
-    pub const qwen4BuildDraftRerank = @import("../../plugins/qwen4_exp/mtp.zig").qwen4BuildDraftRerank;
-    pub const qwen4DraftRerankReady = @import("../../plugins/qwen4_exp/mtp.zig").qwen4DraftRerankReady;
-    pub const qwen4DraftSelect = @import("../../plugins/qwen4_exp/mtp.zig").qwen4DraftSelect;
-    pub const qwen4DraftShortlist = @import("../../plugins/qwen4_exp/mtp.zig").qwen4DraftShortlist;
-    pub const qwen4DraftShortlistsBatched = @import("../../plugins/qwen4_exp/mtp.zig").qwen4DraftShortlistsBatched;
-    pub const qwen4DraftSelectBatched = @import("../../plugins/qwen4_exp/mtp.zig").qwen4DraftSelectBatched;
-    pub const Qwen4Trace = @import("../../plugins/qwen4_exp/mtp.zig").Qwen4Trace;
     // sdk/blocks/linear/verify_projection.zig
     pub const verifyFeatureEnabled = @import("methods/verify_projection.zig").verifyFeatureEnabled;
     pub const mtpProjectionRows = @import("methods/verify_projection.zig").mtpProjectionRows;
@@ -798,8 +605,6 @@ pub const Transformer = struct {
     pub const concatAxis0 = @import("../../mlx/array.zig").concatAxis0;
     pub const axisView = @import("../../mlx/array.zig").axisView;
     pub const concatAxis1 = @import("../../mlx/array.zig").concatAxis1;
-    // plugins/qwen4_exp/qsa/decode_gather.zig
-    pub const qsaBatchedAttn = @import("../../plugins/qwen4_exp/qsa/decode_gather.zig").qsaBatchedAttn;
     // engines/mlx/batched/layered.zig
     pub const forwardMoeBatchedDecode = @import("batched/layered.zig").forwardMoeBatchedDecode;
     pub const forwardMoeBatchedVerify = @import("batched/layered.zig").forwardMoeBatchedVerify;
@@ -816,37 +621,18 @@ pub const Transformer = struct {
     const MOE_DECODE_BATCH_MAX = @import("../../plugins/glm5_next/forward.zig").MOE_DECODE_BATCH_MAX;
     pub const forwardGlmBatchedDecode = @import("../../plugins/glm5_next/forward.zig").forwardGlmBatchedDecode;
     pub const glmDsaAttn = @import("../../plugins/glm5_next/forward.zig").glmDsaAttn;
-    // plugins/qwen4_exp/ple.zig
-    const advancePlePrev = @import("../../plugins/qwen4_exp/ple.zig").advancePlePrev;
-    const pleDeferrable = @import("../../plugins/qwen4_exp/ple.zig").pleDeferrable;
-    pub const pleEmbedding = @import("../../plugins/qwen4_exp/ple.zig").pleEmbedding;
-    pub const pleEmbeddingGpu = @import("../../plugins/qwen4_exp/ple.zig").pleEmbeddingGpu;
-    pub const pleClaimSpecCapture = @import("../../plugins/qwen4_exp/ple.zig").pleClaimSpecCapture;
     pub const flushDeferredPle = @import("plugin/settle.zig").flush;
     pub const flushDeferredPleGroup = @import("plugin/settle.zig").flushGroup;
     pub const settleDeferredPle = @import("plugin/settle.zig").settleWith;
     pub const deferredPleOnGpu = @import("plugin/settle.zig").historyOwed;
-    const releasePlePending = @import("../../plugins/qwen4_exp/ple.zig").releasePlePending;
     pub const discardDeferredPle = @import("plugin/settle.zig").discard;
-    pub const pleGatherBf16 = @import("../../plugins/qwen4_exp/ple.zig").pleGatherBf16;
-    pub const pleSettleFromArray = @import("../../plugins/qwen4_exp/ple.zig").pleSettleFromArray;
-    pub const pleEvalIds = @import("../../plugins/qwen4_exp/ple.zig").pleEvalIds;
-    pub const pleHostIds = @import("../../plugins/qwen4_exp/ple.zig").pleHostIds;
-    pub const plePrepareIds = @import("../../plugins/qwen4_exp/ple.zig").plePrepareIds;
-    pub const pleFillFromIds = @import("../../plugins/qwen4_exp/ple.zig").pleFillFromIds;
-    const plePrevOf = @import("../../plugins/qwen4_exp/ple.zig").plePrevOf;
-    const pleAdvanceSerial = @import("../../plugins/qwen4_exp/ple.zig").pleAdvanceSerial;
-    pub const pleForward = @import("../../plugins/qwen4_exp/ple.zig").pleForward;
     // engines/mlx/ssm/group.zig
     pub const mergeSsmAcrossSlots = @import("ssm/group.zig").mergeSsmAcrossSlots;
     pub const splitSsmToSlots = @import("ssm/group.zig").splitSsmToSlots;
     pub const ssmGroupDrop = @import("ssm/group.zig").ssmGroupDrop;
     pub const ssmGroupRelease = @import("ssm/group.zig").ssmGroupRelease;
     pub const ssmBindBatched = @import("ssm/group.zig").ssmBindBatched;
-    // plugins/qwen4_exp/qsa/pooled.zig
-    pub const resetQsaPooledRope = @import("../../plugins/qwen4_exp/qsa/pooled.zig").resetQsaPooledRope;
-    pub const qwen4Host = @import("plugin/intree.zig").host;
-    pub const markQsaPooledRopeStale = @import("../../plugins/qwen4_exp/qsa/pooled.zig").markQsaPooledRopeStale;
+    pub const qwen4Trunk = @import("plugin/intree.zig").trunk;
     // sdk/blocks/attention/batched.zig
     pub const BATCHED_PER_SLOT_ATTN_MIN_KV = @import("../../sdk/blocks/attention/batched.zig").BATCHED_PER_SLOT_ATTN_MIN_KV;
     pub const batchedAttnPerSlot = @import("../../sdk/blocks/attention/batched.zig").batchedAttnPerSlot;
@@ -910,24 +696,6 @@ pub const Transformer = struct {
     pub const compileGdnGate = @import("methods/gdn_gate.zig").compileGdnGate;
     const gdnGateClosureCallback = @import("methods/gdn_gate.zig").gdnGateClosureCallback;
     pub const computeGdnGate = @import("methods/gdn_gate.zig").computeGdnGate;
-    // plugins/qwen4_exp/hc.zig
-    pub const compileQwen4Hc = @import("../../plugins/qwen4_exp/hc.zig").compileQwen4Hc;
-    const hcSiluCallback = @import("../../plugins/qwen4_exp/hc.zig").hcSiluCallback;
-    const hcMixCallback = @import("../../plugins/qwen4_exp/hc.zig").hcMixCallback;
-    const hcInjCallback = @import("../../plugins/qwen4_exp/hc.zig").hcInjCallback;
-    const hcWriteCallback = @import("../../plugins/qwen4_exp/hc.zig").hcWriteCallback;
-    pub const HcRead = @import("../../plugins/qwen4_exp/hc.zig").HcRead;
-    pub const hcReadStandin = @import("../../plugins/qwen4_exp/hc.zig").hcReadStandin;
-    pub const hcReadPending = @import("../../plugins/qwen4_exp/hc.zig").hcReadPending;
-    pub const hcReadFusedFor = @import("../../plugins/qwen4_exp/hc.zig").hcReadFusedFor;
-    pub const addVerifyPle = @import("../../plugins/qwen4_exp/hc.zig").addVerifyPle;
-    pub const hcReadVerifyRows = @import("../../plugins/qwen4_exp/hc.zig").hcReadVerifyRows;
-    pub const hcWriteOrDefer = @import("../../plugins/qwen4_exp/hc.zig").hcWriteOrDefer;
-    pub const hcFlush = @import("../../plugins/qwen4_exp/hc.zig").hcFlush;
-    pub const hcGroupNorm = @import("../../plugins/qwen4_exp/hc.zig").hcGroupNorm;
-    pub const hcRead = @import("../../plugins/qwen4_exp/hc.zig").hcRead;
-    pub const hcReadNormed = @import("../../plugins/qwen4_exp/hc.zig").hcReadNormed;
-    pub const hcWrite = @import("../../plugins/qwen4_exp/hc.zig").hcWrite;
     // sdk/blocks/moe/routing.zig
     pub const compileMoeRouting = @import("methods/moe_routing.zig").compileMoeRouting;
     pub const MoeRouting = @import("../../sdk/blocks/moe/routing.zig").MoeRouting;
@@ -998,12 +766,6 @@ pub const Transformer = struct {
     pub const ladderStepMulti = @import("eval_cadence.zig").ladderStepMulti;
     pub const prefillEvalCadence = @import("eval_cadence.zig").prefillEvalCadence;
     pub const prefillEvalCadenceFor = @import("eval_cadence.zig").prefillEvalCadenceFor;
-    // plugins/qwen4_exp/forward.zig
-    const QWEN4_DECODE_ASYNC_LADDER_DEFAULT = @import("../../plugins/qwen4_exp/forward.zig").QWEN4_DECODE_ASYNC_LADDER_DEFAULT;
-    pub const qwen4VerifyRowsEligible = @import("../../plugins/qwen4_exp/forward.zig").qwen4VerifyRowsEligible;
-    pub const forwardQwen4VerifyRows = @import("../../plugins/qwen4_exp/forward.zig").forwardQwen4VerifyRows;
-    pub const forwardQwen4Stream = @import("../../plugins/qwen4_exp/forward.zig").forwardQwen4Stream;
-    pub const forwardQwen4With = @import("../../plugins/qwen4_exp/forward.zig").forwardQwen4With;
     // engines/mlx/dispatch.zig
     pub const defaultCtx = @import("dispatch.zig").defaultCtx;
     pub const module_owned_state_fields = @import("dispatch.zig").module_owned_state_fields;
@@ -1025,16 +787,6 @@ pub const Transformer = struct {
     pub const lmHeadRowsForDraft = @import("spec/trunk_hooks.zig").lmHeadRowsForDraft;
     // engines/mlx/warmup.zig
     pub const warmup = @import("warmup.zig").warmup;
-    const SpecWarmSlot = @import("warmup.zig").SpecWarmSlot;
-    const specWarmIds = @import("warmup.zig").specWarmIds;
-    const specWarmEvalFree = @import("warmup.zig").specWarmEvalFree;
-    pub const specWarmVerify = @import("warmup.zig").specWarmVerify;
-    const MAX_WARM_SEQ = @import("warmup.zig").MAX_WARM_SEQ;
-    const MAX_WIDTH_WARM = @import("warmup.zig").MAX_WIDTH_WARM;
-    pub const warmupSpecVerify = @import("warmup.zig").warmupSpecVerify;
-    pub const specWarmGroupRows = @import("warmup.zig").specWarmGroupRows;
-    pub const specWarmGroupSeq = @import("warmup.zig").specWarmGroupSeq;
-    pub const specWarmHead = @import("warmup.zig").specWarmHead;
     // engines/mlx/capture.zig
     pub const forwardCaptureHidden = @import("capture.zig").forwardCaptureHidden;
     pub const forwardWithCapture = @import("capture.zig").forwardWithCapture;
@@ -1051,7 +803,7 @@ pub const Transformer = struct {
     pub const VerifyLaps = @import("batched/row_axis_verify.zig").VerifyLaps;
     pub const VerifyRollback = @import("batched/row_axis_verify.zig").VerifyRollback;
     pub const forwardRowAxisVerify = @import("batched/row_axis_verify.zig").forwardRowAxisVerify;
-    pub const releaseJoinedVerifyLogits = @import("batched/row_axis_verify.zig").releaseJoinedVerifyLogits;
+    pub const verifyLaps = @import("batched/row_axis_verify.zig").verifyLaps;
     pub const takeJoinedVerifyLogits = @import("batched/row_axis_verify.zig").takeJoinedVerifyLogits;
     // engines/mlx/batched/caps.zig
     pub const hasRecurrentLayers = @import("batched/caps.zig").hasRecurrentLayers;
@@ -1063,29 +815,6 @@ pub const Transformer = struct {
     pub const ropeAtFreqs = @import("methods/rope.zig").ropeAtFreqs;
     pub const ropeCosSinFromFreqs = @import("methods/rope.zig").ropeCosSinFromFreqs;
     pub const ropeApplyCosSin = @import("methods/rope.zig").ropeApplyCosSin;
-    // plugins/qwen4_exp/qsa/indexer.zig
-    pub const qsaInstallRing = @import("../../plugins/qwen4_exp/qsa/indexer.zig").qsaInstallRing;
-    pub const qsaAppendKeys = @import("../../plugins/qwen4_exp/qsa/indexer.zig").qsaAppendKeys;
-    pub const qsaAppendPooled = @import("../../plugins/qwen4_exp/qsa/indexer.zig").qsaAppendPooled;
-    pub const qsaScoreCols = @import("../../plugins/qwen4_exp/qsa/indexer.zig").qsaScoreCols;
-    pub const qsaScoreBank = @import("../../plugins/qwen4_exp/qsa/indexer.zig").qsaScoreBank;
-    pub const qsaScoreOperand = @import("../../plugins/qwen4_exp/qsa/indexer.zig").qsaScoreOperand;
-    pub const qsaPooledCosSin = @import("../../plugins/qwen4_exp/qsa/indexer.zig").qsaPooledCosSin;
-    pub const qsaPooledKeys = @import("../../plugins/qwen4_exp/qsa/indexer.zig").qsaPooledKeys;
-    pub const qsaPooledKeysComposed = @import("../../plugins/qwen4_exp/qsa/indexer.zig").qsaPooledKeysComposed;
-    pub const qsaPoolNorm = @import("../../plugins/qwen4_exp/qsa/indexer.zig").qsaPoolNorm;
-    pub const qsaPooledRopeComposed = @import("../../plugins/qwen4_exp/qsa/indexer.zig").qsaPooledRopeComposed;
-    const qsaSlotEntry = @import("../../plugins/qwen4_exp/qsa/indexer.zig").qsaSlotEntry;
-    pub const qsaMask = @import("../../plugins/qwen4_exp/qsa/indexer.zig").qsaMask;
-    pub const qsaMaskBatched = @import("../../plugins/qwen4_exp/qsa/indexer.zig").qsaMaskBatched;
-    pub const qsaMaskFromQk = @import("../../plugins/qwen4_exp/qsa/indexer.zig").qsaMaskFromQk;
-    pub const qsaSelectMaskOps = @import("../../plugins/qwen4_exp/qsa/indexer.zig").qsaSelectMaskOps;
-    pub const qsaBlockVisibility = @import("../../plugins/qwen4_exp/qsa/indexer.zig").qsaBlockVisibility;
-    pub const qsaChunkSelect = @import("../../plugins/qwen4_exp/qsa/indexer.zig").qsaChunkSelect;
-    pub const qsaSelectBlocks = @import("../../plugins/qwen4_exp/qsa/indexer.zig").qsaSelectBlocks;
-    // plugins/qwen4_exp/attention.zig
-    pub const qwen4AttnWith = @import("../../plugins/qwen4_exp/attention.zig").qwen4AttnWith;
-    pub const qwen4AttnProjected = @import("../../plugins/qwen4_exp/attention.zig").qwen4AttnProjected;
     // plugins/gemma4/moe_tail.zig
     pub const gemma4MoeLayerTail = @import("../../plugins/gemma4/moe_tail.zig").gemma4MoeLayerTail;
     // engines/mlx/diag/profile.zig
@@ -1141,10 +870,6 @@ pub const Transformer = struct {
     pub const moeAddUngatedShared = @import("methods/moe.zig").moeAddUngatedShared;
     pub const moeAddGatedShared = @import("methods/moe.zig").moeAddGatedShared;
     pub const moeAddSharedDown = @import("methods/moe.zig").moeAddSharedDown;
-    pub const moeAddSharedGateRows = @import("methods/moe.zig").moeAddSharedGateRows;
-    pub const moeSharedDownRows = @import("methods/moe.zig").moeSharedDownRows;
-    pub const moeVerifyRowsSolo = @import("methods/moe.zig").moeVerifyRowsSolo;
-    pub const moeVerifyRows = @import("methods/moe.zig").moeVerifyRows;
     pub const moeMLP = @import("methods/moe.zig").moeMLP;
     pub const moeTensorParallel = @import("methods/moe.zig").moeTensorParallel;
     pub const moeExpertsRouted = @import("methods/moe.zig").moeExpertsRouted;
@@ -1163,7 +888,6 @@ pub const Transformer = struct {
     pub const createSlidingWindowMask = @import("methods/masks.zig").createSlidingWindowMask;
 
     pub fn deinit(self: *Transformer) void {
-        self.releaseJoinedVerifyLogits();
         lane_qmm.release(@intFromPtr(self));
         if (self.ane_prefill) |eng| {
             eng.deinit();
@@ -1209,8 +933,6 @@ pub const Transformer = struct {
         if (self.yarn_mscale) |m| _ = mlx.mlx_array_free(m);
         if (self.yarn_inv_freq) |f| self.allocator.free(f);
         if (self.suppress_mask) |m| _ = mlx.mlx_array_free(m);
-        self.qsa_consts.deinit();
-        self.qsa_pooled_rope.deinit();
         self.yarn_mscale_cast.deinit();
         if (self.prompt_cache) |*pc| pc.deinit();
         self.cache.deinit();
@@ -1258,22 +980,6 @@ pub const Transformer = struct {
         }
         self.ssm_group.deinit();
         if (self.moe_layers) |ml| self.allocator.free(ml);
-        if (self.qwen4_mtp) |*m| {
-            for (m.owned) |a| _ = mlx.mlx_array_free(a);
-            self.allocator.free(m.owned);
-            m.cache.deinit();
-            _ = mlx.mlx_array_free(m.entry.conv_state);
-            _ = mlx.mlx_array_free(m.entry.ssm_state);
-            ssmFreeQsaState(&m.entry);
-            m.qsa_marks.deinit();
-            if (m.rerank) |*rc| rc.deinit();
-            self.qwen4_mtp = null;
-        }
-        if (self.qwen4) |st| {
-            st.deinit();
-            self.allocator.destroy(st);
-            self.qwen4 = null;
-        }
         if (self.moe_owned_bf16) |arrs| {
             for (arrs) |a| _ = mlx.mlx_array_free(a);
             self.allocator.free(arrs);
@@ -1312,14 +1018,23 @@ pub const Transformer = struct {
         return self.lmHeadProject(xc);
     }
 
-    pub var qsa_engaged_logged: bool = false;
-
     /// `--mtp-head-kv-quant` opts the qwen4 MTP head's KV into `--kv-quant`; the default
     /// stays dense bf16 (the head is a lossy draft and short prompts dequantize under the
     /// fused-kernel floor). Set once at parse; the override is a test seam.
     pub var mtp_head_kv_quant_override: ?bool = null;
     pub var mtp_head_kv_quant_flag: bool = false;
-    pub var qwen4_trace: ?*Qwen4Trace = null;
+
+    pub fn mtpHeadKvQuantEnabled() bool {
+        if (mtp_head_kv_quant_override) |v| return v;
+        return mtp_head_kv_quant_flag;
+    }
+
+    /// The qwen4_exp head's KV scheme: dense unless `--mtp-head-kv-quant`, then the trunk's. Fixed at load, so a
+    /// session never mixes schemes and the bill prices the head at this scheme.
+    pub fn qwen4MtpHeadKvConfig(trunk: KVQuantConfig) KVQuantConfig {
+        if (mtpHeadKvQuantEnabled()) return trunk;
+        return KVQuantConfig.dense;
+    }
 };
 
 test {

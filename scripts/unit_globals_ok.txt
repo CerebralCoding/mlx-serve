@@ -83,6 +83,9 @@ sdk.blocks.moe.gather_qmv.gqmv_cfg_cache
 engines.mlx.methods.moe.moeMLP2WithRouter.Once.logged.2
 engines.mlx.methods.moe.moeMLP2WithRouter.Once.logged.3
 engines.mlx.methods.moe.moeMLP2WithRouter.Once.logged.4
+plugins.qwen4_exp.trunk.moe.moeMLP2WithRouter.Once.logged.2
+plugins.qwen4_exp.trunk.moe.moeMLP2WithRouter.Once.logged.3
+plugins.qwen4_exp.trunk.moe.moeMLP2WithRouter.Once.logged.4
 sdk.blocks.moe.moe_cuda.env_enabled
 sdk.blocks.moe.moe_prefill_cuda.env_enabled
 sdk.blocks.qmm.lane_qmm.mdims_cache

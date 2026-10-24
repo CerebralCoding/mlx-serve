@@ -34,15 +34,15 @@ pub fn defaultCtx(self: *Transformer) ForwardCtx {
 /// slot deinits and rebuilds the live request's state and both then append
 /// to the ONE state. Add a new arm here the moment its pointer field is
 /// added above, or the arch serves two clients one mangled stream.
-pub const module_owned_state_fields = [_][]const u8{ "mlx_stream_ext", "dist_peer" };
+pub const module_owned_state_fields = [_][]const u8{"mlx_stream_ext"};
 
-/// Module pointer fields that hold READ-ONLY per-model state (qwen4: the
+/// Module pointer fields that hold READ-ONLY per-model state (qwen4: the trunk module with the
 /// n-gram hash + mmapped table). Every per-request thing lives on the
 /// slot's `SSMCacheEntry` (GDN pair, PLE window + tokens, QSA keys +
 /// pooled blocks), so slots interleave AND batch freely. The one
 /// module-owned piece on this arch is the MTP head's cache, and the
 /// scheduler makes the SLOT that uses it exclusive (`slotExclusiveDecode`).
-pub const module_shared_readonly_fields = [_][]const u8{ "qwen4", "dist_tp" };
+pub const module_shared_readonly_fields = [_][]const u8{};
 
 /// A served model's caps; null on the legacy path.
 fn servedCaps(self: *const Transformer) ?abi.Caps {
@@ -55,6 +55,8 @@ pub fn ownsModuleDecodeState(self: *const Transformer) bool {
     inline for (module_owned_state_fields) |f| {
         if (@field(self, f) != null) return true;
     }
+    // A pipeline rank 0's worker holds the later layers' per-request state.
+    if (intree.trunk(self)) |t| if (t.dist_peer != null) return true;
     return false;
 }
 
@@ -103,7 +105,7 @@ pub fn moduleStateSpecRollback(self: *const Transformer) bool {
     // qwen4_exp: GDN per-position capture + PLE window/token capture +
     // positional QSA key histories (`ssmRollbackFromCapture`), so the MTP
     // head's verify can rewind. dsv4 cannot.
-    return self.qwen4_mtp != null;
+    return false;
 }
 
 /// Is this arch's MTP head the checkpoint's OWN trained layer AND measured
@@ -128,7 +130,6 @@ pub fn forwardWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_arra
     if (self.mlx_stream_ext) |m| return forwardMlxStream(self, ctx, token_ids, m);
     // EmbeddingGemma (a bidirectional gemma3 trunk) never runs causal decode.
     if (self.config.use_bidirectional_attention) return self.forwardGemma3EncoderWith(ctx, token_ids);
-    if (self.qwen4 != null) return self.forwardQwen4With(ctx, token_ids);
     if (self.config.isGlm5()) return self.forwardGlm5With(ctx, token_ids);
     if (self.moe_layers != null) return self.forwardMoeWith(ctx, token_ids);
     return self.forwardStandardWith(ctx, token_ids);
@@ -166,24 +167,17 @@ test "ownsModuleDecodeState covers every module-owned arch" {
     t.plugin = null;
     t.rht = null;
     t.mlx_stream_ext = null;
-    t.qwen4 = null;
-    t.dist_peer = null;
-    t.dist_tp = null;
     try testing.expect(!t.ownsModuleDecodeState());
 
     var fake_ext: mlx_stream_mod.Model = undefined;
     t.mlx_stream_ext = &fake_ext;
-    try testing.expect(t.ownsModuleDecodeState());
-    t.mlx_stream_ext = null;
-    var fake_peer: distributed_mod.Peer = undefined;
-    t.dist_peer = &fake_peer;
     try testing.expect(t.ownsModuleDecodeState());
 }
 
 test "every optional pointer on Transformer is declared module-owned, shared read-only or engine-owned" {
     // A third arch declared like the module-owned ones is exclusive by construction only if it lands in a list:
     // forgetting it is silent until two clients arrive at once.
-    const engine_owned = [_][]const u8{ "ane_prefill", "plugin", "qwen4_mtp_owner", "rht", "int8_cache", "capture_hidden", "spec_tree" };
+    const engine_owned = [_][]const u8{ "ane_prefill", "plugin", "rht", "int8_cache", "capture_hidden", "spec_tree" };
     const info = @typeInfo(Transformer).@"struct";
     inline for (info.field_names, info.field_types) |name, T| {
         const ti = @typeInfo(T);

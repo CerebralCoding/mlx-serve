@@ -53,6 +53,8 @@ pub const Config = struct {
 
     num_experts: u32 = 0,
     num_experts_per_tok: u32 = 0,
+    /// A Sushi pack: routed experts in EXL3 (`expert_quant`, read by `toModelConfig`).
+    expert_quant: bool = false,
     moe_intermediate_size: u32 = 0,
     shared_expert_intermediate_size: u32 = 0,
 
@@ -261,7 +263,7 @@ const foreign_keys = [_][]const u8{
     "use_bidirectional_attention", "global_head_dim", "num_global_key_value_heads", "num_kv_shared_layers",
     "attention_k_eq_v",            "final_logit_softcapping", "hidden_size_per_layer_input", "top_k_experts",
 };
-const foreign_root_keys = [_][]const u8{ "pooling_mode", "audio_config", "audio_token_id", "boa_token_id", "eoa_token_index", "eoa_token_id", "expert_quant" };
+const foreign_root_keys = [_][]const u8{ "pooling_mode", "audio_config", "audio_token_id", "boa_token_id", "eoa_token_index", "eoa_token_id" };
 
 /// config.json into `c`, as the engine's generic block and its qwen4_exp arm read it.
 pub fn parseJson(c: *Config, outer: std.json.ObjectMap) ParseError!void {
@@ -286,6 +288,7 @@ pub fn parseJson(c: *Config, outer: std.json.ObjectMap) ParseError!void {
     try readU32(cfg, "query_pre_attn_scalar", &c.query_pre_attn_scalar);
     try readU32If(cfg, "num_experts", &c.num_experts);
     try readU32If(cfg, "num_experts_per_tok", &c.num_experts_per_tok);
+    c.expert_quant = field(root, "expert_quant") != null;
     try readU32If(cfg, "moe_intermediate_size", &c.moe_intermediate_size);
     try readU32If(cfg, "shared_expert_intermediate_size", &c.shared_expert_intermediate_size);
     try readU32(cfg, "linear_num_key_heads", &c.linear_num_key_heads);
@@ -676,6 +679,7 @@ pub fn facts(c: *Config) abi.Parsed {
         .spec_rollback = true,
         .images = c.qwen_vision,
         .video = c.qwen_vision,
+        .cluster_plan = true,
     };
     const s = &p.shell;
     s.* = .{
@@ -819,7 +823,7 @@ test "qwen4_exp config: a bad bound is refused by name, another family's key is 
     const no_ple = "{\"model_type\":\"qwen4_exp\",\"num_hidden_layers\":2}";
     const v = parse(&dir, .of(no_ple), .{}, null, true, &p);
     try testing.expect(v.code == .failed and std.mem.indexOf(u8, v.why.slice(), "InvalidQwen4PleLayer") != null and p.private == null);
-    const sushi = "{\"model_type\":\"qwen4_exp\",\"expert_quant\":{}}";
-    try testing.expectEqual(abi.Verdict.Code.unsupported, parse(&dir, .of(sushi), .{}, null, true, &p).code);
+    const audio = "{\"model_type\":\"qwen4_exp\",\"audio_config\":{}}";
+    try testing.expectEqual(abi.Verdict.Code.unsupported, parse(&dir, .of(audio), .{}, null, true, &p).code);
     try testing.expectEqual(abi.Verdict.Code.unsupported, parse(&dir, .of(tiny_text), .{}, &.{ .first = 0, .count = 2 }, true, &p).code);
 }

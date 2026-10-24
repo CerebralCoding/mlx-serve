@@ -11,7 +11,7 @@ const restoreSsmCheckpoint = @import("../../../engines/mlx/ssm/checkpoint.zig").
 const ssmCheckpointBytes = @import("../../../engines/mlx/ssm/checkpoint.zig").ssmCheckpointBytes;
 const SSMCacheEntry = @import("../../../engines/mlx/ssm/entry.zig").SSMCacheEntry;
 const SSMCacheEntrySnapshot = @import("../../../engines/mlx/ssm/entry.zig").SSMCacheEntrySnapshot;
-const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
+const Trunk = @import("../trunk.zig").Trunk;
 const materializedOwnedCopy = @import("../../../mlx/array.zig").materializedOwnedCopy;
 const attn256MaxDiff = @import("../../../sdk/blocks/attention/attn256.zig").attn256MaxDiff;
 const attn256RandBf16 = @import("../../../sdk/blocks/attention/attn256.zig").attn256RandBf16;
@@ -580,9 +580,8 @@ test "QSA checkpoint aux+pooled bytes are O(rows + checkpoints)" {
     try testing.expectEqual(@as(c_int, 11), dest[0].qsa_pooled_blocks);
     try testing.expectEqual(@as(c_int, 46), dest[0].qsa_hist_rows);
 
-    var t: Transformer = undefined;
+    var t: Trunk = undefined;
 
-    t.rht = null;
     t.s = s;
     t.allocator = testing.allocator;
     const extra_shape = [_]c_int{ 1, 1, hd };
@@ -794,8 +793,7 @@ test "handoffQsaHistoryToLatest: the newest snap takes a VIEW of the live buffer
     // The handoff hands the dying slot's buffer to the entry: same rows, same bytes, no allocation.
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
-    var t: Transformer = undefined;
-    t.rht = null;
+    var t: Trunk = undefined;
     t.s = s;
     t.allocator = testing.allocator;
     const hd: c_int = 16;
@@ -848,8 +846,7 @@ test "handoffQsaHistoryToLatest materializes when the buffer's slack past the sn
     // Past the slack bar the handoff pays the copy.
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
-    var t: Transformer = undefined;
-    t.rht = null;
+    var t: Trunk = undefined;
     t.s = s;
     t.allocator = testing.allocator;
     const hd: c_int = 16;
@@ -909,9 +906,8 @@ test "applyQsaHistoryAt: a sliced restore is a VIEW of the entry's history; the 
     const src_ptr = mlx.mlx_array_data_float32(cps[0].layers[0].qsa_pooled) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(src_ptr, dest_ptr);
 
-    var t: Transformer = undefined;
+    var t: Trunk = undefined;
 
-    t.rht = null;
     t.s = s;
     t.allocator = testing.allocator;
     var extra = mlx.mlx_array_new();

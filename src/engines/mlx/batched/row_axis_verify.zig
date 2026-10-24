@@ -1,5 +1,5 @@
 //! engines/mlx/batched/row_axis_verify, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns VerifyLaps, VerifyRollback, forwardRowAxisVerify, releaseJoinedVerifyLogits, takeJoinedVerifyLogits, expectRowsByteEqual, and 9 more.
+//! Owns VerifyLaps, VerifyRollback, forwardRowAxisVerify, verifyLaps, takeJoinedVerifyLogits, expectRowsByteEqual, and 9 more.
 
 const std = @import("std");
 const env = @import("../../../env.zig");
@@ -15,6 +15,7 @@ const intree = @import("../plugin/intree.zig");
 const mtp = @import("../../../plugins/qwen4_exp/mtp.zig");
 const verify_projection = @import("../../../sdk/blocks/linear/verify_projection.zig");
 const Qwen4TestSlot = @import("../../../plugins/qwen4_exp/forward.zig").Qwen4TestSlot;
+const Qwen4Trunk = @import("../../../plugins/qwen4_exp/trunk.zig").Trunk;
 const ssmFreeQsaState = @import("../../../plugins/qwen4_exp/qsa/history.zig").ssmFreeQsaState;
 const qsaArraysAllEqual = @import("../../../plugins/qwen4_exp/qsa/select.zig").qsaArraysAllEqual;
 const attn256RandBf16 = @import("../../../sdk/blocks/attention/attn256.zig").attn256RandBf16;
@@ -47,21 +48,22 @@ pub const VerifyRollback = struct {
     const KvMark = struct { offset: usize, initialized: bool };
 
     allocator: std.mem.Allocator,
-    xfm: *Transformer,
+    /// The trunk's per-forward QSA scratch key, bumped on restore.
+    fwd_gen: *u64,
     ctx: *ForwardCtx,
     kv_marks: []KvMark,
     cache_step: usize,
     ssm: []SSMCacheEntrySnapshot,
     offset: usize,
 
-    fn capture(xfm: *Transformer, ctx: *ForwardCtx) !@This() {
-        const marks = try xfm.allocator.alloc(KvMark, ctx.cache.entries.len);
-        errdefer xfm.allocator.free(marks);
+    pub fn capture(allocator: std.mem.Allocator, fwd_gen: *u64, ctx: *ForwardCtx) !@This() {
+        const marks = try allocator.alloc(KvMark, ctx.cache.entries.len);
+        errdefer allocator.free(marks);
         for (ctx.cache.entries, marks) |entry, *mark| mark.* = .{ .offset = entry.offset, .initialized = entry.initialized };
         const entries = ctx.ssm_entries orelse &.{};
-        const states = try xfm.allocator.alloc(SSMCacheEntrySnapshot, entries.len);
+        const states = try allocator.alloc(SSMCacheEntrySnapshot, entries.len);
         for (entries, states) |*entry, *state| state.* = ssmSnapshot(entry);
-        return .{ .allocator = xfm.allocator, .xfm = xfm, .ctx = ctx, .kv_marks = marks, .cache_step = ctx.cache.step, .ssm = states, .offset = ctx.moe_seq_offset.* };
+        return .{ .allocator = allocator, .fwd_gen = fwd_gen, .ctx = ctx, .kv_marks = marks, .cache_step = ctx.cache.step, .ssm = states, .offset = ctx.moe_seq_offset.* };
     }
 
     pub fn restore(self: *@This()) void {
@@ -104,7 +106,7 @@ pub const VerifyRollback = struct {
             }
         }
         self.ctx.ssm_member_gen = nextSsmMemberGen();
-        self.xfm.fwd_gen +%= 1;
+        self.fwd_gen.* +%= 1;
     }
 
     pub fn deinit(self: *@This()) void {
@@ -126,7 +128,8 @@ pub fn forwardRowAxisVerify(
 ) !void {
     std.debug.assert(token_rows.len == ctxs.len);
     std.debug.assert(out_logits.len >= token_rows.len and out_last.len >= token_rows.len and out_all.len >= token_rows.len);
-    // P8 debt (`plugin/intree.zig`): a served qwen4_exp's grouped verify runs on its inner trunk, owed PLE work first.
+    // qwen4_exp's grouped verify runs on its trunk module (a single row keeps the plugin forward below), owed PLE work
+    // settled first.
     if (token_rows.len > 1) if (intree.inner(self)) |t| {
         try self.flushDeferredPleGroup(ctxs);
         return t.forwardRowAxisVerify(token_rows, ctxs, out_logits, out_last, out_all, row_ns, rollback_out);
@@ -140,21 +143,6 @@ pub fn forwardRowAxisVerify(
     }
     if (row_ns) |ns| @memset(ns[0..token_rows.len], 0);
     self.verify_laps = .{};
-    self.releaseJoinedVerifyLogits();
-    var rollback: [MAX_BATCH_ROWS]VerifyRollback = undefined;
-    var n_rollback: usize = 0;
-    defer for (rollback[0..n_rollback]) |*saved| saved.deinit();
-    errdefer for (rollback[0..n_rollback]) |*saved| saved.restore();
-    if (self.qwen4 != null and token_rows.len > 1) {
-        if (token_rows.len > MAX_BATCH_ROWS) return error.MtpBatchTooWide;
-        for (ctxs) |ctx| try self.ssmGroupRelease(ctx);
-        for (ctxs, 0..) |ctx, i| {
-            var snapshot_lap = io_util_mod.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
-            rollback[i] = try VerifyRollback.capture(self, ctx);
-            n_rollback += 1;
-            if (row_ns) |ns| ns[i] = snapshot_lap.read();
-        }
-    }
     var lap = io_util_mod.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
     var built: usize = 0;
     var touched: usize = 0;
@@ -169,87 +157,50 @@ pub fn forwardRowAxisVerify(
             if (ctxs[i].ssm_entries) |entries| for (entries) |*e| ssmFreeSpecCapture(e);
         }
     }
-    if (self.qwen4VerifyRowsEligible(token_rows, ctxs)) {
-        const Once = struct {
-            var logged = false;
-        };
-        if (!Once.logged) {
-            Once.logged = true;
-            log.info("[batched] row-axis mtp verify grouped MoE engaged (slots={d})\n", .{token_rows.len});
-        }
-        for (ctxs) |ctx| {
-            ctx.capture_ssm_seq = true;
-            ctx.ple_defer = true;
-        }
-        touched = token_rows.len;
-        {
-            defer for (ctxs) |ctx| {
-                ctx.ple_defer = false;
-                ctx.capture_ssm_seq = false;
-            };
-            try self.forwardQwen4VerifyRows(token_rows, ctxs, out_logits, out_last, out_all);
-        }
-        built = token_rows.len;
-        const group_ns = lap.read();
-        self.verify_laps.build_ns += group_ns;
-        if (row_ns) |ns| {
-            for (ns[0..token_rows.len]) |*value| value.* += group_ns;
-        }
-        lap.reset();
-    } else {
-        for (token_rows, ctxs, 0..) |row, ctx, i| {
-            touched = i + 1;
-            var last = mlx.mlx_array_new();
-            var all = mlx.mlx_array_new();
-            // Per-position SSM capture lets a partial accept roll back without a re-forward;
-            // the deferred PLE leaf keeps qwen4_exp's host gather out of the graph build.
-            ctx.capture_ssm_seq = ctx.ssm_entries != null;
-            ctx.ple_defer = true;
-            const logits = self.forwardWithCaptureAll(ctx, row, &last, &all) catch |e| {
-                ctx.ple_defer = false;
-                ctx.capture_ssm_seq = false;
-                _ = mlx.mlx_array_free(last);
-                _ = mlx.mlx_array_free(all);
-                return e;
-            };
+    for (token_rows, ctxs, 0..) |row, ctx, i| {
+        touched = i + 1;
+        var last = mlx.mlx_array_new();
+        var all = mlx.mlx_array_new();
+        // Per-position SSM capture lets a partial accept roll back without a re-forward; a served model's deferred
+        // host work keeps out of the graph build.
+        ctx.capture_ssm_seq = ctx.ssm_entries != null;
+        ctx.ple_defer = true;
+        const logits = self.forwardWithCaptureAll(ctx, row, &last, &all) catch |e| {
             ctx.ple_defer = false;
             ctx.capture_ssm_seq = false;
-            out_logits[i] = logits;
-            out_last[i] = last;
-            out_all[i] = all;
-            built = i + 1;
-            const row_build_ns = lap.read();
-            self.verify_laps.build_ns += row_build_ns;
-            lap.reset();
-            if (row_ns) |ns| ns[i] += row_build_ns;
-        }
+            _ = mlx.mlx_array_free(last);
+            _ = mlx.mlx_array_free(all);
+            return e;
+        };
+        ctx.ple_defer = false;
+        ctx.capture_ssm_seq = false;
+        out_logits[i] = logits;
+        out_last[i] = last;
+        out_all[i] = all;
+        built = i + 1;
+        const row_build_ns = lap.read();
+        self.verify_laps.build_ns += row_build_ns;
+        lap.reset();
+        if (row_ns) |ns| ns[i] += row_build_ns;
     }
-    // Fills the deferred PLE leaves and advances every row's n-gram history: after EVERY
-    // row's build, before the first eval downstream of a leaf and before any rollback.
+    // Settles the deferred host work after every row's build, before the first eval downstream of it.
     try self.flushDeferredPleGroup(ctxs[0..token_rows.len]);
     const ple_ns = lap.read();
     self.verify_laps.ple_ns = ple_ns;
     if (row_ns) |ns| ns[0] += ple_ns;
-    if (rollback_out) |out| {
-        @memcpy(out[0..n_rollback], rollback[0..n_rollback]);
-        n_rollback = 0;
-    }
 }
 
-/// Drop the published joined verify block. Called before every row-axis
-/// verify and at teardown; the accept side takes ownership when it wants it.
-pub fn releaseJoinedVerifyLogits(self: *Transformer) void {
-    if (self.verify_joined_logits.ctx == null) return;
-    _ = mlx.mlx_array_free(self.verify_joined_logits);
-    self.verify_joined_logits = .{ .ctx = null };
+/// The laps of the last grouped verify: qwen4_exp's trunk keeps its own.
+pub fn verifyLaps(self: *Transformer) *VerifyLaps {
+    if (intree.trunk(self)) |t| return &t.verify_laps;
+    return &self.verify_laps;
 }
 
-/// Hand the joined verify block to the caller (null when the projection ran
-/// per row).
+/// Hand the joined verify block to the caller (null when the projection ran per row; only qwen4_exp's grouped verify
+/// joins one).
 pub fn takeJoinedVerifyLogits(self: *Transformer) mlx.mlx_array {
-    const out = self.verify_joined_logits;
-    self.verify_joined_logits = .{ .ctx = null };
-    return out;
+    const t = intree.trunk(self) orelse return .{ .ctx = null };
+    return t.takeJoinedVerifyLogits();
 }
 
 // ── tests ──
@@ -284,7 +235,7 @@ pub const L10VerifySlots = struct {
     solo: [2]*Qwen4TestSlot,
     group: [2]*Qwen4TestSlot,
 
-    pub fn init(alloc: std.mem.Allocator, xfm: *Transformer, n_layers: u32, prompts: [2][]const i32) !L10VerifySlots {
+    pub fn init(alloc: std.mem.Allocator, xfm: anytype, n_layers: u32, prompts: [2][]const i32) !L10VerifySlots {
         var out: L10VerifySlots = undefined;
         for (0..2) |i| {
             out.solo[i] = try Qwen4TestSlot.init(alloc, n_layers);
@@ -335,12 +286,9 @@ test "row-axis verify: every row of a group verify is byte-identical to its solo
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Qwen4Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
-    try testing.expect(xfm.qwen4 != null);
-    xfm.compileQwen4Hc();
-    xfm.compileGdnGate();
-    xfm.compileMoeRouting();
+    xfm.prepare();
     const n_layers = config.num_hidden_layers;
 
     var ids: [640]i32 = undefined;
@@ -498,12 +446,9 @@ test "per-row rollback: different accept counts across rows restore exactly the 
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Qwen4Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
-    try testing.expect(xfm.qwen4 != null);
-    xfm.compileQwen4Hc();
-    xfm.compileGdnGate();
-    xfm.compileMoeRouting();
+    xfm.prepare();
     const n_layers = config.num_hidden_layers;
 
     var ids: [640]i32 = undefined;
@@ -600,9 +545,9 @@ test "a tensor-parallel rank 0 never takes the grouped verify, whose MoE skips t
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Qwen4Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
-    xfm.compileMoeRouting();
+    xfm.prepare();
 
     var ids: [256]i32 = undefined;
     for (&ids, 0..) |*t, i| t.* = @intCast((i * 7919 + 13) % 40000);
@@ -637,12 +582,9 @@ test "group round: a row's own argmax and budget decide it, and nothing else doe
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Qwen4Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
-    try testing.expect(xfm.qwen4 != null);
-    xfm.compileQwen4Hc();
-    xfm.compileGdnGate();
-    xfm.compileMoeRouting();
+    xfm.prepare();
     const n_layers = config.num_hidden_layers;
 
     var ids: [640]i32 = undefined;
@@ -753,12 +695,9 @@ test "N=4 rollback: rejects, partial accepts and full accept restore solo states
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Qwen4Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
-    try testing.expect(xfm.qwen4 != null);
-    xfm.compileQwen4Hc();
-    xfm.compileGdnGate();
-    xfm.compileMoeRouting();
+    xfm.prepare();
     const n_layers = config.num_hidden_layers;
 
     var ids: [640]i32 = undefined;
@@ -910,11 +849,8 @@ test "verify rollback permits in-place KV append and restores its valid prefix" 
     @memcpy(&expected, before[0..expected.len]);
     var offset: usize = 8;
     var ctx = ForwardCtx{ .cache = &cache, .moe_seq_offset = &offset, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
-    var xfm: Transformer = undefined;
-    xfm.rht = null;
-    xfm.allocator = allocator;
-    xfm.fwd_gen = 0;
-    var rollback = try Transformer.VerifyRollback.capture(&xfm, &ctx);
+    var fwd_gen: u64 = 0;
+    var rollback = try VerifyRollback.capture(allocator, &fwd_gen, &ctx);
     defer rollback.deinit();
     var appended = try cache.update(0, tail, tail, stream, 0);
     appended.deinit();
@@ -1009,11 +945,8 @@ fn verifyRollbackKvCase(config: KVQuantConfig, prefix_len: usize, force_growth: 
     }
     var offset = prefix_len;
     var ctx = ForwardCtx{ .cache = &cache, .moe_seq_offset = &offset, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
-    var xfm: Transformer = undefined;
-    xfm.rht = null;
-    xfm.allocator = allocator;
-    xfm.fwd_gen = 0;
-    var rollback = try Transformer.VerifyRollback.capture(&xfm, &ctx);
+    var fwd_gen: u64 = 0;
+    var rollback = try VerifyRollback.capture(allocator, &fwd_gen, &ctx);
     defer rollback.deinit();
     var appended = try cache.update(0, tail, tail, stream, 0);
     appended.deinit();

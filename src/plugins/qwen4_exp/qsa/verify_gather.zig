@@ -6,7 +6,6 @@ const kv_quant = @import("../../../engines/mlx/cache/kv_quant.zig");
 const log = @import("../../../host/log.zig");
 const arms = @import("arms.zig");
 const sparse_attn = @import("sparse_attn.zig");
-const transformer = @import("../../../engines/mlx/transformer.zig");
 const KVCache = @import("../../../engines/mlx/kv/cache.zig").KVCache;
 const bf16Scalar = @import("../../../engines/mlx/load/weights.zig").bf16Scalar;
 const takeContig = @import("../../../mlx/array.zig").takeContig;
@@ -35,8 +34,12 @@ const qsaWantsBlocks = @import("sparse_attn.zig").qsaWantsBlocks;
 /// instead of the whole cache under a dense [S, kv] mask. With `--kv-quant 8`
 /// the dense mask arm also dequantizes the whole stored range per layer per
 /// forward; this arm dequantizes only the gathered rows.
+/// Test seams: the verify gather on or off, and its KV floor.
+pub var qsa_verify_gather_override: ?bool = null;
+pub var qsa_verify_gather_min_kv_override: ?c_int = null;
+
 pub fn qsaVerifyGatherEnabled() bool {
-    return transformer.qsa_verify_gather_override orelse true;
+    return qsa_verify_gather_override orelse true;
 }
 
 /// The union is FIXED-size (S * budget blocks): at the production budget
@@ -51,7 +54,7 @@ pub const QSA_VERIFY_GATHER_MIN_KV_QUANT: c_int = 16384;
 /// `quantized` = the arm will dequantize only the gathered rows, i.e. the
 /// view carries affine triples (`DenseKVView.has_quant_triple`).
 pub fn qsaVerifyGatherMinKvFor(quantized: bool) c_int {
-    if (transformer.qsa_verify_gather_min_kv_override) |v| return v;
+    if (qsa_verify_gather_min_kv_override) |v| return v;
     return if (quantized) QSA_VERIFY_GATHER_MIN_KV_QUANT else QSA_VERIFY_GATHER_MIN_KV_DENSE;
 }
 
@@ -377,12 +380,12 @@ pub fn qsaVerifyGatherAttn(
 // ── tests ──
 
 test "qsa verify gather floor: dense KV 32768, quantized 16384, override wins" {
-    const prev_o = transformer.qsa_verify_gather_min_kv_override;
-    defer transformer.qsa_verify_gather_min_kv_override = prev_o;
-    transformer.qsa_verify_gather_min_kv_override = null;
+    const prev_o = qsa_verify_gather_min_kv_override;
+    defer qsa_verify_gather_min_kv_override = prev_o;
+    qsa_verify_gather_min_kv_override = null;
     try std.testing.expectEqual(@as(c_int, 32768), qsaVerifyGatherMinKvFor(false));
     try std.testing.expectEqual(@as(c_int, 16384), qsaVerifyGatherMinKvFor(true));
-    transformer.qsa_verify_gather_min_kv_override = 4096;
+    qsa_verify_gather_min_kv_override = 4096;
     try std.testing.expectEqual(@as(c_int, 4096), qsaVerifyGatherMinKvFor(false));
     try std.testing.expectEqual(@as(c_int, 4096), qsaVerifyGatherMinKvFor(true));
 }
@@ -710,10 +713,10 @@ test "qsa verify gather: subset SDPA matches masked full SDPA at verify widths (
     // (strided views, capacity > logical) so the subset dequant sees the live
     // layout, and its reference is the same cache's FULL dense view.
     const s = mlx.gpuStream();
-    transformer.qsa_verify_gather_override = true;
-    transformer.qsa_verify_gather_min_kv_override = 1024;
-    defer transformer.qsa_verify_gather_override = null;
-    defer transformer.qsa_verify_gather_min_kv_override = null;
+    qsa_verify_gather_override = true;
+    qsa_verify_gather_min_kv_override = 1024;
+    defer qsa_verify_gather_override = null;
+    defer qsa_verify_gather_min_kv_override = null;
     var prng = std.Random.DefaultPrng.init(0x7e21f);
     const rnd = prng.random();
     const ratio: c_int = 4;
@@ -784,10 +787,10 @@ test "qsa verify gather: subset SDPA matches masked full SDPA at verify widths (
     const bl = mlx.mlx_array_new_data(bh.ptr, &bsh, 3, .int32);
     defer _ = mlx.mlx_array_free(bl);
     var dv2 = DenseKVView{ .k = kd, .v = vd, .owned = false };
-    transformer.qsa_verify_gather_override = false;
+    qsa_verify_gather_override = false;
     try std.testing.expect((try qsaVerifyGatherAttn(s, q, &dv2, bl, ratio, 1.0)) == null);
-    transformer.qsa_verify_gather_override = true;
-    transformer.qsa_verify_gather_min_kv_override = 16384;
+    qsa_verify_gather_override = true;
+    qsa_verify_gather_min_kv_override = 16384;
     try std.testing.expect((try qsaVerifyGatherAttn(s, q, &dv2, bl, ratio, 1.0)) == null);
 }
 
@@ -879,6 +882,7 @@ test "qsa route: dense bf16 verify at kv 20000 takes the fused kernel through th
 }
 
 test "qsa route: qsaWantsBlocks admits verify widths wherever the fused kernel serves" {
+    const transformer = @import("../../../engines/mlx/transformer.zig");
     defer {
         sparse_attn.qsa_attn_dense_override = null;
         transformer.qsa_attn_kernel_override = null;

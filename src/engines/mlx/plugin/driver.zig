@@ -97,9 +97,21 @@ fn loadSplit(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, config: *M
 
 /// The lossy load setting a served pack has on that the plugin path does not run yet, by its settings name.
 fn lossyUnserved(config: *const ModelConfig) ?[]const u8 {
-    if ((config.int8_prefill_override orelse false) and mlx.metalKernelsAvailable()) return "int8_prefill";
-    if (lmHeadMxfp8On(config.lm_head_mxfp8_override, transformer_mod.cli().lm_head_mxfp8_cli, mlx.cudaIntegrated(), false, config.quant_bits)) return "lm_head_mxfp8";
+    const table = (config.plugin orelse return null).table;
+    if ((config.int8_prefill_override orelse false) and mlx.metalKernelsAvailable() and !intree.servesLossy(table, .int8_prefill)) return "int8_prefill";
+    if (lmHeadMxfp8On(headMxfp8Setting(config), null, mlx.cudaIntegrated(), false, config.quant_bits) and !intree.servesLossy(table, .lm_head_mxfp8)) return "lm_head_mxfp8";
     return null;
+}
+
+/// `lm_head_mxfp8` as the model's settings, else the launch flag, state it; null = the model's default.
+fn headMxfp8Setting(config: *const ModelConfig) ?bool {
+    return config.lm_head_mxfp8_override orelse transformer_mod.cli().lm_head_mxfp8_cli;
+}
+
+/// `LoadCtx.settings_json`: the lossy load settings stated for this model (a plugin that serves them reads them).
+fn loadSettings(buf: []u8, config: *const ModelConfig) []const u8 {
+    const head = headMxfp8Setting(config) orelse return "{}";
+    return std.fmt.bufPrint(buf, "{{\"lm_head_mxfp8\":{s}}}", .{if (head) "true" else "false"}) catch unreachable;
 }
 
 /// A pack with a lossy setting its plugin does not run goes back to the legacy path while one exists (a type whose
@@ -148,10 +160,12 @@ pub fn loadWith(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_di
     var why: abi.Verdict = .{};
     // A placeholder only the tokenizer names (RADIO's `<image>`) comes from the engine config, which read it.
     if (b.parsed.caps.images and b.parsed.placeholder_ids.image == 0) b.parsed.placeholder_ids.image = config.image_token_id;
+    var settings_buf: [64]u8 = undefined;
     const m = b.table.load(&.{
         .model_dir = abi.Str.of(model_dir),
         .dir = &dir,
         .parsed = &b.parsed,
+        .settings_json = abi.Str.of(loadSettings(&settings_buf, config)),
         .stream = .{ .ctx = s.ctx },
         .weights = &src,
     }, &why) orelse {

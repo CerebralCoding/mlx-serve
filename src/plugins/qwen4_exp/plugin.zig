@@ -1,15 +1,13 @@
-//! Qwen3.8-Flash-Next (`qwen4_exp`): the family's own forward behind the model table. The trunk module (hyper-
-//! connection streams, the n-gram PLE, QSA sparse attention, GatedDeltaNet + MoE layers) still loads through the
-//! engine's `Transformer`; the table drives `forwardQwen4With` and the batched GDN tick with each slot's caches.
+//! Qwen3.8-Flash-Next (`qwen4_exp`): the family's own forward behind the model table. The plugin's trunk module
+//! (`trunk.zig`: hyper-connection streams, the n-gram PLE, QSA sparse attention, GatedDeltaNet + MoE layers, the MTP
+//! head) runs `forwardQwen4With` and the batched GDN tick on each slot's caches.
 
 const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const model = @import("../../engines/mlx/model.zig");
-const transformer_mod = @import("../../engines/mlx/transformer.zig");
 const engine_cache_ops = @import("../../engines/mlx/kv/cache_ops.zig");
-const batched_caps = @import("../../engines/mlx/batched/caps.zig");
 const ForwardCtx = @import("../../engines/mlx/forward_ctx.zig").ForwardCtx;
 const CaptureLayers = @import("../../engines/mlx/forward_ctx.zig").CaptureLayers;
 const KVCache = @import("../../engines/mlx/kv/cache.zig").KVCache;
@@ -23,6 +21,9 @@ const MAX_BATCH_ROWS = @import("../../engines/mlx/batched/layered.zig").MAX_BATC
 const bill_mod = @import("bill.zig");
 const fixture = @import("fixture.zig");
 const toModelConfig = @import("model_config.zig").toModelConfig;
+const trunk_load = @import("trunk_load.zig");
+const distributed = @import("../../engines/mlx/cluster/distributed.zig");
+const lmHeadMxfp8On = @import("../../sdk/quant/mxfp8.zig").lmHeadMxfp8On;
 pub const config = @import("config.zig");
 
 pub const plugin = sdk.Plugin{
@@ -54,7 +55,7 @@ pub threadlocal var engine_ctx: ?*const ForwardCtx = null;
 
 const Verdict = abi.Verdict;
 const Array = mlx.mlx_array;
-const Transformer = transformer_mod.Transformer;
+const Trunk = @import("trunk.zig").Trunk;
 const gpa = std.heap.c_allocator;
 
 /// GatedDeltaNet layers keep a recurrent state; every `full_attention_interval`-th layer caches KV at the shell's
@@ -87,7 +88,7 @@ const OwnSlot = struct {
         return .{ .id = id, .cache = cache, .ssm = ssm };
     }
 
-    fn deinit(self: *OwnSlot, xfm: *Transformer) void {
+    fn deinit(self: *OwnSlot, xfm: *Trunk) void {
         xfm.ssmGroupDrop(self.ssm);
         for (self.ssm) |*e| {
             _ = mlx.mlx_array_free(e.conv_state);
@@ -110,7 +111,9 @@ const Rec = struct {
 pub const Model = struct {
     cfg: model.ModelConfig,
     weights: model.Weights,
-    xfm: Transformer,
+    trunk: Trunk,
+    /// The cache a settle-only context names (it reads no cache).
+    scratch: KVCache,
     caps: abi.Caps,
     own: std.ArrayList(OwnSlot) = .empty,
     recs: std.AutoHashMapUnmanaged(u32, Rec) = .empty,
@@ -124,13 +127,13 @@ pub const Model = struct {
 
     /// A context for host work on `r`'s owed record alone (no forward reads its cache).
     fn settleCtx(m: *Model, r: *Rec, offset: *usize) ForwardCtx {
-        return .{ .cache = &m.xfm.cache, .moe_seq_offset = offset, .ssm_entries = r.ssm, .capture_hidden = null, .vision_embeddings = null, .ple_pending = r.pending };
+        return .{ .cache = &m.scratch, .moe_seq_offset = offset, .ssm_entries = r.ssm, .capture_hidden = null, .vision_embeddings = null, .ple_pending = r.pending };
     }
 
     fn ownSlot(m: *Model, id: u32, pos: u64) !*OwnSlot {
         for (m.own.items) |*o| if (o.id == id) {
             if (pos == 0) {
-                o.deinit(&m.xfm);
+                o.deinit(&m.trunk);
                 o.* = try OwnSlot.init(id, m.cfg.num_hidden_layers);
             } else if (o.pos != pos) return error.PositionDoesNotFollow;
             return o;
@@ -140,15 +143,6 @@ pub const Model = struct {
         return &m.own.items[m.own.items.len - 1];
     }
 };
-
-/// The steps the engine's loader runs on a qwen4 trunk after `Transformer.init`: the compiled routing, GDN gate and
-/// hyper-connection kernels its forward reads.
-pub fn prepare(xfm: *Transformer) void {
-    if (mlx.noGpuBackend()) return;
-    if (xfm.moe_layers != null) xfm.compileMoeRouting();
-    if (xfm.config.linear_num_key_heads > 0) xfm.compileGdnGate();
-    xfm.compileQwen4Hc();
-}
 
 fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     return loadModel(ctx) catch |e| {
@@ -160,20 +154,41 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     };
 }
 
+/// `lm_head_mxfp8` as the load settings state it; null = the default (on for a quantized pack on an integrated CUDA
+/// GPU).
+fn headMxfp8Setting(settings_json: []const u8) ?bool {
+    if (settings_json.len == 0) return null;
+    const S = struct { lm_head_mxfp8: ?bool = null };
+    const parsed = std.json.parseFromSlice(S, gpa, settings_json, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    return parsed.value.lm_head_mxfp8;
+}
+
 /// The trunk module keeps the loader's whole map (folds and n-gram shards included): the engine's own when the
 /// driver loaded it with this config (`Resident.take`), else read here. The vision tower stays the engine's.
 fn loadModel(ctx: *const abi.LoadCtx) !*Model {
     const io = std.Io.Threaded.global_single_threaded.io();
     const m = try gpa.create(Model);
     errdefer gpa.destroy(m);
-    m.* = .{ .cfg = undefined, .weights = undefined, .xfm = undefined, .caps = ctx.parsed.caps };
+    m.* = .{ .cfg = undefined, .weights = undefined, .trunk = undefined, .scratch = try KVCache.init(gpa, 0), .caps = ctx.parsed.caps };
+    errdefer m.scratch.deinit();
     m.cfg = try toModelConfig(gpa, config.of(ctx.parsed), ctx.model_dir.slice());
     errdefer m.cfg.deinit(gpa);
-    m.weights = (if (ctx.weights) |src| Resident.take(src) else null) orelse try model.loadModelWeights(io, gpa, ctx.model_dir.slice(), &m.cfg, false);
+    const taken = if (ctx.weights) |src| Resident.take(src) else null;
+    m.weights = taken orelse try model.loadModelWeights(io, gpa, ctx.model_dir.slice(), &m.cfg, false);
     errdefer m.weights.deinit();
+    // The driver's load planned a Thunderbolt pair on the engine's config, and its map holds this Mac's part: the
+    // same plan here (the plugin's own load applies it itself).
+    if (taken != null) if (try distributed.planFor(ctx.model_dir.slice(), &m.cfg)) |part| switch (part) {
+        .span => |sp| try m.cfg.applyLayerSpan(sp),
+        .shard => |sh| try m.cfg.applyShard(sh),
+        .remote => {},
+    };
     model.resolveWeightPrefix(&m.cfg, &m.weights);
-    m.xfm = try Transformer.init(io, gpa, m.cfg, &m.weights);
-    prepare(&m.xfm);
+    m.trunk = try trunk_load.load(io, gpa, &m.cfg, &m.weights, .{
+        .head_mxfp8 = lmHeadMxfp8On(headMxfp8Setting(ctx.settings_json.slice()), null, mlx.cudaIntegrated(), true, m.cfg.quant_bits),
+    });
+    m.trunk.prepare();
     return m;
 }
 
@@ -182,9 +197,10 @@ fn unload(mp: *anyopaque) callconv(.c) void {
     var it = m.recs.iterator();
     while (it.next()) |e| if (e.value_ptr.pending) |p| ple.releasePlePending(p);
     m.recs.deinit(gpa);
-    for (m.own.items) |*o| o.deinit(&m.xfm);
+    for (m.own.items) |*o| o.deinit(&m.trunk);
     m.own.deinit(gpa);
-    m.xfm.deinit();
+    m.trunk.deinit();
+    m.scratch.deinit();
     m.weights.deinit();
     m.cfg.deinit(gpa);
     gpa.destroy(m);
@@ -239,7 +255,7 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
 /// `logits` `[B, S, V]` as the table returns it: every row, or each slot's last one.
 fn shapeLogits(m: *Model, logits: Array, all: bool) !Array {
     const sh = mlx.getShape(logits);
-    const s = m.xfm.s;
+    const s = m.trunk.s;
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
     if (all) {
@@ -299,9 +315,9 @@ fn runOne(m: *Model, f: *const abi.Forward, out: *abi.ForwardOut) !void {
         r.pending = ctx.ple_pending;
         r.arms.add(ctx.qsa_arms);
     }
-    try m.xfm.ssmGroupRelease(&ctx);
-    const res = m.xfm.forwardQwen4With(&ctx, ids) catch |e| {
-        ple.discardDeferredPle(&m.xfm, &ctx);
+    try m.trunk.ssmGroupRelease(&ctx);
+    const res = m.trunk.forwardQwen4With(&ctx, ids) catch |e| {
+        ple.discardDeferredPle(&m.trunk, &ctx);
         return e;
     };
     defer _ = mlx.mlx_array_free(res);
@@ -353,9 +369,9 @@ fn runBatched(m: *Model, f: *const abi.Forward, out: *abi.ForwardOut) !void {
         _ = mlx.mlx_array_free(h);
     };
     // The legacy tick's PLE gather defers inside it and settles once, before it returns: nothing is left owed.
-    if (n > 1 and batched_caps.batchedGdnReady(&m.xfm, ptrs[0..n])) {
+    if (n > 1 and m.trunk.batchedGdnReady(ptrs[0..n])) {
         var hrows: ?[]Array = null;
-        const got = try m.xfm.forwardMoeBatchedDecode(f.tokens.slice(), ptrs[0..n], f.positions.slice(), if (f.want_hidden) &hrows else null);
+        const got = try m.trunk.forwardMoeBatchedDecode(f.tokens.slice(), ptrs[0..n], f.positions.slice(), if (f.want_hidden) &hrows else null);
         defer gpa.free(got);
         @memcpy(rows[0..n], got);
         made = n;
@@ -368,13 +384,13 @@ fn runBatched(m: *Model, f: *const abi.Forward, out: *abi.ForwardOut) !void {
         var id: i32 = @intCast(f.tokens.slice()[i]);
         const ids = mlx.mlx_array_new_data(&id, &[_]c_int{ 1, 1 }, 2, .int32);
         defer _ = mlx.mlx_array_free(ids);
-        try m.xfm.ssmGroupRelease(ptrs[i]);
+        try m.trunk.ssmGroupRelease(ptrs[i]);
         if (f.want_hidden) {
             hidden[i] = mlx.mlx_array_new();
             made_hidden += 1;
             ptrs[i].capture_hidden = &hidden[i];
         }
-        rows[i] = try m.xfm.forwardQwen4With(ptrs[i], ids);
+        rows[i] = try m.trunk.forwardQwen4With(ptrs[i], ids);
         made += 1;
     }
     for (0..n) |i| {
@@ -408,7 +424,7 @@ fn runBatchedVerify(m: *Model, f: *const abi.Forward, out: *abi.ForwardOut) !voi
     defer _ = mlx.mlx_array_free(last);
     var all = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(all);
-    const logits = try m.xfm.forwardMoeBatchedVerify(.{ .ctx = f.ids.ctx }, ptrs[0..n], f.positions.slice(), &last, &all);
+    const logits = try m.trunk.forwardMoeBatchedVerify(.{ .ctx = f.ids.ctx }, ptrs[0..n], f.positions.slice(), &last, &all);
     defer _ = mlx.mlx_array_free(logits);
     for (0..n) |i| {
         if (caches[i].own) |o| o.pos = f.positions.slice()[i] + f.rows;
@@ -429,7 +445,7 @@ fn concatRows(m: *Model, xs: []const Array) !Array {
     for (xs) |x| _ = mlx.mlx_vector_array_append_value(vec, x);
     var cat = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(cat);
-    try mlx.check(mlx.mlx_concatenate_axis(&cat, vec, 0, m.xfm.s));
+    try mlx.check(mlx.mlx_concatenate_axis(&cat, vec, 0, m.trunk.s));
     return cat;
 }
 
@@ -461,11 +477,11 @@ fn settleSlots(m: *Model, ids: []const u32, how: abi.Settle, tokens: []const u32
     // A failed settle leaves nothing owed behind it: the engine discards the forward.
     defer for (ctxs[0..n]) |*c| if (c.ple_pending) |p| ple.releasePlePending(p);
     switch (how) {
-        .discard => for (ctxs[0..n]) |*c| ple.discardDeferredPle(&m.xfm, c),
+        .discard => for (ctxs[0..n]) |*c| ple.discardDeferredPle(&m.trunk, c),
         .flush => if (tokens.len > 0) {
             if (n != 1) return error.PleSettleWidth;
-            try ple.settleDeferredPle(&m.xfm, &ctxs[0], tokens);
-        } else if (n == 1) try ple.flushDeferredPle(&m.xfm, &ctxs[0]) else try ple.flushDeferredPleGroup(&m.xfm, ptrs[0..n]),
+            try ple.settleDeferredPle(&m.trunk, &ctxs[0], tokens);
+        } else if (n == 1) try ple.flushDeferredPle(&m.trunk, &ctxs[0]) else try ple.flushDeferredPleGroup(&m.trunk, ptrs[0..n]),
     }
 }
 
@@ -477,12 +493,12 @@ fn releaseSlot(mp: *anyopaque, slot: u32) callconv(.c) void {
         var r = kv.value;
         var off: usize = 0;
         var c = m.settleCtx(&r, &off);
-        ple.discardDeferredPle(&m.xfm, &c);
-        if (r.ssm) |entries| m.xfm.ssmGroupDrop(entries);
+        ple.discardDeferredPle(&m.trunk, &c);
+        if (r.ssm) |entries| m.trunk.ssmGroupDrop(entries);
     }
-    m.xfm.markQsaPooledRopeStale();
+    m.trunk.markQsaPooledRopeStale();
     for (m.own.items, 0..) |*o, i| if (o.id == slot) {
-        o.deinit(&m.xfm);
+        o.deinit(&m.trunk);
         _ = m.own.swapRemove(i);
         break;
     };
@@ -514,4 +530,7 @@ test {
     _ = @import("proof_test.zig");
     _ = @import("contract.zig");
     _ = @import("served_test.zig");
+    _ = @import("oracle_test.zig");
+    _ = @import("cost_profile.zig");
+    _ = @import("trunk.zig");
 }

@@ -128,7 +128,7 @@ pub fn ssmFreeMergedLayer(m: *SSMCacheEntry) void {
     m.initialized = false;
 }
 
-fn ssmMergeLayer(s: mlx.mlx_stream, ctxs: []const *ForwardCtx, layer: usize, kind: SsmMergeKind) !SSMCacheEntry {
+pub fn ssmMergeLayer(s: mlx.mlx_stream, ctxs: []const *ForwardCtx, layer: usize, kind: SsmMergeKind) !SSMCacheEntry {
     // The qwen4 PLE layer's dilated-conv window is merged like the SSM state.
     var out: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = kind.linear };
     errdefer ssmFreeMergedLayer(&out);
@@ -147,7 +147,7 @@ fn ssmMergeLayer(s: mlx.mlx_stream, ctxs: []const *ForwardCtx, layer: usize, kin
     return out;
 }
 
-fn ssmSplitLayer(s: mlx.mlx_stream, m: *const SSMCacheEntry, ctxs: []const *ForwardCtx, layer: usize, kind: SsmMergeKind) !void {
+pub fn ssmSplitLayer(s: mlx.mlx_stream, m: *const SSMCacheEntry, ctxs: []const *ForwardCtx, layer: usize, kind: SsmMergeKind) !void {
     for (ctxs, 0..) |c, i| {
         var e = &c.ssm_entries.?[layer];
         if (kind.linear) {
@@ -485,7 +485,7 @@ fn ssmRepackMembers(
     }
 }
 
-fn ssmGroupDropMember(group: *PersistentSsmGroup, s: mlx.mlx_stream, entries: []SSMCacheEntry) !void {
+pub fn ssmGroupDropMember(group: *PersistentSsmGroup, s: mlx.mlx_stream, entries: []SSMCacheEntry) !void {
     if (!group.live) return;
     const key = @intFromPtr(entries.ptr);
     var row: ?usize = null;
@@ -523,7 +523,7 @@ fn ssmGroupDropMember(group: *PersistentSsmGroup, s: mlx.mlx_stream, entries: []
     };
 }
 
-fn ssmGroupReleaseCtx(group: *PersistentSsmGroup, s: mlx.mlx_stream, ctx: *ForwardCtx) !void {
+pub fn ssmGroupReleaseCtx(group: *PersistentSsmGroup, s: mlx.mlx_stream, ctx: *ForwardCtx) !void {
     const entries = ctx.ssm_entries orelse return;
     if (!group.live) return;
     const key = @intFromPtr(entries.ptr);
@@ -1535,7 +1535,6 @@ test "persistent group: forwardWith releases a bound member between batched tick
     }
     p_xfm.mlx_stream_ext = null;
     p_xfm.plugin = null;
-    p_xfm.qwen4 = null;
     p_xfm.moe_layers = null;
     p_xfm.emb_w = .{ .ctx = null };
     p_xfm.config = std.mem.zeroes(ModelConfig);

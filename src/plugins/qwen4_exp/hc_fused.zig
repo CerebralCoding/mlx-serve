@@ -4,10 +4,9 @@
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const hc_decode2 = @import("../../sdk/blocks/hc/hc_decode2.zig");
-const transformer = @import("../../engines/mlx/transformer.zig");
 const KVCache = @import("../../engines/mlx/kv/cache.zig").KVCache;
 const testing = @import("../../engines/mlx/kv/cache.zig").testing;
-const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
+const Trunk = @import("trunk.zig").Trunk;
 const attn256MaxDiff = @import("../../sdk/blocks/attention/attn256.zig").attn256MaxDiff;
 const attn256RandBf16 = @import("../../sdk/blocks/attention/attn256.zig").attn256RandBf16;
 const qmatmulBits = @import("../../sdk/blocks/linear/qmatmul.zig").qmatmulBits;
@@ -22,10 +21,12 @@ const HcWeights = @import("weights.zig").HcWeights;
 // The read is two launches (down, then up/mix) in hc_decode2.zig for 1..HC_FUSED_MAX_ROWS rows; anything outside its
 // geometry keeps the unfused chain.
 var hc_fused_eps: ?mlx.mlx_array = null;
+/// Test seam: false keeps the unfused chain.
+pub var hc_fused_override: ?bool = null;
 var hc_fused_eps_val: f32 = 0;
 
 pub fn hcFusedEnabled() bool {
-    return transformer.hc_fused_override orelse true;
+    return hc_fused_override orelse true;
 }
 
 pub const HcFusedOut = struct { mixed: mlx.mlx_array, inj: mlx.mlx_array, stream: mlx.mlx_array };
@@ -237,8 +238,8 @@ fn hcFusedReadParity(bits: u32, gs: u32) !void {
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x4C0FFEE);
     const rnd = prng.random();
-    transformer.hc_fused_override = true;
-    defer transformer.hc_fused_override = null;
+    hc_fused_override = true;
+    defer hc_fused_override = null;
 
     const HC: c_int = 4;
     const H: c_int = 512;
@@ -564,9 +565,7 @@ test "hc prefill: pending write, normalized streams, native inject reduction and
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const hp = @import("../../sdk/blocks/hc/hc_prefill.zig");
     const s = mlx.gpuStream();
-    var cache = try KVCache.init(testing.allocator, 0);
-    defer cache.deinit();
-    var xfm = std.mem.zeroInit(Transformer, .{ .s = s, .allocator = testing.allocator, .cache = cache });
+    var xfm = std.mem.zeroInit(Trunk, .{ .s = s, .allocator = testing.allocator });
     xfm.compileQwen4Hc();
     defer inline for (.{ xfm.compiled_hc_silu, xfm.compiled_hc_mix, xfm.compiled_hc_inj, xfm.compiled_hc_write }) |slot| {
         if (slot) |closure| _ = mlx.mlx_closure_free(closure);
@@ -604,7 +603,7 @@ test "hc prefill: pending write, normalized streams, native inject reduction and
         try mlx.check(mlx.mlx_astype(&f32_w, w, .float32, s));
         try testing.expect((try hp.norm(s, x, f32_w, iw, eps, b, seq, null)) == null);
         try testing.expect((try hp.mix(s, x, x, b, seq + 1)) == null);
-        const written = (try Transformer.applyClosure(xfm.compiled_hc_write, &.{ x, wo, wi })) orelse return error.MissingCompiledHc;
+        const written = (try @import("../../engines/mlx/compiled.zig").applyClosure(xfm.compiled_hc_write, &.{ x, wo, wi })) orelse return error.MissingCompiledHc;
         defer _ = mlx.mlx_array_free(written);
         for ([_]bool{ false, true }) |pending| {
             const stream = if (pending) written else x;
@@ -628,7 +627,7 @@ test "hc prefill: pending write, normalized streams, native inject reduction and
             defer _ = mlx.mlx_array_free(raw);
             try mlx.check(mlx.mlx_matmul(&raw, flat, iw, s));
             try testing.expectEqual(@as(f32, 0), try attn256MaxDiff(n.raw_inject, raw, s));
-            const expected = (try Transformer.applyClosure(xfm.compiled_hc_mix, &.{ x, normed })) orelse return error.MissingCompiledHc;
+            const expected = (try @import("../../engines/mlx/compiled.zig").applyClosure(xfm.compiled_hc_mix, &.{ x, normed })) orelse return error.MissingCompiledHc;
             defer _ = mlx.mlx_array_free(expected);
             const mixed = (try hp.mix(s, x, normed, b, seq)) orelse return error.HcFusedDeclined;
             defer _ = mlx.mlx_array_free(mixed);
@@ -641,9 +640,7 @@ test "hc prefill on CUDA: the fused write, norm and mix are bit-identical to the
     if (!mlx.cudaAvailable()) return error.SkipZigTest;
     const hpc = @import("../../sdk/blocks/hc/hc_prefill_cuda.zig");
     const s = mlx.gpuStream();
-    var cache = try KVCache.init(testing.allocator, 0);
-    defer cache.deinit();
-    var xfm = std.mem.zeroInit(Transformer, .{ .s = s, .allocator = testing.allocator, .cache = cache });
+    var xfm = std.mem.zeroInit(Trunk, .{ .s = s, .allocator = testing.allocator });
     xfm.compileQwen4Hc();
     defer inline for (.{ xfm.compiled_hc_silu, xfm.compiled_hc_mix, xfm.compiled_hc_inj, xfm.compiled_hc_write }) |slot| {
         if (slot) |closure| _ = mlx.mlx_closure_free(closure);
@@ -670,7 +667,7 @@ test "hc prefill on CUDA: the fused write, norm and mix are bit-identical to the
         defer _ = mlx.mlx_array_free(wi);
         const up = try attn256RandBf16(rnd, &.{ b, seq, hc, hidden }, s);
         defer _ = mlx.mlx_array_free(up);
-        const written = (try Transformer.applyClosure(xfm.compiled_hc_write, &.{ x, wo, wi })) orelse return error.MissingCompiledHc;
+        const written = (try @import("../../engines/mlx/compiled.zig").applyClosure(xfm.compiled_hc_write, &.{ x, wo, wi })) orelse return error.MissingCompiledHc;
         defer _ = mlx.mlx_array_free(written);
         for ([_]bool{ false, true }) |pending| {
             const stream = if (pending) written else x;
@@ -687,7 +684,7 @@ test "hc prefill on CUDA: the fused write, norm and mix are bit-identical to the
             defer _ = mlx.mlx_array_free(normed);
             try mlx.check(mlx.mlx_multiply(&normed, rms, w, s));
             try testing.expect(try bf16BitEqual(n.normalized, normed, s));
-            const expected = (try Transformer.applyClosure(xfm.compiled_hc_mix, &.{ up, normed })) orelse return error.MissingCompiledHc;
+            const expected = (try @import("../../engines/mlx/compiled.zig").applyClosure(xfm.compiled_hc_mix, &.{ up, normed })) orelse return error.MissingCompiledHc;
             defer _ = mlx.mlx_array_free(expected);
             const mixed = (try hpc.mix(s, up, normed)) orelse return error.HcFusedDeclined;
             defer _ = mlx.mlx_array_free(mixed);
@@ -711,9 +708,7 @@ test "hc prefill: unsupported configuration and coalesced chunk bounds decline" 
 test "hc prefill: incompatible read writes immediately" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
-    var cache = try KVCache.init(testing.allocator, 0);
-    defer cache.deinit();
-    var xfm = std.mem.zeroInit(Transformer, .{ .s = s, .allocator = testing.allocator, .cache = cache });
+    var xfm = std.mem.zeroInit(Trunk, .{ .s = s, .allocator = testing.allocator });
     xfm.config.hc_count = 4;
     xfm.config.hidden_size = 128;
     for ([_]mlx.mlx_dtype{ .float32, .bfloat16 }) |dtype| {

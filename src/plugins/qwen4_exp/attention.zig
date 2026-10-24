@@ -5,8 +5,8 @@ const mlx = @import("../../mlx/ffi.zig");
 const ForwardCtx = @import("../../engines/mlx/forward_ctx.zig").ForwardCtx;
 const FullAttnWeights = @import("../../engines/mlx/layer_weights.zig").FullAttnWeights;
 const SSMCacheEntry = @import("../../engines/mlx/ssm/entry.zig").SSMCacheEntry;
-const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
-const AttnVerifyInputs = @import("../../engines/mlx/verify/joined_rows.zig").AttnVerifyInputs;
+const Trunk = @import("trunk.zig").Trunk;
+const AttnVerifyInputs = @import("trunk/verify.zig").AttnVerifyInputs;
 const qwen4Standin = @import("../../sdk/diag/standin.zig").qwen4Standin;
 const Qwen4Trace = @import("mtp.zig").Qwen4Trace;
 const Qwen4AttnProf = @import("prof.zig").Qwen4AttnProf;
@@ -15,11 +15,11 @@ const qsaMaskFromBlocks = @import("qsa/mask.zig").qsaMaskFromBlocks;
 
 /// Full-attention layer with the QSA mask threaded through
 /// `gatedFullAttnWith` (q-gate, QK norm, partial RoPE, KV cache all shared).
-pub fn qwen4AttnWith(self: *Transformer, ctx: *ForwardCtx, x: mlx.mlx_array, fa: *const FullAttnWeights, entry: *SSMCacheEntry, layer: u32, cache_len: c_int, pos_base: c_int, batch: c_int, seq_len: c_int, is_prefill: bool) !mlx.mlx_array {
+pub fn qwen4AttnWith(self: *Trunk, ctx: *ForwardCtx, x: mlx.mlx_array, fa: *const FullAttnWeights, entry: *SSMCacheEntry, layer: u32, cache_len: c_int, pos_base: c_int, batch: c_int, seq_len: c_int, is_prefill: bool) !mlx.mlx_array {
     return self.qwen4AttnProjected(ctx, x, fa, entry, layer, cache_len, pos_base, batch, seq_len, is_prefill, null, false);
 }
 
-pub fn qwen4AttnProjected(self: *Transformer, ctx: *ForwardCtx, x: mlx.mlx_array, fa: *const FullAttnWeights, entry: *SSMCacheEntry, layer: u32, cache_len: c_int, pos_base: c_int, batch: c_int, seq_len: c_int, is_prefill: bool, projected: ?*const AttnVerifyInputs, skip_output: bool) !mlx.mlx_array {
+pub fn qwen4AttnProjected(self: *Trunk, ctx: *ForwardCtx, x: mlx.mlx_array, fa: *const FullAttnWeights, entry: *SSMCacheEntry, layer: u32, cache_len: c_int, pos_base: c_int, batch: c_int, seq_len: c_int, is_prefill: bool, projected: ?*const AttnVerifyInputs, skip_output: bool) !mlx.mlx_array {
     // Registered above the fallible builders: `qsaMask` can throw with `ctx.qsa_blocks` already written.
     defer {
         if (ctx.qsa_mask.ctx != null) _ = mlx.mlx_array_free(ctx.qsa_mask);
@@ -46,7 +46,7 @@ pub fn qwen4AttnProjected(self: *Transformer, ctx: *ForwardCtx, x: mlx.mlx_array
         if (ctx.qsa_mask.ctx != null) _ = mlx.mlx_array_free(ctx.qsa_mask);
         ctx.qsa_mask = vis;
     }
-    if (layer == 3) if (Transformer.qwen4_trace) |tr| {
+    if (layer == 3) if (Trunk.qwen4_trace) |tr| {
         if (ctx.qsa_mask.ctx != null) {
             Qwen4Trace.set(&tr.qsa_mask, ctx.qsa_mask);
         } else if (ctx.qsa_blocks.ctx != null) {

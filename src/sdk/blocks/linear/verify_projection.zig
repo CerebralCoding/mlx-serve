@@ -28,6 +28,8 @@ pub const SingleVerifyFeature = enum { routing, down_reduce };
 pub var single_verify_test_features: [2]bool = @splat(true);
 
 pub var mtp_verify_shared_rows_calls: u64 = 0;
+pub var mtp_coarse_pair_dispatches: u64 = 0;
+pub var mtp_verify_kernel_calls: [3]u64 = @splat(0);
 pub var mtp_verify_shared_gate_rows_calls: u64 = 0;
 
 pub var mtp_verify_gdn_rows_calls: u64 = 0;
@@ -288,8 +290,6 @@ fn verifyJoinedProjection(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array,
     return result;
 }
 
-pub var mtp_coarse_pair_dispatches: u64 = 0;
-pub var mtp_verify_kernel_calls: [3]u64 = @splat(0);
 
 // ── tests ──
 

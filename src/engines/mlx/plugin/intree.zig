@@ -10,6 +10,7 @@ const Transformer = @import("../transformer.zig").Transformer;
 const ForwardCtx = @import("../forward_ctx.zig").ForwardCtx;
 const distributed = @import("../cluster/distributed.zig");
 const qwen4 = @import("../../../plugins/qwen4_exp/plugin.zig");
+const Qwen4Trunk = @import("../../../plugins/qwen4_exp/trunk.zig").Trunk;
 
 /// The map the driver already loaded, moved out of the `Resident` behind `ctx.weights` (it is left empty, so the
 /// driver's `deinit` frees nothing the plugin keeps); null when the source is not the driver's resident map.
@@ -48,9 +49,9 @@ pub fn dsv41(xfm: *const Transformer) ?*v41plugin.Module {
 
 // ── qwen4_exp ──
 // Its forward runs through the table; the MTP head (padded placement, lazy predraft, QSA leftover marks, prefix-cache
-// and SSD head history, group lanes and the grouped verify, the coarse rerank, the G17 cost profile) runs unchanged on
-// the plugin's inner `Transformer` through the legacy `.qwen4` arm (`MtpHeadRef{ .qwen4 = inner }`, every engine site
-// that touches `qwen4` / `qwen4_mtp` goes through `Transformer.qwen4Host`). An ABI-clean head needs: (1)
+// and SSD head history, group lanes and the grouped verify, the coarse rerank, the G17 cost profile) runs on the
+// plugin's trunk module through the `.qwen4` arm (`MtpHeadRef{ .qwen4 = trunk }`, every engine site that touches the
+// trunk's `qwen4` / `qwen4_mtp` goes through `Transformer.qwen4Host`). An ABI-clean head needs: (1)
 // `ForwardOut.next`, the chained hidden apart from the projected one; (2) a fact that the trunk's hidden is the
 // pre-mixer stream; (3) a placed head forward (dead history rows); (4) `HeadHooks.mark` with a length; (5) head
 // snapshot / bytes / serialize for the prefix cache and SSD; (6) group lanes and the grouped verify on the plugin arm;
@@ -62,17 +63,22 @@ fn isQwen4(table: *const abi.ModelTable) bool {
     return table.load == qwen4.table.load;
 }
 
-/// The plugin's own trunk module behind a served qwen4_exp shell; null for every other model.
-pub fn inner(xfm: *const Transformer) ?*Transformer {
-    const b = xfm.plugin orelse return null;
-    if (!isQwen4(b.table)) return null;
-    return &@as(*qwen4.Model, @ptrCast(@alignCast(b.model))).xfm;
+/// A lossy load setting the plugin serves itself (`LoadCtx.settings_json`). qwen4_exp builds its MXFP8 head; int8
+/// prefill runs only on Hadamard-rotated projections, which no qwen4_exp pack has, so it changes nothing there.
+pub fn servesLossy(table: *const abi.ModelTable, what: enum { int8_prefill, lm_head_mxfp8 }) bool {
+    _ = what;
+    return isQwen4(table);
 }
 
-/// The module that holds qwen4_exp's state (`qwen4`, `qwen4_mtp`): the plugin's inner trunk when served, else `xfm`.
-pub fn host(xfm: *Transformer) *Transformer {
-    return inner(xfm) orelse xfm;
+/// The plugin's own trunk module behind a served qwen4_exp shell; null for every other model.
+pub fn inner(xfm: *const Transformer) ?*Qwen4Trunk {
+    const b = xfm.plugin orelse return null;
+    if (!isQwen4(b.table)) return null;
+    return &@as(*qwen4.Model, @ptrCast(@alignCast(b.model))).trunk;
 }
+
+/// qwen4_exp's trunk module (state `qwen4`, head `qwen4_mtp`); null for every other model.
+pub const trunk = inner;
 
 /// Lends the shell the inner trunk's embedding table and head (borrowed, as `adoptTrunkWeights` does): the
 /// generator's draft readouts read them off the target.

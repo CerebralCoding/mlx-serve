@@ -2,6 +2,7 @@
 //! Owns SpecTree, CaptureLayers, ForwardCtx.
 
 const mlx = @import("../../mlx/ffi.zig");
+const HeadPlace = @import("../../plugins/qwen4_exp/mtp.zig").HeadPlace;
 const abi = @import("../../abi/plugin.zig");
 const row_attn = @import("../../sdk/blocks/attention/row_attn.zig");
 const PlePending = @import("../../plugins/qwen4_exp/ple.zig").PlePending;
@@ -174,7 +175,7 @@ pub const ForwardCtx = struct {
     qsa_pos_base: c_int = 0,
     /// MTP head draft row placed past dead history rows (`qwen4MtpForwardPlacedOn`), and its
     /// `[1]` int32 RoPE position. Null on every other forward.
-    head_place: ?*const Transformer.HeadPlace = null,
+    head_place: ?*const HeadPlace = null,
     head_rope_pos: mlx.mlx_array = .{ .ctx = null },
     /// qwen4_exp pipelined decode: the n-gram PLE rows are a HOST gather keyed
     /// on the token ids, and the pipelined step builds its graph on a token

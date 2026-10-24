@@ -13,7 +13,7 @@ const transformer = @import("../../../engines/mlx/transformer.zig");
 const diagEnvValueOn = @import("../../../engines/mlx/env_transformer.zig").diagEnvValueOn;
 const testing = @import("../../../engines/mlx/kv/cache.zig").testing;
 const SSMCacheEntry = @import("../../../engines/mlx/ssm/entry.zig").SSMCacheEntry;
-const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
+const Transformer = @import("../trunk.zig").Trunk;
 const QsaCfgCache = @import("../../../mlx/kernel_cache.zig").QsaCfgCache;
 const attn256MaxDiff = @import("../../../sdk/blocks/attention/attn256.zig").attn256MaxDiff;
 const attn256RandBf16 = @import("../../../sdk/blocks/attention/attn256.zig").attn256RandBf16;
@@ -510,7 +510,6 @@ test "qsa score bank: incremental column append matches a from-scratch rebuild" 
 
     var t: Transformer = undefined;
 
-    t.rht = null;
     t.s = s;
     t.allocator = testing.allocator;
     t.qsa_score_bank_builds = 0;
@@ -1017,7 +1016,6 @@ test "qsa score fused: no bank is built under the fused arm" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var xfm: Transformer = undefined;
-    xfm.rht = null;
     xfm.s = s;
     xfm.allocator = testing.allocator;
     xfm.qsa_score_bank_builds = 0;
@@ -1059,7 +1057,6 @@ test "qsa score fused: unsupported indexer geometry falls back to the composed c
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var xfm: Transformer = undefined;
-    xfm.rht = null;
     xfm.s = s;
     xfm.allocator = testing.allocator;
     xfm.qsa_score_bank_builds = 0;

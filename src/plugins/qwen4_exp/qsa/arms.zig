@@ -6,7 +6,7 @@ const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 const ForwardCtx = @import("../../../engines/mlx/forward_ctx.zig").ForwardCtx;
 const KVCache = @import("../../../engines/mlx/kv/cache.zig").KVCache;
-const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
+const Trunk = @import("../trunk.zig").Trunk;
 const FUSED256_MIN_Q_LEN = @import("../../../sdk/blocks/attention/attn256.zig").FUSED256_MIN_Q_LEN;
 
 // ── QSA arm meters ──
@@ -98,9 +98,9 @@ pub const QsaDecline = struct {
 /// Per-request tally of which arm served each full-attention call. One
 /// increment per attention layer; read and reset where the request's
 /// `[qsa-arms]` line is emitted. It lives on the REQUEST's `ForwardCtx`
-/// (the Generator's own), never on the shared Transformer: qwen4 text slots
-/// batch-decode on one Transformer and a cold prefill interleaves with other
-/// slots' decode ticks, so a Transformer-level tally prints the union of
+/// (the Generator's own), never on the shared Trunk: qwen4 text slots
+/// batch-decode on one Trunk and a cold prefill interleaves with other
+/// slots' decode ticks, so a Trunk-level tally prints the union of
 /// every concurrent slot and leaves the next finisher an empty one.
 pub const QsaArmCounts = struct {
     mask: u32 = 0,
@@ -250,10 +250,10 @@ test "qsa arm meters: one-shot bits, width buckets, and the per-request tally" {
 test "qsa arm tally is owned by the request: two ForwardCtx owners never mix" {
     // The `[qsa-arms]` line is a PER-REQUEST meter, so its tally belongs to
     // the seam that logs it (the Generator's own ForwardCtx), never to the
-    // shared Transformer. qwen4 text slots batch-decode on ONE Transformer
+    // shared Trunk. qwen4 text slots batch-decode on ONE Trunk
     // (`forwardMoeBatchedDecode`) and a cold prefill interleaves with other
     // slots' decode ticks (`scheduler.interleaveDecodeTick`), so a
-    // Transformer-level counter printed the union of every concurrent slot
+    // Trunk-level counter printed the union of every concurrent slot
     // since the last reset and left the next finisher a near-empty tally — a
     // short chat claimed `qsa=verify_gather` while the 40k chat later logged
     // `qsa=mask`. Two owners here stand in for two concurrent slots.
@@ -299,8 +299,8 @@ test "qsa arm tally is owned by the request: two ForwardCtx owners never mix" {
     try std.testing.expectEqual(@as(u32, 1), b.qsa_arms.mask);
 }
 
-test "the qsa arm tally lives on the ForwardCtx, never the shared Transformer" {
+test "the qsa arm tally lives on the ForwardCtx, never the shared Trunk" {
     try std.testing.expect(@hasField(ForwardCtx, "qsa_arms"));
-    try std.testing.expect(!@hasField(Transformer, "qsa_arms"));
-    try std.testing.expect(!@hasDecl(Transformer, "qsaArmsTake"));
+    try std.testing.expect(!@hasField(Trunk, "qsa_arms"));
+    try std.testing.expect(!@hasDecl(Trunk, "qsaArmsTake"));
 }

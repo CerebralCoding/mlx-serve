@@ -10,7 +10,12 @@ const io_util = @import("../../../sdk/util/io_util.zig");
 const log = @import("../../../host/log.zig");
 const model_mod = @import("../model.zig");
 const status = @import("../../../host/status.zig");
-const transformer_mod = @import("../transformer.zig");
+const Qwen4Trunk = @import("../../../plugins/qwen4_exp/trunk.zig").Trunk;
+const ForwardCtx = @import("../forward_ctx.zig").ForwardCtx;
+const KVCache = @import("../kv/cache.zig").KVCache;
+const SSMCacheEntry = @import("../ssm/entry.zig").SSMCacheEntry;
+const ssmFreeSpecCapture = @import("../ssm/entry.zig").ssmFreeSpecCapture;
+const ssmFreeQsaState = @import("../../../plugins/qwen4_exp/qsa/history.zig").ssmFreeQsaState;
 const h3_split = @import("../../../plugins/minimax_h3/cluster.zig");
 const lan = @import("../../../host/lan/lan.zig");
 const dsv41_mod = @import("../../../plugins/deepseek_v41/deepseek_v41.zig");
@@ -1150,15 +1155,14 @@ fn servePlan(io: std.Io, allocator: std.mem.Allocator, link: *const Link, roots:
         fail.send(link, LOAD_FAILED);
         return err;
     };
-    defer xfm.t.deinit();
-    defer xfm.w.deinit();
+    defer xfm.deinit(allocator);
     var active: usize = 0;
     _ = mlx.mlx_get_active_memory(&active);
     try sendMsg(link, .{ MAGIC, 0, mib(active), 0, 0, 0, 0, 0 }, 0);
     log.info("[dist] worker ready ({d} MiB resident)\n", .{active >> 20});
 
     const t = &xfm.t;
-    var ctx = t.defaultCtx();
+    var ctx: ForwardCtx = .{ .cache = &xfm.cache, .moe_seq_offset = &xfm.off, .ssm_entries = xfm.entries, .capture_hidden = null, .vision_embeddings = null };
     var forwards: u64 = 0;
     while (true) {
         const m = try recvMsg(link, 0);
@@ -1168,9 +1172,9 @@ fn servePlan(io: std.Io, allocator: std.mem.Allocator, link: *const Link, roots:
             OP_FORWARD => {
                 const offset: usize = @as(usize, @intCast(m[3])) | (@as(usize, @intCast(m[4])) << 31);
                 if (offset == 0) {
-                    try t.resetCache();
-                } else if (offset != t.moe_seq_offset) {
-                    log.err("[dist] forward at {d} but this worker holds {d} tokens\n", .{ offset, t.moe_seq_offset });
+                    try xfm.reset();
+                } else if (offset != xfm.off) {
+                    log.err("[dist] forward at {d} but this worker holds {d} tokens\n", .{ offset, xfm.off });
                     return error.DistPeerDiverged;
                 }
                 const shape = [_]c_int{ m[1], m[2], m[5] };
@@ -1192,7 +1196,7 @@ fn servePlan(io: std.Io, allocator: std.mem.Allocator, link: *const Link, roots:
                 defer _ = mlx.mlx_array_free(sent);
                 try evalOne(sent);
                 forwards += 1;
-                if (m[1] * m[2] > 1 or forwards % 256 == 0) log.info("[dist] worker: forward {d}: {d}x{d} rows, now at {d} tokens\n", .{ forwards, m[1], m[2], t.moe_seq_offset });
+                if (m[1] * m[2] > 1 or forwards % 256 == 0) log.info("[dist] worker: forward {d}: {d}x{d} rows, now at {d} tokens\n", .{ forwards, m[1], m[2], xfm.off });
             },
             OP_MOE => {
                 const x = try queuedRecv(link, &.{ m[1], m[2], m[3] }, @fromBackingInt(@intCast(m[5])), 0);
@@ -1222,7 +1226,39 @@ fn servePlan(io: std.Io, allocator: std.mem.Allocator, link: *const Link, roots:
     return false;
 }
 
-const Loaded = struct { w: model_mod.Weights, t: transformer_mod.Transformer };
+/// The worker's part of the pack: its weights, the trunk module over them and the one request's caches.
+const Loaded = struct {
+    w: model_mod.Weights,
+    t: Qwen4Trunk,
+    cache: KVCache,
+    entries: []SSMCacheEntry,
+    off: usize = 0,
+
+    /// A new request: no keys, no recurrent state.
+    fn reset(self: *Loaded) !void {
+        try self.cache.reinit(self.t.config.num_hidden_layers, self.cache.config);
+        for (self.entries) |*e| {
+            freeEntry(e);
+            e.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
+        }
+        self.off = 0;
+    }
+
+    fn deinit(self: *Loaded, a: std.mem.Allocator) void {
+        for (self.entries) |*e| freeEntry(e);
+        a.free(self.entries);
+        self.cache.deinit();
+        self.t.deinit();
+        self.w.deinit();
+    }
+
+    fn freeEntry(e: *SSMCacheEntry) void {
+        ssmFreeSpecCapture(e);
+        _ = mlx.mlx_array_free(e.conv_state);
+        _ = mlx.mlx_array_free(e.ssm_state);
+        ssmFreeQsaState(e);
+    }
+};
 
 fn load(io: std.Io, allocator: std.mem.Allocator, dir: []const u8, config: *model_mod.ModelConfig, mode: Mode, span: LayerSpan) !Loaded {
     if (!config.isQwen4()) return error.DistArchUnsupported;
@@ -1233,12 +1269,16 @@ fn load(io: std.Io, allocator: std.mem.Allocator, dir: []const u8, config: *mode
     }
     var w = try model_mod.loadModelWeights(io, allocator, dir, config, false);
     errdefer w.deinit();
-    var t = try transformer_mod.Transformer.init(io, allocator, config.*, &w);
+    var t = try Qwen4Trunk.init(io, allocator, config.*, &w);
     errdefer t.deinit();
     _ = mlx.applyWiredPolicy();
-    if (t.moe_layers != null) t.compileMoeRouting();
+    t.compileMoeRouting();
     if (config.linear_num_key_heads > 0) t.compileGdnGate();
-    return .{ .w = w, .t = t };
+    var cache = try KVCache.init(allocator, config.num_hidden_layers);
+    errdefer cache.deinit();
+    const entries = try allocator.alloc(SSMCacheEntry, config.num_hidden_layers);
+    for (entries) |*e| e.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
+    return .{ .w = w, .t = t, .cache = cache, .entries = entries };
 }
 
 fn evalOne(a: mlx.mlx_array) !void {

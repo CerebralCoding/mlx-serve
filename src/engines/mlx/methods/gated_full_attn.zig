@@ -306,10 +306,7 @@ pub fn gatedFullAttnProjected(
                 self.batched_kv_append_override orelse true,
             );
 
-            if (try self.qsaBatchedAttn(ctx, slots, q_rope, layer, seq_len, attn_scale)) |gathered| {
-                _ = mlx.mlx_array_free(attn_out_b);
-                attn_out_b = gathered;
-            } else {
+            {
                 const dense_views = try self.allocator.alloc(DenseKVView, slots.len);
                 defer {
                     for (dense_views) |*dv| dv.deinit();
@@ -323,14 +320,7 @@ pub fn gatedFullAttnProjected(
                 }
                 _ = mlx.mlx_array_free(attn_out_b);
                 attn_out_b = mlx.mlx_array_new();
-                if (ctx.qsa_mask.ctx != null) {
-                    // qwen4 QSA: the per-slot block selection (bool, false-padded to
-                    // kv_max) narrows the pad mask. One dense-mask call serves the
-                    // whole group, so it is billed to every slot: the tally is per REQUEST.
-                    noteQsaArmForSlots(slots, .mask);
-                    if (self.cost_trace_active) self.cost_attention |= 16;
-                    attn_out_b = try self.stackedBatchedAttn(q_rope, dense_views, seq_len, attn_scale, ctx.qsa_mask);
-                } else if (batchedAttnPerSlot(dense_views)) {
+                if (batchedAttnPerSlot(dense_views)) {
                     attn_out_b = try self.perSlotBatchedAttn(q_rope, dense_views, fused_buf[0..slots.len], seq_len, attn_scale);
                 } else {
                     attn_out_b = try self.stackedBatchedAttn(q_rope, dense_views, seq_len, attn_scale, .{ .ctx = null });
@@ -355,23 +345,7 @@ pub fn gatedFullAttnProjected(
     // (kernel-or-DENSE — a declined kernel falls to the arms below).
     const sel_mode_moe: []const u8 = if (is_prefill) "causal" else "";
     var kv_fused_done = false;
-    if (ctx.qsa_blocks.ctx != null or ctx.qsa_mask.ctx != null) {
-        // qwen4_exp QSA: the indexer already chose the visible blocks
-        // (causal folded in). Prefill gathers them by index; decode/
-        // verify widths (and a declined gather) run under the bool mask.
-        const ratio: c_int = @intCast(self.config.indexer_compress_ratio);
-        if (Qwen4AttnProf.active) {
-            Qwen4AttnProf.sync(full_k);
-            Qwen4AttnProf.sync(full_v);
-            Qwen4AttnProf.lap(q_rope, .proj);
-        }
-        const served = try qsaSlotAttn(self.s, q_rope, &kv_view, ctx.qsa_blocks, &ctx.qsa_mask, &ctx.qsa_arms, seq_len, ratio, attn_scale);
-        if (Qwen4AttnProf.active) Qwen4AttnProf.lap(served.out, .qsa);
-        if (self.cost_trace_active) self.cost_attention |= served.cost_bit;
-        _ = mlx.mlx_array_free(attn_out);
-        attn_out = served.out;
-        kv_fused_done = true;
-    } else if (ctx.kv_attn_fused and kvAttnFusedEligible(&kv_view, seq_len)) {
+    if (ctx.kv_attn_fused and kvAttnFusedEligible(&kv_view, seq_len)) {
         if (try qkvAttnDecodeKernel(self.s, q_rope, &kv_view, attn_scale, sel_mode_moe, none_mask)) |fused| {
             logKvAttnFusedEngaged(&kv_view, q_rope, seq_len);
             _ = mlx.mlx_array_free(attn_out);

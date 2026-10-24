@@ -12,7 +12,6 @@ const io_util_mod = @import("../../sdk/util/io_util.zig");
 const ModelConfig = @import("../../engines/mlx/model.zig").ModelConfig;
 const layered = @import("../../engines/mlx/batched/layered.zig");
 const prof = @import("prof.zig");
-const transformer = @import("../../engines/mlx/transformer.zig");
 const MAX_BATCH_ROWS = @import("../../engines/mlx/batched/layered.zig").MAX_BATCH_ROWS;
 const L10VerifySlots = @import("../../engines/mlx/batched/row_axis_verify.zig").L10VerifySlots;
 const ProfClock = @import("../../engines/mlx/diag/profile.zig").ProfClock;
@@ -25,7 +24,7 @@ const SSMCacheEntry = @import("../../engines/mlx/ssm/entry.zig").SSMCacheEntry;
 const splitSpecCaptures = @import("../../engines/mlx/ssm/entry.zig").splitSpecCaptures;
 const ssmFreeSpecCapture = @import("../../engines/mlx/ssm/entry.zig").ssmFreeSpecCapture;
 const ssmRollbackFromCapture = @import("../../engines/mlx/ssm/entry.zig").ssmRollbackFromCapture;
-const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
+const Trunk = @import("trunk.zig").Trunk;
 const materializedOwnedCopy = @import("../../mlx/array.zig").materializedOwnedCopy;
 const qwen4ReadF32 = @import("../../sdk/testing/parity.zig").qwen4ReadF32;
 const Qwen4TestSlot = @import("forward.zig").Qwen4TestSlot;
@@ -92,6 +91,9 @@ pub fn advancePlePrev(entry: *SSMCacheEntry, prev: [8]u32, ids: []const u32, ctx
     entry.ple_prev_valid = true;
 }
 
+/// Test meter: device reads of a batched tick's deferred PLE ids (one per group flush).
+pub var deferred_ple_group_syncs: u64 = 0;
+
 /// A deferred PLE leaf is filled after the build, so a build that reads its
 /// routing on the host (the EXL3 prefill GEMM, past `DECODE_ROWS_MAX` rows)
 /// would evaluate it empty: those widths gather eagerly.
@@ -104,7 +106,7 @@ pub fn pleDeferrable(cfg: *const ModelConfig, rows: usize) bool {
 /// `[1, S]`. Batched (`ctx.batch_slots`): `[N, 1]`, each row hashed
 /// against ITS slot's history (`slots[i].ssm_entries[layer]`), ONE gather
 /// for all N·heads rows.
-pub fn pleEmbedding(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, layer: usize, seq_len: c_int) !mlx.mlx_array {
+pub fn pleEmbedding(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, layer: usize, seq_len: c_int) !mlx.mlx_array {
     const st = self.qwen4.?;
     // A pipelined serial step on the GPU arm leaves its history settle to the next forward:
     // by now those ids are evaluated, so the read waits on nothing.
@@ -154,7 +156,7 @@ pub fn pleEmbedding(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_arr
 /// GPU arm of a serial forward: the kernel reads the ids itself, lazy or not, so the build
 /// needs no host read. The history moves now (eager) or when the caller flushes or settles
 /// the pending record (`ple_defer`), before anything reads the history again.
-pub fn pleEmbeddingGpu(self: *Transformer, ctx: *ForwardCtx, tbl: ple_gpu.Table, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, layer: usize, seq_len: c_int, capture: bool, shape: []const c_int) !mlx.mlx_array {
+pub fn pleEmbeddingGpu(self: *Trunk, ctx: *ForwardCtx, tbl: ple_gpu.Table, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, layer: usize, seq_len: c_int, capture: bool, shape: []const c_int) !mlx.mlx_array {
     const st = self.qwen4.?;
     if (ctx.ple_defer and ctx.ple_pending != null) return error.PlePendingAlreadySet;
     const prev = plePrevOf(entry, st.hash.eos);
@@ -180,7 +182,7 @@ pub fn pleEmbeddingGpu(self: *Transformer, ctx: *ForwardCtx, tbl: ple_gpu.Table,
 /// would set `spec_ple_len` runs AFTER the PLE layer's conv capture, which
 /// keys on it — so the length is claimed here, at build time, and the
 /// gather only fills the tokens.
-pub fn pleClaimSpecCapture(self: *Transformer, entry: *SSMCacheEntry, n: usize) bool {
+pub fn pleClaimSpecCapture(self: *Trunk, entry: *SSMCacheEntry, n: usize) bool {
     const ctx_len: usize = self.qwen4.?.hash.ngram_size - 1;
     return claimPleSpecCapture(entry, n, ctx_len, self.spec_capture_ssm);
 }
@@ -189,7 +191,7 @@ pub fn pleClaimSpecCapture(self: *Transformer, entry: *SSMCacheEntry, n: usize) 
 /// read NOW (this is the one host sync of a pipelined qwen4 step), the
 /// rows gathered straight into the leaf's buffer, and the per-entry
 /// n-gram history advanced. No-op without a pending leaf.
-pub fn flushDeferredPle(self: *Transformer, ctx: *ForwardCtx) !void {
+pub fn flushDeferredPle(self: *Trunk, ctx: *ForwardCtx) !void {
     const p = ctx.ple_pending orelse return;
     if (p.gpu) {
         try self.pleSettleFromArray(p.token_ids, p.entry, p.capture);
@@ -204,7 +206,7 @@ pub fn flushDeferredPle(self: *Transformer, ctx: *ForwardCtx) !void {
 
 /// Fill every pending deferred-PLE leaf of a group in ONE pass. The caller retains
 /// rollback state until the whole round succeeds.
-pub fn flushDeferredPleGroup(self: *Transformer, ctxs: []const *ForwardCtx) !void {
+pub fn flushDeferredPleGroup(self: *Trunk, ctxs: []const *ForwardCtx) !void {
     var ids: [MAX_BATCH_ROWS]mlx.mlx_array = undefined;
     var n: usize = 0;
     defer for (ids[0..n]) |a| {
@@ -223,7 +225,7 @@ pub fn flushDeferredPleGroup(self: *Transformer, ctxs: []const *ForwardCtx) !voi
     var sync_lap = io_util_mod.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
     try mlx.check(mlx.mlx_eval(vec));
     self.verify_laps.ple_sync_ns = sync_lap.read();
-    transformer.cli().deferred_ple_group_syncs += 1;
+    deferred_ple_group_syncs += 1;
     var k: usize = 0;
     for (ctxs) |ctx| {
         const p = ctx.ple_pending orelse continue;
@@ -248,7 +250,7 @@ pub fn flushDeferredPleGroup(self: *Transformer, ctxs: []const *ForwardCtx) !voi
 /// GPU arm: advance a deferred forward's history from ids the caller already read (the
 /// solo MTP verify reads its drafts anyway), so the forward costs no host read of its own.
 /// Runs before the round rolls the history back or builds on it. No-op without a record.
-pub fn settleDeferredPle(self: *Transformer, ctx: *ForwardCtx, ids: []const u32) !void {
+pub fn settleDeferredPle(self: *Trunk, ctx: *ForwardCtx, ids: []const u32) !void {
     const p = ctx.ple_pending orelse return;
     if (!p.gpu) return error.PleLeafUnfilled;
     if (ids.len != @as(usize, @intCast(p.seq_len))) return error.PleSettleWidth;
@@ -272,7 +274,7 @@ pub fn releasePlePending(p: PlePending) void {
 /// Drop a pending leaf without filling it (the forward that built on it
 /// is being abandoned). The spec-PLE slot the build claimed is released
 /// too — no gather ever filled its tokens.
-pub fn discardDeferredPle(_: *Transformer, ctx: *ForwardCtx) void {
+pub fn discardDeferredPle(_: *Trunk, ctx: *ForwardCtx) void {
     const p = ctx.ple_pending orelse return;
     ctx.ple_pending = null;
     p.entry.spec_ple_len = 0;
@@ -287,14 +289,14 @@ pub fn discardDeferredPle(_: *Transformer, ctx: *ForwardCtx) void {
 /// entry's n-gram history. `capture` comes from `pleClaimSpecCapture` at
 /// BUILD time (never re-read off `spec_capture_ssm`, which a deferred
 /// flush sees already cleared).
-pub fn pleGatherBf16(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, layer: usize, seq_len: c_int, pk: []u16, capture: bool) !void {
+pub fn pleGatherBf16(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, layer: usize, seq_len: c_int, pk: []u16, capture: bool) !void {
     const ids_c = try self.pleEvalIds(token_ids);
     defer _ = mlx.mlx_array_free(ids_c);
     return self.pleFillFromIds(ctx, ids_c, entry, layer, seq_len, pk, capture);
 }
 
 /// The GPU arm's host half: read the ids (the one sync), advance the history.
-pub fn pleSettleFromArray(self: *Transformer, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, capture: bool) !void {
+pub fn pleSettleFromArray(self: *Trunk, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, capture: bool) !void {
     // A one-token id is read in place after waiting on its own event (no new ops): the
     // cast+contiguous eval below would queue behind whatever the GPU is running, which for a
     // settle deferred past its own forward is the next forward.
@@ -318,7 +320,7 @@ pub fn pleSettleFromArray(self: *Transformer, token_ids: mlx.mlx_array, entry: *
 }
 
 /// `plePrepareIds` evaluated now: the host read of the ids, timed as `ple_sync`.
-pub fn pleEvalIds(self: *Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
+pub fn pleEvalIds(self: *Trunk, token_ids: mlx.mlx_array) !mlx.mlx_array {
     const ids_c = try self.plePrepareIds(token_ids);
     errdefer _ = mlx.mlx_array_free(ids_c);
     var sync_lap = io_util_mod.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
@@ -328,7 +330,7 @@ pub fn pleEvalIds(self: *Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
 }
 
 /// An evaluated int32 id array copied out as tokens. Caller frees.
-pub fn pleHostIds(self: *Transformer, ids_c: mlx.mlx_array) ![]u32 {
+pub fn pleHostIds(self: *Trunk, ids_c: mlx.mlx_array) ![]u32 {
     const n: usize = mlx.mlx_array_size(ids_c);
     const ids = try self.allocator.alloc(u32, n);
     errdefer self.allocator.free(ids);
@@ -339,7 +341,7 @@ pub fn pleHostIds(self: *Transformer, ids_c: mlx.mlx_array) ![]u32 {
 
 /// The gather ids as one contiguous int32 array, still LAZY: a group evaluates every
 /// row's ids together so the flush costs ONE host sync, not one per row.
-pub fn plePrepareIds(self: *Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
+pub fn plePrepareIds(self: *Trunk, token_ids: mlx.mlx_array) !mlx.mlx_array {
     var ids_i32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(ids_i32);
     try mlx.check(mlx.mlx_astype(&ids_i32, token_ids, .int32, self.s));
@@ -351,7 +353,7 @@ pub fn plePrepareIds(self: *Transformer, token_ids: mlx.mlx_array) !mlx.mlx_arra
 
 /// Host-only half of the gather: `ids_c` must already be evaluated. Everything that
 /// MOVES state (the spec token slot, the n-gram history) happens here.
-pub fn pleFillFromIds(self: *Transformer, ctx: *ForwardCtx, ids_c: mlx.mlx_array, entry: *SSMCacheEntry, layer: usize, seq_len: c_int, pk: []u16, capture: bool) !void {
+pub fn pleFillFromIds(self: *Trunk, ctx: *ForwardCtx, ids_c: mlx.mlx_array, entry: *SSMCacheEntry, layer: usize, seq_len: c_int, pk: []u16, capture: bool) !void {
     const st = self.qwen4.?;
     const ctx_len: usize = st.hash.ngram_size - 1;
     const ids = try self.pleHostIds(ids_c);
@@ -413,13 +415,13 @@ pub fn pleAdvanceSerial(st: *const qwen4_mod.Qwen4State, entry: *SSMCacheEntry, 
 
 /// Qwen4ExpTextPLELayer.forward → the `[B,S,hc*hidden]` addend. Batched
 /// decode hands in the MERGED conv window as `entry.aux_state`.
-pub fn pleForward(self: *Transformer, ctx: *ForwardCtx, stream: mlx.mlx_array, token_ids: mlx.mlx_array, pw: *const PleWeights, entry: *SSMCacheEntry, layer: usize, batch: c_int, seq_len: c_int) !mlx.mlx_array {
+pub fn pleForward(self: *Trunk, ctx: *ForwardCtx, stream: mlx.mlx_array, token_ids: mlx.mlx_array, pw: *const PleWeights, entry: *SSMCacheEntry, layer: usize, batch: c_int, seq_len: c_int) !mlx.mlx_array {
     const cfg = &self.config;
     const hc: c_int = @intCast(cfg.hc_count);
     const hidden: c_int = @intCast(cfg.hidden_size);
     const emb = try self.pleEmbedding(ctx, token_ids, entry, layer, seq_len);
     defer _ = mlx.mlx_array_free(emb);
-    if (Transformer.qwen4_trace) |tr| Qwen4Trace.set(&tr.ple_emb, emb);
+    if (Trunk.qwen4_trace) |tr| Qwen4Trace.set(&tr.ple_emb, emb);
 
     const key_raw = try self.qmatmul(emb, pw.key_w, pw.key_s, pw.key_b);
     defer _ = mlx.mlx_array_free(key_raw);
@@ -526,7 +528,7 @@ pub fn pleForward(self: *Transformer, ctx: *ForwardCtx, stream: mlx.mlx_array, t
     }
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_add(&out, gv, conv_act, self.s));
-    if (Transformer.qwen4_trace) |tr| Qwen4Trace.set(&tr.ple_out, out);
+    if (Trunk.qwen4_trace) |tr| Qwen4Trace.set(&tr.ple_out, out);
     return out;
 }
 
@@ -653,7 +655,7 @@ const Qwen4BatchedPleRun = struct {
 };
 
 pub fn qwen4BatchedPleForward(
-    xfm: *Transformer,
+    xfm: *Trunk,
     slots: []const *Qwen4TestSlot,
     ids: []const i32,
     seq_len: c_int,
@@ -670,7 +672,7 @@ pub fn qwen4BatchedPleForward(
         ctxs[i] = &sl.ctx;
         off_buf[i] = @intCast(sl.off);
     }
-    const ml = xfm.moe_layers.?;
+    const ml = xfm.moe_layers;
     const merged = try xfm.allocator.alloc(SSMCacheEntry, ml.len);
     defer xfm.allocator.free(merged);
     for (merged) |*m| m.* = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false };
@@ -726,7 +728,7 @@ test "batched PLE defer engages at N=2 and matches eager at S=1 and S=4" {
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
     try testing.expect(xfm.qwen4 != null);
     xfm.qwen4_stream_f32 = true;
@@ -821,7 +823,7 @@ test "deferred PLE at N rows: a failed row abandons every row's claim and leaves
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
     try testing.expect(xfm.qwen4 != null);
     xfm.compileQwen4Hc();
@@ -865,7 +867,7 @@ test "deferred PLE at N rows: a failed row abandons every row's claim and leaves
 
     // A round that never commits must not move any row's n-gram history.
     const ple_layer = blk: {
-        for (xfm.moe_layers.?, 0..) |*lw, l| {
+        for (xfm.moe_layers, 0..) |*lw, l| {
             if (lw.ple != null) break :blk l;
         }
         return error.SkipZigTest;
@@ -917,12 +919,12 @@ test "deferred PLE at N rows: a failed row abandons every row's claim and leaves
         try testing.expectEqual(prev_valid_before[i], e.ple_prev_valid);
     }
 
-    const sync_before = transformer.cli().deferred_ple_group_syncs;
+    const sync_before = deferred_ple_group_syncs;
     layered.verify_fail_after_flush = 1;
     const flushed_failure = xfm.forwardRowAxisVerify(&rows, &ctxs, &logits, &last, &all, null, null);
     layered.verify_fail_after_flush = null;
     try testing.expectError(error.InjectedGroupFlushFailure, flushed_failure);
-    try testing.expectEqual(@as(u64, 1), transformer.cli().deferred_ple_group_syncs - sync_before);
+    try testing.expectEqual(@as(u64, 1), deferred_ple_group_syncs - sync_before);
     for (ctxs, 0..) |ctx, row| {
         try testing.expectEqual(offsets_before[row], ctx.moe_seq_offset.*);
         for (ctx.cache.entries, 0..) |entry, layer| try testing.expectEqual(kv_offsets_before[row][layer], entry.offset);
@@ -979,7 +981,7 @@ test "deferred PLE at N rows: every row's capacity is checked against its OWN wi
 
 // ── qwen4 PLE: the GPU arm against the host gather (synthetic table, no model) ──
 
-/// A zeroed Transformer carrying only what `pleEmbedding` reads, over a synthetic 4-bit table.
+/// A zeroed Trunk carrying only what `pleEmbedding` reads, over a synthetic 4-bit table.
 /// With `gate` the table goes through `ple_gpu.load`, so the `--ple-gpu` switch is what is tested;
 /// without it the table is wrapped directly, because `load`'s working-set gate (table plus
 /// 16 GB headroom) rightly picks the host gather on a small CI runner, and these tests are
@@ -988,7 +990,7 @@ pub const PleArmFixture = struct {
     fx: ple_gpu.Fixture,
     st: qwen4_mod.Qwen4State,
     gpu: ?ple_gpu.Table,
-    xfm_bytes: [@sizeOf(Transformer)]u8 align(@alignOf(Transformer)),
+    xfm_bytes: [@sizeOf(Trunk)]u8 align(@alignOf(Trunk)),
     cache_bytes: [@sizeOf(KVCache)]u8 align(@alignOf(KVCache)),
     off: usize,
 
@@ -1012,7 +1014,7 @@ pub const PleArmFixture = struct {
         self.fx.td.cleanup();
     }
 
-    pub fn xfm(self: *PleArmFixture) *Transformer {
+    pub fn xfm(self: *PleArmFixture) *Trunk {
         return @ptrCast(&self.xfm_bytes);
     }
 

@@ -7,7 +7,7 @@ const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 const mtp = @import("../mtp.zig");
 const testing = @import("../../../engines/mlx/kv/cache.zig").testing;
-const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
+const Transformer = @import("../trunk.zig").Trunk;
 const QsaCfgCache = @import("../../../mlx/kernel_cache.zig").QsaCfgCache;
 const attn256MaxDiff = @import("../../../sdk/blocks/attention/attn256.zig").attn256MaxDiff;
 const OneShotBits = @import("arms.zig").OneShotBits;
@@ -556,7 +556,6 @@ test "qsa visibility skip: bit-identical selection where it is an identity, and 
 
     var t: Transformer = undefined;
 
-    t.rht = null;
     t.s = s;
     t.allocator = testing.allocator;
     t.config = .{};

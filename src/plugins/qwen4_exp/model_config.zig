@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const model = @import("../../engines/mlx/model.zig");
+const exl3 = @import("../../sdk/quant/exl3/format.zig");
 const qwen4_exp = @import("qwen4_exp.zig");
 const Config = @import("config.zig").Config;
 
@@ -20,7 +21,7 @@ fn convert(comptime Dst: type, src: anytype) Dst {
 pub fn toModelConfig(a: std.mem.Allocator, c: *const Config, dir: ?[]const u8) !model.ModelConfig {
     var m: model.ModelConfig = .{};
     inline for (@typeInfo(Config).@"struct".field_names) |name| {
-        if (comptime std.mem.eql(u8, name, "embedded_ngram") or std.mem.eql(u8, name, "mrope_inv_freq")) continue;
+        if (comptime std.mem.eql(u8, name, "embedded_ngram") or std.mem.eql(u8, name, "mrope_inv_freq") or std.mem.eql(u8, name, "expert_quant")) continue;
         @field(m, name) = convert(@TypeOf(@field(m, name)), @field(c, name));
     }
     m.model_type = "qwen4_exp";
@@ -40,8 +41,23 @@ pub fn toModelConfig(a: std.mem.Allocator, c: *const Config, dir: ?[]const u8) !
         m.ngram_table_path = try std.fmt.allocPrint(a, "{s}/ngram_table.bin", .{d});
         errdefer m.deinit(a);
         if (try qwen4_exp.inspectEmbedded(d, try model.qwen4EmbeddedSpec(&m))) |info| m.embedded_ple_payload_bytes = info.payload_bytes;
+        if (c.expert_quant) m.exl3 = try sushiSpec(a, d, m.num_experts_per_tok);
     }
     return m;
+}
+
+
+/// A Sushi pack's `expert_quant` (config.json in `dir`): its EXL3 banks' codebook, window and rate.
+fn sushiSpec(a: std.mem.Allocator, dir: []const u8, top_k: u32) !exl3.Spec {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var d = try std.Io.Dir.cwd().openDir(io, dir, .{});
+    defer d.close(io);
+    const bytes = try d.readFileAlloc(io, "config.json", a, .limited(16 * 1024 * 1024));
+    defer a.free(bytes);
+    const doc = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+    defer doc.deinit();
+    if (doc.value != .object) return error.InvalidConfigJson;
+    return exl3.parse(doc.value.object, top_k);
 }
 
 // ── tests ──
@@ -154,4 +170,9 @@ test "qwen4_exp model config: an index naming n-gram shards measures the embedde
     var got = try toModelConfig(testing.allocator, config.of(&p), path);
     defer got.deinit(testing.allocator);
     try testing.expectEqualDeep(want, got);
+}
+
+test "qwen4_exp model config: a Sushi pack's EXL3 experts equal the engine's parse" {
+    const sushi = "{\"expert_quant\":{\"format\":\"exl3\",\"k\":2,\"codebook\":\"mcg\",\"window\":15}," ++ config.tiny_text[1..];
+    try expectEngineParse(&.{.{ .name = "config.json", .bytes = sushi }});
 }

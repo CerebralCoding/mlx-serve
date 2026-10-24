@@ -1,6 +1,6 @@
 //! A served model's per-slot plugin calls: the slot id the driver hands in `Forward.slots`, the deferred host work a
 //! `defer_host` forward leaves (`forward_settle`) behind the Transformer's deferred-PLE entry points, the slot's
-//! release and its meter lines. A legacy model takes the qwen4 deferred-PLE path these entry points always ran.
+//! release and its meter lines. A legacy model owes nothing.
 
 const std = @import("std");
 const abi = @import("../../../abi/plugin.zig");
@@ -33,7 +33,7 @@ fn call(b: *Bound, ids: []const u32, how: abi.Settle, tokens: []const u32) !void
 
 /// `Transformer.flushDeferredPle`: settles what the slot's last forward left owed, reading its tokens off the device.
 pub fn flush(xfm: *Transformer, ctx: *ForwardCtx) !void {
-    const b = xfm.plugin orelse return ple.flushDeferredPle(xfm, ctx);
+    const b = xfm.plugin orelse return;
     if (ctx.plugin_owed == .none) return;
     try call(b, &.{ctx.plugin_slot}, .flush, &.{});
     ctx.plugin_owed = .none;
@@ -41,7 +41,7 @@ pub fn flush(xfm: *Transformer, ctx: *ForwardCtx) !void {
 
 /// `Transformer.flushDeferredPleGroup`: every owing slot of a batched tick in one call (one device read).
 pub fn flushGroup(xfm: *Transformer, ctxs: []const *ForwardCtx) !void {
-    const b = xfm.plugin orelse return ple.flushDeferredPleGroup(xfm, ctxs);
+    const b = xfm.plugin orelse return;
     var ids: [MAX_GROUP]u32 = undefined;
     var n: usize = 0;
     for (ctxs) |c| if (c.plugin_owed != .none) {
@@ -56,7 +56,7 @@ pub fn flushGroup(xfm: *Transformer, ctxs: []const *ForwardCtx) !void {
 
 /// `Transformer.settleDeferredPle`: settles the slot's owed history with the tokens the engine already read.
 pub fn settleWith(xfm: *Transformer, ctx: *ForwardCtx, tokens: []const u32) !void {
-    const b = xfm.plugin orelse return ple.settleDeferredPle(xfm, ctx, tokens);
+    const b = xfm.plugin orelse return;
     if (ctx.plugin_owed == .none) return;
     if (ctx.plugin_owed != .history) return error.PleLeafUnfilled;
     try call(b, &.{ctx.plugin_slot}, .flush, tokens);
@@ -65,7 +65,7 @@ pub fn settleWith(xfm: *Transformer, ctx: *ForwardCtx, tokens: []const u32) !voi
 
 /// `Transformer.discardDeferredPle`: drops what the slot was owed (the forward that built on it is abandoned).
 pub fn discard(xfm: *Transformer, ctx: *ForwardCtx) void {
-    const b = xfm.plugin orelse return ple.discardDeferredPle(xfm, ctx);
+    const b = xfm.plugin orelse return;
     if (ctx.plugin_owed == .none) return;
     ctx.plugin_owed = .none;
     call(b, &.{ctx.plugin_slot}, .discard, &.{}) catch {};
@@ -78,8 +78,8 @@ pub fn historyOwed(ctx: *const ForwardCtx) bool {
 
 /// The model defers host work past its forwards (the decode step sends the sampled token out as its own batch).
 pub fn defersHost(xfm: *const Transformer) bool {
-    if (xfm.plugin) |b| return b.table.forward_settle != null;
-    return xfm.qwen4 != null;
+    const b = xfm.plugin orelse return false;
+    return b.table.forward_settle != null;
 }
 
 /// The slot is gone: the plugin frees what it keeps for it.

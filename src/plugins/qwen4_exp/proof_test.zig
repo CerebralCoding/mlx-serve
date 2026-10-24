@@ -1,6 +1,6 @@
 //! Parity proof for the qwen4_exp plugin: on a tiny random pack, the table's forward (prefill, decode across the QSA
 //! budget, verify, a later chunk, layer and stream captures, batched rows) is bit-equal to the legacy forward the
-//! engine runs (`Transformer.forwardWith` / `forwardMoeBatchedDecode`), on the engine's slot caches and on the
+//! engine ran (`Transformer.forwardWith` / `forwardMoeBatchedDecode`, recorded on the tapes), on the engine's slot caches and on the
 //! model's own.
 
 const std = @import("std");
@@ -10,8 +10,7 @@ const ops = @import("../../mlx/ops.zig");
 const model = @import("../../engines/mlx/model.zig");
 const sdk = @import("../../sdk/root.zig");
 const engine_cache_ops = @import("../../engines/mlx/kv/cache_ops.zig");
-const batched_caps = @import("../../engines/mlx/batched/caps.zig");
-const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
+const Trunk = @import("trunk.zig").Trunk;
 const ForwardCtx = @import("../../engines/mlx/forward_ctx.zig").ForwardCtx;
 const CaptureLayers = @import("../../engines/mlx/forward_ctx.zig").CaptureLayers;
 const KVCache = @import("../../engines/mlx/kv/cache.zig").KVCache;
@@ -20,6 +19,7 @@ const nextSsmMemberGen = @import("../../engines/mlx/ssm/group.zig").nextSsmMembe
 const ssmFreeQsaState = @import("qsa/history.zig").ssmFreeQsaState;
 const q4 = @import("plugin.zig");
 const fixture = @import("fixture.zig");
+const Oracle = @import("oracle_test.zig").Oracle;
 
 const testing = std.testing;
 const Array = mlx.mlx_array;
@@ -38,7 +38,7 @@ const Caches = struct {
         return .{ .kv = try KVCache.init(testing.allocator, layers), .ssm = ssm };
     }
 
-    fn deinit(c: *Caches, xfm: *Transformer) void {
+    fn deinit(c: *Caches, xfm: *Trunk) void {
         xfm.ssmGroupDrop(c.ssm);
         for (c.ssm) |*e| {
             _ = mlx.mlx_array_free(e.conv_state);
@@ -55,12 +55,12 @@ const Caches = struct {
     }
 };
 
-/// A pack on disk, loaded twice on the GPU stream: the legacy Transformer and the plugin's table.
+/// A pack on disk, loaded twice on the GPU stream: a bare trunk module and the plugin's table.
 const Twin = struct {
     tmp: testing.TmpDir,
     cfg: model.ModelConfig,
     weights: model.Weights,
-    xfm: Transformer,
+    xfm: Trunk,
     parsed: abi.Parsed = .{},
     m: *anyopaque,
 
@@ -79,9 +79,9 @@ const Twin = struct {
         t.weights = try model.loadModelWeights(io, a, dir, &t.cfg, false);
         errdefer t.weights.deinit();
         model.resolveWeightPrefix(&t.cfg, &t.weights);
-        t.xfm = try Transformer.init(io, a, t.cfg, &t.weights);
+        t.xfm = try Trunk.init(io, a, t.cfg, &t.weights);
         errdefer t.xfm.deinit();
-        q4.prepare(&t.xfm);
+        t.xfm.prepare();
         const mem: sdk.fixture.MemDir = .{ .files = files };
         const pd = mem.packDir();
         try testing.expect(q4.table.parse(&pd, .of(files[0].bytes), .{}, null, false, &t.parsed).isOk());
@@ -104,8 +104,8 @@ const Twin = struct {
     }
 
     /// The plugin's trunk module: the engine slots it batched are dropped from its group.
-    fn inner(t: *Twin) *Transformer {
-        return &@as(*q4.Model, @ptrCast(@alignCast(t.m))).xfm;
+    fn inner(t: *Twin) *Trunk {
+        return &@as(*q4.Model, @ptrCast(@alignCast(t.m))).trunk;
     }
 
     fn ids(toks: []const u32) Array {
@@ -169,7 +169,7 @@ const steps = [_]Step{
     .{ .mode = .verify, .ids = &.{ 6, 70 } },
 };
 
-fn expectSteps(precision: fixture.Precision, own: bool) !void {
+fn expectSteps(precision: fixture.Precision, own: bool, oracle: *Oracle) !void {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const t = try Twin.open(try fixture.files(arena.allocator(), 5, precision));
@@ -192,31 +192,35 @@ fn expectSteps(precision: fixture.Precision, own: bool) !void {
         var out: abi.ForwardOut = .{ .captured = &captured };
         const got = try t.plugin(if (own) null else &pc, pos, st.mode, st.ids, &out, st.capture);
         defer _ = mlx.mlx_array_free(got);
-        try ops.expectBitEqual(got, want);
+        try oracle.check(got, want, false);
         if (st.capture) {
             const hs: Array = .{ .ctx = out.hidden.ctx };
             defer _ = mlx.mlx_array_free(hs);
             const l2: Array = .{ .ctx = captured[0].ctx };
             defer _ = mlx.mlx_array_free(l2);
-            try ops.expectBitEqual(hs, stream);
-            try ops.expectBitEqual(l2, layer2);
+            try oracle.check(hs, stream, false);
+            try oracle.check(l2, layer2, false);
         }
     }
+    try oracle.close();
 }
 
 test "qwen4_exp plugin: bf16 pack, every step on the engine's slot caches equals the legacy forward bit for bit" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
-    try expectSteps(.bf16, false);
+    var oracle = try Oracle.open("proof-bf16");
+    try expectSteps(.bf16, false, &oracle);
 }
 
 test "qwen4_exp plugin: 4-bit pack, every step on the engine's slot caches equals the legacy forward bit for bit" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
-    try expectSteps(.q4, false);
+    var oracle = try Oracle.open("proof-q4");
+    try expectSteps(.q4, false, &oracle);
 }
 
 test "qwen4_exp plugin: on the model's own slot state every step equals the legacy forward bit for bit" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
-    try expectSteps(.q4, true);
+    var oracle = try Oracle.open("proof-q4-own");
+    try expectSteps(.q4, true, &oracle);
 }
 
 test "qwen4_exp plugin: batched rows equal the legacy batched GDN tick per slot, and a cold group steps serially" {
@@ -225,6 +229,7 @@ test "qwen4_exp plugin: batched rows equal the legacy batched GDN tick per slot,
     defer arena.deinit();
     const t = try Twin.open(try fixture.files(arena.allocator(), 9, .q4));
     defer t.close();
+    var oracle = try Oracle.open("proof-batched");
     const layers = t.cfg.num_hidden_layers;
     var lc: [2]Caches = .{ try Caches.init(layers), try Caches.init(layers) };
     defer for (&lc) |*c| c.deinit(&t.xfm);
@@ -250,7 +255,7 @@ test "qwen4_exp plugin: batched rows equal the legacy batched GDN tick per slot,
             lptr[i] = &lctx[i];
         }
         // Both slots' recurrent state is live: the engine's gate takes the batched tick, not the serial fallback.
-        try testing.expect(batched_caps.batchedGdnReady(&t.xfm, &lptr));
+        try testing.expect(t.xfm.batchedGdnReady(&lptr));
         const want = try t.xfm.forwardMoeBatchedDecode(&toks, &lptr, &pos, null);
         defer {
             for (want) |w| _ = mlx.mlx_array_free(w);
@@ -268,13 +273,14 @@ test "qwen4_exp plugin: batched rows equal the legacy batched GDN tick per slot,
             var w2 = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(w2);
             try mlx.check(mlx.mlx_reshape(&w2, w, &[_]c_int{ 1, -1 }, 2, mlx.gpuStream()));
-            try ops.expectBitEqual(row, w2);
+            try oracle.check(row, w2, false);
         }
         for (0..2) |i| {
             lc[i].pos += 1;
             pc[i].pos += 1;
         }
     }
+    try oracle.close();
 }
 
 test "qwen4_exp plugin: a position that does not follow the slot's state is refused by name" {

@@ -15,6 +15,8 @@
 //! `HotPrefixCache.shouldUse(config)` returns false for those archs.
 
 const std = @import("std");
+const Qwen4Trunk = @import("../../../plugins/qwen4_exp/trunk.zig").Trunk;
+const qsaTestAppendPool = @import("../../../plugins/qwen4_exp/qsa/history.zig").qsaTestAppendPool;
 const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
@@ -422,11 +424,11 @@ pub const DflashCommit = struct {
 
 /// Where `lookupAndRestore` puts a restored assistant context. `base_pos` is
 /// written on every path so the caller can build `DflashCtx` from it. `head` is the qwen4_exp
-/// Transformer owning the in-checkpoint MTP head; the adoption then goes through `qwen4MtpAdopt`.
+/// trunk owning the in-checkpoint MTP head; the adoption then goes through `qwen4MtpAdopt`.
 pub const DflashTarget = struct {
     cache: *KVCache,
     base_pos: *usize,
-    head: ?*transformer_mod.Transformer = null,
+    head: ?*Qwen4Trunk = null,
     /// Receives the snap's `tail_hidden` when the restore lands one row past the history;
     /// the caller appends that row and frees the handle.
     tail_hidden: ?*mlx.mlx_array = null,
@@ -3503,13 +3505,13 @@ fn testFillCache(cache: *KVCache, s: mlx.mlx_stream, n_layers: u32, tokens: u32)
 }
 
 /// Fill a head-shaped cache: one layer at `layer` (the qwen4_exp MTP head's layer is never 0),
-/// driven through `Transformer.qwen4MtpAdvance` as `qwen4MtpForward` drives it.
+/// driven through `qwen4MtpAdvance` as `qwen4MtpForward` drives it.
 fn testFillHeadCache(cache: *KVCache, s: mlx.mlx_stream, layer: u32, tokens: u32, seq_offset: *usize) !void {
     var written: u32 = 0;
     while (written < tokens) {
         const step: u32 = @min(64, tokens - written);
         try testWriteCacheLayer(cache, s, layer, written, step);
-        transformer_mod.Transformer.qwen4MtpAdvance(cache, seq_offset, @intCast(step));
+        @import("../../../plugins/qwen4_exp/mtp.zig").qwen4MtpAdvance(cache, seq_offset, @intCast(step));
         written += step;
     }
 }
@@ -6103,15 +6105,14 @@ fn pcQsaExpectViewEqual(s: mlx.mlx_stream, warm: *SSMCacheEntry, cold: *SSMCache
     }
 }
 
-fn pcQsaFeed(xfm: *transformer_mod.Transformer, entry: *SSMCacheEntry, keys: mlx.mlx_array, n: c_int, s: mlx.mlx_stream) !void {
+fn pcQsaFeed(xfm: *Qwen4Trunk, entry: *SSMCacheEntry, keys: mlx.mlx_array, n: c_int, s: mlx.mlx_stream) !void {
     const chunk = try pcQsaSliceAxis1(s, keys, 0, n);
     defer _ = mlx.mlx_array_free(chunk);
-    try transformer_mod.qsaTestAppendPool(xfm, entry, chunk, 0, s);
+    try qsaTestAppendPool(xfm, entry, chunk, 0, s);
 }
 
 fn pcQsaSweep(hc: *HotPrefixCache, toks: []const u32, keys: mlx.mlx_array, lo: usize, hi: usize, s: mlx.mlx_stream) !void {
-    var xfm: transformer_mod.Transformer = undefined;
-    xfm.rht = null;
+    var xfm: Qwen4Trunk = undefined;
     xfm.s = s;
     xfm.allocator = testing.allocator;
     var r = lo;
@@ -6148,9 +6149,7 @@ test "HotPrefixCache: restored QSA history values match a cold feed at every pos
     var toks: [P]u32 = undefined;
     for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
 
-    var xfm: transformer_mod.Transformer = undefined;
-
-    xfm.rht = null;
+    var xfm: Qwen4Trunk = undefined;
     xfm.s = s;
     xfm.allocator = testing.allocator;
 
@@ -6171,7 +6170,7 @@ test "HotPrefixCache: restored QSA history values match a cold feed at every pos
             defer _ = mlx.mlx_array_free(chunk);
             transformer_mod.ssmFreeQsaState(&live[0]);
             live[0] = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_ratio = 4 };
-            try transformer_mod.qsaTestAppendPool(&xfm, &live[0], chunk, 0, s);
+            try qsaTestAppendPool(&xfm, &live[0], chunk, 0, s);
             cps[i] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, @intCast(pos), s);
         }
         try transformer_mod.attachQsaHistoryToLatest(cps, &live, s);
@@ -6213,7 +6212,7 @@ test "HotPrefixCache: restored QSA history values match a cold feed at every pos
             defer _ = mlx.mlx_array_free(chunk);
             transformer_mod.ssmFreeQsaState(&donor_live[0]);
             donor_live[0] = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_ratio = 4 };
-            try transformer_mod.qsaTestAppendPool(&xfm, &donor_live[0], chunk, 0, s);
+            try qsaTestAppendPool(&xfm, &donor_live[0], chunk, 0, s);
             donor_cps[i] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &donor_live, @intCast(pos), s);
         }
         try transformer_mod.attachQsaHistoryToLatest(donor_cps, &donor_live, s);
@@ -6231,7 +6230,7 @@ test "HotPrefixCache: restored QSA history values match a cold feed at every pos
         {
             const chunk = try pcQsaSliceAxis1(s, donor_keys, 0, @intCast(shared));
             defer _ = mlx.mlx_array_free(chunk);
-            try transformer_mod.qsaTestAppendPool(&xfm, &heir_live[0], chunk, 0, s);
+            try qsaTestAppendPool(&xfm, &heir_live[0], chunk, 0, s);
         }
         const heir_own = try testing.allocator.alloc(SSMCheckpoint, 1);
         heir_own[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &heir_live, shared, s);
@@ -6505,7 +6504,7 @@ fn pcSsmDiffField(s: mlx.mlx_stream, a: []const SSMCacheEntry, b: []const SSMCac
 fn pcCaptureFed(
     allocator: std.mem.Allocator,
     s: mlx.mlx_stream,
-    xfm: *transformer_mod.Transformer,
+    xfm: *Qwen4Trunk,
     keys: mlx.mlx_array,
     pos: c_int,
     conv_base: f64,
@@ -6526,8 +6525,7 @@ test "HotPrefixCache: inherit does not clone checkpoints past donor.shared" {
     const s = mlx.gpuStream();
     const P: usize = 20;
     const hd: c_int = 8;
-    var xfm: transformer_mod.Transformer = undefined;
-    xfm.rht = null;
+    var xfm: Qwen4Trunk = undefined;
     xfm.s = s;
     xfm.allocator = testing.allocator;
     const keys = try pcQsaArangeKeys(s, 40, hd);
@@ -6607,8 +6605,7 @@ test "HotPrefixCache: inherit of a greedy continuation stops at the prompt" {
     const P: usize = 48;
     const prompt_len: usize = P - 1;
     const hd: c_int = 8;
-    var xfm: transformer_mod.Transformer = undefined;
-    xfm.rht = null;
+    var xfm: Qwen4Trunk = undefined;
     xfm.s = s;
     xfm.allocator = testing.allocator;
     const keys = try pcQsaArangeKeys(s, 80, hd);
@@ -6664,8 +6661,7 @@ test "HotPrefixCache: sliced qsa bank apply at backoff matches the full bank at 
     const ratio: c_int = 4;
     const B: usize = 19;
     const H: usize = 80;
-    var xfm: transformer_mod.Transformer = undefined;
-    xfm.rht = null;
+    var xfm: Qwen4Trunk = undefined;
     xfm.s = s;
     xfm.allocator = testing.allocator;
     const keys = try pcQsaArangeKeys(s, @intCast(H), hd);
@@ -6760,8 +6756,7 @@ test "HotPrefixCache: heir restore at backoff matches the donor bit for bit" {
     const donor_gen: usize = 16;
     const heir_gen: usize = 12;
     const a2_extra: usize = 8;
-    var xfm: transformer_mod.Transformer = undefined;
-    xfm.rht = null;
+    var xfm: Qwen4Trunk = undefined;
     xfm.s = s;
     xfm.allocator = testing.allocator;
 

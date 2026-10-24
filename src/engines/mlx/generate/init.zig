@@ -385,7 +385,7 @@ pub fn initWithOptions(
         if (mtp_cache) |*mc| mc.activate();
         transformer_mod.reserveQsaHistoryWithHead(
             ctx.ssm_entries,
-            if (xfm.qwen4Host().qwen4_mtp) |*m| &m.entry else null,
+            if (xfm.qwen4Trunk()) |t| if (t.qwen4_mtp) |*m| &m.entry else null else null,
             @intCast(reserved_tokens),
         );
 
@@ -565,7 +565,7 @@ pub fn initWithOptions(
                 if (mtp_active) {
                     mtp_cache.?.activate();
                 }
-                if (mtp_active) xfm.qwen4Host().qwen4MtpMarkQsaLeftover(abs_end_for_cp2 -| mtp_position_base) catch |e| {
+                if (mtp_active) if (xfm.qwen4Trunk()) |t| t.qwen4MtpMarkQsaLeftover(abs_end_for_cp2 -| mtp_position_base) catch |e| {
                     log.debug("[qwen4] MTP head leftover mark failed: {s}\n", .{@errorName(e)});
                 };
                 // Thin the interior, never the oldest (#330): drop-oldest survivors covered only
@@ -689,7 +689,7 @@ pub fn initWithOptions(
                 if (mtp_active) {
                     mtp_cache.?.activate();
                 }
-                if (mtp_active) xfm.qwen4Host().qwen4MtpMarkQsaLeftover(final_abs -| mtp_position_base) catch |e| {
+                if (mtp_active) if (xfm.qwen4Trunk()) |t| t.qwen4MtpMarkQsaLeftover(final_abs -| mtp_position_base) catch |e| {
                     log.debug("[qwen4] MTP head leftover mark failed: {s}\n", .{@errorName(e)});
                 };
                 if (options.ssm_checkpoint_max > 0 and
