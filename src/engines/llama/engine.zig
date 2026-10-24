@@ -3,9 +3,9 @@
 //!
 //! `Open.model_dir` names the `.gguf` file (a split GGUF's first shard); `settings_json` is `load.Settings`;
 //! `Open.context` is each sequence's context (0: 8192, the scheduler's default). The host renders the GGUF's chat
-//! template (`chat_template`) and tokenizes through `tokenize`, whose `specials` adds the model's BOS. Our shim's
-//! sampler takes temperature, top-k, top-p and min-p only: penalties, logit bias, logprobs, grammar, the think
-//! budget and the tool gate are refused by name.
+//! template (`chat_template`) and tokenizes through `tokenize`, whose `specials` adds the model's BOS. Penalties,
+//! logit bias and logprobs run on the sequence's own logits row before the shim's sampler draws from it (such
+//! requests take no MTP round); grammar, the think budget and the tool gate are refused by name.
 
 const std = @import("std");
 const env = @import("../../env.zig");
@@ -15,6 +15,7 @@ const engine_pick = @import("../../sdk/quant/gguf/engine_pick.zig");
 const log = @import("../../sdk/util/log.zig");
 const book_mod = @import("../own_thread/book.zig");
 const TokenTable = @import("../own_thread/token_table.zig").TokenTable;
+const logits = @import("../own_thread/logits.zig");
 const load = @import("load.zig");
 const policy = @import("policy.zig");
 
@@ -81,8 +82,58 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
             startup_buf: [96]u8 = undefined,
         };
 
-        /// A request decoding on a sequence: the token it drew last round, not yet emitted nor fed.
-        const Live = struct { r: *Req, seq: *B.LlamaSeq, next: i32, rng: u64 };
+        /// A request decoding on a sequence: the token it drew last round, not yet emitted nor fed, with its logprob
+        /// when asked. A request that shapes its logits keeps the ids it emitted (`history`) and, for logprobs, the
+        /// raw row (`raw`) the shaping overwrites.
+        const Live = struct {
+            r: *Req,
+            seq: *B.LlamaSeq,
+            next: i32,
+            rng: u64,
+            history: logits.History = .{},
+            raw: []f32 = &.{},
+            top: []abi.Bias = &.{},
+            lp: [1]abi.Logprob = undefined,
+
+            fn shaped(l: *const Live) bool {
+                return logits.shapes(l.r.sampling);
+            }
+
+            /// Penalties, logit bias and logprobs need the row on the host; such a request takes no MTP round.
+            fn onHost(l: *const Live) bool {
+                return l.shaped() or l.r.logprobs > 0;
+            }
+
+            /// The next token from the row the last decode left: shaped first when the request asks, its logprob
+            /// read off the raw row.
+            fn draw(l: *Live) !i32 {
+                const shaped_row = l.shaped();
+                var row: []f32 = &.{};
+                if (l.onHost()) {
+                    row = l.seq.logits() orelse return error.LlamaLogitsUnavailable;
+                    if (shaped_row and l.r.logprobs > 0) @memcpy(l.raw, row);
+                    if (shaped_row) logits.shape(f32, row, l.r.sampling, &l.history);
+                }
+                const t = l.seq.sample(sampling(l.r), &l.rng);
+                if (t < 0) return error.LlamaSampleFailed;
+                if (l.r.logprobs > 0) l.lp[0] = logits.logprob(f32, if (shaped_row) l.raw else row, @intCast(t), l.top);
+                return t;
+            }
+
+            /// Emits `next`; null: decode on.
+            fn emit(l: *Live) !?Reason {
+                const before = l.r.emitted;
+                const why = l.r.commit(&.{@intCast(l.next)}, if (l.r.logprobs > 0) &l.lp else &.{});
+                if (l.shaped() and l.r.emitted > before) try l.history.add(gpa, @intCast(l.next));
+                return why;
+            }
+
+            fn deinit(l: *Live) void {
+                l.history.deinit(gpa);
+                gpa.free(l.raw);
+                gpa.free(l.top);
+            }
+        };
 
         fn state(e: *anyopaque) *State {
             return @ptrCast(@alignCast(e));
@@ -134,6 +185,9 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
                 .engine = opened.engine,
                 .ctx = opened.ctx,
                 .caps = .{
+                    .penalties = true,
+                    .logit_bias = true,
+                    .logprobs = true,
                     .owns_tokenizer = true,
                     .batches = seqs > 1,
                     .drafts = opened.ctx.mtpDrafts() > 0,
@@ -246,20 +300,22 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
             seq.busy = true;
             seq.last_used_ns = @intCast(book_mod.nowNs());
             var l: Live = .{ .r = r, .seq = seq, .next = 0, .rng = r.seed() };
+            l.top = gpa.alloc(abi.Bias, r.logprobs) catch return end(st, &l, .failed, "OutOfMemory");
+            if (l.shaped() and r.logprobs > 0) l.raw = gpa.alloc(f32, st.tokens.pieces.len) catch return end(st, &l, .failed, "OutOfMemory");
             const cached = seq.syncWithFallback(prompt) catch |err| return end(st, &l, .failed, @errorName(err));
             if (r.prefilled(@intCast(@max(cached, 0)))) |why| return end(st, &l, why, "");
-            l.next = seq.sample(sampling(r), &l.rng);
-            if (l.next < 0) return end(st, &l, .failed, "llama_sample_failed");
+            l.next = l.draw() catch |err| return end(st, &l, .failed, @errorName(err));
             live.append(gpa, l) catch return end(st, &l, .failed, "OutOfMemory");
         }
 
-        fn end(st: *State, l: *const Live, reason: Reason, why: []const u8) void {
+        fn end(st: *State, l: *Live, reason: Reason, why: []const u8) void {
             l.seq.busy = false;
+            l.deinit();
             st.book.done(l.r, reason, why);
         }
 
         fn endAt(st: *State, live: *std.ArrayList(Live), i: usize, reason: Reason, why: []const u8) void {
-            const l = live.orderedRemove(i);
+            var l = live.orderedRemove(i);
             end(st, &l, reason, why);
         }
 
@@ -270,8 +326,12 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
             var i: usize = 0;
             while (i < live.items.len) {
                 const l = &live.items[i];
-                if (l.r.commit(&.{@intCast(l.next)}, &.{})) |why| {
-                    endAt(st, live, i, why, "");
+                const why = l.emit() catch |err| {
+                    endAt(st, live, i, .failed, @errorName(err));
+                    continue;
+                };
+                if (why) |w| {
+                    endAt(st, live, i, w, "");
                     continue;
                 }
                 i += 1;
@@ -280,7 +340,7 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
             if (n == 0) return;
 
             const first = &live.items[0];
-            const drafts = policy.draftsThisTick(n, st.ctx.mtpDrafts(), first.r.max_tokens - first.r.emitted);
+            const drafts = if (first.onHost()) 0 else policy.draftsThisTick(n, st.ctx.mtpDrafts(), first.r.max_tokens - first.r.emitted);
             if (drafts > 0) {
                 var buf: [policy.max_drafts + 1]i32 = undefined;
                 const got = first.seq.specStep(first.next, drafts, sampling(first.r), &first.rng, &buf) catch |err| return endAt(st, live, 0, .failed, @errorName(err));
@@ -312,11 +372,10 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
             i = 0;
             while (i < live.items.len) {
                 const l = &live.items[i];
-                l.next = l.seq.sample(sampling(l.r), &l.rng);
-                if (l.next < 0) {
-                    endAt(st, live, i, .failed, "llama_sample_failed");
+                l.next = l.draw() catch |err| {
+                    endAt(st, live, i, .failed, @errorName(err));
                     continue;
-                }
+                };
                 i += 1;
             }
         }
@@ -336,8 +395,8 @@ test {
     _ = load;
 }
 
-/// A llama.cpp bridge with no model: a sequence's next token after n resident tokens is `100 + n % 800`; an MTP
-/// round accepts every draft.
+/// A llama.cpp bridge with no model: a sequence's logits after n resident tokens favour `100 + n % 800` (1, every
+/// other id 0) and it samples their argmax, so a shaped row changes what comes out; an MTP round accepts every draft.
 const FakeBridge = struct {
     pub const vocab = 1024;
     pub const Sampling = struct { temperature: f32, top_k: i32 = 0, top_p: f32 = 1, min_p: f32 = 0 };
@@ -396,8 +455,16 @@ const FakeBridge = struct {
         resident: std.ArrayList(i32) = .empty,
         last_used_ns: i64 = 0,
         busy: bool = false,
+        row: [vocab]f32 = @splat(0),
+        lent: bool = false,
         fn next(s: *const LlamaSeq) i32 {
             return @intCast(100 + s.resident.items.len % 800);
+        }
+        pub fn logits(s: *LlamaSeq) ?[]f32 {
+            s.row = @splat(0);
+            s.row[@intCast(s.next())] = 1;
+            s.lent = true;
+            return &s.row;
         }
         pub fn syncWithFallback(s: *LlamaSeq, p: []const i32) !i32 {
             const common = @min(bridge.commonPrefixLen(s.resident.items, p), p.len -| 1);
@@ -405,8 +472,11 @@ const FakeBridge = struct {
             try s.resident.appendSlice(testing.allocator, p[common..]);
             return @intCast(common);
         }
+        /// The argmax of the row `logits` handed out (reshaped or not), else of a fresh one.
         pub fn sample(s: *LlamaSeq, _: Sampling, _: *u64) i32 {
-            return s.next();
+            if (!s.lent) return s.next();
+            s.lent = false;
+            return @intCast(std.mem.indexOfMax(f32, &s.row));
         }
         pub fn specStep(s: *LlamaSeq, id_last: i32, max_drafts: u32, _: Sampling, _: *u64, out: []i32) ![]i32 {
             try s.resident.append(testing.allocator, id_last);
@@ -503,7 +573,7 @@ test "llama adapter: an EOG id ends a request unemitted; a follow-up reuses its 
     try testing.expectEqual(@as(u32, 2), info.max_concurrent);
     try testing.expectEqual(default_context, info.context_window);
     try testing.expectEqual(@as(u32, FakeBridge.vocab), info.vocab_size);
-    try testing.expect(info.caps.batches and !info.caps.drafts and !info.caps.penalties);
+    try testing.expect(info.caps.batches and !info.caps.drafts and info.caps.penalties and info.caps.logprobs and !info.caps.grammar);
 
     var prompt: [20]u32 = undefined;
     for (&prompt, 0..) |*t, i| t.* = @intCast(10 + i);
@@ -525,6 +595,41 @@ test "llama adapter: an EOG id ends a request unemitted; a follow-up reuses its 
     try testing.expectEqual(@as(usize, 3), Fake.table.tokenize.?(e, abi.span(u8, "ab"), true, &ids, ids.len));
     try testing.expectEqualSlices(u32, &.{ 1, 'a', 'b' }, ids[0..3]);
     try testing.expectEqualStrings("<5>", abi.items(u8, Fake.table.token_bytes.?(e, 5)));
+}
+
+test "llama adapter: a logit bias and a penalty steer the sampled row; logprobs come off the raw row" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try llamaGguf(&tmp, &buf);
+    var info: abi.Info = undefined;
+    const e = try openFake(path, "{\"seqs\":1,\"mtp_drafts\":3}", &info);
+    defer Fake.table.close(e);
+    const LogCollect = struct {
+        toks: std.ArrayList(u32) = .empty,
+        top: std.ArrayList(u32) = .empty,
+        done: std.atomic.Value(bool) = .init(false),
+        fn onEvent(ctx: *anyopaque, _: u64, ev: *const abi.Event) callconv(.c) abi.Action {
+            const c: *@This() = @ptrCast(@alignCast(ctx));
+            c.toks.appendSlice(testing.allocator, abi.items(u32, ev.tokens)) catch {};
+            for (abi.items(abi.Logprob, ev.logprobs)) |lp| c.top.append(testing.allocator, abi.items(abi.Bias, lp.top)[0].token) catch {};
+            if (ev.kind == .finished) c.done.store(true, .release);
+            return .go;
+        }
+    };
+    var c: LogCollect = .{};
+    defer {
+        c.toks.deinit(testing.allocator);
+        c.top.deinit(testing.allocator);
+    }
+    // id 9 biased past the favoured id, then a presence penalty takes it back once it came out (no MTP round:
+    // the row is shaped on the host).
+    const bias = [_]abi.Bias{.{ .token = 9, .bias = 2 }};
+    const req: abi.Request = .{ .prompt = abi.span(u32, &.{ 5, 6, 7 }), .max_tokens = 3, .sampling = .{ .temperature = 0, .presence_penalty = 3, .logit_bias = abi.span(abi.Bias, &bias) }, .logprobs = 1 };
+    try testing.expectEqual(abi.Verdict.Code.ok, Fake.table.submit(e, 1, &req, .{ .ctx = &c, .event = LogCollect.onEvent }).code);
+    while (!c.done.load(.acquire)) io.sleep(.fromMicroseconds(100), .awake) catch {};
+    try testing.expectEqualSlices(u32, &.{ 9, 104, 105 }, c.toks.items);
+    try testing.expectEqualSlices(u32, &.{ 103, 104, 105 }, c.top.items); // the raw row's favourite
 }
 
 // ── against a real GGUF (`MLX_SERVE_TEST_LLAMA_GGUF`; skipped without it)

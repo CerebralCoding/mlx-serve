@@ -403,6 +403,12 @@ pub const LlamaSeq = struct {
         return ffi.mlx_llama_seq_sample(self.ctx.handle, self.id, temp, s.top_k, s.top_p, s.min_p, rng);
     }
 
+    /// The row the last decode left for this sequence, writable: `sample` draws from it. Null when there is none.
+    pub fn logits(self: *LlamaSeq) ?[]f32 {
+        const p = ffi.mlx_llama_seq_logits(self.ctx.handle, self.id) orelse return null;
+        return p[0..@intCast(self.ctx.engine.nVocab())];
+    }
+
     pub fn argmax(self: *LlamaSeq) i32 {
         var rng: u64 = 0;
         return self.sample(.{ .temperature = 0 }, &rng);
