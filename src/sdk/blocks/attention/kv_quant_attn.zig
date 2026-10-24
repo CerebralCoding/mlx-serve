@@ -787,7 +787,7 @@ pub fn logKvAttnFusedEngaged(view: *const DenseKVView, q: mlx.mlx_array, t_q: c_
 
 // ── tests ──
 
-const kv_quant = @import("../../../engines/mlx/cache/kv_quant.zig");
+const kv_quant = @import("kv_quant.zig");
 const KVCache = @import("../../../engines/mlx/kv/cache.zig").KVCache;
 
 /// Shared harness for the decode quantized-KV kernel parity tests: prefill

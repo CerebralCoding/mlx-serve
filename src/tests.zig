@@ -113,7 +113,7 @@ test {
     _ = @import("host/api/responses/model.zig");
     _ = @import("host/http/ws.zig");
     _ = @import("engines/mlx/spec/pld_index.zig");
-    _ = @import("engines/mlx/cache/kv_quant.zig");
+    _ = @import("sdk/blocks/attention/kv_quant.zig");
     _ = @import("host/registry/model_settings.zig");
     _ = @import("host/registry/load_progress.zig");
     _ = @import("plugins/gemma4/assistant_drafter.zig");
