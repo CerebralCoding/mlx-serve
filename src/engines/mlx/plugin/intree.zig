@@ -94,11 +94,11 @@ pub fn lendTrunk(xfm: *Transformer) void {
 
 /// The engine's context of the serial forward in flight, for the qwen4_exp plugin (`leave` clears it).
 pub fn enter(ctx: *const ForwardCtx) void {
-    qwen4.engine_ctx = ctx;
+    qwen4.engineCtx().* = ctx;
 }
 
 pub fn leave() void {
-    qwen4.engine_ctx = null;
+    qwen4.engineCtx().* = null;
 }
 
 // ── tests ──

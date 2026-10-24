@@ -93,7 +93,7 @@ pub const StreamCtx = struct {
         return false;
     }
     pub fn progress(self: *StreamCtx) Progress {
-        progress_mod.stream_keepalive = if (self.stream) .{ .ctx = self.conn, .beat_until = beatUntil } else null;
+        progress_mod.streamKeepalive().* = if (self.stream) .{ .ctx = self.conn, .beat_until = beatUntil } else null;
         const opts = (preview.Opts{
             .enabled = self.preview,
             .frames = self.preview_frames,
@@ -277,8 +277,8 @@ test "Progress.boundary gives the installed scheduler hook its turn, then report
     try std.testing.expectEqual(@as(u32, 0), h.steps);
 
     const y = Yield{ .ctx = &h, .step = H.step, .serve_until = H.serve, .wake = H.wake };
-    progress_mod.gen_yield = &y;
-    defer progress_mod.gen_yield = null;
+    progress_mod.genYield().* = &y;
+    defer progress_mod.genYield().* = null;
     try std.testing.expect(!p.boundary());
     h.flag = true;
     try std.testing.expect(p.boundary());
@@ -306,8 +306,8 @@ test "offload runs a CPU stage on a worker while the hook serves, and returns it
 
     var h = H{};
     const y = Yield{ .ctx = &h, .step = H.step, .serve_until = H.serve, .wake = H.wake };
-    progress_mod.gen_yield = &y;
-    defer progress_mod.gen_yield = null;
+    progress_mod.genYield().* = &y;
+    defer progress_mod.genYield().* = null;
     const r = try offload(H.work, .{ 3, 5 });
     try std.testing.expectEqual(@as(u32, 8), r.sum);
     try std.testing.expect(r.tid != me);
@@ -327,7 +327,7 @@ test "offload keeps a streaming job's socket alive through a long CPU stage, wit
     conn.heartbeat = .{ .last_write_ms = 0, .interval_ms = 1 };
     var sctx = StreamCtx{ .conn = &conn, .stream = true };
     _ = sctx.progress();
-    defer progress_mod.stream_keepalive = null;
+    defer progress_mod.streamKeepalive().* = null;
     const H = struct {
         fn work() u32 {
             std.Io.sleep(std.Io.Threaded.global_single_threaded.io(), .fromMilliseconds(250), .real) catch {};
@@ -348,8 +348,8 @@ test "offload keeps a streaming job's socket alive through a long CPU stage, wit
     // With the scheduler's hook serving chat meanwhile.
     var dummy: u8 = 0;
     const y = Yield{ .ctx = &dummy, .step = H.step, .serve_until = H.serve, .wake = H.wake };
-    progress_mod.gen_yield = &y;
-    defer progress_mod.gen_yield = null;
+    progress_mod.genYield().* = &y;
+    defer progress_mod.genYield().* = null;
     conn.heartbeat = .{ .last_write_ms = 0, .interval_ms = 1 };
     try std.testing.expectEqual(@as(u32, 7), offload(H.work, .{}));
     n = std.c.recv(sv[1], &buf, buf.len, std.posix.MSG.DONTWAIT);
@@ -358,11 +358,11 @@ test "offload keeps a streaming job's socket alive through a long CPU stage, wit
 
 test "a job that is not streaming registers no keepalive connection, and a stale one is dropped" {
     var dummy: Conn = undefined;
-    progress_mod.stream_keepalive = .{ .ctx = &dummy, .beat_until = beatUntil };
-    defer progress_mod.stream_keepalive = null;
+    progress_mod.streamKeepalive().* = .{ .ctx = &dummy, .beat_until = beatUntil };
+    defer progress_mod.streamKeepalive().* = null;
     var quiet = StreamCtx{ .conn = &dummy, .stream = false };
     _ = quiet.progress();
-    try std.testing.expect(progress_mod.stream_keepalive == null);
+    try std.testing.expect(progress_mod.streamKeepalive().* == null);
 }
 
 test "a NON-streaming job still gets a cancellation probe, and writes no SSE" {
@@ -427,7 +427,7 @@ test "preview SSE event carries JPEG b64 and is absent when the flag is off" {
         .preview = true,
     };
     const p = sctx.progress();
-    defer progress_mod.stream_keepalive = null; // the scheduler clears it in production; a stale one segfaults a later offload
+    defer progress_mod.streamKeepalive().* = null; // the scheduler clears it in production; a stale one segfaults a later offload
     try std.testing.expect(p.wantsPreview());
     const jpg = [_]u8{ 0xFF, 0xD8, 0xFF, 0xD9 };
     p.emitPreview("Generating", 8, 30, .{ .jpeg = @constCast(&jpg), .w = 16, .h = 9 });

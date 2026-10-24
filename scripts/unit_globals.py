@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The plugin units' duplicated state (-Dunits). Every unit object compiles its own copy of the globals its code
 reaches; one the host sets or reads must be `Shared` (src/sdk/util/shared.zig). This lists the internal data
-symbols of each unit object (a Debug build keeps their names) and fails on any that scripts/unit_globals_ok.txt does
+symbols of each unit object, threadlocals included (a Debug build keeps their names) and fails on any that scripts/unit_globals_ok.txt does
 not allow, by pattern (`~regex`) or by name.
 
   python3 scripts/unit_globals.py <unit .o file or dir>...      (zig build units-check -Dunits=true runs this)
@@ -27,10 +27,11 @@ def main(argv):
         f = os.path.basename(o)
         out = subprocess.run(['nm', '-m', o], capture_output=True, text=True, check=True).stdout
         for l in out.splitlines():
-            if not re.search(r'\(__DATA,__(data|bss|common)\)', l) or 'non-external' not in l: continue
+            # A threadlocal is a `__thread_vars` descriptor under the variable's own name (its `$tlv$init` image beside it).
+            if not re.search(r'\(__DATA,__(data|bss|common|thread_vars)\)', l) or 'non-external' not in l: continue
             sym = l.split('non-external ', 1)[1].strip().lstrip('_')
             # A unit resolves Shared state to the host's copy, so it never holds the storage itself.
-            if not (sym.startswith('sdk.util.shared.Shared(') and sym.endswith(').storage')):
+            if not (sym.startswith(('sdk.util.shared.Shared(', 'sdk.util.shared.SharedThreadLocal(')) and sym.endswith(').storage')):
                 if sym in names or any(p.search(sym) for p in pats): continue
             bad.setdefault(sym, []).append(f[:-2])
     for sym, units in sorted(bad.items()):

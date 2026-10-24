@@ -117,7 +117,7 @@ fn quietReport(_: ?*anyopaque, _: abi.Str, _: u32, _: u32) callconv(.c) void {}
 
 /// A merged pass belongs to no one client: its boundary gives chat its turn and never stops the pass.
 fn chatTurn(_: ?*anyopaque) callconv(.c) bool {
-    if (media_progress.gen_yield) |y| y.step(y.ctx);
+    if (media_progress.genYield().*) |y| y.step(y.ctx);
     return false;
 }
 
@@ -362,8 +362,8 @@ test "plugin arm: chat gets one turn per step boundary, from the driver, through
     };
     var dummy: u8 = 0;
     const hook = sse.Yield{ .ctx = &dummy, .step = Count.step, .serve_until = Count.serve, .wake = Count.wake };
-    media_progress.gen_yield = &hook;
-    defer media_progress.gen_yield = null;
+    media_progress.genYield().* = &hook;
+    defer media_progress.genYield().* = null;
     var sink = Sink{ .sctx = .{ .conn = &conn, .stream = false } };
     sink.prog = sink.sctx.progress();
     const p = sink.progress();

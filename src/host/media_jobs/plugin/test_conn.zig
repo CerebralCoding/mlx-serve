@@ -27,7 +27,7 @@ pub fn capture(a: std.mem.Allocator, comptime run: anytype, args: anytype) ![]u8
     conn.init(.{ .socket = .{ .handle = sv[0], .address = undefined } }, testing.io);
     // The job's keepalive registration outlives it here (the scheduler clears it in production): drop it with the conn.
     const r = @call(.auto, run, .{&conn} ++ args);
-    media_progress.stream_keepalive = null;
+    media_progress.streamKeepalive().* = null;
     _ = std.c.close(sv[0]);
     t.join();
     _ = std.c.close(sv[1]);
@@ -57,7 +57,7 @@ pub fn captureMany(a: std.mem.Allocator, comptime n: usize, comptime run: anytyp
         t.* = try std.Thread.spawn(.{}, Drain.f, .{ p[1], o, a });
     }
     @call(.auto, run, .{&conns} ++ args);
-    media_progress.stream_keepalive = null;
+    media_progress.streamKeepalive().* = null;
     var got: [n][]u8 = undefined;
     for (&sv, &outs, &threads, &got) |p, *o, t, *g| {
         _ = std.c.close(p[0]);

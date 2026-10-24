@@ -3271,8 +3271,8 @@ test "generateCodes yields at frame boundaries and stops on cancel" {
     };
     var h = H{};
     const y = sse.Yield{ .ctx = &h, .step = H.step, .serve_until = H.serve, .wake = H.wake };
-    sse.gen_yield = &y;
-    defer sse.gen_yield = null;
+    sse.genYield().* = &y;
+    defer sse.genYield().* = null;
     const ids = [_]i32{ 9707, 11, 1879, 13 };
     const p = sse.Progress{ .ctx = &h, .cb = H.emitCb, .cancelled_cb = H.cancelCb };
     try std.testing.expectError(error.Cancelled, m.generateCodes(&ids, 2048, p, null));

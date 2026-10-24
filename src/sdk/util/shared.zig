@@ -32,6 +32,43 @@ pub fn Shared(comptime T: type, comptime name: []const u8, comptime init: T) typ
     };
 }
 
+/// A `threadlocal` the host and every unit share: the host holds the storage, and a unit takes the CURRENT thread's
+/// slot from the host on every access (each thread's address differs, so nothing is cached).
+pub fn SharedThreadLocal(comptime T: type, comptime name: []const u8, comptime init: T) type {
+    return struct {
+        threadlocal var storage: T = init;
+        const sym = "mlx_serve_shared_tls_" ++ name;
+
+        fn addr() callconv(.c) *anyopaque {
+            return @ptrCast(&storage);
+        }
+
+        comptime {
+            if (!in_unit) @export(&addr, .{ .name = sym });
+        }
+
+        pub inline fn get() *T {
+            if (!in_unit) return &storage;
+            const f = @extern(*const fn () callconv(.c) *anyopaque, .{ .name = sym });
+            return @ptrCast(@alignCast(f()));
+        }
+    };
+}
+
+test "SharedThreadLocal: each thread starts at init and keeps its own value" {
+    const S = SharedThreadLocal(u32, "test_shared_tls", 3);
+    S.get().* = 9;
+    var other: u32 = 0;
+    const t = try @import("std").Thread.spawn(.{}, struct {
+        fn run(out: *u32) void {
+            out.* = S.get().*;
+        }
+    }.run, .{&other});
+    t.join();
+    try @import("std").testing.expectEqual(@as(u32, 3), other);
+    try @import("std").testing.expectEqual(@as(u32, 9), S.get().*);
+}
+
 test "Shared: outside a unit the storage is the module's own and starts at init" {
     const S = Shared(u32, "test_shared_counter", 7);
     try @import("std").testing.expectEqual(@as(u32, 7), S.get().*);

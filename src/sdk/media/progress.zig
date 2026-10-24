@@ -2,6 +2,7 @@
 //! `offload`, which runs a CPU stage off the inference thread while chat keeps it.
 
 const std = @import("std");
+const shared = @import("../util/shared.zig");
 const preview = @import("preview.zig");
 
 /// Erased progress callback handed into the model code (flux/tts/ltx) so the
@@ -39,7 +40,7 @@ pub const Progress = struct {
     /// The per-step poll: gives chat its turn on the inference thread (when a
     /// scheduler hook is installed), then reports whether the client left.
     pub fn boundary(self: Progress) bool {
-        if (self.yields) if (gen_yield) |y| y.step(y.ctx);
+        if (self.yields) if (genYield().*) |y| y.step(y.ctx);
         return self.cancelled();
     }
 };
@@ -57,7 +58,10 @@ pub const Yield = struct {
 /// Installed by the scheduler around a media job, on the inference thread only.
 /// Thread-local rather than a `Progress` field so every wrapper that rebuilds a
 /// `Progress` (H3's chained windows, LTX's windows) keeps it.
-pub threadlocal var gen_yield: ?*const Yield = null;
+pub fn genYield() *?*const Yield {
+    return GenYield.get();
+}
+const GenYield = shared.SharedThreadLocal(?*const Yield, "gen_yield", null);
 
 /// A streaming job's keepalive: `beat_until` writes a keepalive whenever the stream has been silent, until `done`.
 pub const Keepalive = struct {
@@ -71,7 +75,10 @@ pub const Keepalive = struct {
 
 /// The streaming job's keepalive on this thread, set by the host's stream sink and cleared when the job ends: a CPU
 /// stage that runs for minutes (`offload`) keeps the socket alive through it.
-pub threadlocal var stream_keepalive: ?Keepalive = null;
+pub fn streamKeepalive() *?Keepalive {
+    return StreamKeepalive.get();
+}
+const StreamKeepalive = shared.SharedThreadLocal(?Keepalive, "stream_keepalive", null);
 
 fn ReturnOf(comptime func: anytype) type {
     return @typeInfo(@TypeOf(func)).@"fn".return_type.?;
@@ -80,8 +87,8 @@ fn ReturnOf(comptime func: anytype) type {
 /// Run a pure-CPU stage (zero MLX: it runs off the inference thread) on a worker
 /// thread while chat keeps the inference thread. Inline when no hook is installed.
 pub fn offload(comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) ReturnOf(func) {
-    const ka = stream_keepalive;
-    if (gen_yield == null and ka == null) return @call(.auto, func, args);
+    const ka = streamKeepalive().*;
+    if (genYield().* == null and ka == null) return @call(.auto, func, args);
     const Job = struct {
         args: @TypeOf(args),
         y: ?*const Yield,
@@ -93,7 +100,7 @@ pub fn offload(comptime func: anytype, args: std.meta.ArgsTuple(@TypeOf(func))) 
             if (j.y) |y| y.wake(y.ctx);
         }
     };
-    var job = Job{ .args = args, .y = gen_yield };
+    var job = Job{ .args = args, .y = genYield().* };
     const t = std.Thread.spawn(.{}, Job.run, .{&job}) catch return @call(.auto, func, args);
     const beater = if (ka) |k| std.Thread.spawn(.{}, Keepalive.run, .{ k, &job.done }) catch null else null;
     if (job.y) |y| y.serve_until(y.ctx, &job.done);

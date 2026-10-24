@@ -51,7 +51,10 @@ pub const table = abi.ModelTable{
 
 /// P8 debt (`engines/mlx/plugin/intree.zig`): the engine's context of the serial forward in flight when the MLX
 /// engine serves this plugin in-tree; the slot's M-RoPE table rides it.
-pub threadlocal var engine_ctx: ?*const ForwardCtx = null;
+pub fn engineCtx() *?*const ForwardCtx {
+    return EngineCtx.get();
+}
+const EngineCtx = @import("../../sdk/util/shared.zig").SharedThreadLocal(?*const ForwardCtx, "qwen4_engine_ctx", null);
 
 const Verdict = abi.Verdict;
 const Array = mlx.mlx_array;
@@ -238,7 +241,7 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     const m: *Model = @ptrCast(@alignCast(mp));
     if (!abi.declaresMode(m.caps, f.mode)) return Verdict.refuse(.unsupported, "qwen4_exp: forward mode not declared");
     // Pooled QSA keys rope at block starts off the slot's whole M-RoPE table, which only the engine's context carries.
-    if (f.mrope.ctx != null and engine_ctx == null) return Verdict.refuse(.unsupported, "qwen4_exp: M-RoPE needs the slot's position table");
+    if (f.mrope.ctx != null and engineCtx().* == null) return Verdict.refuse(.unsupported, "qwen4_exp: M-RoPE needs the slot's position table");
     if (f.rows == 0) return Verdict.refuse(.failed, "qwen4_exp: a forward of no rows");
     const slots = @max(f.positions.len, 1);
     if (f.mode != .batched_rows and slots != 1) return Verdict.refuse(.unsupported, "qwen4_exp: one slot's rows at a time outside batched rows");
@@ -287,7 +290,7 @@ fn runOne(m: *Model, f: *const abi.Forward, out: *abi.ForwardOut) !void {
     const r = try m.rec(if (f.slots.len > 0) f.slots.slice()[0] else 0);
     r.ssm = sc.ssm;
     // On the M-RoPE table the slot's position is the engine's own (`Forward.positions` carries its delta past it).
-    const ec = engine_ctx;
+    const ec = engineCtx().*;
     const on_table = if (ec) |e| e.mrope_pos != null else false;
     if (on_table) offset = ec.?.moe_seq_offset.*;
     // A verify leaves each recurrent row's state for the partial-accept rollback; the stream is the head's input.
