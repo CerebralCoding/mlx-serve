@@ -28,8 +28,8 @@ engines.mlx.kv.cache.KVCache.kv_cap_buf_grows
 engines.mlx.model.narrow_1d_cached
 engines.mlx.model.narrowed_1d
 engines.mlx.ssm.checkpoint.cadence_conv_eval_count
-engines.mlx.ssm.checkpoint.compact_conv_state_copy_count
-host.status.gpu_cores
+sdk.blocks.conv.depthwise.compact_conv_state_copy_count
+sdk.util.system.gpu_cores
 mlx.device.device_gen_cache
 mlx.device.nax_avail_cache
 mlx.ffi.cuda_cache
