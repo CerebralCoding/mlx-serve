@@ -41,8 +41,7 @@ fn open(p: *served.Pair, g: q3proof.Geo, comptime seed: u64) !void {
     try q3proof.writePack(&pk, g);
     const json = try asrJson(testing.allocator, g);
     defer testing.allocator.free(json);
-    try p.open(&qwen3_asr.table, &pk, json);
-    p.oracle = try served.oracle("qwen3_asr", std.fmt.comptimePrint("served-{x}", .{seed}));
+    try p.open(&qwen3_asr.table, &pk, json, try served.oracle("qwen3_asr", std.fmt.comptimePrint("served-{x}", .{seed})));
 }
 
 test "qwen3_asr served: the trunk's steps and lookup loop equal the legacy shell (4-bit, bf16 tied)" {
@@ -66,12 +65,13 @@ test "qwen3_asr served: audio rows spliced across a chunk boundary, then the ali
     const rows = try g0.astype(try g0.adopt(try served.fixtureRows(5, 128, 7)), .bfloat16);
     const tokens = [_]i32{ 3, 17, AUDIO, AUDIO, AUDIO, AUDIO, AUDIO, 42, 9, 11 };
     const xs = p.shells();
-    var lanes: [2]served.Lane = undefined;
-    for (&lanes, xs) |*l, x| {
+    var lane_buf: [2]served.Lane = undefined;
+    const lanes = lane_buf[0..xs.len];
+    for (lanes, xs) |*l, x| {
         try l.init(x);
         l.ctx.vision_embeddings = rows;
     }
-    defer for (&lanes) |*l| l.deinit();
+    defer for (lanes) |*l| l.deinit();
     const chunks = [_]struct { ids: []const i32, offset: usize = 0 }{
         .{ .ids = tokens[0..4] },
         .{ .ids = tokens[4..], .offset = 2 },
@@ -82,18 +82,18 @@ test "qwen3_asr served: audio rows spliced across a chunk boundary, then the ali
         defer g.deinit();
         const t = try fixture.tokens(&g, ch.ids);
         var outs: [2]Array = undefined;
-        for (&lanes, xs, &outs) |*l, x, *o| {
+        for (lanes, xs, outs[0..xs.len]) |*l, x, *o| {
             l.ctx.vision_splice_offset = ch.offset;
             o.* = try g.adopt(try x.forwardWith(&l.ctx, t));
         }
-        try p.oracle.check(outs[1], outs[0], false);
+        try p.check(outs[0..xs.len]);
     }
     // The aligner's pass: one prompt, hidden rows (no head), the head over picked rows (`forced_align.timestampClasses`).
     var g = ops.Graph.init(a, s);
     defer g.deinit();
     const t = try fixture.tokens(&g, &tokens);
     var outs: [2]Array = undefined;
-    for (xs, &outs) |x, *o| {
+    for (xs, outs[0..xs.len]) |x, *o| {
         try x.resetCache();
         var ctx = x.defaultCtx();
         ctx.vision_embeddings = rows;
@@ -102,6 +102,6 @@ test "qwen3_asr served: audio rows spliced across a chunk boundary, then the ali
         const picked = try g.sliceAxis(hidden, 1, 7, 10);
         o.* = try g.adopt(try x.lmHeadForDraft(picked));
     }
-    try p.oracle.check(outs[1], outs[0], false);
+    try p.check(outs[0..xs.len]);
     try p.oracle.done();
 }

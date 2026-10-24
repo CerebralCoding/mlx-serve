@@ -8,6 +8,9 @@ const mlx = @import("../../mlx/ffi.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
 const transformer_mod = @import("../../engines/mlx/transformer.zig");
+const plugin_config = @import("../../engines/mlx/plugin/config.zig");
+const plugin_driver = @import("../../engines/mlx/plugin/driver.zig");
+const qwen3_5 = @import("../qwen3_5/plugin.zig");
 const forward_ctx = @import("../../engines/mlx/forward_ctx.zig");
 const cache_mod = @import("../../engines/mlx/kv/cache.zig");
 const entry = @import("../../engines/mlx/ssm/entry.zig");
@@ -511,7 +514,6 @@ pub const Engine = struct {
     allocator: std.mem.Allocator,
     stream: S,
     config: model_mod.ModelConfig,
-    weights: model_mod.Weights,
     xfm: transformer_mod.Transformer,
     tok: tokenizer_mod.Tokenizer,
     head_weights: model_mod.Weights,
@@ -534,7 +536,8 @@ pub const Engine = struct {
         self.head_dim = kc.head_dim;
         self.logit_scale = kc.logit_scale;
 
-        self.config = try model_mod.parseConfig(io, allocator, dir);
+        // The legacy parse alone: kev's marker keeps the registry's claim off the pack, so the trunk is bound here.
+        self.config = try model_mod.parseConfigLegacy(io, allocator, dir);
         errdefer self.config.deinit(allocator);
         // The branch restore below snapshots exactly the Qwen3.5 caches (KV + GatedDeltaNet).
         if (!std.mem.startsWith(u8, self.config.model_type, "qwen3_5")) return error.KevUnsupportedBase;
@@ -554,16 +557,13 @@ pub const Engine = struct {
         self.k_w_t = try laya.transposeAxes(self.head_weights.get("k.weight").?, &.{ 1, 0 }, s);
         errdefer free(self.k_w_t);
 
-        self.weights = try model_mod.loadModelWeights(io, allocator, dir, &self.config, false);
-        errdefer self.weights.deinit();
-        model_mod.resolveWeightPrefix(&self.config, &self.weights);
-        self.xfm = try transformer_mod.Transformer.init(io, allocator, self.config, &self.weights);
+        self.config.plugin = try plugin_config.bindTable(io, allocator, dir, &qwen3_5.table) orelse return error.KevUnsupportedBase;
+        self.xfm = try plugin_driver.load(io, allocator, &self.config, dir, mlx.gpuStream());
         return self;
     }
 
     pub fn deinit(self: *Engine) void {
         self.xfm.deinit();
-        self.weights.deinit();
         free(self.q_w_t);
         free(self.k_w_t);
         self.head_weights.deinit();

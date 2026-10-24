@@ -8,7 +8,7 @@ const served = @import("served.zig");
 const sdk_plugin = @import("../../../sdk/plugin.zig");
 const registry = @import("../../../plugins/registry.zig");
 
-/// One pack's verdict: the plugin serves it (`why` null) or the legacy path does, and why.
+/// One pack's verdict: the plugin serves it (`why` null) or not, and why.
 pub const Row = struct { model_type: []const u8, why: ?[]const u8 };
 
 /// The verdict on the pack at `model_dir`; `model_type` and `why` are static or arena-owned.
@@ -20,7 +20,7 @@ pub fn auditPack(io: std.Io, arena: std.mem.Allocator, model_dir: []const u8, co
             b.destroy(std.heap.page_allocator);
             return .{ .model_type = model_type, .why = null };
         },
-        .legacy => |why| return .{ .model_type = model_type, .why = why },
+        .declined => |why| return .{ .model_type = model_type, .why = why },
     }
 }
 

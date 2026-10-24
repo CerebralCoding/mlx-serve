@@ -8,7 +8,6 @@ const abi = @import("../../abi/plugin.zig");
 const quant_abi = @import("../../abi/quant.zig");
 const sdk = @import("../../sdk/root.zig");
 const mlx = @import("../../mlx/ffi.zig");
-const computeLlama3Freqs = @import("../../sdk/blocks/rope/rope.zig").computeLlama3Freqs;
 const bases = @import("../../sdk/bases/bases.zig");
 const run_mod = @import("../../sdk/bases/run.zig");
 const compiled = @import("../../sdk/bases/blocks/compiled.zig");
@@ -16,6 +15,8 @@ const moe_affine4 = @import("../../sdk/blocks/moe/moe_affine4.zig");
 const QuantParams = @import("../../sdk/quant/params.zig").QuantParams;
 const QuantMode = @import("../../sdk/quant/params.zig").QuantMode;
 const ld = @import("load.zig");
+const rope_scaling = @import("../../sdk/config/rope_scaling.zig");
+const scaled = @import("../../sdk/blocks/rope/scaled.zig");
 pub const config = @import("config.zig");
 
 pub const plugin = config.plugin;
@@ -113,16 +114,11 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     };
 }
 
-fn llama3Table(m: *Loaded, c: *const config.Config) !Array {
-    const l3 = c.llama3 orelse return .{};
-    var f64s: [256]f64 = undefined;
-    var f32s: [256]f32 = undefined;
-    const half = c.head_dim / 2;
-    computeLlama3Freqs(f64s[0..half], c.head_dim, c.rope_theta, l3);
-    for (f64s[0..half], f32s[0..half]) |v, *o| o.* = @floatCast(v);
-    const freqs = mlx.mlx_array_new_data(&f32s, &[_]c_int{@intCast(half)}, 1, .float32);
-    try m.owned.own(freqs);
-    return freqs;
+/// The trunk's scaled spectrum (null = the base's), owned by `m`.
+fn ropeFreqs(m: *Loaded, c: *const config.Config) !Array {
+    const f = (try scaled.freqs(c.rope, c.head_dim, c.rope_theta)) orelse return .{};
+    try m.owned.own(f);
+    return f;
 }
 
 fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
@@ -138,6 +134,7 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
     m.* = .{ .caps = ctx.parsed.caps, .body = undefined };
     errdefer m.owned.deinit();
     const shared = bases.Shared.init(c.rms_norm_eps, c.rms_norm_eps);
+    scaled.logScaling(plugin.name, c.rope);
     if (c.moe) {
         m.body = .{ .moe = .{ .base = .{ .weights = undefined, .shared = shared, .a = gpa, .s = s, .placeholders = ctx.parsed.placeholder_ids }, .layers = &.{}, .routes = &.{} } };
         errdefer m.release();
@@ -160,7 +157,7 @@ fn norm(m: *Loaded, r: *ld.Reader, comptime leaf: []const u8, i: usize) !Array {
 fn loadDense(m: *Loaded, r: *ld.Reader, c: *const config.Config, s: mlx.mlx_stream) !void {
     const d = &m.body.dense;
     d.layers = try gpa.alloc(Dense.Layer, c.num_hidden_layers);
-    const freqs = try llama3Table(m, c);
+    const freqs = try ropeFreqs(m, c);
     const hidden = c.hidden_size;
     const q_rows = c.num_attention_heads * c.head_dim;
     var nb: [256]u8 = undefined;
@@ -193,8 +190,10 @@ fn loadDense(m: *Loaded, r: *ld.Reader, c: *const config.Config, s: mlx.mlx_stre
                     .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(c.query_pre_attn_scalar))),
                     .rope_dims = @intCast(c.head_dim),
                     .rope_base = c.rope_theta,
-                    .rope_scale = 1.0,
+                    .rope_scale = rope_scaling.positionScale(c.rope),
                     .freqs = freqs,
+                    .mscale = @floatCast(rope_scaling.mscale(c.rope)),
+                    .ntk = rope_scaling.ntk(c.rope, c.max_position_embeddings),
                 },
             },
             .mlp = .{ .gate = gate, .up = up, .down = down, .gu = gu, .rows_joined = qkv.built() },
@@ -252,6 +251,10 @@ fn loadMoe(m: *Loaded, r: *ld.Reader, c: *const config.Config, s: mlx.mlx_stream
     const hidden = c.hidden_size;
     const q_rows = c.num_attention_heads * c.head_dim;
     const n: u32 = c.num_hidden_layers;
+    const freqs = try ropeFreqs(m, c);
+    const mscale: f32 = @floatCast(rope_scaling.mscale(c.rope));
+    const mscale_table: Array = if (mscale == 1.0) .{} else try scaled.mscaleTable(mscale, c.head_dim, c.head_dim, .bfloat16, s);
+    if (mscale_table.ctx != null) try m.owned.own(mscale_table);
     var nb: [256]u8 = undefined;
     for (e.layers, 0..) |*L, i| {
         const li: u32 = @intCast(i);
@@ -282,6 +285,11 @@ fn loadMoe(m: *Loaded, r: *ld.Reader, c: *const config.Config, s: mlx.mlx_stream
                     .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(c.query_pre_attn_scalar))),
                     .rope_dims = @intCast(c.head_dim),
                     .rope_base = c.rope_theta,
+                    .yarn_freqs = freqs,
+                    .yarn_mscale = mscale_table,
+                    .yarn_factor = mscale,
+                    .rope_scale = rope_scaling.positionScale(c.rope),
+                    .ntk = rope_scaling.ntk(c.rope, c.max_position_embeddings),
                     .output_gate = false,
                 },
                 .angles = &e.angles,

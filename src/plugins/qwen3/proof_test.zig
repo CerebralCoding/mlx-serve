@@ -17,8 +17,6 @@ const CaptureLayers = @import("../../engines/mlx/forward_ctx.zig").CaptureLayers
 const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
 const twin = @import("twin_test.zig");
 const dflash_mod = @import("../../engines/mlx/spec/dflash/dflash.zig");
-const Generator = @import("../../engines/mlx/generate/generator.zig").Generator;
-const Tokenizer = @import("../../sdk/tokenizer/tokenizer.zig").Tokenizer;
 const pooling = @import("../../engines/mlx/embed/pooling.zig");
 const qwen3 = @import("plugin.zig");
 const served_test = @import("../qwen3_5/served_test.zig");
@@ -93,16 +91,18 @@ pub fn writePack(p: *fixture.Pack, g: Geo) !void {
 
 // ── dense, served through the engine's plugin path ──
 
-/// The same pack served both ways: the legacy `Transformer` and the plugin's shell.
+/// The pack served by its plugin, against the legacy `Transformer` while its tape records.
 const Both = struct {
-    lg: *fixture.Legacy,
+    lg: ?*fixture.Legacy,
+    tmp: testing.TmpDir,
     dir: []u8,
     cfg: model.ModelConfig,
     xfm: Transformer,
     layers: u32,
     oracle: served_test.Oracle,
+    sides: [2]*Transformer = undefined,
 
-    fn open(g: Geo, comptime seed: u64) !Both {
+    fn open(b: *Both, g: Geo, comptime seed: u64) !void {
         const a = testing.allocator;
         const io = std.Io.Threaded.global_single_threaded.io();
         var p = fixture.Pack.init(seed);
@@ -110,19 +110,25 @@ const Both = struct {
         try writePack(&p, g);
         const json = try configJson(a, g);
         defer a.free(json);
-        const lg = try p.load(json);
-        errdefer lg.deinit();
-        // The engine's load compiles the router where a GPU runs it; the plugin does too.
-        if (g.experts > 0) lg.xfm.compileMoeRouting();
-        try lg.tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = json });
+        b.* = .{ .lg = null, .tmp = testing.tmpDir(.{}), .dir = &.{}, .cfg = undefined, .xfm = undefined, .layers = g.layers, .oracle = try served_test.oracle("qwen3", std.fmt.comptimePrint("both-{x}", .{seed})) };
+        errdefer b.tmp.cleanup();
+        if (b.oracle.tape.recording()) {
+            const lg = try p.load(json);
+            // The engine's load compiles the router where a GPU runs it; the plugin does too.
+            if (g.experts > 0) lg.xfm.compileMoeRouting();
+            b.lg = lg;
+        }
+        errdefer if (b.lg) |lg| lg.deinit();
+        const dir_h = if (b.lg) |lg| lg.tmp.dir else b.tmp.dir;
+        try dir_h.writeFile(io, .{ .sub_path = "config.json", .data = json });
         var path_buf: [512]u8 = undefined;
-        const dir = try a.dupe(u8, path_buf[0..try lg.tmp.dir.realPath(io, &path_buf)]);
-        errdefer a.free(dir);
-        var cfg = try model.parseConfig(io, a, dir);
-        errdefer cfg.deinit(a);
-        if (cfg.plugin == null) return error.TestExpectedServedPack;
-        const xfm = try driver.load(io, a, &cfg, dir, fixture.stream());
-        return .{ .lg = lg, .dir = dir, .cfg = cfg, .xfm = xfm, .layers = g.layers, .oracle = try served_test.oracle("qwen3", std.fmt.comptimePrint("both-{x}", .{seed})) };
+        b.dir = try a.dupe(u8, path_buf[0..try dir_h.realPath(io, &path_buf)]);
+        errdefer a.free(b.dir);
+        if (b.lg == null) try p.save(b.dir);
+        b.cfg = try model.parseConfig(io, a, b.dir);
+        errdefer b.cfg.deinit(a);
+        if (b.cfg.plugin == null) return error.TestExpectedServedPack;
+        b.xfm = try driver.load(io, a, &b.cfg, b.dir, fixture.stream());
     }
 
     fn close(b: *Both) void {
@@ -130,7 +136,19 @@ const Both = struct {
         b.xfm.deinit();
         b.cfg.deinit(testing.allocator);
         testing.allocator.free(b.dir);
-        b.lg.deinit();
+        if (b.lg) |lg| lg.deinit();
+        b.tmp.cleanup();
+    }
+
+    /// The shells to run: the legacy one first while recording, the served one last.
+    fn shells(b: *Both) []const *Transformer {
+        b.sides = .{ if (b.lg) |lg| &lg.xfm else &b.xfm, &b.xfm };
+        return if (b.lg != null) &b.sides else b.sides[1..];
+    }
+
+    /// One value per shell: the served one's against the legacy's or the tape.
+    pub fn check(b: *Both, vals: []const Array) !void {
+        try b.oracle.check(vals[vals.len - 1], if (vals.len == 2) vals[0] else null, false);
     }
 };
 
@@ -159,18 +177,16 @@ const steps = [_]struct { ids: []const i32, verify: bool = false }{
 
 /// Prefill, decode and verify steps: logits, the last hidden row and a captured layer bit-equal.
 fn expectSteps(b: *Both) !void {
-    var ls: Slot = undefined;
-    try ls.init(b.layers);
-    defer ls.deinit();
-    var ps: Slot = undefined;
-    try ps.init(b.layers);
-    defer ps.deinit();
+    const xs = b.shells();
+    var slots: [2]Slot = undefined;
+    for (slots[0..xs.len]) |*s| try s.init(b.layers);
+    defer for (slots[0..xs.len]) |*s| s.deinit();
     for (steps) |st| {
-        var g = ops.Graph.init(testing.allocator, b.lg.xfm.s);
+        var g = ops.Graph.init(testing.allocator, fixture.stream());
         defer g.deinit();
         const ids = try fixture.tokens(&g, st.ids);
         var outs: [2][3]Array = undefined;
-        for ([_]*Transformer{ &b.lg.xfm, &b.xfm }, [_]*Slot{ &ls, &ps }, 0..) |x, s, k| {
+        for (xs, slots[0..xs.len], 0..) |x, *s, k| {
             var hidden = mlx.mlx_array_new();
             var caps: [2]Array = .{ mlx.mlx_array_new(), mlx.mlx_array_new() };
             var cl: CaptureLayers = .{ .ids = &.{ 0, 1 }, .out = &caps };
@@ -183,18 +199,19 @@ fn expectSteps(b: *Both) !void {
             _ = try g.adopt(caps[1]);
             outs[k] = .{ logits, hidden, caps[1] };
         }
-        for (0..3) |i| try b.oracle.check(outs[1][i], outs[0][i], false);
+        try served_test.checkRows(b, &outs, xs.len);
     }
 }
 
 /// Greedy decode through the pipelined step (`lazyForward`), tokens equal.
 fn expectGreedy(b: *Both) !void {
     var tokens: [2][8]u32 = undefined;
-    for ([_]*Transformer{ &b.lg.xfm, &b.xfm }, 0..) |x, k| {
+    const xs = b.shells();
+    for (xs, 0..) |x, k| {
         var s: Slot = undefined;
         try s.init(b.layers);
         defer s.deinit();
-        var g = ops.Graph.init(testing.allocator, b.lg.xfm.s);
+        var g = ops.Graph.init(testing.allocator, fixture.stream());
         defer g.deinit();
         var logits = try g.adopt(try x.forwardWith(&s.ctx, try fixture.tokens(&g, &.{ 7, 8, 9, 10 })));
         for (&tokens[k]) |*t| {
@@ -207,26 +224,26 @@ fn expectGreedy(b: *Both) !void {
             t.* = mlx.mlx_array_data_uint32(host).?[0];
         }
     }
-    try b.oracle.stream(&tokens[1], &tokens[0]);
+    try b.oracle.stream(&tokens[xs.len - 1], if (xs.len == 2) &tokens[0] else null);
 }
 
 /// Two slots prefilled apart, then decoded together: each slot's logits bit-equal to the legacy batched tick's.
 fn expectBatched(b: *Both) !void {
     const a = testing.allocator;
+    const xs = b.shells();
     var slots: [2][2]Slot = undefined;
-    for (&slots) |*pair| for (pair) |*s| try s.init(b.layers);
-    defer for (&slots) |*pair| for (pair) |*s| s.deinit();
+    for (slots[0..xs.len]) |*pair| for (pair) |*s| try s.init(b.layers);
+    defer for (slots[0..xs.len]) |*pair| for (pair) |*s| s.deinit();
     const prompts = [_][]const i32{ &.{ 4, 8, 15, 16, 23 }, &.{ 42, 101, 7 } };
-    const xs = [_]*Transformer{ &b.lg.xfm, &b.xfm };
     var positions: [2]u32 = undefined;
     for (prompts, 0..) |pr, i| {
-        var g = ops.Graph.init(a, b.lg.xfm.s);
+        var g = ops.Graph.init(a, fixture.stream());
         defer g.deinit();
         for (xs, 0..) |x, k| _ = try g.adopt(try x.forwardWith(&slots[k][i].ctx, try fixture.tokens(&g, pr)));
         positions[i] = @intCast(pr.len);
     }
     for ([_][2]u32{ .{ 77, 3 }, .{ 190, 64 } }) |next| {
-        var g = ops.Graph.init(a, b.lg.xfm.s);
+        var g = ops.Graph.init(a, fixture.stream());
         defer g.deinit();
         var rows: [2][]Array = undefined;
         for (xs, 0..) |x, k| {
@@ -234,16 +251,20 @@ fn expectBatched(b: *Both) !void {
             rows[k] = try x.forwardBatchedDecode(&next, &ctxs, &positions);
             for (rows[k]) |r| _ = try g.adopt(r);
         }
-        defer for (rows) |r| a.free(r);
-        for (rows[0], rows[1]) |want, got| try b.oracle.check(got, want, false);
+        defer for (rows[0..xs.len]) |r| a.free(r);
+        for (0..2) |i| {
+            const col = [2]Array{ rows[0][i], rows[xs.len - 1][i] };
+            try b.check(col[2 - xs.len ..]);
+        }
         for (&positions) |*p| p.* += 1;
     }
 }
 
 test "qwen3 plugin: a 4-bit pack served by its plugin is bit-equal to the legacy forward (steps, greedy, batched)" {
-    var b = try Both.open(.{ .quantized = true }, 0x9e31);
+    var b: Both = undefined;
+    try b.open(.{ .quantized = true }, 0x9e31);
     defer b.close();
-    try testing.expect(b.xfm.plugin != null and b.lg.xfm.plugin == null);
+    try testing.expect(b.xfm.plugin != null);
     try expectSteps(&b);
     try expectGreedy(&b);
     try expectBatched(&b);
@@ -251,7 +272,8 @@ test "qwen3 plugin: a 4-bit pack served by its plugin is bit-equal to the legacy
 }
 
 test "qwen3 plugin: a bf16 pack at head width 256 (the fused decode norm+RoPE) with a tied head is bit-equal" {
-    var b = try Both.open(.{ .head_dim = 256, .tied = true }, 0x9e32);
+    var b: Both = undefined;
+    try b.open(.{ .head_dim = 256, .tied = true }, 0x9e32);
     defer b.close();
     try expectSteps(&b);
     try expectGreedy(&b);
@@ -317,7 +339,7 @@ test "qwen3 plugin: the served ModelConfig equals the legacy parse on every gene
     }
 }
 
-test "qwen3 plugin: a dense pack named as an embedding model is served, last-token pooled by its folder name; MoE stays legacy" {
+test "qwen3 plugin: a dense pack named as an embedding model is served, last-token pooled by its folder name; MoE is refused by name" {
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     for ([_]Geo{ .{ .quantized = true }, .{ .quantized = true, .experts = 4 } }) |geo| {
@@ -331,29 +353,33 @@ test "qwen3 plugin: a dense pack named as an embedding model is served, last-tok
         const root = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
         const dir = try std.fmt.allocPrint(a, "{s}/Qwen3-Embedding-0.6B-4bit", .{root});
         defer a.free(dir);
+        if (geo.experts > 0) {
+            try testing.expectError(error.PluginDeclinedNoLegacy, model.parseConfig(io, a, dir));
+            continue;
+        }
         var cfg = try model.parseConfig(io, a, dir);
         defer cfg.deinit(a);
         try testing.expectEqual(model.PoolingMode.last_token, cfg.pooling_mode.?);
-        try testing.expectEqual(geo.experts == 0, cfg.plugin != null);
+        try testing.expect(cfg.plugin != null);
     }
 }
 
 /// `seqs`' pooled rows from both shells through the engine's embedding batch.
 fn expectEmbeddings(b: *Both, seqs: []const []const u32) !void {
     const a = testing.allocator;
+    const xs = b.shells();
     var rows: [2][][]f32 = undefined;
-    for (&rows, [_]*Transformer{ &b.lg.xfm, &b.xfm }) |*r, x| r.* = try pooling.computeEmbeddingsBatchWith(a, x, seqs, null);
-    defer for (rows) |r| {
+    for (rows[0..xs.len], xs) |*r, x| r.* = try pooling.computeEmbeddingsBatchWith(a, x, seqs, null);
+    defer for (rows[0..xs.len]) |r| {
         for (r) |row| a.free(row);
         a.free(r);
     };
-    for (rows[0], rows[1]) |want, got| {
-        const sh = [_]c_int{@intCast(want.len)};
-        const w = mlx.mlx_array_new_data(want.ptr, &sh, 1, .float32);
-        defer _ = mlx.mlx_array_free(w);
-        const g = mlx.mlx_array_new_data(got.ptr, &sh, 1, .float32);
-        defer _ = mlx.mlx_array_free(g);
-        try b.oracle.check(g, w, false);
+    var g = ops.Graph.init(a, fixture.stream());
+    defer g.deinit();
+    for (0..seqs.len) |i| {
+        var col: [2]Array = undefined;
+        for (rows[0..xs.len], col[0..xs.len]) |r, *c| c.* = try g.fromSlice(f32, r[i], &.{@intCast(r[i].len)});
+        try b.check(col[0..xs.len]);
     }
 }
 
@@ -365,7 +391,8 @@ const embed_batches = [_][]const []const u32{
 
 test "qwen3 plugin: a Qwen3-Embedding pack's pooled rows equal the legacy dense forward's (one sequence, padded batches)" {
     inline for (.{ .{ Geo{ .quantized = true, .last_token_pooling = true }, 0x3e01 }, .{ Geo{ .head_dim = 256, .tied = true, .last_token_pooling = true }, 0x3e02 } }) |case| {
-        var b = try Both.open(case[0], case[1]);
+        var b: Both = undefined;
+        try b.open(case[0], case[1]);
         defer b.close();
         try testing.expect(b.xfm.plugin != null and b.cfg.pooling_mode.? == .last_token);
         for (embed_batches) |seqs| try expectEmbeddings(&b, seqs);
@@ -387,19 +414,21 @@ const moe_steps = [_]twin.Step{
     .{ .mode = .decode, .ids = &.{17} },
 };
 
-fn moeCase(g: Geo, seed: u64) !void {
+fn moeCase(g: Geo, comptime seed: u64) !void {
     var p = fixture.Pack.init(seed);
     defer p.deinit();
     try writePack(&p, g);
     const T = twin.Twin(qwen3);
     const json = try configJson(testing.allocator, g);
     defer testing.allocator.free(json);
-    const t = try T.open(&p, json, &.{});
+    const name = std.fmt.comptimePrint("fixtures/twin-{x}.tape", .{seed});
+    const t = try T.open(&p, json, &.{}, "src/plugins/qwen3/" ++ name, @embedFile(name));
     defer t.close();
-    t.lg.xfm.compileMoeRouting();
+    if (t.lg) |lg| lg.xfm.compileMoeRouting();
     const l = try t.lane();
     defer l.deinit();
     for (moe_steps) |st| try t.step(l, st);
+    try t.expectDone();
 }
 
 test "qwen3 plugin: qwen3_moe 4-bit through the table is bit-equal to the legacy layered forward" {
@@ -412,32 +441,6 @@ test "qwen3 plugin: qwen3_moe bf16 at head width 256 (dense experts, decode side
 
 // ── a DFlash drafter on the served dense trunk ──
 
-/// A greedy DFlash run on `xfm` with the tiny assistant at `asst`: every emitted token and each round's accepted count.
-pub fn dflashRun(xfm: *Transformer, asst: []const u8, tokens: []u32, accepted: *std.ArrayList(u32)) !void {
-    const a = testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var dm = try dflash_mod.loadDflash(io, a, fixture.stream(), asst);
-    defer dm.deinit();
-    try dm.bind(xfm);
-    var tok_dummy: Tokenizer = undefined; // never read by the Generator
-    const prompt = [_]u32{ 3, 7, 1, 12, 30, 5, 9, 22, 4, 17, 2, 28 };
-    var gen = try Generator.initWithOptions(io, a, xfm, &tok_dummy, &prompt, @intCast(tokens.len), .{ .temperature = 0.0 }, &.{}, .{
-        .dflash_enabled = true,
-        .dflash = &dm,
-        .dflash_min_accepted_per_round = 0,
-    });
-    defer gen.deinit(a);
-    var n: usize = 0;
-    while (try gen.nextDflash(a)) |res| {
-        defer a.free(res.tokens);
-        @memcpy(tokens[n..][0..res.tokens.len], res.tokens);
-        n += res.tokens.len;
-        try accepted.append(a, res.accepted_tokens);
-    }
-    try testing.expectEqual(tokens.len, n);
-    try testing.expect(gen.dflash_attempted > 0);
-}
-
 test "qwen3 plugin: a DFlash drafter on a served trunk (dense and MoE) reads its embedding and head and emits the legacy stream" {
     // The tiny assistant's geometry (`dflash.TinyFix`): hidden 64, targets layers 0 and 2, mask id 127.
     try expectDflash(.{ .hidden = 64, .head_dim = 16, .inter = 128, .vocab = 128, .layers = 4, .tied = true }, 0xdf1a6);
@@ -447,16 +450,24 @@ test "qwen3 plugin: a DFlash drafter on a served trunk (dense and MoE) reads its
 fn expectDflash(geo: Geo, comptime seed: u64) !void {
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    var b = try Both.open(geo, seed);
+    var b: Both = undefined;
+    try b.open(geo, seed);
     defer b.close();
     try testing.expect(b.xfm.supportsLayerCapture());
+    const xs = b.shells();
     {
-        var g = ops.Graph.init(a, b.lg.xfm.s);
+        var g = ops.Graph.init(a, fixture.stream());
         defer g.deinit();
         const ids = try fixture.tokens(&g, &.{ 4, 90, 127, 0, 33 });
-        const hidden = try g.reshape(try g.adopt(try b.lg.xfm.rawEmbedding(ids)), &.{ 1, 5, 64 });
-        try b.oracle.check(try g.adopt(try b.xfm.rawEmbedding(ids)), try g.adopt(try b.lg.xfm.rawEmbedding(ids)), false);
-        try b.oracle.check(try g.adopt(try b.xfm.lmHeadForDraft(hidden)), try g.adopt(try b.lg.xfm.lmHeadForDraft(hidden)), false);
+        const hidden = try g.reshape(try g.adopt(try xs[0].rawEmbedding(ids)), &.{ 1, 5, 64 });
+        var emb: [2]Array = undefined;
+        var head: [2]Array = undefined;
+        for (xs, emb[0..xs.len], head[0..xs.len]) |x, *e, *h| {
+            e.* = try g.adopt(try x.rawEmbedding(ids));
+            h.* = try g.adopt(try x.lmHeadForDraft(hidden));
+        }
+        try b.check(emb[0..xs.len]);
+        try b.check(head[0..xs.len]);
     }
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -466,10 +477,10 @@ fn expectDflash(geo: Geo, comptime seed: u64) !void {
     var tokens: [2][16]u32 = undefined;
     var accepted: [2]std.ArrayList(u32) = .{ .empty, .empty };
     defer for (&accepted) |*l| l.deinit(a);
-    try dflashRun(&b.lg.xfm, asst, &tokens[0], &accepted[0]);
-    try dflashRun(&b.xfm, asst, &tokens[1], &accepted[1]);
-    try b.oracle.stream(&tokens[1], &tokens[0]);
-    try b.oracle.stream(accepted[1].items, accepted[0].items);
+    for (xs, 0..) |x, k| try served_test.dflashRun(x, asst, &tokens[k], &accepted[k]);
+    const last = xs.len - 1;
+    try b.oracle.stream(&tokens[last], if (last == 1) &tokens[0] else null);
+    try b.oracle.stream(accepted[last].items, if (last == 1) accepted[0].items else null);
     try b.oracle.done();
 }
 
@@ -482,8 +493,7 @@ test "qwen3 plugin: a qwen3_moe pack through the driver (legacy ModelConfig) equ
     const json = try configJson(testing.allocator, g);
     defer testing.allocator.free(json);
     var p: served.Pair = undefined;
-    try p.open(&qwen3.table, &pk, json);
-    p.oracle = try served.oracle("qwen3", "served-3e03");
+    try p.open(&qwen3.table, &pk, json, try served.oracle("qwen3", "served-3e03"));
     defer p.close();
     try served.expectSolo(&p);
 }

@@ -21,8 +21,8 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
 ## Facts the table declares
 - `owns_decode_state`, `prefix_cache = false` (the module resumes its own state), serial + single-flight
   (`batching: false`, `max_concurrent: 1`), no spec rollback (DSpark rewinds inside the module), DSpark stages from the config (`native_stages`);
-  `spec.trunk_weight` lends the loaded embedding and head; `cluster_plan` (a Thunderbolt pair re-reads the
-  driver's plan, `distributed.planFor`, idempotent: untested without two Macs).
+  `spec.trunk_weight` lends the loaded embedding and head; a Thunderbolt pair's load re-reads the engine's plan
+  (`distributed.planFor`, idempotent: untested without two Macs).
 - Thinking default ON; effort vocabulary `dsv41`; DSML tools on OUR byte-pinned template.
 - Metal only: a CPU host stream loads on this thread's GPU stream; no GPU = refused by name.
 

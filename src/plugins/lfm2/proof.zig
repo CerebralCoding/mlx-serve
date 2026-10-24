@@ -402,6 +402,6 @@ fn legacyGguf(g: *const Gguf, io: std.Io) !*fixture.Legacy {
     lg.weights = try model.loadModelWeights(io, a, dir, &lg.config, false);
     errdefer lg.weights.deinit();
     model.resolveWeightPrefix(&lg.config, &lg.weights);
-    lg.xfm = try @import("../../engines/mlx/transformer.zig").Transformer.init(io, a, lg.config, &lg.weights);
+    lg.xfm = try @import("../../engines/mlx/transformer.zig").Transformer.init(io, a, lg.config);
     return lg;
 }

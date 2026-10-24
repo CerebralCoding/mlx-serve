@@ -11,7 +11,6 @@ const transformer_mod = @import("../../engines/mlx/transformer.zig");
 const plugin_config = @import("../../engines/mlx/plugin/config.zig");
 const plugin_driver = @import("../../engines/mlx/plugin/driver.zig");
 const lfm2 = @import("../lfm2/plugin.zig");
-const FsPackDir = @import("../../host/registry/pack_dir.zig").FsPackDir;
 const testing = std.testing;
 
 const A = mlx.mlx_array;
@@ -492,25 +491,6 @@ fn argmax(p: []const f64) usize {
     return best;
 }
 
-/// The LFM2 trunk through the lfm2 plugin's table, as the engine serves an LFM2 pack; the D1 marker keeps the
-/// registry's claim off the pack, so the binding is made here.
-fn bindTrunk(io: std.Io, a: std.mem.Allocator, dir: []const u8) !*plugin_config.Binding {
-    var fs = try FsPackDir.open(io, dir);
-    defer fs.close();
-    const pd = fs.packDir();
-    const buf = try a.alloc(u8, 1 << 20);
-    defer a.free(buf);
-    var why: @import("../../abi/plugin.zig").Verdict = .{};
-    const cfg = pd.readFile("config.json", buf, &why) orelse return error.D1ConfigUnreadable;
-    const b = try a.create(plugin_config.Binding);
-    b.* = .{ .table = &lfm2.table };
-    if (!lfm2.table.parse(&pd, .of(cfg), .{}, null, false, &b.parsed).isOk()) {
-        a.destroy(b);
-        return error.D1UnsupportedBase;
-    }
-    return b;
-}
-
 pub const Engine = struct {
     allocator: std.mem.Allocator,
     stream: S,
@@ -531,7 +511,7 @@ pub const Engine = struct {
         if (!std.mem.startsWith(u8, self.config.model_type, "lfm2")) return error.D1UnsupportedBase;
         self.tok = try tokenizer_mod.loadTokenizer(io, allocator, dir);
         errdefer self.tok.deinit();
-        self.config.plugin = try bindTrunk(io, allocator, dir);
+        self.config.plugin = try plugin_config.bindTable(io, allocator, dir, &lfm2.table) orelse return error.D1UnsupportedBase;
         // The shell owns its stream: the thread's default GPU stream, as the engine's own load takes.
         self.xfm = try plugin_driver.load(io, allocator, &self.config, dir, mlx.gpuStream());
         return self;

@@ -85,6 +85,13 @@ pub const Both = struct {
         return openAs(table, pack, config_json, legacy_config, .{ .tape = tape });
     }
 
+    /// The plugin against `recorded`, the tape at `rel` (a path under the repo root); an empty tape is recorded from
+    /// the legacy forward (`tape.records`).
+    pub fn proof(table: *const abi.ModelTable, pack: *fixture.Pack, config_json: []const u8, legacy_config: bool, comptime rel: []const u8, recorded: []const u8) !Both {
+        if (tape_mod.records(recorded)) return openAs(table, pack, config_json, legacy_config, .{ .legacy = rel });
+        return replay(table, pack, config_json, legacy_config, recorded);
+    }
+
     /// `oracle.legacy` names the tape (a path under the repo root) the legacy values are recorded to.
     pub fn openAs(table: *const abi.ModelTable, pack: *fixture.Pack, config_json: []const u8, legacy_config: bool, oracle: Oracle) !Both {
         const a = testing.allocator;

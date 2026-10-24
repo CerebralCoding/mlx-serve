@@ -1,7 +1,7 @@
 //! Parity proof for hy_v3's MTP head behind `SpecHooks.head`: a `model-mtp.safetensors` head (all 4-bit; or 8-bit
 //! group-32 projections over 3-bit experts, Hunyuan's own mix; or bf16) beside a 4-bit trunk, run by the plugin and by
-//! the legacy `MtpModel` (`appendKvOnly`, `forwardWithMrope`) on caches of their own, the head output bit-equal at
-//! every step; then served through the driver against the legacy sidecar arm.
+//! the legacy `MtpModel` (`appendKvOnly`, `forwardWithMrope`, its values recorded to `fixtures/`) on caches of their
+//! own, the head output bit-equal at every step; then served through the driver against the legacy sidecar arm.
 
 const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
@@ -12,7 +12,6 @@ const cache_ops = @import("../../engines/mlx/kv/cache_ops.zig");
 const KVCache = @import("../../engines/mlx/kv/cache.zig").KVCache;
 const FsPackDir = @import("../../host/registry/pack_dir.zig").FsPackDir;
 const fixture = @import("../../sdk/bases/proof/fixture.zig");
-const proof = @import("../lfm2/proof.zig");
 const both = @import("../../engines/mlx/plugin/both.zig");
 const plugin_head = @import("../../engines/mlx/plugin/head.zig");
 const mtpRun = @import("../../engines/mlx/plugin/proof_mtp.zig").mtpRun;
@@ -74,7 +73,22 @@ fn rows(g: *ops.Graph, n: c_int, seed: u64) !mlx.mlx_array {
 
 const Step = struct { ids: []const i32, logits: abi.Logits, want_hidden: bool };
 
-fn headCase(q: Quant, seed: u64) !void {
+/// The trunk served on the legacy config, the legacy values recorded to `fixtures/head-<seed>.tape`.
+fn open(p: *fixture.Pack, comptime seed: u64) !both.Both {
+    const name = std.fmt.comptimePrint("fixtures/head-{x}.tape", .{seed});
+    return both.Both.proof(&hy3.table, p, trunk.configJson(true), true, "src/plugins/hy_v3/" ++ name, @embedFile(name));
+}
+
+/// The legacy head bound to the legacy trunk (recording only).
+fn legacyHead(b: *both.Both) !?mtp_mod.MtpModel {
+    const lg = b.lg orelse return null;
+    var lm = try mtp_mod.loadMtp(std.Io.Threaded.global_single_threaded.io(), testing.allocator, lg.xfm.s, b.dir);
+    errdefer lm.deinit();
+    try lm.bind(&lg.xfm);
+    return lm;
+}
+
+fn headCase(q: Quant, comptime seed: u64) !void {
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var p = fixture.Pack.init(seed);
@@ -83,21 +97,19 @@ fn headCase(q: Quant, seed: u64) !void {
     var hp = fixture.Pack.init(seed + 1);
     defer hp.deinit();
     try writeHead(&hp, q);
-    var t = try proof.Twin(hy3).open(&p, trunk.configJson(true), &.{});
-    defer t.close();
-    var path_buf: [512]u8 = undefined;
-    const dir = path_buf[0..try t.lg.tmp.dir.realPath(io, &path_buf)];
-    try saveHead(&hp, dir);
-    const s = t.lg.xfm.s;
-    var lm = try mtp_mod.loadMtp(io, a, s, dir);
-    defer lm.deinit();
-    try testing.expectEqual(mtp_mod.Layout.hy3, lm.layout);
-    try lm.bind(&t.lg.xfm);
-    var fs = try FsPackDir.open(io, dir);
+    var b = try open(&p, seed);
+    defer b.close();
+    try saveHead(&hp, b.dir);
+    const s = b.xfm.s;
+    var legacy = try legacyHead(&b);
+    defer if (legacy) |*lm| lm.deinit();
+    if (legacy) |lm| try testing.expectEqual(mtp_mod.Layout.hy3, lm.layout);
+    var fs = try FsPackDir.open(io, b.dir);
     defer fs.close();
     const pd = fs.packDir();
     const hooks = hy3.table.spec.?.head.?;
-    try testing.expect(hooks.load(t.m, &.{ .model_dir = .of(dir), .dir = &pd, .parsed = &t.parsed, .stream = .{ .ctx = s.ctx } }).isOk());
+    const m = b.xfm.plugin.?.model;
+    try testing.expect(hooks.load(m, &.{ .model_dir = .of(b.dir), .dir = &pd, .parsed = &b.cfg.plugin.?.parsed, .stream = .{ .ctx = s.ctx } }).isOk());
 
     var lcache = try KVCache.init(a, 1);
     defer lcache.deinit();
@@ -120,7 +132,7 @@ fn headCase(q: Quant, seed: u64) !void {
         const ids = try g.fromSlice(i32, st.ids, &.{n});
         const hid = try rows(&g, n, seed + 10 + i);
         var out: abi.ForwardOut = .{};
-        const v = hooks.forward(t.m, &.{
+        const v = hooks.forward(m, &.{
             .mode = if (n == 1) .decode else .prefill,
             .logits = st.logits,
             .want_hidden = st.want_hidden,
@@ -137,23 +149,27 @@ fn headCase(q: Quant, seed: u64) !void {
             return error.PluginForward;
         }
         if (st.logits == .none and !st.want_hidden) {
-            try mtp_mod.appendKvOnly(&lm, &t.lg.xfm, &lcache, ids, hid, pos, null);
+            if (legacy) |*lm| try mtp_mod.appendKvOnly(lm, &b.lg.?.xfm, &lcache, ids, hid, pos, null);
             try testing.expect(out.hidden.ctx == null);
         } else {
-            const r = try mtp_mod.forwardWithMrope(&lm, &t.lg.xfm, &lcache, ids, hid, pos, st.logits == .last_row, null);
-            if (r.logits.ctx != null) _ = mlx.mlx_array_free(r.logits);
-            const want = try g.adopt(r.hidden_next);
-            try ops.expectBitEqual(try g.adopt(.{ .ctx = out.hidden.ctx }), want);
+            var want: ?mlx.mlx_array = null;
+            if (legacy) |*lm| {
+                const r = try mtp_mod.forwardWithMrope(lm, &b.lg.?.xfm, &lcache, ids, hid, pos, st.logits == .last_row, null);
+                if (r.logits.ctx != null) _ = mlx.mlx_array_free(r.logits);
+                want = try g.adopt(r.hidden_next);
+            }
+            try b.check(try g.adopt(.{ .ctx = out.hidden.ctx }), want, false);
         }
         pos += n;
     }
-    try testing.expectEqual(lcache.step, pcache.step);
+    if (legacy != null) try testing.expectEqual(lcache.step, pcache.step);
+    try b.expectDone();
 }
 
 /// Served: the driver's shell on the legacy config with the head beside it; the engine's head calls through
 /// `MtpHeadRef.plugin` bit-equal to the legacy sidecar arm (`.qwen`), and a pinned-depth MTP round loop with equal
 /// tokens and accepted counts. The trunk itself: steps past a chunk and greedy decode.
-fn servedCase(q: Quant, seed: u64) !void {
+fn servedCase(q: Quant, comptime seed: u64) !void {
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var p = fixture.Pack.init(seed);
@@ -162,23 +178,36 @@ fn servedCase(q: Quant, seed: u64) !void {
     var hp = fixture.Pack.init(seed + 1);
     defer hp.deinit();
     try writeHead(&hp, q);
-    var b = try both.Both.openOnLegacyConfig(&hy3.table, &p, trunk.configJson(true));
+    var b = try open(&p, seed);
     defer b.close();
     try b.expectSteps(&both.long_steps);
     try b.expectGreedy();
     try saveHead(&hp, b.dir);
-    var legacy = try mtp_mod.loadMtp(io, a, b.lg.?.xfm.s, b.dir);
-    defer legacy.deinit();
-    try legacy.bind(&b.lg.?.xfm);
+    var legacy = try legacyHead(&b);
+    defer if (legacy) |*lm| lm.deinit();
     const served = plugin_head.load(io, a, &b.xfm, b.dir) orelse return error.TestHeadNotLoaded;
     defer plugin_head.destroy(served, a);
-    try testing.expectEqual(legacy.draft_head != null, served.draft_head != null);
-    try testing.expectEqual(legacy.rerank_coarse != null, served.rerank_coarse != null);
-    const heads = [_]MtpHeadRef{ .{ .qwen = &legacy }, .{ .plugin = served } };
-    const xs = [_]*Transformer{ &b.lg.?.xfm, &b.xfm };
+    if (legacy) |lm| {
+        try testing.expectEqual(lm.draft_head != null, served.draft_head != null);
+        try testing.expectEqual(lm.rerank_coarse != null, served.rerank_coarse != null);
+    }
+    // The legacy side first when recording, the plugin's last.
+    var heads_buf: [2]MtpHeadRef = undefined;
+    var xs_buf: [2]*Transformer = undefined;
+    var sides: usize = 0;
+    if (legacy) |*lm| {
+        heads_buf[0] = .{ .qwen = lm };
+        xs_buf[0] = &b.lg.?.xfm;
+        sides = 1;
+    }
+    heads_buf[sides] = .{ .plugin = served };
+    xs_buf[sides] = &b.xfm;
+    sides += 1;
+    const heads = heads_buf[0..sides];
+    const xs = xs_buf[0..sides];
     {
         // The engine's head calls: history, a multi-row `.logits` step, a `.mixed` step and its draft pick.
-        var g = ops.Graph.init(a, b.lg.?.xfm.s);
+        var g = ops.Graph.init(a, b.xfm.s);
         defer g.deinit();
         const hist = try rows(&g, 3, seed + 2);
         const step = try rows(&g, 2, seed + 3);
@@ -193,14 +222,21 @@ fn servedCase(q: Quant, seed: u64) !void {
             outs[k] = .{ try g.adopt(merged.logits), try g.adopt(merged.hidden_next), try g.adopt(mixed.hidden_next), try g.adopt(try h.draftSelect(x, mixed.hidden_next, null)) };
             try testing.expectEqual(@as(usize, 6), cr.step());
         }
-        for (outs[0], outs[1]) |want, got| try ops.expectBitEqual(got, want);
+        for (outs[sides - 1], 0..) |got, i| try b.check(got, if (sides == 2) outs[0][i] else null, false);
     }
     var tokens: [2][16]u32 = undefined;
     var accepted: [2]std.ArrayList(u32) = .{ .empty, .empty };
     defer for (&accepted) |*l| l.deinit(a);
     for (heads, xs, 0..) |h, x, k| try mtpRun(x, h, &tokens[k], &accepted[k]);
-    try testing.expectEqualSlices(u32, &tokens[0], &tokens[1]);
-    try testing.expectEqualSlices(u32, accepted[0].items, accepted[1].items);
+    const last = sides - 1;
+    for ([_][]const u32{ &tokens[last], accepted[last].items }, [_][]const u32{ &tokens[0], accepted[0].items }) |got, want| {
+        const g_arr = mlx.mlx_array_new_data(got.ptr, &[_]c_int{@intCast(got.len)}, 1, .uint32);
+        defer _ = mlx.mlx_array_free(g_arr);
+        const w_arr = mlx.mlx_array_new_data(want.ptr, &[_]c_int{@intCast(want.len)}, 1, .uint32);
+        defer _ = mlx.mlx_array_free(w_arr);
+        try b.check(g_arr, if (sides == 2) w_arr else null, true);
+    }
+    try b.expectDone();
 }
 
 // ── tests ──
@@ -221,15 +257,13 @@ test "hy_v3 MTP head: a bf16 head (dense experts, which the legacy head cannot r
     var hp = fixture.Pack.init(0x4b04);
     defer hp.deinit();
     try writeHead(&hp, .bf16);
-    var t = try proof.Twin(hy3).open(&p, trunk.configJson(true), &.{});
-    defer t.close();
-    var path_buf: [512]u8 = undefined;
-    const dir = path_buf[0..try t.lg.tmp.dir.realPath(io, &path_buf)];
-    try saveHead(&hp, dir);
-    var fs = try FsPackDir.open(io, dir);
+    var b = try both.Both.openAs(&hy3.table, &p, trunk.configJson(true), true, .none);
+    defer b.close();
+    try saveHead(&hp, b.dir);
+    var fs = try FsPackDir.open(io, b.dir);
     defer fs.close();
     const pd = fs.packDir();
-    const v = hy3.table.spec.?.head.?.load(t.m, &.{ .model_dir = .of(dir), .dir = &pd, .parsed = &t.parsed, .stream = .{ .ctx = t.lg.xfm.s.ctx } });
+    const v = hy3.table.spec.?.head.?.load(b.xfm.plugin.?.model, &.{ .model_dir = .of(b.dir), .dir = &pd, .parsed = &b.cfg.plugin.?.parsed, .stream = .{ .ctx = b.xfm.s.ctx } });
     try testing.expectEqualStrings("DenseExpertHead", v.why.slice());
 }
 

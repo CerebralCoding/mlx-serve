@@ -1,5 +1,5 @@
 //! The MTP head path of a served model proven against the legacy sidecar arm: a test head behind `SpecHooks.head`
-//! runs the same qwen-layout head layer the legacy `MtpModel` runs (on the legacy trunk's config, as a plugin knows
+//! runs the same qwen-layout head layer the legacy `MtpModel` runs (on the served trunk's config, as a plugin knows
 //! its own), so what is under test is the engine's side: the `HeadHooks` call (ids, `hidden_in`, the head's cache
 //! behind `cache_ops`, the row modes), the readout built from the shell's borrowed trunk head, and the generator's
 //! rounds through `MtpHeadRef.plugin`. Head steps, draft picks and a pinned-depth round loop are bit-equal.
@@ -127,6 +127,7 @@ fn idArr(g: *ops.Graph, ids: []const i32) !Array {
 pub fn mtpRun(xfm: *Transformer, head: MtpHeadRef, tokens: []u32, accepted: *std.ArrayList(u32)) !void {
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
+    try xfm.resetCache();
     var tok_dummy: Tokenizer = undefined; // never read by the Generator
     const prompt = [_]u32{ 3, 7, 1, 12, 30, 5, 9, 22, 4, 17, 2, 28 };
     var gen = try Generator.initWithOptions(io, a, xfm, &tok_dummy, &prompt, @intCast(tokens.len), .{ .temperature = 0.0 }, &.{}, .{
@@ -153,7 +154,8 @@ test "plugin MTP head: head steps, draft picks and a pinned-depth round loop equ
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     const geo: proof.Geo = .{ .quantized = true };
-    var b = try proof.Both.open(geo, 0x3e7a);
+    var b: proof.Served = undefined;
+    try b.open(geo, 0x3e7a);
     defer b.close();
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -162,15 +164,15 @@ test "plugin MTP head: head steps, draft picks and a pinned-depth round loop equ
     try writeHead(head_dir, geo);
     const s = fixture.stream();
 
-    // Legacy: the sidecar bound to the legacy trunk (the qwen head's output gate, which a llama trunk never reads).
-    b.lg.xfm.config.attn_output_gate = true;
+    // Legacy: the sidecar bound to the served trunk (the qwen head's output gate, which a llama trunk never reads).
+    b.xfm.config.attn_output_gate = true;
     var legacy = try mtp_mod.loadMtp(io, a, s, head_dir);
     defer legacy.deinit();
-    try legacy.bind(&b.lg.xfm);
-    // Served: the test table's head over the served shell.
+    try legacy.bind(&b.xfm);
+    // Served: the test table's head over the same shell.
     double.m = try mtp_mod.loadMtp(io, a, s, head_dir);
     defer double.m.deinit();
-    double.target = &b.lg.xfm;
+    double.target = &b.xfm;
     b.xfm.plugin.?.table = &test_table;
     const served = plugin_head.load(io, a, &b.xfm, b.dir) orelse return error.TestHeadNotLoaded;
     defer plugin_head.destroy(served, a);
@@ -178,7 +180,7 @@ test "plugin MTP head: head steps, draft picks and a pinned-depth round loop equ
     try testing.expectEqual(legacy.rerank_coarse != null, served.rerank_coarse != null);
 
     const heads = [_]MtpHeadRef{ .{ .qwen = &legacy }, .{ .plugin = served } };
-    const xs = [_]*Transformer{ &b.lg.xfm, &b.xfm };
+    const xs = [_]*Transformer{ &b.xfm, &b.xfm };
     var caches: [2]MtpCacheRef = undefined;
     for (heads, &caches) |h, *c| c.* = try h.makeCache(a);
     defer for (&caches) |*c| c.deinit();
@@ -244,7 +246,8 @@ test "plugin MTP heads: a round opens at head 0, each chained draft runs the nex
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     const geo: proof.Geo = .{ .quantized = true };
-    var b = try proof.Both.open(geo, 0x3e7b);
+    var b: proof.Served = undefined;
+    try b.open(geo, 0x3e7b);
     defer b.close();
     b.xfm.plugin.?.table = &Heads3.table;
     b.xfm.config.plugin.?.parsed.spec.mtp_heads = 3;

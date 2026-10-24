@@ -34,7 +34,7 @@ pub fn quantizeHeadMxfp8(weights: *Weights, key: []const u8, w: mlx.mlx_array, s
 // ── tests ──
 
 const model_mod = @import("../../engines/mlx/model.zig");
-const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
+const plugin_driver = @import("../../engines/mlx/plugin/driver.zig");
 
 // Bar: the default is on only where measured (Flash Next, quantized pack, integrated CUDA); a flag beats it, a model setting beats both.
 test "lm_head mxfp8: on by default for quantized Flash Next packs on integrated CUDA, settings and flags win" {
@@ -49,7 +49,7 @@ test "lm_head mxfp8: on by default for quantized Flash Next packs on integrated 
     try t.expect(!lmHeadMxfp8On(false, true, true, true, 4));
 }
 
-// Bar: vLLM's MXFP8 bytes (scale 2^ceil(log2(amax/448)), e4m3 nearest-even), the map holds them in place of the bf16 head, logits within 5% RMS.
+// Bar: vLLM's MXFP8 bytes (scale 2^ceil(log2(amax/448)), e4m3 nearest-even) behind the served head, logits within 5% RMS.
 test "lm_head mxfp8: a dense head loads as vLLM's MXFP8 bytes in place of the bf16 copy" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const t = std.testing;
@@ -74,6 +74,22 @@ test "lm_head mxfp8: a dense head loads as vLLM's MXFP8 bytes in place of the bf
     var path_buf: [512]u8 = undefined;
     const dir = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
     try Fix.writeTrunk(io, tmp.dir, dir, s);
+    // An untied pack: its own bf16 head beside the trunk.
+    {
+        const untied = try std.mem.replaceOwned(u8, allocator, Fix.TRUNK_CONFIG, "\"tie_word_embeddings\": true", "\"tie_word_embeddings\": false");
+        defer allocator.free(untied);
+        try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = untied });
+        const map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(map);
+        const head = try Fix.bf16Arr(V, H, 99, s);
+        defer _ = mlx.mlx_array_free(head);
+        try mlx.check(mlx.mlx_map_string_to_array_insert(map, "lm_head.weight", head));
+        const file = try std.fmt.allocPrintSentinel(allocator, "{s}/head.safetensors", .{dir}, 0);
+        defer allocator.free(file);
+        const meta = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta);
+        try mlx.check(mlx.mlx_save_safetensors(file.ptr, map, meta));
+    }
     const ids = mlx.mlx_array_new_data(&[_]i32{ 1, 4, 7 }, &[_]c_int{ 1, 3 }, 2, .int32);
     defer _ = mlx.mlx_array_free(ids);
     var logits: [2][]f32 = .{ &.{}, &.{} };
@@ -81,21 +97,14 @@ test "lm_head mxfp8: a dense head loads as vLLM's MXFP8 bytes in place of the bf
     for ([_]bool{ false, true }, &logits) |mxfp8, *out| {
         var config = try model_mod.parseConfig(io, allocator, dir);
         defer config.deinit(allocator);
-        config.tie_word_embeddings = false;
         config.lm_head_mxfp8_override = mxfp8;
-        var weights = try model_mod.loadWeights(io, allocator, dir);
-        defer weights.deinit();
-        model_mod.resolveWeightPrefix(&config, &weights);
-        try weights.put("lm_head.weight", try Fix.bf16Arr(V, H, 99, s));
-        var xfm = try Transformer.init(io, allocator, config, &weights);
+        var xfm = try plugin_driver.load(io, allocator, &config, dir, mlx.gpuStream());
         defer xfm.deinit();
-        const head = weights.get("lm_head.weight").?;
-        try t.expectEqual(head.ctx, xfm.lm_head_w.ctx);
+        const head = xfm.lm_head_w;
         try t.expectEqual(mxfp8, xfm.lm_head_s.ctx != null);
         if (mxfp8) {
             try t.expect(mlx.mlx_array_dtype(xfm.lm_head_s) == .uint8);
             try t.expectEqualSlices(c_int, &.{ V, H / 32 }, mlx.getShape(xfm.lm_head_s));
-            try t.expectEqual(xfm.lm_head_s.ctx, weights.get("lm_head.scales").?.ctx);
             const ref = try Fix.bf16Arr(V, H, 99, s);
             defer _ = mlx.mlx_array_free(ref);
             const w = try Fix.readF32(ref, allocator, s);

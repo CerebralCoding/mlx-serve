@@ -33,6 +33,7 @@ const mlx = @import("../../../../mlx/ffi.zig");
 const log = @import("../../../../sdk/util/log.zig");
 const model_mod = @import("../../model.zig");
 const transformer_mod = @import("../../transformer.zig");
+const plugin_driver = @import("../../plugin/driver.zig");
 // The chunked row requantizer + its packed-triple handle are shared with the
 // MTP head — both sidecars shrink the SAME trunk lm_head for drafts only, and
 // one requantizer with one chunking discipline is the point.
@@ -3340,18 +3341,26 @@ pub const TinyFix = struct {
     }
 
     pub fn writeAssistantOpts(io: std.Io, dir: std.Io.Dir, dir_path: []const u8, s: mlx.mlx_stream, quantize: bool) !void {
-        try dir.writeFile(io, .{ .sub_path = "config.json", .data = ASSISTANT_CONFIG });
+        return writeAssistantAs(io, dir, dir_path, s, quantize, HIDDEN);
+    }
+
+    /// The tiny assistant over a trunk of width `hidden`.
+    pub fn writeAssistantAs(io: std.Io, dir: std.Io.Dir, dir_path: []const u8, s: mlx.mlx_stream, quantize: bool, hidden: usize) !void {
+        var hb: [32]u8 = undefined;
+        const cfg = try std.mem.replaceOwned(u8, testing.allocator, ASSISTANT_CONFIG, "\"hidden_size\": 64", try std.fmt.bufPrint(&hb, "\"hidden_size\": {d}", .{hidden}));
+        defer testing.allocator.free(cfg);
+        try dir.writeFile(io, .{ .sub_path = "config.json", .data = cfg });
         const st_path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/model.safetensors", .{dir_path}, 0);
         defer testing.allocator.free(st_path);
         const map = mlx.mlx_map_string_to_array_new();
         defer _ = mlx.mlx_map_string_to_array_free(map);
         const meta = mlx.mlx_map_string_to_string_new();
         defer _ = mlx.mlx_map_string_to_string_free(meta);
-        try putV1AssistantWeights(map, s, quantize);
+        try putV1AssistantWeights(map, s, quantize, hidden);
         try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
     }
 
-    fn putV1AssistantWeights(map: mlx.mlx_map_string_to_array, s: mlx.mlx_stream, quantize: bool) !void {
+    fn putV1AssistantWeights(map: mlx.mlx_map_string_to_array, s: mlx.mlx_stream, quantize: bool, hidden: usize) !void {
         const q_out = N_HEADS * HEAD_DIM;
         const kv_out = N_KV * HEAD_DIM;
         const putLin = struct {
@@ -3361,23 +3370,23 @@ pub const TinyFix = struct {
             }
         }.f;
 
-        try putLin(map, "encoder.fc.weight", HIDDEN, N_TARGETS * HIDDEN, 100, s, quantize);
-        try putNorm(map, "encoder.output_norm_enc.weight", HIDDEN, s);
-        try putNorm(map, "norm.weight", HIDDEN, s);
+        try putLin(map, "encoder.fc.weight", hidden, N_TARGETS * hidden, 100, s, quantize);
+        try putNorm(map, "encoder.output_norm_enc.weight", hidden, s);
+        try putNorm(map, "norm.weight", hidden, s);
         var key_buf: [128]u8 = undefined;
         var li: usize = 0;
         while (li < ASSISTANT_LAYERS) : (li += 1) {
-            try putNorm(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.input_layernorm.weight", .{li}), HIDDEN, s);
-            try putNorm(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.post_attention_layernorm.weight", .{li}), HIDDEN, s);
-            try putLin(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.q_proj.weight", .{li}), q_out, HIDDEN, 110 + li, s, quantize);
+            try putNorm(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.input_layernorm.weight", .{li}), hidden, s);
+            try putNorm(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.post_attention_layernorm.weight", .{li}), hidden, s);
+            try putLin(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.q_proj.weight", .{li}), q_out, hidden, 110 + li, s, quantize);
             try putNorm(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.q_norm.weight", .{li}), HEAD_DIM, s);
-            try putLin(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.k_proj.weight", .{li}), kv_out, HIDDEN, 120 + li, s, quantize);
+            try putLin(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.k_proj.weight", .{li}), kv_out, hidden, 120 + li, s, quantize);
             try putNorm(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.k_norm.weight", .{li}), HEAD_DIM, s);
-            try putLin(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.v_proj.weight", .{li}), kv_out, HIDDEN, 130 + li, s, quantize);
-            try putLin(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.o_proj.weight", .{li}), HIDDEN, q_out, 140 + li, s, quantize);
-            try putLin(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.mlp.gate_proj.weight", .{li}), INTER, HIDDEN, 150 + li, s, quantize);
-            try putLin(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.mlp.up_proj.weight", .{li}), INTER, HIDDEN, 160 + li, s, quantize);
-            try putLin(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.mlp.down_proj.weight", .{li}), HIDDEN, INTER, 170 + li, s, quantize);
+            try putLin(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.v_proj.weight", .{li}), kv_out, hidden, 130 + li, s, quantize);
+            try putLin(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.o_proj.weight", .{li}), hidden, q_out, 140 + li, s, quantize);
+            try putLin(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.mlp.gate_proj.weight", .{li}), INTER, hidden, 150 + li, s, quantize);
+            try putLin(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.mlp.up_proj.weight", .{li}), INTER, hidden, 160 + li, s, quantize);
+            try putLin(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.mlp.down_proj.weight", .{li}), hidden, INTER, 170 + li, s, quantize);
         }
     }
 
@@ -3443,7 +3452,7 @@ pub const TinyFix = struct {
         defer _ = mlx.mlx_map_string_to_array_free(map);
         const meta = mlx.mlx_map_string_to_string_new();
         defer _ = mlx.mlx_map_string_to_string_free(meta);
-        try putV1AssistantWeights(map, s, false);
+        try putV1AssistantWeights(map, s, false, HIDDEN);
 
         // Selector: codebooks ship SUFFIX-LESS, like the real checkpoint.
         if (packed_codebooks) {
@@ -3622,10 +3631,8 @@ test "dflash own head: dense and affine projections preserve trained logits and 
     const trunk_path = trunk_buf[0..try trunk.dir.realPath(io, &trunk_buf)];
     try TinyFix.writeTrunk(io, trunk.dir, trunk_path, s);
     var config = try model_mod.parseConfig(io, allocator, trunk_path);
-    var weights = try model_mod.loadWeights(io, allocator, trunk_path);
-    defer weights.deinit();
-    model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer config.deinit(allocator);
+    var xfm = try plugin_driver.load(io, allocator, &config, trunk_path, mlx.gpuStream());
     defer xfm.deinit();
     const ids = mlx.mlx_array_new_data(&[_]i32{ 2, 3, 7 }, &[_]c_int{ 1, 3 }, 2, .int32);
     defer _ = mlx.mlx_array_free(ids);
@@ -4266,10 +4273,8 @@ test "dflash: the draft-only lm_head shrinks the draft read and leaves verify al
     try TinyFix.writeAssistant(io, tmp_asst.dir, asst_path, s);
 
     var config = try model_mod.parseConfig(io, allocator, trunk_path);
-    var weights = try model_mod.loadWeights(io, allocator, trunk_path);
-    defer weights.deinit();
-    model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer config.deinit(allocator);
+    var xfm = try plugin_driver.load(io, allocator, &config, trunk_path, mlx.gpuStream());
     defer xfm.deinit();
 
     const bits: u32 = 3;
@@ -4332,7 +4337,7 @@ test "dflash: quantGroupFor picks the widest divisor, declines what affine canno
     try testing.expectEqual(@as(?u32, null), quantGroupFor(0));
 }
 
-test "standard forward: skip_lm_head hands back the hidden the head reads, never logits" {
+test "served forward: skip_lm_head hands back the hidden the head reads, never logits" {
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -4342,12 +4347,9 @@ test "standard forward: skip_lm_head hands back the hidden the head reads, never
     const dir_path = path_buf[0..try tmp_dir.dir.realPath(io, &path_buf)];
     try TinyFix.writeTrunk(io, tmp_dir.dir, dir_path, s);
     var config = try model_mod.parseConfig(io, allocator, dir_path);
-    var weights = try model_mod.loadWeights(io, allocator, dir_path);
-    defer weights.deinit();
-    model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer config.deinit(allocator);
+    var xfm = try plugin_driver.load(io, allocator, &config, dir_path, mlx.gpuStream());
     defer xfm.deinit();
-    try testing.expect(xfm.usesStandardForward());
 
     const prompt = [_]i32{ 3, 7, 1, 12, 30, 5, 9, 22 };
     const ids = mlx.mlx_array_new_data(&prompt, &[_]c_int{ 1, prompt.len }, 2, .int32);
@@ -4385,10 +4387,8 @@ test "dflash: trunk capture_layers = hidden_states[i+1], consistent across chunk
     try TinyFix.writeTrunk(io, tmp_dir.dir, dir_path, s);
 
     var config = try model_mod.parseConfig(io, allocator, dir_path);
-    var weights = try model_mod.loadWeights(io, allocator, dir_path);
-    defer weights.deinit();
-    model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer config.deinit(allocator);
+    var xfm = try plugin_driver.load(io, allocator, &config, dir_path, mlx.gpuStream());
     defer xfm.deinit();
 
     const prompt = [_]i32{ 3, 7, 1, 12, 30, 5, 9, 22 };
@@ -4419,9 +4419,11 @@ test "dflash: trunk capture_layers = hidden_states[i+1], consistent across chunk
     // the post-final-norm capture_hidden_all — the capture sits exactly one
     // final_norm before it.
     {
+        var pack = try model_mod.loadWeights(io, allocator, dir_path);
+        defer pack.deinit();
         var manual = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(manual);
-        try mlx.check(mlx.mlx_fast_rms_norm(&manual, full_out[1], xfm.final_norm, xfm.config.rms_norm_eps, s));
+        try mlx.check(mlx.mlx_fast_rms_norm(&manual, full_out[1], pack.get("model.norm.weight").?, xfm.config.rms_norm_eps, s));
         const a = try TinyFix.readF32(manual, allocator, s);
         defer allocator.free(a);
         const b = try TinyFix.readF32(all_hidden, allocator, s);
@@ -4479,10 +4481,8 @@ test "dflash: trunk rawEmbedding is the bare table row" {
     try TinyFix.writeTrunk(io, tmp_dir.dir, dir_path, s);
 
     var config = try model_mod.parseConfig(io, allocator, dir_path);
-    var weights = try model_mod.loadWeights(io, allocator, dir_path);
-    defer weights.deinit();
-    model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer config.deinit(allocator);
+    var xfm = try plugin_driver.load(io, allocator, &config, dir_path, mlx.gpuStream());
     defer xfm.deinit();
 
     const ids = [_]i32{ 4, 31 };

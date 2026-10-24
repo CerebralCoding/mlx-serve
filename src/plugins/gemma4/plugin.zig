@@ -4,7 +4,6 @@
 
 const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
-const quant_abi = @import("../../abi/quant.zig");
 const sdk = @import("../../sdk/root.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const Array = mlx.mlx_array;
@@ -38,7 +37,7 @@ pub const table = abi.ModelTable{
     .unload = &unload,
     .forward = &forward,
     .cache = &.{ .layout = &config.layout },
-    .spec = &.{ .trunk_weight = &trunkWeight },
+    .spec = &.{ .trunk_weight = &load_mod.TrunkWeight(Loaded).get },
     .weights = &.{},
 };
 
@@ -272,30 +271,6 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     return run_mod.tableForward(decoder, &m.base, f, out);
 }
 
-/// The trunk's embedding table or LM head for a drafter, borrowed until unload (a tied head is the table). A dense
-/// table keeps its checkpoint layout `[out, in]`.
-pub fn trunkWeight(mp: *anyopaque, which: abi.TrunkWeight, out: *quant_abi.Weight) callconv(.c) Verdict {
-    const m: *Loaded = @ptrCast(@alignCast(mp));
-    const w = &m.base.weights;
-    const l = switch (which) {
-        .embed => w.embed.table,
-        .head => w.head.head,
-    };
-    out.* = .{
-        .w = .{ .ctx = l.w.ctx },
-        .scales = .{ .ctx = l.s.ctx },
-        .biases = .{ .ctx = l.b.ctx },
-        .bits = @intCast(l.bits),
-        .group_size = l.group_size,
-        .layout = @backingInt(if (l.s.ctx == null) native.Layout.dense else switch (l.mode) {
-            .nvfp4 => native.Layout.nvfp4,
-            .mxfp4 => .mxfp4,
-            .mxfp8 => .mxfp8,
-            else => .affine,
-        }),
-    };
-    return .ok;
-}
 
 /// The tiny pack the conformance suite runs: four layers (sliding, global of a wider head, sliding, a KV-shared
 /// global reading layer 1), per-layer embeddings, layer scalars, value norms, a softcap; seeded random f32 weights.

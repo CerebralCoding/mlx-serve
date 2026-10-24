@@ -1,6 +1,6 @@
 # qwen3_5 fixtures
 
-The oracle is the legacy layered forward on tiny random packs written by `sdk/bases/proof/qwen35_test.zig`'s
+The oracle is the legacy layered forward on tiny random packs written by `sdk/bases/proof/qwen35_pack.zig`'s
 `writePack` (seeds in `proof_test.zig`). The real config `src/fixtures/model-configs/minicpmv4_7.json` is claimed
 here. Gate models: `mlx-community/Qwen3.5-4B-4bit`, `mlx-community/Qwen3.6-35B-A3B-4bit`.
 

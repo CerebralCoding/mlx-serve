@@ -167,6 +167,11 @@ pub const Pack = struct {
 
     /// Writes the pack and loads it through the legacy path.
     pub fn load(p: *Pack, config_json: []const u8) !*Legacy {
+        return p.loadEdited(config_json, null);
+    }
+
+    /// `load`, with `edit` applied to the parsed config first (a per-model load setting).
+    pub fn loadEdited(p: *Pack, config_json: []const u8, edit: ?*const fn (*model.ModelConfig) void) !*Legacy {
         const a = testing.allocator;
         const io = std.Io.Threaded.global_single_threaded.io();
         const lg = try a.create(Legacy);
@@ -179,11 +184,12 @@ pub const Pack = struct {
         try p.save(dir);
         lg.config = try model.parseConfigFromJson(a, config_json);
         errdefer lg.config.deinit(a);
+        if (edit) |e| e(&lg.config);
         lg.weights = try model.loadModelWeights(io, a, dir, &lg.config, false);
         errdefer lg.weights.deinit();
         model.resolveWeightPrefix(&lg.config, &lg.weights);
         try model.narrowHadamardPackTables(&lg.config, &lg.weights, stream());
-        lg.xfm = try Transformer.init(io, a, lg.config, &lg.weights);
+        lg.xfm = try Transformer.init(io, a, lg.config);
         return lg;
     }
 };

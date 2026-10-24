@@ -128,30 +128,14 @@ pub fn forwardWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_arra
     if (ctx.batch_slots == null) try self.ssmGroupRelease(ctx);
     if (self.plugin) |b| return plugin_driver.forward(self, b, ctx, token_ids);
     if (self.mlx_stream_ext) |m| return forwardMlxStream(self, ctx, token_ids, m);
-    // EmbeddingGemma (a bidirectional gemma3 trunk) never runs causal decode.
-    if (self.config.use_bidirectional_attention) return self.forwardGemma3EncoderWith(ctx, token_ids);
-    if (self.moe_layers != null) return self.forwardMoeWith(ctx, token_ids);
-    return self.forwardStandardWith(ctx, token_ids);
+    return error.PluginDeclinedNoLegacy;
 }
 
-/// Does `forwardWith` route this model through `forwardStandardWith`?
-/// Mirrors the dispatch chain above IN ORDER.
-pub fn usesStandardForward(self: *const Transformer) bool {
-    return self.plugin == null and self.mlx_stream_ext == null and
-        !self.config.use_bidirectional_attention and
-        self.moe_layers == null;
-}
-
-/// Does `forwardWith` route through a path that honors
-/// `ForwardCtx.capture_layers`? Standard path (v1), the moe/GDN path
-/// (qwen3_5-family DFlash2 sidecars) and the hybrid path (LFM2 DSpark).
-/// `DflashModel.bind` gates on this predicate. Mirrors the dispatch chain
-/// above IN ORDER.
+/// Does `forwardWith` honor `ForwardCtx.capture_layers`? A served plugin captures layers; a drafter also reads the
+/// trunk's embedding and head (`Bound.drafters`). `DflashModel.bind` gates on this predicate.
 pub fn supportsLayerCapture(self: *const Transformer) bool {
-    // A served plugin captures layers; a drafter also reads the trunk's embedding and head (`Bound.drafters`).
-    if (self.plugin) |b| return b.drafters;
-    return self.mlx_stream_ext == null and
-        !self.config.use_bidirectional_attention;
+    const b = self.plugin orelse return false;
+    return b.drafters;
 }
 
 // ── tests ──

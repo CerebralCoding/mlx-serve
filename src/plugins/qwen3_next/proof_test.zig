@@ -90,7 +90,7 @@ const steps = [_]twin.Step{
     .{ .mode = .decode, .ids = &.{17} },
 };
 
-fn case(comptime quantized: bool, seed: u64) !void {
+fn case(comptime quantized: bool, comptime seed: u64) !void {
     var p = fixture.Pack.init(seed);
     defer p.deinit();
     const g: Geo = .{ .quantized = quantized };
@@ -98,13 +98,17 @@ fn case(comptime quantized: bool, seed: u64) !void {
     const json = try config(std.testing.allocator, g);
     defer std.testing.allocator.free(json);
     const T = twin.Twin(qwen3_next);
-    const t = try T.open(&p, json, &.{});
+    const name = std.fmt.comptimePrint("fixtures/twin-{x}.tape", .{seed});
+    const t = try T.open(&p, json, &.{}, "src/plugins/qwen3_next/" ++ name, @embedFile(name));
     defer t.close();
-    t.lg.xfm.compileGdnGate();
-    t.lg.xfm.compileMoeRouting();
+    if (t.lg) |lg| {
+        lg.xfm.compileGdnGate();
+        lg.xfm.compileMoeRouting();
+    }
     const l = try t.lane();
     defer l.deinit();
     for (steps) |st| try t.step(l, st);
+    try t.expectDone();
 }
 
 test "qwen3_next plugin: a 4-bit pack through the table is bit-equal to the legacy layered forward" {
@@ -123,9 +127,8 @@ test "qwen3_next served: steps, captured verifies, rollbacks and the lookup loop
     const json = try config(std.testing.allocator, .{});
     defer std.testing.allocator.free(json);
     var p: served.Pair = undefined;
-    try p.open(&qwen3_next.table, &pk, json);
+    try p.open(&qwen3_next.table, &pk, json, try served.oracle("qwen3_next", "served-3a03"));
     defer p.close();
-    p.oracle = try served.oracle("qwen3_next", "served-3a03");
     try served.expectSolo(&p);
 }
 
@@ -133,7 +136,6 @@ test "qwen3_next served: a DFlash drafter on the served trunk reads its embeddin
     const a = std.testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     const served = @import("../qwen3_5/served_test.zig");
-    const q3 = @import("../qwen3/proof_test.zig");
     const dflash_mod = @import("../../engines/mlx/spec/dflash/dflash.zig");
     // The tiny assistant's geometry (`dflash.TinyFix`): hidden 64, vocab 128, targets layers 0 and 2 (both GDN here).
     const g: Geo = .{ .hidden = 64, .vocab = 128, .head_dim = 64, .hv = 4, .dk = 64, .dv = 64, .moe_inter = 64 };
@@ -143,30 +145,12 @@ test "qwen3_next served: a DFlash drafter on the served trunk reads its embeddin
     const json = try config(a, g);
     defer a.free(json);
     var p: served.Pair = undefined;
-    try p.open(&qwen3_next.table, &pk, json);
+    try p.open(&qwen3_next.table, &pk, json, try served.oracle("qwen3_next", "dflash-3a04"));
     defer p.close();
-    p.oracle = try served.oracle("qwen3_next", "dflash-3a04");
-    try std.testing.expect(p.xfm.plugin.?.drafters and p.xfm.supportsLayerCapture());
-    {
-        const ops = @import("../../mlx/ops.zig");
-        var gr = ops.Graph.init(a, p.lg.xfm.s);
-        defer gr.deinit();
-        const ids = try fixture.tokens(&gr, &.{ 4, 90, 127, 0, 33 });
-        const hidden = try gr.reshape(try gr.adopt(try p.lg.xfm.rawEmbedding(ids)), &.{ 1, 5, 64 });
-        try p.oracle.check(try gr.adopt(try p.xfm.rawEmbedding(ids)), try gr.adopt(try p.lg.xfm.rawEmbedding(ids)), false);
-        try p.oracle.check(try gr.adopt(try p.xfm.lmHeadForDraft(hidden)), try gr.adopt(try p.lg.xfm.lmHeadForDraft(hidden)), false);
-    }
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [512]u8 = undefined;
     const asst = buf[0..try tmp.dir.realPath(io, &buf)];
     try dflash_mod.TinyFix.writeAssistant(io, tmp.dir, asst, fixture.stream());
-    var tokens: [2][16]u32 = undefined;
-    var accepted: [2]std.ArrayList(u32) = .{ .empty, .empty };
-    defer for (&accepted) |*l| l.deinit(a);
-    try q3.dflashRun(&p.lg.xfm, asst, &tokens[0], &accepted[0]);
-    try q3.dflashRun(&p.xfm, asst, &tokens[1], &accepted[1]);
-    try p.oracle.stream(&tokens[1], &tokens[0]);
-    try p.oracle.stream(accepted[1].items, accepted[0].items);
-    try p.oracle.done();
+    try served.expectDflash(&p, asst, 64, "lmHeadForDraft");
 }

@@ -1,8 +1,8 @@
 //! Qwen3.5 / 3.6 / 3.8 packs (mlx-lm's `qwen3_5` and `qwen3_5_moe` layouts, their `_text` siblings) and MiniCPM-V 4.7's
 //! Qwen3.5 trunk: the claim, and the parse into `Parsed` plus the trunk's own fields. MLX-free. GatedDeltaNet layers
 //! with gated full attention every `full_attention_interval`; dense or routed MLPs. Prism's Hadamard packs
-//! (`prism_hadamard_qwen35`) parse here too. A pack this plugin does not serve bit-equal yet (a foreign quant block, a
-//! scaled rope) is refused `unsupported`.
+//! (`prism_hadamard_qwen35`) parse here too. A pack this plugin does not serve (a foreign quant block) is refused
+//! `unsupported`.
 
 const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
@@ -11,6 +11,7 @@ const generation = @import("../../sdk/config/generation.zig");
 const quant_config = @import("../../sdk/config/quantization_config.zig");
 const q3 = @import("../qwen3/config.zig");
 const mrope = @import("../../sdk/vision/mrope.zig");
+const rope_scaling = @import("../../sdk/config/rope_scaling.zig");
 
 pub const plugin = @import("../../sdk/plugin.zig").Plugin{
     .name = "qwen3_5",
@@ -53,6 +54,9 @@ pub const Config = struct {
     rms_norm_eps: f32,
     rope_theta: f32,
     partial_rotary_factor: f32 = 1.0,
+    /// The `rope_scaling` / `rope_parameters` block (mlx-lm's `initialize_rope` over the rotated dims).
+    rope: rope_scaling.Scaling = .none,
+    max_position_embeddings: u32 = 0,
     query_pre_attn_scalar: u32,
     tie_word_embeddings: bool = false,
     full_attention_interval: u32,
@@ -84,6 +88,16 @@ pub const Config = struct {
         return @intFromFloat(@as(f32, @floatFromInt(c.head_dim)) * c.partial_rotary_factor);
     }
 };
+
+/// The M-RoPE table's inverse frequencies under the pack's scaling (a dynamic NTK base stays the static one there).
+fn mropeSpectrum(out: []f64, rd: u32, c: *const Config) void {
+    if (rope_scaling.freqs(c.rope, out, rd, c.rope_theta)) {
+        for (out) |*v| v.* = 1.0 / v.*;
+        return;
+    }
+    mrope.computeInvFreq(out, rd, c.rope_theta);
+    for (out) |*v| v.* *= rope_scaling.positionScale(c.rope);
+}
 
 /// Keys whose presence means a shape this plugin does not serve bit-equal yet.
 const foreign_keys = [_][]const u8{
@@ -156,11 +170,9 @@ pub fn parseAs(comptime variant: Variant, dir: *const abi.PackDir, config_json: 
     if (c.query_pre_attn_scalar == 0) return unsupported("query_pre_attn_scalar");
     c.partial_rotary_factor = @floatCast(q3.partialRotary(cfg, next) catch return unsupported("partial_rotary_factor"));
     if (c.partial_rotary_factor <= 0 or c.partial_rotary_factor > 1) return unsupported("partial_rotary_factor");
-    // The engine's qwen3_5 parse reads no rope schedule: a scaled one would be served unscaled.
-    if (field(cfg, "rope_scaling") != null) return unsupported("a rope scaling");
-    if (field(cfg, "rope_parameters")) |rp| if (rp == .object) if (field(rp.object, "rope_type")) |t| {
-        if (t != .string or !std.mem.eql(u8, t.string, "default")) return unsupported("a rope scaling");
-    };
+    c.rope = rope_scaling.parse(cfg);
+    c.max_position_embeddings = int(field(cfg, "max_position_embeddings")) orelse int(field(root, "max_position_embeddings")) orelse 0;
+    if (c.rope == .dynamic and c.max_position_embeddings == 0) c.rope = .unmodeled;
     if (q3.boolean(field(cfg, "attn_output_gate"))) |g| if (!g) return unsupported("no attention output gate");
     c.tie_word_embeddings = q3.tied(root, cfg);
     if (int(field(cfg, "num_experts"))) |e| if (e > 0) {
@@ -183,12 +195,12 @@ pub fn parseAs(comptime variant: Variant, dir: *const abi.PackDir, config_json: 
 
     // Qwen3-Next decodes serial: the engine batches only the qwen3_5 MoE trunk's GDN state. An affine dense trunk's
     // verify rows are row-exact (the `.mma` lane, set at load where every projection fits); a bf16 matmul's bits
-    // follow its row count. A dense trunk verifies draft trees (the engine's row-exact reach, bf16 included). A Hadamard
-    // pack's drafter reads the trunk head in f32 (`lmHeadForeign`): a pack carrying one stays legacy. The ANE prefill
-    // programs read unrotated separate GDN projections.
+    // follow its row count. A dense trunk verifies draft trees (the engine's row-exact reach, bf16 included). The ANE
+    // prefill programs read unrotated separate GDN projections.
     const dense = !next and !prism and !c.moe();
     const exact = dense and c.quant.bits > 0 and c.quant.mode == .affine;
-    var p: abi.Parsed = .{ .caps = .{ .batches_decode = !next, .moe = c.moe(), .exact_resumed = true, .dflash_capture = !prism, .exact_drafted = exact, .spec_tree = dense, .ane_prefill = !next and !prism } };
+    var p: abi.Parsed = .{ .caps = .{ .batches_decode = !next and c.rope != .dynamic, .moe = c.moe(), .exact_resumed = true, .dflash_capture = true, .exact_drafted = exact, .spec_tree = dense and c.rope != .dynamic, .ane_prefill = !next and !prism } };
+    if (rope_scaling.layoutNamespace(c.rope)) |ns| p.cache.layout_namespace = abi.Str.of(ns);
     // The grafted head over-speculates in auto mode (`ModelConfig.mtpDepth`).
     if (prism) p.spec.mtp_default_depth = 2;
     const s = &p.shell;
@@ -252,8 +264,8 @@ pub fn parseAs(comptime variant: Variant, dir: *const abi.PackDir, config_json: 
             gpa.destroy(cfg_out);
             return abi.Verdict.refuse(.failed, "qwen3_5: out of memory");
         };
-        mrope.computeInvFreq(cfg_out.inv_freq, rd, c.rope_theta);
-        p.mrope = .{ .sections = sections, .rope_dims = rd, .inv_freq = .of(cfg_out.inv_freq) };
+        mropeSpectrum(cfg_out.inv_freq, rd, &c);
+        p.mrope = .{ .sections = sections, .rope_dims = rd, .inv_freq = .of(cfg_out.inv_freq), .mscale = rope_scaling.mscale(c.rope) };
     }
     p.private = cfg_out;
     out.* = p;
@@ -374,12 +386,27 @@ test "qwen3_5 config: shapes this plugin does not serve yet are refused unsuppor
     defer testing.allocator.free(vl);
     const vl2 = try std.mem.replaceOwned(u8, testing.allocator, vl, "\"eos_token_id\":248046,", "\"eos_token_id\":248046,\"vision_config\":{\"depth\":27},\"image_token_id\":5,");
     defer testing.allocator.free(vl2);
-    const yarn = try std.mem.replaceOwned(u8, testing.allocator, qwen36_35b, "\"rope_type\":\"default\"", "\"rope_type\":\"yarn\"");
-    defer testing.allocator.free(yarn);
-    for ([_][]const u8{ vl2, yarn, "{\"model_type\":\"qwen3_next\"}" }) |json| {
+    for ([_][]const u8{ vl2, "{\"model_type\":\"qwen3_next\"}" }) |json| {
         var p: abi.Parsed = .{};
         try testing.expectEqual(abi.Verdict.Code.unsupported, parseJson(json, &p).code);
     }
+}
+
+test "qwen3_5 config: a YaRN rope_parameters block is served over the rotated dims, its M-RoPE table scaled too" {
+    const yarn = try std.mem.replaceOwned(u8, testing.allocator, qwen36_35b, "\"rope_type\":\"default\"", "\"rope_type\":\"yarn\",\"factor\":4,\"original_max_position_embeddings\":262144");
+    defer testing.allocator.free(yarn);
+    const vl = try std.mem.replaceOwned(u8, testing.allocator, yarn, "\"eos_token_id\":248046,", "\"eos_token_id\":248046,\"vision_config\":{\"depth\":27},\"image_token_id\":248056,");
+    defer testing.allocator.free(vl);
+    var p: abi.Parsed = .{};
+    try testing.expect(parseJson(vl, &p).isOk());
+    defer freeParsed(&p);
+    try testing.expect(of(&p).rope == .yarn);
+    try testing.expectEqualStrings("scaled-rope-v1", p.cache.layout_namespace.slice());
+    var want: [32]f64 = undefined;
+    try testing.expect(rope_scaling.freqs(of(&p).rope, &want, 64, 10000000));
+    for (&want) |*v| v.* = 1.0 / v.*;
+    try testing.expectEqualSlices(f64, &want, p.mrope.inv_freq.slice());
+    try testing.expectApproxEqRel(0.1 * @log(4.0) + 1.0, p.mrope.mscale, 1e-12);
 }
 
 test "qwen3_5 config: a routed-expert pack carrying an MTP head is served (its head runs through SpecHooks.head)" {

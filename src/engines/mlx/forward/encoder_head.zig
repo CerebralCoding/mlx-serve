@@ -1,8 +1,7 @@
 //! engines/mlx/forward/encoder_head, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns forwardEmbedding, forwardEmbeddingMasked, hasEmbedProjection, embedProjection, denseHead.
+//! Owns forwardEmbedding, forwardEmbeddingMasked, hasEmbedProjection, embedProjection.
 
 const mlx = @import("../../../mlx/ffi.zig");
-const transposeBf16Weight = @import("../load/weights.zig").transposeBf16Weight;
 const Transformer = @import("../transformer.zig").Transformer;
 const plugin_driver = @import("../plugin/driver.zig");
 
@@ -29,38 +28,13 @@ pub fn forwardEmbeddingMasked(self: *Transformer, token_ids: mlx.mlx_array, key_
 /// (EmbeddingGemma dense.0/dense.1, EmbeddingGemma 2's embedding_projection
 /// as the lone dense.0), applied between pool and normalize.
 pub fn hasEmbedProjection(self: *const Transformer) bool {
-    if (self.plugin) |b| if (b.table.embed) |e| return e.project != null;
-    return self.dense0_w.ctx != null;
+    const b = self.plugin orelse return false;
+    const e = b.table.embed orelse return false;
+    return e.project != null;
 }
 
-/// Sentence-transformers Dense head: pooled [B, H] → dense.0 (→ dense.1)
-/// (identity activations, no layer bias — EmbeddingGemma's config).
-/// Input is cast to bf16 for the quantized matmuls. Caller frees.
+/// Sentence-transformers Dense head: pooled [B, H] → dense.0 (→ dense.1). Caller frees.
 pub fn embedProjection(self: *const Transformer, pooled: mlx.mlx_array) !mlx.mlx_array {
-    if (self.plugin) |b| return plugin_driver.embedProject(b, pooled);
-    var x = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(x);
-    try mlx.check(mlx.mlx_astype(&x, pooled, .bfloat16, self.s));
-    const mid = try self.denseHead(x, self.dense0_w, self.dense0_s, self.dense0_b);
-    const head = if (self.dense1_w.ctx == null) mid else blk: {
-        defer _ = mlx.mlx_array_free(mid);
-        break :blk try self.denseHead(mid, self.dense1_w, self.dense1_s, self.dense1_b);
-    };
-    defer _ = mlx.mlx_array_free(head);
-    // f32 out: the normalization squares and sums it, and a bf16 head output rounds that norm away from 1.
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_astype(&out, head, .float32, self.s));
-    return out;
-}
-
-/// One Dense layer: quantized weights ride `qmatmul`; a dense checkpoint keeps its [out, in] layout
-/// (nothing pre-transposes the head) and projects through a transposed view.
-pub fn denseHead(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array) !mlx.mlx_array {
-    if (sc.ctx != null) return self.qmatmul(x, w, sc, bi);
-    const wt = try transposeBf16Weight(w, self.s);
-    defer _ = mlx.mlx_array_free(wt);
-    var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_matmul(&out, x, wt, self.s));
-    return out;
+    const b = self.plugin orelse return error.NoEmbedProjection;
+    return plugin_driver.embedProject(b, pooled);
 }

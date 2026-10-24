@@ -17,7 +17,7 @@ an in-checkpoint MTP layer, a Qwen3-VL tower. Packs, oracle: `docs/reference.md`
   `oracle_test.zig`; ModelOpt/combined-GDN/ternary arms have their own tests (fixture layouts the tapes lack).
 - P8 DEBT, `engines/mlx/plugin/intree.zig` (in-tree only, delete when the ABI carries these): the MTP head, group
   lanes and the grouped verify run on the plugin's `Trunk` through `MtpHeadRef.qwen4`; the cluster worker runs a
-  bare `Trunk` and the plugin reads the Thunderbolt plan (`caps.cluster_plan`). An ABI-clean head needs:
+  bare `Trunk` and the plugin reads the Thunderbolt plan (`distributed.planFor`). An ABI-clean head needs:
   (1) `ForwardOut.next`, the chained hidden apart from the projected one; (2) a fact that the trunk's hidden is the
   pre-mixer stream; (3) a placed head forward (dead history rows); (4) `HeadHooks.mark` with a length; (5) head
   snapshot / bytes / serialize for the prefix cache and SSD; (6) group lanes and the grouped verify on the plugin arm;

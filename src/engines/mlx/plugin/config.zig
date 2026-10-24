@@ -1,11 +1,9 @@
 //! Who serves a pack, and the engine's `ModelConfig` for one a plugin serves: the registry's claimant parses the pack
-//! into `Parsed` and one adapter builds the generic config the engine reads from it. A pack whose type is not in the
-//! served set, that no plugin claims, whose plugin declines it, or that carries a drafter sidecar its plugin cannot
-//! feed (no `SpecHooks.trunk_weight`) stays on the legacy parse.
+//! into `Parsed` and one adapter builds the generic config the engine reads from it. A served type's pack its plugin
+//! declines is refused by name; a pack of another type (an mlx-stream pack) keeps the legacy parse alone.
 
 const std = @import("std");
 const abi = @import("../../../abi/plugin.zig");
-const quant_abi = @import("../../../abi/quant.zig");
 const common = @import("../../../abi/common.zig");
 const sdk_plugin = @import("../../../sdk/plugin.zig");
 const registry = @import("../../../plugins/registry.zig");
@@ -13,7 +11,6 @@ const served = @import("served.zig");
 const model = @import("../model.zig");
 const log = @import("../../../sdk/util/log.zig");
 const FsPackDir = @import("../../../host/registry/pack_dir.zig").FsPackDir;
-const dflash = @import("../spec/dflash/dflash.zig");
 const intree = @import("intree.zig");
 const outside = @import("../../../host/plugins/loader.zig");
 
@@ -48,20 +45,8 @@ fn claimantIn(list: []const sdk_plugin.Entry, model_type: []const u8, config_jso
     return list[i].model;
 }
 
-/// The table hands drafters the trunk's embedding table and head.
-pub fn lendsTrunk(table: *const abi.ModelTable) bool {
-    const sp = table.spec orelse return false;
-    return sp.trunk_weight != null;
-}
-
-/// The served model binds a DFlash drafter or the Gemma assistant: the trunk lent and its layers captured. An MTP head
-/// needs the trunk alone (`plugin/head.zig`).
-pub fn servesDflash(table: *const abi.ModelTable, p: *const abi.Parsed) bool {
-    return lendsTrunk(table) and p.caps.dflash_capture;
-}
-
 /// The plugin's parse of the pack at `model_dir` (`config_json` its config.json), as the generic `ModelConfig` of its
-/// facts alone carrying its binding (`adapted`); null when the legacy path serves it.
+/// facts alone carrying its binding (`adapted`); null when no plugin serves it.
 pub fn parseServed(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, config_json: []const u8) !?ModelConfig {
     const b = (try bindServed(io, a, model_dir, config_json)) orelse return null;
     return adapted(b);
@@ -75,19 +60,55 @@ pub fn adapted(b: *Binding) ModelConfig {
     return cfg;
 }
 
-/// The plugin's claim and parse of the pack at `model_dir` (caller owns the binding); null when the legacy path
-/// serves it, `error.PluginDeclinedNoLegacy` when that path is gone for the type. The engine's config of a served
-/// pack is the legacy parse with this binding attached.
+/// The plugin's claim and parse of the pack at `model_dir` (caller owns the binding); null for a pack of a type no
+/// plugin serves (an mlx-stream pack is its stream module's), `error.PluginDeclinedNoLegacy` for a served type's pack
+/// its plugin declines. The engine's config of a served pack is the legacy parse with this binding attached.
 pub fn bindServed(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, config_json: []const u8) !?*Binding {
-    if (try bindOrLegacy(io, a, model_dir, config_json)) |b| return b;
+    const why = switch (try resolve(io, a, model_dir, config_json)) {
+        .bound => |b| return b,
+        .declined => |why| why,
+    };
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const model_type = sdk_plugin.modelTypeOf(arena.allocator(), config_json) catch return null;
-    if (!served.legacyRemoved(model_type)) return null;
-    // An mlx-stream pack is its stream module's, never a legacy forward's.
-    if (model.declaresExpertStreaming(a, config_json)) return null;
-    log.err("[plugin] {s}: its plugin does not serve this pack and the legacy forward is gone\n", .{model_type});
+    if (!served.serves(model_type) or streamPack(io, a, model_dir, config_json)) return null;
+    log.err("[plugin] {s}: {s}; no other path serves it\n", .{ model_type, why });
     return error.PluginDeclinedNoLegacy;
+}
+
+/// An mlx-stream pack: a declared expert bank, or an `experts.bin` beside the trunk.
+fn streamPack(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, config_json: []const u8) bool {
+    if (model.declaresExpertStreaming(a, config_json)) return true;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const bank = std.fmt.bufPrint(&buf, "{s}/experts.bin", .{model_dir}) catch return false;
+    std.Io.Dir.accessAbsolute(io, bank, .{}) catch return false;
+    return true;
+}
+
+/// `table`'s parse of the pack at `dir` (caller owns the binding), for an engine that serves a pack through one named
+/// plugin whatever else claims it (a decision pack's trunk); null when the parse declines it.
+pub fn bindTable(io: std.Io, a: std.mem.Allocator, dir: []const u8, table: *const abi.ModelTable) !?*Binding {
+    return bindTableWith(io, a, dir, table, "{}");
+}
+
+/// `bindTable` over the pack's config.json with `overrides` deep-merged in (`model.mergeConfigJson`).
+pub fn bindTableWith(io: std.Io, a: std.mem.Allocator, dir: []const u8, table: *const abi.ModelTable, overrides: []const u8) !?*Binding {
+    var fs = try FsPackDir.open(io, dir);
+    defer fs.close();
+    const pd = fs.packDir();
+    const buf = try a.alloc(u8, 1 << 20);
+    defer a.free(buf);
+    var why: abi.Verdict = .{};
+    const raw = pd.readFile("config.json", buf, &why) orelse return error.ConfigUnreadable;
+    const cfg = try model.mergeConfigJson(a, raw, overrides);
+    defer a.free(cfg);
+    const b = try a.create(Binding);
+    b.* = .{ .table = table };
+    if (!table.parse(&pd, .of(cfg), .{}, null, false, &b.parsed).isOk()) {
+        a.destroy(b);
+        return null;
+    }
+    return b;
 }
 
 /// `config_json` with the launch's `--config-overrides` merged in, as the legacy parse reads it; in `a`.
@@ -96,18 +117,8 @@ pub fn withOverrides(a: std.mem.Allocator, config_json: []const u8) ![]const u8 
     return model.mergeConfigJson(a, config_json, ov);
 }
 
-fn bindOrLegacy(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, config_json: []const u8) !?*Binding {
-    switch (try resolve(io, a, model_dir, config_json)) {
-        .bound => |b| return b,
-        .legacy => |why| {
-            log.info("[plugin] {s}: {s}; the legacy path serves it\n", .{ std.fs.path.basename(model_dir), why });
-            return null;
-        },
-    }
-}
-
-/// Who serves a pack: its plugin's binding (caller owns it), or the legacy path and why (static text).
-pub const Outcome = union(enum) { bound: *Binding, legacy: []const u8 };
+/// Who serves a pack: its plugin's binding (caller owns it), or why none does (static text).
+pub const Outcome = union(enum) { bound: *Binding, declined: []const u8 };
 
 pub fn resolve(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, raw_json: []const u8) !Outcome {
     var arena = std.heap.ArenaAllocator.init(a);
@@ -115,32 +126,24 @@ pub fn resolve(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, raw_json
     // The plugin parses what the legacy parse reads: the overrides land in both.
     const config_json = try withOverrides(arena.allocator(), raw_json);
     const model_type = try sdk_plugin.modelTypeOf(arena.allocator(), config_json);
-    if (!served.serves(model_type) and outside.loaded().len == 0) return .{ .legacy = "type not served" };
-    var fs = FsPackDir.open(io, model_dir) catch return .{ .legacy = "pack dir unreadable" };
+    if (!served.serves(model_type) and outside.loaded().len == 0) return .{ .declined = "type not served" };
+    var fs = FsPackDir.open(io, model_dir) catch return .{ .declined = "pack dir unreadable" };
     defer fs.close();
     const dir = fs.packDir();
     const table = claimant(model_type, config_json, &dir) orelse
-        return .{ .legacy = if (served.serves(model_type)) "no single claimant" else "type not served" };
+        return .{ .declined = if (served.serves(model_type)) "no single claimant" else "type not served" };
     const b = try a.create(Binding);
     b.* = .{ .table = table, .outside = outside.ownerOf(table) != null };
     const v = table.parse(&dir, abi.Str.of(config_json), .{}, null, false, &b.parsed);
     if (!v.isOk()) {
         a.destroy(b);
-        return .{ .legacy = v.why.slice() };
+        return .{ .declined = v.why.slice() };
     }
-    // A drafter sidecar the plugin cannot serve stays with the legacy path while one exists; a type whose legacy
-    // forward is gone serves without drafters (the load skips the sidecar by name).
-    if (servesDflash(table, &b.parsed) or served.legacyRemoved(model_type) or b.outside) {} else if (dflash.resolveInDirDrafter(io, a, model_dir)) |p| {
-        a.free(p);
-        table.free_parsed(&b.parsed);
-        a.destroy(b);
-        return .{ .legacy = "a drafter sidecar the plugin does not serve" };
-    }
-    // The legacy parse infers an embedding pack's pooling from its folder name, which `parse` never sees: an encoder
-    // serves under that config's pooling, a decoder only where its plugin serves the embedding batch.
+    // The engine reads an embedding pack's pooling from its folder name, which `parse` never sees: an encoder serves
+    // under that config's pooling, a decoder only where its plugin serves the embedding batch.
     if (!b.parsed.caps.embed and !served.servesDecoderEmbedding(model_type) and model.poolingFromDirName(std.fs.path.basename(model_dir), model_type) != null) {
         b.destroy(a);
-        return .{ .legacy = "pooling from the folder name on a decoder" };
+        return .{ .declined = "an embedding pack by its folder name" };
     }
     return .{ .bound = b };
 }
@@ -148,7 +151,7 @@ pub fn resolve(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, raw_json
 /// What discovery reads of a served pack: the stub parse's shell and caps.
 pub const Stub = struct { shell: abi.Shell, caps: abi.Caps };
 
-/// The plugin's stub parse of the pack at `model_dir`; null when the legacy reading serves it.
+/// The plugin's stub parse of the pack at `model_dir`; null when no plugin serves it.
 pub fn stubOf(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, raw_json: []const u8) ?Stub {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -285,20 +288,6 @@ test "plugin claimant: a served type goes to its one claimant; an unserved type 
     try testing.expectEqual(@as(?*const abi.ModelTable, null), claimantIn(&one, "not_served", "{}", &dir));
     const two = [_]sdk_plugin.Entry{ .{ .plugin = .{ .name = "a", .kind = .model }, .model = &a }, .{ .plugin = .{ .name = "twin", .kind = .model }, .model = &twin } };
     try testing.expectEqual(@as(?*const abi.ModelTable, null), claimantIn(&two, "llama", "{}", &dir));
-}
-
-test "plugin config: DFlash is served where the trunk is lent and layers captured; an MTP head needs neither caps" {
-    const T = struct {
-        fn weight(_: *anyopaque, _: abi.TrunkWeight, _: *quant_abi.Weight) callconv(.c) abi.Verdict {
-            return .ok;
-        }
-    };
-    const lent: abi.ModelTable = .{ .name = .of("t"), .claims = undefined, .parse = undefined, .free_parsed = undefined, .bill = undefined, .load = undefined, .unload = undefined, .forward = undefined, .cache = undefined, .weights = undefined, .spec = &.{ .trunk_weight = &T.weight } };
-    var bare = lent;
-    bare.spec = null;
-    const capture: abi.Parsed = .{ .caps = .{ .dflash_capture = true } };
-    try testing.expect(servesDflash(&lent, &capture) and lendsTrunk(&lent));
-    try testing.expect(!servesDflash(&lent, &.{}) and !servesDflash(&bare, &capture) and !lendsTrunk(&bare));
 }
 
 test "plugin config: the cache layout sets the sliding window, the global layers and KV sharing; embed_scale the scaling" {

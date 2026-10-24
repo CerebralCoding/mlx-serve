@@ -71,7 +71,7 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
         c.num_kv_shared_layers >= c.num_hidden_layers or (c.has_sliding_window and c.sliding_window_pattern == 0) or
         c.partial_rotary_factor_global <= 0 or c.partial_rotary_factor_global > 1)
         return unsupported("dimensions out of range");
-    const v = gemma.finish(dir, d.root, c, stub, .{ .batches_decode = batches_decode and c.num_experts == 0, .moe = c.num_experts > 0, .exact_resumed = true, .dflash_capture = true }, out);
+    const v = gemma.finish(dir, d.root, c, stub, .{ .batches_decode = batches_decode and c.num_experts == 0, .moe = c.num_experts > 0, .exact_resumed = true, .dflash_capture = true, .prefill_mask = true }, out);
     if (!v.isOk()) return v;
     // Gemma 4 opens its own `<|channel>thought` block when asked to think.
     out.chat.reasoning_dialect = .gemma_channel;

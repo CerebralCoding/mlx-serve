@@ -1,15 +1,16 @@
 //! Llama, Mistral and Qwen2: the dense decoder base over the engine's loaded tensors. The forward is
 //! `Decoder(TableEmbed, RmsNorm, Attention, SwiGlu, ResidualTail, LmHead)`; the load reads each projection through the
 //! pack's quant format, joins q|k|v and gate|up rows of quantized layers (as the engine's loader did) and builds the
-//! llama3 rope table. Every layer is full attention at the shell's geometry (no cache layout hook).
+//! scaled rope (`sdk/config/rope_scaling.zig`). Every layer is full attention at the shell's geometry (no cache layout hook).
 
 const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 const mlx = @import("../../mlx/ffi.zig");
-const computeLlama3Freqs = @import("../../sdk/blocks/rope/rope.zig").computeLlama3Freqs;
 const bases = @import("../../sdk/bases/bases.zig");
 const run_mod = @import("../../sdk/bases/run.zig");
+const rope_scaling = @import("../../sdk/config/rope_scaling.zig");
+const scaled = @import("../../sdk/blocks/rope/scaled.zig");
 pub const loader = @import("load.zig");
 pub const config = @import("config.zig");
 
@@ -99,16 +100,9 @@ pub fn loadDense(comptime D: type, ctx: *const abi.LoadCtx, comptime normOf: any
     m.layers = try gpa.alloc(D.Layer, c.num_hidden_layers);
     const o = &m.owned;
 
-    var freqs: Array = .{};
-    if (c.llama3) |l3| {
-        var f64s: [256]f64 = undefined;
-        var f32s: [256]f32 = undefined;
-        const half = c.head_dim / 2;
-        computeLlama3Freqs(f64s[0..half], c.head_dim, c.rope_theta, l3);
-        for (f64s[0..half], f32s[0..half]) |v, *x| x.* = @floatCast(v);
-        freqs = mlx.mlx_array_new_data(&f32s, &[_]c_int{@intCast(half)}, 1, .float32);
-        try o.own(freqs);
-    }
+    scaled.logScaling(ctx.parsed.shell.model_type.slice(), c.rope);
+    const freqs: Array = (try scaled.freqs(c.rope, c.head_dim, c.rope_theta)) orelse .{};
+    if (freqs.ctx != null) try o.own(freqs);
 
     const hidden = c.hidden_size;
     const q_rows = c.num_attention_heads * c.head_dim;
@@ -151,8 +145,10 @@ pub fn loadDense(comptime D: type, ctx: *const abi.LoadCtx, comptime normOf: any
                     .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(c.head_dim))),
                     .rope_dims = @intCast(c.head_dim),
                     .rope_base = c.rope_theta,
-                    .rope_scale = 1.0,
+                    .rope_scale = rope_scaling.positionScale(c.rope),
                     .freqs = freqs,
+                    .mscale = @floatCast(rope_scaling.mscale(c.rope)),
+                    .ntk = rope_scaling.ntk(c.rope, c.max_position_embeddings),
                 },
             },
             .mlp = .{ .gate = gate, .up = up, .down = down, .gu = gu, .rows_joined = qkv.built() },

@@ -8,6 +8,8 @@ const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 const generation = @import("../../sdk/config/generation.zig");
 const quant_config = @import("../../sdk/config/quantization_config.zig");
+const rope_scaling = @import("../../sdk/config/rope_scaling.zig");
+const json_read = @import("../../sdk/config/json.zig");
 
 pub const plugin = @import("../../sdk/plugin.zig").Plugin{
     .name = "qwen3",
@@ -19,14 +21,6 @@ pub const plugin = @import("../../sdk/plugin.zig").Plugin{
 pub const model_types = [_][]const u8{ "qwen3", "qwen3_moe", "qwen3_moe_text" };
 
 pub const claims = sdk.claimsByType(&model_types);
-
-/// Llama 3.x `rope_type: "llama3"` (HF `_compute_llama3_parameters`), read through f32 as the engine stores it.
-pub const Llama3 = struct {
-    factor: f64,
-    low_freq_factor: f64 = 1.0,
-    high_freq_factor: f64 = 4.0,
-    original_max_position_embeddings: f64 = 8192.0,
-};
 
 /// The fields the forward and the load read.
 pub const Config = struct {
@@ -42,7 +36,9 @@ pub const Config = struct {
     rope_theta: f32,
     /// `1 / sqrt(query_pre_attn_scalar)` is the attention scale; the head width when the config omits it.
     query_pre_attn_scalar: u32,
-    llama3: ?Llama3 = null,
+    /// The `rope_scaling` block (mlx-lm's `initialize_rope`).
+    rope: rope_scaling.Scaling = .none,
+    max_position_embeddings: u32 = 0,
     tie_word_embeddings: bool = false,
     num_experts: u32 = 0,
     num_experts_per_tok: u32 = 0,
@@ -126,25 +122,6 @@ pub fn partialRotary(cfg: std.json.ObjectMap, root_too: bool) error{Unsupported}
     return p;
 }
 
-/// The llama3 schedule of `rope_scaling` (or v5's `rope_parameters`); `error.Unsupported` for any other scaling.
-pub fn ropeScaling(cfg: std.json.ObjectMap) error{Unsupported}!?Llama3 {
-    const rs = field(cfg, "rope_scaling") orelse field(cfg, "rope_parameters") orelse return null;
-    if (rs != .object) return error.Unsupported;
-    // The engine reads a block that names no schedule as the plain rope.
-    const t = field(rs.object, "rope_type") orelse field(rs.object, "type") orelse return null;
-    if (t != .string) return error.Unsupported;
-    if (std.mem.eql(u8, t.string, "default")) return null;
-    if (!std.mem.eql(u8, t.string, "llama3")) return error.Unsupported;
-    var r = Llama3{ .factor = float(field(rs.object, "factor")) orelse return error.Unsupported };
-    if (field(rs.object, "low_freq_factor")) |v| r.low_freq_factor = float(v) orelse return error.Unsupported;
-    if (field(rs.object, "high_freq_factor")) |v| r.high_freq_factor = float(v) orelse return error.Unsupported;
-    if (field(rs.object, "original_max_position_embeddings")) |v| r.original_max_position_embeddings = float(v) orelse return error.Unsupported;
-    if (r.factor <= 0 or r.high_freq_factor <= r.low_freq_factor) return error.Unsupported;
-    inline for (.{ "factor", "low_freq_factor", "high_freq_factor", "original_max_position_embeddings" }) |n|
-        @field(r, n) = @as(f32, @floatCast(@field(r, n)));
-    return r;
-}
-
 fn quantMode(name: []const u8) ?abi.QuantMode {
     inline for (.{ .affine, .nvfp4, .mxfp4, .mxfp8 }) |m| if (std.mem.eql(u8, name, @tagName(m))) return m;
     return null;
@@ -206,14 +183,6 @@ pub fn tied(root: std.json.ObjectMap, cfg: std.json.ObjectMap) bool {
     return t;
 }
 
-/// `layer_types` naming only full attention (transformers v5 writes it for every model) is the engine's every-layer
-/// full attention; any other entry is a shape this family does not serve.
-pub fn allFullAttention(cfg: std.json.ObjectMap) bool {
-    const lt = field(cfg, "layer_types") orelse return true;
-    if (lt != .array) return false;
-    for (lt.array.items) |item| if (item != .string or !std.mem.eql(u8, item.string, "full_attention")) return false;
-    return true;
-}
 
 /// Keys whose presence means a shape this plugin does not serve (another family's, or a feature the base lacks).
 const foreign_keys = [_][]const u8{
@@ -263,7 +232,7 @@ pub fn parseAs(comptime asr: bool, dir: *const abi.PackDir, config_json: abi.Str
         if (asr and std.mem.eql(u8, k, "audio_config")) continue;
         if (field(cfg, k) != null or field(root, k) != null) return unsupported(P, "a key this plugin does not model");
     }
-    if (!allFullAttention(cfg)) return unsupported(P, "layer_types other than full attention");
+    if (!json_read.allFullAttention(cfg)) return unsupported(P, "layer_types other than full attention");
     // An embedding pack (Qwen3-Embedding: `pooling_mode` or a sentence-transformers sidecar) is the dense trunk; the
     // engine reads its pooling, the dense attention serves the padded batch.
     if ((moe or asr) and (field(root, "pooling_mode") != null or dir.has("1_Pooling/config.json"))) return unsupported(P, "an embedding pack on the MoE layout");
@@ -292,10 +261,9 @@ pub fn parseAs(comptime asr: bool, dir: *const abi.PackDir, config_json: abi.Str
     c.query_pre_attn_scalar = if (field(cfg, "query_pre_attn_scalar")) |v| int(v) orelse return unsupported(P, "query_pre_attn_scalar") else c.head_dim;
     if (c.query_pre_attn_scalar == 0) return unsupported(P, "query_pre_attn_scalar");
     if ((partialRotary(cfg, false) catch return unsupported(P, "partial_rotary_factor")) != 1.0) return unsupported(P, "a partial rotary factor");
-    // The MoE parse reads no llama3 table; the dense one does.
-    const l3 = ropeScaling(cfg) catch return unsupported(P, "a rope scaling other than llama3");
-    if (moe and l3 != null) return unsupported(P, "a llama3 rope on the MoE layout");
-    c.llama3 = l3;
+    c.rope = rope_scaling.parse(cfg);
+    c.max_position_embeddings = int(field(cfg, "max_position_embeddings")) orelse int(field(root, "max_position_embeddings")) orelse 0;
+    if (c.rope == .dynamic and c.max_position_embeddings == 0) c.rope = .unmodeled;
     c.tie_word_embeddings = tied(root, cfg);
     if (moe) {
         c.num_experts = int(field(cfg, "num_experts")) orelse return unsupported(P, "num_experts");
@@ -315,7 +283,7 @@ pub fn parseAs(comptime asr: bool, dir: *const abi.PackDir, config_json: abi.Str
     }
     c.quant = quantization(outer) catch return unsupported(P, "quantization");
 
-    var p: abi.Parsed = .{ .caps = .{ .batches_decode = !moe, .moe = moe, .dflash_capture = true } };
+    var p: abi.Parsed = .{ .caps = .{ .batches_decode = !moe and c.rope != .dynamic, .moe = moe, .dflash_capture = true } };
     const s = &p.shell;
     s.* = .{
         .vocab_size = c.vocab_size,
@@ -332,7 +300,7 @@ pub fn parseAs(comptime asr: bool, dir: *const abi.PackDir, config_json: abi.Str
         .model_type = abi.Str.of(if (moe) "qwen3_moe" else "qwen3"),
     };
     shellCommon(root, cfg, s) catch return unsupported(P, "bos or eos ids");
-    if (c.llama3 != null) p.cache.layout_namespace = abi.Str.of("llama3-rope-v1");
+    if (rope_scaling.layoutNamespace(c.rope)) |ns| p.cache.layout_namespace = abi.Str.of(ns);
     p.chat.sampling_defaults = .{ .top_k = 20, .top_p = 0.95 };
     // Thinking stays off unless the pack's generation_config asks (the host reads that).
     p.chat.thinking_default = .off;
@@ -419,7 +387,6 @@ test "qwen3 config: shapes this plugin does not serve are refused unsupported, b
         "{\"model_type\":\"llama\"}",
         qwen3_8b[0 .. qwen3_8b.len - 1] ++ ",\"layer_types\":[\"sliding_attention\"]}",
         qwen3_30b_a3b[0 .. qwen3_30b_a3b.len - 1] ++ ",\"pooling_mode\":\"last_token\"}",
-        qwen3_8b[0 .. qwen3_8b.len - 1] ++ ",\"rope_parameters\":{\"rope_type\":\"yarn\",\"factor\":4.0}}",
         qwen3_30b_a3b[0 .. qwen3_30b_a3b.len - 1] ++ ",\"shared_expert_intermediate_size\":512}",
     }) |json| {
         var p: abi.Parsed = .{};
@@ -428,6 +395,33 @@ test "qwen3 config: shapes this plugin does not serve are refused unsupported, b
     }
     var p: abi.Parsed = .{};
     try testing.expectEqual(abi.Verdict.Code.failed, parseJson("{", true, &p).code);
+}
+
+test "qwen3 config: the defaults released MoE configs carry are served (empty mlp_only_layers, sparse step 1, all-full layer_types, a null rope_scaling)" {
+    const v5 = qwen3_30b_a3b[0 .. qwen3_30b_a3b.len - 1] ++ ",\"layer_types\":[\"full_attention\",\"full_attention\"],\"rope_scaling\":null}";
+    var p: abi.Parsed = .{};
+    try testing.expect(parseJson(v5, true, &p).isOk());
+    defer freeParsed(&p);
+    try testing.expect(of(&p).rope == .none and p.caps.moe);
+}
+
+test "qwen3 config: the rope scalings mlx-lm builds are served, their K/V under a fresh SSD namespace" {
+    inline for (.{
+        .{ ",\"rope_parameters\":{\"rope_type\":\"yarn\",\"factor\":4.0,\"original_max_position_embeddings\":32768}}", true },
+        .{ ",\"rope_parameters\":{\"type\":\"linear\",\"factor\":2.0}}", true },
+        .{ ",\"rope_parameters\":{\"type\":\"dynamic\",\"factor\":2.0}}", false },
+    }) |case| {
+        inline for (.{ qwen3_8b, qwen3_30b_a3b }) |base| {
+            var p: abi.Parsed = .{};
+            const cfg = base[0 .. base.len - 1] ++ case[0];
+            try testing.expect(parseJson(cfg, true, &p).isOk());
+            defer freeParsed(&p);
+            try testing.expect(of(&p).rope != .none);
+            try testing.expectEqualStrings("scaled-rope-v1", p.cache.layout_namespace.slice());
+            // Dynamic NTK ropes each forward at the base its positions reach: no batched rows.
+            if (!case[1]) try testing.expect(!p.caps.batches_decode);
+        }
+    }
 }
 
 test "qwen3 config: transformers v5's all-full layer_types and rope_parameters read as the plain rope" {

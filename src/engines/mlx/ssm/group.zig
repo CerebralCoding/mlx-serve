@@ -1542,7 +1542,7 @@ test "persistent group: forwardWith releases a bound member between batched tick
     var tok_id: i32 = 1;
     const tok = mlx.mlx_array_new_data(&tok_id, &tok_shape, 2, .int32);
     defer _ = mlx.mlx_array_free(tok);
-    try std.testing.expectError(error.MissingWeight, p_xfm.forwardWith(&p_slots[0].ctx, tok));
+    try std.testing.expectError(error.PluginDeclinedNoLegacy, p_xfm.forwardWith(&p_slots[0].ctx, tok));
     try std.testing.expect(p_slots[0].entries[0].group == null);
     try ssmTickBumpSlots(s, p_ctxs[0..1], kinds);
     try ssmTickBumpSlots(s, o_ctxs[0..1], kinds);

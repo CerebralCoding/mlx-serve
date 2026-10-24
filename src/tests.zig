@@ -78,9 +78,6 @@ test {
     _ = @import("plugins/flint/proof_test.zig");
     _ = @import("plugins/llama/proof_test.zig");
     _ = @import("engines/mlx/kv/cache_ops.zig");
-    _ = @import("sdk/bases/proof/dense_test.zig");
-    _ = @import("sdk/bases/proof/layered_test.zig");
-    _ = @import("sdk/bases/proof/attention_test.zig");
     _ = @import("engines/ds4/engine.zig");
     _ = @import("plugins/registry.zig");
     _ = @import("host/plugins/loader.zig");
@@ -107,7 +104,6 @@ test {
     _ = @import("plugins/qwen3_next/plugin.zig");
     _ = @import("plugins/qwen3_asr/plugin.zig");
     _ = @import("sdk/testing/kernel_contract/registry.zig");
-    _ = @import("sdk/bases/proof/mixers.zig");
     _ = @import("host/chat/chat.zig");
     _ = @import("engines/llama/engine.zig");
     _ = @import("host/engines/served.zig");

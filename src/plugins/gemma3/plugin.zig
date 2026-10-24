@@ -43,6 +43,7 @@ pub const table = abi.ModelTable{
     .forward = &forward,
     .cache = &.{ .layout = &config.layout },
     .weights = &.{},
+    .spec = &.{ .trunk_weight = &load_mod.TrunkWeight(Loaded).get },
 };
 
 const gpa = load_mod.gpa;

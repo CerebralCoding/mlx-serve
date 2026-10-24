@@ -185,6 +185,22 @@ test "gemma4 plugin: a 31B-like bf16 pack (no PLE, K=V full layers, untied head)
     try b.expectDone();
 }
 
+test "gemma4 plugin: lm_head_mxfp8 (LOSSY) quantizes the 31B-like pack's untied head as the legacy load does" {
+    const cli = &@import("../../engines/mlx/transformer.zig").cli().lm_head_mxfp8_cli;
+    const was = cli.*;
+    defer cli.* = was;
+    cli.* = true;
+    var p = fixture.Pack.init(0x9e4c);
+    defer p.deinit();
+    try writeGemma4(&p, null, 0, 0, true, true);
+    var b = try proof.Both.openAs(&gemma4.table, &p, dense31b, oracle("31b-mxfp8"));
+    defer b.close();
+    try testing.expect(b.xfm.lm_head_s.ctx != null);
+    try proof.expectSteps(&b);
+    try proof.expectGreedy(&b);
+    try b.expectDone();
+}
+
 /// A 26B-A4B-shaped layer stack: the attention of `writeGemma4` (no PLE, K=V full layers), a shared GeGLU MLP and
 /// `E` experts of width `MI` under the sigma-MoE router, the two extra feed-forward norms, layer scalars.
 const E = 8;
@@ -541,6 +557,34 @@ test "gemma4 plugin: an NVIDIA ModelOpt NVFP4 pack is declined, and the legacy l
     var buf: [512]u8 = undefined;
     const dir = buf[0..try tmp.dir.realPath(io, &buf)];
     const out = try plugin_config.resolve(io, a, dir, json);
-    try testing.expectEqualStrings("gemma: a quantization_config naming a quant_method", out.legacy);
+    try testing.expectEqualStrings("gemma: a quantization_config naming a quant_method", out.declined);
     try testing.expectError(error.ModelOptUnsupportedGlobalScale, p.load(json));
+}
+
+// Bar: LTX 2.5's text encoder (a left-padded prompt under its additive mask, every layer's residual captured) gives
+// the states the legacy forward recorded in `fixtures/ltx-mask.tape`, bit for bit.
+test "gemma4 plugin: LTX 2.5's text encoder states over a left-padded prompt replay the legacy forward's" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const tape_mod = @import("../../engines/mlx/plugin/tape.zig");
+    var p = fixture.Pack.init(0x9e53);
+    defer p.deinit();
+    try writeGemma4(&p, null, 0, 0, true, true);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    try p.save(dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = dense31b });
+    const ids = [_]i32{ 0, 0, 0, 0, 7, 19, 42, 5, 88, 3, 61, 200 };
+    const states = try @import("../ltx/video.zig").gemmaCapture4(io, a, dir, &ids, 0, fixture.stream());
+    defer {
+        for (states) |x| _ = mlx.mlx_array_free(x);
+        a.free(states);
+    }
+    var tape = try tape_mod.Tape.player(@embedFile("fixtures/ltx-mask.tape"));
+    defer tape.finish() catch |e| std.debug.panic("proof tape: {t}", .{e});
+    for (states) |x| try tape.expectNext(x, false);
+    try tape.expectDone();
 }
