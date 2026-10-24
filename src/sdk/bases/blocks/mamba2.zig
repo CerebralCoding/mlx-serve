@@ -12,7 +12,7 @@ const Linear = @import("linear.zig").Linear;
 const row_exact = @import("row_exact.zig");
 const conv_window = @import("conv_window.zig");
 const mamba2_decode = @import("../../blocks/ssm/mamba2_decode.zig");
-const RECURRENCE_EVAL_INTERVAL = @import("../../../engines/mlx/eval_cadence.zig").RECURRENCE_EVAL_INTERVAL;
+const RECURRENCE_EVAL_INTERVAL = @import("../run.zig").RECURRENCE_EVAL_INTERVAL;
 
 const Array = ops.Array;
 const Graph = ops.Graph;

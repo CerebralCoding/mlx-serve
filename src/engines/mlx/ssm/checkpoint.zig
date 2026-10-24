@@ -142,14 +142,9 @@ pub fn captureSsmCheckpoint(
     return .{ .pos = pos, .layers = layers };
 }
 
-/// Test seams (inference thread only): the copy/eval counters let the retention and cadence tests see what the loop did.
-pub var compact_conv_state_override: ?bool = null;
-pub var compact_conv_state_copy_count: u64 = 0;
 pub var cadence_conv_eval_count: u64 = 0;
 
-pub fn compactConvStateEnabled() bool {
-    return compact_conv_state_override orelse true;
-}
+pub const compactConvStateEnabled = @import("../../../sdk/blocks/conv/depthwise.zig").compactConvStateEnabled;
 
 /// A second owner for `cp`'s state: fresh handles and a fresh layer slice,
 /// refcount-SHARING every underlying buffer (`mlx_array_set`, the same idiom

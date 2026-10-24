@@ -196,14 +196,7 @@ pub fn decodeShareCapped(width: usize, cap: usize) usize {
 /// silently tanks MoE prefill throughput (~25% on 35B-class models for an
 /// 850-token prompt at stride 256). Keeping typical prompts single-chunk is what
 /// `ssm_checkpoint_stride`'s default guards.
-/// A trailing remainder smaller than this merges into the preceding chunk
-/// instead of becoming its own chunk. Chat-templated prompts routinely land a
-/// token or two past a chunk multiple (an "8192-token" prompt tokenizes to
-/// 8193); a 1-token final chunk pays a full graph build + eval barrier +
-/// cache clear for one token. The merged chunk's attention-score transient
-/// grows by at most TAIL_MERGE_MAX/default_chunk (~6% at 8192) — within the
-/// score-budget slack `boundedPrefillChunk` already carries.
-pub const TAIL_MERGE_MAX: usize = 512;
+pub const TAIL_MERGE_MAX = @import("../../../sdk/bases/run.zig").TAIL_MERGE_MAX;
 
 /// The tail a chunk of `default_chunk` tokens may absorb where the width is chosen per chunk:
 /// an eighth of the width keeps the flat 512's ~6% bound at every rung (at the ladder floor

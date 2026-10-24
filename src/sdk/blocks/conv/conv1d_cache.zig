@@ -3,15 +3,15 @@
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const checkpoint = @import("../../../engines/mlx/ssm/checkpoint.zig");
-const PREFILL_EVAL_MIN_SEQ = @import("../../../engines/mlx/eval_cadence.zig").PREFILL_EVAL_MIN_SEQ;
-const compactConvStateEnabled = @import("../../../engines/mlx/ssm/checkpoint.zig").compactConvStateEnabled;
+const PREFILL_EVAL_MIN_SEQ = @import("../../bases/run.zig").PREFILL_EVAL_MIN_SEQ;
+const compactConvStateEnabled = @import("depthwise.zig").compactConvStateEnabled;
 const SSMCacheEntry = @import("../../../engines/mlx/ssm/entry.zig").SSMCacheEntry;
 const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
 const materializedOwnedCopy = @import("../../../mlx/array.zig").materializedOwnedCopy;
 const attn256RandBf16 = @import("../attention/attn256.zig").attn256RandBf16;
 const depthwiseConvCuda = @import("depthwise.zig").depthwiseConvCuda;
 const depthwiseConvStep = @import("depthwise.zig").depthwiseConvStep;
+const depthwise_vars = @import("depthwise.zig");
 
 // ── Conv1d with cache (shared by GatedDeltaNet, LFM2, Mamba2) ──
 
@@ -69,7 +69,7 @@ pub fn conv1dWithCache(
             const owned = try materializedOwnedCopy(self.s, new_conv_state);
             _ = mlx.mlx_array_free(new_conv_state);
             new_conv_state = owned;
-            checkpoint.compact_conv_state_copy_count += 1;
+            depthwise_vars.compact_conv_state_copy_count += 1;
         }
         _ = mlx.mlx_array_free(ssm.conv_state);
         ssm.conv_state = new_conv_state;
@@ -118,9 +118,9 @@ pub fn conv1dWithCache(
 fn conv1dTailRetentionDelta(batch: c_int, seq: c_int, cdim: c_int, kernel: c_int) !usize {
     const t = std.testing;
     const s = mlx.gpuStream();
-    const saved = checkpoint.compact_conv_state_override;
-    checkpoint.compact_conv_state_override = true;
-    defer checkpoint.compact_conv_state_override = saved;
+    const saved = depthwise_vars.compact_conv_state_override;
+    depthwise_vars.compact_conv_state_override = true;
+    defer depthwise_vars.compact_conv_state_override = saved;
     var xfm: Transformer = undefined;
     xfm.rht = null;
     xfm.s = s;
@@ -211,9 +211,9 @@ test "conv1dWithCache tail drops a batch-2 strided prefill parent" {
 }
 
 fn conv1dBitCopy(batch: c_int, seq: c_int, cdim: c_int, kernel: c_int, compact: bool, s: mlx.mlx_stream) !struct { out: mlx.mlx_array, conv_state: mlx.mlx_array } {
-    const saved = checkpoint.compact_conv_state_override;
-    checkpoint.compact_conv_state_override = compact;
-    defer checkpoint.compact_conv_state_override = saved;
+    const saved = depthwise_vars.compact_conv_state_override;
+    depthwise_vars.compact_conv_state_override = compact;
+    defer depthwise_vars.compact_conv_state_override = saved;
 
     var xfm: Transformer = undefined;
 
@@ -239,9 +239,9 @@ fn conv1dBitCopy(batch: c_int, seq: c_int, cdim: c_int, kernel: c_int, compact: 
 }
 
 fn conv1dTwoChunk(batch: c_int, t1: c_int, t2: c_int, cdim: c_int, kernel: c_int, compact: bool, s: mlx.mlx_stream) !struct { out: mlx.mlx_array, conv_state: mlx.mlx_array } {
-    const saved = checkpoint.compact_conv_state_override;
-    checkpoint.compact_conv_state_override = compact;
-    defer checkpoint.compact_conv_state_override = saved;
+    const saved = depthwise_vars.compact_conv_state_override;
+    depthwise_vars.compact_conv_state_override = compact;
+    defer depthwise_vars.compact_conv_state_override = saved;
 
     var xfm: Transformer = undefined;
 
@@ -317,16 +317,16 @@ test "conv1dWithCache decode width does not copy the tail" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const t = std.testing;
     const s = mlx.gpuStream();
-    const saved = checkpoint.compact_conv_state_override;
-    defer checkpoint.compact_conv_state_override = saved;
-    checkpoint.compact_conv_state_override = true;
-    checkpoint.compact_conv_state_copy_count = 0;
+    const saved = depthwise_vars.compact_conv_state_override;
+    defer depthwise_vars.compact_conv_state_override = saved;
+    depthwise_vars.compact_conv_state_override = true;
+    depthwise_vars.compact_conv_state_copy_count = 0;
     const on = try conv1dBitCopy(1, 1, 32, 4, true, s);
     defer {
         _ = mlx.mlx_array_free(on.out);
         _ = mlx.mlx_array_free(on.conv_state);
     }
-    try t.expectEqual(@as(u64, 0), checkpoint.compact_conv_state_copy_count);
+    try t.expectEqual(@as(u64, 0), depthwise_vars.compact_conv_state_copy_count);
     const off = try conv1dBitCopy(1, 1, 32, 4, false, s);
     defer {
         _ = mlx.mlx_array_free(off.out);

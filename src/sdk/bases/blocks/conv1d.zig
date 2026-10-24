@@ -4,10 +4,10 @@
 
 const mlx = @import("../../../mlx/ffi.zig");
 const ops = @import("../../../mlx/ops.zig");
-const checkpoint = @import("../../../engines/mlx/ssm/checkpoint.zig");
-const PREFILL_EVAL_MIN_SEQ = @import("../../../engines/mlx/eval_cadence.zig").PREFILL_EVAL_MIN_SEQ;
+const PREFILL_EVAL_MIN_SEQ = @import("../run.zig").PREFILL_EVAL_MIN_SEQ;
 const materializedOwnedCopy = @import("../../../mlx/array.zig").materializedOwnedCopy;
 const depthwise = @import("../../blocks/conv/depthwise.zig");
+const compactConvStateEnabled = @import("../../blocks/conv/depthwise.zig").compactConvStateEnabled;
 
 const Array = ops.Array;
 const Graph = ops.Graph;
@@ -23,9 +23,9 @@ pub fn run(g: *Graph, x: Array, window: ?Array, w: Array, bias: ?Array, batch: c
     const len = ops.shape(input)[1];
     var tail = try g.slice(input, &.{ 0, len - (kernel - 1), 0 }, &.{ batch, len, cdim });
     // An owned copy: a slice of a chunk-wide input keeps the whole chunk alive until the layer's next forward.
-    if (checkpoint.compactConvStateEnabled() and len - (kernel - 1) >= PREFILL_EVAL_MIN_SEQ) {
+    if (compactConvStateEnabled() and len - (kernel - 1) >= PREFILL_EVAL_MIN_SEQ) {
         tail = try g.adopt(try materializedOwnedCopy(g.s, tail));
-        checkpoint.compact_conv_state_copy_count += 1;
+        depthwise.compact_conv_state_copy_count += 1;
     }
     var y = if (mlx.cudaAvailable() and len == kernel)
         try g.adopt(try depthwise.depthwiseConvStep(input, w, cdim, kernel, g.s))

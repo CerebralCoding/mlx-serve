@@ -21,7 +21,7 @@ pub const EVAL_EVERY_N_LAYERS: u32 = 48;
 /// linear layers hold a chunk-wide stream between cadence points.
 pub const PREFILL_EVAL_CADENCE_DEFAULT: u32 = 4;
 pub const MOE_EVAL_EVERY_N_LAYERS: u32 = PREFILL_EVAL_CADENCE_DEFAULT;
-pub const RECURRENCE_EVAL_INTERVAL: usize = 32;
+pub const RECURRENCE_EVAL_INTERVAL = @import("../../sdk/bases/run.zig").RECURRENCE_EVAL_INTERVAL;
 
 /// Per-layer prefill transient (bytes) above which the layer loop eval()s
 /// after EVERY layer instead of the coarse default cadence. Between eval
@@ -44,17 +44,7 @@ pub const RECURRENCE_EVAL_INTERVAL: usize = 32;
 /// that keeps a 32 GB Mac serving a 26B alive.
 pub const PREFILL_EVAL_TRANSIENT_BUDGET: u64 = 2 << 30;
 
-/// Forwards narrower than this skip the mid-loop eval cadence entirely.
-/// Spec-decode VERIFY forwards (PLD/drafter/MTP: seq 2..~9) ride the
-/// prefill layer loops because they're multi-token, but their lazy-graph
-/// transients are decode-scale (KB-MB) — the periodic eval() that bounds
-/// GB-scale prefill-chunk transients only costs them synchronous
-/// pipeline drains. Measured (qwen3.6-27B, 64 layers, cadence 4 = 16
-/// drains per MTP round): depth-1 rounds 48 ms where the AR forward is
-/// ~34 ms, and the drain tax grows superlinearly with draft depth.
-/// seq-1 decode never ran cadence evals, so exempting verify-width
-/// forwards bounds nothing that wasn't already unbounded at decode.
-pub const PREFILL_EVAL_MIN_SEQ: c_int = 32;
+pub const PREFILL_EVAL_MIN_SEQ = @import("../../sdk/bases/run.zig").PREFILL_EVAL_MIN_SEQ;
 
 /// Pure gate: does the mid-loop eval cadence apply to a forward of this
 /// width? (True = real prefill chunk; false = decode/spec-verify shape.)
