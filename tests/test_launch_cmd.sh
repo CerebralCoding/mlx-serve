@@ -9,7 +9,7 @@
 #
 #   ./tests/test_launch_cmd.sh [model_dir] [port]   # any small chat model (default Qwen3.5-0.8B); SKIPs without one
 #
-# Hermetic twins: builder/budget/arg-parse tests in launch.zig; Swift twin CLISetupInstructionsTests.
+# Hermetic twins: builder/budget/arg-parse tests in host/launch/launch.zig; Swift twin CLISetupInstructionsTests.
 
 set -u
 source "$(dirname "$0")/lib/server.sh"

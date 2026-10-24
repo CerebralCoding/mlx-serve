@@ -7,7 +7,7 @@
 #
 #   PENALTY_TEST_MODEL=<dir> ./tests/test_repeat_penalty.sh [port]   # default Qwen3.5-0.8B-MLX-4bit; SKIP without
 #
-# Zig twin: `repeat penalty shapes every sampling path` (generate.zig, LOGPROBS_TEST_MODEL).
+# Zig twin: `repeat penalty shapes every sampling path` (engines/mlx/generate.zig, LOGPROBS_TEST_MODEL).
 
 set -uo pipefail
 source "$(dirname "$0")/lib/server.sh"

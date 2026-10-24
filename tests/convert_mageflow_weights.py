@@ -86,7 +86,7 @@ DROP_ALWAYS = ("pipeline.y_embedder.encoder.",)
 DROP_UNLESS_EDIT = ("model.visual.", "student.dconv_encoder.")
 
 # Everything the engine opens, per component dir (see src/plugins/mage_flow/mage_flow.zig:145-227,
-# src/host/registry/discovery.zig:153, tokenizer.zig loadTokenizerAny).
+# src/host/registry/discovery.zig:153, host/tokenizer/tokenizer.zig loadTokenizerAny).
 KEEP_FILES = {
     "": ["model_index.json"],
     "scheduler": ["scheduler_config.json"],

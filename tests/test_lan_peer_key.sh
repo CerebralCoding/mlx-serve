@@ -6,7 +6,7 @@
 #
 # Without a key B lists A under `lan_needs_key` with no models; writing B's ~/.mlx-serve/lan-keys.json brings A's
 # models in within seconds; a chat on `<id>@<A>` completes through B. SKIPs without the model or a non-loopback IP.
-# Hermetic twins: `peerKeyFromJson`, the keyed-peer fetch and tunnel `Authorization` line (lan.zig), LanPeerKeysTests.
+# Hermetic twins: `peerKeyFromJson`, the keyed-peer fetch and tunnel `Authorization` line (host/lan/lan.zig), LanPeerKeysTests.
 
 source "$(dirname "$0")/lib/server.sh"
 source "$(dirname "$0")/_lib_models.sh"
