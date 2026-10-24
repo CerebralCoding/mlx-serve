@@ -291,7 +291,7 @@ pub fn unbind(b: *Bound, a: std.mem.Allocator) void {
 /// The first `ForwardCtx` field a served forward has no hook for; null when it serves them all.
 fn unservedFeature(xfm: *const Transformer, ctx: *const ForwardCtx) ?[]const u8 {
     if (ctx.stream_in != null) return "a pipeline rank's stream input";
-    if (ctx.prefill_mask_add != null) return "an additive prefill mask";
+    if (ctx.prefill_mask_add != null and !(if (xfm.config.plugin) |pb| pb.parsed.caps.prefill_mask else false)) return "an additive prefill mask";
     if (ctx.tree != null and !(if (xfm.config.plugin) |pb| pb.parsed.caps.spec_tree else false)) return "a draft tree";
     if (ctx.key_pad_mask != null and !xfm.embedding_mode) return "a key padding mask";
     if (ctx.capture_stream_all != null) return "the hyper-connection stream";
@@ -411,6 +411,7 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
             .max_depth = t.attn.max_depth,
         } else .{},
         .pipeline_every = ctx.pipeline_build,
+        .mask_add = .{ .ctx = if (ctx.prefill_mask_add) |m| m.ctx else null },
     };
     var out: abi.ForwardOut = .{ .captured = &captured };
     intree.enter(ctx);

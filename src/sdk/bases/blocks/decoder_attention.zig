@@ -1,7 +1,7 @@
 //! The dense decoder's attention with its comptime extras (Gemma 3/4, Muse, Spark, and with none of them llama/qwen3):
 //! sliding layers reading a block-sized tail of the cache under band masks, layers reading an earlier layer's KV,
 //! a parameter-free value norm, K=V layers, and a sigmoid output gate per channel or per head. Batched rows too.
-//! copied_from: engines/mlx/forward/dense.zig (`forwardStandardWith`'s attention, no `prefill_mask_add`),
+//! copied_from: engines/mlx/forward/dense.zig (`forwardStandardWith`'s attention),
 //! engines/mlx/batched/dense.zig (`forwardBatchedDecode`'s attention), sdk/blocks/attention/gates.zig
 //! (`attnOutGate`).
 
@@ -193,8 +193,16 @@ pub fn DecoderAttention(comptime opts: Options) type {
                 }
             }
 
+            // A caller's additive term (a left-padded prompt) reaches every layer's scores as an explicit array, the band
+            // summed in on a sliding layer; the fused kernels mask from geometry alone and never see it.
+            const extra = c.wide() and c.mask_add.ctx != null;
+            if (extra) {
+                mode = "array";
+                mask = if (window > 0) try g.add(try sliding.bandOnce(c, s, sv.kv_len, @intCast(window)), c.mask_add) else c.mask_add;
+            }
+
             var out: ?Array = null;
-            if (view.packed_reads and kvq.kvAttnFusedEligible(&dv, s)) {
+            if (extra) {} else if (view.packed_reads and kvq.kvAttnFusedEligible(&dv, s)) {
                 if (std.mem.eql(u8, mode, "array") and mask.ctx == null) mask = try sliding.bandOnce(c, s, sv.kv_len, @intCast(window));
                 out = try own(g, try kvq.qkvAttnDecodeKernel(g.s, q_rope, &dv, geo.scale, mode, mask));
                 if (out != null) kvq.logKvAttnFusedEngaged(&dv, q_rope, s);
@@ -207,7 +215,7 @@ pub fn DecoderAttention(comptime opts: Options) type {
                     if (out == null) out = try own(g, try sdpa.splitCausalSdpa(g.s, q_rope, dv.k, dv.v, geo.scale));
                     if (out == null) out = try sdpaRaw(g, q_rope, dv.k, dv.v, geo.scale, "causal", .{}, sdpa.sdpaForceFused(q_rope, dv.k));
                 } else if (std.mem.eql(u8, mode, "array")) {
-                    if (c.wide()) out = try own(g, try attn256.fusedSdpa256Prefill(g.s, q_rope, dv.k, dv.v, geo.scale, @intCast(window)));
+                    if (c.wide() and !extra) out = try own(g, try attn256.fusedSdpa256Prefill(g.s, q_rope, dv.k, dv.v, geo.scale, @intCast(window)));
                     if (out == null) {
                         if (mask.ctx == null) mask = try sliding.bandOnce(c, s, sv.kv_len, @intCast(window));
                         out = try sdpaRaw(g, q_rope, dv.k, dv.v, geo.scale, "array", mask, false);

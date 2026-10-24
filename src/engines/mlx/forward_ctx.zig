@@ -78,7 +78,7 @@ pub const ForwardCtx = struct {
     /// prompt has query rows whose every visible key is padding, and an
     /// all -inf row softmaxes to NaN.
     ///
-    /// Set only by the LTX text encoder (`ltx_video.gemmaCapture4`), whose
+    /// Set only by the LTX text encoder (`ltx_video.gemmaCapture4`, a plugin declaring `Caps.prefill_mask`), whose
     /// prompts are left-padded to a fixed width the reference masks out. Null
     /// everywhere else — and null is what keeps the fused prefill kernels,
     /// which mask from geometry alone and cannot carry an extra term, on
