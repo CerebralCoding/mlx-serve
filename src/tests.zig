@@ -53,7 +53,7 @@ test {
     _ = @import("engines/mlx/model.zig");
     _ = @import("engines/mlx/generate.zig");
     _ = @import("engines/mlx/transformer.zig");
-    _ = @import("sdk/vision/encoder.zig");
+    _ = @import("engines/mlx/vision_encoder.zig");
     _ = @import("sdk/vision/qwen_vision.zig");
     _ = @import("plugins/nemotron_h/radio_vision.zig");
     _ = @import("plugins/muse_glimmer/vision.zig");

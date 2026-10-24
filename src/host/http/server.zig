@@ -28,7 +28,7 @@ const radio_vision = @import("../../plugins/nemotron_h/radio_vision.zig");
 const minicpm_vision = @import("../../plugins/qwen3_5/minicpm_vision.zig");
 const minicpm_canvas = @import("../../plugins/qwen3_5/minicpm_canvas.zig");
 const mrope_mod = @import("../../sdk/vision/mrope.zig");
-const vision_mod = @import("../../sdk/vision/encoder.zig");
+const vision_mod = @import("../../engines/mlx/vision_encoder.zig");
 const log = @import("../log.zig");
 const responses_mod = @import("../api/responses/model.zig");
 const pld_index = @import("../../engines/mlx/spec/pld_index.zig");
@@ -989,5 +989,5 @@ test {
     _ = @import("../../plugins/nemotron_h/media.zig");
     _ = @import("../../plugins/qwen3_5/minicpm_media.zig");
     _ = @import("../../plugins/qwen4_exp/bill.zig");
-    _ = @import("../../sdk/vision/qwen_mrope.zig");
+    _ = @import("../media/qwen_mrope.zig");
 }

@@ -2,11 +2,11 @@
 
 const std = @import("std");
 const model_mod = @import("../../engines/mlx/model.zig");
-const mrope_mod = @import("mrope.zig");
-const log = @import("../../host/log.zig");
+const mrope_mod = @import("../../sdk/vision/mrope.zig");
+const log = @import("../log.zig");
 
-const MediaItem = @import("../../host/media/placeholders.zig").MediaItem;
-const MropeData = @import("../../host/media/encode.zig").MropeData;
+const MediaItem = @import("placeholders.zig").MediaItem;
+const MropeData = @import("encode.zig").MropeData;
 
 /// The interleaved-M-RoPE table over the FINAL (expanded) prompt; empty when
 /// the model isn't Qwen-vision or carries no image/video. Caller owns `pos`.

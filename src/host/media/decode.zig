@@ -9,7 +9,7 @@ const lfm2_vision = @import("../../plugins/lfm2/vision.zig");
 const glm_vision = @import("../../plugins/glm5_next/vision.zig");
 const dsv41_vision = @import("../../plugins/deepseek_v41/vision.zig");
 const radio_vision = @import("../../plugins/nemotron_h/radio_vision.zig");
-const vision_mod = @import("../../sdk/vision/encoder.zig");
+const vision_mod = @import("../../engines/mlx/vision_encoder.zig");
 const log = @import("../log.zig");
 const stb = @import("stb");
 const webp = @import("webp");
@@ -99,7 +99,7 @@ pub fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp
     }
 
     if (vp.mode == .gemma_budget) {
-        const img = vision_mod.budgetPixels(allocator, src.rgb, src_h, src_w, vp.patch, vp.merge, vp.max_tokens) catch return null;
+        const img = qwen_vision.budgetPixels(allocator, src.rgb, src_h, src_w, vp.patch, vp.merge, vp.max_tokens) catch return null;
         log.info("  Decoded {d}x{d} image → {d}x{d} float32 CHW ({d} soft tokens)\n", .{ src_w, src_h, img.w, img.h, (img.h / vp.patch / vp.merge) * (img.w / vp.patch / vp.merge) });
         return .{ .pixels = img.pixels, .width = img.w, .height = img.h };
     }
@@ -219,19 +219,19 @@ fn decodeBudgetVideo(allocator: std.mem.Allocator, frame_urls: []const []const u
     if (frame_urls.len == 0 or vp.max_frames == 0) return null;
     const kept = @min(frame_urls.len, vp.max_frames);
     var bytes: []u8 = &.{};
-    var size: vision_mod.Resized = undefined;
+    var size: qwen_vision.Resized = undefined;
     var frame_bytes: usize = 0;
     var done = false;
     defer if (!done and bytes.len > 0) allocator.free(bytes);
     for (0..kept) |k| {
-        const rgb = decodeFrameUrl(allocator, frame_urls[vision_mod.sampledFrame(k, frame_urls.len, vp.max_frames)], vp.composite_alpha) orelse return null;
+        const rgb = decodeFrameUrl(allocator, frame_urls[qwen_vision.sampledFrame(k, frame_urls.len, vp.max_frames)], vp.composite_alpha) orelse return null;
         defer rgb.deinit(allocator);
         if (k == 0) {
-            size = vision_mod.budgetSize(rgb.h, rgb.w, vp.patch, vp.merge, vp.max_tokens) orelse return null;
+            size = qwen_vision.budgetSize(rgb.h, rgb.w, vp.patch, vp.merge, vp.max_tokens) orelse return null;
             frame_bytes = 3 * @as(usize, size.h) * size.w * @sizeOf(f32);
             bytes = allocator.alloc(u8, kept * frame_bytes) catch return null;
         }
-        const frame = vision_mod.resizeToUnitChw(allocator, rgb.rgb, rgb.h, rgb.w, size.h, size.w) catch return null;
+        const frame = qwen_vision.resizeToUnitChw(allocator, rgb.rgb, rgb.h, rgb.w, size.h, size.w) catch return null;
         defer allocator.free(frame.pixels);
         @memcpy(bytes[k * frame_bytes ..][0..frame_bytes], frame.pixels);
     }
