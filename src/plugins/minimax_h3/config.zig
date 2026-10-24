@@ -9,6 +9,13 @@ const pack_bytes = @import("../../sdk/media/pack_bytes.zig");
 const config_fields = @import("../../sdk/media/config_fields.zig");
 const h3 = @import("geometry.zig");
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "minimax_h3",
+    .kind = .media,
+    .claims = &model_types,
+    .gate_models = &.{"ddalcu/MiniMax-H3-MLX-Serve-4bit"},
+};
+
 pub const model_types = [_][]const u8{"minimax_h3"};
 
 pub const claims = sdk.mediaClaimsByType(&model_types);

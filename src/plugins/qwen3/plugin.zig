@@ -17,12 +17,7 @@ const QuantMode = @import("../../engines/mlx/model.zig").QuantMode;
 const ld = @import("load.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "qwen3",
-    .kind = .model,
-    .claims = &config.model_types,
-    .gate_models = &.{ "mlx-community/Qwen3-4B-4bit", "mlx-community/Qwen3-30B-A3B-4bit" },
-};
+pub const plugin = config.plugin;
 
 const b = bases.blocks;
 

@@ -8,12 +8,7 @@ const sdk = @import("../../sdk/root.zig");
 const q35 = @import("../qwen3_5/plugin.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "prism_hadamard_qwen35",
-    .kind = .model,
-    .claims = &config.model_types,
-    .gate_models = &.{"prism-ml/Ternary-Bonsai-2-27B-mlx-2bit"},
-};
+pub const plugin = config.plugin;
 
 pub const table = abi.ModelTable{
     .name = abi.Str.of(plugin.name),

@@ -13,12 +13,7 @@ const moe = @import("../../sdk/bases/blocks/moe.zig");
 const reader = @import("reader.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "lfm2",
-    .kind = .model,
-    .claims = &config.model_types,
-    .gate_models = &.{ "mlx-community/LFM2.5-1.2B-Instruct-4bit", "mlx-community/LFM2.5-8B-A1B-4bit" },
-};
+pub const plugin = config.plugin;
 
 const b = bases.blocks;
 const Array = mlx.mlx_array;

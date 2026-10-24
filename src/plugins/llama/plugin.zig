@@ -12,12 +12,7 @@ const run_mod = @import("../../sdk/bases/run.zig");
 pub const loader = @import("load.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "llama",
-    .kind = .model,
-    .claims = &config.model_types,
-    .gate_models = &.{"mlx-community/Llama-3.2-3B-Instruct-4bit"},
-};
+pub const plugin = config.plugin;
 
 const b = bases.blocks;
 

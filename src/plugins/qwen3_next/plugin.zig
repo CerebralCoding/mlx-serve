@@ -7,12 +7,7 @@ const sdk = @import("../../sdk/root.zig");
 const q35 = @import("../qwen3_5/plugin.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "qwen3_next",
-    .kind = .model,
-    .claims = &config.model_types,
-    .gate_models = &.{"mlx-community/Qwen3-Next-80B-A3B-Instruct-4bit"},
-};
+pub const plugin = config.plugin;
 
 pub const table = abi.ModelTable{
     .name = abi.Str.of(plugin.name),

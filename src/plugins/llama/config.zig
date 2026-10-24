@@ -8,6 +8,13 @@ const sdk = @import("../../sdk/root.zig");
 const generation = @import("../../sdk/config/generation.zig");
 const quant_config = @import("../../sdk/config/quantization_config.zig");
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "llama",
+    .kind = .model,
+    .claims = &model_types,
+    .gate_models = &.{"mlx-community/Llama-3.2-3B-Instruct-4bit"},
+};
+
 pub const model_types = [_][]const u8{ "llama", "mistral", "qwen2" };
 
 pub const claims = sdk.claimsByType(&model_types);

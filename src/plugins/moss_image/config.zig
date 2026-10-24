@@ -7,6 +7,13 @@ const pack_bytes = @import("../../sdk/media/pack_bytes.zig");
 const pack_claims = @import("../../sdk/media/pack_claims.zig");
 const image_request = @import("../../sdk/media/image_request.zig");
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "moss_image",
+    .kind = .media,
+    .claims = &model_types,
+    .gate_models = &.{"mlx-community/MOSS-Image-SFT-bf16"},
+};
+
 pub const model_types = [_][]const u8{"moss_image"};
 
 /// Every pack names its VAE weights so; `model_index.json` lands first in a pull.

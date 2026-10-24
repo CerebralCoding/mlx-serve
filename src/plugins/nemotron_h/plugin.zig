@@ -14,12 +14,7 @@ const mtp_head = @import("mtp_head.zig");
 const row_exact = @import("../../sdk/bases/blocks/row_exact.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "nemotron_h",
-    .kind = .model,
-    .claims = &config.model_types,
-    .gate_models = &.{"mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-4bit"},
-};
+pub const plugin = config.plugin;
 
 const b = bases.blocks;
 const Array = mlx.mlx_array;

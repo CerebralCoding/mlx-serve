@@ -5,6 +5,13 @@ const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 const q3 = @import("../qwen3/config.zig");
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "qwen3_asr",
+    .kind = .model,
+    .claims = &model_types,
+    .gate_models = &.{ "mlx-community/Qwen3-ASR-0.6B-8bit", "mlx-community/Qwen3-ForcedAligner-0.6B-8bit" },
+};
+
 pub const model_types = [_][]const u8{"qwen3_asr"};
 
 pub const claims = sdk.claimsByType(&model_types);

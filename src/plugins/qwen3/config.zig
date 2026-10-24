@@ -9,6 +9,13 @@ const sdk = @import("../../sdk/root.zig");
 const generation = @import("../../sdk/config/generation.zig");
 const quant_config = @import("../../sdk/config/quantization_config.zig");
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "qwen3",
+    .kind = .model,
+    .claims = &model_types,
+    .gate_models = &.{ "mlx-community/Qwen3-4B-4bit", "mlx-community/Qwen3-30B-A3B-4bit" },
+};
+
 pub const model_types = [_][]const u8{ "qwen3", "qwen3_moe", "qwen3_moe_text" };
 
 pub const claims = sdk.claimsByType(&model_types);
@@ -48,8 +55,8 @@ pub const Config = struct {
 
 pub const gpa = std.heap.c_allocator;
 
-pub fn unsupported(comptime plugin: []const u8, comptime why: []const u8) abi.Verdict {
-    return abi.Verdict.refuse(.unsupported, plugin ++ ": " ++ why);
+pub fn unsupported(comptime name: []const u8, comptime why: []const u8) abi.Verdict {
+    return abi.Verdict.refuse(.unsupported, name ++ ": " ++ why);
 }
 
 /// A config value as the engine reads it: JSON null is absent.

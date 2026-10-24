@@ -7,6 +7,13 @@ const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 const llama = @import("../llama/config.zig");
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "k2_horizon",
+    .kind = .model,
+    .claims = &model_types,
+    .gate_models = &.{"LLM360/K2-Horizon-7B"},
+};
+
 pub const model_types = [_][]const u8{"k2_horizon"};
 
 pub const claims = sdk.claimsByType(&model_types);

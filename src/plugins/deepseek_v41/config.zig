@@ -6,6 +6,13 @@ const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 const v4 = @import("../deepseek_v4/config.zig");
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "deepseek_v41",
+    .kind = .model,
+    .claims = &model_types,
+    .gate_models = &.{"ddalcu/DeepSeek-V4.1-Flash-1017-iQ-MLX-3.0bpw"},
+};
+
 pub const model_types = [_][]const u8{"deepseek_v41"};
 
 pub const claims = sdk.claimsByType(&model_types);

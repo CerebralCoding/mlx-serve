@@ -17,12 +17,7 @@ const SinkAttention = @import("attention.zig").SinkAttention;
 const moe = @import("moe.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "gpt_oss",
-    .kind = .model,
-    .claims = &config.model_types,
-    .gate_models = &.{"mlx-community/gpt-oss-20b-MXFP4-Q8"},
-};
+pub const plugin = config.plugin;
 
 const b = bases.blocks;
 

@@ -6,6 +6,13 @@ const std = @import("std");
 const abi = @import("../../abi/media.zig");
 const pack_claims = @import("../../sdk/media/pack_claims.zig");
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "trellis2",
+    .kind = .media,
+    .claims = &model_types,
+    .gate_models = &.{"microsoft/TRELLIS.2-4B"},
+};
+
 pub const model_types = [_][]const u8{"trellis2"};
 
 /// The SS decoder sorts last of the weights a pull lands (`pipeline.json` comes first).

@@ -13,12 +13,7 @@ const mlx = @import("../../mlx/ffi.zig");
 const krea = @import("krea.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "krea",
-    .kind = .media,
-    .claims = &config.model_types,
-    .gate_models = &.{"krea/Krea-2-Turbo"},
-};
+pub const plugin = config.plugin;
 
 pub const table = abi.MediaTable{
     .name = abi.Str.of(plugin.name),

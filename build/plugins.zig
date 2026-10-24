@@ -37,10 +37,56 @@ pub fn generate(b: *std.Build) []const []const u8 {
     var jsons: std.ArrayList([]const u8) = .empty;
     for (configs) |c| if (std.mem.endsWith(u8, c, ".json")) jsons.append(a, c) catch @panic("OOM");
     const split = splitTemplates(a, names.items) catch @panic("OOM");
-    const src = render(a, split.plugins, split.templates, jsons.items) catch @panic("OOM");
+    const in_config = a.alloc(bool, split.plugins.len) catch @panic("OOM");
+    for (split.plugins, in_config) |n, *f| {
+        const text = root.readFileAlloc(io, b.fmt("{s}/{s}/config.zig", .{ plugins_dir, n }), a, .limited(1 << 20)) catch "";
+        f.* = std.mem.indexOf(u8, text, "\npub const plugin = ") != null;
+    }
+    const src = render(a, split.plugins, in_config, split.templates, jsons.items) catch @panic("OOM");
     writeIfChanged(io, root, registry_path, src) catch |e| std.process.fatal("plugins: cannot write {s}: {t}", .{ registry_path, e });
     b.dependOnFileContents(b.path(registry_path));
     return split.plugins;
+}
+
+/// `-Dunits`: one root per plugin group, `src/unit_<g>.zig` (generated, git-ignored), importing only its own plugins so
+/// an edit to one plugin recompiles its group alone. Returns the roots' paths.
+pub fn writeUnitRoots(b: *std.Build, groups: []const []const []const u8) []const []const u8 {
+    const a = b.allocator;
+    const paths = a.alloc([]const u8, groups.len) catch @panic("OOM");
+    for (groups, paths, 0..) |names, *path, g| {
+        var out: std.ArrayList(u8) = .empty;
+        out.appendSlice(a,
+            \\//! GENERATED at configure time by build/plugins.zig (`-Dunits`): one plugin group as its own compile unit, exporting
+            \\//! its plugins' tables for the host to take by symbol. Never edit, never commit.
+            \\
+            \\comptime {
+            \\    @import("sdk/plugin.zig").exportAll(&.{
+            \\
+        ) catch @panic("OOM");
+        for (names) |n| out.print(a, "        @import(\"plugins/{s}/plugin.zig\"),\n", .{n}) catch @panic("OOM");
+        out.appendSlice(a,
+            \\    });
+            \\}
+            \\
+            \\/// Marks a plugin unit: `Shared` state resolves to the host's copy (sdk/util/shared.zig).
+            \\pub const mlx_serve_unit = true;
+            \\
+            \\// What the absorbed modules read from their host root (`mlx_host`), as `main.zig` declares them.
+            \\pub const env = @import("env.zig");
+            \\pub const mlx = @import("mlx/ffi.zig");
+            \\pub const io_util = @import("sdk/util/io_util.zig");
+            \\pub const shared = @import("sdk/util/shared.zig");
+            \\pub const mtp_acceptance = @import("engines/mlx/spec/mtp_acceptance.zig");
+            \\pub const exl3 = @import("sdk/quant/exl3/format.zig");
+            \\pub const dsa_nax = @import("plugins/glm5_next/dsa_nax.zig");
+            \\pub const log = @import("host/log.zig");
+            \\pub const plugin_profile: bool = @import("build_options").plugin_profile;
+            \\
+        ) catch @panic("OOM");
+        path.* = b.fmt("src/unit_{d}.zig", .{g});
+        writeIfChanged(b.graph.io, b.root.root_dir.handle, path.*, out.items) catch |e| std.process.fatal("units: cannot write {s}: {t}", .{ path.*, e });
+    }
+    return paths;
 }
 
 /// The build's own tests of this file (the scan, the closure check, the rendering), on the host.
@@ -159,7 +205,8 @@ fn chain(a: std.mem.Allocator, parent: *const std.StringHashMapUnmanaged([]const
     return std.mem.join(a, " -> ", hops.items);
 }
 
-fn render(a: std.mem.Allocator, plugins: []const []const u8, templates: []const []const u8, configs: []const []const u8) ![]u8 {
+/// `in_config[i]`: plugin i declares its metadata (`plugin`) in its `config.zig`.
+fn render(a: std.mem.Allocator, plugins: []const []const u8, in_config: []const bool, templates: []const []const u8, configs: []const []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(a,
         \\//! GENERATED at configure time by build/plugins.zig from src/plugins/*/plugin.zig: never edit, never commit.
@@ -177,6 +224,9 @@ fn render(a: std.mem.Allocator, plugins: []const []const u8, templates: []const 
         for (list[1]) |n| try out.print(a, "    \"{s}\",\n", .{n});
         try out.appendSlice(a, "};\n");
     }
+    try out.appendSlice(a, "\n/// Each plugin's metadata as `-Dunits` reads it: from its `config.zig` (no plugin code), else its `plugin.zig`.\nconst unit_metas = [_]sdk.Plugin{\n");
+    for (plugins, in_config) |n, c| try out.print(a, "    @import(\"{s}/{s}.zig\").plugin,\n", .{ n, if (c) "config" else "plugin" });
+    try out.appendSlice(a, "};\n");
     try out.appendSlice(a, "\n/// Every fixture config.json: the packs the claims test runs through every plugin.\npub const model_configs = [_]File{\n");
     for (configs) |c| try out.print(a, "    .{{ .name = \"{s}\", .bytes = @embedFile(\"../fixtures/model-configs/{s}\") }},\n", .{ c, c });
     try out.appendSlice(a,
@@ -185,7 +235,7 @@ fn render(a: std.mem.Allocator, plugins: []const []const u8, templates: []const 
         \\/// `-Dunits`: every plugin is its own compile unit (`src/unit.zig`) exporting its table; the host links them by name.
         \\const units = @import("build_options").units and !@import("builtin").is_test;
         \\
-        \\pub const entries = if (units) sdk.externEntries(&plugins, &plugins_names) else sdk.entries(&plugins, &plugins_names);
+        \\pub const entries = if (units) sdk.externEntries(&unit_metas) else sdk.entries(&plugins, &plugins_names);
         \\
         \\comptime {
         \\    _ = sdk.entries(&templates, &templates_names);
@@ -287,12 +337,14 @@ test "build plugins: templates compile beside the registry but are never registe
     const split = try splitTemplates(a, &.{ "_template", "flint", "_template_media", "laguna" });
     try testing.expectEqual(@as(usize, 2), split.plugins.len);
     try testing.expectEqualStrings("laguna", split.plugins[1]);
-    const src = try render(a, split.plugins, split.templates, &.{"laguna.json"});
+    const in_config = try a.alloc(bool, split.plugins.len);
+    @memset(in_config, false);
+    const src = try render(a, split.plugins, in_config, split.templates, &.{"laguna.json"});
     try testing.expect(std.mem.indexOf(u8, src, "pub const plugins = [_]type{\n    @import(\"flint/plugin.zig\"),\n    @import(\"laguna/plugin.zig\"),\n};") != null);
     try testing.expect(std.mem.indexOf(u8, src, "pub const templates = [_]type{\n    @import(\"_template/plugin.zig\"),\n    @import(\"_template_media/plugin.zig\"),\n};") != null);
     try testing.expect(std.mem.indexOf(u8, src, "@embedFile(\"../fixtures/model-configs/laguna.json\")") != null);
     try testing.expect(std.mem.indexOf(u8, src, "sdk.exportAll(&plugins);") != null);
     // An empty registry still renders valid arrays.
-    const none = try render(a, &.{}, &.{}, &.{});
+    const none = try render(a, &.{}, &.{}, &.{}, &.{});
     try testing.expect(std.mem.indexOf(u8, none, "pub const plugins = [_]type{\n};") != null);
 }

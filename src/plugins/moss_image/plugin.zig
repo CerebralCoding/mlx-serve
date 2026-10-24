@@ -13,12 +13,7 @@ const log = @import("../../host/log.zig");
 const moss = @import("moss_image.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "moss_image",
-    .kind = .media,
-    .claims = &config.model_types,
-    .gate_models = &.{"mlx-community/MOSS-Image-SFT-bf16"},
-};
+pub const plugin = config.plugin;
 
 pub const table = abi.MediaTable{
     .name = abi.Str.of(plugin.name),

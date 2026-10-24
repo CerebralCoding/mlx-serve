@@ -17,12 +17,7 @@ const SinkAttention = @import("sink_attention.zig").SinkAttention;
 const mtp_head = @import("mtp_head.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "mimo_v2",
-    .kind = .model,
-    .claims = &config.model_types,
-    .gate_models = &.{"mlx-community/MiMo-V2.6-Flash-mxfp4-q8"},
-};
+pub const plugin = config.plugin;
 
 const b = bases.blocks;
 const Array = mlx.mlx_array;

@@ -6,6 +6,13 @@ const abi = @import("../../abi/media.zig");
 const sdk = @import("../../sdk/root.zig");
 const pack_bytes = @import("../../sdk/media/pack_bytes.zig");
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "music3",
+    .kind = .media,
+    .claims = &model_types,
+    .gate_models = &.{"ddalcu/MiniMax-Music3-MLX-Serve-8bit"},
+};
+
 pub const model_types = [_][]const u8{"minimax_music3"};
 
 pub const claims = sdk.mediaClaimsByType(&model_types);

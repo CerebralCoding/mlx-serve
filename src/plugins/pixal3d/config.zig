@@ -5,6 +5,13 @@ const std = @import("std");
 const abi = @import("../../abi/media.zig");
 const t2_config = @import("../trellis2/config.zig");
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "pixal3d",
+    .kind = .media,
+    .claims = &model_types,
+    .gate_models = &.{"TencentARC/Pixal3D"},
+};
+
 pub const model_types = [_][]const u8{"pixal3d"};
 
 /// Pixal3D ships its decoders in its own ckpts/; the texture decoder sorts last.

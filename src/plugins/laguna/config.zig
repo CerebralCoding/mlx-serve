@@ -14,6 +14,13 @@ const field = llama.field;
 const int = llama.int;
 const float = llama.float;
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "laguna",
+    .kind = .model,
+    .claims = &model_types,
+    .gate_models = &.{},
+};
+
 pub const Kind = enum { laguna, flint, kolibri1 };
 
 /// Laguna's own claim and parse (Flint's and Kolibri's live in their folders' config.zig).

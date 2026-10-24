@@ -9,12 +9,7 @@ const kokoro = @import("kokoro.zig");
 const mlx = @import("../../mlx/ffi.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "kokoro",
-    .kind = .media,
-    .claims = &config.model_types,
-    .gate_models = &.{"ddalcu/Kokoro-82M-MLX-Serve"},
-};
+pub const plugin = config.plugin;
 
 pub const table = abi.MediaTable{
     .name = abi.Str.of(plugin.name),

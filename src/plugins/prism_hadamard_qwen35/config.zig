@@ -5,6 +5,13 @@ const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 const q35 = @import("../qwen3_5/config.zig");
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "prism_hadamard_qwen35",
+    .kind = .model,
+    .claims = &model_types,
+    .gate_models = &.{"prism-ml/Ternary-Bonsai-2-27B-mlx-2bit"},
+};
+
 pub const model_types = [_][]const u8{"prism_hadamard_qwen35"};
 
 pub const claims = sdk.claimsByType(&model_types);

@@ -24,12 +24,7 @@ const qwen3 = @import("../qwen3/plugin.zig");
 pub const config = @import("config.zig");
 const mtp = @import("mtp.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "qwen3_5",
-    .kind = .model,
-    .claims = &config.model_types,
-    .gate_models = &.{ "mlx-community/Qwen3.5-4B-4bit", "mlx-community/Qwen3.6-35B-A3B-4bit" },
-};
+pub const plugin = config.plugin;
 
 const b = bases.blocks;
 const gdn = b.gdn;

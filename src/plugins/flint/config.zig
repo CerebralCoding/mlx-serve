@@ -4,6 +4,13 @@
 const sdk = @import("../../sdk/root.zig");
 const fam = @import("../laguna/config.zig");
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "flint",
+    .kind = .model,
+    .claims = &model_types,
+    .gate_models = &.{"RecursiveSI/flint-int4"},
+};
+
 pub const model_types = [_][]const u8{"flint"};
 pub const claims = sdk.claimsByType(&model_types);
 pub const parse = fam.Parser(.flint).parse;

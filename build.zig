@@ -281,14 +281,21 @@ pub fn build(b: *std.Build) void {
         // The host is an object too, so it compiles beside the units; the exe's root only calls into it.
         mod.addObject(b.addObject(.{ .name = "host", .root_module = unitModule(b, mod, unit_includes, "src/host_unit.zig", target, optimize) }));
         mod.root_source_file = b.path("src/exe.zig");
-        for (plugin_names) |name| {
-            const unit_options = b.addOptions();
-            unit_options.addOption([]const u8, "plugin", name);
-            const um = unitModule(b, mod, unit_includes, "src/unit.zig", target, optimize);
-            um.addImport("unit_options", unit_options.createModule());
-            const obj = b.addObject(.{ .name = b.fmt("unit-{s}", .{name}), .root_module = um });
+        // Plugins dealt round-robin into `unit-groups` objects: each compiles the shared code it reaches once, so fewer
+        // groups cost less CPU, more groups more parallelism.
+        const n_groups = @min(plugin_names.len, b.option(usize, "unit-groups", "Plugin objects under -Dunits (default 8)") orelse 8);
+        const groups = b.allocator.alloc([]const []const u8, n_groups) catch @panic("OOM");
+        for (groups, 0..) |*names, g| {
+            var list: std.ArrayList([]const u8) = .empty;
+            var i = g;
+            while (i < plugin_names.len) : (i += n_groups) list.append(b.allocator, plugin_names[i]) catch @panic("OOM");
+            names.* = list.items;
+        }
+        for (plugins.writeUnitRoots(b, groups), 0..) |root, g| {
+            const um = unitModule(b, mod, unit_includes, root, target, optimize);
+            const obj = b.addObject(.{ .name = b.fmt("unit-{d}", .{g}), .root_module = um });
             mod.addObject(obj);
-            units_step.dependOn(&b.addInstallFile(obj.getEmittedBin(), b.fmt("units/{s}.o", .{name})).step);
+            units_step.dependOn(&b.addInstallFile(obj.getEmittedBin(), b.fmt("units/{d}.o", .{g})).step);
             check_run.addFileArg(obj.getEmittedBin());
         }
     }

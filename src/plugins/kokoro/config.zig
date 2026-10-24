@@ -5,6 +5,13 @@ const abi = @import("../../abi/media.zig");
 const sdk = @import("../../sdk/root.zig");
 const bill = @import("../../sdk/media/bill.zig");
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "kokoro",
+    .kind = .media,
+    .claims = &model_types,
+    .gate_models = &.{"ddalcu/Kokoro-82M-MLX-Serve"},
+};
+
 pub const model_types = [_][]const u8{"kokoro"};
 
 pub const claims = sdk.mediaClaimsByType(&model_types);

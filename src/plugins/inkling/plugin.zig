@@ -18,12 +18,7 @@ const attention = @import("attention.zig");
 const moe = @import("moe.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "inkling",
-    .kind = .model,
-    .claims = &config.model_types,
-    .gate_models = &.{},
-};
+pub const plugin = config.plugin;
 
 const b = bases.blocks;
 const Array = mlx.mlx_array;

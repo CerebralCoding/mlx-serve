@@ -8,6 +8,13 @@ const sdk = @import("../../sdk/root.zig");
 const generation = @import("../../sdk/config/generation.zig");
 const json = @import("../lfm2/json.zig");
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "mimo_v2",
+    .kind = .model,
+    .claims = &model_types,
+    .gate_models = &.{"mlx-community/MiMo-V2.6-Flash-mxfp4-q8"},
+};
+
 pub const model_types = [_][]const u8{ "mimo_v2", "mimo_v2_flash" };
 
 pub const claims = sdk.claimsByType(&model_types);

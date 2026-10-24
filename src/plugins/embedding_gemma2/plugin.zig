@@ -8,12 +8,7 @@ const sdk = @import("../../sdk/root.zig");
 const encoder = @import("../gemma4/bidirectional.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "embedding_gemma2",
-    .kind = .model,
-    .claims = &config.model_types,
-    .gate_models = &.{"google/embeddinggemma-2"},
-};
+pub const plugin = config.plugin;
 
 pub const table = abi.ModelTable{
     .name = abi.Str.of(plugin.name),

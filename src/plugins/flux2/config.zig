@@ -8,6 +8,13 @@ const pack_bytes = @import("../../sdk/media/pack_bytes.zig");
 const pack_claims = @import("../../sdk/media/pack_claims.zig");
 
 /// [0] is the type discovery reports for a configless (mflux) pack.
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "flux2",
+    .kind = .media,
+    .claims = &model_types,
+    .gate_models = &.{"mlx-community/flux2-klein-4b-4bit"},
+};
+
 pub const model_types = [_][]const u8{ "flux2-klein", "flux2" };
 
 /// No marker (as discovery has always treated these packs).

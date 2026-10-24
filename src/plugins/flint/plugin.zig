@@ -10,12 +10,7 @@ const family = @import("../laguna/family.zig");
 const DecodeCopies = @import("../../sdk/bases/blocks/decode_copies.zig").DecodeCopies;
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "flint",
-    .kind = .model,
-    .claims = &config.model_types,
-    .gate_models = &.{"RecursiveSI/flint-int4"},
-};
+pub const plugin = config.plugin;
 
 const b = bases.blocks;
 

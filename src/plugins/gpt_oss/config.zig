@@ -13,6 +13,13 @@ const field = llama.field;
 const int = llama.int;
 const float = llama.float;
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "gpt_oss",
+    .kind = .model,
+    .claims = &model_types,
+    .gate_models = &.{"mlx-community/gpt-oss-20b-MXFP4-Q8"},
+};
+
 pub const model_types = [_][]const u8{"gpt_oss"};
 pub const claims = sdk.claimsByType(&model_types);
 

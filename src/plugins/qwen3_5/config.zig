@@ -12,6 +12,13 @@ const quant_config = @import("../../sdk/config/quantization_config.zig");
 const q3 = @import("../qwen3/config.zig");
 const mrope = @import("../../sdk/vision/mrope.zig");
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "qwen3_5",
+    .kind = .model,
+    .claims = &model_types,
+    .gate_models = &.{ "mlx-community/Qwen3.5-4B-4bit", "mlx-community/Qwen3.6-35B-A3B-4bit" },
+};
+
 pub const model_types = [_][]const u8{ "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text", "minicpmv4_7" };
 
 pub const claims = sdk.claimsByType(&model_types);

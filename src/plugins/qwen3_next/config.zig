@@ -5,6 +5,13 @@ const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 const q35 = @import("../qwen3_5/config.zig");
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "qwen3_next",
+    .kind = .model,
+    .claims = &model_types,
+    .gate_models = &.{"mlx-community/Qwen3-Next-80B-A3B-Instruct-4bit"},
+};
+
 pub const model_types = [_][]const u8{"qwen3_next"};
 
 pub const claims = sdk.claimsByType(&model_types);

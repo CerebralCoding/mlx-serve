@@ -6,6 +6,13 @@ const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
 const gemma = @import("../gemma3/config.zig");
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "embedding_gemma",
+    .kind = .model,
+    .claims = &model_types,
+    .gate_models = &.{"mlx-community/embeddinggemma-300m-8bit"},
+};
+
 pub const model_types = [_][]const u8{ "gemma3", "gemma3_text" };
 
 pub const Config = gemma.Config;

@@ -8,6 +8,13 @@ const sdk = @import("../../sdk/root.zig");
 const generation = @import("../../sdk/config/generation.zig");
 const json = @import("../lfm2/json.zig");
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "nemotron_h",
+    .kind = .model,
+    .claims = &model_types,
+    .gate_models = &.{"mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-4bit"},
+};
+
 pub const model_types = [_][]const u8{ "nemotron_h", "nemotron_h_puzzle", "nemotron_h_omni" };
 
 pub const claims = sdk.claimsByType(&model_types);

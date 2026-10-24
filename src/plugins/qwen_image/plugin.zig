@@ -14,12 +14,7 @@ const log = @import("../../host/log.zig");
 const qi = @import("qwen_image.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "qwen_image",
-    .kind = .media,
-    .claims = &config.model_types,
-    .gate_models = &.{"mlx-community/Qwen-Image-2.1-4bit"},
-};
+pub const plugin = config.plugin;
 
 pub const table = abi.MediaTable{
     .name = abi.Str.of(plugin.name),

@@ -13,12 +13,7 @@ const t2_config = @import("../trellis2/config.zig");
 const px = @import("pixal3d.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "pixal3d",
-    .kind = .media,
-    .claims = &config.model_types,
-    .gate_models = &.{"TencentARC/Pixal3D"},
-};
+pub const plugin = config.plugin;
 
 /// The tiny pack's job peaks near 13 GB of RSS: a 16 GB runner skips it.
 pub const test_min_ram_gib = 32;

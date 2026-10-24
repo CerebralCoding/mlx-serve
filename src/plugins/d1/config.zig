@@ -6,6 +6,13 @@ const std = @import("std");
 const abi = @import("../../abi/media.zig");
 const bill = @import("../../sdk/media/bill.zig");
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "d1",
+    .kind = .media,
+    .claims = &model_types,
+    .gate_models = &.{"LiquidAI/d1-3B"},
+};
+
 pub const model_types = [_][]const u8{"d1"};
 
 pub fn claims(model_type: abi.Str, dir: *const abi.PackDir) callconv(.c) abi.Claim {

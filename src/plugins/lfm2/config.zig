@@ -10,6 +10,13 @@ const quant_config = @import("../../sdk/config/quantization_config.zig");
 const json = @import("json.zig");
 
 /// `lfm2-vl` is mlx-community's spelling (LFM2-VL-1.6B-4bit): the engine reads it as text, never as `lfm2_vl`.
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "lfm2",
+    .kind = .model,
+    .claims = &model_types,
+    .gate_models = &.{ "mlx-community/LFM2.5-1.2B-Instruct-4bit", "mlx-community/LFM2.5-8B-A1B-4bit" },
+};
+
 pub const model_types = [_][]const u8{ "lfm2", "lfm2_moe", "lfm2_vl", "lfm2-vl" };
 
 /// Every `lfm2*` model_type, as the engine's parse dispatches them.

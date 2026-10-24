@@ -13,6 +13,13 @@ const field = llama.field;
 const int = llama.int;
 const float = llama.float;
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "muse_glimmer",
+    .kind = .model,
+    .claims = &model_types,
+    .gate_models = &.{},
+};
+
 pub const model_types = [_][]const u8{ "muse_glimmer", "muse_glimmer_text" };
 pub const claims = sdk.claimsByType(&model_types);
 

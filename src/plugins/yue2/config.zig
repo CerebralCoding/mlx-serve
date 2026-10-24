@@ -6,6 +6,13 @@ const abi = @import("../../abi/media.zig");
 const sdk = @import("../../sdk/root.zig");
 const bill = @import("../../sdk/media/bill.zig");
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "yue2",
+    .kind = .media,
+    .claims = &model_types,
+    .gate_models = &.{"ddalcu/YuE2-3B-MLX-Serve-8bit"},
+};
+
 pub const model_types = [_][]const u8{"yue2"};
 
 pub const claims = sdk.mediaClaimsByType(&model_types);

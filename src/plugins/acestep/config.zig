@@ -6,6 +6,13 @@ const abi = @import("../../abi/media.zig");
 const sdk = @import("../../sdk/root.zig");
 const pack_bytes = @import("../../sdk/media/pack_bytes.zig");
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "acestep",
+    .kind = .media,
+    .claims = &model_types,
+    .gate_models = &.{"ddalcu/ACE-Step-1.5-XL-Turbo-MLX-Serve-8bit"},
+};
+
 pub const model_types = [_][]const u8{"acestep"};
 
 pub const claims = sdk.mediaClaimsByType(&model_types);

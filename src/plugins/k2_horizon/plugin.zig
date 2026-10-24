@@ -10,12 +10,7 @@ const llama = @import("../llama/plugin.zig");
 const GroupedRmsNorm = @import("norm.zig").GroupedRmsNorm;
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "k2_horizon",
-    .kind = .model,
-    .claims = &config.model_types,
-    .gate_models = &.{"LLM360/K2-Horizon-7B"},
-};
+pub const plugin = config.plugin;
 
 const b = bases.blocks;
 

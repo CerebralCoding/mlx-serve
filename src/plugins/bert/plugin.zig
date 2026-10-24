@@ -14,12 +14,7 @@ const compiled = @import("../../sdk/bases/blocks/compiled.zig");
 const reader = @import("../lfm2/reader.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "bert",
-    .kind = .model,
-    .claims = &config.model_types,
-    .gate_models = &.{"mlx-community/all-MiniLM-L6-v2-4bit"},
-};
+pub const plugin = config.plugin;
 
 const b = bases.blocks;
 const Array = mlx.mlx_array;

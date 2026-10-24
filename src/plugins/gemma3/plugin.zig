@@ -14,12 +14,7 @@ const Attention = load_mod.Attention;
 pub const load_mod = @import("load.zig");
 pub const compiled_mod = @import("compiled.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "gemma3",
-    .kind = .model,
-    .claims = &config.model_types,
-    .gate_models = &.{"mlx-community/gemma-3-1b-it-4bit"},
-};
+pub const plugin = config.plugin;
 
 const b = bases.blocks;
 const extras = b.extras;

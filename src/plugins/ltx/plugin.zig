@@ -19,12 +19,7 @@ const diffvae_fwd = @import("diffvae_forward.zig");
 const engine_mod = @import("engine.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "ltx",
-    .kind = .media,
-    .claims = &config.model_types,
-    .gate_models = &.{"dgrauet/ltx-2.3-mlx-q4"},
-};
+pub const plugin = config.plugin;
 
 pub const table = abi.MediaTable{
     .name = abi.Str.of(plugin.name),

@@ -11,12 +11,7 @@ const mlx = @import("../../mlx/ffi.zig");
 const tp = @import("pipeline.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "trellis2",
-    .kind = .media,
-    .claims = &config.model_types,
-    .gate_models = &.{"microsoft/TRELLIS.2-4B"},
-};
+pub const plugin = config.plugin;
 
 pub const table = abi.MediaTable{
     .name = abi.Str.of(plugin.name),

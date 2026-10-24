@@ -109,15 +109,14 @@ pub fn entries(comptime mods: []const type, comptime names: []const []const u8) 
     return out;
 }
 
-/// `entries` with each table taken by its exported symbol: every plugin compiled as its own unit (`src/unit.zig`), so
-/// only its metadata (`plugin`, MLX-free) is analyzed here.
-pub fn externEntries(comptime mods: []const type, comptime names: []const []const u8) [mods.len]Entry {
-    var out: [mods.len]Entry = undefined;
-    inline for (mods, names, 0..) |M, name, i| {
-        check(M, name);
-        const sym = common.exportName(M.plugin.name, tableVersion(M.plugin.kind));
-        out[i] = .{ .plugin = M.plugin };
-        switch (M.plugin.kind) {
+/// `-Dunits`: each plugin's metadata (from its MLX-free `config.zig`) with its table taken by the symbol its own
+/// compile unit exports, so the host imports no plugin code.
+pub fn externEntries(comptime metas: []const Plugin) [metas.len]Entry {
+    var out: [metas.len]Entry = undefined;
+    inline for (metas, 0..) |p, i| {
+        const sym = common.exportName(p.name, tableVersion(p.kind));
+        out[i] = .{ .plugin = p };
+        switch (p.kind) {
             .model => out[i].model = @extern(*const model_abi.ModelTable, .{ .name = sym }),
             .media => out[i].media = @extern(*const media_abi.MediaTable, .{ .name = sym }),
             .quant => out[i].quant = @extern(*const quant_abi.QuantTable, .{ .name = sym }),

@@ -5,6 +5,13 @@ const std = @import("std");
 const abi = @import("../../abi/media.zig");
 const bill = @import("../../sdk/media/bill.zig");
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "laya",
+    .kind = .media,
+    .claims = &model_types,
+    .gate_models = &.{"aac6fef/laya-multilingual-mlx"},
+};
+
 pub const model_types = [_][]const u8{"laya"};
 
 pub fn claims(model_type: abi.Str, dir: *const abi.PackDir) callconv(.c) abi.Claim {

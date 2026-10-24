@@ -17,12 +17,7 @@ const loader = @import("../llama/load.zig");
 const NormedEmbed = @import("embed.zig").NormedEmbed;
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "muse_glimmer",
-    .kind = .model,
-    .claims = &config.model_types,
-    .gate_models = &.{},
-};
+pub const plugin = config.plugin;
 
 const b = bases.blocks;
 

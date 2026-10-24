@@ -18,12 +18,7 @@ const h3 = @import("h3.zig");
 const vsa = @import("vsa.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "minimax_h3",
-    .kind = .media,
-    .claims = &config.model_types,
-    .gate_models = &.{"ddalcu/MiniMax-H3-MLX-Serve-4bit"},
-};
+pub const plugin = config.plugin;
 
 pub const table = abi.MediaTable{
     .name = abi.Str.of(plugin.name),

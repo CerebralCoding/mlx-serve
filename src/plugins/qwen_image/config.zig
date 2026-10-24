@@ -9,6 +9,13 @@ const pack_claims = @import("../../sdk/media/pack_claims.zig");
 const image_request = @import("../../sdk/media/image_request.zig");
 
 /// [0] is the type discovery reports for a configless (mlx-community) pack.
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "qwen_image",
+    .kind = .media,
+    .claims = &model_types,
+    .gate_models = &.{"mlx-community/Qwen-Image-2.1-4bit"},
+};
+
 pub const model_types = [_][]const u8{"qwen_image21"};
 
 /// No marker (as discovery has always treated these packs).

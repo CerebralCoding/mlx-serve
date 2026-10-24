@@ -5,6 +5,13 @@ const std = @import("std");
 const abi = @import("../../abi/media.zig");
 const pack_bytes = @import("../../sdk/media/pack_bytes.zig");
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "hunyuan3d",
+    .kind = .media,
+    .claims = &model_types,
+    .gate_models = &.{"tencent/Hunyuan3D-2.1"},
+};
+
 pub const model_types = [_][]const u8{"hunyuan3d"};
 
 /// No marker (as discovery has always treated these packs).

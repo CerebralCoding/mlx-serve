@@ -6,6 +6,13 @@ const abi = @import("../../abi/media.zig");
 const sdk = @import("../../sdk/root.zig");
 const bill = @import("../../sdk/media/bill.zig");
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "qwen3_tts",
+    .kind = .media,
+    .claims = &model_types,
+    .gate_models = &.{"mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit"},
+};
+
 pub const model_types = [_][]const u8{"qwen3_tts"};
 
 pub const claims = sdk.mediaClaimsByType(&model_types);

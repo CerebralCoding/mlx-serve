@@ -10,12 +10,7 @@ const mlx = @import("../../mlx/ffi.zig");
 const acestep = @import("acestep.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "acestep",
-    .kind = .media,
-    .claims = &config.model_types,
-    .gate_models = &.{"ddalcu/ACE-Step-1.5-XL-Turbo-MLX-Serve-8bit"},
-};
+pub const plugin = config.plugin;
 
 pub const table = abi.MediaTable{
     .name = abi.Str.of(plugin.name),

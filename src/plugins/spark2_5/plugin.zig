@@ -14,12 +14,7 @@ const loader = @import("../llama/load.zig");
 const Attention = @import("attention.zig").Attention;
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "spark2_5",
-    .kind = .model,
-    .claims = &config.model_types,
-    .gate_models = &.{"abenzerps/Spark-X2.5-4B-MLX-4bit"},
-};
+pub const plugin = config.plugin;
 
 const b = bases.blocks;
 

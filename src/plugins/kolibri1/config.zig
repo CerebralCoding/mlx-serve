@@ -4,6 +4,13 @@
 const sdk = @import("../../sdk/root.zig");
 const fam = @import("../laguna/config.zig");
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "kolibri1",
+    .kind = .model,
+    .claims = &model_types,
+    .gate_models = &.{},
+};
+
 pub const model_types = [_][]const u8{"kolibri1"};
 pub const claims = sdk.claimsByType(&model_types);
 pub const parse = fam.Parser(.kolibri1).parse;

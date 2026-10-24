@@ -9,12 +9,7 @@ const json_str = @import("../../host/chat/json_text.zig");
 const yue2 = @import("yue2.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "yue2",
-    .kind = .media,
-    .claims = &config.model_types,
-    .gate_models = &.{"ddalcu/YuE2-3B-MLX-Serve-8bit"},
-};
+pub const plugin = config.plugin;
 
 pub const table = abi.MediaTable{
     .name = abi.Str.of(plugin.name),

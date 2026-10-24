@@ -5,6 +5,13 @@ const std = @import("std");
 const abi = @import("../../abi/media.zig");
 const bill = @import("../../sdk/media/bill.zig");
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "stable_audio3",
+    .kind = .media,
+    .claims = &model_types,
+    .gate_models = &.{"stabilityai/stable-audio-3-small"},
+};
+
 pub const model_types = [_][]const u8{"stable_audio3"};
 
 pub const DEFAULT_STEPS: u32 = 8;

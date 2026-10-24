@@ -20,12 +20,7 @@ const distributed = @import("../../engines/mlx/cluster/distributed.zig");
 const Layout = @import("../../sdk/quant/native.zig").Layout;
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "deepseek_v41",
-    .kind = .model,
-    .claims = &config.model_types,
-    .gate_models = &.{"ddalcu/DeepSeek-V4.1-Flash-1017-iQ-MLX-3.0bpw"},
-};
+pub const plugin = config.plugin;
 
 pub const table = abi.ModelTable{
     .name = abi.Str.of(plugin.name),

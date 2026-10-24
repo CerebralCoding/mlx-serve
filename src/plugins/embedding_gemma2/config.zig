@@ -9,6 +9,13 @@ const sdk = @import("../../sdk/root.zig");
 const generation = @import("../../sdk/config/generation.zig");
 const gemma = @import("../gemma3/config.zig");
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "embedding_gemma2",
+    .kind = .model,
+    .claims = &model_types,
+    .gate_models = &.{"google/embeddinggemma-2"},
+};
+
 pub const model_types = [_][]const u8{"embedding_gemma2"};
 
 pub const claims = sdk.claimsByType(&model_types);

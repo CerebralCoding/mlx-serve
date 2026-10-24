@@ -12,12 +12,7 @@ const mlx = @import("../../mlx/ffi.zig");
 const tts = @import("tts.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "qwen3_tts",
-    .kind = .media,
-    .claims = &config.model_types,
-    .gate_models = &.{"mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit"},
-};
+pub const plugin = config.plugin;
 
 pub const table = abi.MediaTable{
     .name = abi.Str.of(plugin.name),

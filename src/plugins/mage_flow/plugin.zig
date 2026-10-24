@@ -11,12 +11,7 @@ const mlx = @import("../../mlx/ffi.zig");
 const mf = @import("mage_flow.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "mage_flow",
-    .kind = .media,
-    .claims = &config.model_types,
-    .gate_models = &.{"microsoft/Mage-Flow-Turbo"},
-};
+pub const plugin = config.plugin;
 
 pub const table = abi.MediaTable{
     .name = abi.Str.of(plugin.name),

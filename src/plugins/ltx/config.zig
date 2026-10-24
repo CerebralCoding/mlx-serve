@@ -8,6 +8,13 @@ const sdk = @import("../../sdk/root.zig");
 const bill = @import("../../sdk/media/bill.zig");
 const pack_bytes = @import("../../sdk/media/pack_bytes.zig");
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "ltx",
+    .kind = .media,
+    .claims = &model_types,
+    .gate_models = &.{"dgrauet/ltx-2.3-mlx-q4"},
+};
+
 pub const model_types = [_][]const u8{"AudioVideo"};
 
 pub const claims = sdk.mediaClaimsByType(&model_types);

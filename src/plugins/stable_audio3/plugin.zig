@@ -9,12 +9,7 @@ const job = @import("../../host/media_jobs/plugin_job.zig");
 const sa = @import("stable_audio.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "stable_audio3",
-    .kind = .media,
-    .claims = &config.model_types,
-    .gate_models = &.{"stabilityai/stable-audio-3-small"},
-};
+pub const plugin = config.plugin;
 
 pub const table = abi.MediaTable{
     .name = abi.Str.of(plugin.name),

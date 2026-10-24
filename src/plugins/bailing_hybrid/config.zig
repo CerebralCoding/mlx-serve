@@ -15,6 +15,13 @@ const u32v = family.u32v;
 const f32v = family.f32v;
 const intIf = family.intIf;
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "bailing_hybrid",
+    .kind = .model,
+    .claims = &model_types,
+    .gate_models = &.{"rapid-mlx/Ling-3.0-tiny-MLX-4bit"},
+};
+
 pub const model_types = [_][]const u8{"bailing_hybrid"};
 
 pub const claims = sdk.claimsByType(&model_types);

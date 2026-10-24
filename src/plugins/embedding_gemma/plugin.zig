@@ -7,12 +7,7 @@ const sdk = @import("../../sdk/root.zig");
 const encoder = @import("../gemma4/bidirectional.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "embedding_gemma",
-    .kind = .model,
-    .claims = &config.model_types,
-    .gate_models = &.{"mlx-community/embeddinggemma-300m-8bit"},
-};
+pub const plugin = config.plugin;
 
 pub const table = abi.ModelTable{
     .name = abi.Str.of(plugin.name),

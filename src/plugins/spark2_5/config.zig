@@ -13,6 +13,13 @@ const field = llama.field;
 const int = llama.int;
 const float = llama.float;
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "spark2_5",
+    .kind = .model,
+    .claims = &model_types,
+    .gate_models = &.{"abenzerps/Spark-X2.5-4B-MLX-4bit"},
+};
+
 pub const model_types = [_][]const u8{"spark2_5"};
 
 pub const claims = sdk.claimsByType(&model_types);

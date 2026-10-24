@@ -7,6 +7,13 @@ const sdk = @import("../../sdk/root.zig");
 const quant_config = @import("../../sdk/config/quantization_config.zig");
 const json = @import("../lfm2/json.zig");
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "bert",
+    .kind = .model,
+    .claims = &model_types,
+    .gate_models = &.{"mlx-community/all-MiniLM-L6-v2-4bit"},
+};
+
 pub const model_types = [_][]const u8{"bert"};
 
 pub const claims = sdk.claimsByType(&model_types);

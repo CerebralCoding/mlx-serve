@@ -8,12 +8,7 @@ const job = @import("../../host/media_jobs/plugin_job.zig");
 const music3 = @import("music3.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "music3",
-    .kind = .media,
-    .claims = &config.model_types,
-    .gate_models = &.{"ddalcu/MiniMax-Music3-MLX-Serve-8bit"},
-};
+pub const plugin = config.plugin;
 
 pub const table = abi.MediaTable{
     .name = abi.Str.of(plugin.name),

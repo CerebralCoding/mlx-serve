@@ -10,12 +10,7 @@ const chat = @import("../../host/chat/chat.zig");
 const decision = @import("../laya/decision_job.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "clef",
-    .kind = .media,
-    .claims = &config.model_types,
-    .gate_models = &.{},
-};
+pub const plugin = config.plugin;
 
 const Backend = struct {
     pub const Engine = clef.Engine;

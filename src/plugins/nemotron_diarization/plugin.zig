@@ -10,12 +10,7 @@ const mlx = @import("../../mlx/ffi.zig");
 const diarization = @import("diarization.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "nemotron_diarization",
-    .kind = .media,
-    .claims = &config.model_types,
-    .gate_models = &.{"mlx-community/Nemotron-3-Diarization-8bit"},
-};
+pub const plugin = config.plugin;
 
 pub const table = abi.MediaTable{
     .name = abi.Str.of(plugin.name),

@@ -13,12 +13,7 @@ const toModelConfig = @import("model_config.zig").toModelConfig;
 const intree = @import("../../engines/mlx/plugin/intree.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "deepseek_v4",
-    .kind = .model,
-    .claims = &config.model_types,
-    .gate_models = &.{"ddalcu/DeepSeek-V4-Flash-MLX-Serve"},
-};
+pub const plugin = config.plugin;
 
 pub const table = abi.ModelTable{
     .name = abi.Str.of(plugin.name),

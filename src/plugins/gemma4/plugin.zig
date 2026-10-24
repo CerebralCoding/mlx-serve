@@ -22,12 +22,7 @@ const quantParamsFromGeometry = @import("../../sdk/quant/params.zig").quantParam
 pub const config = @import("config.zig");
 pub const decoder = @import("decoder.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "gemma4",
-    .kind = .model,
-    .claims = &config.model_types,
-    .gate_models = &.{"mlx-community/gemma-4-e4b-it-4bit"},
-};
+pub const plugin = config.plugin;
 
 comptime {
     if (decoder.batches_decode != config.batches_decode) @compileError("gemma4: config.batches_decode disagrees with the decoder");

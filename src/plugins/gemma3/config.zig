@@ -8,6 +8,13 @@ const sdk = @import("../../sdk/root.zig");
 const generation = @import("../../sdk/config/generation.zig");
 const quant_config = @import("../../sdk/config/quantization_config.zig");
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "gemma3",
+    .kind = .model,
+    .claims = &model_types,
+    .gate_models = &.{"mlx-community/gemma-3-1b-it-4bit"},
+};
+
 pub const model_types = [_][]const u8{ "gemma3", "gemma3_text" };
 
 pub const claims = sdk.claimsByType(&model_types);

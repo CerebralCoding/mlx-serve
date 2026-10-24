@@ -10,12 +10,7 @@ const fwd = @import("table_forward.zig");
 const fixture = @import("../glm5_next/fixture.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "bailing_hybrid",
-    .kind = .model,
-    .claims = &config.model_types,
-    .gate_models = &.{"rapid-mlx/Ling-3.0-tiny-MLX-4bit"},
-};
+pub const plugin = config.plugin;
 
 pub const table = abi.ModelTable{
     .name = abi.Str.of(plugin.name),

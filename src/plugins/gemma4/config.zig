@@ -9,6 +9,13 @@ const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 const gemma = @import("../gemma3/config.zig");
 
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "gemma4",
+    .kind = .model,
+    .claims = &model_types,
+    .gate_models = &.{"mlx-community/gemma-4-e4b-it-4bit"},
+};
+
 pub const model_types = [_][]const u8{ "gemma4", "gemma4_text", "gemma4_unified", "gemma4_unified_text" };
 
 pub const claims = sdk.claimsByType(&model_types);

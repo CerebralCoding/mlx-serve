@@ -10,12 +10,7 @@ const laya = @import("laya.zig");
 const decision = @import("decision_job.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "laya",
-    .kind = .media,
-    .claims = &config.model_types,
-    .gate_models = &.{"aac6fef/laya-multilingual-mlx"},
-};
+pub const plugin = config.plugin;
 
 pub const table = abi.MediaTable{
     .name = abi.Str.of(plugin.name),

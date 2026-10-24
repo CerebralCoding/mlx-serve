@@ -15,12 +15,7 @@ const hy3d = @import("hunyuan3d.zig");
 const paint = @import("paint.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "hunyuan3d",
-    .kind = .media,
-    .claims = &config.model_types,
-    .gate_models = &.{"tencent/Hunyuan3D-2.1"},
-};
+pub const plugin = config.plugin;
 
 pub const table = abi.MediaTable{
     .name = abi.Str.of(plugin.name),

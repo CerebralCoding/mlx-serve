@@ -8,12 +8,7 @@ const d1 = @import("d1.zig");
 const decision = @import("../laya/decision_job.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "d1",
-    .kind = .media,
-    .claims = &config.model_types,
-    .gate_models = &.{"LiquidAI/d1-3B"},
-};
+pub const plugin = config.plugin;
 
 const Backend = struct {
     pub const Engine = d1.Engine;
