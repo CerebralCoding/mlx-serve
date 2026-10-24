@@ -274,7 +274,7 @@ test "mimo_v2 streaming pack: fp8 residents and experts read from its experts.bi
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = js });
     var cfg = try both.parse(&mimo.table, dir, js);
     const xfm = try driver.load(std.Io.Threaded.global_single_threaded.io(), testing.allocator, &cfg, dir, fixture.stream());
-    var b: both.Both = .{ .lg = null, .tmp = tmp, .dir = dir, .cfg = cfg, .xfm = xfm };
+    var b: both.Both = .{ .tmp = tmp, .dir = dir, .cfg = cfg, .xfm = xfm };
     defer b.close();
     const m: *mimo.Loaded = @ptrCast(@alignCast(b.xfm.plugin.?.model));
     try testing.expect(m.experts != null and m.layers[FIRST_MOE].mlp.second.streamed != null);
