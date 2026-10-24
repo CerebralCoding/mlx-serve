@@ -139,7 +139,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 - `test_dsv4.sh` **E**, `test_dsv41.sh` **E** DeepSeek V4/V4.1 · `test_inkling.sh` **E** · `test_bailing_hybrid.sh` **E** Ling 3.0
 - `test_muse_glimmer.sh` **E**, `test_muse_repetition.sh` **E** Muse · `test_mimo_v2.sh` **E** · `test_glm5_next.sh` **E** · `test_glm53.sh` **E**
 - `test_flint.sh` **E** · `test_kolibri1.py` **E** · `test_minicpmv4_7.sh` **E** · `test_nemotron_bolt.py` Nemotron 3.5
-- `test_diffusion_gemma.sh` · `test_ud_moe.sh` · `test_nvfp4.sh` · `test_dense_bf16.sh` · `test_hadamard_fidelity.sh` (+ `hadamard_fidelity.py`)
+- `test_ud_moe.sh` · `test_nvfp4.sh` · `test_dense_bf16.sh` · `test_hadamard_fidelity.sh` (+ `hadamard_fidelity.py`)
 - `test_kev_decisions.sh`, `test_laya_decisions.sh`, `test_d1_decisions.sh` POST /v1/decisions
 
 **Vision, audio input, embeddings**

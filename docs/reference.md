@@ -40,7 +40,6 @@ Verbatim deep detail: per-file contracts, subsystem designs, API surfaces. Root 
 | `kv_disk_cache.zig` | Persistent prefix tier (`--prefix-cache-disk`, default OFF): chunked safetensors survive RAM eviction and server restart. `--no-prefix-cache-ram` disables only idle RAM retention when disk is enabled (`--prefix-cache-entries 0` disables both tiers); completed prefixes write through continuously and restore directly into the next request's working KV. Hybrid SSM checkpoints persist beside KV chunks and restore both states at one position. Schemes off/affine, B==1. Guard: `tests/test_prefix_cache_disk.sh` + hermetic DiskTier/HotPrefixCache tests. |
 | `drafter.zig` | Gemma 4 assistant drafter (cross-attention spec-decode) |
 | `mtp.zig` | Qwen 3.5/3.6 native MTP head (sidecar spec-decode; self-contained — delete this + `Generator.nextMtp` to remove the feature). MLP is a union: dense SwiGLU OR the 35B-A3B MoE layout (`language_model.mtp.` prefix, mlx-lm `switch_mlp` split experts + shared expert + SEG — forwards through the trunk's `moeMLP`); quant params re-solve PER WEIGHT per call (`transformer.affineParamsFromGeometry` — sidecars mix 5/6-bit gs-128 beside 4-bit gs-64). Prefill history is FULL by default (`--mtp-history-window` opts into last-window capture; the A/B showed windowing costs 14 acceptance points at 64K on the stock head) |
-| `diffusion.zig` | DiffusionGemma block-diffusion generation: canvas denoising loop, entropy-bound sampler, self-conditioning, per-slot `Runner` |
 | `status.zig` | TUI status bar |
 | `log.zig` | Leveled logging + persistent file sink (`--log-file`, default `~/.mlx-serve/logs/mlx-serve-<port>.log`, 32 MB rotation). libc `write(2)` + pthread mutex — callers carry no `Io`. |
 | `build.zig` | Links mlx-c, libjinja, libwebp, stb_image |
@@ -77,7 +76,6 @@ Dispatched on `model_type` in `config.json` via `model.zig` (config/weights) and
 | `model_type` | Family | Weight prefix | Vision | MoE | Notes |
 |---|---|---|---|---|---|
 | `gemma4`, `gemma4_text` | Gemma 4 | `language_model.model` | SigLIP | -- | Full vision, clipped linears, PLE |
-| `diffusion_gemma` | DiffusionGemma | `model.decoder` | -- (tower not wired) | 128/top-8 | Gemma 4 26B-A4B trunk; BLOCK-DIFFUSION generation (src/plugins/diffusion_gemma/runner.zig), not AR decode. See "DiffusionGemma" below. |
 | `gemma3` | Gemma 3 | `language_model.model` | -- | -- | |
 | `qwen3` | Qwen 3 | `model` | -- | -- | QK norm |
 | `qwen3_5`, `qwen3_5_moe(_text)` | Qwen 3.5/3.6 | `language_model.model` | -- | Optional | GatedDeltaNet + MoE/dense, shared expert routing |
@@ -115,16 +113,6 @@ The `gguf` quant format (`src/sdk/quant/gguf/`, formerly the mlx-serve-gguf repo
 - Guards: its tests in `zig build test` (decoders vs ggml fixtures, GPU vs CPU reference, the kernel contract), the `mlx_gguf.zig` tests here (`MLX_SERVE_GGUF_TEST_MODEL=<gguf>` for the real-file arm), `tests/test_mlx_gguf.sh` (`MLX_GGUF_MODELS="<gguf> ..."`, 13 assertions per model incl. PLD output == `--no-pld`).
 
 Models with `vision_config` but no vision weights (e.g., text-only quantized Qwen 3.5) gracefully disable vision at init. Swift app flags unsupported archs via `supportedModelTypes` in `HFModels.swift`.
-
-### DiffusionGemma (block diffusion)
-
-`model_type: diffusion_gemma` (google/diffusiongemma-26B-A4B-it, June 2026) reuses the Gemma 4 26B-A4B MoE trunk verbatim — same `forwardMoeWith` gemma4 branch, sigma-MoE router, v_norm, K=V alias on full layers, proportional RoPE — but GENERATION is a canvas-denoising loop (`src/plugins/diffusion_gemma/runner.zig`), not autoregressive decode. `config.isDiffusion()` (canvas_length > 0) gates everything; `config.isGemma4Layers()` collapses gemma4 + diffusion onto the shared binding/forward arms.
-
-- **Encoder/decoder split over one trunk.** The *encoder* runs the trunk causally (normal prefill, fills the slot's KV cache) using its own per-layer scalars (`model.encoder.language_model.layers.N.layer_scalar` — the only untied encoder weights; `ForwardCtx.use_encoder_scalars`). The *decoder* (`forwardDiffusionDecoder`) re-forwards a 64–256-token canvas of noise tokens BIDIRECTIONALLY each denoising step: q/k/v computed for the canvas only, cache K/V concat-READ (never written), sliding layers sliced to the last `sliding_window − 1` cached positions, no mask at all. `ctx.skip_lm_head` skips the 262K-vocab projection on encoder passes.
-- **The loop** (`diffusion.Runner.nextCanvas`, one canvas per scheduler tick): uniform-RANDOM canvas init (no mask token), ≤48 steps, linear temp schedule (t_max 0.8 → t_min 0.4 on countdown), entropy-bound acceptance (sort entropies asc, accept while `cumsum − cummax ≤ 0.1`, renoise the rest), self-conditioning via soft embeddings (`softmax(processed) @ dequantized_embed_table × √hidden` — table dequantized once per request, ~1.5 GB transient), early stop when argmax is stable across `stability_threshold` steps AND mean entropy < 0.005. COMMIT = the argmax canvas; committed tokens are causally re-encoded at the START of the next tick (so an EOS-terminated request never pays for it). User temp < 0.01 → greedy denoiser; ≥ → categorical (temp 1.0 ≡ HF reference). Measured: 256-token canvas in ~10 steps on prose (25.6 tokens/forward), ~30% faster than the mlx-vlm reference.
-- **Dispatch**: third engine-style branch (`runPrefillDiffusion` / `runDiffusionDecodeTick`, `Slot.diffusion`) — tokens flow through normal slot machinery, so all four HTTP surfaces + block-wise streaming work unchanged. PLD/drafter/MTP/batching never apply (MoE already non-batchable; `modelBatchable` also gates `isDiffusion`). Hot prefix cache is intentionally NOT consulted (restored snapshots leave cache VIEWS stale; the decoder reads views via denseView before any update would rebuild them) — wire it later by refreshing views post-restore.
-- **Weights**: prefix `model.decoder`; experts packed as `experts.gate_up_proj` [E, 2M, X] (gate rows first) → `splitPackedGateUp` slices + MATERIALIZES halves at load; self-conditioning module under `model.decoder.self_conditioning.*`; `model.encoder.vision_tower.*` dropped at load (tower not wired — `has_vision` forced false).
-- **Template/EOS**: standard Gemma 4 `<|turn>`/`<|channel>thought` template; EOS set {1, 106, 50}. Raw `/v1/completions` (no chat template) degenerates — reference behaves identically; instruct-only checkpoint trait, not a bug.
 
 ### Laguna (poolside Laguna S 2.1)
 

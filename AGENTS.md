@@ -508,7 +508,7 @@ Media backends:
 
 Parity method:
 - **Cosine cannot see SCALE** — concatenated tensors assert `rms_ratio`; a permutation-invariant checksum cannot see a permutation (`pos_weighted`); an oracle that cannot execute the reference must say so; a faithful port can make the checkpoint WORSE (H3 splice default-off).
-- **Deep ViT/DiT fixtures dump fp32 on CPU**; transformers ≥5 zeroes custom rotary buffers (assert non-zero), `.float()` drops a complex buffer's sine half; an oracle that IMPROVES when a transform is removed had it disabled. DiffusionGemma parity = converged-canvas self-consistency (`MLX_SERVE_DIFFUSION_TRACE=1`).
+- **Deep ViT/DiT fixtures dump fp32 on CPU**; transformers ≥5 zeroes custom rotary buffers (assert non-zero), `.float()` drops a complex buffer's sine half; an oracle that IMPROVES when a transform is removed had it disabled.
 
 ### Licensing & third-party code
 
