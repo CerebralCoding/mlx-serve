@@ -985,6 +985,7 @@ test "MTP continuation releases its owned chain when drafting fails" {
     defer _ = mlx.mlx_stream_free(s);
     var xfm: Transformer = undefined;
     xfm.rht = null;
+    xfm.config = .{};
     xfm.s = s;
     var trunk: Qwen4Trunk = undefined;
     trunk.s = s;

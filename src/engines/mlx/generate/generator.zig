@@ -816,7 +816,6 @@ pub const Generator = struct {
     pub const MTP_DRAFT_TEMP = @import("../spec/mtp/depth.zig").MTP_DRAFT_TEMP;
     pub const MTP_DRAFT_TOP_P = @import("../spec/mtp/depth.zig").MTP_DRAFT_TOP_P;
     pub const MTP_DRAFT_TOP_K = @import("../spec/mtp/depth.zig").MTP_DRAFT_TOP_K;
-    pub const MTP_DRAFT_TEMP_QWEN4 = @import("../spec/mtp/depth.zig").MTP_DRAFT_TEMP_QWEN4;
     pub const mtpDraftTempFor = @import("../spec/mtp/depth.zig").mtpDraftTempFor;
     pub const mtpDraftSamplingFor = @import("../spec/mtp/depth.zig").mtpDraftSamplingFor;
     pub const mtpDraftSampling = @import("../spec/mtp/depth.zig").mtpDraftSampling;
