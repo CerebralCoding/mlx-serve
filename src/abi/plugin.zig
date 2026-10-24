@@ -378,6 +378,23 @@ pub const Forward = extern struct {
     /// A DFlash drafter is bound: projections and attention read the row-exact kernels wherever the model's weights
     /// fit them, so a verify row reproduces serial decode bit for bit (`Caps.exact_drafted`).
     row_exact: bool = false,
+    /// A verify whose rows form a draft tree (`Caps.spec_tree`); null `table` = a chain.
+    tree: Tree = .{},
+    /// A verify hands the residual built so far to the GPU every this many layers (0 = never), so the GPU runs while
+    /// the rest of the graph is built.
+    pipeline_every: u32 = 0,
+};
+
+/// Draft-tree verify rows: row w sits at its slot's position + `depth[w]`, its keys and recurrence follow its
+/// ancestors. A recurrent layer leaves the round's input state and per-row prework (`StateSlot.state_in`..) for the
+/// engine to replay the accepted path from.
+pub const Tree = extern struct {
+    /// `[6 W]` int32: each row's parent (-1 for row 0), then its conv-input sources (`gdn_decode.treeTable`).
+    table: Array = .{},
+    /// `[W]` int32 depths, and `[W, max_depth + 1]` int32: each row's ancestor at every depth.
+    depth: Array = .{},
+    path: Array = .{},
+    max_depth: i32 = 0,
 };
 
 /// What a `defer_host` forward left owed (`ForwardOut.owed`), settled by `forward_settle`.
@@ -417,8 +434,9 @@ pub const KvView = extern struct {
 
 /// A recurrent layer's states: the convolution window and the scan state, and what a verify forward leaves for the
 /// partial-accept rollback: the conv input behind the window (`conv_input` [B, K-1+S, C]) and the state after every
-/// row (`state_seq` [S, B, Hv, Dv, Dk]).
-pub const StateSlot = enum(u8) { conv, ssm, conv_input, state_seq };
+/// row (`state_seq` [S, B, Hv, Dv, Dk]); a tree verify leaves the round's input state (`state_in`) and its rows'
+/// prework (`prework_k`, `prework_v`, `prework_gb`) in place of `state_seq`. Writing a null array clears a slot.
+pub const StateSlot = enum(u8) { conv, ssm, conv_input, state_seq, state_in, prework_k, prework_v, prework_gb };
 
 /// The engine's calls on a slot's cache (`Handle`), handed in `Forward.cache_ops`: blocks append and read KV and
 /// recurrent state through it and never see the engine's types. Every `Array` passed in stays the caller's.
@@ -550,6 +568,8 @@ pub const SpecHooks = extern struct {
     native_drafter: ?*const NativeDrafter = null,
     /// Writes the verify widths to warm into `out` (`cap` entries); returns the count.
     warmup_shapes: ?*const fn (p: *const Parsed, out: [*]u32, cap: u32) callconv(.c) u32 = null,
+    /// Once a drafter binds, re-orders the trunk's projections in place for row-exact lane `lane` (the bases'
+    /// `row_exact.Lane`), the GPU synchronized; the model releases them at `unload`.
     tile_lanes: ?*const fn (m: *anyopaque, lane: u32) callconv(.c) Verdict = null,
 };
 

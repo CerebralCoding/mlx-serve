@@ -126,6 +126,10 @@ fn state(h: abi.Handle, layer: u32, which: abi.StateSlot) callconv(.c) abi.Array
         .ssm => e.ssm_state,
         .conv_input => e.spec_conv_input,
         .state_seq => e.spec_state_seq,
+        .state_in => e.spec_state_in,
+        .prework_k => e.spec_prework.k,
+        .prework_v => e.spec_prework.v,
+        .prework_gb => e.spec_prework.gb,
     });
 }
 
@@ -138,9 +142,16 @@ fn setState(h: abi.Handle, layer: u32, which: abi.StateSlot, value: abi.Array) c
         .ssm => &e.ssm_state,
         .conv_input => &e.spec_conv_input,
         .state_seq => &e.spec_state_seq,
+        .state_in => &e.spec_state_in,
+        .prework_k => &e.spec_prework.k,
+        .prework_v => &e.spec_prework.v,
+        .prework_gb => &e.spec_prework.gb,
     };
-    var r = mlx.mlx_array_new();
-    _ = mlx.mlx_array_set(&r, mx(value));
+    var r: mlx.mlx_array = .{ .ctx = null };
+    if (value.ctx != null) {
+        r = mlx.mlx_array_new();
+        _ = mlx.mlx_array_set(&r, mx(value));
+    }
     if (dst.ctx != null) _ = mlx.mlx_array_free(dst.*);
     dst.* = r;
     if (which == .conv or which == .ssm) e.initialized = true;

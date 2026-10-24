@@ -51,6 +51,9 @@ pub const Memo = struct {
     pub const Key = struct { what: What, n: [7]i64 = @splat(0) };
 };
 
+/// Draft-tree verify rows (`abi.Tree`): the GDN table and the attention rows' depths and ancestor paths.
+pub const Tree = struct { table: Array, attn: @import("../blocks/attention/row_attn.zig").Tree };
+
 /// One forward as a block sees it. `g` is the current layer's graph: arrays made in it die with the layer unless
 /// the base keeps them.
 pub const Ctx = struct {
@@ -79,6 +82,8 @@ pub const Ctx = struct {
     memo: ?*Memo = null,
     /// The row-exact lane the projections take (`blocks/row_exact.zig`): a bound drafter on a covered model.
     row_exact: @import("blocks/row_exact.zig").Lane = .off,
+    /// A verify whose rows form a draft tree (`Forward.tree`); null = a chain.
+    tree: ?Tree = null,
 
     pub fn stream(c: *const Ctx) ops.Stream {
         return c.g.s;
