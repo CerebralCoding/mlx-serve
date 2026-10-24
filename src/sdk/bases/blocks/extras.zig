@@ -20,11 +20,12 @@ const Ctx = block.Ctx;
 const Linear = linear.Linear;
 const Joined = linear.Joined;
 
-/// `B` with its output RMS-normed at the post-norm epsilon (`Shared.post_eps`). The seam after it then adds and
-/// norms as usual: bit-equal to the legacy's fused pre-normed seam, which reproduces the same ops.
+/// `B` with its output RMS-normed at the post-norm epsilon (`Shared.post_eps`). The decoder hands that norm to the
+/// seam (`Inner`), which folds it into its fused dispatch at decode, as the legacy did.
 pub fn PostNormed(comptime B: type) type {
     block.check(B, &.{ .mixer, .mlp });
     return struct {
+        pub const Inner = B;
         pub const kind = B.kind;
         pub const supports_batched_rows = B.supports_batched_rows;
         pub const Weights = struct { inner: B.Weights, norm: Array };

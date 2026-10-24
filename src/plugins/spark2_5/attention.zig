@@ -104,19 +104,19 @@ pub const Attention = struct {
             const w_c: c_int = @intCast(window);
             if (c.wide()) {
                 mode = "array";
-                if (!sv.band_in_kernel) mask = try sliding.bandMask(g, s, sv.kv_len, w_c);
+                if (!sv.band_in_kernel) mask = try sliding.bandOnce(c, s, sv.kv_len, w_c);
             } else {
                 const held: c_int = @intCast((try c.cacheOps()).len(c.cache(), c.layer));
                 if (held > w_c) {
                     mode = "array";
-                    mask = try sliding.decodeMask(g, @min(total_kv, w_c), w_c);
+                    mask = try sliding.decodeOnce(c, @min(total_kv, w_c), w_c);
                 }
             }
         }
 
         var out: ?Array = null;
         if (view.packed_reads and kvq.kvAttnFusedEligible(&dv, s)) {
-            if (std.mem.eql(u8, mode, "array") and mask.ctx == null) mask = try sliding.bandMask(g, s, sv.kv_len, @intCast(window));
+            if (std.mem.eql(u8, mode, "array") and mask.ctx == null) mask = try sliding.bandOnce(c, s, sv.kv_len, @intCast(window));
             out = try da.own(g, try kvq.qkvAttnDecodeKernel(g.s, q_rope, &dv, geo.scale, mode, mask));
             if (out != null) kvq.logKvAttnFusedEngaged(&dv, q_rope, s);
         } else if (view.packed_reads and kvq.kvAttnVerifyEligible(&dv, s)) {
@@ -130,7 +130,7 @@ pub const Attention = struct {
             } else if (std.mem.eql(u8, mode, "array")) {
                 if (c.wide()) out = try da.own(g, try attn256.fusedSdpa256Prefill(g.s, q_rope, dv.k, dv.v, geo.scale, @intCast(window)));
                 if (out == null) {
-                    if (mask.ctx == null) mask = try sliding.bandMask(g, s, sv.kv_len, @intCast(window));
+                    if (mask.ctx == null) mask = try sliding.bandOnce(c, s, sv.kv_len, @intCast(window));
                     out = try da.sdpaRaw(g, q_rope, dv.k, dv.v, geo.scale, "array", mask, false);
                 }
             } else {

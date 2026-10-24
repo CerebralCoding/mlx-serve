@@ -48,14 +48,14 @@ pub const RotAddNorm = struct {
         return .{ .h = sum, .normed = key };
     }
 
-    pub fn mid(c: *Ctx, h: Array, delta: Array, comptime Norm: type, nw: *const Norm.Weights) !block.Mid {
-        if (try fused(c, h, delta, nw)) |m| return m;
-        return seam.AddNorm.mid(c, h, delta, norm.RmsNorm, &nw.w);
+    pub fn mid(c: *Ctx, h: Array, delta: Array, pre: Array, comptime Norm: type, nw: *const Norm.Weights) !block.Mid {
+        if (pre.ctx == null) if (try fused(c, h, delta, nw)) |m| return m;
+        return seam.AddNorm.mid(c, h, delta, pre, norm.RmsNorm, &nw.w);
     }
 
-    pub fn end(c: *Ctx, h: Array, delta: Array, comptime Norm: type, next: ?*const Norm.Weights) !block.End {
-        const nw = next orelse return seam.AddNorm.end(c, h, delta, norm.RmsNorm, null);
-        if (try fused(c, h, delta, nw)) |m| return .{ .h = m.h, .normed = m.normed };
-        return seam.AddNorm.end(c, h, delta, norm.RmsNorm, &nw.w);
+    pub fn end(c: *Ctx, h: Array, delta: Array, pre: Array, comptime Norm: type, next: ?*const Norm.Weights) !block.End {
+        const nw = next orelse return seam.AddNorm.end(c, h, delta, pre, norm.RmsNorm, null);
+        if (pre.ctx == null) if (try fused(c, h, delta, nw)) |m| return .{ .h = m.h, .normed = m.normed };
+        return seam.AddNorm.end(c, h, delta, pre, norm.RmsNorm, &nw.w);
     }
 };

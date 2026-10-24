@@ -17,6 +17,12 @@ const Ctx = block.Ctx;
 pub const Run = run_mod.Run;
 pub const Out = run_mod.Out;
 
+/// A block's output and the norm the seam applies to it: a `PostNormed` block's own (folded into the seam's dispatch).
+fn blockOut(comptime B: type, w: *const B.Weights, c: *Ctx, x: Array) !struct { x: Array, norm: Array } {
+    if (@hasDecl(B, "Inner")) return .{ .x = try B.Inner.forward(&w.inner, c, x), .norm = w.norm };
+    return .{ .x = try B.forward(w, c, x), .norm = .{} };
+}
+
 /// `spec`: `.embed`, `.norm`, `.mixer`, `.mlp`, `.seam`, `.head` (block types) and optionally `.hooks`, a type with
 /// any of `Extra` (weights the hooks read), `afterEmbed`, `perLayer`, `beforeHead`, each
 /// `fn (x: *const Extra, c: *Ctx, h: Array) !Array`. A `perLayer` hook rewrites the residual after the layer's last
@@ -77,11 +83,11 @@ pub fn Decoder(comptime spec: anytype) type {
                 c.g = &lg;
                 c.layer = @intCast(i);
                 const normed = carried orelse try Norm.forward(&L.input_norm, &c, h);
-                const mixed = try Mixer.forward(&L.mixer, &c, normed);
-                const mid = try Seam.mid(&c, h, mixed, Norm, &L.post_norm);
-                const m = try Mlp.forward(&L.mlp, &c, mid.normed);
+                const mixed = try blockOut(Mixer, &L.mixer, &c, normed);
+                const mid = try Seam.mid(&c, h, mixed.x, mixed.norm, Norm, &L.post_norm);
+                const m = try blockOut(Mlp, &L.mlp, &c, mid.normed);
                 const next: ?*const Norm.Weights = if (per_layer) null else if (i + 1 < w.layers.len) &w.layers[i + 1].input_norm else &w.final_norm;
-                var end = try Seam.end(&c, mid.h, m, Norm, next);
+                var end = try Seam.end(&c, mid.h, m.x, m.norm, Norm, next);
                 if (per_layer) end.h = try Hooks.perLayer(&w.extra, &c, end.h);
 
                 c.g = g;

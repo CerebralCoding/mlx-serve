@@ -105,13 +105,13 @@ pub fn Hybrid(comptime spec: anytype) type {
         fn closeLayer(L: *const Layer, c: *Ctx, normed: Array, h: Array, next: ?*const Norm.Weights) !block.End {
             if (L.mlp) |*mlp| {
                 const out = try Op.forward(&L.op, c, normed);
-                const mid = try Seam.mid(c, h, out, Norm, &L.post_norm.?);
-                return Seam.end(c, mid.h, try Mlp.forward(mlp, c, mid.normed), Norm, next);
+                const mid = try Seam.mid(c, h, out, .{}, Norm, &L.post_norm.?);
+                return Seam.end(c, mid.h, try Mlp.forward(mlp, c, mid.normed), .{}, Norm, next);
             }
             if (@hasDecl(Op, "fold")) if (next) |nw| if (Norm.fusable) {
                 if (try Op.fold(&L.op, c, normed, h, nw.*)) |f| return f;
             };
-            return Seam.end(c, h, try Op.forward(&L.op, c, normed), Norm, next);
+            return Seam.end(c, h, try Op.forward(&L.op, c, normed), .{}, Norm, next);
         }
 
         pub fn tableForward(m: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) abi.Verdict {

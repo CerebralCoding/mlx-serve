@@ -292,3 +292,42 @@ test "bases attention: Gemma 4 batched rows (shared KV, value norm) are bit-equa
     const w = try gemmaWeights(lg, &layers);
     try batchedCase(Gemma, lg, &w, false);
 }
+
+extern "c" fn open_memstream(buf: *?[*]u8, len: *usize) ?*std.c.FILE;
+
+/// `RMSNorm` nodes in the lazy graph of `x`, read off mlx's own printout of it.
+fn rmsNormNodes(x: Array) !usize {
+    var buf: ?[*]u8 = null;
+    var len: usize = 0;
+    const f = open_memstream(&buf, &len) orelse return error.NoStream;
+    const outs = mlx.mlx_vector_array_new_value(x);
+    defer _ = mlx.mlx_vector_array_free(outs);
+    const namer = mlx.mlx_node_namer_new();
+    defer _ = mlx.mlx_node_namer_free(namer);
+    _ = mlx.mlx_print_graph(f, namer, outs);
+    _ = std.c.fclose(f);
+    defer std.c.free(buf);
+    return std.mem.count(u8, buf.?[0..len], "RMSNorm");
+}
+
+test "bases attention: a Gemma 3 decode step folds all four sandwich norms of a layer into its seam dispatches" {
+    const a = testing.allocator;
+    const lg = try loadGemma(0x9e33, false);
+    defer lg.deinit();
+    var layers: [4]Gemma.Layer = undefined;
+    const w = try gemmaWeights(lg, &layers);
+    var shared = bases.Shared.init(lg.config.rms_norm_eps, lg.config.postNormEps());
+    defer shared.deinit();
+    var nodes: [2]usize = undefined;
+    for ([_]abi.Mode{ .prefill, .decode }, &nodes) |mode, *n| {
+        var kv = try KVCache.init(a, lg.config.num_hidden_layers);
+        defer kv.deinit();
+        var slot: cache_ops.Slot = .{ .kv = &kv };
+        const h = [_]abi.Handle{slot.handle()};
+        var g = ops.Graph.init(a, lg.xfm.s);
+        defer g.deinit();
+        const out = try Gemma.forward(&w, &shared, &g, try fixture.tokens(&g, &.{42}), .{ .mode = mode, .rows = 1, .positions = &.{0}, .caches = &h, .cache_ops = &cache_ops.ops, .logits = .last_row });
+        n.* = try rmsNormNodes(out.logits);
+    }
+    try testing.expectEqual(nodes[0] - 4 * layers.len, nodes[1]);
+}
