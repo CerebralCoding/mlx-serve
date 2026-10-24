@@ -615,7 +615,13 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     var plugin_mtp: ?*plugin_head.Head = null;
     if (served) {
         if (mtp_enabled) plugin_mtp = plugin_head.load(sch.io, sch.allocator, xfm_ptr, params.model_dir);
-        if (plugin_mtp) |h| mtp_cost_profile = h.profile;
+        if (plugin_mtp) |h| {
+            mtp_cost_profile = h.m5NaxCostProfile(xfm_ptr);
+            log.info("MTP head ready (depth={d}, profile={s}).\n", .{
+                generate_mod.Generator.resolveMtpDepthCapForProfile(params.config.mtpDepth(params.mtp_depth), mtp_cost_profile),
+                @tagName(mtp_cost_profile),
+            });
+        }
     } else if (mtp_enabled and mtp_mod.hasMtpHead(sch.io, sch.allocator, params.model_dir)) {
         if (sch.allocator.create(mtp_mod.MtpModel)) |h| {
             if (mtp_mod.loadMtp(sch.io, sch.allocator, mlx.gpuStream(), params.model_dir)) |loaded| {

@@ -178,6 +178,36 @@ pub fn m5NaxCostProfileForFingerprint(
     };
 }
 
+/// The trunk geometry a head's fingerprint is read against.
+pub const HeadDims = struct { hidden: u32, heads: u32, kv_heads: u32, head_dim: u32, intermediate: u32 };
+
+/// A head that is the measured dense layout, at its projections' width.
+pub const HeadFingerprint = struct { bits: u32, group_size: u32 };
+
+/// Select the exact full-round cost surface for a head fingerprint (`MtpModel.m5NaxHeadFingerprint`) on `target`.
+/// Every G17 profile requires the successfully built 3-bit/gs-64 draft-only lm_head and an exact dense 27B head.
+/// Uniform q4/q6/q8 gs64 trunks and mixed-q4/q5/q6 oQ4e trunks remain separate profiles; target embedding storage
+/// is part of the fingerprint too. Compatible but off-profile geometry remains correct under `generic`.
+pub fn m5NaxProfileFor(fp: ?HeadFingerprint, target: *const Transformer, draft: ?*const QLinear, draft_bits: u32, draft_group: u32) MtpCostProfile {
+    const head = fp orelse return .generic;
+    const target_surface: MtpNaxTargetSurface = if (target.mtpNaxQ4Gs64ProfileEnabled())
+        .uniform_bf16_embedding
+    else if (target.mtpNaxQ6Gs64ProfileEnabled())
+        .uniform_q6_quantized_embedding
+    else if (target.mtpNaxQ8Gs64ProfileEnabled())
+        .uniform_q8_bf16_embedding
+    else if (target.mtpNaxProfileEnabled())
+        .uniform_quantized_embedding
+    else if (target.mtpOqeNaxProfileEnabled())
+        .oqe_quantized_embedding
+    else
+        .none;
+    const profile = m5NaxCostProfileForFingerprint(head.bits, head.group_size, target_surface);
+    if (profile == .generic) return .generic;
+    const cfg = &target.config;
+    return if (m5NaxDraftHeadMatches(draft, draft_bits, draft_group, cfg.hidden_size, cfg.vocab_size)) profile else .generic;
+}
+
 /// Prefill history windowing (OPT-IN via `--mtp-history-window <n>`; mirrors
 /// others `last_window 8192` above a 16384-token threshold): prompts whose
 /// forwarded tail exceeds the threshold only build MTP history for the LAST
@@ -429,104 +459,65 @@ pub const MtpModel = struct {
         return KVCache.init(allocator, 1);
     }
 
-    /// Select the exact full-round cost surface for this bound sidecar and
-    /// target. Every G17 profile requires the successfully built 3-bit/gs-64
-    /// draft-only lm_head and an exact dense 27B sidecar. Uniform q4/q6/q8
-    /// gs64 trunks and mixed-q4/q5/q6 oQ4e trunks remain separate profiles;
-    /// target embedding storage is part of the fingerprint too.
-    /// Compatible but off-profile geometry remains correct under `generic`.
+    /// The measured cost surface for this bound sidecar and target (`m5NaxProfileFor`).
     pub fn m5NaxCostProfile(self: *const MtpModel, target: *const Transformer) MtpCostProfile {
-        if (self.eh_proj != null) return .generic;
-        const target_surface: MtpNaxTargetSurface = if (target.mtpNaxQ4Gs64ProfileEnabled())
-            .uniform_bf16_embedding
-        else if (target.mtpNaxQ6Gs64ProfileEnabled())
-            .uniform_q6_quantized_embedding
-        else if (target.mtpNaxQ8Gs64ProfileEnabled())
-            .uniform_q8_bf16_embedding
-        else if (target.mtpNaxProfileEnabled())
-            .uniform_quantized_embedding
-        else if (target.mtpOqeNaxProfileEnabled())
-            .oqe_quantized_embedding
-        else
-            .none;
-        const profile = m5NaxCostProfileForFingerprint(
-            self.quant_bits,
-            self.quant_group_size,
-            target_surface,
-        );
-        if (profile == .generic) return .generic;
-        const sidecar_bits: u32 = switch (profile) {
-            .g17_nax_q8_gs32, .g17_nax_q8_gs64 => 8,
-            .g17_nax_q6_gs64 => 6,
-            .g17_nax_q4_gs32, .g17_nax_q4_gs64, .g17_nax_oq4e_q4_gs64 => 4,
-            // The sidecar fingerprint classifier above never returns the
-            // qwen4 profile; keep the fallback honest anyway.
-            .generic, .g17_nax_qwen4_q4_gs64, .g17_nax_qwen4_mixed_4_8_gs64 => return .generic,
-        };
-        const sidecar_group_size: u32 = switch (profile) {
-            .g17_nax_q8_gs32, .g17_nax_q4_gs32 => 32,
-            .g17_nax_q4_gs64, .g17_nax_q6_gs64, .g17_nax_q8_gs64, .g17_nax_oq4e_q4_gs64 => 64,
-            .generic, .g17_nax_qwen4_q4_gs64, .g17_nax_qwen4_mixed_4_8_gs64 => return .generic,
-        };
-
         const cfg = &target.config;
-        const full_out_wide = @as(u64, cfg.num_attention_heads) * cfg.head_dim;
+        const fp = self.m5NaxHeadFingerprint(.{
+            .hidden = cfg.hidden_size,
+            .heads = cfg.num_attention_heads,
+            .kv_heads = cfg.num_key_value_heads,
+            .head_dim = cfg.head_dim,
+            .intermediate = cfg.intermediate_size,
+        });
+        const draft: ?*const QLinear = if (self.draft_head) |*q| q else null;
+        return m5NaxProfileFor(fp, target, draft, self.draft_head_bits, self.draft_head_group);
+    }
+
+    /// The head's half of the fingerprint: its projections' (bits, group) when every head tensor is the measured
+    /// dense layout at that width for `d`; null otherwise.
+    pub fn m5NaxHeadFingerprint(self: *const MtpModel, d: HeadDims) ?HeadFingerprint {
+        if (self.eh_proj != null) return null;
+        const bits = self.quant_bits;
+        const group_size = self.quant_group_size;
+        const full_out_wide = @as(u64, d.heads) * d.head_dim;
         const q_out_wide = full_out_wide * 2;
-        const kv_out_wide = @as(u64, cfg.num_key_value_heads) * cfg.head_dim;
+        const kv_out_wide = @as(u64, d.kv_heads) * d.head_dim;
         if (full_out_wide == 0 or full_out_wide > std.math.maxInt(u32) or
             q_out_wide > std.math.maxInt(u32) or
-            kv_out_wide == 0 or kv_out_wide > std.math.maxInt(u32)) return .generic;
-        const full_out: u32 = @intCast(full_out_wide);
-        const q_out: u32 = @intCast(q_out_wide);
-        const kv_out: u32 = @intCast(kv_out_wide);
+            kv_out_wide == 0 or kv_out_wide > std.math.maxInt(u32)) return null;
+        if (d.hidden == 0 or d.hidden > std.math.maxInt(c_int) / 2) return null;
 
         const fc_shape = mlx.getShape(self.fc.w);
         if (mlx.mlx_array_dtype(self.fc.w) != .bfloat16 or
             fc_shape.len != 2 or
-            fc_shape[0] != @as(c_int, @intCast(cfg.hidden_size * 2)) or
-            fc_shape[1] != @as(c_int, @intCast(cfg.hidden_size))) return .generic;
-        if (!m5NaxNormMatches(self.pre_fc_norm_emb, cfg.hidden_size) or
-            !m5NaxNormMatches(self.pre_fc_norm_hidden, cfg.hidden_size) or
-            !m5NaxNormMatches(self.final_norm, cfg.hidden_size) or
-            !m5NaxNormMatches(self.input_norm, cfg.hidden_size) or
-            !m5NaxNormMatches(self.post_attn_norm, cfg.hidden_size) or
-            !m5NaxNormMatches(self.q_norm, cfg.head_dim) or
-            !m5NaxNormMatches(self.k_norm, cfg.head_dim)) return .generic;
+            fc_shape[0] != @as(c_int, @intCast(d.hidden * 2)) or
+            fc_shape[1] != @as(c_int, @intCast(d.hidden))) return null;
+        if (!m5NaxNormMatches(self.pre_fc_norm_emb, d.hidden) or
+            !m5NaxNormMatches(self.pre_fc_norm_hidden, d.hidden) or
+            !m5NaxNormMatches(self.final_norm, d.hidden) or
+            !m5NaxNormMatches(self.input_norm, d.hidden) or
+            !m5NaxNormMatches(self.post_attn_norm, d.hidden) or
+            !m5NaxNormMatches(self.q_norm, d.head_dim) or
+            !m5NaxNormMatches(self.k_norm, d.head_dim)) return null;
 
         switch (self.mlp) {
             .dense => |*mlp| {
                 if (!m5NaxDenseSidecarMatches(
+                    .{ .q = &self.q, .k = &self.k, .v = &self.v, .o = &self.o, .gate = &mlp.gate, .up = &mlp.up, .down = &mlp.down },
                     .{
-                        .q = &self.q,
-                        .k = &self.k,
-                        .v = &self.v,
-                        .o = &self.o,
-                        .gate = &mlp.gate,
-                        .up = &mlp.up,
-                        .down = &mlp.down,
+                        .hidden = d.hidden,
+                        .q_out = @intCast(q_out_wide),
+                        .kv_out = @intCast(kv_out_wide),
+                        .full_out = @intCast(full_out_wide),
+                        .intermediate = d.intermediate,
+                        .bits = bits,
+                        .group_size = group_size,
                     },
-                    .{
-                        .hidden = cfg.hidden_size,
-                        .q_out = q_out,
-                        .kv_out = kv_out,
-                        .full_out = full_out,
-                        .intermediate = cfg.intermediate_size,
-                        .bits = sidecar_bits,
-                        .group_size = sidecar_group_size,
-                    },
-                )) return .generic;
+                )) return null;
             },
-            .moe => return .generic,
+            .moe => return null,
         }
-
-        const draft: ?*const QLinear = if (self.draft_head) |*q| q else null;
-        return if (m5NaxDraftHeadMatches(
-            draft,
-            self.draft_head_bits,
-            self.draft_head_group,
-            cfg.hidden_size,
-            cfg.vocab_size,
-        )) profile else .generic;
+        return .{ .bits = bits, .group_size = group_size };
     }
 
     /// Validate the head against the target trunk: dims must line up and the

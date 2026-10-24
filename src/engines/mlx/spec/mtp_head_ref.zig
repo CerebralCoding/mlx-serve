@@ -143,7 +143,7 @@ pub const MtpHeadRef = union(enum) {
     ) !void {
         switch (self) {
             .qwen => |h| try mtp_mod.appendHistoryWithMrope(h, target, &cache.qwen, token_ids, hidden, rope_offset, mrope_ctx),
-            .plugin => |h| try h.appendHistory(&cache.plugin, token_ids, hidden, rope_offset, mrope_ctx, allocator),
+            .plugin => |h| try h.appendHistory(target, &cache.plugin, token_ids, hidden, rope_offset, mrope_ctx, allocator),
             .qwen4 => |t| {
                 const ids_i32 = try allocator.alloc(i32, token_ids.len);
                 defer allocator.free(ids_i32);
@@ -204,6 +204,44 @@ pub const MtpHeadRef = union(enum) {
         };
     }
 
+    /// Can a group on this head and `other` draft as the rows of one head forward (`forwardLanes`)?
+    pub fn lanesWith(self: MtpHeadRef, other: MtpHeadRef) bool {
+        return switch (self) {
+            .qwen => |h| other == .qwen and other.qwen == h,
+            .plugin => |h| other == .plugin and other.plugin == h and h.lanes(),
+            .qwen4 => false,
+        };
+    }
+
+    pub const Lane = struct { cache: *MtpCacheRef, id: mlx.mlx_array, hidden: mlx.mlx_array, rope_offset: c_int };
+
+    /// One draft step for every lane as the rows of one head forward; the post-norm rows `[1, N, H]`.
+    pub fn forwardLanes(self: MtpHeadRef, target: *Transformer, lanes: []const Lane) !mlx.mlx_array {
+        if (lanes.len > mtp_mod.MAX_LANES) return error.MtpLaneCount;
+        switch (self) {
+            .qwen => |h| {
+                var ls: [mtp_mod.MAX_LANES]mtp_mod.Lane = undefined;
+                for (lanes, 0..) |l, k| ls[k] = .{ .cache = &l.cache.qwen, .id = l.id, .hidden = l.hidden, .rope_offset = l.rope_offset };
+                return mtp_mod.forwardLanes(h, target, ls[0..lanes.len]);
+            },
+            .plugin => |h| {
+                var ls: [mtp_mod.MAX_LANES]plugin_head.Head.Lane = undefined;
+                for (lanes, 0..) |l, k| ls[k] = .{ .ref = &l.cache.plugin, .id = l.id, .hidden = l.hidden, .rope_offset = l.rope_offset };
+                return h.forwardLanes(ls[0..lanes.len]);
+            },
+            .qwen4 => return error.MtpLaneCount,
+        }
+    }
+
+    /// Committed rows `ids` `[n]` with `hidden` `[1, n, H]` into the history at `rope_offset`, K/V only.
+    pub fn appendRows(self: MtpHeadRef, target: *Transformer, cache: *MtpCacheRef, ids: mlx.mlx_array, hidden: mlx.mlx_array, rope_offset: c_int) !void {
+        switch (self) {
+            .qwen => |h| try mtp_mod.appendKvOnly(h, target, &cache.qwen, ids, hidden, rope_offset, null),
+            .plugin => |h| try h.appendRows(target, &cache.plugin, ids, hidden, rope_offset, null),
+            .qwen4 => return error.MtpLaneCount,
+        }
+    }
+
     /// `draftSelect` over group rows `x` `[N,1,H]`: `[N,1]` int32 ids.
     pub fn draftSelectBatched(self: MtpHeadRef, target: *Transformer, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !mlx.mlx_array {
         return switch (self) {
@@ -231,7 +269,7 @@ pub const MtpHeadRef = union(enum) {
         return switch (self) {
             .qwen => |h| h.m5NaxCostProfile(target),
             .qwen4 => |t| @import("../../../plugins/qwen4_exp/cost_profile.zig").qwen4G17CostProfileForKv(t, kv),
-            .plugin => |h| h.profile,
+            .plugin => |h| h.m5NaxCostProfile(target),
         };
     }
 

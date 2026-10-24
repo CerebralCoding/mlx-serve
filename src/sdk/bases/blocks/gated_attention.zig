@@ -270,7 +270,7 @@ fn tail(w: *const GatedAttention.Weights, lane: row_exact.Lane, parent: *Graph, 
 }
 
 /// Interleaved M-RoPE on `[B, H, S, D]` from per-token `cos`/`sin` rows over the first `rd` dims.
-fn applyMrope(parent: *Graph, x: Array, cos: Array, sin: Array, rd: c_int) !Array {
+pub fn applyMrope(parent: *Graph, x: Array, cos: Array, sin: Array, rd: c_int) !Array {
     var t = parent.scope();
     defer t.deinit();
     const g = &t;

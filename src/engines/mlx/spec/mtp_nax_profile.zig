@@ -9,10 +9,10 @@ const verifyQmmEnabled = @import("../../../sdk/blocks/linear/verify_qmm.zig").ve
 const naxMinMForBits = @import("../../../sdk/blocks/linear/verify_qmm_nax.zig").naxMinMForBits;
 const verifyQmmNaxAvailable = @import("../../../sdk/blocks/linear/verify_qmm_nax.zig").verifyQmmNaxAvailable;
 const verifyQmmNaxEnabledForMFrom = @import("../../../sdk/blocks/linear/verify_qmm_nax.zig").verifyQmmNaxEnabledForMFrom;
-const DenseMlpWeights = @import("../../../sdk/blocks/mlp/dense.zig").DenseMlpWeights;
 const QuantParams = @import("../../../sdk/quant/params.zig").QuantParams;
 const affineParamsFromGeometry = @import("../../../sdk/quant/params.zig").affineParamsFromGeometry;
 const MoeLayerWeights = @import("../forward/layered.zig").MoeLayerWeights;
+const Weights = @import("../../../sdk/weights/resident.zig").Weights;
 const testing = @import("../kv/cache.zig").testing;
 const Transformer = @import("../transformer.zig").Transformer;
 
@@ -175,12 +175,6 @@ fn mtpNaxAffineProjectionMatches(
     });
 }
 
-fn mtpNaxDenseMlpMatches(config: *const ModelConfig, mlp: *const DenseMlpWeights) bool {
-    return mtpNaxAffineProjectionMatches(config, mlp.gate_w, mlp.gate_s, mlp.gate_b, config.hidden_size, config.intermediate_size) and
-        mtpNaxAffineProjectionMatches(config, mlp.up_w, mlp.up_s, mlp.up_b, config.hidden_size, config.intermediate_size) and
-        mtpNaxAffineProjectionMatches(config, mlp.down_w, mlp.down_s, mlp.down_b, config.intermediate_size, config.hidden_size);
-}
-
 pub const OQE_MLP_DOWN_BITS = "5555555555555555555555555556555644444444444444444444444444444444";
 pub const OQE_LINEAR_Z_BITS = "5554444444545554555454444444444444444444444444444444444444444444";
 pub const OQE_LINEAR_AB_BITS = "5554544444545554555455545554555444444444444444444444444444444444";
@@ -209,15 +203,80 @@ fn mtpNaxOqeProjectionMatches(
     });
 }
 
-/// Exact resident-tensor fingerprint for Jundot's Qwen3.6-27B-oQ4e trunk.
-/// The checkpoint is globally affine-4/gs64 with a fixed layer/role map of
-/// affine q5/q6 overrides. Matching the full map avoids granting cap 8 to
-/// unrelated "mixed 4-bit" checkpoints with a different round-cost surface.
-pub fn mtpNaxOqeAffineTrunkFrom(config: *const ModelConfig, maybe_layers: ?[]MoeLayerWeights) bool {
+/// One projection's packed triple as loaded.
+const Proj = struct { w: mlx.mlx_array, s: mlx.mlx_array, b: mlx.mlx_array };
+
+/// What a trunk fingerprint reads of each layer: the full attention's q, k, v, o or the linear attention's
+/// qkv, z, a, b, out (`attn[4]` unused on a full layer), then the dense MLP's gate, up, down.
+const LayerProjs = struct { linear: bool, attn: [5]Proj, mlp: [3]Proj };
+
+/// The trunk's layers as the legacy load built them, or as a served pack's tensors name them (`<prefix>.layers.<i>`).
+pub const TrunkSource = union(enum) {
+    layers: ?[]MoeLayerWeights,
+    weights: struct { w: *const Weights, prefix: []const u8 },
+
+    fn len(src: TrunkSource, config: *const ModelConfig) ?usize {
+        return switch (src) {
+            .layers => |l| if (l) |ls| ls.len else null,
+            .weights => @intCast(config.num_hidden_layers),
+        };
+    }
+
+    /// Layer `i`'s projections; null where it is not the separate-projection dense layout the fingerprints read
+    /// (fused qkvz, a MoE MLP, a missing tensor).
+    pub fn at(src: TrunkSource, config: *const ModelConfig, i: usize) ?LayerProjs {
+        const linear = config.isLinearLayer(@intCast(i));
+        switch (src) {
+            .layers => |l| {
+                const layer = &l.?[i];
+                if (layer.is_linear != linear) return null;
+                var p: LayerProjs = .{ .linear = linear, .attn = undefined, .mlp = undefined };
+                switch (layer.attn) {
+                    .full => |*a| p.attn = .{ .{ .w = a.q_w, .s = a.q_s, .b = a.q_b }, .{ .w = a.k_w, .s = a.k_s, .b = a.k_b }, .{ .w = a.v_w, .s = a.v_s, .b = a.v_b }, .{ .w = a.o_w, .s = a.o_s, .b = a.o_b }, undefined },
+                    .linear => |*a| {
+                        if (a.combined_proj) return null;
+                        p.attn = .{ .{ .w = a.qkv_w, .s = a.qkv_s, .b = a.qkv_b }, .{ .w = a.z_w, .s = a.z_s, .b = a.z_b }, .{ .w = a.a_w, .s = a.a_s, .b = a.a_b }, .{ .w = a.b_w, .s = a.b_s, .b = a.b_b }, .{ .w = a.out_w, .s = a.out_s, .b = a.out_b } };
+                    },
+                }
+                switch (layer.mlp) {
+                    .dense => |*m| p.mlp = .{ .{ .w = m.gate_w, .s = m.gate_s, .b = m.gate_b }, .{ .w = m.up_w, .s = m.up_s, .b = m.up_b }, .{ .w = m.down_w, .s = m.down_s, .b = m.down_b } },
+                    .moe => return null,
+                }
+                return p;
+            },
+            .weights => |src_w| {
+                const full = [_][]const u8{ "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj" };
+                const lin = [_][]const u8{ "linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.in_proj_a", "linear_attn.in_proj_b", "linear_attn.out_proj" };
+                const mlp = [_][]const u8{ "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj" };
+                var p: LayerProjs = .{ .linear = linear, .attn = undefined, .mlp = undefined };
+                const names: []const []const u8 = if (linear) &lin else &full;
+                for (names, 0..) |n, k| p.attn[k] = projNamed(src_w.w, src_w.prefix, i, n) orelse return null;
+                for (mlp, 0..) |n, k| p.mlp[k] = projNamed(src_w.w, src_w.prefix, i, n) orelse return null;
+                return p;
+            },
+        }
+    }
+};
+
+fn projNamed(w: *const Weights, prefix: []const u8, i: usize, name: []const u8) ?Proj {
+    var buf: [256]u8 = undefined;
+    var out: Proj = undefined;
+    for ([_][]const u8{ "weight", "scales", "biases" }, [_]*mlx.mlx_array{ &out.w, &out.s, &out.b }) |leaf, dst| {
+        const key = std.fmt.bufPrint(&buf, "{s}.layers.{d}.{s}.{s}", .{ prefix, i, name, leaf }) catch return null;
+        dst.* = w.get(key) orelse if (std.mem.eql(u8, leaf, "weight")) return null else mlx.mlx_array{ .ctx = null };
+    }
+    return out;
+}
+
+/// Projection roles, in `LayerProjs` order per kind.
+const Role = enum { q, k, v, o, qkv, z, a, b, out, gate, up, down };
+
+pub fn trunkMatches(config: *const ModelConfig, src: TrunkSource, comptime oqe: bool) bool {
     if (config.isMoe() or config.full_attention_interval == 0) return false;
-    if (config.num_hidden_layers != 64 or config.hidden_size == 0 or config.intermediate_size == 0) return false;
-    const layers = maybe_layers orelse return false;
-    if (layers.len != 64) return false;
+    if (config.hidden_size == 0 or config.intermediate_size == 0) return false;
+    if (oqe and config.num_hidden_layers != 64) return false;
+    const n = src.len(config) orelse return false;
+    if (n != @as(usize, @intCast(config.num_hidden_layers))) return false;
 
     const full_out_wide = @as(u64, config.num_attention_heads) * config.head_dim;
     const full_q_out_wide = full_out_wide * 2;
@@ -228,42 +287,58 @@ pub fn mtpNaxOqeAffineTrunkFrom(config: *const ModelConfig, maybe_layers: ?[]Moe
     if (full_out_wide == 0 or full_out_wide > std.math.maxInt(u32) or
         full_q_out_wide > std.math.maxInt(u32) or
         kv_out_wide == 0 or kv_out_wide > std.math.maxInt(u32) or
+        (!oqe and (linear_key_out_wide == 0 or linear_key_out_wide > std.math.maxInt(u32))) or
         linear_out_wide == 0 or linear_out_wide > std.math.maxInt(u32) or
         linear_qkv_out_wide > std.math.maxInt(u32)) return false;
+    const h = config.hidden_size;
     const full_out: u32 = @intCast(full_out_wide);
-    const full_q_out: u32 = @intCast(full_q_out_wide);
-    const kv_out: u32 = @intCast(kv_out_wide);
     const linear_out: u32 = @intCast(linear_out_wide);
-    const linear_qkv_out: u32 = @intCast(linear_qkv_out_wide);
+    const heads_v = config.linear_num_value_heads;
 
-    for (layers, 0..) |*layer, i| {
-        if (layer.is_linear != config.isLinearLayer(@intCast(i))) return false;
-        switch (layer.attn) {
-            .full => |*attn| {
-                if (!mtpNaxOqeProjectionMatches(attn.q_w, attn.q_s, attn.q_b, config.hidden_size, full_q_out, oqeLayerBits(OQE_FULL_QK_BITS, i)) or
-                    !mtpNaxOqeProjectionMatches(attn.k_w, attn.k_s, attn.k_b, config.hidden_size, kv_out, oqeLayerBits(OQE_FULL_QK_BITS, i)) or
-                    !mtpNaxOqeProjectionMatches(attn.v_w, attn.v_s, attn.v_b, config.hidden_size, kv_out, oqeLayerBits(OQE_FULL_V_BITS, i)) or
-                    !mtpNaxOqeProjectionMatches(attn.o_w, attn.o_s, attn.o_b, full_out, config.hidden_size, oqeLayerBits(OQE_FULL_O_BITS, i))) return false;
-            },
-            .linear => |*attn| {
-                if (attn.combined_proj) return false;
-                if (!mtpNaxOqeProjectionMatches(attn.qkv_w, attn.qkv_s, attn.qkv_b, config.hidden_size, linear_qkv_out, 4) or
-                    !mtpNaxOqeProjectionMatches(attn.z_w, attn.z_s, attn.z_b, config.hidden_size, linear_out, oqeLayerBits(OQE_LINEAR_Z_BITS, i)) or
-                    !mtpNaxOqeProjectionMatches(attn.a_w, attn.a_s, attn.a_b, config.hidden_size, config.linear_num_value_heads, oqeLayerBits(OQE_LINEAR_AB_BITS, i)) or
-                    !mtpNaxOqeProjectionMatches(attn.b_w, attn.b_s, attn.b_b, config.hidden_size, config.linear_num_value_heads, oqeLayerBits(OQE_LINEAR_AB_BITS, i)) or
-                    !mtpNaxOqeProjectionMatches(attn.out_w, attn.out_s, attn.out_b, linear_out, config.hidden_size, oqeLayerBits(OQE_LINEAR_OUT_BITS, i))) return false;
-            },
+    for (0..n) |i| {
+        const p = src.at(config, i) orelse return false;
+        const roles: []const Role = if (p.linear) &.{ .qkv, .z, .a, .b, .out } else &.{ .q, .k, .v, .o };
+        for (roles, 0..) |role, k| {
+            const dims: [2]u32 = switch (role) {
+                .q => .{ h, @intCast(full_q_out_wide) },
+                .k, .v => .{ h, @intCast(kv_out_wide) },
+                .o => .{ full_out, h },
+                .qkv => .{ h, @intCast(linear_qkv_out_wide) },
+                .z => .{ h, linear_out },
+                .a, .b => .{ h, heads_v },
+                .out => .{ linear_out, h },
+                else => unreachable,
+            };
+            if (!roleMatches(config, p.attn[k], dims, role, i, oqe)) return false;
         }
-        switch (layer.mlp) {
-            .dense => |*mlp| {
-                if (!mtpNaxOqeProjectionMatches(mlp.gate_w, mlp.gate_s, mlp.gate_b, config.hidden_size, config.intermediate_size, 4) or
-                    !mtpNaxOqeProjectionMatches(mlp.up_w, mlp.up_s, mlp.up_b, config.hidden_size, config.intermediate_size, 4) or
-                    !mtpNaxOqeProjectionMatches(mlp.down_w, mlp.down_s, mlp.down_b, config.intermediate_size, config.hidden_size, oqeLayerBits(OQE_MLP_DOWN_BITS, i))) return false;
-            },
-            .moe => return false,
-        }
+        const inter = config.intermediate_size;
+        for ([_]Role{ .gate, .up, .down }, [_][2]u32{ .{ h, inter }, .{ h, inter }, .{ inter, h } }, 0..) |role, dims, k|
+            if (!roleMatches(config, p.mlp[k], dims, role, i, oqe)) return false;
     }
     return true;
+}
+
+fn roleMatches(config: *const ModelConfig, p: Proj, dims: [2]u32, role: Role, i: usize, comptime oqe: bool) bool {
+    if (!oqe) return mtpNaxAffineProjectionMatches(config, p.w, p.s, p.b, dims[0], dims[1]);
+    const bits: u32 = switch (role) {
+        .q, .k => oqeLayerBits(OQE_FULL_QK_BITS, i),
+        .v => oqeLayerBits(OQE_FULL_V_BITS, i),
+        .o => oqeLayerBits(OQE_FULL_O_BITS, i),
+        .qkv, .gate, .up => 4,
+        .z => oqeLayerBits(OQE_LINEAR_Z_BITS, i),
+        .a, .b => oqeLayerBits(OQE_LINEAR_AB_BITS, i),
+        .out => oqeLayerBits(OQE_LINEAR_OUT_BITS, i),
+        .down => oqeLayerBits(OQE_MLP_DOWN_BITS, i),
+    };
+    return mtpNaxOqeProjectionMatches(p.w, p.s, p.b, dims[0], dims[1], bits);
+}
+
+/// Exact resident-tensor fingerprint for Jundot's Qwen3.6-27B-oQ4e trunk.
+/// The checkpoint is globally affine-4/gs64 with a fixed layer/role map of
+/// affine q5/q6 overrides. Matching the full map avoids granting cap 8 to
+/// unrelated "mixed 4-bit" checkpoints with a different round-cost surface.
+pub fn mtpNaxOqeAffineTrunkFrom(config: *const ModelConfig, maybe_layers: ?[]MoeLayerWeights) bool {
+    return trunkMatches(config, .{ .layers = maybe_layers }, true);
 }
 
 /// The depth-8 controller constants describe the measured homogeneous affine
@@ -272,53 +347,21 @@ pub fn mtpNaxOqeAffineTrunkFrom(config: *const ModelConfig, maybe_layers: ?[]Moe
 /// while retaining a model-wide affine-4 config. Inspect every resident linear
 /// used by the dense trunk so those checkpoints stay on the conservative cap 6.
 pub fn mtpNaxUniformAffineTrunkFrom(config: *const ModelConfig, maybe_layers: ?[]MoeLayerWeights) bool {
-    if (config.isMoe() or config.full_attention_interval == 0) return false;
-    if (config.hidden_size == 0 or config.intermediate_size == 0) return false;
-    const layers = maybe_layers orelse return false;
-    if (layers.len != @as(usize, @intCast(config.num_hidden_layers))) return false;
+    return trunkMatches(config, .{ .layers = maybe_layers }, false);
+}
 
-    const full_out_wide = @as(u64, config.num_attention_heads) * config.head_dim;
-    const full_q_out_wide = full_out_wide * 2;
-    const kv_out_wide = @as(u64, config.num_key_value_heads) * config.head_dim;
-    const linear_key_out_wide = @as(u64, config.linear_num_key_heads) * config.linear_key_head_dim;
-    const linear_out_wide = @as(u64, config.linear_num_value_heads) * config.linear_value_head_dim;
-    const linear_qkv_out_wide = 2 * linear_key_out_wide + linear_out_wide;
-    if (full_out_wide == 0 or full_out_wide > std.math.maxInt(u32) or
-        full_q_out_wide > std.math.maxInt(u32) or
-        kv_out_wide == 0 or kv_out_wide > std.math.maxInt(u32) or
-        linear_key_out_wide == 0 or linear_key_out_wide > std.math.maxInt(u32) or
-        linear_out_wide == 0 or linear_out_wide > std.math.maxInt(u32) or
-        linear_qkv_out_wide > std.math.maxInt(u32)) return false;
-    const full_out: u32 = @intCast(full_out_wide);
-    const full_q_out: u32 = @intCast(full_q_out_wide);
-    const kv_out: u32 = @intCast(kv_out_wide);
-    const linear_out: u32 = @intCast(linear_out_wide);
-    const linear_qkv_out: u32 = @intCast(linear_qkv_out_wide);
+/// `Transformer.mtp_uniform_affine_trunk` and `mtp_oqe_affine_trunk` for a trunk whose head is `lm_head_w`.
+pub const TrunkFlags = struct { uniform: bool, oqe: bool };
 
-    for (layers, 0..) |*layer, i| {
-        if (layer.is_linear != config.isLinearLayer(@intCast(i))) return false;
-        switch (layer.attn) {
-            .full => |*attn| {
-                if (!mtpNaxAffineProjectionMatches(config, attn.q_w, attn.q_s, attn.q_b, config.hidden_size, full_q_out) or
-                    !mtpNaxAffineProjectionMatches(config, attn.k_w, attn.k_s, attn.k_b, config.hidden_size, kv_out) or
-                    !mtpNaxAffineProjectionMatches(config, attn.v_w, attn.v_s, attn.v_b, config.hidden_size, kv_out) or
-                    !mtpNaxAffineProjectionMatches(config, attn.o_w, attn.o_s, attn.o_b, full_out, config.hidden_size)) return false;
-            },
-            .linear => |*attn| {
-                if (attn.combined_proj) return false;
-                if (!mtpNaxAffineProjectionMatches(config, attn.qkv_w, attn.qkv_s, attn.qkv_b, config.hidden_size, linear_qkv_out) or
-                    !mtpNaxAffineProjectionMatches(config, attn.z_w, attn.z_s, attn.z_b, config.hidden_size, linear_out) or
-                    !mtpNaxAffineProjectionMatches(config, attn.a_w, attn.a_s, attn.a_b, config.hidden_size, config.linear_num_value_heads) or
-                    !mtpNaxAffineProjectionMatches(config, attn.b_w, attn.b_s, attn.b_b, config.hidden_size, config.linear_num_value_heads) or
-                    !mtpNaxAffineProjectionMatches(config, attn.out_w, attn.out_s, attn.out_b, linear_out, config.hidden_size)) return false;
-            },
-        }
-        switch (layer.mlp) {
-            .dense => |*mlp| if (!mtpNaxDenseMlpMatches(config, mlp)) return false,
-            .moe => return false,
-        }
-    }
-    return true;
+pub fn trunkFlags(config: *const ModelConfig, lm_head_w: mlx.mlx_array, src: TrunkSource) TrunkFlags {
+    const head_shape = mlx.getShape(lm_head_w);
+    const head_n: c_int = if (lm_head_w.ctx != null and head_shape.len == 2) head_shape[0] else 0;
+    if (!mtpNaxCalibratedModelFrom(config, head_n) or config.quant_group_size != 64 or config.quant_mode != .affine) return .{ .uniform = false, .oqe = false };
+    const uniform_bits = config.quant_bits == 4 or config.quant_bits == 6 or config.quant_bits == 8;
+    return .{
+        .uniform = uniform_bits and trunkMatches(config, src, false),
+        .oqe = config.quant_bits == 4 and trunkMatches(config, src, true),
+    };
 }
 
 pub fn mtpNaxProfileEnabledForTrunk(self: *const Transformer, profiled_trunk: bool) bool {

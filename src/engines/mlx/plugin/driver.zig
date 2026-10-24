@@ -16,6 +16,7 @@ const transformer_mod = @import("../transformer.zig");
 const qmm_int8 = @import("../../../sdk/blocks/qmm/qmm_int8.zig");
 const lmHeadMxfp8On = @import("../../../sdk/quant/mxfp8.zig").lmHeadMxfp8On;
 const Resident = @import("../../../sdk/weights/resident.zig").Resident;
+const mtp_nax_profile = @import("../spec/mtp_nax_profile.zig");
 const firstRowExactMiss = @import("../../../sdk/quant/ternary.zig").firstRowExactMiss;
 const FsPackDir = @import("../../../host/registry/pack_dir.zig").FsPackDir;
 const moduleShell = @import("../modules/shell.zig").moduleShell;
@@ -193,6 +194,12 @@ pub fn loadWith(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_di
     if (trunk) try adoptRotations(&xfm, b.table, m);
     intree.lendTrunk(&xfm);
     xfm.dense_attn_proj = @import("../load/init.zig").denseAttnProj(&xfm.config, xfm.config.num_experts > 0, &res.weights);
+    // The measured MTP cost surfaces fingerprint the trunk's projections, read off the pack's tensors as loaded.
+    if (trunk) {
+        const f = mtp_nax_profile.trunkFlags(&xfm.config, xfm.lm_head_w, .{ .weights = .{ .w = &res.weights, .prefix = xfm.config.weight_prefix } });
+        xfm.mtp_uniform_affine_trunk = f.uniform;
+        xfm.mtp_oqe_affine_trunk = f.oqe;
+    }
     // The engine's row-exact sampling reads coverage off the config, measured over the pack as the legacy load does.
     if (trunk and xfm.config.rowExactArch()) {
         const gather_only: Array = if (xfm.lm_head_w.ctx == xfm.emb_w.ctx) .{ .ctx = null } else xfm.emb_w;
