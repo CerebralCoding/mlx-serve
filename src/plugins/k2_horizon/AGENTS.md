@@ -24,3 +24,9 @@ through this table.
   `Tokenizer.marker_aliases`); only the rendered prompt keeps the pack's spelling (`k2ThinkOpenerAt`). JSON-schema +
   thinking on K2 keeps thinking off (known).
 - Story: `docs/gotchas/models-media.md` "K2-Horizon (`k2_horizon`) port".
+
+## The row from the root architecture table
+
+IFM K2-Horizon dense (7B: 36 layers, hd 128, 512k ctx): Llama trunk + GROUPED RMS norms (`groupedRmsNorm`). `<ifm|…>`
+markers decode to `<think>`/GLM tags (`installMarkerAliases`); the template RAISES on a thinking-less assistant turn
+and on any other effort word (`k2EffortFor`). Thinking default ON; MoVA not served.

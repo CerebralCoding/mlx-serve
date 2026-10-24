@@ -57,6 +57,8 @@ an in-checkpoint MTP layer, a Qwen3-VL tower. Packs, oracle: `docs/reference.md`
 - Decode is kernel-time and dispatch bound: a kernel that replaces ONE dispatch loses to MLX's qmv; rows per simdgroup
   is an occupancy decision (sweep in situ). Meters: `fwd-ubench`, `MLX_SERVE_STEP_TRACE=1`.
 
+- MTP specifics: the head projects only the consumed row (`Qwen4MtpProject`) and rides the slot's M-RoPE table on image turns; the grouped-expert NAX tile is a LOSS; solo greedy rounds pad the head history and pre-draft lazily, lagging one round at auto depth BY DESIGN.
+
 ## Nulls (measured, reverted)
 
 One-expert gather kernels for the shared expert, tail ops folded into down+reduce, the uv hc kernel at one row,

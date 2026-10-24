@@ -17,3 +17,11 @@ dense trunk (`plugins/qwen3`) parsed from `thinker_config.text_config`, the quan
   (audio-only Qwen3-ASR heard silence).
 - The aligner shares the root `model_type`; the thinker's `qwen3_forced_aligner` is the tell (capability
   `alignment`, loaded when a request asks for times, never a route of its own).
+
+## The row from the root architecture table
+
+Qwen3-ASR (mlx-audio layout, `thinker_config` nesting): a plain `qwen3` trunk + audio tower whose rows splice at
+`<|audio_pad|>`; serves `/v1/audio/transcriptions` only (no chat template, not chat-pickable). Its forced aligner
+shares the root `model_type`; the thinker's `qwen3_forced_aligner` is the tell (arch hint of that name, capability
+`alignment`, loaded when a request asks for times, never a route of its own). Oracles:
+`tests/dump_qwen3_asr_fixtures.py`, `tests/dump_qwen3_aligner_fixtures.py`

@@ -39,3 +39,10 @@ a student runs exactly its own), `seed`, `turbo` (needs `turbo_lora.safetensors`
 - `conformanceFixture`: DiT at 64 (two 32-wide heads, one block + one refiner), text encoder at 64, VAE decoder at 32,
   byte tokenizer, no audio VAE (the clip is silent); 64x64 x 5 frames, 2 steps on CPU.
 - Oracles: `tests/dump_minimax_h3_fixtures.py` (toy DiT block, layout, vision) in `h3.zig` tests.
+
+## The row from the root architecture table
+
+MiniMax-H3 text-to-audio-video: joint denoise, 17k+5 frame ladder, 24 fps, two partitions (fl2va/ref2va — `tasks` is
+the ONLY discriminator), Turbo LoRA, chained windows, fast recipe default-on. FastH3 Omni = REF2VA's 8-step PDD
+student: 32 stacked output heads fused per step from the config's `pdd_*` contract, trained VSA sparse attention
+(`vsa.zig`)

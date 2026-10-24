@@ -67,3 +67,10 @@ the residual before the final norm (`hooks.residual_hidden`), as the legacy capt
 ## Fixtures
 - `conformanceFixture`: conv + attention layer, width 64, f32. Proof packs: `proof_test.zig` (4-bit; bf16 nested +
   torch conv + untied head; lfm2_moe; an LFM2-VL image prompt over two chunks). VL oracle: `tests/test_lfm2_vision.sh`.
+
+## The row from the root architecture table
+
+Hybrid gated conv + attention; `lfm2_moe` = sparse MoE past `num_dense_layers` (sigmoid routing, selection-only
+`expert_bias`, no shared expert); dense MLP `w1/w3/w2` OR `gate/up/down_proj` (probed); `lfm2_vl` = siglip2 tower +
+projector, NaFlex 64-256 merged tokens, tiling past `max_image_tokens x 2.0` into 512px tiles + thumbnail
+(`<|img_row_R_col_C|>`/`<|img_thumbnail|>`)

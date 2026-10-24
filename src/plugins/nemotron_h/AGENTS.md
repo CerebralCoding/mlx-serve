@@ -34,6 +34,7 @@ the trunk under `llm_config`, the RADIO tower beside it). Packs: mlx-community's
   `layers_block_type` name it does not know, a layer span (the cluster refuses nemotron_h).
 
 ## Rules (moved from root AGENTS.md)
+- **The MTP head reads the FINAL-NORMED hidden and pays per verify ROW** (`ModelConfig.mtpReadsFinalNorm`; more drafts kept at depth 1 and 2 than from the residual): every extra row routes to more experts, so round cost climbs with depth; depth is 1 or 2 per round (`mtpExactDepth`).
 - Pattern from `hybrid_override_pattern` (string wins) OR `layers_block_type`; Bolt's `llm_config` omits
   `num_hidden_layers`: the block list is the depth. `time_step_limit` bounds: numbers or positive infinity only.
 - Attention is NoPE whatever `rope_theta` the config carries, in every trunk layer and the MTP head.
@@ -72,3 +73,10 @@ config by name, `loadMtp` a Nemotron head); the config parse stays.
 ## Fixtures
 - `conformanceFixture`: `M*E-`, width 64, f32. Proof packs in `proof_test.zig`. Oracles: Super RADIO reference
   fixtures, LiLiCorr tests, `tests/test_nemotron_bolt.py`.
+
+## The row from the root architecture table
+
+Hybrid transformer + Mamba2 (`backbone` prefix; nested trunks probed); pattern from `hybrid_override_pattern` OR
+`layers_block_type`; sigmoid/ReLU² MoE + shared expert, including latent full-hidden routing; attention is NoPE
+(`layer_no_rope`). Puzzle/omni aliases, RADIO image/video and LiLiCorr via DFlash. MTP = a bare-key
+`mtp_head.safetensors`, depth 2.

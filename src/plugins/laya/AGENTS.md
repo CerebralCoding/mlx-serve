@@ -25,3 +25,9 @@ set on the host by `MLX_SERVE_LAYA_MAX_QUESTIONS` / `_MAX_INPUT_TOKENS`; a refus
 ## Fixtures
 - `conformanceFixture`: ModernBERT at 32, one global + one sliding layer, byte tokenizer, one head layer.
 - Reference oracles: `LAYA_TEST_MODEL` / `LAYA_FIXTURES` env-gated tests in `laya.zig`.
+
+## The row from the root architecture table
+
+Laya typed-decision checkpoints (no root config.json: classified from `encoder/config.json` + `rl_agent_config.json`
+by `discovery.peekLayaCheckpoint`, app twin `DownloadManager.markerModelType`): ModernBERT encoder + 2 head layers +
+marker scorer + act head, fp16

@@ -6,6 +6,7 @@ Native Zig server running MLX-format LMs on Apple Silicon; OpenAI/Anthropic/Olla
 
 - `docs/reference.md` — deep detail: per-file contracts, media-gen schemas, API surfaces, LAN design, observability, embedded engines, arch numerics (dsv4/inkling/H3, Kokoro, runtime LoRA), website/tier list, licensing. Read its section BEFORE deep work on a subsystem.
 - `docs/gotchas/{tool-calling,server-http,engine-mlx,models-media,app}.md` — full war stories behind every rule in `## Rules`.
+- `src/plugins/<name>/AGENTS.md` — each model's rules, quirks, packs and oracles. `docs/known-issues.md` — what is broken now.
 - `docs/CUDA.md` — NVIDIA (Linux, Windows): builds, our own CUDA kernels, per-device defaults, memory, measuring, MLX patches.
 - `tests/CLAUDE.md` — integration-test matrix. `app/CLAUDE.md` — Swift app layout + rules; `app-web/CLAUDE.md` — console source (auto-load in their dirs).
 - Skills: `/release` (pre-release checklist, CalVer, CHANGELOG), `/bench` (llmprobe methodology + comparison traps).
@@ -15,86 +16,32 @@ Native Zig server running MLX-format LMs on Apple Silicon; OpenAI/Anthropic/Olla
 
 ## Stack
 
-Zig 0.17.0 (pinned via `scripts/fetch-zig.sh`); mlx + mlx-c PINNED SUBMODULES (`lib/mlx-src` v0.32.3, `lib/mlxc-src` 56b2d39 = PR #127 + `patches/mlxc-gather-qmm-global-scale.patch`, applied by the build scripts) self-built NAX-enabled by `scripts/build-mlx.sh` into `lib/mlx/` (FFI `src/mlx/ffi.zig`); jinja.cpp (wangzhaode, Apache-2.0, NOT llama.cpp's) as `lib/jinja_cpp/libjinja.a`; stb_image + libwebp; safetensors; BPE. Embedded engines: ds4 (`lib/ds4`, DSV4-Flash GGUF) + libllama (`lib/llama`, generic GGUF). `lib/sushi` (our fork of beamivalice/sushi, module `sushi_exl3`, `-Dsushi-dir`) serves Sushi packs' EXL3 routed experts on qwen4_exp (`ModelConfig.exl3`). `lib/mlx-stream` (davidtai, pinned from our fork `ddalcu/mlx-stream`): V4.1's EXL3 repack.
+Zig 0.17.0 (pinned via `scripts/fetch-zig.sh`); mlx + mlx-c PINNED SUBMODULES (`lib/mlx-src` v0.32.3, `lib/mlxc-src` 56b2d39 = PR #127 + `patches/mlxc-gather-qmm-global-scale.patch`, applied by the build scripts) self-built NAX-enabled by `scripts/build-mlx.sh` into `lib/mlx/` (FFI `src/mlx/ffi.zig`); jinja.cpp (wangzhaode, Apache-2.0, NOT llama.cpp's) as `lib/jinja_cpp/libjinja.a`; stb_image + libwebp; safetensors; BPE. Embedded engines: ds4 (`lib/ds4`, DSV4-Flash GGUF), libllama (`lib/llama`, generic GGUF), the Neural Engine runtime (`lib/ane`). Absorbed in-tree: sushi's EXL3 + STQ (`src/sdk/quant/exl3/sushi/`, module `sushi_exl3`, `zig build exl3-test`) and davidtai's mlx-stream (`src/mlx_stream.zig`).
 
 ## Layout (`src/`)
 
-| File | Role |
+Two seams: the ENGINE interface (`abi/engine.zig`, host ↔ an engine, per request) and the PLUGIN tables
+(`abi/plugin.zig` model, `abi/media.zig` media, `abi/quant.zig` quant; per load and per forward, never per layer).
+
+| Area | Role |
 |---|---|
-| `main.zig` | Entry, CLI flags + subcommands (`run/pull/list/serve/launch`) |
-| `cli.zig` | Ollama-grade CLI: alias → HF repo, resumable pull into `~/.mlx-serve/models/<org>/<repo>`, `list`, `run` REPL |
-| `launch.zig` | `mlx-serve launch <agent>` (claude/pi/omp/opencode/opencode2/codex/hermes/aider/fx/grok/zcode): reads `/v1/models` (ADVERTISED context), writes configs into `~/.mlx-serve/<agent>/`, links the `skills/mlx-serve` skill, starts the app if the server is down. `GET /launch?agent=` serves the same files as a `curl … | sh` script for another machine (the console's Code Launcher, `remoteScript`). Swift twin: `CLILauncher` + `AgentConfigs`. Detail: reference.md "row detail" |
-| `mlx.zig` | mlx-c FFI |
-| `model.zig` | Config parse + safetensors loading |
-| `tokenizer.zig` | BPE; single special-token splitter (first-byte-bucketed); per-model `digit_group` |
-| `transformer.zig` | Forward pass, arch dispatch (attention/MLP/MoE/GatedDeltaNet), quant resolution, custom kernels (`msv_attn_p256`, `verifyQmm` lanes incl. NAX) |
-| `generate.zig` | Generation, sampling, PLD/drafter/MTP orchestration, `StallClock`, prefill chunking, loop-stop tiers |
-| `reasoning_protocol.zig` | Bounded reasoning/header masks, recovery, and authoritative JSON response routing (see `docs/reasoning-protocols.md`) |
-| `chat.zig` | Chat templates (ChatML/Gemma/Llama-3/Jinja2), thinking tags, tool-call parsing/repair/coercion |
-| `vision.zig` / `qwen_vision.zig` + `mrope.zig` | Gemma SigLIP / Qwen3-VL ViT + M-RoPE |
-| `muse_vision.zig` / `lfm2_vision.zig` / `glm_vision.zig` | Muse-Glimmer ViT / LFM2-VL SigLIP2-NaFlex tower + projector + tiling / GLM-5.3-Flash ViT + its padded-canvas processor |
-| `minicpm_vision.zig` / `minicpm_canvas.zig` | MiniCPM-V 4.7: SigLIP2 tower with the in-tower 2x2 window merger after layer 6 + merger MLP, the processor's thumbnail + crop slicing (each crop its own encoder call), and the canvas M-RoPE positions over the expanded prompt (pure host arithmetic) |
-| `server.zig` | All HTTP: `/v1/*` (chat/completions/messages/responses/embeddings/load/unload/load-progress/models), media endpoints, `/metrics(.json)`, WS, Ollama glue, `--api-key`, console at `GET /` (embedded `src/html/index.html`, renders with NO model). Embeddings: BERT + EmbeddingGemma, per-checkpoint pooling, `--embedding-max-length` |
-| `lan.zig` | LAN sharing: Bonjour, `SharedSet` + `routeClass` allowlist, `<id>@<peer>` mirroring, streaming proxy. Pure transport |
-| `model_settings.zig` | Per-model settings (`~/.mlx-serve/model-settings.json`, keyed by model path): `alias` (a request NAME, never a load setting), `ctx_size`, `kv_quant`, `mtp`/`mtp_acceptance`/`mtp_greedy_tail`, `int8_prefill` (LOSSY), `lm_head_mxfp8` (LOSSY), `engine` (mlx/ane/ds4/llama: outranks `ane` and, on a GGUF, `--engine`; the app's picker offers the row's `engines`), `chat_template_kwargs`; read at every load site, stamped on `ModelConfig.*_override` + `ChatConfig.chat_template_kwargs`. Detail: reference.md "row detail" |
-| `providers.zig` | Upstream OpenAI-compatible chat providers (`~/.mlx-serve/providers.json`): background `/v1/models` probe, `<id>@<name>` rows (`models` = filter, or the list for a listless provider), curl-backed `/v1/chat/completions` proxy. `GET /v1/providers`, `POST /v1/providers/reload` |
-| `distributed.zig` / `h3_split.zig` | Two Macs over Thunderbolt RDMA: Flash Next by layers or experts, H3 by step rows (`chooseCut`). Detail: reference.md "Thunderbolt cluster" |
-| `metrics.zig` | Lock-free zero-when-off observability (`--metrics`): `vllm:`+`mlx_serve:` Prometheus + JSON |
-| `ollama.zig` | `/api/*` translation, SSE→NDJSON `Sink`, tags/show/ps, `resolveName` |
-| `gen.zig` | Unified media gen: modality-named engine slots, `detectModality`/`peekModelType`, per-request handlers, img2img/edit/LoRA, residency estimators |
-| `krea.zig` / `flux.zig` | Image backends (Krea-2-Turbo / FLUX.2 klein 4B+9B); `MixedLinear` infers quant geometry |
-| `qwen_image.zig` / `qwen_image_edit.zig` | Qwen-Image-2.1 (`qwen_image21`): block-causal single-stream DiT, 64-ch /16 VAE, 8B `mage_flow.TextEncoder`; 40 steps, real CFG, img2img; text encoder STAGED where the pack crowds the GPU (`gen.qwenImageStagesTextEncoder`); edit = `mode:"edit"` (cap `gen.editRefCap`, tower gate `towerPresentIn`). Detail: reference.md "row detail" |
-| `moss_image.zig` | MOSS-Image: Qwen3.5-9B encoder, 5B single-stream DiT, FLUX.2 small VAE (f32); 50 steps, CFG 3 by default (negative branch skips block 22); t2i only. Detail: reference.md |
-| `multipart.zig` | RFC 7578 form parsing, zero-copy `Part` (non-JSON shapes: `POST /v1/images/edits`, `/v1/audio/transcriptions`) |
-| `qwen_audio.zig` / `transcription.zig` / `forced_align.zig` | Qwen3-ASR audio tower (Whisper log-mel, chunked convs, windowed encoder; a `VisionEncoder` arm) / `/v1/audio/transcriptions` form, languages, the reference prompt, the official 180 s cuts, verbose_json/srt/vtt/diarized_json, each word's speaker (`Activity`) / Qwen3-ForcedAligner word times: the official units (Japanese and Korean one character each), ONE trunk pass whose head classifies every `<timestamp>` into 80 ms steps, the official monotonic repair |
-| `nemotron_diarization.zig` | Nemotron 3 Diarization: NeMo log-mels eight to a row into a 31-layer RoPE encoder, speaker probabilities every 10 ms for up to 8 speakers in order of first speech; 27.2 s chunks attend to a FIFO and the Arrival-Order Speaker Cache, whose compression (`aoscKeep`) runs on the host |
-| `mage_flow.zig` | MageFlow Turbo/Edit: flow DiT + DiCo VAE + Qwen3-VL TE; `MfLinear` shared with H3; DiT/TE bf16, VAE f32 (load-bearing) |
-| `w8a8.zig` / `int8_attn.zig` / `dit_kernels.zig` | Media DiTs on NAX GPUs (LOSSY; ON by default only with NAX + 64 GiB RAM, `--w8a8` / `--no-w8a8`): rotated per-row int8 x int8 GEMM whose int8 copy REPLACES the packed weights (`w8a8.residentBytes` bills it), Sage-style int8 attention (hd 128), fused qkv norm+RoPE. Detail: `docs/reference.md` "Int8 media DiTs" |
-| `hunyuan3d.zig` / `hunyuan3d_paint*.zig` | 3D shape + texture paint; converted layouts BAKE OUT per-head QKV interleaves — never "fix" it |
-| `trellis2*.zig` / `dinov3.zig` | TRELLIS.2-4B image → textured PBR GLB, `gen.MeshEngine`'s second backend: DiTs, sparse SC-VAE decoders, DINOv3, dual grid, sign-free REMESH + `snapToSurface`, xatlas bake. GPU half `generateVoxels`, CPU half `meshToGlb`. Detail: `docs/reference.md` |
-| `pixal3d.zig` / `naf.zig` | Pixal3D, the third mesh backend: TRELLIS.2's cascade + decoders with pixel-aligned conditioning (cameras project each voxel into DINOv3 + NAF-upsampled features), one view or 2-8 posed views averaged |
-| `acestep.zig` | ACE-Step music (Qwen3 encoder, AdaLN DiT, Euler flow-match, Oobleck VAE 48 kHz; Snake/encode f32) |
-| `music3.zig` | MiniMax Music 3: Qwen3-8B global LLM (batch-2 CFG) + depth decoder → hidden states condition a flow DiT (temb as TOKEN) + Snake/DAC vocoder 44.1 kHz |
-| `stable_audio.zig` | Stable Audio 3 small text-to-audio (`/v1/audio/sound-generations`): T5Gemma + DiT + ping-pong sampler + SAME-S decoder, the official repo as published |
-| `yue2.zig` | YuE2-3B songs (`/v1/audio/music-generations`): ONE Qwen3-shaped trunk with AR and NAR weight sets per layer — ABC score → semantic ids (host sampler, CFG) → flow-matching latents → tiled Oobleck decoder, 48 kHz. Pack = ahmadw/YuE2-3B-MLX's layout (`qwen.tiktoken` via `tokenizer.loadTiktoken`) |
-| `mlx_scope.zig` | `Scope`: the ops of one forward over mlx-c, every intermediate freed together (stable_audio, yue2) |
-| `ltx_video.zig` / `ltx_audio.zig` | LTX video (one/two-stage/HQ, i2v, a2vid) + audio VAE/BigVGAN. `LtxVersion` (from `model_version`) keys 2.3-vs-2.5: text encoder, `ff_bias`, `keyframes_abs_pos_embedding` |
-| `ltx_diffvae*.zig` | LTX-2.5 DiffVAE decoder (`"decoder":"diffusion"`): geometry/tiling, fused 3D NA Metal kernel, MLX pass. Sampler contract is MEASURED (x0, 1 step, timesteps x1000) |
-| `minimax_h3*.zig` / `h3_vsa.zig` | MiniMax-H3 text-to-audio-video (arch row below), staged residency; FastVideo's VSA for students trained with it — detail in `docs/reference.md` |
-| `tts.zig` | Qwen3-TTS incl. ECAPA-TDNN voice clone |
-| `kokoro.zig` / `kokoro_g2p.zig` | Kokoro-82M TTS + text→IPA G2P (no espeak — GPLv3) |
-| `laya.zig` | Laya typed decisions (`POST /v1/decisions`): mmBERT/ModernBERT encoder + decision head, prompt layout and output JSON mirror `laya_mlx`; `.decision` modality slot |
-| `marching_cubes.zig` / `glb.zig` / `uvwrap.zig` / `mesh_simplify.zig` / `rasterize.zig` / `texinpaint.zig` | Pure-Zig mesh/GLB/xatlas/FQMS decimation/rasterizer/inpaint (zero MLX, hermetic tests) |
-| `preview.zig` / `latent_rgb.zig` / `jpeg.zig` | Opt-in per-step video previews (#208): published latent→RGB map per backend (GENERATED — `tests/dump_latent_rgb_factors.py`), temporal pick + filmstrip, bilinear resize, baseline JPEG. Zero MLX; `zig build preview-test` is the Linux-runnable graph |
-| `responses.zig` | Responses API pure data: parser, envelope, `ResponseStore`, compaction |
-| `ws.zig` | RFC 6455 framing (server-side) |
-| `pld_index.zig` | PLD n-gram index (`findMatch`, `ngramRepeatScore`) |
-| `prefix_cache.zig` / `kv_disk_cache.zig` / `kv_disk_writer.zig` | Hot prefix cache + SSD tier (`--prefix-cache-disk`, default OFF); SSD-first mode (qwen4_exp or RAM disabled); a background writer thread on both arms |
-| `drafter.zig` | Gemma 4 assistant drafter (cross-attention spec-decode) |
-| `dflash.zig` | DFlash block-drafter: config-contract detection (root OR nested `dflash_config`), per-request context cache, block forward; DFlash2 adds `selectPath` + 2-tap grouped convs; trunk seam = `ForwardCtx.capture_layers` + `rawEmbedding` |
-| `mtp.zig` | Qwen 3.5/3.6/3.8 native MTP head (sidecar OR in-checkpoint `mtp.*` via `resolveMtpSource`; per-weight quant re-solve; committed-history cache) |
-| `diffusion.zig` | DiffusionGemma block-diffusion canvas loop |
-| `deepseek_v4.zig` / `deepseek_v41.zig` / `dsv41_vision.zig` | DeepSeek-V4 / V4.1 NATIVE archs (module-owned `dec_state`, NOT the KVCache); V4.1's tower (the release's `vision.py`: ViT + 3x3 aligner, the whole span incl. the learned start/newline/end rows) |
-| `qwen4_exp.zig` | Qwen3.8-Flash-Next (`qwen4_exp`) host side: n-gram hash (splitmix multipliers, per-head primes, eos-segment shifts) + the mmapped 4-bit `ngram_table.bin` row gather. `ple_gpu.zig` = the same hash + gather as one Metal kernel over a no-copy wrap of the whole mapping (serial forwards). Trunk forward = `transformer.forwardQwen4With` (hyper-connections, PLE, QSA mask over `gatedFullAttnWith`) |
-| `scheduler.zig` | Slots, inference thread (sole MLX caller), queues, batching, loop-stop guard, spec wiring, single-flight admission |
-| `round_cost.zig` | Measured per-model/width/KV-bucket spec round-cost table (`Transformer.round_cost`), persisted |
-| `model_discovery.zig` / `model_registry.zig` | Discovery (two-level org/name, multi-root, GGUF classification, stub meta), multi-model registry |
-| `arch/ds4.zig` / `arch/llama.zig` (+ `*_ffi.zig`, `lib/llama_shim`) | Embedded-engine bridges |
-| `sdk/quant/gguf/` (pure Zig + Metal, generators in `scripts/gguf/`) | GGUF on the MLX path, no llama.cpp: JSON rebuilt from its metadata, raw ggml blocks (`QuantMode.gguf`) through the module's kernels. Detail: `docs/reference.md` "MLX GGUF engine" |
-| `arch/ane_lm.zig` + `ane_qwen35.zig` + `ane_dflash.zig` + `ane_prefix.zig` (+ `ane_mil.zig`, `ane_pack.zig`, `ane_rt.zig`) | Dense qwen3_5 + Qwen3 MLX packs on the Neural Engine (`--ane` / per-model `"ane"`, private API, `lib/ane`): MIL programs (int8 rows, compile cache), split across an Ultra's two engines, DFlash2, KV to 64K, checkpoints. Detail: `docs/reference.md` "Neural Engine engine" |
-| `ane.zig` + `lib/ane/` | ANE prefill offload (`--ane-prefill`, opt-in, LOSSY int8/fp16, M4-and-below): SwiGLU-MLP + fused GDN in-proj MIL programs on the private AppleNeuralEngine framework (`msv_ane_*`, attribution in NOTICE), `/props` `"ane"` + `mlx_serve:ane_*`. Rules: `docs/reference.md` "ANE prefill rules" |
-| `rht.zig` / `qmv2.zig` / `gdn_decode.zig` / `mtp_graft.zig` | Prism Hadamard packs (`prism_hadamard_qwen35`): `<linear>.signs` on weight handles, `qmatmul` reads `H_block(signs*x)`, the embedding gather the inverse; exact 2-bit GEMVs (`qmv2`, M 1..8, per-GPU `planFor`, also `ternary_2bit`); 2-dispatch GDN decode; MTP head grafted from Qwen3.8-27B |
-| `qmv_cuda.zig` | 2..8 rows x 4-bit affine on CUDA through `mma.m16n8k16` (16 weight rows x 8 x rows), passed to MLX as a `cuda_kernel`; on by default where measured (sm_120) |
-| `moe_fp4.zig` | MoE decode over fp4 banks (MiMo's MXFP4) for 1-2 tokens in two dispatches; 3+ rows keep MLX's sorted gather |
-| `moe_affine4.zig` / `hc_decode2.zig` / `qsa_decode.zig` / `qsa_mask.zig` | qwen4_exp one-token decode kernels, each with a kill switch + engagement line: affine-4 MoE gate+up and down+reduce over one-expert bank views, the two-launch hyper-connection read, QSA split+merge attention over the indexer's picks, the one-launch QSA row mask. Stories: `docs/gotchas/engine-mlx.md` |
-| `dec_attn.zig` | Split-K decode/verify attention for MiMo's global layers (q/k 192, v 128): a KV group's heads x positions are one MMA tile's rows, keys read once per split |
-| `nax_attention.zig` | NAX prefill attention at q/k 192 or 128, v 128 (MiMo; Flint's sliding layers; oMLX port): causal, sliding, sinks, fp32-carry key passes; `msv_attn_p256` is the fallback |
-| `glm5_next.zig` / `kda_recurrence.zig` / `glm_mtp.zig` | GLM-5-Next mHC (one token: ONE `hcPre`, expand deferred), DSA indexer + latent attention, one-token MoE; KDA prefill + decode step; `mtp.0` head |
-| `modelopt_pack.zig` / `mxfp8_qmv.zig` | NVIDIA ModelOpt packs as published (`quant_method: modelopt`, NVIDIA's Flash Next FP4): names mapped to mlx-lm's, MXFP8 bytes reinterpreted in place, NVFP4 routed experts read off disk into banks (csf scales decoded) with each expert's `weight_scale_2` as a gate scale (before the SiLU) and an up x down scale (on the routing weight); MXFP8 GEMV for 1..8 rows |
-| `sushi_pack.zig` | Sushi GLM/MiMo packs (`expert_quant`, EXL3 experts through `sushi_exl3`) in their source layout: GLM hyper-connection names + `kv_b_proj` split into `embed_q`/`unembed_out` (dense bf16); MiMo QKV kept e4m3 with one scale row per code row (`fp8Linear`: an e4m3 GEMV up to 8 rows, wider inputs decoded per projection inside `qmatmul`), layer-0 MLP decoded to bf16; the resident bill (`residentBytes`) reads shard headers, skipping unserved tensors and shards the index does not own |
-| `lora.zig` | Runtime unfused STACKED LoRA (8 max, summed never merged) across QLinear/MixedLinear/MfLinear |
-| `status.zig` / `log.zig` | TUI status bar; leveled logging + file sink (`~/.mlx-serve/logs/mlx-serve-<port>.log`, 32 MB rotation) |
-| `format_corpus_test.zig` / `tool_traffic_replay_test.zig` / `mtp_replay_test.zig` | Hermetic format corpus + real-traffic replay (`src/fixtures/tool_traffic.jsonl`) + MTP depth-policy replay over recorded acceptance traces (`src/fixtures/mtp_accept_traces.txt`) |
+| `main.zig`, `env.zig` | Entry, CLI flags + subcommands; every environment variable registered in `env.zig` (kind, owner, since) |
+| `exe.zig`, `unit.zig`, `host_unit.zig` | `-Dunits` roots: the host and each plugin as their own objects (below) |
+| `host/` | Everything model-agnostic: `http/` (router, conn, SSE, WS, multipart, auth), `api/` (OpenAI, Anthropic, Responses, Ollama, embeddings, `/v1/models`, providers, transcription), `chat/` (templates, `tools/` one file per dialect, `reasoning/`, stops, loop-stop, format corpus + traffic replay), `tokenizer/`, `registry/` (discovery, modality map, model settings, preflight, load progress), `gpu_thread/` (the inference thread: sole MLX caller), `media/` (request media), `media_jobs/` (media-gen jobs, previews), `lan/`, `launch/`, `cli/`, `metrics/`, `plugins/` (outside dylibs, `mlx-serve plugin new\|check\|install`), `sandbox/` |
+| `abi/` | Extern tables only, no globals: engine, model plugin, media, quant, `Host`, dylib manifest; `contract_test.zig` + `exactness_test.zig` run every engine |
+| `engines/mlx/` | Our engine: `scheduler.zig` + `step.zig` (slots, admission in `admission/`, batching in `batching/`/`batched/`), `generate/`, `sampling/`, `grammar/`, `spec/` (PLD, drafter, DFlash/DSpark, MTP rounds, round cost), `kv/`, `cache/` (prefix cache, SSD tier `cache/ssd/`), `ssm/`, `cluster/` (Thunderbolt RDMA), `plugin/` (the DRIVER that serves a plugin table, its proofs and tapes), `load/` + `forward/` + `transformer.zig` (the legacy `Transformer` the unflipped archs still run) |
+| `engines/{ds4,llama,ane}/` | One adapter each over its runtime (`lib/ds4`, `lib/llama` + `lib/llama_shim`, `lib/ane`); `engines/own_thread/` is what the three share |
+| `sdk/` | Everything a plugin imports: `bases/` (decoder, hybrid, encoder, DiT skeletons + `bases/blocks/` the blocks they compose), `blocks/` (attention, mlp, moe, gdn, kda, ssm, conv, norms, rope, hc, linear, qmm, dit, schedulers), `quant/` (affine/fp8/mxfp8/nvfp4, `hadamard/`, `exl3/`, `gguf/`, `fp8_block128`), `weights/` (resident, streamed SSD banks, LoRA), `spec/` (MTP head), `vision/` (SigLIP, Qwen3-VL, DINOv3, M-RoPE), `media/` + `mesh/` (media helpers, pure-Zig mesh/GLB/xatlas), `testing/` (fixtures, conformance, fake host, `kernel_contract/`), `util/` (`shared.zig`, `rtfmt.zig`) |
+| `plugins/<name>/` | One model family or media backend each: `plugin.zig` (the table), `config.zig` (MLX-free claim + parse + bill), its own blocks, `kernels/`, `fixtures/`, proofs, and its `AGENTS.md` (its rules and quirks: read it before touching the model). `_template*` = the barebones plugins, `_example*` = the kit's |
+| `mlx/` | `ffi.zig` (mlx-c), `ops.zig` (the op layer: a `Graph` owns what it makes), `scope.zig`, `kernels.zig` (the kernel loader), `state.zig` |
+| `kernels/<area>/` | Metal/CUDA kernels two or more plugins use (one model's own: `plugins/<name>/kernels/`); every file listed with its sha256 in `kernels/digests.txt` |
+| `mlx_stream.zig` | The absorbed mlx-stream plugin (DeepSeek-V4.1 EXL3 repack; MiMo + GLM stream packs): archs in `plugins/<model>/stream/`, EXL3 lanes in `sdk/quant/exl3/stream/`, the expert streamer in `sdk/weights/streamed/`; `zig build mlx-stream-test` |
+| `kit.zig`, `plugin_host.zig` | The plugin kit's module (`mlx_serve`) and the host surface a plugin's own test build imports |
+| `testing/fake_engine.zig`, `tests.zig`, `preview_tests.zig`, `ios_lib.zig` | Test roots, the no-model engine, the iOS entry |
+| `html/index.html` | The console, BUILT from `app-web/` (never hand-edited) |
+
+Build glue: `build.zig` + `build/` (`plugins.zig` scans `src/plugins/*/plugin.zig` into the generated registry and
+refuses a `config.zig` that reaches MLX; `test_runner.zig` shards the tests; `kit/`).
 
 CLI flags: `mlx-serve --help` (`printUsage` in `src/main.zig` is the source of truth; `docs/cli.md` for users).
 
@@ -105,7 +52,14 @@ Generation defaults for omitted fields: body > model `generation_defaults` > glo
 - First-time: `./scripts/fetch-zig.sh` stages the pinned Zig at `.zig-toolchain/`.
 - Zig caches configure-time subprocess output: after a toolchain/SDK change `rm -rf .zig-cache` or the link references a ghost path.
 - **ALWAYS `zig build -Doptimize=ReleaseFast`, never bare `zig build`** (Debug 2–4× slower ⇒ fake regressions). `zig build test` does NOT refresh `zig-out/bin/mlx-serve` — rebuild before any live A/B.
-- **Edit loop: `zig build check`** (35 s, `-fno-emit-bin`: Sema over both roots, no codegen) → `zig build test` for behaviour (1 min Debug compile; the binary runs as 8 parallel shards, `-Dtest-shards=N`, `build/test_runner.zig`; a `sharded:` test splits its own work) → ReleaseFast only to RUN or MEASURE. A ReleaseFast rebuild is 3.5 min, 96% LLVM `-O3` on ONE thread (link 0.2 s), and nothing tunes it: no `-mllvm` or codegen-thread knob, `-fstrip` 3%, `-fincremental` panics, ReleaseSafe 10%, the self-hosted backend (`-fno-llvm`) was killed after 4:29 on the test binary. Only less code helps — media engines are 15% of `__text`, `Writer.print` monomorphization 15%.
+- **Edit loop: `zig build check`** (35 s, `-fno-emit-bin`: Sema over both roots, no codegen) → `zig build test` for behaviour (1 min Debug compile; the binary runs as 8 parallel shards, `-Dtest-shards=N`, `build/test_runner.zig`; a `sharded:` test splits its own work) → ReleaseFast only to RUN or MEASURE. A ReleaseFast rebuild is minutes of single-threaded LLVM `-O3` that no flag tunes (`-mllvm`, `-fstrip`, `-fincremental`, ReleaseSafe and `-fno-llvm` all tried); only less code helps (`Writer.print` instances: `sdk/util/rtfmt.zig`).
+- **`-Dunits=true`** compiles the host and every plugin as their own objects, in parallel (`src/exe.zig`, `src/unit.zig`,
+  `src/host_unit.zig`; off by default). A unit gets its own copy of every global it reaches, so host state is `Shared`
+  (`sdk/util/shared.zig`); a new or moved top-level `var` passes `zig build units-check -Dunits=true` (Shared, or listed
+  with its reason in `scripts/unit_globals_ok.txt`).
+- **Every kernel registers with the kernel contract** (`sdk/testing/kernel_contract/REGISTERING.md`: one `contract.zig`
+  per area or plugin, five gates against a float64 reference, planted controls must fail); it runs as ONE `sharded:`
+  test split across the shards. Lint: `python3 scripts/lint.py --strict` (`zig build lint`) stays 0.
 - Swift app: `bash app/build.sh`. The two bundle binaries move together.
 - mlx + mlx-c: submodules built by `scripts/build-mlx.sh` (deployment target 26.2 → NAX kernels; script + `tests/test_mlx_staged_nax.sh` ASSERT `*_nax` in the metallib). Min macOS 26.2. Bump = checkout tag → rerun → re-diff `src/mlx/ffi.zig` externs. Brew: webp ≥ 1.6.0.
 - **Linux/Windows CUDA**: build with `./scripts/build-linux.sh` / `scripts\build-windows.ps1`; MLX's JIT needs `CUDA_HOME`; custom MSL runs on Metal only. Kernels, per-device defaults, memory, measuring, and its rules (GPU-pool loads, graphs, kernel cache, matching MLX's bits): `docs/CUDA.md`.
@@ -147,50 +101,45 @@ Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dslow-tests -
 
 ## Supported architectures
 
-Dispatch on `config.json` `model_type`. With `--mlx-gguf` (opt-in, experimental) a GGUF that `mlx_gguf.servablePath` accepts (arch `qwen35`/`qwen35moe`/`gemma4`, every tensor type known) runs on the MLX path as the matching MLX arch; `--engine ds4|llama` still wins. Every other GGUF bypasses MLX → embedded engine by header (`gguf_meta.preferredEngine`: antirez DSV4-Flash + the ds4-only archs `deepseek41`/`qwen4exp`/`glm-dsa`/`glm5-next` → ds4, else llama.cpp); a SPLIT GGUF (`split.count` > 1) always → llama.cpp (ds4 `exit()`s on a missing shard; `Ds4Engine.open` refuses one by name, #586).
+Dispatch on `config.json` `model_type`: the first plugin whose `config.zig` claims it serves it (`build/plugins.zig`
+registry). Each plugin's `AGENTS.md` holds its rules, quirks, packs and oracles (`src/plugins/<name>/AGENTS.md`; the
+name column below is the folder). With `--mlx-gguf` (opt-in, experimental) a GGUF that `sdk/quant/gguf/claim.zig`
+`servablePath` accepts (arch `qwen35`/`qwen35moe`/`gemma4`, every tensor type known) runs on the MLX path as the
+matching arch; `--engine ds4|llama` still wins. Every other GGUF bypasses MLX → embedded engine by header
+(`engine_pick.preferredEngine`: antirez DSV4-Flash + the ds4-only archs `deepseek41`/`qwen4exp`/`glm-dsa`/`glm5-next`
+→ ds4, else llama.cpp); a SPLIT GGUF (`split.count` > 1) always → llama.cpp (ds4 `exit()`s on a missing shard). ds4
+DSpark arms with `--dspark` when a `-DSpark-` GGUF sits beside the model (`mtpDraftTokens() > 1`, not `hasMtp()`).
 
-| model_type | Notes |
-|---|---|
-| `gemma4`, `gemma4_text` | `language_model.model` prefix; SigLIP vision; clipped linears, PLE |
-| `diffusion_gemma` | Gemma 4 26B-A4B trunk, BLOCK-DIFFUSION (diffusion.zig): ≤48-step canvas denoise; PLD/drafter/MTP/batching/prefix-cache never apply; instruct-only |
-| `gemma3`, `gemma3_text` | + flat text-only sibling; EmbeddingGemma encoder when `use_bidirectional_attention` |
-| `embedding_gemma2` | EmbeddingGemma 2: Gemma 4 trunk trained bidirectional (`forwardEmbeddingGemma2With`), projection-only PLE, INCLUSIVE band, head in the dense0 slot; images (Gemma 4 SigLIP tower, budgeted size) and video FRAMES ride `messages` on `/v1/embeddings`; no audio. Story: `docs/gotchas/models-media.md` |
-| `qwen3` | QK norm |
-| `qwen3_5`, `qwen3_5_moe(_text)` | GatedDeltaNet + optional MoE, shared expert; Qwen3-VL vision. Qwen3.8 packs serve on this arch, and MiniCPM-V 4.7 (`minicpmv4_7`, mlx-vlm layout; SigLIP2 tower + canvas M-RoPE in `minicpm_vision.zig`/`minicpm_canvas.zig`, a pack without the tower serves text) |
-| `prism_hadamard_qwen35` | prism-ml Bonsai 2 = qwen3_5 behind Hadamard rotations (block 512-4096 per pack: `rht.zig`, `hadamard_block` from `modules[].block`); in the pack's numerics: f16 activations over f16 scales, f32 GDN state; fused QKV declines; MTP depth 2 |
-| `qwen3_next` | DeltaNet |
-| `nemotron_h` | Hybrid transformer + Mamba2 (`backbone` prefix; nested trunks probed); pattern from `hybrid_override_pattern` OR `layers_block_type`; sigmoid/ReLU² MoE + shared expert, including latent full-hidden routing; attention is NoPE (`layer_no_rope`). Puzzle/omni aliases, RADIO image/video and LiLiCorr via DFlash. MTP = a bare-key `mtp_head.safetensors` (`mtp.Layout.nemotron`), depth 2. Detail: reference.md "Nemotron 3.5 Bolt and Super" |
-| `lfm2`, `lfm2_moe`, `lfm2_vl` | Hybrid gated conv + attention; `lfm2_moe` = sparse MoE past `num_dense_layers` (sigmoid routing, selection-only `expert_bias`, no shared expert); dense MLP `w1/w3/w2` OR `gate/up/down_proj` (probed); `lfm2_vl` = siglip2 tower + projector, NaFlex 64-256 merged tokens, tiling past `max_image_tokens x 2.0` into 512px tiles + thumbnail (`<|img_row_R_col_C|>`/`<|img_thumbnail|>`) |
-| `hy_v3` | Hunyuan 3 MoE (expert container probed) |
-| `laguna` | poolside Laguna S 2.1 (117.6B-A8.5B): nvfp4 experts, softplus attn out gate, YaRN + sliding, sigmoid routing, UNGATED shared expert. Serial |
-| `kolibri1` | Aleph Alpha Kolibri-1 (78B-A3.5B, 384 experts top-6): 40 sliding(513) + 10 NoPE full layers on laguna's attention arm, sandwich norms, UNGATED shared expert; top-k on logits + `expert_bias`, weights sigmoid(logits), router in fp32 (`moe_logit_select`, fused `logit_bias` kernel). Serial |
-| `flint` | Recursive Flint (39.8B-A2.5B, 256 experts top-6): laguna's attention arm (QK norm, 35 sliding(513) + 14 NoPE full layers, no gate) plus learned sinks (`self_attn.softmax_offset`), laguna's MoE binding (sigmoid top-k renormed, UNGATED shared expert, dense `mlp_only_layers`). The model opens its own `<think>`; GLM-4.7 `<arg_key>` calls with no newlines. Batches decode. Oracle: `tests/dump_flint_fixtures.py` (Recursive's rec_mlx model) |
-| `mimo_v2`, `mimo_v2_flash` | Xiaomi MiMo-V2.6-Flash (309B-A15B), mlx-lm's layout (release refused by name): gpt_oss's sink arm with PER-LAYER geometry (global / sliding-128 ring, K192/V128), laguna's MoE binding. Serial. MTP = 3 heads (`mimo_mtp.zig`). A pack whose config declares `expert_streaming` (residents + `experts.bin`) is `lib/mlx-stream`'s (`ModelConfig.mimo_stream`). Detail: `docs/reference.md` |
-| `inkling_mm_model` | Thinking Machines Inkling Small (276B-A12B, REAP-prunable). NO RoPE (RelativeLogits bias + causal short-convs); role-less markers; serial, spec off |
-| `muse_glimmer` | Muse-Glimmer-30B (dense VL, GQA 32/2 hd128): sandwich norms, qk-norm folded into `attnScale()`, sigmoid out-gate, NoPE every 4th layer, softcap 20. Harmony channels + ATEM tools; thinking ON with tools / OFF without (`defaultEnableThinking`). CASED Llama-3 pretokenizer (`.llama3`). Vision `muse_vision.zig`; DFlash via `-assistant` sidecar. Detail: reference.md "row detail" |
-| `llama`, `mistral` | Standard |
-| `spark2_5` | XHToken Spark-X2.5 (1.7B/4B dense, hd 256): 3 sliding(512)+1 full layers with PER-TYPE RoPE, PER-HEAD sigmoid out-gate, fused `q_k_v_proj` split at load, tied head. DeepSeek-style template, GLM `<arg_key>` tools; per-digit tokenizer. Packs `abenzerps/Spark-X2.5-4B-MLX-{4,8}bit`. Detail: reference.md "row detail" |
-| `k2_horizon` | IFM K2-Horizon dense (7B: 36 layers, hd 128, 512k ctx): Llama trunk + GROUPED RMS norms (`groupedRmsNorm`). `<ifm|…>` markers decode to `<think>`/GLM tags (`installMarkerAliases`); the template RAISES on a thinking-less assistant turn and on any other effort word (`k2EffortFor`). Thinking default ON; MoVA not served. Detail: reference.md "row detail" |
-| `deepseek_v4`, `deepseek_v41` | DeepSeek-V4/V4.1 Flash, 1M ctx. Serial, spec off but DSpark, single-flight; DSML tools, OUR byte-pinned templates. V4: prefix cache OFF, 0731+, our layout. V4.1: MLX packs, DSpark ON, resumes one conversation (keyed on the image rows too); EXL3 repack on `lib/mlx-stream`. V4.1 images: every span position carries `image_token_id` (without the request's rows that id is TEXT, as in the reference), the module splices the rows itself, image rows route by `gate.bias_vl` and get no Engram write (`Hash.DEAD`) |
-| `qwen4_exp` | Qwen3.8-Flash-Next (125B-A6B + 51B n-gram + 4B MTP): qwen3_5 GDN+MoE trunk in 4 hyper-connection streams, n-gram PLE at layer 1 (`ngram_table.bin`; `--ple-gpu` opt-in), QSA sparse attention past 2048 tokens. Module state READ-ONLY: text slots BATCH-decode, only the MTP slot is exclusive (`slotExclusiveDecode`), prefix cache ON. MTP = the checkpoint's own layer over the PRE-mixer stream (`Qwen4Mtp`, on by default). Vision = Qwen3-VL tower + M-RoPE, serial. Packs, oracle: `docs/reference.md` |
-| `bailing_hybrid` | Ling 3.0 (BailingMoeV3): KDA + MLA hybrid MoE, `layer_group_size` → `full_attention_interval`; KDA = GDN with PER-CHANNEL gate (`_vec` kernel), BOUNDED-SIGMOID gate (`kda_lower_bound` REPLACES softplus), sigmoid out-gate; MLA = naive DeepSeek-V3 (ASYMMETRIC K192/V128 cache; `--kv-quant 4|8` ok); `noaux_tc` routing. Thinking ON; GLM tool tags. Mirror `rapid-mlx/Ling-3.0-tiny-MLX-4bit` |
-| `glm5_next` | GLM-5.3-Flash: KDA (f32 state) + DSA (absorbed NoPE MLA, indexer past position 2051) inside mHC, 288-expert MoE. Thinking ON. Batches decode (`forwardGlmBatchedDecode`); MTP = its `mtp.0` layer. Vision = `glm_vision.zig`, rows spliced at `<|image|>` on 1-D positions. Detail: `docs/reference.md` |
-| `*.gguf` | ds4/llama.cpp; GGUF presence WINS over stray config.json. ds4 DSpark: `--dspark` arms when a `-DSpark-` GGUF sits beside the model (gate keys on `mtpDraftTokens()>1` NOT `hasMtp()`) |
-| `trellis2` | microsoft/TRELLIS.2-4B (MIT): a `pipeline.json`-only pack (`model_discovery.peekTrellis2Pipeline`), `.mesh` modality, always textured. Gated DINOv3 rides in the pack; no background remover (RMBG-2.0 is non-commercial), a cutout's alpha is the subject. 512/1024/1536 cascade |
-| `pixal3d` | TencentARC/Pixal3D (MIT): TRELLIS.2's `pipeline.json` name, told apart by its flows' `image_attn_mode: proj` (`peekPixal3dPipeline`); `images` + `cameras` + `fov` only here. Pack adds `naf/` beside `dinov3/` |
-| `minimax_h3` | MiniMax-H3 text-to-audio-video: joint denoise, 17k+5 frame ladder, 24 fps, two partitions (fl2va/ref2va — `tasks` is the ONLY discriminator), Turbo LoRA, chained windows, fast recipe default-on. FastH3 Omni = REF2VA's 8-step PDD student: 32 stacked output heads fused per step from the config's `pdd_*` contract, trained VSA sparse attention (`h3_vsa.zig`) |
-| `laya` | Laya typed-decision checkpoints (no root config.json: classified from `encoder/config.json` + `rl_agent_config.json` by `model_discovery.peekLayaCheckpoint`, app twin `DownloadManager.markerModelType`): ModernBERT encoder + 2 head layers + marker scorer + act head, fp16 |
-| `kev` | Kev typed-decision packs: qwen3_5 trunk + pointer head; `kev_config.json` wins over the trunk's config.json (`model_discovery.peekKevPack`, app twin `DownloadManager.markerModelType`); the state runs once, each question from a KV/SSM snapshot (`kev.zig`) |
-| `d1` | LiquidAI D1-3B decision packs (bf16, the card's own layout): LFM2-VL trunk whose root config.json `auto_map` names `modeling_d1.D1Model` (`model_discovery.isD1Root`, app twin `DownloadManager.markerModelType`); the answer is a softmax over each option's token group at the LM head, no new weights (`d1.zig`, state runs once via `kev.scoreBranches`); text only, torchao int8 refused by name. Oracle: `tests/dump_d1_fixtures.py` |
-| `qwen3_asr` | Qwen3-ASR (mlx-audio layout, `thinker_config` nesting): a plain `qwen3` trunk + audio tower whose rows splice at `<|audio_pad|>`; serves `/v1/audio/transcriptions` only (no chat template, not chat-pickable). Its forced aligner shares the root `model_type`; the thinker's `qwen3_forced_aligner` is the tell (arch hint of that name, capability `alignment`, loaded when a request asks for times, never a route of its own). Oracles: `tests/dump_qwen3_asr_fixtures.py`, `tests/dump_qwen3_aligner_fixtures.py` |
-| `nemotron_diarization` | NVIDIA Nemotron 3 Diarization (mlx-audio layout, mlx-community bf16 + 8-bit packs): the `.diarization` engine slot, capability `diarization`, no route of its own; `diarized_json` loads it and runs it ONCE over the whole clip, so a voice keeps its letter across the 180 s pieces. Oracle: `tests/dump_nemotron_diarization_fixtures.py` (mlx-audio and transformers' official model) |
-| media types | `flux2*`/`krea*`/`mage_flow*`/`qwen_image*` (unified t2i+edit)/`moss_image`/`qwen3_tts`/`acestep`/`minimax_music3`/`stable_audio3`/`yue2`/`AudioVideo` (LTX 2.3 + 2.5 by `model_version`)/`hunyuan3d*` → gen.zig slots (`mage_flow`, `moss_image` + the mlx-community qwen21 spelling have NO root config.json — classified from `model_index.json`, `stable_audio3` from `model_config.json`, by `gen.peekModelType` + `model_discovery`, kept in sync) |
+| model_type | Plugin | Notes |
+|---|---|---|
+| `gemma4`, `gemma4_text`, `gemma4_unified(_text)` | `gemma4` | SigLIP vision, clipped linears, PLE; Gemma 4 assistant drafter |
+| `gemma3`, `gemma3_text` | `gemma3` | + EmbeddingGemma encoder when `use_bidirectional_attention` (`embedding_gemma`) |
+| `embedding_gemma2` | `embedding_gemma2` | Gemma 4 trunk trained bidirectional; images + video frames on `/v1/embeddings` `messages` |
+| `bert` | `bert` | Embedding encoder, per-checkpoint pooling |
+| `llama`, `mistral`, `qwen2`, `qwen3`, `qwen3_moe(_text)`, `qwen3_next`, `hy_v3` | `llama`, `qwen3`, `qwen3_next`, `hy_v3` | Standard dense / DeltaNet / Hunyuan 3 MoE |
+| `qwen3_5(_text)`, `qwen3_5_moe(_text)`, `minicpmv4_7` | `qwen3_5` | GDN + optional MoE; Qwen3-VL vision; Qwen3.8 packs; MiniCPM-V 4.7 tower + canvas M-RoPE; native MTP |
+| `prism_hadamard_qwen35` | `prism_hadamard_qwen35` | Bonsai 2: qwen3_5 behind block Hadamard rotations, f16 activations, exact 2-bit GEMVs |
+| `qwen4_exp(_text)` | `qwen4_exp` | Qwen3.8-Flash-Next: hyper-connections, n-gram PLE, QSA; batched text, exclusive MTP slot |
+| `nemotron_h`, `nemotron_h_puzzle`, `nemotron_h_omni` | `nemotron_h` | Transformer + Mamba2 hybrid, NoPE attention, RADIO vision, LiLiCorr DFlash, MTP sidecar |
+| `lfm2`, `lfm2_moe`, `lfm2_vl` (`lfm2-vl`) | `lfm2` | Gated conv + attention hybrid; SigLIP2 NaFlex tower with tiling |
+| `laguna`, `kolibri1`, `flint` | same | Sliding + NoPE attention arms with sigmoid MoE and an UNGATED shared expert |
+| `gpt_oss`, `spark2_5`, `k2_horizon`, `muse_glimmer(_text)` | same | Sink attention / sliding dense / grouped-RMS Llama / Muse VL (Harmony channels, ATEM tools) |
+| `mimo_v2`, `mimo_v2_flash` | `mimo_v2` | MiMo-V2.6-Flash, mlx-lm's layout (release refused by name); legacy forward deleted; MTP = 3 heads (`mtp_head.zig`); stream packs (`expert_streaming`) are mlx-stream's |
+| `inkling_mm_model` | `inkling` | NO RoPE (relative-logit bias + short convs); serial, spec off |
+| `deepseek_v4`, `deepseek_v41` | `deepseek_v4`, `deepseek_v41` | 1M ctx, module-owned state, serial + single-flight, DSML tools on our byte-pinned templates, DSpark; V4.1 images + EXL3 stream packs |
+| `bailing_hybrid` | `bailing_hybrid` | Ling 3.0: KDA + MLA hybrid MoE |
+| `glm5_next(_text)`, `glm_moe_dsa` | `glm5_next` | GLM-5.3-Flash: KDA + DSA inside mHC, 288-expert MoE, batched decode, `mtp.0` head, vision |
+| `kev`, `laya`, `d1`, `clef` | same | Typed decisions (`POST /v1/decisions`) |
+| `qwen3_asr` | `qwen3_asr` | `/v1/audio/transcriptions` only, + the forced aligner (`qwen3_forced_aligner`) |
+| `nemotron_diarization` | `nemotron_diarization` | `diarized_json` speakers, run once over the whole clip |
+| `*.gguf` | engines | ds4 / llama.cpp (above); GGUF presence WINS over a stray config.json |
+| media | `flux2`, `krea`, `mage_flow`, `qwen_image`, `moss_image`, `ltx`, `minimax_h3`, `hunyuan3d`, `trellis2`, `pixal3d`, `acestep`, `music3`, `stable_audio3`, `yue2`, `qwen3_tts`, `kokoro` | Media plugins (`abi/media.zig`); configless packs are claimed from `model_index.json` / `pipeline.json` / `model_config.json` (`sdk/media/pack_claims.zig`) |
 
 Models with `vision_config` but no vision weights disable vision. Embedded-engine detail: `docs/reference.md`.
 
 ## Unified media generation
 
-One server, one registry — image/audio/video/3D coexist with chat. Engine slots are MODALITY-named unions on `LoadedModel`; new backend = one union arm + impl file. App flow load→generate→unload; headless starts idle. Which `model_type` is which modality is ONE map (`registry/modality.zig`): discovery, the load arms and each `/v1/models` row's `modality` read it. Downloads → `~/.mlx-serve/models` (Swift + Zig).
+One server, one registry — image/audio/video/3D coexist with chat. Engine slots are MODALITY-named unions on `LoadedModel`; new backend = one union arm + impl file. App flow load→generate→unload; headless starts idle. Which `model_type` is which modality is ONE map (`host/registry/modality.zig`): discovery, the load arms and each `/v1/models` row's `modality` read it. Downloads → `~/.mlx-serve/models` (Swift + Zig).
 
 - `POST /v1/images/edits` = OpenAI multipart translated by `gen.openaiEditFormToJson` into the `mode:"edit"` JSON body; unhonored fields = NAMED 400.
 - LoRAs are STACKED, ONE grammar across image/LTX/H3: `lora_paths`+`lora_scales` (cap 8, `gen.parseLoraFields`), summed at forward — never merged. Resident backends reconcile via `setLoras`; H3 pre-validates (`lora.validatePath`), Turbo = file 0.
@@ -281,7 +230,7 @@ With `tools`, tokens buffer for detection (all tag families + raw JSON); thinkin
 Reasoning, budgets, agents:
 - **A reasoning budget is enforced at DECODE** (`armThinkBound` → `think_bound`, `thinkBoundTick`): early-stop line + atomic closer committed as ONE forward (`commitForcedTokens`); bare-`<think>` family only; all three surfaces (`reasoning_budget_tokens`). Guard: `tests/test_reasoning_budget_stream.sh`.
 - **Effort budgets are pi's ladder** (`responses.effortBudget`): minimal 1024, low 2048, medium 8192, high/xhigh uncapped; the word maps to a budget only where the bound can arm (`effortWordOnly`).
-- **Agent output share is ctx/2; compaction reserve ctx/4 capped 20000** (`launch/budget.zig`, served as each chat row's `agent_budget`; the app and the pi extension read it, never derive it); pi `settings.json` is MERGED, opencode2 carries `compaction` + `limit.output`.
+- **Agent output share is ctx/2; compaction reserve ctx/4 capped 20000** (`host/launch/budget.zig`, served as each chat row's `agent_budget`; the app and the pi extension read it, never derive it); pi `settings.json` is MERGED, opencode2 carries `compaction` + `limit.output`.
 - **A launch below the agent's context floor WARNS, never blocks** (`budget.contextFloor`: claude 64k, opencode 32k, others 16k; the row's `agent_budget.too_small_for` drives the app's NSAlert BEFORE launch).
 - **A constrained JSON payload offset is AUTHORITATIVE** (`reasoning_protocol.Delivery`): nothing after it is re-parsed or cleaned. Guard: `tests/test_json_schema_protocol_routing.py`.
 - **Schema-mask surfaces share one policy** (`schemaMasksThinking`, #331): defer only across bare `<think>` + atomic closer with no finite budget; tools present = no mask. Guard: `tests/test_json_schema_thinking.sh`.
@@ -364,7 +313,7 @@ Prefix cache (RAM + SSD):
 - **SIGTERM finishes the owed slices, under a deadline** (`--shutdown-persist-secs`, default 45, `shutdownPersist`): never a whole-cache dump; staged bytes still queued at the deadline are fenced, not written. launchd's default `ExitTimeOut` is 5 s and SIGKILLs the flush, so a plist sets it above the deadline.
 - **A change to what stored K/V MEAN gets a fresh SSD root** (`ModelConfig.cacheLayoutNamespace` → `modelFingerprintWithLayout`; null keeps the old root): the fingerprint hashes only the dir, the config's stat and the overrides, so a fixed model would restore its buggy keys (Nemotron-H NoPE).
 - **A disk restore evals each chunk before loading the next** (a lazy `mlx_load_safetensors` holds its fd until eval: 256 files = ~250k tokens); restore entry points drop their own latch, or the cold fallback fails.
-- **SSD-first** (qwen4 + disk tier, or `--no-prefix-cache-ram` + disk): SSD-only retains no idle RAM KV; writes ride `kv_disk_writer.zig`; a checkout is a PROMISE until append donates (`donateCheckout`/`releaseCheckout`).
+- **SSD-first** (qwen4 + disk tier, or `--no-prefix-cache-ram` + disk): SSD-only retains no idle RAM KV; writes ride `engines/mlx/cache/ssd/writer.zig`; a checkout is a PROMISE until append donates (`donateCheckout`/`releaseCheckout`).
 - **The batched pad-waste cap reads `KVCache.kvLenForBatching`**, never `cache.step`.
 - **An in-place SSD commit bills by MEASURE** (`nonChunkBytes` after − before, #573): the per-term delta in `appendSsmOnly` under-billed whole checkpoint lists in ReleaseFast builds and the tier outgrew its cap. Its guard is red only under `zig build test -Doptimize=ReleaseFast`.
 
@@ -414,7 +363,7 @@ Attention + KV:
 Spec decode:
 - **Verify invariant** (all drafters): `cache.step = prompt_len + emitted`, t1 NOT in cache on entry, verify input `[t1, draft…]`, partial-accept correction from ORIGINAL `verify_logits[accepted]`.
 - **A capture gate is a promise the forward must keep**: `supportsLayerCapture` said yes while `forwardGlm5With` ignored `capture_layers`, and the first DFlash prefill crashed on an unfilled slot. An arch that passes the gate fills every slot (GLM taps the MEAN of its hyper-connection streams); `dflash.encodeContext` names an unfilled one (`DflashCaptureMissing`). Guard: `glm5_next DFlash capture`.
-- **A sparse target's DFlash is policy-driven** (`dflash_policy.zig`, GLM; `MLX_SERVE_DFLASH_POLICY=0` kills it): rows follow the selector's calibrated confidence, plain ticks ride the serial pipeline with their taps parked (`dflash_pending`), and the plain cost is the REQUEST's own tick interval — the shared round-cost table's plain cell ran stale-high and the policy never stepped back.
+- **A sparse target's DFlash is policy-driven** (`engines/mlx/spec/dflash/policy.zig`, GLM; `MLX_SERVE_DFLASH_POLICY=0` kills it): rows follow the selector's calibrated confidence, plain ticks ride the serial pipeline with their taps parked (`dflash_pending`), and the plain cost is the REQUEST's own tick interval — the shared round-cost table's plain cell ran stale-high and the policy never stepped back.
 - **A block decoder checks its ENTRY token first** (`generate.tokenStops`, all five); only an ALL-pad generation declines commit (`commitDeclinesPadOnly`); a cancel mid batched tick still RECORDS the row (`batchedTickAction`).
 - **The token budget is a PRE-COMMIT invariant in every block decoder**; blocks publish through ONE `+= 1` loop.
 - **A spec path that refuses a KV scheme must be gated at LOAD, or implemented**: `compactRows` refused quantized KV mid-decode, so a draft tree under `--kv-quant 8` 500'd the second request. Guard: smoke `drafter_kv8`.
@@ -428,7 +377,6 @@ Spec decode:
 - **Group lanes draft as rows of ONE head forward** (`mtp.forwardLanes`), greedy off the exact trunk head, sampled off its top-32; next chain pre-dispatched (`mtpGroupPreDraft`). M-RoPE/confidence-gated lanes keep `mtpChainBuild`.
 - **The group planner prices each width per row** (`mtp_group_planner.zig`, per-request `enable_batch_mtp:false`) and falls to plain batched decode at width 0; `[mtp-planner]` names the choice.
 - **A group's sampled accept is ONE filtered block on the group's own eval** (`mtpGroupSampledAccept`; one shared sampler, no seeded row). A padded verify row reads `1+m` rows (`verifyRows2d`, #446).
-- **qwen4 MTP head state is a `Qwen4MtpState` swapped onto the module** (`qwen4MtpActivate` before EVERY head touch); its MTP rounds stay solo (`mtpRoundsStaySolo`: a batched verify measured no better).
 - **A DFlash sidecar yields to the MTP head when the request has company** (`requestSpecModes(..., has_company)`); a burst's first request yields after 2 ticks with company (`specYieldTick`, one-way): DSpark, sparse targets and PLD on CUDA always, a dense DFlash slot only once the others reach `mtpCrowdThresholdFor`.
 - **DFlash is a METHOD keyed on the CONFIG CONTRACT** (`block_size` + `mask_token_id` + `target_layer_ids`; `--drafter` the one flag): drafts from ONE assistant forward, anchor row DROPPED, context via `capture_layers`, block K/V never cached.
 - **DFlash2** = v1 + selector + convs on NESTED `dflash_config`; selector codebooks bf16 gather tables NEVER quantized; discovery classifies by contract.
@@ -438,7 +386,6 @@ Spec decode:
 - **The measured round-cost table OUTRANKS the calibrated gate** (`Table.roundBeatsSerial`): the bar is a constant from an older round cost, and a sticky disable lands on PLAIN decode. Serial is only measured once something decodes plain.
 - **A shipped spec sidecar is a load-time dependency** (`resolveInDirDrafter`: `<model_dir>/drafter`, else the pack's one servable drafter subfolder, never standalone sushi's `dflash2/` cache); `--drafter` wins, `--no-drafter` opts out; discovery refuses `*_assistant` standalone.
 - **A declared DFlash own head is mandatory** (`has_own_lm_head`, `draft_vocab_size`): load and validate its token space; never silently borrow the target head. Every API surface admits a loaded DFlash independently of the Gemma drafter slot.
-- **The Nemotron-H MTP head reads the FINAL-NORMED hidden and pays per verify ROW** (`ModelConfig.mtpReadsFinalNorm`; more drafts kept at depth 1 and 2 than from the residual): every extra row routes to more experts, so round cost climbs with depth; depth is 1 or 2 per round (`mtpExactDepth`).
 - **Row-exact archs make drafted output byte-identical to serial ONLY while a DFlash drafter is bound** (`rowExactDecode`: nemotron_h + dense qwen3_5; MTP/serial stay stock): a sampled verify row draws `keyed_sample` at the ABSOLUTE position. Serial reference = the SAME server with `"enable_drafter": false`, never a `--no-drafter` boot.
 - **The spec BLOCK is a MACHINE property** (`resolveBlockSize`, `blockCapForMachine`: M3 Ultra 8, else 5; wide lane: NAX, M4 ternary); a wider block loses off a wide lane.
 - **Trunk-derived draft state rides the prefix cache** (`DflashSnap`, `Entry.mtp`, `restoreSpecSnap`): adopt only on `base + step == matched`; survives the SSD tier (`spec.safetensors`).
@@ -456,7 +403,6 @@ Spec decode:
 - **EV cost tables are refit whenever the verify forward changes** (`MTP_EV_DEFAULT_COSTS`); `MtpCostProfile` comes from the runtime fingerprint, never the sidecar; qwen4 has its own G17 surface. A/B profiles with persistence OFF on both arms.
 - **Drafts shortlist on a coarse lm_head and re-score exactly** (`buildRerankCoarse`/`rerankShortlist`, from the MIXER output). Proposal is per REQUEST (`mtpDraftStepPath`): greedy = argmax, sampled = q over the exact top-32; sampled group rows stay batched (`shortlistProposalRows`).
 - **A draft depth's proposal is resolved in ONE place, `mtpDraftSampling(step)`**: the greedy tail (`--mtp-greedy-tail`, per-model `mtp_greedy_tail`) samples depth 0 and argmaxes later depths with a one-hot q. A chain carrying q drafts `[1]` ids at every depth (`argmaxStepProposal`): the accept graphs concat them, and `draftSelect` returns `[1,1]`.
-- **qwen4 MTP specifics**: the head projects only the consumed row (`Qwen4MtpProject`) and rides the slot's M-RoPE table on image turns; the grouped-expert NAX tile is a LOSS; solo greedy rounds pad the head history and pre-draft lazily, lagging one round at auto depth BY DESIGN.
 
 Sampling:
 - **Penalties apply in `Generator.sampleLazy`** (#564); `SamplingParams.penalized()` keeps a request off `next`'s fast path, spec and batching. `frequency_penalty` is OpenAI's, subtracted per occurrence, never a `repeat_penalty` multiplier (#912). Guard: `tests/test_repeat_penalty.sh`.
@@ -492,9 +438,9 @@ Kernels + numerics:
 - **A table that stands in for an MLX op is cached PER DEVICE** (`swigluSigTable`): CPU and GPU sigmoids round apart, and
   Qwen3-TTS's CPU stream cached CPU bits that every later fused SwiGLU on the GPU read.
 - **MoE decode**: gate+up fused `gatherQmv` default by the kernel's OWN conditions (`useGatherQmvDecode`); down+reduce ONE dispatch over 8 lanes (`gatherQmvDownReduce`, `DOWNRED_LPR`; bar = fp32-truth RMS). MoE PREFILL uses `_gather_sort`.
+- **A streamed bank feeds the shared MoE block through `Moe.Weights.streamed`** (`sdk/bases/blocks/moe.zig`, contract `sdk/weights/routed.zig`): every arm reads slot banks in the in-memory arm's kernel class (fp4 decode over up to 3 banks; sorted calls at the row-block B/E); an arm whose kernel reads one bank is refused by name.
 - **Affine-4 banks at ONE decode token take `moe_affine4`** (`MLX_SERVE_MOE_AFFINE4=0` restores the gather kernels); a one-expert bank VIEW is what the kernels bind, because MLX bills a command buffer per bound array's `data_size` (`MLX_SERVE_MOE_BANK_VIEWS=0`).
 - **MLX's concurrent encoder puts a GLOBAL barrier before any kernel that reads an outstanding write**: parallel branches overlap one stage only, and ordering the q projection behind the indexer with `mlx_depends` made the layer slower; judge a chained kernel by its stage, not its alone-time.
-- **Past the indexer budget a solo dense-KV decode row skips mask, gather and SDPA** (`qsa_decode.attend`, `MLX_SERVE_QSA_DEC_KERNEL=0`; on CUDA solo verify rows too; batched slots and quantized KV keep their arms): a shuffle reduction inside divergent code returns garbage, so reduce BEFORE the select.
 - **The indexer score stays on the NAX matrix kernel at every width** (`msv_qsa_score`): no scalar accumulation order reproduces it, and decode, verify and prefill must pick the same blocks.
 - **A fused kernel gated on ONE model's shape leaves the others on the composed chain**: gate on the kernel's arithmetic, test each served shape; re-sweep planners after an mlx bump.
 - **verifyQmm lanes** (`vqmmLaneForTile`): split-K M 2–7 / wide tile / NAX m16 M 8–16 / shader matmul2d on G16 (4-bit, M 8–24); plain-SIMD tiles BITS-templated and SHAPE-gated (`mixedPlainShapeEnabled`; NAX by width, shape AND rows, `mixedNaxShapeEnabled`). M=8 is the plain-SIMD cliff; with neither tile, 8–16 rows go to `simd_qmm` (`simdQmmDecodeMinRows`).
@@ -503,9 +449,6 @@ Kernels + numerics:
 - **Metal caps threads per threadgroup PER COMPILED KERNEL, by register use** (M1/M2 can be below 1024): a kernel above 256 threads probes on its first eval and shrinks simdgroups in the same summation order (`mma_sg`); under test a latched MLX error is invisible and poisons the next tests, so a kernel test drops its own latch.
 - **A diagnostic env goes through `env.on`** (absent or `0` = off; also armed by token in `MLX_SERVE_DIAG`). A default belongs to the engine that MEASURED it.
 - **Kernel testing**: parity = no-worse-than fp32 truth, never kernel-vs-kernel; same-boot A/Bs at per-cell MEDIANS, interleaved in one process; every adopted shape gets its own A/B; content-forking arms need 3+ reps with a NONCE per rep.
-- **QSA** (qwen4): GATHERS selected blocks, never a dense `[S, kv]` mask (`gatherQsa256`, `qsaSparseAttn`, `qsaDecodeGatherAttn`); exact select `msv_qsa_select` (split 16-way at decode); score sheet one NAX kernel (`msv_qsa_score`, `qsaScoreFusedActiveFor`); verify gather floor per KV scheme (`qsaVerifyGatherMinKvFor`); NAX gather via `qsaNaxEligible` (bar = error vs float64).
-- **QSA indexer**: ONE YaRN mscale on every arm (`yarnScaleRotated`, never double-scale M-RoPE); ropes with attention's M-RoPE table (`beginMropeChunk`). A pointer-keyed cache is invalidated by an ATOMIC MARK (`markQsaPooledRopeStale`), freed on the inference thread.
-- **qwen4 residual stream is bf16; the f32 fixture is the MATH oracle** (`QWEN4_STREAM_F32=1`; `qwen4 fixture bf16` pins streams at 0.999).
 - **A fusion on a small dense model pays only by shortening the DEPENDENT chain** (`fuseRowGroup` at decode width only, `fusedResidualNorm`, `tableGateMul`, `fusedGatedConvStep`, `fusedGeluPleProj`).
 - **Gates**: a lower bound may REPLACE the formula (KDA `kdaUsesBoundedGate`); per-head vs per-channel gating is an INDEXING contract (`gdnKernelSource(vectorized, …)`). A struct in a generic fn must capture its comptime params.
 - **A norm's epsilon sits where the REFERENCE puts it**: fla's l2norm adds it to the SUM, `rms_norm` to the MEAN (`gdnQkNormEps`: GLM 1e-6/dk); GLM's small post-conv keys came out 1.8% short per KDA layer at 1e-6.
@@ -513,8 +456,7 @@ Kernels + numerics:
 - **A per-block temporary of GBs is a FRESH allocation in the server** (8 GB pool cap, `applyMlxCacheLimit`; the test binary has none): FastH3 VSA lost to dense in situ while its ubench won, until pooling and assembly became kernels (`h3_vsa`). Price media-DiT changes by the server's step log.
 - **Memory**: RSS is blind to Metal (`/props` `active_bytes`); a live handle pins its buffer through the eval, so free a step's intermediates BEFORE evaluating it; a weights MAP outliving the model pins every buffer; `iterator_next` hands a +1; `mlx_array_new_data` COPIES shape-worth of bytes; Metal at the working-set edge returns ZEROS before it aborts.
 - **Tokenizer**: special-token splitting only in `Tokenizer.encode` (first-byte buckets); any per-position loop over a vocab-derived collection needs an index.
-- **Upgrades**: mlx-c → diff `lib/mlxc-src/mlx/c/*.h` vs `src/mlx/ffi.zig`; ds4 → re-sync `ds4_ffi.zig` EngineOptions + CORE_OBJS; NAX presence asserted, never assumed.
-- **Kokoro**: safetensors READ on CPU stream; depthwise `ConvTranspose1d` transposes `{0,2,1}`; `AdaIN1d` is pure instance norm; `Vocab.encode` DROPS unknowns; reproducing an upstream NO-OP means NOT doing it (SineGen).
+- **Upgrades**: mlx-c → diff `lib/mlxc-src/mlx/c/*.h` vs `src/mlx/ffi.zig`; ds4 → re-sync `engines/ds4/ffi.zig` EngineOptions + CORE_OBJS; NAX presence asserted, never assumed.
 - **ANE prefill (opt-in, M4-and-below, LOSSY)**: rules in `docs/reference.md` "ANE prefill rules"; parity = per-program cos/rms + perceived-content equivalence; `ready: N/M` under-count = silent partial coverage. Guard: `tests/test_ane_prefill.sh`.
 
 ### Model loading, configs, converters, media parity (→ docs/gotchas/models-media.md)
@@ -545,14 +487,6 @@ Weights, quant, loading:
 - **Discovery**: a configless repo SHAPE is taught to ONE predicate (`peekMageFlowIndex`; `gen.peekModelType` delegates); size sums stat THROUGH symlinks; an incomplete media pack is invisible until its marker lands (`requiredMediaMarker`, `error.IncompleteMediaPack`); a GGUF folder is a SHELF (`id#<file>`). Guard: `tests/test_model_rescan.sh`.
 - **The `--no-vision` drop list is a GLOBAL prefix filter**: a tower loads through `loadWeightsWithVision`, never `loadWeights`.
 
-qwen4_exp:
-- **NOT a qwen3_5 pack**: hyper-connections, n-gram PLE, QSA around the trunk; HF `hidden_states[i]` is the INPUT of layer i. Vision rows splice BEFORE the hc tile (`forwardQwen4With`).
-- **Tiny MoE oracles tie everywhere**: fixtures dump the reference's OWN margins, `Qwen4Ties` acquits by those; k < E selection coverage = the MTP head's one MoE layer (`--topk 2`, `route_gap`).
-- **PLE read-path selection is measured before and after warming**, on the inference thread (`NgramTable.calibrateArm`), with the gather's OWN arms (read + dequant) and the MEDIAN of 5 trials: one sample put warm tables on the slower pool (#821). Explicit overrides win; the long-KV pool gate remains. Guard: `ngram prefill` tests.
-- **QSA's visible tail is PER QUERY**; scores in f32; `torch.topk` keeps the LOWER index on ties; n-gram hash eos is the TEXT config's (`ngram_eos`).
-- **The spec "hidden" IS the pre-mixer stream** (`[B,L,hc*hidden]`); head row r = (stream r, token r+1) at position r+1 (`pos_base`).
-- **Per-request state outside conv/ssm rides `SSMCacheEntry.aux_state` + `ple_prev`**; every reset/free via `ssmFreeQsaState`; restore-parity bar = the CHUNKING class (~0.3 nats top-5).
-
 Vision:
 - **`x-mlx-pixels` is a GEMMA format** (`wantsServerPreprocess`; server refuses when `vp.mode != .gemma`); `VisionEncoder.forward` returns named errors.
 - **A MiniCPM-V image is SEVERAL encoder calls** (thumbnail + crops, `tile_*` on `ImageData`) laid out as `<image_id>N</image_id><image>…</image><slice>…</slice>` rows; the canvas M-RoPE table is built from the EXPANDED ids (`minicpm_canvas.canvasPositions`), so a changed placeholder run shifts every crop silently. Guard: the `MiniCPM-V 4.7` test in server.zig.
@@ -562,22 +496,15 @@ Vision:
 - **Nemotron omni's native MTP config requires a final vision LayerNorm BEFORE pixel shuffle**, even if a conversion omitted MTP weights; projector quantization is per linear. Guards: Super RADIO reference fixtures and format corpus.
 
 Media backends:
-- **ACE-Step**: timbre slot = silence latent OR the reference clip's VAE mean (`ref_audio`, #259); a TASK is the context stream + instruction line (`complete`, `cover` with soft clamp THEN hard grid; `fsq.safetensors` separate dense bf16). Guards assert log lines, never output.
 - **A condition works only as TRAINING fed it**: `instrumental` as TEXT (`[Instrumental]`; + lyrics = NAMED 400, `instrumentalConflicts`); Stable Audio 3 `seconds_total` as whole seconds >= 1 (`trainedSeconds`; a fraction is noise, reference too).
-- **Music3 is NOT an ACE-Step variant** (timestep TOKEN, reversed SwiGLU, alpha-only Snake, hardcoded DiT RoPE). Probe laps (`MUSIC3_COST_PROBE`) before bandwidth arithmetic.
-- **TRELLIS.2's raw dual grid is NON-MANIFOLD by design** (a fifth of the edges on 3+ faces): xatlas on it = thousands of charts + minutes; always `trellis2_remesh` first. The remesh skin sits 1-2 voxels off the decoded surface, so bake texels are `snapToSurface`d onto the RAW mesh before the volume read (else black stripes).
 - **xatlas segments one connected surface on ONE thread** (`uvwrap.parametrizeParallel`: median-split regions as `faceMaterialData` = one chart group per core; 1M faces 424 s → 3.4 s). Hunyuan paint keeps `parametrize`.
 - **A flow-DiT forward over tens of thousands of tokens needs a scope PER BLOCK** (`Dit.forward`, `Decoder.run`): one scope around the whole forward keeps every block's intermediates alive together; fixture-sized oracles never show it.
-- **LTX**: a standalone-frame latent belongs in slot 0 ONLY (#260; `keyframeMask` + `keyframePositions`); the RELEASE is a config field deciding the text encoder (`LtxVersion`; 2.5 runs the real gemma4 via `gemmaCapture4`, `prefill_mask_add`); `keyframes_abs_pos_embedding` parsed, never added.
-- **LTX DiffVAE**: constructor args are not its config (`Sampler`: 1-step x0 at t×1000); tile budget is a per-REQUEST memory decision (`tileTokensForMemory`). 4-bit affine on a video DiT is a QUALITY setting (8-bit mirror).
 - **A full-resolution f32 VAE stage is BANDED, exact because everything but its 3x3 convs is per-pixel** (`qwen_image.Stage.banded` + `Conv.forwardStrips`); MLX's peak counter does not see the whole-stage peak. Bar = the fixture oracle with bands forced.
 - **A pinned library's op TRANSIENT is invisible to residency bills** (#321, #424): `conv3dDepthChunked` windows decoder convs; H3 `encodeMoments` EVALS per tile pass. Diff conv DISPATCH per mlx bump.
 - **Canvas**: `recommendedResolution(totalGB:)` per Mac, capped by `autoCanvasCapPixels`; two-stage denoises at HALF; `maxFramePayloadBytes` is a TRANSPORT limit. A tiled decoder whose positions normalize over the EXTENT refuses (`error.TilingUnsupported`).
-- **H3**: condition stream assembled in SEGMENT order by ONE resolver (`resolveRefs`); identical-file partitions need a DECLARED discriminator (`tasks`). Two reuse levers never stack: a forward after a step-cache skip recomputes attention (`attnBroadcastRefresh(…, after_skip)`), else speech garbles.
 - **LoRA alpha lives wherever the exporter put it** (`lora.fileAlphaScale`; per-module tensor WINS); test with `tests/lora_noise.py` + `tests/test_real_loras.sh`.
 - **A reference-image editor keeps its input's geometry** (`resolveEditTargetSize`); a few-step distilled model can REQUIRE bf16 (MageFlow Turbo: `roundBf16`, `scalarLike`).
 - **Latent→RGB previews are GENERATED fits per latent SPACE** (#208, `tests/dump_latent_rgb_factors.py`; `LTXAV` ≠ `LTXV`).
-- **TTS**: `TimeDelayNetBlock` = conv + IMPLICIT ReLU; embedding lookups reshape to the TABLE's width; voice clone = ECAPA embedding as one codec-prefix position.
 
 Parity method:
 - **Cosine cannot see SCALE** — concatenated tensors assert `rms_ratio`; a permutation-invariant checksum cannot see a permutation (`pos_weighted`); an oracle that cannot execute the reference must say so; a faithful port can make the checkpoint WORSE (H3 splice default-off).

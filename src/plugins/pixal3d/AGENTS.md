@@ -39,3 +39,8 @@ through the `_mv` checkpoints `pipeline_mv.json` names, each through its own cam
 - The tiny pack's job peaks near 12 GB RSS on the CPU stream: NAF's 256-wide guide at the fixed 1024 input size is
   the architecture's, whatever the pack's widths.
 - The golden covers a single view; multi-view conditioning has only the env-gated oracle.
+
+## The row from the root architecture table
+
+TencentARC/Pixal3D (MIT): TRELLIS.2's `pipeline.json` name, told apart by its flows' `image_attn_mode: proj`
+(`pack_claims`); `images` + `cameras` + `fov` only here. Pack adds `naf/` beside `dinov3/`

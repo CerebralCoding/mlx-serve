@@ -23,3 +23,9 @@ As Laya's (`laya/AGENTS.md`): `state` + `questions` (noul / choice / score), the
 - `conformanceFixture`: `sdk/testing/tiny_qwen35` (two layers, GDN + gated attention) over a byte tokenizer with the
   delimiters as added tokens, a pointer head at 32.
 - Reference oracle: `KEV_TEST_MODEL` + `KEV_FIXTURES` env-gated test in `kev.zig`.
+
+## The row from the root architecture table
+
+Kev typed-decision packs: qwen3_5 trunk + pointer head; `kev_config.json` wins over the trunk's config.json
+(`discovery.peekKevPack`, app twin `DownloadManager.markerModelType`); the state runs once, each question from a
+KV/SSM snapshot (`kev.zig`)
