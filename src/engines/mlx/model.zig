@@ -482,10 +482,6 @@ pub const ModelConfig = struct {
     dsv41_engram_compressed_vocab: u32 = 0,
     dsv41_dspark_experts: u32 = 0,
     dsv41_dspark_top_k: u32 = 0,
-    /// The pack's routed experts are an EXL3 bank (`experts.bin`, the OpensourceWTF
-    /// streaming repack): mlx-stream serves it (`arch/mlx_stream.zig`) and loads its
-    /// weights. Set by `parseConfig`.
-    dsv41_stream: bool = false,
     /// A MiMo pack prepared for mlx-stream (its config declares `expert_streaming`): mlx-stream serves it
     /// (`arch/mlx_stream.zig`) and loads its weights. Set by `parseConfig`.
     mimo_stream: bool = false,
@@ -1210,10 +1206,9 @@ pub const ModelConfig = struct {
         return std.mem.eql(u8, self.model_type, "mimo_v2");
     }
 
-    /// The pack is mlx-stream's (`arch/mlx_stream.zig`): DeepSeek-V4.1's EXL3 repack, a MiMo stream pack or a GLM-5.3
-    /// pack.
+    /// The pack is mlx-stream's (`arch/mlx_stream.zig`): a MiMo stream pack or a GLM-5.3 pack.
     pub fn mlxStream(self: *const ModelConfig) bool {
-        return self.dsv41_stream or self.mimo_stream or self.glm_stream or self.glm5_stream;
+        return self.mimo_stream or self.glm_stream or self.glm5_stream;
     }
 
     pub fn isMoe(self: *const ModelConfig) bool {
@@ -1693,12 +1688,7 @@ fn parseConfigWith(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
         return plugin_config.adapted(b);
     };
     errdefer config.deinit(allocator);
-    if (config.isDsv41()) {
-        config.pack_dir = try allocator.dupe(u8, model_dir);
-        const bank = try std.fmt.allocPrint(allocator, "{s}/experts.bin", .{model_dir});
-        defer allocator.free(bank);
-        config.dsv41_stream = if (std.Io.Dir.accessAbsolute(io, bank, .{})) |_| true else |_| false;
-    }
+    if (config.isDsv41()) config.pack_dir = try allocator.dupe(u8, model_dir);
     if (config.isMimo() and declaresExpertStreaming(allocator, content)) {
         config.pack_dir = try allocator.dupe(u8, model_dir);
         config.mimo_stream = true;
@@ -7349,7 +7339,7 @@ test "parseConfig: a MiMo pack that declares expert_streaming is mlx-stream's; a
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = marked });
     var pack = try parseConfig(io, testing.allocator, dir);
     defer pack.deinit(testing.allocator);
-    try testing.expect(pack.isMimo() and pack.mimo_stream and pack.mlxStream() and !pack.dsv41_stream);
+    try testing.expect(pack.isMimo() and pack.mimo_stream and pack.mlxStream());
     try testing.expectEqualStrings(dir, pack.pack_dir.?);
     var w = try loadModelWeights(io, testing.allocator, dir, &pack, false);
     defer w.deinit();
@@ -7375,25 +7365,6 @@ test "parseConfig: a glm5_next pack that declares expert_streaming is mlx-stream
     try testing.expect(pack.isGlm5() and pack.glm5_stream and pack.mlxStream() and !pack.mimo_stream and !pack.glm_stream);
     try testing.expectEqualStrings(dir, pack.pack_dir.?);
     var w = try loadModelWeights(io, testing.allocator, dir, &pack, false);
-    defer w.deinit();
-    try testing.expectEqual(@as(u32, 0), w.count());
-}
-
-test "parseConfig: a deepseek_v41 pack with an EXL3 bank is mlx-stream's, and the host loads none of its weights" {
-    const io = testing.io;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = dsv41_release_config });
-    var buf: [512]u8 = undefined;
-    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
-    var plain = try parseConfig(io, testing.allocator, dir);
-    defer plain.deinit(testing.allocator);
-    try testing.expect(!plain.dsv41_stream);
-    try tmp.dir.writeFile(io, .{ .sub_path = "experts.bin", .data = "" });
-    var repack = try parseConfig(io, testing.allocator, dir);
-    defer repack.deinit(testing.allocator);
-    try testing.expect(repack.dsv41_stream);
-    var w = try loadModelWeights(io, testing.allocator, dir, &repack, false);
     defer w.deinit();
     try testing.expectEqual(@as(u32, 0), w.count());
 }
@@ -7430,7 +7401,7 @@ test "parseConfig: a glm_moe_dsa pack with an experts.bin bank is mlx-stream's; 
     try tmp.dir.writeFile(io, .{ .sub_path = "experts.bin", .data = "" });
     var pack = try parseConfig(io, testing.allocator, dir);
     defer pack.deinit(testing.allocator);
-    try testing.expect(pack.glm_stream and pack.mlxStream() and !pack.dsv41_stream and !pack.mimo_stream);
+    try testing.expect(pack.glm_stream and pack.mlxStream() and !pack.mimo_stream);
     try testing.expectEqualStrings(dir, pack.pack_dir.?);
     var w = try loadModelWeights(io, testing.allocator, dir, &pack, false);
     defer w.deinit();

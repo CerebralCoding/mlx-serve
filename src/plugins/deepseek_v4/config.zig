@@ -112,6 +112,8 @@ pub const Config = struct {
     boi_token_id: u32 = 0,
     eoi_token_id: u32 = 0,
     dsv41_vision: bool = false,
+    /// V4.1's routed experts in an `experts.bin` bank, streamed (`deepseek_v41/plugin.zig`).
+    dsv41_streamed: bool = false,
     dv_downsample: u32 = 3,
     dv_max_image_tokens: u32 = 1024,
     dv_min_pixels: u32 = 295936,
@@ -360,8 +362,7 @@ const gpa = std.heap.c_allocator;
 
 /// Parses config.json (and, for a load, `generation_config.json`) into `out`; `v41` selects the release.
 pub fn parseInto(dir: *const abi.PackDir, config_json: abi.Str, stub: bool, v41: bool, out: *abi.Parsed, extend: ?*const fn (*Config, Json) ParseError!void) abi.Verdict {
-    // An experts.bin bank is lib/mlx-stream's pack: the legacy path serves it until the streamed engine is a plugin.
-    if (v41 and dir.has("experts.bin")) return abi.Verdict.refuse(.unsupported, "deepseek_v41: a streamed (experts.bin) pack is served by lib/mlx-stream");
+    const streamed = v41 and dir.has("experts.bin");
     const tree = std.json.parseFromSlice(std.json.Value, gpa, config_json.slice(), .{}) catch
         return abi.Verdict.refuse(.failed, "deepseek: config.json does not parse");
     defer tree.deinit();
@@ -369,6 +370,7 @@ pub fn parseInto(dir: *const abi.PackDir, config_json: abi.Str, stub: bool, v41:
     cfg.* = .{};
     const j = Json.of(tree.value) catch |e| return refuseFree(cfg, e);
     parseShared(cfg, j, v41) catch |e| return refuseFree(cfg, e);
+    cfg.dsv41_streamed = streamed;
     if (extend) |f| f(cfg, j) catch |e| return refuseFree(cfg, e);
     if (!stub) {
         var buf: [64 * 1024]u8 = undefined;
@@ -404,6 +406,9 @@ fn facts(c: *const Config) abi.Parsed {
             .images = c.dsv41_vision,
             // V4.1 re-reads a Thunderbolt pair's plan at load (`deepseek_v41/plugin.zig`).
             .cluster_plan = v41,
+            // A streamed bank's prompt runs in the module's own wide calls (each layer's experts read once a call).
+            .whole_prompt_prefill = c.dsv41_streamed,
+            .streamed_weights = c.dsv41_streamed,
         },
         .chat = .{
             .thinking_default = if (v41) .on else .off,

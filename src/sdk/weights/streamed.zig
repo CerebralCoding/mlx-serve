@@ -51,6 +51,32 @@ pub const Setting = union(enum) {
     }
 };
 
+/// An EXL3 expert bank (`streamed/exl3_source.zig`) for a trunk with no EXL3 math: the source returns routed sums.
+pub const Exl3 = if (build_options.mlx_stream) plugin.exl3_source else struct {};
+
+/// `src`'s `Routed` (`source` math, its phases and read-ahead).
+pub fn exl3Routed(src: *Exl3.Source) Routed {
+    const C = struct {
+        fn rows(ctx: *anyopaque, layer: u32, x: mlx.mlx_array, idx: mlx.mlx_array, wts: mlx.mlx_array) anyerror!mlx.mlx_array {
+            const s: *Exl3.Source = @ptrCast(@alignCast(ctx));
+            return s.rows(layer, x, idx, wts);
+        }
+        fn settle(ctx: *anyopaque) anyerror!void {
+            const s: *Exl3.Source = @ptrCast(@alignCast(ctx));
+            return s.settle();
+        }
+        fn phase(ctx: *anyopaque, prompt: bool) anyerror!void {
+            const s: *Exl3.Source = @ptrCast(@alignCast(ctx));
+            return s.setPhase(if (prompt) .prompt else .decode);
+        }
+        fn readAhead(ctx: *anyopaque, layer: u32, experts: []const u16) anyerror!void {
+            const s: *Exl3.Source = @ptrCast(@alignCast(ctx));
+            return s.readAhead(layer, experts);
+        }
+    };
+    return .{ .ctx = src, .math = .{ .source = C.rows }, .settle_fn = C.settle, .phase_fn = C.phase, .read_ahead_fn = C.readAhead };
+}
+
 pub const Streamed = struct {
     pub const refusal = abi.Verdict.refuse(.unsupported, "streamed weights: no expert bank, or a build without mlx-stream");
 

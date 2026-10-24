@@ -370,6 +370,8 @@ pub const Dsv41Model = struct {
     qat_off: bool = false,
     /// The routed experts from a streamed bank (`sdk/weights/streamed.zig`); null = the in-memory banks.
     streamed: ?streamed.Routed = null,
+    /// The pack's routed experts live in a streamed bank: the trunk loads none (`InitOpts.streamed_experts`).
+    streamed_experts: bool = false,
     dspark: ?DsparkW = null,
     hash: ?engram.Hash = null,
     token_map: []u32 = &.{},
@@ -929,7 +931,7 @@ fn loadLayer(m: *Dsv41Model, w: *model.Weights, comptime pfx: []const u8, li: us
             try getLin(w, d, pfx ++ ".{d}.ffn.shared_experts.w3", .{li}),
             try getLin(w, c.moe_intermediate_size, pfx ++ ".{d}.ffn.shared_experts.w2", .{li}),
         },
-        .experts = try fuseExperts(m, w, try loadExperts(m, w, pfx, li, n_experts)),
+        .experts = if (trunk_li != null and m.streamed_experts) .{ .gate = .{ .w = none }, .up = .{ .w = none }, .down = .{ .w = none } } else try fuseExperts(m, w, try loadExperts(m, w, pfx, li, n_experts)),
     };
     if (trunk_li != null) if (getOpt(w, pfx ++ ".{d}.ffn.gate.bias_vl", .{li})) |b| {
         ly.gate_bias_vl = try ownReshape(m, try ownCast(m, b, .float32), &.{ 1, ci(n_experts) });
@@ -1251,6 +1253,8 @@ pub const InitOpts = struct {
     pair: ?Pair = null,
     /// A dense head served 8-bit (affine, g64): half the bytes every token reads. Lossy.
     head_8bit: bool = false,
+    /// The routed experts stream from the pack's bank (`Dsv41Model.streamed`, bound after the load).
+    streamed_experts: bool = false,
 };
 
 pub fn init(gpa: std.mem.Allocator, cfg: *const ModelConfig, w: *model.Weights, s: S, opts: InitOpts) !*Dsv41Model {
@@ -1300,6 +1304,7 @@ pub fn init(gpa: std.mem.Allocator, cfg: *const ModelConfig, w: *model.Weights, 
     };
     m.cfg.pack_dir = null; // borrowed; the caller's config owns it
     m.pair = opts.pair;
+    m.streamed_experts = opts.streamed_experts;
     const worker = if (opts.pair) |p| p.worker else false;
     if (opts.pair) |p| if (p.worker and engramIn(cfg, p.lo, p.hi)) return error.DsvPairEngram;
     errdefer {
@@ -2950,12 +2955,13 @@ fn addShared(sc: *Scope, m: *const Dsv41Model, y: A, sy: A) !A {
 fn moe(sc: *Scope, m: *const Dsv41Model, li: usize, x: A, img: A) !A {
     const ly = &m.layers[li];
     const r = try route(sc, m, ly, x, img);
-    if (m.streamed) |src| {
+    // The DSpark stages' experts stay resident.
+    if (li < m.n_layers) if (m.streamed) |src| {
         if (src.math == .source) return withShared(sc, m, ly, x, try sc.keep(try src.math.source(src.ctx, @intCast(li), x, r.idx, r.wts)));
         const sl = try fetchSlots(sc, src, li, r.idx);
         if (dim(x, 0) > region_rows) return slotPrefill(sc, m, &sl, x, r.wts, try shared(sc, m, ly, x));
         return withShared(sc, m, ly, x, try rowSum(sc, try slotRows(sc, m, &sl, x, r.wts, null)));
-    }
+    };
     if (dim(x, 0) > region_rows) return moePrefill(sc, m, ly, x, r.idx, r.wts, try shared(sc, m, ly, x));
     return withShared(sc, m, ly, x, try routed(sc, m, ly, x, r.idx, r.wts));
 }
@@ -3188,6 +3194,7 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
     const p0 = st.n;
     const hc = c.dsv4_hc_mult;
     const d = c.hidden_size;
+    if (m.streamed) |src| try src.phase(L > region_rows);
     if (ids == .gpu) {
         if (L != 1 or m.pair != null) return error.Dsv41GpuIdsUnsupported;
         const tv = mlx.mlx_vector_array_new_value(ids.gpu);
@@ -3470,7 +3477,9 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
     defer gpa.free(parts);
     for (parts, 0..) |*p, k| p.* = try spanIn(&sc, m, gpa, sp, li, k);
     const x = try sc.concat(parts, 0);
-    const pa = try hcPreNormWide(&sc, m, x, try sc.concat(sp.pres, 0), &ly.hc_attn, ly.attn_norm);
+    const pres = try sc.concat(sp.pres, 0);
+    if (m.streamed) |src| if (src.read_ahead_fn) |ra| try readAhead(&sc, m, ly, li, x, pres, sp.img, ra, src.ctx);
+    const pa = try hcPreNormWide(&sc, m, x, pres, &ly.hc_attn, ly.attn_norm);
     const pos = try sc.i(ci(sp.p0));
     const pj = try qkvProj(&sc, m, ly, ropeFor(m, li).fwd, pa.h, pos);
     const heads = try gpa.alloc(A, n_spans);
@@ -3488,7 +3497,8 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
     }
     const y = try attnOut(&sc, m, ly, ropeFor(m, li).inv, try sc.concat(heads, 0), pos);
     const pf = try hcExpandPreNorm(&sc, m, x, y, &pa.sp, pa.sp.pre, &ly.hc_ffn, ly.ffn_norm);
-    const group = @max(1, m.moe_rows / sp.span);
+    // A streamed bank reads each layer's experts once per call: one MoE over all of its rows.
+    const group = if (m.streamed != null) n_spans else @max(1, m.moe_rows / sp.span);
     var k0: usize = 0;
     while (k0 < n_spans) : (k0 += group) {
         const k1 = @min(n_spans, k0 + group);
@@ -3505,6 +3515,22 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
             hold(&sp.pres[k], try gsc.slice(pf.sp.pre, 0, a, b));
         }
     }
+}
+
+/// A streamed prompt call's routes of layer `li` predicted before its attention (the FFN's input taken as the stream
+/// collapsed with the previous mix), handed to the source to read while the attention runs.
+fn readAhead(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, li: usize, x: A, pre: A, img: A, ra: anytype, ctx: *anyopaque) !void {
+    const h = try sc.rms(try hcCollapse(sc, x, pre), ly.ffn_norm, m.cfg.rms_norm_eps);
+    const r = try route(sc, m, ly, h, img);
+    var host = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(host);
+    try mlx.check(mlx.mlx_astype(&host, r.idx, .uint32, sc.s));
+    try mlx.check(mlx.mlx_array_eval(host));
+    const n = mlx.mlx_array_size(host);
+    const ids = try sc.a.alloc(u16, n);
+    defer sc.a.free(ids);
+    for (ids, (mlx.mlx_array_data_uint32(host) orelse return error.NoData)[0..n]) |*o, v| o.* = @intCast(v);
+    try ra(ctx, @intCast(li), ids);
 }
 
 /// What crosses layers in `extend`: each span's stream and mix, the picks
