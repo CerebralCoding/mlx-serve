@@ -3,7 +3,7 @@
 //! pack asks), the fused one-dispatch decode, verify rows with the per-row state capture a partial accept rolls back
 //! to, and batched rows (every slot's state stacked on the batch axis).
 //! copied_from: sdk/blocks/gdn/gated_delta_net.zig (`gatedDeltaNetProjected` without the KDA, low-rank gate, ANE,
-//! spec-tree, grouped-verify and diagnostic arms), sdk/blocks/gdn/gate.zig (`computeGdnGate`).
+//! grouped-verify and diagnostic arms), sdk/blocks/gdn/gate.zig (`computeGdnGate`).
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
@@ -234,6 +234,7 @@ fn mix(w: *const Gdn.Weights, c: *Ctx, x: Array) !Array {
     // Verify rows: the same kernel over S tokens, keeping every row's state for the rollback.
     if (w.out.rht == null and batch == 1 and seq >= 1 and seq <= gdn_decode.MAX_SEQ and capture and conv != null and ssm != null and geo.kernel == 4 and fused.gdnDecodeRecurEnabled()) fast: {
         const ins = gdnInputs(w, p, conv.?, ssm.?, eps);
+        if (c.tree) |t| return treeVerify(w, c, p, ins, ssm.?, t.table);
         if (fused.gdnVerifyFoldEnabled()) fold: {
             const f = (try gdn_decode.recurSeqFold(geo.dec(), seq, ins, swish, g.s)) orelse break :fold;
             try adopt3(g, .{ f.gated, f.conv_input, f.state_seq, f.conv_state, f.ssm_state });
@@ -262,6 +263,7 @@ fn mix(w: *const Gdn.Weights, c: *Ctx, x: Array) !Array {
         return row_exact.linear(c.row_exact, g, &w.out, try g.adopt(flat));
     }
 
+    if (c.tree != null) return error.SpecTreeUnsupported;
     var q_scaled: Array = undefined;
     var k_scaled: Array = undefined;
     var v_heads: Array = undefined;
@@ -377,6 +379,32 @@ fn mix(w: *const Gdn.Weights, c: *Ctx, x: Array) !Array {
     else
         try g.mul(try g.mul(z_heads, try g.sigmoid(z_heads)), y_normed);
     return row_exact.linear(c.row_exact, g, &w.out, try g.reshape(gated, &.{ batch, seq, value_dim }));
+}
+
+/// A draft tree's verify rows, each row's recurrence along its own ancestors. The conv and scan states stay the round's
+/// input: the commit replays the kept path from the input state, the conv input and every row's prework left here.
+fn treeVerify(w: *const Gdn.Weights, c: *Ctx, p: Proj, ins: gdn_decode.Inputs, ssm: Array, table: Array) !Array {
+    const g = c.g;
+    const geo = &w.geo;
+    const wd = w.in.widths;
+    const joined: ?gdn_decode.Joined = if (p.all) |all| .{ .all = all, .a_off = wd[0] + wd[1], .b_off = wd[0] + wd[1] + wd[2] } else null;
+    const r = (try gdn_decode.recurTree(geo.dec(), c.rows, ins, joined, table, g.s)) orelse return error.SpecTreeUnsupported;
+    inline for (.{ r.y, r.conv_input, r.prework.k, r.prework.v, r.prework.gb }) |x| _ = try g.adopt(x);
+    const z_src = if (joined) |j| j.all else p.z;
+    const z_off: c_int = if (joined != null) wd[0] else 0;
+    const z_stride = if (joined) |j| ops.shape(j.all)[2] else geo.valueDim();
+    const flat = (try fused.gdnNormGateFused(g.s, r.y, z_src, z_off, z_stride, w.norm_w, c.shared.eps_arr, !geo.sigmoid_gate, geo.hv, geo.dv, 1, c.rows)) orelse return error.SpecTreeUnsupported;
+    try state.put(c, .state_seq, .{ .ctx = null });
+    try state.put(c, .conv_input, r.conv_input);
+    try state.put(c, .state_in, ssm);
+    try state.put(c, .prework_k, r.prework.k);
+    try state.put(c, .prework_v, r.prework.v);
+    try state.put(c, .prework_gb, r.prework.gb);
+    if (!fused.gdn_verify_tree_engaged) {
+        fused.gdn_verify_tree_engaged = true;
+        log.info("[gdn] verify tree engaged: S={d} Hk={d} Hv={d}\n", .{ c.rows, geo.hk, geo.hv });
+    }
+    return row_exact.linear(c.row_exact, g, &w.out, try g.adopt(flat));
 }
 
 /// The decay gate `[B, S, Hv]`: the compiled closure where one was built, else the chain.

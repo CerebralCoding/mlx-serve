@@ -27,14 +27,17 @@ run by the engine). `qwen3_next` reuses this plugin's load and forward (`plugins
 - DFlash (`trunk_weight` + `dflash_capture`, every layout). With a drafter bound an affine dense trunk runs the
   `.mma` row-exact lane (`sdk/bases/blocks/row_exact.zig`, set at load where every projection fits): projections,
   joined groups at every lane width, attention through `lane_attn`/`row_attn`. `served_test.zig` proves it against
-  the legacy `rowExactDecode` and a verify row against serial decode, bit for bit (`exact_drafted`). bf16 and MoE
+  the legacy `rowExactDecode` and a verify row against serial decode, bit for bit (`exact_drafted`). A dense trunk
+  (bf16 too, as legacy) declares `spec_tree` (DFlash2 draft trees: tree-masked attention on per-depth RoPE, the GDN
+  tree recurrence, the round's input state + prework left for the engine's commit); the `.mma` lane tiles its
+  projections in place when a drafter binds (`SpecHooks.tile_lanes`). Both proven against the legacy trunk (and
+  serial decode along each row's ancestors) in `served_test.zig`. bf16 and MoE
   trunks take DFlash without `exact_drafted` (a bf16 matmul's bits follow its row count; legacy claimed them).
 - Parse declines: an image tower without M-RoPE sections, rope scaling, no output gate,
   `mlp_only_layers`, pooling, `quantization_config.quant_method` / `expert_quant` / `modules` (ModelOpt, EXL3; Hadamard
   outside `prism_hadamard_qwen35`),
   2-bit group-128.
-- Not carried by the blocks (so not declared): `spec_tree` (the tree verify: drafts chain), grouped-verify
-  `projected` slices, ANE prefill, int8 prefill.
+- Not carried by the blocks (so not declared): grouped-verify `projected` slices, ANE prefill, int8 prefill.
 - Prism packs (`plugins/prism_hadamard_qwen35`) are this plugin's dense trunk with `Config.hadamard_block`: the `.prism`
   body (`Prism` base), one `rht.Registry` per model, f16 activations, an f32 GDN state.
 

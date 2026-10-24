@@ -24,6 +24,9 @@ const Tokenizer = @import("../../sdk/tokenizer/tokenizer.zig").Tokenizer;
 const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
 const qwen3_5 = @import("plugin.zig");
 const tape_mod = @import("../../engines/mlx/plugin/tape.zig");
+const tree_mod = @import("../../engines/mlx/spec/tree.zig");
+const lane_qmm = @import("../../sdk/blocks/qmm/lane_qmm.zig");
+const naxAvailable = @import("../../mlx/device.zig").naxAvailable;
 
 const testing = std.testing;
 const Array = mlx.mlx_array;
@@ -389,6 +392,141 @@ pub fn expectImage(p: *Pair) !void {
     try p.oracle.done();
 }
 
+/// A draft tree of 8 rows over three branches (the root, then each row's parent and depth).
+const tree_parents = [_]i32{ -1, 0, 1, 1, 3, 0, 5, 2 };
+const tree_depth = [_]i32{ 0, 1, 2, 2, 3, 1, 2, 3 };
+const tree_toks = [_]i32{ 88, 5, 61, 200, 12, 9, 33, 77 };
+/// The accepted path the commit keeps: rows 0, 1, 3, 4.
+const tree_kept = [_]u32{ 0, 1, 3, 4 };
+
+/// Row `r`'s tokens from the root down to it.
+fn treePath(r: usize, out: *[4]i32) []const i32 {
+    const d: usize = @intCast(tree_depth[r]);
+    var cur: i32 = @intCast(r);
+    var i = d + 1;
+    while (cur >= 0) : (cur = tree_parents[@intCast(cur)]) {
+        i -= 1;
+        out[i] = tree_toks[@intCast(cur)];
+    }
+    return out[0 .. d + 1];
+}
+
+/// With a drafter bound: a draft-tree verify (captures on) and the commit of an accepted path, served vs legacy, bit
+/// for bit (logits, captures, every state the commit replays from, the committed states, the next step). With `exact`
+/// every tree row equals serial decode along its own ancestors, and the committed state the serial state after the
+/// kept path (a bf16 matmul's bits follow its row count).
+fn expectTree(p: *Pair, exact: bool) !void {
+    const a = testing.allocator;
+    const s = fixture.stream();
+    const xs = p.shells();
+    for (xs) |x| try testing.expect(x.specTreeSupported());
+    var lanes: [2]Lane = undefined;
+    for (&lanes, xs) |*l, x| try l.init(x);
+    defer for (&lanes) |*l| l.deinit();
+    var g = ops.Graph.init(a, s);
+    defer g.deinit();
+    const prompt = try fixture.tokens(&g, &ids(19, 7));
+    for (&lanes, xs) |*l, x| _ = try g.adopt(try x.forwardWith(&l.ctx, prompt));
+    const anchor = lanes[0].off;
+
+    const tree = tree_mod.specTreeFor(&tree_parents, &tree_depth, 3);
+    defer tree.deinit();
+    var outs: [2]Array = undefined;
+    var caps: [2][2]Array = @splat(@splat(.{ .ctx = null }));
+    defer for (caps) |pair| for (pair) |c| if (c.ctx != null) {
+        _ = mlx.mlx_array_free(c);
+    };
+    for (&lanes, xs, &outs, &caps) |*l, x, *o, *cv| {
+        for (cv) |*c| c.* = mlx.mlx_array_new();
+        var cl: CaptureLayers = .{ .ids = &.{ 0, 1 }, .out = cv };
+        l.ctx.capture_layers = &cl;
+        l.ctx.capture_ssm_seq = true;
+        l.ctx.tree = &tree;
+        // As `dflash_tree.zig` runs it: the residual handed to the GPU between layers.
+        l.ctx.pipeline_build = 1;
+        defer {
+            l.ctx.capture_layers = null;
+            l.ctx.capture_ssm_seq = false;
+            l.ctx.tree = null;
+            l.ctx.pipeline_build = 0;
+        }
+        o.* = try g.adopt(try x.forwardWith(&l.ctx, try fixture.tokens(&g, &tree_toks)));
+    }
+    try ops.expectBitEqual(outs[1], outs[0]);
+    for (caps[0], caps[1]) |want, got| try ops.expectBitEqual(got, want);
+    try fixture.expectEntries(lanes[0].ssm, lanes[1].ssm);
+    try expectTreeCaptures(lanes[0].ssm, lanes[1].ssm);
+    try testing.expect(lanes[1].ssm[0].spec_prework.k.ctx != null);
+
+    // Every row against serial decode along its ancestors, from the prompt's state.
+    const vocab = ops.shape(outs[1])[2];
+    for (0..if (exact) tree_toks.len else 0) |r| {
+        var buf: [4]i32 = undefined;
+        const path = treePath(r, &buf);
+        var ser: Lane = undefined;
+        try ser.init(&p.xfm);
+        defer ser.deinit();
+        _ = try g.adopt(try p.xfm.forwardWith(&ser.ctx, prompt));
+        var last: Array = undefined;
+        for (path) |t| last = try g.adopt(try p.xfm.forwardWith(&ser.ctx, try fixture.tokens(&g, &.{t})));
+        const rc: c_int = @intCast(r);
+        try ops.expectBitEqual(try g.slice(outs[1], &.{ 0, rc, 0 }, &.{ 1, rc + 1, vocab }), last);
+    }
+
+    // The commit (`dflash_tree.zig`): the kept rows' KV moved to consecutive positions, the states replayed.
+    const accepted = tree_kept.len - 1;
+    var conv_rows: [3]i32 = undefined;
+    for (0..3) |i| {
+        const dd: i32 = @as(i32, @intCast(accepted)) - 2 + @as(i32, @intCast(i));
+        conv_rows[i] = if (dd < 0) dd + 3 else 3 + @as(i32, @intCast(tree_kept[@intCast(dd)]));
+    }
+    var kept: [tree_kept.len]i32 = undefined;
+    for (tree_kept, &kept) |r, *k| k.* = @intCast(r);
+    for (&lanes) |*l| {
+        const step = l.kv.step;
+        try l.kv.compactRows(anchor, tree_kept[1..], s);
+        try l.kv.truncate(anchor + tree_kept.len, s);
+        l.kv.step = step;
+        for (l.ssm) |*e| {
+            try ssm_entry.ssmCommitTreePath(e, &kept, conv_rows, s);
+            ssm_entry.ssmFreeSpecCapture(e);
+        }
+        l.off = anchor + tree_kept.len;
+    }
+    try fixture.expectEntries(lanes[0].ssm, lanes[1].ssm);
+    var next: [2]Array = undefined;
+    for (&lanes, xs, &next) |*l, x, *o| o.* = try g.adopt(try x.forwardWith(&l.ctx, try fixture.tokens(&g, &.{17})));
+    try ops.expectBitEqual(next[1], next[0]);
+    if (!exact) return;
+    var ser: Lane = undefined;
+    try ser.init(&p.xfm);
+    defer ser.deinit();
+    _ = try g.adopt(try p.xfm.forwardWith(&ser.ctx, prompt));
+    for (tree_kept) |r| _ = try g.adopt(try p.xfm.forwardWith(&ser.ctx, try fixture.tokens(&g, &.{tree_toks[r]})));
+    try ops.expectBitEqual(next[1], try g.adopt(try p.xfm.forwardWith(&ser.ctx, try fixture.tokens(&g, &.{17}))));
+}
+
+/// What a tree verify leaves for the commit to replay from (the round's input state, every row's prework), bit-equal.
+fn expectTreeCaptures(want: []const SSMCacheEntry, got: []const SSMCacheEntry) !void {
+    for (want, got) |*w, *gt| for (
+        [_]Array{ w.spec_state_in, w.spec_prework.k, w.spec_prework.v, w.spec_prework.gb },
+        [_]Array{ gt.spec_state_in, gt.spec_prework.k, gt.spec_prework.v, gt.spec_prework.gb },
+    ) |wa, ga| {
+        try testing.expectEqual(wa.ctx == null, ga.ctx == null);
+        if (wa.ctx != null) try ops.expectBitEqual(ga, wa);
+    };
+}
+
+/// The dense pack (4-bit or bf16) with no proof tape, a drafter bound on both shells.
+fn openBound(p: *Pair, comptime quantized: bool, seed: u64) !void {
+    var pk = fixture.Pack.init(seed);
+    defer pk.deinit();
+    try pack.writePack(&pk, false, quantized, 8);
+    try p.open(&qwen3_5.table, &pk, pack.config(false, quantized, 8));
+    p.oracle = .{};
+    for (p.shells()) |x| x.config.dflash_bound = true;
+}
+
 pub fn fixtureRows(n: c_int, h: c_int, seed: u64) !Array {
     var prng = std.Random.DefaultPrng.init(seed);
     const buf = try testing.allocator.alloc(f32, @intCast(n * h));
@@ -477,4 +615,37 @@ test "qwen3_5 served: a bf16 pack takes DFlash without exact_drafted (its matmul
     try openPack(&p, false, false, 8, 0x5e09, pack.config(false, false, 8));
     defer p.close();
     try testing.expect(p.xfm.plugin.?.drafters and !p.cfg.plugin.?.parsed.caps.exact_drafted);
+}
+
+test "qwen3_5 served: with a drafter bound, a draft-tree verify and its commit equal the legacy trunk and serial decode along each row's ancestors" {
+    var p: Pair = undefined;
+    try openBound(&p, true, 0x5e0a);
+    defer p.close();
+    try testing.expect(p.cfg.plugin.?.parsed.caps.spec_tree);
+    try expectTree(&p, true);
+}
+
+test "qwen3_5 served: a bf16 dense pack verifies draft trees as the legacy trunk does" {
+    var p: Pair = undefined;
+    try openBound(&p, false, 0x5e0c);
+    defer p.close();
+    try expectTree(&p, false);
+}
+
+test "qwen3_5 served: trunk projections tiled in place for the lane give the legacy tiled trunk's bits (steps, verify, tree)" {
+    if (!naxAvailable()) return error.SkipZigTest;
+    var p: Pair = undefined;
+    try openBound(&p, true, 0x5e0b);
+    defer p.close();
+    try testing.expect(try p.lg.xfm.tileLaneWeights() > 0);
+    _ = try p.xfm.tileLaneWeights();
+    const m: *qwen3_5.Loaded = @ptrCast(@alignCast(p.xfm.plugin.?.model));
+    const o = &m.body.dense.layers[1].mixer.second.o.lin;
+    var g = ops.Graph.init(testing.allocator, fixture.stream());
+    defer g.deinit();
+    const x = try g.astype(try g.adopt(try fixtureRows(1, ops.shape(o.w)[1] * 8, 3)), .bfloat16);
+    try testing.expect(try lane_qmm.tiledQmm(x, o.w, fixture.stream()) != null);
+    try expectSolo(&p);
+    for (p.shells()) |sh| try expectVerifyEqualsSerial(sh);
+    try expectTree(&p, true);
 }
