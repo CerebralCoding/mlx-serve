@@ -159,3 +159,18 @@ test "kit examples: the model plugin's fixture written as a pack is one it claim
     // The media example claims nothing of a model pack.
     try testing.expectError(error.NotClaimed, cli.checkPack(testing.io, a, inst.set.plugins.items[1], pack));
 }
+
+test "kit examples: the model plugin's fixture pack tokenizes and renders its chat template as the server will" {
+    var inst = try Installed.init();
+    defer inst.deinit();
+    const a = inst.arena.allocator();
+    const pack = try inst.path("pack");
+    try cli.writeFixture(testing.io, a, inst.set.plugins.items[0], pack);
+    var tok = try @import("../tokenizer/load.zig").loadTokenizer(testing.io, a, pack);
+    defer tok.deinit();
+    try testing.expectEqualSlices(u32, &.{ 258, 'h', 'i', 256 }, try tok.encode(a, "<|user|>hi<|end|>"));
+    const chat_config = try @import("../chat/template_load.zig").loadChatConfig(testing.io, a, pack);
+    const Message = @import("../chat/types.zig").Message;
+    const prompt = try @import("../chat/render.zig").renderChatTemplate(a, &[_]Message{.{ .role = "user", .content = "hi" }}, &chat_config, null, null, false, null, false);
+    try testing.expectEqualStrings("<|user|>hi<|end|><|assistant|>", prompt);
+}

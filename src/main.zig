@@ -152,7 +152,7 @@ fn printUsage(io: std.Io) void {
         \\                      hermes, aider, zcode); starts the MLX-Serve app if the
         \\                      server is down. `mlx-serve launch <agent> -h` for
         \\                      options
-        \\  plugin new|check|install
+        \\  plugin new|check|fixture|install
         \\                      Outside plugins (dylibs built with the plugin kit):
         \\                      `mlx-serve plugin` for usage
         \\
