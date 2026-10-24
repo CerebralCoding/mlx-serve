@@ -6,9 +6,9 @@ import XCTest
 /// missing, so a MiniMax Music 3 checkpoint on disk was labelled a red
 /// "Unsupported" on the same screen that offers to download it (#228).
 ///
-/// Zig already pins its two copies against each other (`gen.media_model_types`
-/// vs `model_discovery.isMediaModelType`). Nothing pinned Swift, which is
-/// exactly why the drift went unnoticed — so the guard reads the Zig array.
+/// The server classifies media packs from its media plugins alone. Nothing
+/// pinned Swift, which is why the drift went unnoticed — so the guard reads
+/// the types the media plugins declare.
 final class MediaModalityParityTests: XCTestCase {
 
     private var repoRoot: URL {
@@ -19,24 +19,29 @@ final class MediaModalityParityTests: XCTestCase {
             .deletingLastPathComponent()  // repo root
     }
 
-    /// `media_model_types` out of src/host/registry/modality.zig, which is the source of truth.
+    /// Every `model_types` entry of a media plugin (a `src/plugins/*/config.zig` declaring `.kind = .media`):
+    /// the server's source of truth.
     private func zigMediaModelTypes() throws -> Set<String> {
-        let text = try String(contentsOf: repoRoot.appendingPathComponent("src/host/registry/modality.zig"), encoding: .utf8)
-        guard let start = text.range(of: "pub const media_model_types = [_][]const u8{"),
-              let end = text.range(of: "};", range: start.upperBound..<text.endIndex) else {
-            XCTFail("could not find media_model_types in src/host/registry/modality.zig")
-            return []
+        let plugins = repoRoot.appendingPathComponent("src/plugins")
+        var types: Set<String> = []
+        for name in try FileManager.default.contentsOfDirectory(atPath: plugins.path) where !name.hasPrefix("_") {
+            let config = plugins.appendingPathComponent(name).appendingPathComponent("config.zig")
+            guard let text = try? String(contentsOf: config, encoding: .utf8),
+                  text.contains(".kind = .media"),
+                  let start = text.range(of: "pub const model_types = [_][]const u8{"),
+                  let end = text.range(of: "};", range: start.upperBound..<text.endIndex) else { continue }
+            types.formUnion(text[start.upperBound..<end.lowerBound]
+                .split(whereSeparator: { $0 == "," || $0 == "\n" })
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { $0.hasPrefix("\"") }
+                .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "\"")) })
         }
-        let body = text[start.upperBound..<end.lowerBound]
-        return Set(body.split(whereSeparator: { $0 == "," || $0 == "\n" })
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { $0.hasPrefix("\"") }
-            .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "\"")) })
+        return types
     }
 
     func testEveryMediaArchitectureTheServerKnowsIsKnownToTheApp() throws {
         let zig = try zigMediaModelTypes()
-        XCTAssertGreaterThanOrEqual(zig.count, 11, "parsed too few types — did the Zig array move?")
+        XCTAssertGreaterThanOrEqual(zig.count, 11, "parsed too few types — did the media plugins move?")
         for type in zig {
             // Prefix entries in Zig ("flux2", "krea", "mage_flow", "hunyuan3d")
             // are matched by prefix on both sides, so the bare stem must pass.

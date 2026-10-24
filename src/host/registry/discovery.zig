@@ -23,73 +23,15 @@ const served_media = @import("../media_jobs/plugin/served.zig");
 const modality = @import("modality.zig");
 const served_plugin = @import("../../engines/mlx/plugin/config.zig");
 const outside_plugins = @import("../plugins/loader.zig");
-const FsPackDir = @import("pack_dir.zig").FsPackDir;
+const pack_dir = @import("pack_dir.zig");
+const FsPackDir = pack_dir.FsPackDir;
+const registry = @import("../../plugins/registry.zig");
 
-/// Architecture allow-list for discovery. Must stay in sync with the
-/// `model_type` branches in `model.zig:parseConfigFromJson`. Discovery
-/// silently skips any subdirectory whose `config.json` declares a
-/// `model_type` outside this list — that prevents `--model-dir` from
-/// picking up partially-downloaded or unsupported checkpoints (e.g. a
-/// `deepseek_v4` directory next to gemma/qwen ones) which would otherwise
-/// crash the server when the tokenizer for the unknown arch is loaded.
-///
-/// `gemma4_assistant` is deliberately excluded: those are speculative-
-/// decoding drafters, not standalone primary models. Bare `gemma4`/`qwen3`
-/// drafters can't decode on their own, and users shouldn't see them in
-/// `/v1/models`.
-const supported_model_types = [_][]const u8{
-    "gemma3",         "gemma3_text",
-    "gemma4",         "gemma4_text",
-    "gemma4_unified", "gemma4_unified_text",
-    "qwen2",          "qwen3",
-    "qwen3_5",        "qwen3_5_text",
-    "qwen3_5_moe",    "qwen3_5_moe_text",
-    "qwen3_moe",      "qwen3_moe_text",
-    "qwen3_next",
-    "qwen4_exp", "qwen4_exp_text", // Qwen3.8-Flash-Next (GDN + QSA + n-gram PLE MoE)
-    "llama",     "mistral",
-    "lfm2",       "lfm2_vl", "lfm2_moe", // any other "lfm2*" passes by prefix, as model.zig parses it
-    "nemotron_h",
-    "nemotron_h_puzzle", // Nemotron 3.5 Bolt language tower (latent heterogeneous MoE)
-    "nemotron_h_omni", // Bolt omni wrapper; language config is llm_config
-    "bert",
-    "deepseek_v4",
-    "deepseek_v41", // DeepSeek-V4.1-Flash (src/plugins/deepseek_v41/deepseek_v41.zig; the EXL3 repack on mlx-stream)
-    "hy_v3", // Tencent Hunyuan 3 (295B-A21B MoE)
-    "laguna", // poolside Laguna S 2.1 (117.6B-A8.5B MoE coder)
-    "kolibri1", // Aleph Alpha Kolibri-1 (78B-A3.5B MoE)
-    "flint", // Recursive Flint (39.8B-A2.5B MoE coder)
-    "inkling_mm_model", // Thinking Machines Inkling Small (276B-A12B MoE)
-    "muse_glimmer", // meta-models Muse-Glimmer-30B (dense VL; text served, vision pending)
-    "muse_glimmer_text",
-    "bailing_hybrid", // inclusionAI Ling 3.0 (KDA + MLA hybrid MoE)
-    "gpt_oss", // OpenAI gpt-oss (20B-A3.6B / 120B-A5.1B MoE, harmony format)
-    "mimo_v2", // Xiaomi MiMo-V2.6-Flash (309B-A15B MoE, mlx-lm layout)
-    "mimo_v2_flash", // MiMo-V2-Flash, and TensorFold's label for V2.6 packs
-    "spark2_5", // XHToken Spark-X2.5 (dense sliding/full GQA, per-head attn gate)
-    "k2_horizon", // IFM K2-Horizon dense (Llama trunk, grouped RMS norms)
-    "prism_hadamard_qwen35", // prism-ml Bonsai 2: qwen3_5 behind block Hadamard rotations
-    "glm5_next", "glm5_next_text", // Z.ai GLM-5.3-Flash (KDA + DSA inside mHC)
-    "glm_moe_dsa", // Z.ai GLM-5.3 (744B MoE), the mlx-stream pack (experts streamed from experts.bin)
-    "embedding_gemma2", // Google EmbeddingGemma 2 (bidirectional Gemma 4 trunk, text/image/video embeddings)
-    "minicpmv4_7", // openbmb MiniCPM-V 4.7 (Qwen3.5 trunk + SigLIP2 tower)
-    "qwen3_asr", // Qwen3-ASR speech recognition (qwen3 trunk + audio tower)
-    "qwen3_forced_aligner", // Qwen3-ForcedAligner word times (the ASR shape, a timestamp head)
-};
-
-/// Native media-generation archs (image / audio / video / 3D), served by the
-/// unified engines in `gen.zig`. Recognized here so `--model-dir` discovery
-/// and `/v1/load-model` by-path accept them; the modality engine (not the MLX
-/// transformer) handles the load. Kept as inline string checks so this module
-/// stays filesystem-only (no mlx/gen import). Mirrors `gen.modalityFromType`.
-/// A file that must exist beside config.json for `model_type` to count as a
-/// COMPLETE media pack. Every H3/LTX download holds a valid config.json for
-/// the tens of minutes its big weights are still `.partial` (and a turbo-lora
-/// fragment forever) — registering such a dir shadows complete copies in
-/// later roots, and loading it falls through to the text loader, which dies
-/// on the first missing weight. The ONE table: `gen.requiredMarkerFor`
-/// delegates here, so discovery, register-by-path and the load guard agree.
-/// App twin: `DownloadManager.requiredMediaMarker` (keep in sync).
+/// The file whose presence makes a media pack of `model_type` COMPLETE (its plugin's `required_file`), or null. Every
+/// H3/LTX download holds a valid config.json for the tens of minutes its big weights are still `.partial`: registering
+/// such a dir shadows complete copies in later roots, and loading it falls through to the text loader, which dies on
+/// the first missing weight. Discovery, register-by-path and the load guard all read this one.
+/// App twin: `DownloadManager.requiredMediaMarker`.
 pub fn requiredMediaMarker(model_type: []const u8) ?[]const u8 {
     if (served_media.byName(model_type)) |t| return if (t.required_file.len == 0) null else t.required_file.slice();
     return null;
@@ -98,19 +40,17 @@ pub fn requiredMediaMarker(model_type: []const u8) ?[]const u8 {
 /// Models a transcription leans on that serve no request of their own: the
 /// forced aligner and the speaker diarizer.
 pub fn isTranscriptionCompanion(model_type: []const u8) bool {
-    return std.mem.eql(u8, model_type, "qwen3_forced_aligner") or std.mem.eql(u8, model_type, "nemotron_diarization");
+    return std.mem.eql(u8, model_type, "qwen3_forced_aligner") or modality.fromType(model_type) == .diarization;
 }
 
 pub fn isMediaModelType(model_type: []const u8) bool {
     return modality.fromType(model_type) != null;
 }
 
+/// A registered plugin claims `model_type` by its type alone.
 fn isSupportedModelType(model_type: []const u8) bool {
-    if (std.mem.startsWith(u8, model_type, "lfm2")) return true;
     if (isMediaModelType(model_type)) return true;
-    for (supported_model_types) |t| {
-        if (std.mem.eql(u8, model_type, t)) return true;
-    }
+    for (registry.entries) |e| if (e.model) |t| if (t.claims(.of(model_type), .{}, &pack_dir.none) != .no) return true;
     return false;
 }
 
@@ -150,20 +90,10 @@ const ConfigPeek = union(enum) {
 fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_name: []const u8) ConfigPeek {
     var sub = dir.openDir(io, entry_name, .{}) catch return .missing_or_unparseable;
     defer sub.close(io);
+    // A media pack is its plugin's, whatever its config.json says (a Kev pack carries its base model's) or when it
+    // ships none.
     if (served_media.claimTypeIn(io, sub, allocator)) |mt| return .{ .supported = mt };
-    if (peekClefPack(io, sub)) return .{ .supported = allocator.dupe(u8, "clef") catch return .missing_or_unparseable };
-    // A Kev pack carries its base model's config.json (qwen3_5): the marker must win before it is read.
-    if (peekKevPack(io, sub)) return .{ .supported = allocator.dupe(u8, "kev") catch return .missing_or_unparseable };
-    var file = sub.openFile(io, "config.json", .{}) catch {
-        // No root config.json (configless image and 3D packs are their plugins' claims, above).
-        // A Laya decision checkpoint ships encoder/config.json + rl_agent_config.json.
-        if (peekLayaCheckpoint(io, sub))
-            return .{ .supported = allocator.dupe(u8, "laya") catch return .missing_or_unparseable };
-        // …and a Stable Audio 3 repo: stable-audio-tools' model_config.json.
-        if (peekStableAudio3Config(io, allocator, sub))
-            return .{ .supported = allocator.dupe(u8, "stable_audio3") catch return .missing_or_unparseable };
-        return .missing_or_unparseable;
-    };
+    var file = sub.openFile(io, "config.json", .{}) catch return .missing_or_unparseable;
     defer file.close(io);
     var rbuf: [4096]u8 = undefined;
     var rs = file.reader(io, &rbuf);
@@ -173,7 +103,6 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
     defer parsed.deinit();
     if (parsed.value != .object) return .missing_or_unparseable;
     const root = parsed.value.object;
-    if (isD1Root(root)) return .{ .supported = allocator.dupe(u8, "d1") catch return .missing_or_unparseable };
     // The DFlash contract outranks model_type: v1 assistants at least carry a
     // `*_assistant` suffix, but a DFlash2 sidecar is config-indistinguishable
     // from its trunk family without this probe (one predicate, shared with
@@ -217,152 +146,10 @@ pub fn isForcedAligner(root: std.json.ObjectMap) bool {
     return mt == .string and std.mem.eql(u8, mt.string, "qwen3_forced_aligner");
 }
 
-/// True when `sub` holds a Kev typed-decision pack (tests/convert_kev_weights.py). The marker alone decides,
-/// so a pack with a missing or broken part fails its load by name instead of serving as a chat model.
-/// Twin of gen.isKevPack, which delegates here.
-pub fn peekKevPack(io: std.Io, sub: std.Io.Dir) bool {
-    const st = sub.statFile(io, "kev_config.json", .{}) catch return false;
-    return st.kind == .file;
-}
-
-/// True for a D1 decision checkpoint (LiquidAI/d1-3B): its LFM2-VL config.json's `auto_map` names the card's own
-/// class, which is what tells it from a chat LFM2.5-VL. Twin of gen.isD1Pack, which delegates here.
-pub fn isD1Root(root: std.json.ObjectMap) bool {
-    const map = root.get("auto_map") orelse return false;
-    if (map != .object) return false;
-    const cls = map.object.get("AutoModel") orelse return false;
-    return cls == .string and std.mem.eql(u8, cls.string, "modeling_d1.D1Model");
-}
-
-pub fn peekD1Pack(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) bool {
-    var file = sub.openFile(io, "config.json", .{}) catch return false;
-    defer file.close(io);
-    var rbuf: [4096]u8 = undefined;
-    var rs = file.reader(io, &rbuf);
-    const bytes = rs.interface.allocRemaining(allocator, .limited(1 * 1024 * 1024)) catch return false;
-    defer allocator.free(bytes);
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return false;
-    defer parsed.deinit();
-    return parsed.value == .object and isD1Root(parsed.value.object);
-}
-
-pub fn peekClefPack(io: std.Io, sub: std.Io.Dir) bool {
-    const st = sub.statFile(io, "joint_head_config.json", .{}) catch return false;
-    return st.kind == .file;
-}
-
-/// True when `sub` holds a Laya typed-decision checkpoint (no root config.json;
-/// identified by the two configs every Laya export carries). Twin of
-/// gen.isLayaRepo, which delegates here.
-pub fn peekLayaCheckpoint(io: std.Io, sub: std.Io.Dir) bool {
-    for ([_][]const u8{ "rl_agent_config.json", "encoder/config.json" }) |rel| {
-        const f = sub.openFile(io, rel, .{}) catch return false;
-        f.close(io);
-    }
-    return true;
-}
-
-/// True when `sub/model_index.json` marks a MageFlow pipeline (`_class_name` ==
-/// "MageFlowPipeline", or a `_mage_flow_version` tag). Same signature as
-/// gen.isMageFlowRepo, over an already-open Dir.
-pub fn peekMageFlowIndex(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) bool {
-    var file = sub.openFile(io, "model_index.json", .{}) catch return false;
-    defer file.close(io);
-    var rbuf: [4096]u8 = undefined;
-    var rs = file.reader(io, &rbuf);
-    const bytes = rs.interface.allocRemaining(allocator, .limited(1 * 1024 * 1024)) catch return false;
-    defer allocator.free(bytes);
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return false;
-    defer parsed.deinit();
-    if (parsed.value != .object) return false;
-    if (parsed.value.object.get("_mage_flow_version") != null) return true;
-    const cn = parsed.value.object.get("_class_name") orelse return false;
-    return cn == .string and std.mem.eql(u8, cn.string, "MageFlowPipeline");
-}
-
-/// True when `sub/model_config.json` is a stable-audio-tools inpainting
-/// diffusion model conditioned on T5Gemma: the Stable Audio 3 family as
-/// Stability publishes it. Twin of gen.isStableAudio3Repo, which delegates here.
-pub fn peekStableAudio3Config(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) bool {
-    var file = sub.openFile(io, "model_config.json", .{}) catch return false;
-    defer file.close(io);
-    var rbuf: [4096]u8 = undefined;
-    var rs = file.reader(io, &rbuf);
-    const bytes = rs.interface.allocRemaining(allocator, .limited(1 * 1024 * 1024)) catch return false;
-    defer allocator.free(bytes);
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return false;
-    defer parsed.deinit();
-    if (parsed.value != .object) return false;
-    const mt = parsed.value.object.get("model_type") orelse return false;
-    if (mt != .string or !std.mem.eql(u8, mt.string, "diffusion_cond_inpaint")) return false;
-    var cur = parsed.value;
-    for ([_][]const u8{ "model", "conditioning", "configs" }) |k| {
-        if (cur != .object) return false;
-        cur = cur.object.get(k) orelse return false;
-    }
-    if (cur != .array) return false;
-    for (cur.array.items) |c| {
-        if (c != .object) continue;
-        const t = c.object.get("type") orelse continue;
-        if (t == .string and std.mem.eql(u8, t.string, "t5gemma")) return true;
-    }
-    return false;
-}
-
-/// The FLUX.2 DiT's shared-modulation tensor. Unique to this architecture —
-/// no other diffusers-shaped repo names a weight this — so it identifies an
-/// mflux FLUX.2 conversion without a config.json to read.
-const flux2_dit_marker = "double_stream_modulation_img";
-
-/// True when `sub/transformer/` holds FLUX.2 DiT weights. The 4B mirror ships
-/// a root config.json and never reaches here; `mlx-community/flux2-klein-9b-4bit`
-/// ships none, and a repo the server can load but cannot SEE is the MageFlow
-/// class all over again.
-///
-/// Keyed on the architecture, never on the directory shape: transformer + vae +
-/// text_encoder describes most of diffusers. Reads the shard index when there
-/// is one, else the first shard's safetensors header (a single-file conversion
-/// has no index) — in both cases a bounded prefix, never the weights.
-/// Same signature as gen.isMfluxFlux2Repo, over an already-open Dir.
-pub fn peekMfluxFlux2(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) bool {
-    var tdir = sub.openDir(io, "transformer", .{ .iterate = true }) catch return false;
-    defer tdir.close(io);
-    const cap = 1024 * 1024;
-    const buf = allocator.alloc(u8, cap) catch return false;
-    defer allocator.free(buf);
-
-    if (readPrefix(io, tdir, "model.safetensors.index.json", buf)) |idx| {
-        return std.mem.indexOf(u8, idx, flux2_dit_marker) != null;
-    }
-    // No index → a single-file conversion. The safetensors header is a JSON
-    // blob of tensor names prefixed by its own u64 length; that is enough.
-    var it = tdir.iterate();
-    while (it.next(io) catch null) |entry| {
-        if (entry.kind != .file and entry.kind != .sym_link) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
-        const head = readPrefix(io, tdir, entry.name, buf) orelse continue;
-        if (head.len <= 8) continue;
-        return std.mem.indexOf(u8, head[8..], flux2_dit_marker) != null;
-    }
-    return false;
-}
-
 pub const indexShardSet = @import("../../sdk/weights/resident.zig").indexShardSet;
 
 pub const freeShardSet = @import("../../sdk/weights/resident.zig").freeShardSet;
 const gguf_files = @import("../../sdk/quant/gguf/files.zig");
-
-/// Read at most `buf.len` bytes of `dir/name` into `buf`; null when it can't be
-/// opened or read. Short by design — the callers want a header, not a file, and
-/// the file may be gigabytes.
-fn readPrefix(io: std.Io, dir: std.Io.Dir, name: []const u8, buf: []u8) ?[]u8 {
-    var file = dir.openFile(io, name, .{}) catch return null;
-    defer file.close(io);
-    var rbuf: [4096]u8 = undefined;
-    var rs = file.reader(io, &rbuf);
-    const n = rs.interface.readSliceShort(buf) catch return null;
-    return buf[0..n];
-}
 
 const GgufScan = gguf_files.GgufScan;
 
@@ -454,26 +241,19 @@ pub const ModelKind = enum {
     }
 };
 
-/// Map a config.json `model_type` to its ModelKind. "gguf" is the synthetic
-/// type discovery assigns to GGUF dirs — chat via the embedded engines.
-pub fn modelKindFromType(model_type: []const u8) ModelKind {
-    if (std.mem.eql(u8, model_type, "bert")) return .embed;
+/// The ModelKind a config.json `model_type` alone tells: a media type by its plugin's modality. An encoder is told by
+/// its pack (`classifyModelPath`). "gguf" is the synthetic type discovery assigns to GGUF dirs — chat via the embedded
+/// engines.
+fn modelKindFromType(model_type: []const u8) ModelKind {
+    if (modality.fromType(model_type)) |m| return switch (m) {
+        .image => .image,
+        .audio => .audio,
+        .video => .video,
+        .mesh => .mesh,
+        .decision => .decision,
+        .diarization => .diarization,
+    };
     if (std.mem.endsWith(u8, model_type, "_assistant")) return .drafter;
-    if (std.mem.startsWith(u8, model_type, "flux2") or
-        std.mem.startsWith(u8, model_type, "krea") or
-        std.mem.startsWith(u8, model_type, "mage_flow") or
-        std.mem.eql(u8, model_type, "mageflow") or
-        std.mem.startsWith(u8, model_type, "qwen_image") or
-        std.mem.eql(u8, model_type, "moss_image")) return .image;
-    if (std.mem.eql(u8, model_type, "qwen3_tts") or
-        std.mem.eql(u8, model_type, "acestep") or
-        std.mem.eql(u8, model_type, "minimax_music3") or
-        std.mem.eql(u8, model_type, "yue2") or
-        std.mem.eql(u8, model_type, "stable_audio3")) return .audio;
-    if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
-    if (std.mem.startsWith(u8, model_type, "hunyuan3d") or std.mem.eql(u8, model_type, "trellis2") or std.mem.eql(u8, model_type, "pixal3d")) return .mesh;
-    if (std.mem.eql(u8, model_type, "laya") or std.mem.eql(u8, model_type, "kev") or std.mem.eql(u8, model_type, "clef") or std.mem.eql(u8, model_type, "d1")) return .decision;
-    if (std.mem.eql(u8, model_type, "nemotron_diarization")) return .diarization;
     if (std.mem.eql(u8, model_type, "gguf")) return .chat;
     if (isSupportedModelType(model_type)) return .chat;
     return .unsupported;
@@ -506,7 +286,9 @@ pub fn classifyModelPath(io: std.Io, allocator: std.mem.Allocator, abs_path: []c
         .drafter => .drafter,
         .supported => |mt| blk: {
             defer allocator.free(mt);
-            break :blk modelKindFromType(mt);
+            const kind = modelKindFromType(mt);
+            // An encoder (BERT, EmbeddingGemma 1 and 2) serves embeddings, never chat.
+            break :blk if (kind == .chat and readStubMeta(io, allocator, abs_path).is_encoder) .embed else kind;
         },
     };
 }
@@ -787,10 +569,7 @@ fn tryAddModel(
         // `/v1/models` and the app picker. Anything with neither file still
         // returns false below, via `.missing_or_unparseable`.
         const has_config = if (sub.statFile(io, "config.json", .{})) |st| st.kind == .file else |_| false;
-        if (!has_config and
-            served_media.claimIn(io, sub) == null and
-            !peekLayaCheckpoint(io, sub) and
-            !peekStableAudio3Config(io, allocator, sub)) return false;
+        if (!has_config and served_media.claimIn(io, sub) == null) return false;
 
         // Filter by supported model_type AND quantization scheme. Catches:
         //   - partially-downloaded checkpoints (missing/garbage config)
@@ -1846,8 +1625,9 @@ test "modelKindFromType labels every family (list TYPE column + run preflight)" 
     try testing.expectEqual(ModelKind.audio, modelKindFromType("acestep"));
     try testing.expectEqual(ModelKind.video, modelKindFromType("AudioVideo"));
     try testing.expectEqual(ModelKind.mesh, modelKindFromType("hunyuan3d_2_1"));
-    // Encoders, drafter sidecars, and genuinely unsupported archs.
-    try testing.expectEqual(ModelKind.embed, modelKindFromType("bert"));
+    try testing.expectEqual(ModelKind.audio, modelKindFromType("kokoro"));
+    try testing.expectEqual(ModelKind.video, modelKindFromType("minimax_h3"));
+    // Drafter sidecars, and genuinely unsupported archs.
     try testing.expectEqual(ModelKind.drafter, modelKindFromType("gemma4_assistant"));
     try testing.expectEqual(ModelKind.drafter, modelKindFromType("gemma4_unified_assistant"));
     // DFlash sidecars ride the same `*_assistant` suffix rule — never listed
@@ -1859,7 +1639,7 @@ test "modelKindFromType labels every family (list TYPE column + run preflight)" 
     try testing.expectEqualStrings("chat", ModelKind.chat.label());
 }
 
-test "classifyModelPath: gguf/media/drafter dirs classify; junk is null" {
+test "classifyModelPath: gguf/media/drafter/encoder dirs classify; junk is null" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -1874,6 +1654,11 @@ test "classifyModelPath: gguf/media/drafter dirs classify; junk is null" {
     // MageFlow diffusers repo: NO root config.json, only model_index.json.
     try tmp.dir.createDirPath(io, "mage");
     try tmp.dir.writeFile(io, .{ .sub_path = "mage/model_index.json", .data = "{\"_class_name\":\"MageFlowPipeline\"}" });
+    // Encoders embed: BERT, and EmbeddingGemma 2 (a chat-shaped trunk).
+    try tmp.dir.createDirPath(io, "bert");
+    try tmp.dir.writeFile(io, .{ .sub_path = "bert/config.json", .data = "{\"model_type\":\"bert\"}" });
+    try tmp.dir.createDirPath(io, "eg2");
+    try tmp.dir.writeFile(io, .{ .sub_path = "eg2/config.json", .data = "{\"model_type\":\"embedding_gemma2\"}" });
     try tmp.dir.createDirPath(io, "junk");
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -1885,6 +1670,8 @@ test "classifyModelPath: gguf/media/drafter dirs classify; junk is null" {
         .{ "img", ModelKind.image },
         .{ "drafter", ModelKind.drafter },
         .{ "mage", ModelKind.image },
+        .{ "bert", ModelKind.embed },
+        .{ "eg2", ModelKind.embed },
     };
     inline for (cases) |c| {
         const p = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, c[0] });

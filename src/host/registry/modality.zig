@@ -1,5 +1,5 @@
-//! Which media modality a `model_type` is, or none: the one map discovery (what is servable), the media load arms
-//! (which engine slot) and `/v1/models` (each row's `modality`) read. MLX-free, so discovery may import it.
+//! Which media modality a `model_type` is, or none, as its media plugin declares it: what discovery (what is servable),
+//! the media load arms (which engine slot) and `/v1/models` (each row's `modality`) read.
 
 const std = @import("std");
 const served = @import("../media_jobs/plugin/served.zig");
@@ -44,38 +44,16 @@ pub const Modality = enum {
     }
 };
 
-/// Every media `model_type` this server serves (a prefix where a family spells its sizes into the type). The app's
-/// `isMediaModelType` table is pinned against this list (`MediaModalityTests`).
-pub const media_model_types = [_][]const u8{
-    "flux2",     "krea",       "mage_flow",      "mageflow",
-    "qwen3_tts", "acestep",    "kokoro",         "AudioVideo",
-    "hunyuan3d", "minimax_h3", "minimax_music3", "qwen_image",
-    "laya",      "kev",        "clef",           "d1",
-    "stable_audio3", "yue2",      "nemotron_diarization", "moss_image",
-    "trellis2",  "pixal3d",
-};
-
-/// The modality of `model_type`, or null for an LM/embedding arch. Accepts the markers of `Modality.modelType` AND the
-/// raw config strings discovery peeks ("flux2-klein-4b", "qwen3_tts", "AudioVideo").
+/// The modality of `model_type`, or null for an LM/embedding arch: its media plugin's (a type it claims, or the type
+/// it reports for a pack claimed by its files, as `Modality.modelType`'s markers are).
 pub fn fromType(model_type: []const u8) ?Modality {
-    if (served.byName(model_type)) |t| return served.modalityAs(Modality, t);
-    if (std.mem.eql(u8, model_type, "qwen3_tts")) return .audio;
-    if (std.mem.eql(u8, model_type, "acestep")) return .audio;
-    if (std.mem.eql(u8, model_type, "minimax_music3")) return .audio;
-    if (std.mem.eql(u8, model_type, "yue2")) return .audio;
-    if (std.mem.eql(u8, model_type, "kokoro")) return .audio;
-    if (std.mem.eql(u8, model_type, "stable_audio3")) return .audio;
-    if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
-    if (std.mem.eql(u8, model_type, "minimax_h3")) return .video;
-    if (std.mem.eql(u8, model_type, "laya") or std.mem.eql(u8, model_type, "kev") or std.mem.eql(u8, model_type, "clef") or std.mem.eql(u8, model_type, "d1")) return .decision;
-    if (std.mem.eql(u8, model_type, "nemotron_diarization")) return .diarization;
-    return null;
+    return served.modalityAs(Modality, served.byName(model_type) orelse return null);
 }
 
 // ── tests ──
 
-test "every listed media type has a modality, and an LM arch has none" {
-    for (media_model_types) |mt| try std.testing.expect(fromType(mt) != null);
+test "every served media type has its plugin's modality, and an LM arch has none" {
+    for (served.tables, served.types) |t, mt| try std.testing.expectEqual(served.modalityAs(Modality, t), fromType(mt).?);
     for ([_][]const u8{ "gemma4", "qwen3", "llama", "deepseek_v4", "bert", "qwen3_asr" }) |mt|
         try std.testing.expect(fromType(mt) == null);
     // Every marker the load path stamps reads back as its own modality.

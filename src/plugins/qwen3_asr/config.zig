@@ -12,7 +12,8 @@ pub const plugin = @import("../../sdk/plugin.zig").Plugin{
     .gate_models = &.{ "mlx-community/Qwen3-ASR-0.6B-8bit", "mlx-community/Qwen3-ForcedAligner-0.6B-8bit" },
 };
 
-pub const model_types = [_][]const u8{"qwen3_asr"};
+/// The aligner's pack says `qwen3_asr` at its root; discovery names it by its thinker's type.
+pub const model_types = [_][]const u8{ "qwen3_asr", "qwen3_forced_aligner" };
 
 pub const claims = sdk.claimsByType(&model_types);
 

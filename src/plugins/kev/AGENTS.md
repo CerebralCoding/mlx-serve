@@ -27,5 +27,5 @@ As Laya's (`laya/AGENTS.md`): `state` + `questions` (noul / choice / score), the
 ## The row from the root architecture table
 
 Kev typed-decision packs: qwen3_5 trunk + pointer head; `kev_config.json` wins over the trunk's config.json
-(`discovery.peekKevPack`, app twin `DownloadManager.markerModelType`); the state runs once, each question from a
+(this plugin's `claims`, app twin `DownloadManager.markerModelType`); the state runs once, each question from a
 KV/SSM snapshot (`kev.zig`)

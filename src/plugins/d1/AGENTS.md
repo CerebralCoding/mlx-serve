@@ -27,6 +27,6 @@ As Laya's (`laya/AGENTS.md`); `images` is refused by name (text only in this bui
 ## The row from the root architecture table
 
 LiquidAI D1-3B decision packs (bf16, the card's own layout): LFM2-VL trunk whose root config.json `auto_map` names
-`modeling_d1.D1Model` (`discovery.isD1Root`, app twin `DownloadManager.markerModelType`); the answer is a softmax over
+`modeling_d1.D1Model` (this plugin's `claims`, app twin `DownloadManager.markerModelType`); the answer is a softmax over
 each option's token group at the LM head, no new weights (`d1.zig`, state runs once via `kev.scoreBranches`); text
 only, torchao int8 refused by name. Oracle: `tests/dump_d1_fixtures.py`
