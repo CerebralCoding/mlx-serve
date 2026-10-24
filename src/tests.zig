@@ -16,6 +16,7 @@ comptime {
 }
 
 test {
+    _ = @import("sdk/blocks/hc/hc_cuda_test.zig");
     _ = @import("plugins/stable_audio3/plugin.zig");
     _ = @import("host/media_jobs/plugin/served.zig");
     _ = @import("host/media_jobs/plugin/flip_test.zig");

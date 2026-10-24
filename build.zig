@@ -56,6 +56,13 @@ pub fn build(b: *std.Build) void {
         lint_test.setCwd(b.path("."));
         lint_test.has_side_effects = true;
         b.step("lint-test", "Run the lint's own tests").dependOn(&lint_test.step);
+        // `zig build unit-closure`: no plugin's import closure leaves src/sdk, src/mlx, src/abi, src/kernels, env.zig and
+        // the plugin folders (scripts/unit_closure.py), so a plugin edit rebuilds its -Dunits group alone. The plugins
+        // named here still reach the engine; each leaves the list once it no longer does.
+        const closure = b.addSystemCommand(&.{ "python3", "scripts/unit_closure.py", "--except", "bailing_hybrid,clef,d1,deepseek_v4,deepseek_v41,diffusion_gemma,glm5_next,kev,ltx,minimax_h3,moss_image,prism_hadamard_qwen35,qwen3_5,qwen3_next,qwen4_exp" });
+        closure.setCwd(b.path("."));
+        closure.has_side_effects = true;
+        b.step("unit-closure", "Check every plugin's import closure stays in the SDK and the plugin folders").dependOn(&closure.step);
     }
 
     // Setting any non-default target field disables Zig's native macOS SDK detection,
@@ -404,6 +411,7 @@ pub fn build(b: *std.Build) void {
     // `zig build kit`, and the kit's example plugins built from it as dylibs the unit tests load.
     @import("build/kit.zig").add(b, version, test_runs);
     test_step.dependOn(&b.top_level_steps.get("lint-test").?.step);
+    test_step.dependOn(&b.top_level_steps.get("unit-closure").?.step);
     {
         // Zig collects tests from an artifact's root module only: the EXL3 module is its own artifact, over the
         // plugin host surface. Its CPU references run for hours unoptimized, so Debug runs it as ReleaseSafe.
@@ -645,6 +653,7 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     });
     const test_step = b.step("test", "Run unit tests");
     if (builtin.os.tag != .windows) test_step.dependOn(&b.top_level_steps.get("lint-test").?.step); // no python3 there
+    if (builtin.os.tag != .windows) test_step.dependOn(&b.top_level_steps.get("unit-closure").?.step);
     const run_unit_tests = b.addRunArtifact(unit_tests);
     // Rerun every time when filtered, as on macOS (env-gated tests).
     if (test_filter != null) run_unit_tests.has_side_effects = true;

@@ -7,7 +7,7 @@ only `src/sdk/`, `src/mlx/`, `src/abi/`, `src/kernels/`, `src/env.zig`, its own 
 
   python3 scripts/unit_closure.py [plugin ...]      (no arguments: every registered plugin)
   python3 scripts/unit_closure.py --summary         (one line per plugin)
-  python3 scripts/unit_closure.py --except a,b      (skips plugins a and b; an edge into their folders is only noted)
+  python3 scripts/unit_closure.py --except a,b      (skips plugins a and b; an exit from inside their folders is only noted)
 """
 import os, re, sys
 
@@ -40,12 +40,9 @@ def exits(plugin, skipped=()):
         for t, line in imports(p):
             if not t.startswith('src/') or not os.path.exists(t):
                 continue
-            if plugin_of(t) in skipped:
-                notes.append((p, line, t))
-                continue
             # The registry imports every plugin: reaching it puts them all in the closure.
             if not (t.startswith(ALLOWED) or t == 'src/env.zig') or t == 'src/plugins/registry.zig':
-                out.append((p, line, t))
+                (notes if plugin_of(p) in skipped else out).append((p, line, t))
                 continue
             if t not in seen:
                 seen.add(t)
