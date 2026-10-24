@@ -123,8 +123,8 @@ cancelling one quant took its siblings; a speech tokenizer GGUF could load as th
 
 ### A configless repo shape has to be taught to every "is this a model?" answer
 Defect: every MageFlow checkpoint (no root config.json) and the mflux FLUX.2 klein 9B (no index either) were invisible
-to `list`, `/v1/models` and the app, though `--model` loaded them. Fix: one predicate per shape, delegated to by every
-classifier (`peekMageFlowIndex`, `peekMfluxFlux2` reading a bounded header prefix; `gen.peekModelType` delegates); the
+to `list`, `/v1/models` and the app, though `--model` loaded them. Fix: one predicate per shape, the media plugin's
+`claims` (reading a bounded header prefix), read by every classifier through `served.claimIn`; the
 app's bundle markers declare `hasRootConfig: false`. Signal on weight names, not directory shapes. Guard: the
 discovery and `isModelDir` tests for each shape.
 
@@ -132,7 +132,7 @@ discovery and `isModelDir` tests for each shape.
 Defect: a Turbo-adapter fetch wrote config.json + tokenizer + LoRA into a fresh dir, which shadowed the complete pack
 in a later root; loading it fell through to the text loader and `unreachable` killed the process. Every H3/LTX
 download holds a valid config.json while its weights are still `.partial`. Fix: one completeness table
-(`discovery.requiredMediaMarker`; `gen.requiredMarkerFor` delegates) skips incomplete packs; `probeModelDir` answers
+(the plugin's `required_file`, read through `discovery.requiredMediaMarker`) skips incomplete packs; `probeModelDir` answers
 `error.IncompleteMediaPack`; the preload refuses a media dir that failed its marker by name; adapters download into
 the pack's resolved dir and cancel surgically. Guard: `tests/test_model_rescan.sh`, `TurboLoraFetchTargetTests`.
 

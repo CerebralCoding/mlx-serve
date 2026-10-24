@@ -86,10 +86,10 @@ let supportedModelTypes: Set<String> = [
 /// so they must pass the architecture gate (not show "Unsupported
 /// architecture" in the Downloaded tab) while still being excluded from
 /// chat-model pickers (`LocalModel.isChatPickable` checks this separately).
-/// Mirrors the server's `modality.fromType` (src/host/registry/modality.zig) for
-/// rows no server has classified: a Discover search hit, a download on disk.
+/// Mirrors the server's media plugins (their `model_types`) for rows no server
+/// has classified: a Discover search hit, a download on disk.
 private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "mage_flow", "qwen_image", "moss_image", "hunyuan3d"]
-// Mirrors `modality.media_model_types` on the server. Drift here is not cosmetic:
+// Mirrors the media plugins' `model_types` on the server. Drift here is not cosmetic:
 // a media model missing from this list fails the ARCHITECTURE gate outright,
 // so the browser draws it a red "Unsupported" — which is what happened to
 // `minimax_music3` on the same screen that offers to download it, and to bare
@@ -100,8 +100,8 @@ private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "mage_flow", "q
 // architecture" are different decisions, and it was getting both. Exclusion
 // from pickers is `isChatPickable`'s job, which reads this same list. #228.
 //
-// `MediaModalityParityTests` reads `media_model_types` out of src/host/registry/modality.zig and
-// asserts this agrees; the server's own discovery and dispatch read that one list.
+// `MediaModalityParityTests` reads every media plugin's `model_types` out of src/plugins/*/config.zig and
+// asserts this agrees; the server's own discovery and dispatch read those plugins.
 private let mediaModelTypeExactValues: Set<String> = [
     "qwen3_tts", "AudioVideo", "acestep", "minimax_h3", "minimax_music3", "kokoro", "mageflow", "laya", "kev",
     "stable_audio3", "clef", "d1", "yue2", "nemotron_diarization", "trellis2", "pixal3d",
@@ -236,7 +236,7 @@ struct HFConfigMeta: Codable {
 /// (they come through the main door); their raw upstream layouts are not
 /// served, so their classes deliberately map nowhere.
 private let servedDiffusersClasses: [String: String] = [
-    "MageFlowPipeline": "mage_flow", // mirrors model_discovery.peekMageFlowIndex
+    "MageFlowPipeline": "mage_flow", // mirrors the mage_flow plugin's `claims`
     "MOSSImagePipeline": "moss_image", // mirrors model_discovery.peekMossImageIndex
 ]
 

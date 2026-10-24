@@ -726,8 +726,9 @@ pub fn facts(c: *Config) abi.Parsed {
     p.spec = .{
         .mtp_layout = .in_checkpoint,
         .head_module_owned = true,
-        // Module archs run only their own MTP head: PLD and drafters are unmeasured here.
-        .policy = .{ .drafter_ok = false, .mtp_group_solo = true },
+        // Module archs run only their own MTP head: PLD and drafters are unmeasured here. Flash Next drafts best at
+        // the target's own temperature.
+        .policy = .{ .drafter_ok = false, .mtp_group_solo = true, .draft_temperature = 1.0 },
     };
     p.placeholder_ids = .{
         .image = c.image_token_id,
@@ -814,6 +815,7 @@ test "qwen4_exp config: the flat text pack parses with the family defaults and i
     const p = facts(c);
     try testing.expect(p.caps.batches_decode and p.caps.long_ctx and p.caps.moe and !p.caps.images and !p.caps.batch_per_slot_attn);
     try testing.expectEqual(@as(u32, 1), p.shell.eos_count);
+    try testing.expectEqual(@as(f32, 1.0), p.spec.policy.draft_temperature);
 }
 
 test "qwen4_exp config: a bad bound is refused by name, another family's key is unsupported" {

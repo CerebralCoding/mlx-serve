@@ -138,7 +138,7 @@ Models with `vision_config` but no vision weights disable vision. Embedded-engin
 
 ## Unified media generation
 
-One server, one registry — image/audio/video/3D coexist with chat. Engine slots are MODALITY-named unions on `LoadedModel`; new backend = one union arm + impl file. App flow load→generate→unload; headless starts idle. Which `model_type` is which modality is ONE map (`host/registry/modality.zig`): discovery, the load arms and each `/v1/models` row's `modality` read it. Downloads → `~/.mlx-serve/models` (Swift + Zig).
+One server, one registry — image/audio/video/3D coexist with chat. Engine slots are MODALITY-named unions on `LoadedModel`; new backend = one union arm + impl file. App flow load→generate→unload; headless starts idle. Which pack or `model_type` is which modality is its media plugin's answer (`MediaTable.claims` + `modality`, read through `host/media_jobs/plugin/served.zig`): discovery, `list`, the load arms and each `/v1/models` row's `modality` read it. Downloads → `~/.mlx-serve/models` (Swift + Zig).
 
 - `POST /v1/images/edits` = OpenAI multipart translated by `gen.openaiEditFormToJson` into the `mode:"edit"` JSON body; unhonored fields = NAMED 400.
 - LoRAs are STACKED, ONE grammar across image/LTX/H3: `lora_paths`+`lora_scales` (cap 8, `gen.parseLoraFields`), summed at forward — never merged. Resident backends reconcile via `setLoras`; H3 pre-validates (`lora.validatePath`), Turbo = file 0.
@@ -484,7 +484,7 @@ Weights, quant, loading:
 - **A gather-read table is quantized only where the READER has a quantized-gather path** (media `NEVER_QUANTIZE`; LM `embed_tokens` via `gatherQuantizedRows`).
 - **Calibrated quant**: weights per-input-channel and per-expert; bit width beats group granularity ≤3 bits; round (s,b) to the STORED dtype first; an imatrix is valid only for the WEIGHTS it was collected on; uniform ≤2-bit experts to the LAST layer cause agent loops (4-bit tail fixes it).
 - **Publish MTP head norms FOLDED** (`--fold-mtp-norms`).
-- **Discovery**: a configless repo SHAPE is taught to ONE predicate (`peekMageFlowIndex`; `gen.peekModelType` delegates); size sums stat THROUGH symlinks; an incomplete media pack is invisible until its marker lands (`requiredMediaMarker`, `error.IncompleteMediaPack`); a GGUF folder is a SHELF (`id#<file>`). Guard: `tests/test_model_rescan.sh`.
+- **Discovery**: a configless repo SHAPE is its media plugin's claim (`served.claimIn`; discovery, `list` and `gen.peekModelType` read it); size sums stat THROUGH symlinks; an incomplete media pack is invisible until its marker lands (`requiredMediaMarker`, `error.IncompleteMediaPack`); a GGUF folder is a SHELF (`id#<file>`). Guard: `tests/test_model_rescan.sh`.
 - **The `--no-vision` drop list is a GLOBAL prefix filter**: a tower loads through `loadWeightsWithVision`, never `loadWeights`.
 
 Vision:

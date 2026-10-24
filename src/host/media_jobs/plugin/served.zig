@@ -1,74 +1,54 @@
-//! The served set: the media plugins gen.zig serves through their table instead of a legacy arm. A backend flips by
-//! adding its name to `names` (and later deleting its legacy arm); every lookup below reads only this list.
+//! The media plugins gen.zig serves, every registered one: the one place the host asks which media plugin a type or a
+//! pack is.
 
 const std = @import("std");
 const abi = @import("../../../abi/media.zig");
 const common = @import("../../../abi/common.zig");
 const sdk_plugin = @import("../../../sdk/plugin.zig");
 const registry = @import("../../../plugins/registry.zig");
-const FsPackDir = @import("../../registry/pack_dir.zig").FsPackDir;
+const pack_dir = @import("../../registry/pack_dir.zig");
+const FsPackDir = pack_dir.FsPackDir;
 const log = @import("../../../sdk/util/log.zig");
 const outside = @import("../../plugins/loader.zig");
 
 pub const MediaTable = abi.MediaTable;
 
-/// The flipped backends, by plugin name.
-pub const names = [_][]const u8{
-    "stable_audio3", "kokoro",     "qwen3_tts", "acestep",  "music3",     "yue2",    "ltx",     "minimax_h3",
-    "laya",          "kev",        "d1",        "clef",     "nemotron_diarization",
-    "flux2",         "krea",       "mage_flow", "qwen_image", "moss_image", "trellis2", "pixal3d", "hunyuan3d",
-};
-
-/// Every served table, resolved from the registry at compile time.
-pub const tables: [names.len]*const MediaTable = blk: {
-    var out: [names.len]*const MediaTable = undefined;
-    for (names, &out) |n, *t| t.* = entryOf(n).media orelse @compileError("served media plugin " ++ n ++ " has no media table");
+/// The registered media plugins, in registry order.
+const entries = blk: {
+    var out: []const sdk_plugin.Entry = &.{};
+    for (registry.entries) |e| if (e.media != null) {
+        out = out ++ .{e};
+    };
     break :blk out;
 };
 
-/// Each served table's model type: the first `model_type` its plugin claims (what discovery, the registry and the
-/// app call the pack: `AudioVideo` for LTX, `minimax_music3` for Music 3), else its name. A pack claimed by its
-/// config.json `model_type` reports that type instead (`claimType`).
-pub const types: [names.len][]const u8 = blk: {
-    var out: [names.len][]const u8 = undefined;
-    for (names, &out) |n, *ty| {
-        const c = entryOf(n).plugin.claims;
-        ty.* = if (c.len > 0) c[0] else n;
-    }
+/// Every media plugin's table.
+pub const tables: [entries.len]*const MediaTable = blk: {
+    var out: [entries.len]*const MediaTable = undefined;
+    for (entries, &out) |e, *t| t.* = e.media.?;
     break :blk out;
 };
 
-fn entryOf(comptime n: []const u8) @TypeOf(registry.entries[0]) {
-    @setEvalBranchQuota(100_000);
-    for (registry.entries) |e| if (std.mem.eql(u8, e.plugin.name, n)) return e;
-    @compileError("served media plugin " ++ n ++ " is not registered");
-}
+/// Each table's model type: the first `model_type` its plugin claims (what discovery, the registry and the app call
+/// the pack: `AudioVideo` for LTX, `minimax_music3` for Music 3), else its name. A pack claimed by its config.json
+/// `model_type` reports that type instead (`claimType`).
+pub const types: [entries.len][]const u8 = blk: {
+    var out: [entries.len][]const u8 = undefined;
+    for (entries, &out) |e, *ty| ty.* = if (e.plugin.claims.len > 0) e.plugin.claims[0] else e.plugin.name;
+    break :blk out;
+};
 
 /// The served table for `model_type` (the type `claimType` reports for a pack), or null: a table's own type, else the
 /// first served table that claims the type.
 pub fn byName(model_type: []const u8) ?*const MediaTable {
     if (model_type.len > 0) for (outside.entries()) |e| if (e.media) |t| {
-        if (std.mem.eql(u8, typeOf(t), model_type) or t.claims(.of(model_type), &no_files) == .by_type) return t;
+        if (std.mem.eql(u8, typeOf(t), model_type) or t.claims(.of(model_type), &pack_dir.none) == .by_type) return t;
     };
     for (tables, types) |t, ty| if (std.mem.eql(u8, ty, model_type)) return t;
     if (model_type.len == 0) return null;
-    for (tables) |t| if (t.claims(.of(model_type), &no_files) == .by_type) return t;
+    for (tables) |t| if (t.claims(.of(model_type), &pack_dir.none) == .by_type) return t;
     return null;
 }
-
-/// A pack with no files: `byName` asks each table about a bare type.
-const no_files: common.PackDir = .{ .ctx = null, .exists = NoFiles.exists, .read = NoFiles.read, .safetensors_header = NoFiles.read, .list = NoFiles.read, .file_bytes = NoFiles.bytes };
-const NoFiles = struct {
-    fn exists(_: ?*anyopaque, _: common.Str) callconv(.c) bool {
-        return false;
-    }
-    fn read(_: ?*anyopaque, _: common.Str, _: [*]u8, _: usize, _: *usize) callconv(.c) common.Verdict {
-        return common.Verdict.refuse(.failed, "no files");
-    }
-    fn bytes(_: ?*anyopaque, _: common.Str) callconv(.c) u64 {
-        return 0;
-    }
-};
 
 /// The model type a served table reports for its packs (an outside plugin's: its first declared type).
 pub fn typeOf(t: *const MediaTable) []const u8 {
@@ -86,7 +66,7 @@ pub fn modalityAs(comptime M: type, t: *const MediaTable) M {
 const max_config_bytes = 4 * 1024 * 1024;
 
 /// The served table that wins `dir` under the registry's rank rules (every registered plugin claims, the highest rank
-/// wins), or null: no claim, a tie, or a winner that is not served (it stays on its legacy path).
+/// wins), or null: no claim, a tie, or a model plugin's win.
 pub fn claim(dir: *const common.PackDir) ?*const MediaTable {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -112,12 +92,11 @@ fn claimWith(a: std.mem.Allocator, dir: *const common.PackDir) ?Claimed {
     var claims_buf: [registry.entries.len]common.Claim = undefined;
     const claims = sdk_plugin.claimsOf(&registry.entries, mt, cfg, dir, &claims_buf);
     const i = (common.pick(claims) catch {
-        log.warn("[gen] two plugins claim the pack at one rank ({s}); serving it on the legacy path\n", .{mt});
+        log.warn("[gen] two plugins claim the pack at one rank ({s}); it is not served as media\n", .{mt});
         return null;
     }) orelse return null;
     const t = registry.entries[i].media orelse return null;
-    for (tables) |x| if (x == t) return .{ .t = x, .model_type = if (claims[i] == .by_type) mt else typeOf(x) };
-    return null;
+    return .{ .t = t, .model_type = if (claims[i] == .by_type) mt else typeOf(t) };
 }
 
 /// The model type of the served pack in open folder `d` (owned by `allocator`), or null when no served table wins it.
@@ -148,8 +127,7 @@ pub fn claimIn(io: std.Io, d: std.Io.Dir) ?*const MediaTable {
 const testing = std.testing;
 
 test "served set: each served type resolves to its registered media table, nothing else does" {
-    for (names, tables, types) |n, t, ty| {
-        try testing.expectEqualStrings(n, t.name.slice());
+    for (tables, types) |t, ty| {
         try testing.expectEqual(t, byName(ty).?);
         try testing.expectEqualStrings(ty, typeOf(t));
     }
