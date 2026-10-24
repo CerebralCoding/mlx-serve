@@ -8,7 +8,6 @@ const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 const QuantMode = @import("../../quant/params.zig").QuantMode;
 const gather_qmv = @import("gather_qmv.zig");
-const transformer = @import("../../../engines/mlx/transformer.zig");
 const deviceGeneration = @import("../../../mlx/device.zig").deviceGeneration;
 const testReadF32 = @import("../../testing/parity.zig").testReadF32;
 const attn256RandBf16 = @import("../attention/attn256.zig").attn256RandBf16;

@@ -5,7 +5,6 @@ const std = @import("std");
 const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const QuantMode = @import("../../quant/params.zig").QuantMode;
-const transformer = @import("../../../engines/mlx/transformer.zig");
 const testing = std.testing;
 const lastDim = @import("../../../mlx/array.zig").lastDim;
 const naxAvailable = @import("../../../mlx/device.zig").naxAvailable;

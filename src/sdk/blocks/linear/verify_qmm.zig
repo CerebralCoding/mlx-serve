@@ -6,7 +6,6 @@ const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
-const transformer = @import("../../../engines/mlx/transformer.zig");
 const testing = std.testing;
 const gpuArchitecture = @import("../../../mlx/device.zig").gpuArchitecture;
 const macosProductVersion = @import("../../../mlx/device.zig").macosProductVersion;

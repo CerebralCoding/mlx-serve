@@ -7,7 +7,6 @@ const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 const sdpa = @import("sdpa.zig");
-const transformer = @import("../../../engines/mlx/transformer.zig");
 const naxSdpaPreferred = @import("sdpa.zig").naxSdpaPreferred;
 
 // ── Fused head_dim-256 prefill attention (flash-style Metal kernel) ──

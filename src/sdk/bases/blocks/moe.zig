@@ -16,7 +16,6 @@ const linear = @import("linear.zig");
 const compiled = @import("compiled.zig");
 const QuantParams = @import("../../quant/params.zig").QuantParams;
 const quant_abi = @import("../../../abi/quant.zig");
-const model = @import("../../../engines/mlx/model.zig");
 const routing = @import("../../blocks/moe/routing.zig");
 const router_kernel = @import("../../blocks/moe/router_kernel.zig");
 const moe_decode = @import("../../blocks/moe/decode.zig");

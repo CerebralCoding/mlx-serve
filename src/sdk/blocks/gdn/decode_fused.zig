@@ -9,7 +9,6 @@ const rht = @import("../../quant/hadamard/rht.zig");
 const qmv2 = @import("../qmm/qmv2.zig");
 const gdn_decode = @import("decode.zig");
 const log = @import("../../../host/log.zig");
-const ModelConfig = @import("../../../engines/mlx/model.zig").ModelConfig;
 const testing = std.testing;
 const bf16Scalar = @import("../../../mlx/array.zig").bf16Scalar;
 const scalarOf = @import("../../../mlx/array.zig").scalarOf;
@@ -351,6 +350,8 @@ pub fn gdnNormGateFused(
 }
 
 // ── tests ──
+
+const ModelConfig = @import("../../../engines/mlx/model.zig").ModelConfig;
 
 const model_mod = @import("../../../engines/mlx/model.zig");
 const SpecTree = @import("../../../engines/mlx/forward_ctx.zig").SpecTree;

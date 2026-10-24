@@ -9,7 +9,6 @@ const log = @import("../../../host/log.zig");
 const QuantMode = @import("../../quant/params.zig").QuantMode;
 const moe_fp4 = @import("moe_fp4.zig");
 const fused_activations = @import("../mlp/fused_activations.zig");
-const transformer = @import("../../../engines/mlx/transformer.zig");
 const testing = std.testing;
 const testRandWeightBf16 = @import("../../testing/parity.zig").testRandWeightBf16;
 const testReadF32 = @import("../../testing/parity.zig").testReadF32;

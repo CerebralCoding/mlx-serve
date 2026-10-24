@@ -8,7 +8,6 @@ const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 const QuantMode = @import("../../quant/params.zig").QuantMode;
 const standin = @import("../../diag/standin.zig");
-const transformer = @import("../../../engines/mlx/transformer.zig");
 const testing = std.testing;
 const qwen4Standin = @import("../../diag/standin.zig").qwen4Standin;
 const testRandUniformBf16 = @import("../../testing/parity.zig").testRandUniformBf16;

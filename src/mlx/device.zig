@@ -6,7 +6,6 @@ const env = @import("../env.zig");
 const builtin = @import("builtin");
 const mlx = @import("ffi.zig");
 const ane_offload = @import("../sdk/ane/offload.zig");
-const transformer = @import("../engines/mlx/transformer.zig");
 const testing = std.testing;
 
 // ── NAX m16 verify tile (M5-class matrix units; see the section comment

@@ -9,7 +9,6 @@ const log = @import("../../../host/log.zig");
 const testing = std.testing;
 const bf16Scalar = @import("../../../mlx/array.zig").bf16Scalar;
 const scalarOf = @import("../../../mlx/array.zig").scalarOf;
-const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
 const testReadF32 = @import("../../testing/parity.zig").testReadF32;
 const attn256MaxDiff = @import("../attention/attn256.zig").attn256MaxDiff;
 const gdnParityRand = @import("../gdn/decode_fused.zig").gdnParityRand;
@@ -361,6 +360,8 @@ pub fn fusedGeluErfMul(s: mlx.mlx_stream, gate: mlx.mlx_array, up: mlx.mlx_array
 }
 
 // ── tests ──
+
+const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
 
 const fusedGeluPleProj = @import("../../../plugins/gemma4/gelu_ple.zig").fusedGeluPleProj;
 

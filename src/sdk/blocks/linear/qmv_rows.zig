@@ -6,7 +6,6 @@ const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 const Weights = @import("../../weights/resident.zig").Weights;
-const transformer = @import("../../../engines/mlx/transformer.zig");
 const testing = std.testing;
 const KernelCfgCache = @import("../../../mlx/kernel_cache.zig").KernelCfgCache;
 const firstRowExactMiss = @import("../../quant/ternary.zig").firstRowExactMiss;
