@@ -80,9 +80,9 @@ sdk.blocks.linear.verify_qmm.vqmm_scalar_count
 sdk.blocks.linear.verify_qmm_nax.vqmm_nax_avail_cache
 sdk.blocks.linear.verify_qmm_nax.vqmm_tile_cache
 sdk.blocks.moe.gather_qmv.gqmv_cfg_cache
-sdk.blocks.moe.moe.moeMLP2WithRouter.Once.logged.2
-sdk.blocks.moe.moe.moeMLP2WithRouter.Once.logged.3
-sdk.blocks.moe.moe.moeMLP2WithRouter.Once.logged.4
+engines.mlx.methods.moe.moeMLP2WithRouter.Once.logged.2
+engines.mlx.methods.moe.moeMLP2WithRouter.Once.logged.3
+engines.mlx.methods.moe.moeMLP2WithRouter.Once.logged.4
 sdk.blocks.moe.moe_cuda.env_enabled
 sdk.blocks.moe.moe_prefill_cuda.env_enabled
 sdk.blocks.qmm.lane_qmm.mdims_cache
