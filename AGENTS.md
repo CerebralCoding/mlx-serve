@@ -40,8 +40,9 @@ Two seams: the ENGINE interface (`abi/engine.zig`, host ↔ an engine, per reque
 | `testing/fake_engine.zig`, `tests.zig`, `preview_tests.zig`, `ios_lib.zig` | Test roots, the no-model engine, the iOS entry |
 | `html/index.html` | The console, BUILT from `app-web/` (never hand-edited) |
 
-Build glue: `build.zig` + `build/` (`plugins.zig` scans `src/plugins/*/plugin.zig` into the generated registry and
-refuses a `config.zig` that reaches MLX; `test_runner.zig` shards the tests; `kit/`).
+Build glue: `build.zig` lists the steps; `build/` holds each graph (`macos`, `linux`, `ios`, `standalone`, `lint`), what
+they link (`libs`), the configure-time reads and checks (`config`), `plugins.zig` (scans `src/plugins/*/plugin.zig` into
+the generated registry, refuses a `config.zig` that reaches MLX), `test_runner.zig` (shards the tests) and `kit/`.
 
 CLI flags: `mlx-serve --help` (`printUsage` in `src/main.zig` is the source of truth; `docs/cli.md` for users).
 
