@@ -5,7 +5,6 @@ const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const ModelConfig = @import("../../engines/mlx/model.zig").ModelConfig;
 const testing = std.testing;
-const detectQuantBits = @import("../../engines/mlx/load/weights.zig").detectQuantBits;
 
 // ── Quantization params cache ──
 // A tiny lock-free pointer → (bits, group_size) cache. Quantized weights are loaded
@@ -236,6 +235,17 @@ pub const QuantMode = enum {
         return self == .mxfp4 or self == .nvfp4;
     }
 };
+
+/// Detect quantization bits from weight and scales shapes: bits = w_cols * 32 / (s_cols * group_size)
+pub fn detectQuantBits(w: mlx.mlx_array, sc: mlx.mlx_array, group_size: u32) u32 {
+    const w_shape = mlx.getShape(w);
+    const s_shape = mlx.getShape(sc);
+    if (w_shape.len < 2 or s_shape.len < 2) return 4;
+    const w_cols: u32 = @intCast(w_shape[w_shape.len - 1]);
+    const s_cols: u32 = @intCast(s_shape[s_shape.len - 1]);
+    if (s_cols == 0) return 4;
+    return (w_cols * 32) / (s_cols * group_size);
+}
 
 // ── tests ──
 

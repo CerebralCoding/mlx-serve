@@ -8,7 +8,7 @@ const ops = @import("../../../mlx/ops.zig");
 const kc = @import("../../testing/kernel_contract/root.zig");
 const fa = @import("fused_activations.zig");
 const activations = @import("activations.zig");
-const scalarOf = @import("../../../engines/mlx/load/weights.zig").scalarOf;
+const scalarOf = @import("../../../mlx/array.zig").scalarOf;
 
 const spec = kc.spec;
 const metal = kc.metal;

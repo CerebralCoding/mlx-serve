@@ -4,7 +4,7 @@
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const testing = std.testing;
-const bf16Scalar = @import("../../../engines/mlx/load/weights.zig").bf16Scalar;
+const bf16Scalar = @import("../../../mlx/array.zig").bf16Scalar;
 const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
 
 // ── Mask helpers ──

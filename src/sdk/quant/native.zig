@@ -12,7 +12,7 @@ const sushi_pack = @import("exl3/sushi_pack.zig");
 const modelopt_pack = @import("nvfp4/modelopt_pack.zig");
 const qmatmulBits = @import("../blocks/linear/qmatmul.zig").qmatmulBits;
 const gatherExpertMm = @import("../blocks/moe/experts.zig").gatherExpertMm;
-const transposeBf16Weight = @import("../../engines/mlx/load/weights.zig").transposeBf16Weight;
+const transposeBf16Weight = @import("../../mlx/array.zig").transposeBf16Weight;
 
 const Str = abi.Str;
 const Verdict = abi.Verdict;

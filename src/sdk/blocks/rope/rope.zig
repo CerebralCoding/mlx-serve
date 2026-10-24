@@ -4,7 +4,7 @@
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const model_mod = @import("../../../engines/mlx/model.zig");
-const scalarOf = @import("../../../engines/mlx/load/weights.zig").scalarOf;
+const scalarOf = @import("../../../mlx/array.zig").scalarOf;
 const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
 const MropeCosSin = @import("mrope.zig").MropeCosSin;
 

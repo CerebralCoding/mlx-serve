@@ -84,6 +84,78 @@ pub fn concatRows(parts: []const mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_arra
     return out;
 }
 
+/// A 0-d scalar in `dt` (a bare f32 scalar array promotes bf16 operands).
+pub fn scalarOf(val: f32, dt: mlx.mlx_dtype, s: mlx.mlx_stream) !mlx.mlx_array {
+    const raw = mlx.mlx_array_new_float(val);
+    defer _ = mlx.mlx_array_free(raw);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&out, raw, dt, s));
+    return out;
+}
+
+pub fn bf16Scalar(val: f32, s: mlx.mlx_stream) mlx.mlx_array {
+    const f32_arr = mlx.mlx_array_new_float(val);
+    defer _ = mlx.mlx_array_free(f32_arr);
+    var bf16_arr = mlx.mlx_array_new();
+    _ = mlx.mlx_astype(&bf16_arr, f32_arr, .bfloat16, s);
+    return bf16_arr;
+}
+
+/// Last-axis size of an array, as the input-dimension hint for
+/// `quantParamsHinted`. Null for null-ctx handles or degenerate shapes.
+pub inline fn lastDim(x: mlx.mlx_array) ?u32 {
+    if (x.ctx == null) return null;
+    const shape = mlx.getShape(x);
+    if (shape.len == 0) return null;
+    const d = shape[shape.len - 1];
+    return if (d > 0) @as(u32, @intCast(d)) else null;
+}
+
+pub fn transposeBf16Weight(w: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    // Swap the last two axes for any rank: 2D weights [out, in] → [in, out];
+    // stacked MoE expert tensors [experts, out, in] → [experts, in, out].
+    const ndim = mlx.getShape(w).len;
+    var perm: [8]c_int = undefined; // mlx arrays never exceed 8 dims here
+    for (0..ndim) |i| perm[i] = @intCast(i);
+    perm[ndim - 2] = @intCast(ndim - 1);
+    perm[ndim - 1] = @intCast(ndim - 2);
+    var w_t = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_transpose_axes(&w_t, w, &perm, @intCast(ndim), s));
+    return w_t;
+}
+
+pub fn splitPackedGateUp(arr: mlx.mlx_array, s: mlx.mlx_stream) !struct { gate: mlx.mlx_array, up: mlx.mlx_array } {
+    const shape = mlx.getShape(arr);
+    if (shape.len != 3) return error.BadPackedGateUpShape;
+    const two_m = shape[1];
+    const m = @divExact(two_m, 2);
+    const strides = [_]c_int{ 1, 1, 1 };
+
+    var gate_view = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(gate_view);
+    const g_start = [_]c_int{ 0, 0, 0 };
+    const g_stop = [_]c_int{ shape[0], m, shape[2] };
+    try mlx.check(mlx.mlx_slice(&gate_view, arr, &g_start, 3, &g_stop, 3, &strides, 3, s));
+
+    var up_view = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(up_view);
+    const u_start = [_]c_int{ 0, m, 0 };
+    const u_stop = [_]c_int{ shape[0], two_m, shape[2] };
+    try mlx.check(mlx.mlx_slice(&up_view, arr, &u_start, 3, &u_stop, 3, &strides, 3, s));
+
+    // gather_qmm reads the expert weight buffers as ROW-CONTIGUOUS — a lazy
+    // slice view has parent strides and silently produces zeros. Materialize
+    // both halves (one-time cost at load).
+    var gate = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(gate);
+    try mlx.check(mlx.mlx_contiguous(&gate, gate_view, false, s));
+    var up = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(up);
+    try mlx.check(mlx.mlx_contiguous(&up, up_view, false, s));
+
+    return .{ .gate = gate, .up = up };
+}
+
 // ── tests ──
 
 /// `arr[:, :, start..stop]` as a lazy view.
