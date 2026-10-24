@@ -8,6 +8,8 @@ const model_mod = @import("../../../engines/mlx/model.zig");
 const model_discovery = @import("../../../host/registry/discovery.zig");
 
 const Weights = @import("../../weights/resident.zig").Weights;
+const indexShardSet = @import("../../weights/resident.zig").indexShardSet;
+const freeShardSet = @import("../../weights/resident.zig").freeShardSet;
 const ModelConfig = model_mod.ModelConfig;
 
 /// Also serves NVIDIA's ModelOpt GLM pack, which ships the same source layout.
@@ -57,8 +59,8 @@ fn pastTrunk(key: []const u8, trunk_layers: u32) bool {
 pub fn residentBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig) !u64 {
     var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true });
     defer dir.close(io);
-    var referenced = model_discovery.indexShardSet(io, dir);
-    defer if (referenced) |*r| model_discovery.freeShardSet(r);
+    var referenced = indexShardSet(io, dir);
+    defer if (referenced) |*r| freeShardSet(r);
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     var owners = model_mod.indexOwners(io, arena.allocator(), dir);

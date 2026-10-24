@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const mlx_gguf = @import("../../quant/gguf/claim.zig");
+const mlx_gguf = @import("../../quant/gguf/root.zig");
 const gather_qmm_nax = @import("gather_qmm_nax.zig");
 const QuantMode = @import("../../quant/params.zig").QuantMode;
 const testing = std.testing;

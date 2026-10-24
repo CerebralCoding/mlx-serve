@@ -4,6 +4,7 @@
 const std = @import("std");
 const abi = @import("../../abi/quant.zig");
 const mlx = @import("../../mlx/ffi.zig");
+const log = @import("../../host/log.zig");
 const model = @import("../../engines/mlx/model.zig");
 
 pub const Resident = struct {
@@ -124,6 +125,51 @@ pub const Weights = struct {
         return @intCast(self.map.count());
     }
 };
+
+/// The set of shard basenames in `model.safetensors.index.json`'s `weight_map`,
+/// or null when there is no usable index (single-file packs, media packs).
+pub fn indexShardSet(io: std.Io, dir: std.Io.Dir) ?std.StringHashMapUnmanaged(void) {
+    const a = std.heap.page_allocator;
+    const raw = dir.readFileAlloc(io, "model.safetensors.index.json", a, .limited(64 * 1024 * 1024)) catch return null;
+    defer a.free(raw);
+    var parsed = std.json.parseFromSlice(std.json.Value, a, raw, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const wm = parsed.value.object.get("weight_map") orelse return null;
+    if (wm != .object) return null;
+    var set: std.StringHashMapUnmanaged(void) = .empty;
+    for (wm.object.values()) |v| {
+        if (v != .string) continue;
+        if (set.contains(v.string)) continue;
+        const key = a.dupe(u8, v.string) catch continue;
+        set.put(a, key, {}) catch {
+            a.free(key);
+            continue;
+        };
+    }
+    // An index none of whose shards exist is stale (the repo was re-sharded
+    // after this index was written); the directory is then the set.
+    var any_present = false;
+    var keys = set.keyIterator();
+    while (keys.next()) |k| {
+        _ = dir.statFile(io, k.*, .{}) catch continue;
+        any_present = true;
+        break;
+    }
+    if (!any_present) {
+        log.warn("model.safetensors.index.json names no shard in this directory; loading every *.safetensors instead\n", .{});
+        freeShardSet(&set);
+        return null;
+    }
+    return set;
+}
+
+/// Free a set from `indexShardSet`.
+pub fn freeShardSet(set: *std.StringHashMapUnmanaged(void)) void {
+    var keys = set.keyIterator();
+    while (keys.next()) |k| std.heap.page_allocator.free(k.*);
+    set.deinit(std.heap.page_allocator);
+}
 
 // ── tests ──
 

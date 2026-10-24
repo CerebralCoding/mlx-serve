@@ -5,7 +5,7 @@
 const mlx = @import("../../../mlx/ffi.zig");
 const ops = @import("../../../mlx/ops.zig");
 const block = @import("../block.zig");
-const mlx_gguf = @import("../../quant/gguf/claim.zig");
+const mlx_gguf = @import("../../quant/gguf/root.zig");
 const rht = @import("../../quant/hadamard/rht.zig");
 const Linear = @import("linear.zig").Linear;
 
