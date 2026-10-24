@@ -40,7 +40,7 @@ pub const Served = struct {
             errdefer p.weights.deinit();
             model.resolveWeightPrefix(&p.cfg, &p.weights);
             try model.narrowHadamardPackTables(&p.cfg, &p.weights, s);
-            p.xfm = try Transformer.init(io, a, p.cfg, &p.weights);
+            p.xfm = try Transformer.init(io, a, p.cfg);
         }
         return p;
     }

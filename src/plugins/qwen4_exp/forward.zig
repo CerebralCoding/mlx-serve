@@ -20,7 +20,7 @@ const evalCadencePoint = @import("../../engines/mlx/eval_cadence.zig").evalCaden
 const ladderStepMulti = @import("../../engines/mlx/eval_cadence.zig").ladderStepMulti;
 const prefillEvalCadenceApplies = @import("../../engines/mlx/eval_cadence.zig").prefillEvalCadenceApplies;
 const prefillEvalCadenceFor = @import("../../engines/mlx/eval_cadence.zig").prefillEvalCadenceFor;
-const MoeLayerWeights = @import("../../engines/mlx/forward/layered.zig").MoeLayerWeights;
+const MoeLayerWeights = @import("../../engines/mlx/layer_weights.zig").MoeLayerWeights;
 const CaptureLayers = @import("../../engines/mlx/forward_ctx.zig").CaptureLayers;
 const ForwardCtx = @import("../../engines/mlx/forward_ctx.zig").ForwardCtx;
 const KVCache = @import("../../engines/mlx/kv/cache.zig").KVCache;
@@ -1886,7 +1886,7 @@ const Qwen4LadderRig = struct {
         const x = self.fx.xfm();
         const st = x.qwen4.?;
         const emb_dim: c_int = @intCast(st.table.dim * st.hash.n_heads);
-        x.config = .{ .model_type = "qwen4_exp", .hidden_size = HIDDEN, .hc_count = HC, .num_hidden_layers = LAYERS, .vocab_size = VOCAB };
+        x.config = .{ .model_type = "qwen4_exp", .legacy = .{ .caps = .{ .long_ctx = true } }, .hidden_size = HIDDEN, .hc_count = HC, .num_hidden_layers = LAYERS, .vocab_size = VOCAB };
         var prng = std.Random.DefaultPrng.init(59);
         const r = prng.random();
         x.emb_w = try self.weight(r, &.{ VOCAB, HIDDEN });

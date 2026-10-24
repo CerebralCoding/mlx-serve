@@ -4,8 +4,7 @@
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../sdk/util/log.zig");
-const qsa_row_mask = @import("../qsa_mask.zig");
-const qsa_decode = @import("../qsa_decode.zig");
+const qsa_row_mask = @import("../../../sdk/blocks/attention/sparse_block/row_mask.zig");
 const history = @import("history.zig");
 const mtp = @import("../mtp.zig");
 const prof_mod = @import("../prof.zig");
@@ -24,24 +23,31 @@ const qsaBatchedGatherEnabled = @import("gather.zig").qsaBatchedGatherEnabled;
 const QSA_RING_ROWS = @import("history.zig").QSA_RING_ROWS;
 const capBufAppend = @import("history.zig").capBufAppend;
 const seedCapBuf = @import("history.zig").seedCapBuf;
-const headPlaceScores = @import("mask.zig").headPlaceScores;
-const qsaMaskFromBlockSel = @import("mask.zig").qsaMaskFromBlockSel;
-const qsaMaskFromBlocks = @import("mask.zig").qsaMaskFromBlocks;
+const headPlaceScores = @import("head_place.zig").headPlaceScores;
+const qsaMaskFromBlockSel = @import("../../../sdk/blocks/attention/sparse_block/mask.zig").qsaMaskFromBlockSel;
+const qsaMaskFromBlocks = @import("../../../sdk/blocks/attention/sparse_block/mask.zig").qsaMaskFromBlocks;
 const qsaAllBlocksVisible = @import("pooled.zig").qsaAllBlocksVisible;
 const qsaIdxRopeFusedEnabled = @import("pooled.zig").qsaIdxRopeFusedEnabled;
 const qsaPoolNormRopeFused = @import("pooled.zig").qsaPoolNormRopeFused;
 const qsaPooledTableEq = @import("pooled.zig").qsaPooledTableEq;
 const qsaDumpQsaBlocks = @import("score.zig").qsaDumpQsaBlocks;
-const qsaPooledRowContiguous = @import("score.zig").qsaPooledRowContiguous;
-const qsaScoreFusedEligibleFrom = @import("score.zig").qsaScoreFusedEligibleFrom;
-const qsaScoreRowsPerChunkFused = @import("score.zig").qsaScoreRowsPerChunkFused;
-const qsaScoreSheet = @import("score.zig").qsaScoreSheet;
-const qsaSelectComposedOps = @import("score.zig").qsaSelectComposedOps;
-const qsaSortWithInvisible = @import("score.zig").qsaSortWithInvisible;
-const qsaTopBlocksOps = @import("score.zig").qsaTopBlocksOps;
-const qsaSelectKernelEnabled = @import("select.zig").qsaSelectKernelEnabled;
-const qsaSelectTopBlocks = @import("select.zig").qsaSelectTopBlocks;
-const qsaVisibleBoundsHost = @import("select.zig").qsaVisibleBoundsHost;
+const qsaPooledRowContiguous = @import("../../../sdk/blocks/attention/sparse_block/score.zig").qsaPooledRowContiguous;
+const qsaScoreFusedEligibleFrom = @import("../../../sdk/blocks/attention/sparse_block/score.zig").qsaScoreFusedEligibleFrom;
+const qsaScoreRowsPerChunkFused = @import("../../../sdk/blocks/attention/sparse_block/score.zig").qsaScoreRowsPerChunkFused;
+const qsaScoreSheet = @import("../../../sdk/blocks/attention/sparse_block/score.zig").qsaScoreSheet;
+const qsaSelectComposedOps = @import("../../../sdk/blocks/attention/sparse_block/select.zig").qsaSelectComposedOps;
+const qsaSortWithInvisible = @import("../../../sdk/blocks/attention/sparse_block/select.zig").qsaSortWithInvisible;
+const qsaTopBlocksOps = @import("../../../sdk/blocks/attention/sparse_block/select.zig").qsaTopBlocksOps;
+const qsaSelectKernelEnabled = @import("../../../sdk/blocks/attention/sparse_block/select.zig").qsaSelectKernelEnabled;
+const qsaSelectTopBlocks = @import("../../../sdk/blocks/attention/sparse_block/select.zig").qsaSelectTopBlocks;
+const Blocks = @import("../../../sdk/blocks/attention/sparse_block/params.zig").Blocks;
+const sb_select = @import("../../../sdk/blocks/attention/sparse_block/select.zig");
+const qsaSelectCfgBuilds = sb_select.qsaSelectCfgBuilds;
+const tieBias = sb_select.tieBias;
+const qsaVisSheetForTest = sb_select.qsaVisSheetForTest;
+const qsaArraysAllEqual = @import("../../../sdk/testing/parity.zig").qsaArraysAllEqual;
+const attn256MaxDiff = @import("../../../sdk/blocks/attention/attn256.zig").attn256MaxDiff;
+const testing = std.testing;
 const qsaWantsBlocks = @import("sparse_attn.zig").qsaWantsBlocks;
 
 pub fn qsaInstallRing(_: *Trunk, entry: *SSMCacheEntry, src: mlx.mlx_array, s: mlx.mlx_stream) !void {
@@ -642,7 +648,7 @@ pub fn qsaSelectMaskOps(
         if (batch == 1) {
             const bounds_host = try alloc.alloc(i32, @intCast(seq_len));
             defer alloc.free(bounds_host);
-            qsaVisibleBoundsHost(bounds_host, offset, seq_len, nb, ratio, vis3.ctx == null);
+            (Blocks{ .size = @intCast(ratio), .top_k = @intCast(block_topk) }).selectBounds(bounds_host, offset, nb, vis3.ctx == null);
             const bounds = mlx.mlx_array_new_data(bounds_host.ptr, &[_]c_int{seq_len}, 1, .int32);
             defer _ = mlx.mlx_array_free(bounds);
             if (qsaSelectTopBlocks(s, scores, bounds, block_topk) catch null) |picks| {
@@ -709,13 +715,13 @@ pub fn qsaBlockVisibility(self: *Trunk, offset: c_int, seq_len: c_int, nb: c_int
 
 /// One row-chunk of the block selection: the top-`kb` visible blocks per row, ascending,
 /// INT_MAX past the row's count. Under `all_vis` the visibility sheet and both `where`s are
-/// identities and are skipped; the fused arm reads the same claim through `qsaVisibleBoundsHost`.
+/// identities and are skipped; the fused arm reads the same claim through `Blocks.selectBounds`.
 pub fn qsaChunkSelect(self: *Trunk, scores: mlx.mlx_array, canonical: mlx.mlx_array, row0: c_int, rows: c_int, nb: c_int, ratio: c_int, kb: c_int, block_topk: c_int, all_vis: bool) !mlx.mlx_array {
     if (canonical.ctx == null and qsaSelectKernelEnabled() and mlx.streamIsGpu(self.s)) {
         // The whole composed tail in one dispatch; bounds are host arithmetic.
         const bounds_host = try self.allocator.alloc(i32, @intCast(rows));
         defer self.allocator.free(bounds_host);
-        qsaVisibleBoundsHost(bounds_host, row0, rows, nb, ratio, all_vis);
+        (Blocks{ .size = @intCast(ratio), .top_k = @intCast(block_topk) }).selectBounds(bounds_host, row0, nb, all_vis);
         const bounds = mlx.mlx_array_new_data(bounds_host.ptr, &[_]c_int{rows}, 1, .int32);
         defer _ = mlx.mlx_array_free(bounds);
         if (try qsaSelectTopBlocks(self.s, scores, bounds, kb)) |fused| return fused;
@@ -772,7 +778,6 @@ pub fn qsaSelectBlocks(self: *Trunk, q_rope: mlx.mlx_array, k32t: mlx.mlx_array,
         var q_chunk = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(q_chunk);
         try mlx.check(mlx.mlx_slice(&q_chunk, q_rope, &[_]c_int{ 0, 0, r0, 0 }, 4, &[_]c_int{ 1, n_idx, r1, idx_hd }, 4, &strides4, 4, self.s));
-        mtp.qsa_index_score_graphs += 1;
         const scores = try qsaScoreSheet(self.s, q_chunk, pooled, k32t, fused);
         defer _ = mlx.mlx_array_free(scores);
         const sorted = try self.qsaChunkSelect(scores, canonical, offset + r0, rows, nb, ratio, kb, block_topk, qsaAllBlocksVisible(offset + r0, nb, ratio));
@@ -785,4 +790,216 @@ pub fn qsaSelectBlocks(self: *Trunk, q_rope: mlx.mlx_array, k32t: mlx.mlx_array,
     var merged = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_concatenate_axis(&merged, vec, 1, self.s));
     return merged;
+}
+
+// ── The QSA all-visible identity skip at the engagement boundary ──
+
+/// Random f32 score sheet (the reference's own dtype).
+fn qsaRandScoresF32(rnd: std.Random, shape: []const c_int) !mlx.mlx_array {
+    var n: usize = 1;
+    for (shape) |d| n *= @intCast(d);
+    const data = try std.testing.allocator.alloc(f32, n);
+    defer std.testing.allocator.free(data);
+    // relu output: many exact zeros.
+    for (data) |*x| {
+        const v = rnd.float(f32) - 0.35;
+        x.* = if (v > 0) v else 0.0;
+    }
+    return mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
+}
+
+test "qsa mask: the all-visible skip must not hand a NULL sheet to an mlx op (kv just past the budget)" {
+    // `mlx_logical_and(&blk_sel, picked, vis3)` in the nb > block_topk arm passed the null
+    // all-visible sheet straight to mlx-c and killed the process. At decode width all-visible
+    // is always true, so every generated token past kv = (block_topk + 1) * ratio crashed.
+    // Bar: where the predicate claims all-visible, the real sheet is all-true and the null-sheet
+    // arm produces the same mask.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ratio: c_int = 4;
+    const batch: c_int = 1;
+    var prng = std.Random.DefaultPrng.init(0x2068_B0DE);
+    const rnd = prng.random();
+
+    var checked_skip: usize = 0;
+    // 2049..2051 sit just below the selection boundary; 2052 is the first kv that can crash.
+    for ([_]c_int{ 2049, 2052, 2068, 2100, 4100 }) |kv| {
+        // `nb` is the complete-block count, floor(kv/ratio).
+        const nb = @divTrunc(kv, ratio);
+        for ([_]c_int{ 1, 31, 1024 }) |seq_len| {
+            if (seq_len > kv) continue;
+            const offset = kv - seq_len;
+            var topk_buf: [11]c_int = undefined;
+            topk_buf[0] = nb;
+            topk_buf[1] = nb + 4;
+            for (1..9) |d| topk_buf[1 + d] = nb - @as(c_int, @intCast(d));
+            topk_buf[10] = 512;
+
+            for (topk_buf) |block_topk| {
+                if (block_topk <= 0) continue;
+                const scores = try qsaRandScoresF32(rnd, &[_]c_int{ batch, seq_len, nb });
+                defer _ = mlx.mlx_array_free(scores);
+                const tie = try tieBias(s, nb);
+                defer _ = mlx.mlx_array_free(tie);
+                const sheet = try qsaVisSheetForTest(s, offset, seq_len, nb, ratio);
+                defer _ = mlx.mlx_array_free(sheet);
+
+                const ref = try qsaSelectMaskOps(std.testing.allocator, s, scores, sheet, tie, offset, seq_len, kv, nb, ratio, block_topk, batch);
+                defer _ = mlx.mlx_array_free(ref);
+                try mlx.check(mlx.mlx_array_eval(ref));
+
+                if (!qsaAllBlocksVisible(offset, nb, ratio)) continue;
+                var ones = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(ones);
+                try mlx.check(mlx.mlx_ones(&ones, &[_]c_int{ 1, seq_len, nb }, 3, .bool_, s));
+                try std.testing.expect(try qsaArraysAllEqual(sheet, ones, s));
+                const null_vis = mlx.mlx_array{ .ctx = null };
+                const got = try qsaSelectMaskOps(std.testing.allocator, s, scores, null_vis, tie, offset, seq_len, kv, nb, ratio, block_topk, batch);
+                defer _ = mlx.mlx_array_free(got);
+                try std.testing.expect(try qsaArraysAllEqual(got, ref, s));
+                checked_skip += 1;
+            }
+        }
+    }
+    std.debug.print("[qsa-boundary] all-visible skip exercised in {d} cases\n", .{checked_skip});
+    try std.testing.expect(checked_skip >= 8);
+}
+
+test "qsa selection: the mask arm and the gather path use ONE tie rule" {
+    // Two selection paths with two different tie rules would let two slots with identical
+    // scores attend different blocks. The signal: the mask arm now dispatches the select kernel.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ta = std.testing.allocator;
+    const ratio: c_int = 4;
+    const batch: c_int = 1;
+    // All-visible at width S needs S <= (kv % ratio) + 1, so kv must not be a multiple of ratio.
+    const seq_len: c_int = 4;
+    const kv: c_int = 4099;
+    const nb = @divTrunc(kv, ratio);
+    // 511 so this test owns a config key no other test builds.
+    const block_topk: c_int = 511;
+    var prng = std.Random.DefaultPrng.init(0x71E5_10FF);
+    const rnd = prng.random();
+
+    const scores = try qsaRandScoresF32(rnd, &[_]c_int{ batch, seq_len, nb });
+    defer _ = mlx.mlx_array_free(scores);
+    const tie = try tieBias(s, nb);
+    defer _ = mlx.mlx_array_free(tie);
+    const offset = kv - seq_len;
+    try std.testing.expect(qsaAllBlocksVisible(offset, nb, ratio));
+    const null_vis = mlx.mlx_array{ .ctx = null };
+
+    const before = qsaSelectCfgBuilds();
+    const got = try qsaSelectMaskOps(ta, s, scores, null_vis, tie, offset, seq_len, kv, nb, ratio, block_topk, batch);
+    defer _ = mlx.mlx_array_free(got);
+    try mlx.check(mlx.mlx_array_eval(got));
+    // A build, not a hit: this key is unique to this test, so the counter moving IS the dispatch.
+    try std.testing.expect(qsaSelectCfgBuilds() > before);
+
+    try std.testing.expectEqual(@as(usize, 4), @as(usize, @intCast(mlx.mlx_array_ndim(got))));
+    const gsh = mlx.getShape(got);
+    try std.testing.expectEqual(batch, gsh[0]);
+    try std.testing.expectEqual(seq_len, gsh[2]);
+    try std.testing.expectEqual(kv, gsh[3]);
+
+    // With the kernel off both arms fall to the chain: still one rule.
+    sb_select.qsa_select_kernel_override = false;
+    defer sb_select.qsa_select_kernel_override = null;
+    const chain = try qsaSelectMaskOps(ta, s, scores, null_vis, tie, offset, seq_len, kv, nb, ratio, block_topk, batch);
+    defer _ = mlx.mlx_array_free(chain);
+    try mlx.check(mlx.mlx_array_eval(chain));
+    try std.testing.expectEqual(kv, mlx.getShape(chain)[3]);
+}
+
+test "qsa boundary: past (block_topk+1)*ratio EVERY decode step reaches the all-visible skip" {
+    // At decode width offset = kv-1 and nb = floor(kv/ratio), so the all-visible claim holds at
+    // every kv and the skip is gated by `nb > block_topk` alone.
+    const ratio: c_int = 4;
+    const block_topk: c_int = 512; // budget 2048 / ratio
+    const first: c_int = (block_topk + 1) * ratio; // 2052
+    var kv: c_int = 1;
+    while (kv <= 6000) : (kv += 1) {
+        const nb = @divTrunc(kv, ratio);
+        try std.testing.expect(qsaAllBlocksVisible(kv - 1, nb, ratio));
+        try std.testing.expectEqual(kv >= first, nb > block_topk);
+    }
+    var kv2: c_int = 1;
+    while (kv2 < first) : (kv2 += 1) {
+        try std.testing.expect(!(@divTrunc(kv2, ratio) > block_topk));
+    }
+    // A prefill chunk's first row can sit far below the last complete block.
+    try std.testing.expect(!qsaAllBlocksVisible(1028, @divTrunc(@as(c_int, 2052), ratio), ratio));
+}
+
+test "qsa visibility: decode width is ALWAYS all-visible; a prefill chunk's FIRST row decides" {
+    const ratio: c_int = 4;
+    // Decode (S == 1): all-visible for every ragged tail.
+    var kv: c_int = 2049;
+    while (kv <= 2400) : (kv += 1) {
+        const nb = @divTrunc(kv, ratio);
+        try testing.expect(qsaAllBlocksVisible(kv - 1, nb, ratio));
+    }
+    try testing.expect(qsaAllBlocksVisible(2051, 513, ratio));
+    try testing.expect(!qsaAllBlocksVisible(2050, 513, ratio));
+    try testing.expect(!qsaAllBlocksVisible(0, 513, ratio));
+    try testing.expect(qsaAllBlocksVisible(0, 0, ratio));
+}
+
+test "qsa visibility skip: bit-identical selection where it is an identity, and a REAL difference where it is not" {
+    // Where every block is visible the two arms must agree bit for bit; where they are not,
+    // the arms must differ (else a blanket "always skip" would pass).
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+
+    var t: Trunk = undefined;
+
+    t.s = s;
+    t.allocator = testing.allocator;
+    t.config = .{};
+    t.qsa_consts = .{};
+    defer t.qsa_consts.deinit();
+
+    const ratio: c_int = 4;
+    const nb: c_int = 24;
+    const block_topk: c_int = 8;
+    const rows: c_int = 6;
+    var prng = std.Random.DefaultPrng.init(0x5EED_9E11);
+    const rnd = prng.random();
+    var sc_buf: [@as(usize, @intCast(rows)) * @as(usize, @intCast(nb))]f32 = undefined;
+    for (&sc_buf) |*v| v.* = if (rnd.boolean()) 0.0 else rnd.float(f32) * 4.0;
+    const sc_shape = [_]c_int{ 1, rows, nb };
+    const scores = mlx.mlx_array_new_data(&sc_buf, &sc_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(scores);
+    const none = mlx.mlx_array{ .ctx = null };
+
+    const row0_all: c_int = nb * ratio - 1;
+    try testing.expect(qsaAllBlocksVisible(row0_all, nb, ratio));
+    const a = try t.qsaChunkSelect(scores, none, row0_all, rows, nb, ratio, block_topk, block_topk, true);
+    defer _ = mlx.mlx_array_free(a);
+    const b = try t.qsaChunkSelect(scores, none, row0_all, rows, nb, ratio, block_topk, block_topk, false);
+    defer _ = mlx.mlx_array_free(b);
+    try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(a, b, s));
+
+    // One row earlier is not all-visible: the two arms must disagree.
+    const row0_partial: c_int = 4;
+    try testing.expect(!qsaAllBlocksVisible(row0_partial, nb, ratio));
+    const c = try t.qsaChunkSelect(scores, none, row0_partial, rows, nb, ratio, block_topk, block_topk, true);
+    defer _ = mlx.mlx_array_free(c);
+    const d = try t.qsaChunkSelect(scores, none, row0_partial, rows, nb, ratio, block_topk, block_topk, false);
+    defer _ = mlx.mlx_array_free(d);
+    try testing.expect(try attn256MaxDiff(c, d, s) > 0.0);
+
+    // The `nb <= block_topk` arm takes the same skip.
+    var ar = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ar);
+    try mlx.check(mlx.mlx_arange(&ar, 0, @floatFromInt(nb), 1.0, .int32, s));
+    var canonical = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(canonical);
+    try mlx.check(mlx.mlx_reshape(&canonical, ar, &[_]c_int{ 1, 1, nb }, 3, s));
+    const e = try t.qsaChunkSelect(scores, canonical, row0_all, rows, nb, ratio, nb, nb, true);
+    defer _ = mlx.mlx_array_free(e);
+    const f = try t.qsaChunkSelect(scores, canonical, row0_all, rows, nb, ratio, nb, nb, false);
+    defer _ = mlx.mlx_array_free(f);
+    try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(e, f, s));
 }

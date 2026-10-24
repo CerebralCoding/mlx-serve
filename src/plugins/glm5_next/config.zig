@@ -584,6 +584,7 @@ fn glmFacts(c: *const Config, p: *abi.Parsed) void {
         .batch_pads_kv = false,
         .moe = c.num_experts > 0,
         .dflash_capture = true,
+        .dflash_policy = true,
         .images = c.advertises_images,
         .video = c.advertises_video,
     };
@@ -593,7 +594,8 @@ fn glmFacts(c: *const Config, p: *abi.Parsed) void {
     // A pool's completing indexer row stores the pool's key in its gate half; v2: the KDA q/k norm epsilon.
     p.cache.layout_namespace = abi.Str.of("glm5-pooled-keys-v2");
     p.cache.ssm_state = .{ .entries = c.num_hidden_layers, .dtype = .f32 };
-    p.spec = .{ .mtp_default_depth = 3, .mtp_layout = .in_checkpoint, .head_reads_final_norm = true };
+    // Its head drafts one slot at a time: MTP rounds never group.
+    p.spec = .{ .mtp_default_depth = 3, .mtp_layout = .in_checkpoint, .head_reads_final_norm = true, .policy = .{ .mtp_group_solo = true } };
     p.placeholder_ids.image = c.image_token_id;
     p.weights.prefix = abi.Str.of(c.weight_prefix);
     if (c.modelopt) p.weights.quant_layout = abi.Str.of("modelopt") else if (c.expert_quant_json.len > 0) p.weights.quant_layout = abi.Str.of("exl3");

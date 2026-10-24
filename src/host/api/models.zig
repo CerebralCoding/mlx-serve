@@ -47,12 +47,11 @@ const jsonEscape = @import("format.zig").jsonEscape;
 /// `architecture`: a NATIVE deepseek_v4 safetensors dir and a DeepSeek GGUF
 /// on the embedded ds4 engine report the SAME model_type. "gguf" = an
 /// unloaded GGUF stub whose engine (llama vs ds4) is only known once the
-/// header is read at load time. A loaded model's `config` names the MLX path's own engines: the
-/// mlx-stream DeepSeek-V4.1 repack and a Sushi pack's EXL3 experts.
+/// header is read at load time. A loaded model's `config` names the MLX path's own engine: a Sushi
+/// pack's EXL3 experts.
 fn modelEngineName(engine: ?EngineKind, mlx_gguf_served: bool, config: ?*const model_mod.ModelConfig, path: []const u8, arch_hint: []const u8) []const u8 {
     if (engine) |k| return @tagName(k);
     if (config) |c| {
-        if (c.dsv41_stream) return "mlx-stream";
         if (c.exl3 != null) return "sushi";
     }
     if (mlx_gguf_served) return "mlx-gguf";
@@ -1159,8 +1158,6 @@ test "modelEngineName: native dsv4 reports mlx, embedded engines report themselv
     // reads "gguf" as llama.cpp.
     try testing.expectEqualStrings("mlx-gguf", modelEngineName(null, true, null, "/m/qwen.gguf", ""));
     // The MLX path's own engines, from a loaded model's config.
-    var stream: model_mod.ModelConfig = .{ .dsv41_stream = true };
-    try testing.expectEqualStrings("mlx-stream", modelEngineName(null, false, &stream, "/m/DeepSeek-V4.1-Flash-MLX", "deepseek_v41"));
     var sushi: model_mod.ModelConfig = .{};
     sushi.exl3 = @as(@typeInfo(@TypeOf(sushi.exl3)).optional.child, undefined);
     try testing.expectEqualStrings("sushi", modelEngineName(null, false, &sushi, "/m/GLM-5.3-Flash-Sushi", "glm5_next"));

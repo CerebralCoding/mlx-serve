@@ -9,7 +9,6 @@ const testing = std.testing;
 const scalarOf = @import("../../../mlx/array.zig").scalarOf;
 const constTableAs = @import("../../../mlx/dtype.zig").constTableAs;
 const jsonF64 = @import("../../testing/parity.zig").jsonF64;
-const computeLlama3Freqs = @import("rope.zig").computeLlama3Freqs;
 
 /// HF `_compute_yarn_parameters` → the per-dim RoPE DENOMINATOR array (`freqs`)
 /// that mlx_fast_rope consumes: mlx computes angle = position / freqs[i], so we

@@ -14,7 +14,7 @@ const Trunk = @import("trunk.zig").Trunk;
 const loadHcWeights = @import("load.zig").loadHcWeights;
 const loadQwen4Mtp = @import("mtp.zig").loadQwen4Mtp;
 const qsaNaxArm = @import("qsa/gather.zig").qsaNaxArm;
-const qsaScoreFusedArm = @import("qsa/score.zig").qsaScoreFusedArm;
+const qsaScoreFusedArm = @import("../../sdk/blocks/attention/sparse_block/score.zig").qsaScoreFusedArm;
 const checkQsaCompressRatio = @import("qsa/history.zig").checkQsaCompressRatio;
 const ssmFreeQsaState = @import("qsa/history.zig").ssmFreeQsaState;
 const initMoeLayers = @import("../../engines/mlx/load/layers_layered.zig").initMoeLayers;
@@ -23,7 +23,7 @@ const quantizeHeadMxfp8 = @import("../../sdk/quant/mxfp8.zig").quantizeHeadMxfp8
 const computeYarnFreqs = @import("../../sdk/blocks/rope/yarn.zig").computeYarnFreqs;
 const yarnSpec = @import("../../engines/mlx/methods/yarn.zig").yarnSpec;
 const mtp_nax_profile = @import("../../engines/mlx/spec/mtp_nax_profile.zig");
-const MoeLayerWeights = @import("../../engines/mlx/forward/layered.zig").MoeLayerWeights;
+const MoeLayerWeights = @import("../../engines/mlx/layer_weights.zig").MoeLayerWeights;
 const ternaryKernelCandidate = @import("../../sdk/quant/ternary.zig").ternaryKernelCandidate;
 const firstNonTernaryBias = @import("../../sdk/quant/ternary.zig").firstNonTernaryBias;
 

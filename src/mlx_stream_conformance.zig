@@ -75,11 +75,6 @@ test "mlx-stream conformance: every arch the glue dispatches declines what is no
         .{ .config = @embedFile("sdk/weights/streamed/fixtures/mimo_v2_flash_q4_config.json"), .want = null },
     });
     try std.testing.expect(glm.spec == .draft_lane and glm.caps.owns_decode_state);
-    // The archs share the process's one reader: a load of one refuses another's claim by name.
-    const v41 = comptime sdk.Arch.of(@import("plugins/deepseek_v41/stream/plugin.zig"));
-    try v41.claim_process.?();
-    try std.testing.expectError(error.ExpertReaderInUse, glm.claim_process.?());
-    v41.release_process.?();
 }
 
 // Declared last so it runs after every other conformance test (the CPU lane's bar).

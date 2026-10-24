@@ -1,6 +1,6 @@
-//! The Qwen family's parity harness: one tiny random pack on disk, loaded twice (the legacy `Transformer` and a
-//! plugin's table over a second load of the same tensors), each forward step run on both sides with caches of their
-//! own, logits and every recurrent state bit-equal. Shared by the qwen3 and qwen3_5 proofs.
+//! The Qwen family's parity harness: one tiny random pack on disk under a plugin's table, each forward step's logits
+//! bit-equal to the legacy `Transformer`'s, recorded to a tape (`tape.zig`) beside a second load of the same tensors
+//! with every recurrent state compared too. Shared by the qwen3 and qwen3_5 proofs.
 
 const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
@@ -14,31 +14,40 @@ const KVCache = @import("../../engines/mlx/kv/cache.zig").KVCache;
 const ForwardCtx = @import("../../engines/mlx/forward_ctx.zig").ForwardCtx;
 const SSMCacheEntry = @import("../../engines/mlx/ssm/entry.zig").SSMCacheEntry;
 const Resident = @import("../../sdk/weights/resident.zig").Resident;
+const tape_mod = @import("../../engines/mlx/plugin/tape.zig");
 
 const testing = std.testing;
 const Array = mlx.mlx_array;
 
 pub const Step = struct { mode: abi.Mode, ids: []const i32 };
 
-/// A pack loaded through the legacy path and through plugin `P`'s table.
+/// A pack loaded through plugin `P`'s table, and through the legacy path while its tape records.
 pub fn Twin(comptime P: type) type {
     return struct {
-        lg: *fixture.Legacy,
+        lg: ?*fixture.Legacy,
+        tmp: testing.TmpDir,
+        tape: tape_mod.Tape,
         res: Resident,
         parsed: abi.Parsed = .{},
         m: *anyopaque,
 
-        /// Writes `p` with `config_json` (and `files` beside it), loads both sides.
-        pub fn open(p: *fixture.Pack, config_json: []const u8, files: []const sdk.fixture.File) !*@This() {
+        /// Writes `p` with `config_json` (and `files` beside it) and loads it; `recorded` is the tape at `rel` (a path
+        /// under the repo root), recorded beside the legacy load while it is empty (`tape.records`).
+        pub fn open(p: *fixture.Pack, config_json: []const u8, files: []const sdk.fixture.File, comptime rel: []const u8, recorded: []const u8) !*@This() {
             const a = testing.allocator;
             const io = std.Io.Threaded.global_single_threaded.io();
             const t = try a.create(@This());
             errdefer a.destroy(t);
-            t.lg = try p.load(config_json);
-            errdefer t.lg.deinit();
+            t.* = .{ .lg = null, .tmp = testing.tmpDir(.{}), .tape = undefined, .res = undefined, .m = undefined };
+            errdefer t.tmp.cleanup();
+            t.tape = if (tape_mod.records(recorded)) try tape_mod.Tape.recorder(tape_mod.recordRoot().?, rel) else try tape_mod.Tape.player(recorded);
+            if (t.tape.recording()) t.lg = try p.load(config_json);
+            errdefer if (t.lg) |lg| lg.deinit();
+            const dir_h = if (t.lg) |lg| lg.tmp.dir else t.tmp.dir;
             var buf: [512]u8 = undefined;
-            const dir = buf[0..try t.lg.tmp.dir.realPath(io, &buf)];
-            for (files) |f| try t.lg.tmp.dir.writeFile(io, .{ .sub_path = f.name, .data = f.bytes });
+            const dir = buf[0..try dir_h.realPath(io, &buf)];
+            if (t.lg == null) try p.save(dir);
+            for (files) |f| try dir_h.writeFile(io, .{ .sub_path = f.name, .data = f.bytes });
             var cfg = try model.parseConfigFromJson(a, config_json);
             defer cfg.deinit(a);
             t.res = Resident.adopt(try model.loadModelWeights(io, a, dir, &cfg, false));
@@ -56,7 +65,7 @@ pub fn Twin(comptime P: type) type {
             errdefer P.table.free_parsed(&t.parsed);
             const src = t.res.source();
             var why: abi.Verdict = .{};
-            t.m = P.table.load(&.{ .model_dir = .of(dir), .dir = &pd, .parsed = &t.parsed, .stream = .{ .ctx = t.lg.xfm.s.ctx }, .weights = &src }, &why) orelse {
+            t.m = P.table.load(&.{ .model_dir = .of(dir), .dir = &pd, .parsed = &t.parsed, .stream = .{ .ctx = fixture.stream().ctx }, .weights = &src }, &why) orelse {
                 std.debug.print("load: {s}\n", .{why.why.slice()});
                 return error.PluginLoad;
             };
@@ -64,25 +73,40 @@ pub fn Twin(comptime P: type) type {
         }
 
         pub fn close(t: *@This()) void {
+            t.tape.finish() catch |e| std.debug.panic("proof tape: {t}", .{e});
             P.table.unload(t.m);
             P.table.free_parsed(&t.parsed);
             t.res.deinit();
-            t.lg.deinit();
+            if (t.lg) |lg| lg.deinit();
+            t.tmp.cleanup();
             testing.allocator.destroy(t);
         }
 
-        /// One request on both sides.
-        pub fn lane(t: *@This()) !*Lane {
-            return Lane.init(t.lg);
+        /// A playback read every recorded value (a proof's last call).
+        pub fn expectDone(t: *const @This()) !void {
+            try t.tape.expectDone();
         }
 
-        /// One step on `l`: the legacy forward and the table's, logits and states bit-equal.
+        /// One request (on both sides while recording).
+        pub fn lane(t: *@This()) !*Lane {
+            return Lane.init(t.parsed.shell.num_hidden_layers, t.lg);
+        }
+
+        /// `got` (the table's) bit-equal to `want` (the legacy forward's, recorded) or to the tape.
+        fn check(t: *@This(), got: Array, want: ?Array) !void {
+            if (want) |w| {
+                try ops.expectBitEqual(got, w);
+                try t.tape.put(w);
+            } else try t.tape.expectNext(got, false);
+        }
+
+        /// One step on `l`: the table's logits (and states, while recording) bit-equal to the legacy forward's.
         pub fn step(t: *@This(), l: *Lane, st: Step) !void {
-            var g = ops.Graph.init(testing.allocator, t.lg.xfm.s);
+            var g = ops.Graph.init(testing.allocator, fixture.stream());
             defer g.deinit();
             const ids = try fixture.tokens(&g, st.ids);
             l.ctx.capture_ssm_seq = st.mode == .verify;
-            const want = try fixture.rows2(&g, try g.adopt(try t.lg.xfm.forwardWith(&l.ctx, ids)));
+            const want: ?Array = if (t.lg) |lg| try fixture.rows2(&g, try g.adopt(try lg.xfm.forwardWith(&l.ctx, ids))) else null;
             const host = try testing.allocator.alloc(u32, st.ids.len);
             defer testing.allocator.free(host);
             for (st.ids, host) |x, *y| y.* = @intCast(x);
@@ -95,16 +119,15 @@ pub fn Twin(comptime P: type) type {
                 std.debug.print("forward: {s}\n", .{v.why.slice()});
                 return error.PluginForward;
             }
-            const got = try g.adopt(.{ .ctx = out.logits.ctx });
-            try ops.expectBitEqual(got, want);
-            try l.expectStates();
+            try t.check(try g.adopt(.{ .ctx = out.logits.ctx }), want);
+            if (t.lg != null) try l.expectStates();
         }
 
         /// Two lanes stepped together (`rows` tokens each): the legacy GDN batched driver (or the dense batched tick
         /// at one row) against the table's batched rows.
         pub fn batched(t: *@This(), lanes: [2]*Lane, tick: [2][]const i32, gdn: bool) !void {
             const a = testing.allocator;
-            var g = ops.Graph.init(a, t.lg.xfm.s);
+            var g = ops.Graph.init(a, fixture.stream());
             defer g.deinit();
             const rows = tick[0].len;
             const ctxs = [_]*ForwardCtx{ &lanes[0].ctx, &lanes[1].ctx };
@@ -114,10 +137,10 @@ pub fn Twin(comptime P: type) type {
             @memcpy(flat[0..rows], tick[0]);
             @memcpy(flat[rows .. 2 * rows], tick[1]);
             for (flat[0 .. 2 * rows], host[0 .. 2 * rows]) |x, *y| y.* = @intCast(x);
-            var want: Array = undefined;
-            if (rows == 1) {
+            var want: ?Array = null;
+            if (t.lg) |lg| if (rows == 1) {
                 const next = [_]u32{ host[0], host[1] };
-                const legacy = if (gdn) try t.lg.xfm.forwardMoeBatchedDecode(&next, &ctxs, &positions, null) else try t.lg.xfm.forwardBatchedDecode(&next, &ctxs, &positions);
+                const legacy = if (gdn) try lg.xfm.forwardMoeBatchedDecode(&next, &ctxs, &positions, null) else try lg.xfm.forwardBatchedDecode(&next, &ctxs, &positions);
                 defer a.free(legacy);
                 for (legacy) |x| _ = try g.adopt(x);
                 want = try g.concat(&.{ try fixture.rows2(&g, legacy[0]), try fixture.rows2(&g, legacy[1]) }, 0);
@@ -125,11 +148,11 @@ pub fn Twin(comptime P: type) type {
                 const ids = try g.fromSlice(i32, flat[0 .. 2 * rows], &.{ 2, @intCast(rows) });
                 var hl = mlx.mlx_array_new();
                 var ha = mlx.mlx_array_new();
-                const logits = try t.lg.xfm.forwardMoeBatchedVerify(ids, &ctxs, &positions, &hl, &ha);
+                const logits = try lg.xfm.forwardMoeBatchedVerify(ids, &ctxs, &positions, &hl, &ha);
                 _ = try g.adopt(hl);
                 _ = try g.adopt(ha);
                 want = try fixture.rows2(&g, try g.reshape(try g.adopt(logits), &.{ 1, 2 * @as(c_int, @intCast(rows)), -1 }));
-            }
+            };
             const handles = [_]abi.Handle{ lanes[0].slot.handle(), lanes[1].slot.handle() };
             const slots = [_]u32{ 0, 1 };
             var out: abi.ForwardOut = .{};
@@ -138,17 +161,17 @@ pub fn Twin(comptime P: type) type {
                 std.debug.print("batched forward: {s}\n", .{v.why.slice()});
                 return error.PluginForward;
             }
-            try ops.expectBitEqual(try g.adopt(.{ .ctx = out.logits.ctx }), want);
+            try t.check(try g.adopt(.{ .ctx = out.logits.ctx }), want);
             for (lanes) |l| {
                 l.offset += rows;
                 l.pos += @intCast(rows);
-                try l.expectStates();
+                if (t.lg != null) try l.expectStates();
             }
         }
     };
 }
 
-/// A request on both sides: the legacy forward's own cache and recurrent entries, and the plugin's.
+/// A request: the plugin's cache and recurrent entries, and the legacy forward's own while recording.
 pub const Lane = struct {
     legacy_kv: KVCache,
     legacy_ssm: []SSMCacheEntry,
@@ -161,11 +184,10 @@ pub const Lane = struct {
     plugin_ssm: []SSMCacheEntry,
     slot: cache_ops.Slot = undefined,
 
-    fn init(lg: *fixture.Legacy) !*Lane {
-        const n = lg.config.num_hidden_layers;
+    fn init(n: u32, lg: ?*fixture.Legacy) !*Lane {
         const l = try testing.allocator.create(Lane);
         l.* = .{ .legacy_kv = try KVCache.init(testing.allocator, n), .legacy_ssm = try fixture.newEntries(n), .plugin_kv = try KVCache.init(testing.allocator, n), .plugin_ssm = try fixture.newEntries(n) };
-        l.ctx = lg.xfm.defaultCtx();
+        if (lg) |x| l.ctx = x.xfm.defaultCtx();
         l.ctx.cache = &l.legacy_kv;
         l.ctx.moe_seq_offset = &l.offset;
         l.ctx.ssm_entries = l.legacy_ssm;

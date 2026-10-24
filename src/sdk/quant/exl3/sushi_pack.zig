@@ -8,6 +8,8 @@ const log = @import("../../util/log.zig");
 const Weights = @import("../../weights/resident.zig").Weights;
 const indexShardSet = @import("../../weights/resident.zig").indexShardSet;
 const freeShardSet = @import("../../weights/resident.zig").freeShardSet;
+const Owners = @import("../../weights/load.zig").Owners;
+const indexOwners = @import("../../weights/load.zig").indexOwners;
 
 fn rename(weights: *Weights, from: []const u8, to: []const u8) !void {
     const kv = weights.map.fetchRemove(from) orelse return;
@@ -430,7 +432,100 @@ fn gemv(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, s: mlx.mlx_stream
     return out;
 }
 
+/// A tensor of a shard's header as the resident bill reads it.
+pub const Stored = struct {
+    key: []const u8,
+    bytes: u64,
+    dtype: []const u8,
+    shape: []const std.json.Value,
+
+    pub fn elements(t: Stored) u64 {
+        var n: u64 = 1;
+        for (t.shape) |d| n *= @intCast(d.integer);
+        return n;
+    }
+};
+
+/// What a load holds of the Sushi pack at `model_dir` once its family's adapter has run: every tensor of the shards
+/// the index names, in the shard the index gives it, as `family.bill(tensor)` prices it.
+pub fn residentBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, family: anytype) !u64 {
+    var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true });
+    defer dir.close(io);
+    var referenced = indexShardSet(io, dir);
+    defer if (referenced) |*r| freeShardSet(r);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var owners = indexOwners(io, arena.allocator(), dir);
+    var total: u64 = 0;
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file and entry.kind != .sym_link) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
+        if (referenced) |r| if (!r.contains(entry.name)) continue;
+        var file = try dir.openFile(io, entry.name, .{});
+        defer file.close(io);
+        var rbuf: [8192]u8 = undefined;
+        var rs = file.reader(io, &rbuf);
+        const len = try rs.interface.takeInt(u64, .little);
+        if (len > 64 * 1024 * 1024) return error.InvalidSafetensorsHeader;
+        const raw = try rs.interface.readAlloc(allocator, @intCast(len));
+        defer allocator.free(raw);
+        total += try headerResidentBytes(allocator, raw, entry.name, if (owners) |*o| o else null, family);
+    }
+    return total;
+}
+
+/// One shard header's share of `residentBytes`.
+pub fn headerResidentBytes(allocator: std.mem.Allocator, raw: []const u8, shard: []const u8, owners: ?*const Owners, family: anytype) !u64 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    var total: u64 = 0;
+    var it = parsed.value.object.iterator();
+    while (it.next()) |e| {
+        if (std.mem.eql(u8, e.key_ptr.*, "__metadata__") or e.value_ptr.* != .object) continue;
+        const key = e.key_ptr.*;
+        if (owners) |o| if (o.get(key)) |owner| if (!std.mem.eql(u8, owner, shard)) continue;
+        const offs = e.value_ptr.object.get("data_offsets") orelse return error.InvalidSafetensorsHeader;
+        if (offs != .array or offs.array.items.len != 2) return error.InvalidSafetensorsHeader;
+        const shape = e.value_ptr.object.get("shape") orelse return error.InvalidSafetensorsHeader;
+        if (shape != .array) return error.InvalidSafetensorsHeader;
+        const dtype = if (e.value_ptr.object.get("dtype")) |d| (if (d == .string) d.string else "") else "";
+        total += try family.bill(.{
+            .key = key,
+            .bytes = @intCast(offs.array.items[1].integer - offs.array.items[0].integer),
+            .dtype = dtype,
+            .shape = shape.array.items,
+        });
+    }
+    return total;
+}
+
+/// `<prefix>.layers.N.<rest>` with N at or past the trunk's depth (an MTP layer the trunk never reads).
+pub fn pastTrunk(key: []const u8, trunk_layers: u32) bool {
+    const at = std.mem.indexOf(u8, key, ".layers.") orelse return false;
+    const digits = key[at + ".layers.".len ..];
+    const end = std.mem.indexOfScalar(u8, digits, '.') orelse return false;
+    const n = std.fmt.parseInt(u32, digits[0..end], 10) catch return false;
+    return n >= trunk_layers;
+}
+
 const testing = std.testing;
+
+test "sushi pack: a tensor another shard owns is not billed" {
+    const header =
+        \\{"model.embed_tokens.weight":{"dtype":"BF16","shape":[1,1],"data_offsets":[0,700]},
+        \\"lm_head.weight":{"dtype":"U32","shape":[1,1],"data_offsets":[700,800]}}
+    ;
+    const AsStored = struct {
+        fn bill(_: @This(), t: Stored) !u64 {
+            return t.bytes;
+        }
+    };
+    var owners: Owners = .empty;
+    defer owners.deinit(testing.allocator);
+    try owners.put(testing.allocator, "model.embed_tokens.weight", "affine.safetensors");
+    try testing.expectEqual(@as(u64, 100), try headerResidentBytes(testing.allocator, header, "source.safetensors", &owners, AsStored{}));
+}
 
 fn putNew(weights: *Weights, name: []const u8, arr: mlx.mlx_array) !void {
     try weights.map.put(try weights.allocator.dupe(u8, name), arr);

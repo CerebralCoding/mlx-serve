@@ -1,8 +1,8 @@
-//! The streaming packs on mlx-stream (module `mlx_stream`, rooted at `src/mlx_stream.zig`): DeepSeek-V4.1's EXL3 repack (`ModelConfig.dsv41_stream`),
+//! The streaming packs on mlx-stream (module `mlx_stream`, rooted at `src/mlx_stream.zig`):
 //! GLM-5.3's pack (`ModelConfig.glm_stream`) and GLM-5.3-Flash's NVFP4 pack (`ModelConfig.glm5_stream`).
 //! The plugin owns each arch, its kernels and the expert streamer, and loads its own weights; the host parses the
 //! config, renders the template, samples and schedules. The plugin exports one glue surface per arch (`arch`,
-//! `default_context`, `generation_headroom`): the root's for DeepSeek-V4.1, `glm`'s for GLM-5.3, `glm5_next`'s for GLM-5.3-Flash.
+//! `default_context`, `generation_headroom`): `glm`'s for GLM-5.3, `glm5_next`'s for GLM-5.3-Flash.
 //! An entry point an arch does not declare (prefix restore, decode handover, request end) is left out at comptime.
 //! GLM-5.3 alone takes the model's model-settings.json entry, and generates past its billed context as far as its
 //! arch's `maxOutput`.
@@ -26,20 +26,17 @@ pub fn setForeignBytes(n: u64) void {
 }
 
 /// The plugin's arches this host serves.
-const Kind = enum { dsv41, glm, glm5 };
+const Kind = enum { glm, glm5 };
 
 fn Side(comptime k: Kind) type {
     return switch (k) {
-        .dsv41 => plugin,
         .glm => plugin.glm,
         .glm5 => plugin.glm5_next,
     };
 }
 
 fn kindOf(config: *const ModelConfig) Kind {
-    if (config.glm_stream) return .glm;
-    if (config.glm5_stream) return .glm5;
-    return .dsv41;
+    return if (config.glm_stream) .glm else .glm5;
 }
 
 fn Bound(comptime k: Kind) type {
@@ -50,7 +47,7 @@ fn Bound(comptime k: Kind) type {
 pub const Model = struct {
     gpa: std.mem.Allocator,
     /// The arch's config and module (it keeps references into `weights`).
-    arch: union(Kind) { dsv41: Bound(.dsv41), glm: Bound(.glm), glm5: Bound(.glm5) },
+    arch: union(Kind) { glm: Bound(.glm), glm5: Bound(.glm5) },
     /// The trunk the module binds.
     weights: sdk.Weights,
     /// The request `begin` started: its prompt pass's shape, then its decode handover.
@@ -435,12 +432,12 @@ test "mlx_stream: a model that sets no context takes the largest rung whose load
     };
     try testing.expectEqual(@as(?u64, 65536), largestFitting(1, &auto_context_rungs, Broken{}));
     // The recorded auto context is what `contextLength` reads for a model without ctx_size.
-    var config: ModelConfig = .{ .model_type = "deepseek_v41", .pack_dir = "/packs/dsv41-repack", .dsv41_stream = true, .ctx_override = 0 };
-    try testing.expectEqual(@as(u32, @intCast(plugin.default_context + plugin.generation_headroom)), contextLength(&config));
-    glueState().auto_context.note("/packs/dsv41-repack", 131072);
-    try testing.expectEqual(@as(u32, 131072 + @as(u32, @intCast(plugin.generation_headroom))), contextLength(&config));
+    var config: ModelConfig = .{ .model_type = "glm5_next", .pack_dir = "/packs/glm5-stream", .glm5_stream = true, .ctx_override = 0 };
+    try testing.expectEqual(@as(u32, @intCast(plugin.glm5_next.default_context)), contextLength(&config));
+    glueState().auto_context.note("/packs/glm5-stream", 131072);
+    try testing.expectEqual(@as(u32, 131072), contextLength(&config));
     config.ctx_override = 40000;
-    try testing.expectEqual(@as(u32, 40000 + @as(u32, @intCast(plugin.generation_headroom))), contextLength(&config));
+    try testing.expectEqual(@as(u32, 40000), contextLength(&config));
 }
 
 test "mlx_stream: a GLM-5.3 request spans the billed context and the arch's maxOutput (131,072 by default)" {

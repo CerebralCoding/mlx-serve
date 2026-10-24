@@ -473,10 +473,9 @@ fn mtpRoundsStaySolo(slot: *const Slot) bool {
     const t = slot.model.transformer orelse return true;
     // A stateless trunk (MiMo) has no grouped verify: its MTP rounds run alone.
     if (!t.hasRecurrentLayers()) return true;
-    // GLM-5-Next likewise: its head drafts one slot at a time.
-    if (t.config.isGlm5()) return true;
-    // qwen4_exp verify rows are expert bytes: a batched verify measured no better than solo rounds.
-    return t.qwen4Trunk() != null;
+    // A model whose grouped verify measured no better than solo rounds says so.
+    const b = t.config.plugin orelse return false;
+    return b.parsed.spec.policy.mtp_group_solo;
 }
 
 pub fn mtpCrowdThresholdFor(slot: *const Slot) usize {

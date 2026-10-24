@@ -2,26 +2,27 @@
 
 DeepSeek-V4.1-Flash (`model_type: deepseek_v41`, 1M context, MLX packs) with its vision tower, as a native,
 module-owned arch. One conversation resumes (`resumePrompt`, keyed on its image rows too). Packs:
-`ddalcu/DeepSeek-V4.1-Flash-1017-iQ-MLX-3.0bpw`, `mlx-community/DeepSeek-V4.1-Flash-1017-oQ2.5e-mtp`. Streamed EXL3
-packs (`experts.bin`) are refused by name: lib/mlx-stream serves them until P4 merges the two implementations.
+`ddalcu/DeepSeek-V4.1-Flash-1017-iQ-MLX-3.0bpw`, `mlx-community/DeepSeek-V4.1-Flash-1017-oQ2.5e-mtp`, and
+OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank, streamed).
 
 ## Files
 - `plugin.zig`: the table; `CacheHooks.resume_prompt` / `state_bytes` (a cold or failed resume resets and returns
-  0). Served: `deepseek_v41` is in `engines/mlx/plugin/served.zig` (MLX packs; an `experts.bin` pack is refused at
-  parse, so the legacy path hands it to lib/mlx-stream).
+  0); a streamed pack's bank (`openBank`) and its prompt calls (`runPrompt`).
 - `config.zig`: claims + V4.1 fields on top of `../deepseek_v4/config.zig`; `bill.zig`: compressed caches per
-  token, attended keys, `dsv41_mod.prefillBytes`.
+  token, attended keys, `dsv41_mod.prefillBytes`; a streamed bank's budget (`streamBudget`).
 - `media.zig`: decode, the release's processor (`vision.preprocess`), tower, placeholder run.
-- `deepseek_v41.zig` (model), `engram.zig`, `vision.zig`. The legacy seam is deleted: an MLX pack the plugin declines
-  is refused by name (`load/init.zig`); a streamed pack loads through `initMlxStream` until P4.
+- `deepseek_v41.zig` (model), `engram.zig`, `vision.zig`. The legacy seam is deleted: a pack the plugin declines is
+  refused by name (`load/init.zig`).
+- `streamed_test.zig`: the trunk over an MXFP4 `experts.bin` bit-equal to the in-memory banks; a served EXL3 pack
+  equal to the trunk over the same bank at fewer slot rows (phase change, misses through the transient bank).
 - `fixtures/`: proof tapes recorded from the legacy forward (`fixtures/MANIFEST.md`).
 - `contract.zig`: kernel contract registrations of `kernels/*.metal`.
 
 ## Facts the table declares
 - `owns_decode_state`, `prefix_cache = false` (the module resumes its own state), serial + single-flight
   (`batching: false`, `max_concurrent: 1`), no spec rollback (DSpark rewinds inside the module), DSpark stages from the config (`native_stages`);
-  `spec.trunk_weight` lends the loaded embedding and head; `cluster_plan` (a Thunderbolt pair re-reads the
-  driver's plan, `distributed.planFor`, idempotent: untested without two Macs).
+  `spec.trunk_weight` lends the loaded embedding and head; a Thunderbolt pair's load re-reads the engine's plan
+  (`distributed.planFor`, idempotent: untested without two Macs).
 - Thinking default ON; effort vocabulary `dsv41`; DSML tools on OUR byte-pinned template.
 - Metal only: a CPU host stream loads on this thread's GPU stream; no GPU = refused by name.
 
@@ -43,6 +44,19 @@ packs (`experts.bin`) are refused by name: lib/mlx-stream serves them until P4 m
 - Serial is not exclusive: module-owned state needs admission single-flight.
 - The V4.1 template, like V4's, is byte-pinned (`tests/dsv41_template_ab.py`).
 
+## Streamed packs (`experts.bin`)
+- The routed experts come from `sdk/weights/streamed.zig` `Exl3` (`exl3_source.zig`: the EXL3 lane, event-gated
+  waves, the next layer's reads predicted, the wide prompt feed, the decode forms / banked waves / hoist / device
+  route); the trunk's own MoE never runs for them (`moe`'s `source` arm; the DSpark stages stay resident).
+- The prompt runs in calls of up to `bill.stream_call_rows`, each one MoE call a layer over all its rows
+  (`wideLayer`), its routes predicted before the attention (`readAhead`) so the reads overlap it.
+- Slot rows per phase (`Routed.phase`): a call wider than `region_rows` is a prompt, else decode; the phase change
+  grows the rows into what the prompt's working set held.
+- The bank bills its rows at the load (`streamBudget`: the GPU working set less `stream_margin_bytes`, the memory
+  in use, the phase's working set at the context); the context is `ctx_size`, else the largest
+  `stream_context_rungs` rung keeping `stream_min_rows`. The engine's prefill guard leaves the pack to it
+  (`streamed_weights`); a prompt past the billed context is refused by name.
+
 ## Known issues
 - Serial + single-flight; prefix cache off (module-owned rings).
 - Serial decode near the memory wall: 720 GB/s of ~1.1 TB/s, so kernel work buys 15-25%, not 2x.
@@ -63,6 +77,6 @@ packs (`experts.bin`) are refused by name: lib/mlx-stream serves them until P4 m
 
 DeepSeek-V4/V4.1 Flash, 1M ctx. Serial, spec off but DSpark, single-flight; DSML tools, OUR byte-pinned templates. V4:
 prefix cache OFF, 0731+, our layout. V4.1: MLX packs, DSpark ON, resumes one conversation (keyed on the image rows
-too); EXL3 repack on mlx-stream (`stream/`). V4.1 images: every span position carries `image_token_id` (without the
+too); the EXL3 repack's experts streamed from its bank. V4.1 images: every span position carries `image_token_id` (without the
 request's rows that id is TEXT, as in the reference), the module splices the rows itself, image rows route by
 `gate.bias_vl` and get no Engram write (`Hash.DEAD`)

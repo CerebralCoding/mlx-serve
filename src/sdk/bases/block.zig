@@ -72,6 +72,8 @@ pub const Ctx = struct {
     shared: *const Shared,
     /// An additive key mask `[B, 1, 1, T]` (a padded encoder batch); null = none.
     mask: Array = .{},
+    /// An additive mask `[1, 1, T, T]` summed into a whole prompt's scores (`Forward.mask_add`); null = none.
+    mask_add: Array = .{},
     /// A prompt chunk's M-RoPE `cos`/`sin` rows, roped by in place of `positions`; null = 1-D positions (which
     /// carry the slot's M-RoPE delta).
     mrope: ?[2]Array = null,

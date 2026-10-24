@@ -93,3 +93,44 @@ test "kev plugin: a decision on the tiny pack is deterministic JSON echoing the 
 }
 
 const MediaPack = @import("../../sdk/testing/media_pack.zig").MediaPack(@This());
+
+// Bar: every branch's final-norm hidden rows bit-equal to the legacy trunk's, recorded in `fixtures/trunk.tape`.
+test "kev plugin: the served qwen3_5 trunk scores branches bit-equal to the engine's own trunk" {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const mlx = @import("../../mlx/ffi.zig");
+    const tape_mod = @import("../../engines/mlx/plugin/tape.zig");
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const fx = try conformanceFixture(arena.allocator());
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for (fx.files) |f| try tmp.dir.writeFile(io, .{ .sub_path = f.name, .data = f.bytes });
+    var pbuf: [512]u8 = undefined;
+    const dir = pbuf[0..try tmp.dir.realPath(io, &pbuf)];
+
+    const state = [_]u32{ 256, 116, 104, 101, 32, 111, 114, 100, 101, 114, 10, 83, 58, 32, 120 };
+    const branches = [_][]const u32{ &.{ 257, 81, 58, 32, 65 }, &.{ 257, 81, 58, 32, 66, 67, 258 }, &.{ 260, 10 } };
+    const Collect = struct {
+        out: [branches.len]mlx.mlx_array = @splat(.{ .ctx = null }),
+        fn run(self: *@This(), i: usize, h: mlx.mlx_array) !void {
+            self.out[i] = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&self.out[i], h));
+        }
+    };
+    const s = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(s);
+    const eng = try kev.Engine.load(io, a, dir, s);
+    defer eng.deinit();
+    var got: Collect = .{};
+    try kev.scoreBranches(a, &eng.xfm, eng.config.num_hidden_layers, &state, &branches, &got, Collect.run);
+    defer for (got.out) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+
+    var tape = try tape_mod.Tape.player(@embedFile("fixtures/trunk.tape"));
+    defer tape.finish() catch |e| std.debug.panic("proof tape: {t}", .{e});
+    for (got.out) |x| try tape.expectNext(x, false);
+    try tape.expectDone();
+}

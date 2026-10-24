@@ -25,6 +25,7 @@ pub fn toModelConfig(a: std.mem.Allocator, c: *const Config, dir: ?[]const u8) !
         @field(m, name) = convert(@TypeOf(@field(m, name)), @field(c, name));
     }
     m.model_type = "qwen4_exp";
+    m.legacy.caps.long_ctx = true;
     m.weight_prefix = "language_model.model";
     m.norm_has_offset = false;
     m.has_final_norm = false; // the hyper-connection mixer replaces model.norm

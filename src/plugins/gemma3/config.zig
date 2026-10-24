@@ -348,7 +348,7 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
     var c: Config = .{};
     const v = readGemma3(&d, &c);
     if (!v.isOk()) return v;
-    const fin = finish(dir, d.root, c, stub, .{ .batches_decode = batches_decode }, out);
+    const fin = finish(dir, d.root, c, stub, .{ .batches_decode = batches_decode, .prefill_mask = true }, out);
     if (!fin.isOk()) return fin;
     readMedia(d.root, out) catch {
         freeParsed(out);

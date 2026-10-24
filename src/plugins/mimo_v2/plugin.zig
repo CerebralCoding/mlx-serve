@@ -16,6 +16,7 @@ const EitherMlp = @import("../lfm2/plugin.zig").EitherMlp;
 const SinkAttention = @import("sink_attention.zig").SinkAttention;
 const mtp_head = @import("mtp_head.zig");
 const streamed = @import("../../sdk/weights/streamed.zig");
+const sushi_pack = @import("../../sdk/quant/exl3/sushi_pack.zig");
 pub const config = @import("config.zig");
 
 pub const plugin = config.plugin;
@@ -48,7 +49,7 @@ pub const table = abi.ModelTable{
     .forward = &forward,
     .cache = &.{ .layout = &config.layout },
     .spec = &.{ .trunk_weight = b.trunk_weight.trunkWeightHook(Loaded), .head = head_hooks },
-    .weights = &.{},
+    .weights = &.{ .resident_bytes = &residentBytes },
 };
 
 const head_hooks = reader.headHooks(Loaded, mtp_head.Heads, struct {
@@ -66,6 +67,38 @@ const head_hooks = reader.headHooks(Loaded, mtp_head.Heads, struct {
 fn bill(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
     out.* = .{};
 }
+
+/// A Sushi pack is held as its adapter leaves it (`SushiBill`); a streaming pack as its residents plus the stream's
+/// rows (`slotRows`); every other pack as stored.
+fn residentBytes(p: *const abi.Parsed, model_dir: abi.Str, settings_json: abi.Str, shards: u64, out: *u64) callconv(.c) Verdict {
+    const c = config.of(p);
+    out.* = shards;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    if (c.streamed) {
+        const bank = streamed.Streamed.bankBytes(gpa, io, model_dir.slice(), slotRows(c, settings_json.slice())) catch |e| return Verdict.named(.failed, @errorName(e));
+        out.* = shards +| bank;
+        return .ok;
+    }
+    if (c.expert_block_json.len == 0) return .ok;
+    out.* = sushi_pack.residentBytes(io, std.heap.page_allocator, model_dir.slice(), SushiBill{ .layers = c.num_hidden_layers }) catch |e|
+        return Verdict.named(.failed, @errorName(e));
+    return .ok;
+}
+
+/// A Sushi MiMo tensor as the load holds it: the towers and anything past the trunk not at all, a QKV part's tile
+/// scales one row per code row, the dense MLP's dropped once it is decoded (bf16, twice its e4m3 codes).
+pub const SushiBill = struct {
+    layers: u32,
+
+    pub fn bill(f: SushiBill, t: sushi_pack.Stored) !u64 {
+        for ([_][]const u8{ "visual.", "audio_encoder.", "speech_embeddings." }) |u| if (std.mem.startsWith(u8, t.key, u)) return 0;
+        if (sushi_pack.pastTrunk(t.key, f.layers)) return 0;
+        if (std.mem.endsWith(u8, t.key, ".weight_scale_inv"))
+            return if (std.mem.indexOf(u8, t.key, ".self_attn.qkv_proj.") != null) t.bytes * sushi_pack.FP8_BLOCK else 0;
+        if (std.mem.eql(u8, t.dtype, "F8_E4M3") and std.mem.indexOf(u8, t.key, ".mlp.") != null) return 2 * t.bytes;
+        return t.bytes;
+    }
+};
 
 pub const Loaded = struct {
     base: bases.Model(Model),
@@ -110,10 +143,9 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
     m.* = .{ .base = .{ .weights = undefined, .shared = bases.Shared.init(c.rms_norm_eps, c.rms_norm_eps), .a = gpa, .s = r.s } };
     errdefer m.release();
     if (c.streamed) {
-        // The slot rows per routed layer: the model's `stream_experts` (the host stamps a quarter when it sets none).
         const rows = try gpa.alloc(u32, c.num_hidden_layers - c.first_k_dense);
         defer gpa.free(rows);
-        @memset(rows, if (streamed.Setting.parse(ctx.settings_json.slice())) |st| st.slotRows(c.experts) else c.experts);
+        @memset(rows, slotRows(c, ctx.settings_json.slice()));
         m.experts = try streamed.Streamed.open(gpa, std.Io.Threaded.global_single_threaded.io(), ctx.model_dir.slice(), r.s, .{ .rows = rows });
     }
     m.layers = try gpa.alloc(Model.Layer, c.num_hidden_layers);
@@ -245,6 +277,11 @@ fn mlpOf(m: *Loaded, r: *reader.Reader, xr: ?*reader.Reader, c: *const config.Co
     if (m.route_fn.ctx == null) m.route_fn = moe.compileRouting(&w, r.s);
     w.route_fn = m.route_fn;
     return .{ .second = w };
+}
+
+/// A streaming pack's slot rows per routed layer: the model's `stream_experts`, else every expert.
+fn slotRows(c: *const config.Config, settings_json: []const u8) u32 {
+    return if (streamed.Setting.parse(settings_json)) |st| st.slotRows(c.experts) else c.experts;
 }
 
 fn unload(mp: *anyopaque) callconv(.c) void {

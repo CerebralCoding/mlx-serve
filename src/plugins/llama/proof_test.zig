@@ -1,5 +1,6 @@
-//! The llama plugin against the legacy dense forward on tiny random Qwen2 (q/k/v biases, tied head) and Mistral
-//! packs: steps, greedy decode and batched rows bit-equal, and the engine's config of both parses equal.
+//! The llama plugin against the legacy dense forward's values (recorded to `fixtures/`) on tiny random Qwen2 (q/k/v
+//! biases, tied head) and Mistral packs: steps, greedy decode and batched rows bit-equal, and the engine's config of
+//! both parses equal.
 
 const std = @import("std");
 const plugin = @import("plugin.zig");
@@ -50,10 +51,16 @@ fn writePack(p: *fixture.Pack, quantized: bool, tied: bool, biases: bool) !void 
     }
 }
 
+/// The legacy forward's values, recorded to `fixtures/<name>.tape`.
+fn open(p: *fixture.Pack, json: []const u8, comptime legacy_config: bool, comptime name: []const u8) !both.Both {
+    return both.Both.proof(&plugin.table, p, json, legacy_config, "src/plugins/llama/fixtures/" ++ name ++ ".tape", @embedFile("fixtures/" ++ name ++ ".tape"));
+}
+
 fn expectAll(b: *both.Both) !void {
     try b.expectSteps(&both.steps);
     try b.expectGreedy();
     try b.expectBatched(.dense);
+    try b.expectDone();
 }
 
 /// Fields only the plugin's forward reads; the adapter leaves their defaults.
@@ -68,7 +75,7 @@ test "llama plugin: a Qwen2 4-bit pack (q/k/v biases, tied head) is bit-equal to
     var p = fixture.Pack.init(0x0e2a);
     defer p.deinit();
     try writePack(&p, true, true, true);
-    var b = try both.Both.open(&plugin.table, &p, qwen2_json);
+    var b = try open(&p, qwen2_json, false, "0e2a");
     defer b.close();
     try expectAll(&b);
 }
@@ -77,7 +84,7 @@ test "llama plugin: a Qwen2 bf16 pack with biases is bit-equal to the legacy for
     var p = fixture.Pack.init(0x0e2b);
     defer p.deinit();
     try writePack(&p, false, true, true);
-    var b = try both.Both.open(&plugin.table, &p, configJson("qwen2", false, true, ""));
+    var b = try open(&p, configJson("qwen2", false, true, ""), false, "0e2b");
     defer b.close();
     try expectAll(&b);
 }
@@ -86,17 +93,17 @@ test "llama plugin: a Mistral 4-bit pack is bit-equal to the legacy forward" {
     var p = fixture.Pack.init(0x3157);
     defer p.deinit();
     try writePack(&p, true, false, false);
-    var b = try both.Both.open(&plugin.table, &p, mistral_json);
+    var b = try open(&p, mistral_json, false, "3157");
     defer b.close();
     try expectAll(&b);
 }
 
 test "llama plugin: Qwen2 and Mistral 4-bit packs are bit-equal on the legacy parse's ModelConfig" {
-    for ([_][]const u8{ qwen2_json, mistral_json }, [_]bool{ true, false }) |json, qwen| {
+    inline for (.{ qwen2_json, mistral_json }, .{ true, false }, .{ "1e9c-lc-qwen2", "1e9c-lc-mistral" }) |json, qwen, name| {
         var p = fixture.Pack.init(0x1e9c);
         defer p.deinit();
         try writePack(&p, true, qwen, qwen);
-        var b = try both.Both.openOnLegacyConfig(&plugin.table, &p, json);
+        var b = try open(&p, json, true, name);
         defer b.close();
         try expectAll(&b);
     }
@@ -115,7 +122,7 @@ test "llama plugin: a launch override the forward reads (rope_theta, the context
     var p = fixture.Pack.init(0x0e2c);
     defer p.deinit();
     try writePack(&p, true, true, true);
-    var b = try both.Both.openOnLegacyConfig(&plugin.table, &p, qwen2_json);
+    var b = try open(&p, qwen2_json, true, "0e2c-lc");
     defer b.close();
     try testing.expect(b.cfg.rope_theta == 12345.0 and b.cfg.max_position_embeddings == 8192);
     try testing.expectEqual(@as(f32, 12345.0), plugin.config.of(&b.cfg.plugin.?.parsed).rope_theta);
@@ -123,4 +130,18 @@ test "llama plugin: a launch override the forward reads (rope_theta, the context
     var served = try both.servedUnderOverrides(qwen2_json);
     defer served.deinit(testing.allocator);
     try testing.expect(served.rope_theta == 12345.0 and served.max_position_embeddings == 8192);
+}
+
+test "llama plugin: lm_head_mxfp8 (LOSSY) quantizes a bf16 Mistral pack's head as the legacy load does" {
+    const cli = &@import("../../engines/mlx/transformer.zig").cli().lm_head_mxfp8_cli;
+    const was = cli.*;
+    defer cli.* = was;
+    cli.* = true;
+    var p = fixture.Pack.init(0x3158);
+    defer p.deinit();
+    try writePack(&p, false, false, false);
+    var b = try open(&p, configJson("mistral", false, false, ",\"head_dim\":null,\"sliding_window\":4096"), false, "mxfp8-3158");
+    defer b.close();
+    try testing.expect(b.xfm.lm_head_s.ctx != null);
+    try expectAll(&b);
 }

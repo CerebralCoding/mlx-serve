@@ -1,8 +1,13 @@
 //! engines/mlx/layer_weights, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns LayerWeights, FullAttnWeights, QW.
+//! Owns LayerWeights, FullAttnWeights, QW, HybridMlpWeights, MoeLayerWeights.
 
 const mlx = @import("../../mlx/ffi.zig");
 const FusedRows = @import("../../sdk/blocks/linear/fused_rows.zig").FusedRows;
+const HcWeights = @import("../../plugins/qwen4_exp/weights.zig").HcWeights;
+const PleWeights = @import("../../plugins/qwen4_exp/weights.zig").PleWeights;
+const LinearAttnWeights = @import("../../sdk/blocks/gdn/gated_delta_net.zig").LinearAttnWeights;
+const DenseMlpWeights = @import("../../sdk/blocks/mlp/dense.zig").DenseMlpWeights;
+const MoeMlpWeights = @import("../../sdk/blocks/moe/weights.zig").MoeMlpWeights;
 
 // ── Standard decoder-only layer weights ──
 
@@ -111,3 +116,31 @@ pub const FullAttnWeights = struct {
 };
 
 pub const QW = @import("../../sdk/blocks/linear/fused_rows.zig").QW;
+
+/// A layer's MLP: dense, or a routed MoE.
+pub const HybridMlpWeights = union(enum) {
+    dense: DenseMlpWeights,
+    moe: MoeMlpWeights,
+};
+
+pub const MoeLayerWeights = struct {
+    input_norm: mlx.mlx_array,
+    post_attn_norm: mlx.mlx_array,
+    is_linear: bool,
+    attn: union(enum) { full: FullAttnWeights, linear: LinearAttnWeights },
+    mlp: HybridMlpWeights,
+    // Gemma 4 MoE: separate shared expert MLP (null for Qwen3.5)
+    shared_mlp: ?DenseMlpWeights = null,
+    // Gemma 4 feedforward norms (null for Qwen3.5)
+    pre_ff_norm: ?mlx.mlx_array = null,
+    post_ff_norm: ?mlx.mlx_array = null,
+    pre_ff_norm_2: ?mlx.mlx_array = null,
+    post_ff_norm_1: ?mlx.mlx_array = null,
+    post_ff_norm_2: ?mlx.mlx_array = null,
+    layer_scalar: ?mlx.mlx_array = null,
+    // qwen4_exp: the two gated residual reads/writes around the block and
+    // the n-gram PLE on its one layer. Null for every other arch.
+    hc_attn: ?HcWeights = null,
+    hc_mlp: ?HcWeights = null,
+    ple: ?PleWeights = null,
+};

@@ -55,7 +55,7 @@ pub const Layout = enum {
 /// The one resolver for a model's layout; the layout decides the store version and so
 /// which persisted file a model reads. `anytype`: this module imports nothing but std.
 pub fn layoutFor(config: anytype) Layout {
-    return if (config.isQwen4()) .long else .legacy;
+    return if (config.longCtxGated()) .long else .legacy;
 }
 
 /// Buckets the layout uses; cells past it are never written and never active.
@@ -1421,13 +1421,13 @@ test "round_cost: the long layout warm-starts from a legacy file — no user boo
 
 test "layoutFor is THE round-cost layout resolver" {
     const Stub = struct {
-        qwen4: bool,
-        fn isQwen4(self: *const @This()) bool {
-            return self.qwen4;
+        long_ctx: bool,
+        fn longCtxGated(self: *const @This()) bool {
+            return self.long_ctx;
         }
     };
-    const long = Stub{ .qwen4 = true };
-    const legacy = Stub{ .qwen4 = false };
+    const long = Stub{ .long_ctx = true };
+    const legacy = Stub{ .long_ctx = false };
     try testing.expectEqual(Layout.long, layoutFor(&long));
     try testing.expectEqual(Layout.legacy, layoutFor(&legacy));
     try testing.expect(storeVersion(layoutFor(&long)) != storeVersion(layoutFor(&legacy)));

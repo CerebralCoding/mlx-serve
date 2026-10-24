@@ -679,7 +679,6 @@ pub fn facts(c: *Config) abi.Parsed {
         .spec_rollback = true,
         .images = c.qwen_vision,
         .video = c.qwen_vision,
-        .cluster_plan = true,
     };
     const s = &p.shell;
     s.* = .{
@@ -720,6 +719,8 @@ pub fn facts(c: *Config) abi.Parsed {
         .ssm_state = .{
             .entries = c.num_hidden_layers,
             .dtype = if (c.ssm_state_f32) .f32 else .bf16,
+            // The aux buffers (PLE window, QSA keys) are written in place.
+            .snapshot_policy = .in_place,
             .checkpoint_bytes = ssmCheckpointBytes(c),
         },
     };

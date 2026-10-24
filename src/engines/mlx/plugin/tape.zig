@@ -84,6 +84,12 @@ fn sample(x: Array) !Array {
     return mlx.mlx_array_new_data(out.ptr, &[_]c_int{@intCast(k)}, 1, mlx.mlx_array_dtype(x));
 }
 
+/// A proof whose tape `recorded` is still empty records it from the legacy forward (`MLX_SERVE_PROOF_RECORD` set);
+/// every other run plays its tape back without the legacy load.
+pub fn records(recorded: []const u8) bool {
+    return recorded.len == 0 and recordRoot() != null;
+}
+
 pub const Tape = struct {
     /// Recording: the file under the root, and the bytes so far.
     path: ?[]u8 = null,

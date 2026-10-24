@@ -119,7 +119,7 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
         error.Invalid => invalid("a config value out of range"),
     };
 
-    var p: abi.Parsed = .{ .caps = .{ .moe = c.experts > 0, .batches_decode = true, .dflash_capture = true } };
+    var p: abi.Parsed = .{ .caps = .{ .moe = c.experts > 0, .batches_decode = true, .dflash_capture = true, .verify_truncates = true } };
     p.cache.sliding_ring = c.ring();
     const s = &p.shell;
     s.* = .{

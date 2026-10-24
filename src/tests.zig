@@ -79,9 +79,6 @@ test {
     _ = @import("plugins/flint/proof_test.zig");
     _ = @import("plugins/llama/proof_test.zig");
     _ = @import("engines/mlx/kv/cache_ops.zig");
-    _ = @import("sdk/bases/proof/dense_test.zig");
-    _ = @import("sdk/bases/proof/layered_test.zig");
-    _ = @import("sdk/bases/proof/attention_test.zig");
     _ = @import("engines/ds4/engine.zig");
     _ = @import("plugins/registry.zig");
     _ = @import("host/plugins/loader.zig");
@@ -96,7 +93,7 @@ test {
     if (@import("build_options").mlx_stream) _ = @import("engines/mlx/modules/stream_glue.zig");
     _ = @import("sdk/weights/streamed/dupes_test.zig");
     _ = @import("sdk/weights/streamed/mlx_pack_test.zig");
-    _ = @import("plugins/deepseek_v41/stream/dupes_test.zig");
+    _ = @import("plugins/deepseek_v41/streamed_test.zig");
     _ = @import("version.zig");
     _ = @import("mlx/ops.zig");
     _ = @import("mlx/kernels.zig");
@@ -108,7 +105,6 @@ test {
     _ = @import("plugins/qwen3_next/plugin.zig");
     _ = @import("plugins/qwen3_asr/plugin.zig");
     _ = @import("sdk/testing/kernel_contract/registry.zig");
-    _ = @import("sdk/bases/proof/mixers.zig");
     _ = @import("host/chat/chat.zig");
     _ = @import("engines/llama/engine.zig");
     _ = @import("host/engines/served.zig");
@@ -148,9 +144,16 @@ test {
     _ = @import("sdk/blocks/hc/hc_cuda.zig");
     _ = @import("sdk/blocks/moe/moe_cuda.zig");
     _ = @import("sdk/blocks/moe/moe_prefill_cuda.zig");
-    _ = @import("plugins/qwen4_exp/qsa_decode_cuda.zig");
-    _ = @import("plugins/qwen4_exp/qsa_mask.zig");
-    _ = @import("plugins/qwen4_exp/qsa_decode.zig");
+    _ = @import("sdk/blocks/attention/sparse_block/block_test.zig");
+    _ = @import("sdk/blocks/attention/sparse_block/contract.zig");
+    _ = @import("sdk/blocks/attention/sparse_block/decode.zig");
+    _ = @import("sdk/blocks/attention/sparse_block/decode_cuda.zig");
+    _ = @import("sdk/blocks/attention/sparse_block/mask.zig");
+    _ = @import("sdk/blocks/attention/sparse_block/params.zig");
+    _ = @import("sdk/blocks/attention/sparse_block/reference.zig");
+    _ = @import("sdk/blocks/attention/sparse_block/row_mask.zig");
+    _ = @import("sdk/blocks/attention/sparse_block/score.zig");
+    _ = @import("sdk/blocks/attention/sparse_block/select.zig");
     _ = @import("sdk/blocks/qmm/rowqmv.zig");
     _ = @import("sdk/blocks/qmm/simd_qmm.zig");
     _ = @import("sdk/blocks/qmm/lane_qmm.zig");

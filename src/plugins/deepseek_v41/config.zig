@@ -161,17 +161,23 @@ test "deepseek_v41 config: the release pack parses with its sources, Engram, DSp
     try testing.expectEqual(@as(u64, (1 << 2) | (1 << 8) | (1 << 14) | (1 << 20)), c.dsv41_kv_sources);
     try testing.expectEqual(@as(u32, 2), c.dsv41_n_engram_layers);
     try testing.expectEqual(@as(u32, 128), c.dsv41_dspark_experts);
-    try testing.expect(c.dsv41_vision and p.caps.images and !p.caps.spec_rollback and p.caps.cluster_plan);
+    try testing.expect(c.dsv41_vision and p.caps.images and !p.caps.spec_rollback);
     try testing.expectEqual(@as(u32, 129264), p.placeholder_ids.image);
     try testing.expectEqual(abi.ThinkingDefault.on, p.chat.thinking_default);
     try testing.expectEqual(abi.EffortVocab.dsv41, p.chat.effort_vocab);
     try testing.expectEqual(@as(u32, 3), p.spec.native_stages);
 }
 
-test "deepseek_v41 config: an experts.bin bank is refused by name (lib/mlx-stream serves it)" {
+test "deepseek_v41 config: an experts.bin bank streams, its prompt passed whole" {
     var p: abi.Parsed = .{};
     const v = parseFiles(&.{ .{ .name = "config.json", .bytes = iq3 }, .{ .name = "experts.bin", .bytes = "" } }, true, &p);
-    try testing.expect(!v.isOk() and std.mem.indexOf(u8, v.why.slice(), "mlx-stream") != null);
+    try testing.expect(v.isOk());
+    defer freeParsed(&p);
+    try testing.expect(of(&p).dsv41_streamed and p.caps.whole_prompt_prefill and p.caps.streamed_weights);
+    var q: abi.Parsed = .{};
+    try testing.expect(parseFiles(&.{.{ .name = "config.json", .bytes = iq3 }}, true, &q).isOk());
+    defer freeParsed(&q);
+    try testing.expect(!of(&q).dsv41_streamed and !q.caps.whole_prompt_prefill);
 }
 
 test "deepseek_v41 config: a layer that would read another ratio's cache is refused by name" {

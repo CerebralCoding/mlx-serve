@@ -34,8 +34,8 @@ const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../sdk/util/log.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
-const transformer_mod = @import("../../engines/mlx/transformer.zig");
 const forward_ctx = @import("../../engines/mlx/forward_ctx.zig");
+const plugin_driver = @import("../../engines/mlx/plugin/driver.zig");
 const params_mod = @import("../../sdk/quant/params.zig");
 const lora_mod = @import("../../sdk/weights/lora.zig");
 const w8a8 = @import("../../sdk/blocks/dit/w8a8.zig");
@@ -1549,24 +1549,22 @@ fn causalPadMask(allocator: std.mem.Allocator, ids: []const i32, pad_id: i32, s:
 /// That checkpoint is the SAME `gemma4_unified` decoder mlx-serve already
 /// serves as a chat model — dual head dims on the full-attention layers (512
 /// vs 256), one global KV head, K aliased to V there, partial proportional
-/// RoPE, a per-layer `layer_scalar` — so this runs the real `Transformer` and
-/// taps its residual stream through `capture_layers` instead of hand-rolling
-/// that arithmetic a second time. `gemmaCapture` (2.3, Gemma-3) stays as it
+/// RoPE, a per-layer `layer_scalar` — so this runs the gemma4 plugin through
+/// the engine's driver and taps its residual stream through `capture_layers`
+/// instead of hand-rolling that arithmetic a second time. `gemmaCapture` (2.3, Gemma-3) stays as it
 /// is; the two encoders share only the mask and the sqrt(hidden) embedding
 /// scale.
 ///
-/// The prompt is LEFT-PADDED, which the standard forward has no notion of, so
-/// the mask rides in on `ForwardCtx.prefill_mask_add` (legacy parse: the served
-/// path takes no additive prefill mask). ONE forward, no chunking: the term is
-/// sized to the whole prompt.
+/// The prompt is LEFT-PADDED, which the decoder has no notion of, so the mask
+/// rides in on `ForwardCtx.prefill_mask_add`. ONE forward, no chunking: the
+/// term is sized to the whole prompt.
 ///
 /// Caller owns the returned states and the slice.
 pub fn gemmaCapture4(io: std.Io, allocator: std.mem.Allocator, gemma_dir: []const u8, ids: []const i32, pad_id: i32, s: S) ![]mlx.mlx_array {
-    var config = try model_mod.parseConfigLegacy(io, allocator, gemma_dir);
-    var weights = try model_mod.loadWeights(io, allocator, gemma_dir);
-    defer weights.deinit();
-    model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try transformer_mod.Transformer.init(io, allocator, config, &weights);
+    var config = try model_mod.parseConfig(io, allocator, gemma_dir);
+    defer config.deinit(allocator);
+    if (config.plugin == null) return error.GemmaCaptureUnavailable;
+    var xfm = try plugin_driver.load(io, allocator, &config, gemma_dir, mlx.gpuStream());
     defer xfm.deinit();
 
     const n_layers = config.num_hidden_layers;
@@ -1608,10 +1606,8 @@ pub fn gemmaCapture4(io: std.Io, allocator: std.mem.Allocator, gemma_dir: []cons
         _ = mlx.mlx_array_free(out);
     }
 
-    // `capture_layers` is honored by the STANDARD forward only. A checkpoint
-    // that routed elsewhere would leave these empty and the connector would
-    // project 48 blank states into a plausible-looking, meaningless prompt —
-    // so say so instead.
+    // A capture left unfilled would have the connector project blank states
+    // into a plausible-looking, meaningless prompt — so say so instead.
     for (states) |st| {
         if (st.ctx == null) return error.GemmaCaptureUnavailable;
     }

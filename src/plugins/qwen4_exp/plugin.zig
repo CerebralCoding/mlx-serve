@@ -46,7 +46,7 @@ pub const table = abi.ModelTable{
     .release_slot = &releaseSlot,
     .meters = &meters,
     .cache = &.{ .layout = &layout },
-    .weights = &.{},
+    .weights = &.{ .resident_bytes = &residentBytes },
 };
 
 /// P8 debt (`engines/mlx/plugin/intree.zig`): the engine's context of the serial forward in flight when the MLX
@@ -518,12 +518,43 @@ fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
     out.* = abi.Str.of(line);
 }
 
+/// An n-gram table embedded in the shards is read from disk per lookup: never resident.
+fn residentBytes(p: *const abi.Parsed, model_dir: abi.Str, _: abi.Str, shards: u64, out: *u64) callconv(.c) Verdict {
+    out.* = shards;
+    const c = config.of(p);
+    if (!c.embedded_ngram) return .ok;
+    var mc = toModelConfig(gpa, c, null) catch |e| return Verdict.named(.failed, @errorName(e));
+    defer mc.deinit(gpa);
+    const spec = model.qwen4EmbeddedSpec(&mc) catch |e| return Verdict.named(.failed, @errorName(e));
+    const info = (@import("qwen4_exp.zig").inspectEmbedded(model_dir.slice(), spec) catch |e| return Verdict.named(.failed, @errorName(e))) orelse return .ok;
+    if (info.payload_bytes > shards) return Verdict.named(.failed, "InvalidEmbeddedNgramTable");
+    out.* = shards - info.payload_bytes;
+    return .ok;
+}
+
 /// The tiny pack the conformance suite runs: four layers (GDN and QSA attention), the PLE, bf16 weights.
 pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
     return .{ .files = try fixture.files(a, 7, .bf16) };
 }
 
 // ── tests ──
+
+test "qwen4_exp resident bill: an embedded n-gram table's payload is not resident" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try @import("ple_table.zig").writeFixture(&td, .valid);
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = path[0..try td.dir.realPath(io, &path)];
+    var c: config.Config = .{ .vocab_size = 1, .ngram_size = 3, .heads_per_ngram = 1, .ngram_vocab_base = 2, .ngram_vocab_divisor = 6, .ple_embed_dim = 64, .split_ngram_parts = 3, .ple_layer_idx = 1, .embedded_ngram = true };
+    var out: u64 = 0;
+    try std.testing.expect(residentBytes(&.{ .private = &c }, .of(dir), .{}, 1000, &out).isOk());
+    try std.testing.expectEqual(@as(u64, 1000 - 120), out);
+    try std.testing.expect(!residentBytes(&.{ .private = &c }, .of(dir), .{}, 100, &out).isOk());
+    c.embedded_ngram = false;
+    try std.testing.expect(residentBytes(&.{ .private = &c }, .of(dir), .{}, 1000, &out).isOk());
+    try std.testing.expectEqual(@as(u64, 1000), out);
+}
 
 test {
     _ = config;

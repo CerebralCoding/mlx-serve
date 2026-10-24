@@ -22,7 +22,7 @@ Packs: `ddalcu/DeepSeek-V4-Flash-MLX-Serve` (0731+, our layout). `config.zig` is
 ## Facts the table declares
 - `owns_decode_state`, `prefix_cache = false`, serial, single-flight (one module state per model); no batching,
   no layer capture, no Gemma/DFlash drafter (`spec.policy.drafter_ok = false`), DSpark stages from the config
-  (opt-in on V4: `--dspark`). No `cluster_plan`: V4 has no multi-Mac path (`distributed.plan` refuses it).
+  (opt-in on V4: `--dspark`). V4 has no multi-Mac path (`distributed.plan` refuses it).
 - Thinking default OFF; effort vocabulary `dsv4`; DSML tools on OUR byte-pinned template (template_family).
 - Missing generation_config = the wild 1.0/1.0 signature: V4 serves the reference temperature 0.6.
 

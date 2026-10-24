@@ -17,7 +17,7 @@ an in-checkpoint MTP layer, a Qwen3-VL tower. Packs, oracle: `docs/reference.md`
   `oracle_test.zig`; ModelOpt/combined-GDN/ternary arms have their own tests (fixture layouts the tapes lack).
 - P8 DEBT, `engines/mlx/plugin/intree.zig` (in-tree only, delete when the ABI carries these): the MTP head, group
   lanes and the grouped verify run on the plugin's `Trunk` through `MtpHeadRef.qwen4`; the cluster worker runs a
-  bare `Trunk` and the plugin reads the Thunderbolt plan (`caps.cluster_plan`). An ABI-clean head needs:
+  bare `Trunk` and the plugin reads the Thunderbolt plan (`distributed.planFor`). An ABI-clean head needs:
   (1) `ForwardOut.next`, the chained hidden apart from the projected one; (2) a fact that the trunk's hidden is the
   pre-mixer stream; (3) a placed head forward (dead history rows); (4) `HeadHooks.mark` with a length; (5) head
   snapshot / bytes / serialize for the prefix cache and SSD; (6) group lanes and the grouped verify on the plugin arm;
@@ -25,8 +25,11 @@ an in-checkpoint MTP layer, a Qwen3-VL tower. Packs, oracle: `docs/reference.md`
   `plugin.engineCtx`, a `SharedThreadLocal`).
 - Unserved hooks: `cache.aux` (QSA history + PLE prev in checkpoints/SSD ride the engine's SSM entries),
   `capture_stream_all` (no caller on this arch).
-- Kernel contract: every Metal kernel registered (`contract*.zig`); the multi-launch ones (qsa_decode, qsa_select's
-  split pair, qsa_attn) chained against their wrappers. Unregistered: qsa_decode's CUDA pair (no CUDA rig).
+- QSA's generic half is the SDK's block-sparse attention (`sdk/blocks/attention/sparse_block/`: `Blocks`/`Params`,
+  score sheet, exact select, masks, decode kernel, float64 reference, its own contract); the indexer (YaRN/M-RoPE,
+  pooled keys, hc reads), the key history and checkpoints, the gather and verify arms stay here.
+- Kernel contract: every Metal kernel registered (`contract*.zig` here and in `sparse_block/`); the multi-launch ones
+  (qsa_decode, qsa_select's split pair, qsa_attn) chained against their wrappers. Unregistered: qsa_decode's CUDA pair.
 
 ## Rules (from the root AGENTS.md)
 
@@ -40,7 +43,7 @@ an in-checkpoint MTP layer, a Qwen3-VL tower. Packs, oracle: `docs/reference.md`
   the score sheet stays ONE NAX kernel at every width (`msv_qsa_score`): decode, verify, prefill pick the same blocks.
 - QSA's visible tail is PER QUERY; scores in f32; `torch.topk` keeps the LOWER index on ties; n-gram eos is the TEXT
   config's (`ngram_eos`). One YaRN mscale on every indexer arm; pooled keys rope with attention's M-RoPE table.
-- Past the budget a solo dense-KV decode row skips mask, gather and SDPA (`qsa_decode.attend`): reduce BEFORE the
+- Past the budget a solo dense-KV decode row skips mask, gather and SDPA (`sparse_block/decode.zig` `attend`): reduce BEFORE the
   select (a shuffle in divergent code returns garbage).
 - A host read inside the layer loop is a GPU barrier: PLE defers (`ple_defer` + `flushDeferredPle`) and claims its
   spec slot at build time; the GPU arm settles its n-gram history at the NEXT forward.

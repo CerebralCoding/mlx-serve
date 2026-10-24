@@ -448,10 +448,10 @@ test "qwen3-aligner: the prompt, the classes and the times match the reference" 
     var config = try model_mod.parseConfig(io, a, model_dir);
     defer config.deinit(a);
     const fa = config.forced_aligner orelse return error.NotAnAligner;
-    var weights = try model_mod.loadModelWeights(io, a, model_dir, &config, true);
+    // The tower's tensors; the trunk is the plugin's, as the engine serves the pack.
+    var weights = model_mod.Weights.init(a);
     defer weights.deinit();
-    model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try transformer_mod.Transformer.init(io, a, config, &weights);
+    var xfm = try @import("../../engines/mlx/plugin/driver.zig").loadWith(io, a, &config, model_dir, mlx.gpuStream(), &weights);
     defer xfm.deinit();
     var qa = try qwen_audio.QwenAudio.init(a, config.qwen_audio.?, &weights);
     defer qa.deinit();

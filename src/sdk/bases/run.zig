@@ -31,6 +31,8 @@ pub const Run = struct {
     captured: []Array = &.{},
     /// An encoder batch's additive key mask; null = none.
     mask: Array = .{},
+    /// `Ctx.mask_add` (`Forward.mask_add`).
+    mask_add: Array = .{},
     /// Evaluate the residual after every this many layers and after the last (0 = never; `Forward.eval_every`).
     eval_every: u32 = 0,
     /// `Ctx.capture_spec`.
@@ -51,7 +53,7 @@ pub const Run = struct {
     offload: ?*const abi.Offload = null,
 
     pub fn ctx(r: *const Run, g: *Graph, shared: *const block.Shared) Ctx {
-        return .{ .g = g, .mode = r.mode, .rows = r.rows, .slots = r.slots, .positions = r.positions, .caches = r.caches, .cache_ops = r.cache_ops, .shared = shared, .mask = r.mask, .capture_spec = r.capture_spec, .mrope = r.mrope, .row_exact = r.row_exact, .offload = r.offload, .tree = r.tree };
+        return .{ .g = g, .mode = r.mode, .rows = r.rows, .slots = r.slots, .positions = r.positions, .caches = r.caches, .cache_ops = r.cache_ops, .shared = shared, .mask = r.mask, .mask_add = r.mask_add, .capture_spec = r.capture_spec, .mrope = r.mrope, .row_exact = r.row_exact, .offload = r.offload, .tree = r.tree };
     }
 
     /// The embedded rows `h` with the media rows at their placeholders (a prompt chunk only, as the engine splices).
@@ -200,6 +202,7 @@ fn run(comptime Base: type, m: *Model(Base), f: *const abi.Forward, out: *abi.Fo
         .mrope = if (f.mrope.ctx != null) .{ try mropeHalf(&g, .{ .ctx = f.mrope.ctx }, 0), try mropeHalf(&g, .{ .ctx = f.mrope.ctx }, 1) } else null,
         .media = .{ .ctx = f.media.ctx },
         .mask = if (f.key_mask.ctx != null) try g.reshape(.{ .ctx = f.key_mask.ctx }, &.{ @intCast(slots), 1, 1, @intCast(f.rows) }) else .{},
+        .mask_add = .{ .ctx = f.mask_add.ctx },
         .media_offset = f.media_offset,
         .placeholders = m.placeholders,
         .row_exact = if (f.row_exact) m.row_exact else .off,

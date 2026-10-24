@@ -27,8 +27,16 @@ pub const Routed = struct {
         source: *const fn (*anyopaque, u32, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array) anyerror!mlx.mlx_array,
     },
     settle_fn: *const fn (*anyopaque) anyerror!void,
+    /// A source whose slot rows follow the pass (`true`: a prompt pass, `false`: decode), told before each forward.
+    phase_fn: ?*const fn (*anyopaque, bool) anyerror!void = null,
+    /// A prompt pass's predicted routes of model layer `layer` (every row's ids), read while its attention runs.
+    read_ahead_fn: ?*const fn (*anyopaque, u32, []const u16) anyerror!void = null,
 
     pub fn settle(r: Routed) !void {
         return r.settle_fn(r.ctx);
+    }
+
+    pub fn phase(r: Routed, prompt: bool) !void {
+        if (r.phase_fn) |f| try f(r.ctx, prompt);
     }
 };

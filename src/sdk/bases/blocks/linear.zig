@@ -1,4 +1,4 @@
-//! copied_from: sdk/blocks/linear/qmatmul.zig (`qmatmul`, `qmatmulMaybeBias` without the int8 and row-exact arms).
+//! copied_from: sdk/blocks/linear/qmatmul.zig (`qmatmul`, `qmatmulMaybeBias` without the row-exact arm).
 //! A projection over its own quant geometry, and a row-joined group of them.
 
 const mlx = @import("../../../mlx/ffi.zig");
@@ -8,6 +8,7 @@ const qmatmulBits = @import("../../blocks/linear/qmatmul.zig").qmatmulBits;
 const sliceQkvPart = @import("../../blocks/linear/fused_rows.zig").sliceQkvPart;
 const qmv2 = @import("../../blocks/qmm/qmv2.zig");
 const qmv_nax2 = @import("../../blocks/qmm/qmv_nax2.zig");
+const qmm_int8 = @import("../../blocks/qmm/qmm_int8.zig");
 const rht = @import("../../quant/hadamard/rht.zig");
 
 const Array = ops.Array;
@@ -46,14 +47,18 @@ pub const Linear = struct {
         return qmatmulBits(x, l.w, l.s, l.b, l.bits, l.group_size, l.mode, g.s);
     }
 
-    /// The engine's rotated arm: the 2-bit kernels first (each declines what it does not serve), then stock qmm.
+    /// The engine's rotated arm: the 2-bit kernels first (each declines what it does not serve), then the opt-in int8
+    /// prompt route, then stock qmm.
     fn rotated(l: *const Linear, reg: *rht.Registry, x: Array, s: ops.Stream) !Array {
+        // With int8 on, a prompt-width rotation rides the quantizer: the rotated activation is never written.
+        if (reg.int8) |ic| if (l.signs.ctx != null) if (try qmm_int8.qmmRotated(ic, x, l.signs, reg.block, l.w, l.s, l.b, l.bits, l.group_size, reg.bias_is_neg_scale, s)) |y| return y;
         const xr = if (l.signs.ctx != null) try reg.applyIn(x, l.signs, s) else x;
         defer if (l.signs.ctx != null) {
             _ = mlx.mlx_array_free(xr);
         };
         if (try qmv_nax2.qmm(xr, l.w, l.s, l.b, l.bits, l.group_size, s)) |y| return y;
         if (try qmv2.qmm(xr, l.w, l.s, l.b, l.bits, l.group_size, l.signs.ctx != null and reg.bias_is_neg_scale, true, s)) |y| return y;
+        if (reg.int8) |ic| if (try qmm_int8.qmm(ic, xr, l.w, l.s, l.b, l.bits, l.group_size, l.signs.ctx != null and reg.bias_is_neg_scale, s)) |y| return y;
         return qmatmulBits(xr, l.w, l.s, l.b, l.bits, l.group_size, l.mode, s);
     }
 };

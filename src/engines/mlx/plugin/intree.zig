@@ -63,10 +63,9 @@ fn isQwen4(table: *const abi.ModelTable) bool {
     return table.load == qwen4.table.load;
 }
 
-/// A lossy load setting the plugin serves itself (`LoadCtx.settings_json`). qwen4_exp builds its MXFP8 head; int8
-/// prefill runs only on Hadamard-rotated projections, which no qwen4_exp pack has, so it changes nothing there.
-pub fn servesLossy(table: *const abi.ModelTable, what: enum { int8_prefill, lm_head_mxfp8 }) bool {
-    _ = what;
+/// qwen4_exp builds its own MXFP8 head (`lm_head_mxfp8`, its default on for a quantized pack on an integrated CUDA
+/// GPU), so the driver leaves its map alone.
+pub fn buildsMxfp8Head(table: *const abi.ModelTable) bool {
     return isQwen4(table);
 }
 

@@ -61,6 +61,16 @@ pub const table = abi.MediaTable{
     .encode = &J.encode,
 };
 
+/// The tiny trunk's config as a Clef pack declares it: a vision config and M-RoPE sections (the pack ships no tower).
+const config_json =
+    \\{"model_type":"qwen3_5","image_token_id":263,"vision_config":{"depth":1},"text_config":{"model_type":"qwen3_5",
+    \\ "hidden_size":256,"intermediate_size":512,"num_hidden_layers":2,"num_attention_heads":4,"num_key_value_heads":2,
+    \\ "head_dim":256,"vocab_size":264,"rms_norm_eps":1e-6,"full_attention_interval":2,"linear_num_key_heads":2,
+    \\ "linear_num_value_heads":8,"linear_key_head_dim":128,"linear_value_head_dim":128,"linear_conv_kernel_dim":4,
+    \\ "max_position_embeddings":4096,"rope_parameters":{"rope_theta":100000.0,"partial_rotary_factor":0.25,
+    \\ "mrope_section":[11,11,10],"mrope_interleaved":true},"tie_word_embeddings":false},"tie_word_embeddings":false}
+;
+
 /// A tiny random Clef: `sdk/testing/tiny_qwen35` (no vision tower) and a joint head at 32 with one routing layer and
 /// one decoder layer.
 pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
@@ -104,7 +114,7 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
     try Norm.lin(&h, "layers.0.linear2", .{}, ff, w, true);
     return .{
         .files = try a.dupe(sdk.fixture.File, &.{
-            .{ .name = "config.json", .bytes = sdk.tiny_qwen35.config },
+            .{ .name = "config.json", .bytes = config_json },
             .{ .name = "tokenizer.json", .bytes = try sdk.byte_tokenizer.json(a, &.{
                 .{ .id = 256, .content = "<|im_start|>" }, .{ .id = 257, .content = "<|im_end|>" },
                 .{ .id = 258, .content = "<think>" },      .{ .id = 259, .content = "</think>" },
