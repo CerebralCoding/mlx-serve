@@ -207,6 +207,10 @@ jobs:
       - name: Build vz-agent guest binary
         run: zig build vz-agent
 
+      # The plugin kit (sdk + abi source, C header, examples, build glue) as a release asset.
+      - name: Build the plugin kit
+        run: zig build kit -Dversion=${{ steps.version.outputs.version }}
+
       - name: Smoke test mlx-serve binary
         run: |
           ./zig-out/bin/mlx-serve --version
@@ -225,6 +229,9 @@ jobs:
         # it twice; releases keep the belt-and-braces run.
         if: github.event_name != 'pull_request'
         run: zig build test --summary all
+
+      - name: Plugin kit end to end
+        run: bash tests/test_plugin_kit.sh
 
       # Same cache as ci.yml, own key: this one also holds the release products.
       - name: Cache SwiftPM build
@@ -575,6 +582,7 @@ jobs:
           files: |
             mlx-serve-bin-macos-arm64.tar.gz
             MLX-Serve.dmg
+            zig-out/kit/mlx-serve-plugin-kit-*.tar.gz
 
       - name: Upload PR / dry-run artifacts
         if: ${{ inputs.dry_run || github.event_name == 'pull_request' }}
@@ -586,6 +594,7 @@ jobs:
           path: |
             mlx-serve-bin-macos-arm64.tar.gz
             MLX-Serve.dmg
+            zig-out/kit/mlx-serve-plugin-kit-*.tar.gz
           retention-days: 7
 
   # The Linux/CUDA tarballs are the ones linux.yml already built for this commit
