@@ -185,6 +185,43 @@ test "prism served: an image prompt on the M-RoPE table equals the legacy shell"
     try served.expectImage(&p);
 }
 
+test "prism served: a DFlash drafter on the rotated trunk reads its embedding and head and emits the legacy stream" {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const q3 = @import("../qwen3/proof_test.zig");
+    const dflash_mod = @import("../../engines/mlx/spec/dflash/dflash.zig");
+    var pk = fixture.Pack.init(0xb007);
+    defer pk.deinit();
+    try writePack(&pk, false);
+    var p: served.Pair = undefined;
+    try p.open(&prism.table, &pk, config(false, false));
+    defer p.close();
+    p.oracle = try served.oracle("prism_hadamard_qwen35", "dflash-b007");
+    try testing.expect(p.xfm.plugin.?.drafters and p.xfm.supportsLayerCapture());
+    {
+        const ops = @import("../../mlx/ops.zig");
+        var g = ops.Graph.init(a, p.lg.xfm.s);
+        defer g.deinit();
+        const ids = try fixture.tokens(&g, &.{ 4, 90, 127, 0, 33 });
+        const hidden = try g.reshape(try g.adopt(try p.lg.xfm.rawEmbedding(ids)), &.{ 1, 5, H });
+        try p.oracle.check(try g.adopt(try p.xfm.rawEmbedding(ids)), try g.adopt(try p.lg.xfm.rawEmbedding(ids)), false);
+        try p.oracle.check(try g.adopt(try p.xfm.lmHeadForeign(hidden)), try g.adopt(try p.lg.xfm.lmHeadForeign(hidden)), false);
+    }
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const asst = buf[0..try tmp.dir.realPath(io, &buf)];
+    try dflash_mod.TinyFix.writeAssistantAs(io, tmp.dir, asst, fixture.stream(), false, @intCast(H));
+    var tokens: [2][16]u32 = undefined;
+    var accepted: [2]std.ArrayList(u32) = .{ .empty, .empty };
+    defer for (&accepted) |*l| l.deinit(a);
+    try q3.dflashRun(&p.lg.xfm, asst, &tokens[0], &accepted[0]);
+    try q3.dflashRun(&p.xfm, asst, &tokens[1], &accepted[1]);
+    try p.oracle.stream(&tokens[1], &tokens[0]);
+    try p.oracle.stream(accepted[1].items, accepted[0].items);
+    try p.oracle.done();
+}
+
 test "prism served: the MTP head over the rotated trunk equals the legacy arm (steps, draft picks, rounds)" {
     var pk = fixture.Pack.init(0xb005);
     defer pk.deinit();

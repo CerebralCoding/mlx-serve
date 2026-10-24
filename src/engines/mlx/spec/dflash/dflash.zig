@@ -3340,18 +3340,26 @@ pub const TinyFix = struct {
     }
 
     pub fn writeAssistantOpts(io: std.Io, dir: std.Io.Dir, dir_path: []const u8, s: mlx.mlx_stream, quantize: bool) !void {
-        try dir.writeFile(io, .{ .sub_path = "config.json", .data = ASSISTANT_CONFIG });
+        return writeAssistantAs(io, dir, dir_path, s, quantize, HIDDEN);
+    }
+
+    /// The tiny assistant over a trunk of width `hidden`.
+    pub fn writeAssistantAs(io: std.Io, dir: std.Io.Dir, dir_path: []const u8, s: mlx.mlx_stream, quantize: bool, hidden: usize) !void {
+        var hb: [32]u8 = undefined;
+        const cfg = try std.mem.replaceOwned(u8, testing.allocator, ASSISTANT_CONFIG, "\"hidden_size\": 64", try std.fmt.bufPrint(&hb, "\"hidden_size\": {d}", .{hidden}));
+        defer testing.allocator.free(cfg);
+        try dir.writeFile(io, .{ .sub_path = "config.json", .data = cfg });
         const st_path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/model.safetensors", .{dir_path}, 0);
         defer testing.allocator.free(st_path);
         const map = mlx.mlx_map_string_to_array_new();
         defer _ = mlx.mlx_map_string_to_array_free(map);
         const meta = mlx.mlx_map_string_to_string_new();
         defer _ = mlx.mlx_map_string_to_string_free(meta);
-        try putV1AssistantWeights(map, s, quantize);
+        try putV1AssistantWeights(map, s, quantize, hidden);
         try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
     }
 
-    fn putV1AssistantWeights(map: mlx.mlx_map_string_to_array, s: mlx.mlx_stream, quantize: bool) !void {
+    fn putV1AssistantWeights(map: mlx.mlx_map_string_to_array, s: mlx.mlx_stream, quantize: bool, hidden: usize) !void {
         const q_out = N_HEADS * HEAD_DIM;
         const kv_out = N_KV * HEAD_DIM;
         const putLin = struct {
@@ -3361,23 +3369,23 @@ pub const TinyFix = struct {
             }
         }.f;
 
-        try putLin(map, "encoder.fc.weight", HIDDEN, N_TARGETS * HIDDEN, 100, s, quantize);
-        try putNorm(map, "encoder.output_norm_enc.weight", HIDDEN, s);
-        try putNorm(map, "norm.weight", HIDDEN, s);
+        try putLin(map, "encoder.fc.weight", hidden, N_TARGETS * hidden, 100, s, quantize);
+        try putNorm(map, "encoder.output_norm_enc.weight", hidden, s);
+        try putNorm(map, "norm.weight", hidden, s);
         var key_buf: [128]u8 = undefined;
         var li: usize = 0;
         while (li < ASSISTANT_LAYERS) : (li += 1) {
-            try putNorm(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.input_layernorm.weight", .{li}), HIDDEN, s);
-            try putNorm(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.post_attention_layernorm.weight", .{li}), HIDDEN, s);
-            try putLin(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.q_proj.weight", .{li}), q_out, HIDDEN, 110 + li, s, quantize);
+            try putNorm(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.input_layernorm.weight", .{li}), hidden, s);
+            try putNorm(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.post_attention_layernorm.weight", .{li}), hidden, s);
+            try putLin(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.q_proj.weight", .{li}), q_out, hidden, 110 + li, s, quantize);
             try putNorm(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.q_norm.weight", .{li}), HEAD_DIM, s);
-            try putLin(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.k_proj.weight", .{li}), kv_out, HIDDEN, 120 + li, s, quantize);
+            try putLin(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.k_proj.weight", .{li}), kv_out, hidden, 120 + li, s, quantize);
             try putNorm(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.k_norm.weight", .{li}), HEAD_DIM, s);
-            try putLin(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.v_proj.weight", .{li}), kv_out, HIDDEN, 130 + li, s, quantize);
-            try putLin(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.o_proj.weight", .{li}), HIDDEN, q_out, 140 + li, s, quantize);
-            try putLin(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.mlp.gate_proj.weight", .{li}), INTER, HIDDEN, 150 + li, s, quantize);
-            try putLin(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.mlp.up_proj.weight", .{li}), INTER, HIDDEN, 160 + li, s, quantize);
-            try putLin(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.mlp.down_proj.weight", .{li}), HIDDEN, INTER, 170 + li, s, quantize);
+            try putLin(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.v_proj.weight", .{li}), kv_out, hidden, 130 + li, s, quantize);
+            try putLin(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.self_attn.o_proj.weight", .{li}), hidden, q_out, 140 + li, s, quantize);
+            try putLin(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.mlp.gate_proj.weight", .{li}), INTER, hidden, 150 + li, s, quantize);
+            try putLin(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.mlp.up_proj.weight", .{li}), INTER, hidden, 160 + li, s, quantize);
+            try putLin(map, try std.fmt.bufPrint(&key_buf, "layers.{d}.mlp.down_proj.weight", .{li}), hidden, INTER, 170 + li, s, quantize);
         }
     }
 
@@ -3443,7 +3451,7 @@ pub const TinyFix = struct {
         defer _ = mlx.mlx_map_string_to_array_free(map);
         const meta = mlx.mlx_map_string_to_string_new();
         defer _ = mlx.mlx_map_string_to_string_free(meta);
-        try putV1AssistantWeights(map, s, false);
+        try putV1AssistantWeights(map, s, false, HIDDEN);
 
         // Selector: codebooks ship SUFFIX-LESS, like the real checkpoint.
         if (packed_codebooks) {

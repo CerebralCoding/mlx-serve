@@ -19,8 +19,8 @@ Owns `prism_hadamard_qwen35` (prism-ml Bonsai 2 packs). Table = `plugins/qwen3_5
   batched verify, an image prompt, and the MTP head (steps, picks, rounds) bit-equal to the legacy shell.
 - The LOSSY `int8_prefill` setting arms the registry's int8 route (`Registry.int8`, `qmm_int8`) on prompt-width
   projections, as the legacy shell's.
-- Not served: a DFlash drafter (its head reads the trunk's in f32, `lmHeadForeign`): a pack carrying one stays legacy;
-  routed experts (the format refuses rotated banks).
+- A DFlash drafter reads the trunk's layers and its rotated table and head through the shell (`lmHeadForeign`).
+- Not served: routed experts (the format refuses rotated banks).
 
 ## The row from the root architecture table
 
