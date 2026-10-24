@@ -1442,7 +1442,7 @@ test {
     _ = @import("../../sdk/blocks/linear/qmv_rows.zig");
     _ = @import("../../sdk/blocks/linear/prefill_dq_gemm.zig");
     _ = @import("../../sdk/blocks/moe/verify_kernels.zig");
-    _ = @import("../../sdk/quant/exl3.zig");
+    _ = @import("load/exl3_bank.zig");
     _ = @import("../../plugins/hy_v3/load.zig");
     _ = @import("../../plugins/bailing_hybrid/load.zig");
     _ = @import("modules/mlx_stream.zig");
