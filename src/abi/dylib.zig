@@ -44,6 +44,8 @@ pub const Manifest = extern struct {
     claims: Span(Str) = .{},
     fixture: *const fn (out: *Fixture) callconv(.c) Verdict,
     fixture_free: *const fn (f: *Fixture) callconv(.c) void,
+    /// The plugin's own version (its root's `version`), shown at install and in Settings; "" when it declares none.
+    plugin_version: Str = .{},
 };
 
 /// The two fields every table opens with.

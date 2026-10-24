@@ -107,7 +107,7 @@ fn lossyUnserved(config: *const ModelConfig) ?[]const u8 {
 pub fn declineLossy(a: std.mem.Allocator, config: *ModelConfig) bool {
     const b = config.plugin orelse return false;
     const what = lossyUnserved(config) orelse return false;
-    if (served.legacyRemoved(config.model_type)) return false;
+    if (served.legacyRemoved(config.model_type) or b.outside) return false;
     log.info("[plugin] {s}: {s} is on, which the plugin does not run; the legacy path loads it\n", .{ b.table.name.slice(), what });
     b.destroy(a);
     config.plugin = null;

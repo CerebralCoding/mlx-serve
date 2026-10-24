@@ -10,6 +10,7 @@ const common = @import("../../abi/common.zig");
 const dylib_abi = @import("../../abi/dylib.zig");
 const sdk_plugin = @import("../../sdk/plugin.zig");
 const log = @import("../log.zig");
+const FsPackDir = @import("../registry/pack_dir.zig").FsPackDir;
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -34,13 +35,37 @@ pub fn readSettings(io: std.Io, a: Allocator, path: []const u8) Settings {
     return std.json.parseFromSliceLeaky(Settings, a, bytes, .{ .ignore_unknown_fields = true }) catch .{};
 }
 
-/// What `plugin install` records beside `<name>.dylib` as `<name>.json`.
+/// What `plugin install` records beside `<name>.dylib` as `<name>.json` (the app's Settings lists these).
 pub const Receipt = struct {
     name: []const u8,
     kind: []const u8,
+    /// The plugin's own version (its root's `version`), "" when it declares none.
+    version: []const u8 = "",
     sha256: []const u8,
+    /// Who signed the file, as `codesign` reports it (`signatureOf`).
+    signature: []const u8 = "",
     source: []const u8 = "",
 };
+
+/// The signer of a code-signed file from `codesign -dvv`'s report: its first `Authority=` (with the team), "ad-hoc", or
+/// "unsigned".
+pub fn signatureFromReport(report: []const u8) []const u8 {
+    var it = std.mem.splitScalar(u8, report, '\n');
+    while (it.next()) |line| {
+        if (std.mem.startsWith(u8, line, "Authority=")) return line["Authority=".len..];
+        if (std.mem.eql(u8, line, "Signature=adhoc")) return "ad-hoc";
+    }
+    return "unsigned";
+}
+
+/// The signer of the file at `path` (`signatureFromReport`); "unknown" where `codesign` cannot run. Use an arena: the
+/// result is in `a` or static.
+pub fn signatureOf(io: std.Io, a: Allocator, path: []const u8) []const u8 {
+    if (builtin.os.tag != .macos) return "unknown";
+    const r = std.process.run(a, io, .{ .argv = &.{ "/usr/bin/codesign", "-dvv", path } }) catch return "unknown";
+    // codesign reports on stderr.
+    return signatureFromReport(r.stderr);
+}
 
 pub const Plugin = struct {
     /// The installed file.
@@ -51,6 +76,9 @@ pub const Plugin = struct {
 
     pub fn name(self: Plugin) []const u8 {
         return self.manifest.name.slice();
+    }
+    pub fn version(self: Plugin) []const u8 {
+        return self.manifest.plugin_version.slice();
     }
     pub fn entry(self: Plugin) sdk_plugin.Entry {
         const m = self.manifest;
@@ -186,9 +214,9 @@ pub fn outsideWinner(builtins: []const sdk_plugin.Entry, outside: []const sdk_pl
     for (builtins) |e| {
         if (replaced(e.plugin.name, outside)) continue;
         var one: [1]common.Claim = undefined;
-        top = @max(top, @intFromEnum(sdk_plugin.claimsOf(&.{e}, model_type, config_json, dir, &one)[0]));
+        top = @max(top, @backingInt(sdk_plugin.claimsOf(&.{e}, model_type, config_json, dir, &one)[0]));
     }
-    return if (@intFromEnum(got[i]) > top) i else null;
+    return if (@backingInt(got[i]) > top) i else null;
 }
 
 fn replaced(name: []const u8, outside: []const sdk_plugin.Entry) bool {
@@ -198,17 +226,47 @@ fn replaced(name: []const u8, outside: []const sdk_plugin.Entry) bool {
 
 // ── the process's set ──
 
+const State = struct { set: Set = .{}, builtins: []const sdk_plugin.Entry = &.{} };
 /// Set once at startup, before any server thread; read-only after.
-var process: Set = .{};
+const process = @import("../../sdk/util/shared.zig").Shared(State, "outside_plugins", .{});
 
 /// The outside plugins this process loaded.
 pub fn loaded() []const Plugin {
-    return process.plugins.items;
+    return process.get().set.plugins.items;
 }
 
 /// Their registry entries, in `loaded()` order.
 pub fn entries() []const sdk_plugin.Entry {
-    return process.entries.items;
+    return process.get().set.entries.items;
+}
+
+/// The loaded outside plugin that serves a pack over the built-ins (`outsideWinner`), or null (at once when none
+/// is loaded).
+pub fn winner(model_type: []const u8, config_json: []const u8, dir: *const common.PackDir) ?*const Plugin {
+    const st = process.get();
+    const i = outsideWinner(st.builtins, st.set.entries.items, model_type, config_json, dir) orelse return null;
+    return &st.set.plugins.items[i];
+}
+
+/// The name of the loaded outside plugin serving the pack at absolute `path` (its `/v1/models` badge), or null.
+pub fn servingName(io: std.Io, path: []const u8) ?[]const u8 {
+    if (loaded().len == 0) return null;
+    var fs = FsPackDir.open(io, path) catch return null;
+    defer fs.close();
+    const dir = fs.packDir();
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const n = dir.fileBytes("config.json");
+    var why: common.Verdict = .{};
+    const cfg: []const u8 = if (n == 0 or n > 4 << 20) "" else dir.readFile("config.json", arena.allocator().alloc(u8, @intCast(n)) catch return null, &why) orelse "";
+    const mt = sdk_plugin.modelTypeOf(arena.allocator(), cfg) catch return null;
+    return (winner(mt, cfg, &dir) orelse return null).name();
+}
+
+/// The loaded outside plugin whose table is `table`, or null (a built-in's).
+pub fn ownerOf(table: *const anyopaque) ?*const Plugin {
+    for (process.get().set.plugins.items) |*p| if (p.manifest.table == table) return p;
+    return null;
 }
 
 /// `~/.mlx-serve/<rel>`.
@@ -230,12 +288,14 @@ pub fn loadAtStartup(io: std.Io, a: Allocator, builtins: []const sdk_plugin.Entr
         return;
     }
     const dir = homePath(arena.allocator(), "plugins") catch return;
-    process = loadDir(io, a, dir, settings, host_mlx) catch |e| {
+    const st = process.get();
+    st.builtins = builtins;
+    st.set = loadDir(io, a, dir, settings, host_mlx) catch |e| {
         log.warn("[plugins] {s}: {t}\n", .{ dir, e });
         return;
     };
-    for (process.refused.items) |r| log.warn("[plugins] refused {s}: {s}\n", .{ r.path, r.why });
-    for (process.plugins.items) |p| {
+    for (st.set.refused.items) |r| log.warn("[plugins] refused {s}: {s}\n", .{ r.path, r.why });
+    for (st.set.plugins.items) |p| {
         log.info("[plugins] loaded {s} ({t}, sha256 {s}) from {s}\n", .{ p.name(), p.manifest.kind, p.sha256[0..12], p.path });
         for (builtins) |e| if (std.mem.eql(u8, e.plugin.name, p.name())) log.info("[plugins] {s} replaces the built-in plugin of that name\n", .{p.name()});
     }
@@ -326,4 +386,10 @@ test "outside plugins: a dylib without a receipt, with a changed hash, or not a 
     try testing.expectEqualStrings("has no install receipt: install it with `mlx-serve plugin install`", set.refused.items[0].why);
     try testing.expectEqualStrings("changed since it was installed (hash differs from its receipt)", set.refused.items[1].why);
     try testing.expect(std.mem.startsWith(u8, set.refused.items[2].why, "does not load: "));
+}
+
+test "plugin signature: codesign's report reads as its first authority, ad-hoc or unsigned" {
+    try testing.expectEqualStrings("Developer ID Application: Jane Doe (ABCDE12345)", signatureFromReport("Executable=/x\nIdentifier=x\nAuthority=Developer ID Application: Jane Doe (ABCDE12345)\nAuthority=Developer ID Certification Authority\nTeamIdentifier=ABCDE12345\n"));
+    try testing.expectEqualStrings("ad-hoc", signatureFromReport("Executable=/x\nSignature=adhoc\nTeamIdentifier=not set\n"));
+    try testing.expectEqualStrings("unsigned", signatureFromReport("/x: code object is not signed at all\n"));
 }

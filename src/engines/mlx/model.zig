@@ -1806,6 +1806,7 @@ fn parseConfigWith(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     // only for a type the legacy parse cannot read.
     const binding = if (served) try plugin_config.bindServed(io, allocator, model_dir, content) else null;
     errdefer if (binding) |b| b.destroy(allocator);
+    if (binding) |b| if (b.outside) return plugin_config.adapted(b);
     var config = parseConfigFromJson(allocator, content) catch |e| {
         const b = binding orelse return e;
         log.info("[plugin] {s}: the legacy parse refused {s} ({s}); the engine config is the plugin's facts\n", .{ b.table.name.slice(), b.parsed.shell.model_type.slice(), @errorName(e) });

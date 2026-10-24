@@ -11,7 +11,7 @@ const Str = common.Str;
 const Verdict = common.Verdict;
 
 /// The manifest of plugin root `M` (the same root contract as a built-in: `plugin`, `table`, `config`,
-/// `conformanceFixture`) built against MLX `mlx_pin`.
+/// `conformanceFixture`, and optionally `version`) built against MLX `mlx_pin`.
 pub fn Manifest(comptime M: type, comptime mlx_pin: []const u8) type {
     comptime sdk_plugin.check(M, M.plugin.name);
     return struct {
@@ -33,6 +33,7 @@ pub fn Manifest(comptime M: type, comptime mlx_pin: []const u8) type {
             .claims = .of(&claims),
             .fixture = &fixtureOf,
             .fixture_free = &fixtureFree,
+            .plugin_version = Str.of(if (@hasDecl(M, "version")) M.version else ""),
         };
 
         const Owned = struct { arena: std.heap.ArenaAllocator };

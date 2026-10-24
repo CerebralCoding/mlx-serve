@@ -1,6 +1,7 @@
 //! The `/v1/models` row fields clients used to derive for themselves: `agent_budget` (what an agent CLI declares,
-//! `launch/budget.zig`), `modality` (which create pane a media pack opens in) and `engines` (what can serve the pack:
-//! the Model Settings engine picker's choices). The same fields on a ready row and an unloaded stub.
+//! `launch/budget.zig`), `modality` (which create pane a media pack opens in), `engines` (what can serve the pack:
+//! the Model Settings engine picker's choices) and `plugin` (the outside plugin serving it, a badge). The same fields
+//! on a ready row and an unloaded stub.
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -14,6 +15,7 @@ const llama_engine = @import("../../engines/llama/engine.zig");
 const ane_engine = @import("../../engines/ane/engine.zig");
 const ane_lm = @import("../../engines/ane/lm.zig");
 const ane_rt = @import("../../engines/ane/rt.zig");
+const outside = @import("../plugins/loader.zig");
 
 pub const Engine = @import("../registry/model_settings.zig").Engine;
 pub const Engines = std.EnumSet(Engine);
@@ -53,9 +55,9 @@ fn accepts(probe: anytype, path: []const u8) bool {
     return probe(abi.span(u8, path), abi.span(u8, ""), &verdict);
 }
 
-/// `,"agent_budget":{…},"modality":"…","engines":[…]`: the budget only on a row serving chat (`chat_ctx` its
-/// advertised context, 0 when unknown), the modality only on a media row.
-pub fn write(allocator: std.mem.Allocator, out: *std.ArrayList(u8), chat_ctx: ?u64, modality_name: ?[]const u8, engines: Engines) !void {
+/// `,"agent_budget":{…},"modality":"…","engines":[…],"plugin":"…"`: the budget only on a row serving chat (`chat_ctx`
+/// its advertised context, 0 when unknown), the modality only on a media row, the plugin only on an outside plugin's.
+pub fn write(allocator: std.mem.Allocator, out: *std.ArrayList(u8), chat_ctx: ?u64, modality_name: ?[]const u8, engines: Engines, plugin: ?[]const u8) !void {
     if (chat_ctx) |ctx| {
         var buf: [256]u8 = undefined;
         try out.print(allocator, ",\"agent_budget\":{s}", .{agent_budget.json(&buf, ctx)});
@@ -70,6 +72,8 @@ pub fn write(allocator: std.mem.Allocator, out: *std.ArrayList(u8), chat_ctx: ?u
         try out.print(allocator, "\"{s}\"", .{@tagName(e)});
     }
     try out.append(allocator, ']');
+    // A plugin name is [a-z0-9_] (`abi.dylib.validName`): no escaping.
+    if (plugin) |p| try out.print(allocator, ",\"plugin\":\"{s}\"", .{p});
 }
 
 /// The facts of one registry entry, its engines answered once (`LoadedModel.engines`). Registry mutex held.
@@ -77,7 +81,7 @@ pub fn forEntry(allocator: std.mem.Allocator, io: std.Io, entry: anytype, model_
     if (entry.engines == null) entry.engines = enginesFor(io, allocator, entry.path, model_type, mlx_gguf).bits.mask;
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
-    try write(allocator, &out, chat_ctx, modalityName(io, entry.path, model_type), .{ .bits = .{ .mask = @intCast(entry.engines.?) } });
+    try write(allocator, &out, chat_ctx, modalityName(io, entry.path, model_type), .{ .bits = .{ .mask = @intCast(entry.engines.?) } }, outside.servingName(io, entry.path));
     return out.toOwnedSlice(allocator);
 }
 
@@ -85,19 +89,19 @@ pub fn forEntry(allocator: std.mem.Allocator, io: std.Io, entry: anytype, model_
 
 const t = std.testing;
 
-test "write: the budget on chat rows, the modality on media rows, the engines on every row" {
+test "write: the budget on chat rows, the modality on media rows, the engines on every row, an outside plugin's badge" {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(t.allocator);
     var two = Engines.empty;
     two.insert(.ane);
     two.insert(.mlx);
-    try write(t.allocator, &out, 24576, null, two);
+    try write(t.allocator, &out, 24576, null, two, null);
     try t.expectEqualStrings(",\"agent_budget\":{\"context\":24576,\"output\":12288,\"compaction_reserve\":6144,\"too_small_for\":{\"claude\":65536,\"opencode\":32768,\"opencode2\":32768}},\"engines\":[\"mlx\",\"ane\"]", out.items);
     out.clearRetainingCapacity();
-    try write(t.allocator, &out, null, "3d", Engines.initOne(.mlx));
-    try t.expectEqualStrings(",\"modality\":\"3d\",\"engines\":[\"mlx\"]", out.items);
+    try write(t.allocator, &out, null, "3d", Engines.initOne(.mlx), "toy_3d");
+    try t.expectEqualStrings(",\"modality\":\"3d\",\"engines\":[\"mlx\"],\"plugin\":\"toy_3d\"", out.items);
     out.clearRetainingCapacity();
-    try write(t.allocator, &out, 0, null, Engines.empty);
+    try write(t.allocator, &out, 0, null, Engines.empty, null);
     try t.expectEqualStrings(",\"agent_budget\":{\"context\":32768,\"output\":8192,\"compaction_reserve\":8192,\"too_small_for\":{\"claude\":65536}},\"engines\":[]", out.items);
 }
 

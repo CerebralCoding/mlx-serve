@@ -9,19 +9,27 @@ const sdk_dylib = @import("../../sdk/dylib.zig");
 const conformance = @import("../../sdk/testing/conformance.zig");
 const loader = @import("loader.zig");
 const log = @import("../log.zig");
+const common = @import("../../abi/common.zig");
+const model_abi = @import("../../abi/plugin.zig");
+const sdk_plugin = @import("../../sdk/plugin.zig");
+const FsPackDir = @import("../registry/pack_dir.zig").FsPackDir;
 
 const Allocator = std.mem.Allocator;
 
 pub const usage =
     \\usage: mlx-serve plugin new <name> [--media|--quant] [--kit <dir>] [--dir <parent>]
-    \\       mlx-serve plugin check <file.dylib | plugin folder>
+    \\       mlx-serve plugin check <file.dylib | plugin folder> [--model <dir>]
+    \\       mlx-serve plugin fixture <file.dylib | plugin folder> <dir>
     \\       mlx-serve plugin install <file.dylib> [--yes]
     \\
     \\  new      A plugin folder from the kit's example (model, or --media / --quant). The kit is the
     \\           release's mlx-serve-plugin-kit tarball, extracted to --kit, $MLX_SERVE_KIT or ~/.mlx-serve/kit.
-    \\  check    Loads the dylib (a folder: its zig-out/lib/*.dylib) and runs the conformance suite on its fixture.
-    \\  install  Copies it into ~/.mlx-serve/plugins/ with a receipt of its hash. A downloaded (quarantined) file
-    \\           installs only with --yes. Plugins load at startup once plugins.json has "enabled": true.
+    \\  check    Loads the dylib (a folder: its zig-out/lib/*.dylib) and runs the conformance suite on its fixture;
+    \\           with --model, also has it claim and parse the pack in <dir>.
+    \\  fixture  Writes the plugin's own tiny pack (its conformance fixture) into <dir>, to serve.
+    \\  install  Copies it into ~/.mlx-serve/plugins/ with a receipt of its hash and signature. A downloaded
+    \\           (quarantined) file installs only once you confirm (--yes confirms). Plugins load at startup once
+    \\           Settings (~/.mlx-serve/plugins.json) switches them on.
     \\
 ;
 
@@ -54,25 +62,47 @@ pub fn cmdPlugin(gpa: Allocator, io: std.Io, args: []const []const u8) !void {
         const dest = new(io, a, args[1], kind, kit_dir, parent) catch |e| return fail("plugin new: {s}", .{newError(e)});
         try out(io, "created {s}: `zig build` there writes zig-out/lib/lib{s}.dylib; `mlx-serve plugin check {s}` tests it\n", .{ dest, args[1], dest });
     } else if (std.mem.eql(u8, cmd, "check")) {
-        const plugin = openForCheck(io, a, args[1]) catch |e| return fail("plugin check: {s}: {t}", .{ args[1], e });
-        const p = switch (plugin) {
-            .ok => |p| p,
-            .refused => |why| return fail("plugin check: {s}: {s}", .{ args[1], why }),
-        };
+        var model: ?[]const u8 = null;
+        var i: usize = 2;
+        while (i < args.len) : (i += 1) {
+            if (i + 1 < args.len and std.mem.eql(u8, args[i], "--model")) {
+                i += 1;
+                model = args[i];
+            } else return fail("plugin check: unknown argument '{s}'\n{s}", .{ args[i], usage });
+        }
+        const p = try opened(io, a, "check", args[1]);
         checkPlugin(io, a, p) catch return fail("plugin check: {s} fails the conformance suite (above)", .{p.name()});
         try out(io, "{s} ({t}) passes the conformance suite\n", .{ p.name(), p.manifest.kind });
+        if (model) |dir| {
+            const what = checkPack(io, a, p, dir) catch |e| return fail("plugin check: {s} on {s}: {s}", .{ p.name(), dir, packError(e) });
+            try out(io, "{s} claims and parses {s}: {s}\n", .{ p.name(), dir, what });
+        }
+    } else if (std.mem.eql(u8, cmd, "fixture")) {
+        if (args.len != 3) return fail("{s}", .{usage});
+        const p = try opened(io, a, "fixture", args[1]);
+        writeFixture(io, a, p, args[2]) catch |e| return fail("plugin fixture: {s} into {s}: {t}", .{ p.name(), args[2], e });
+        try out(io, "wrote {s}'s fixture pack to {s}\n", .{ p.name(), args[2] });
     } else if (std.mem.eql(u8, cmd, "install")) {
         var yes = false;
         for (args[2..]) |arg| {
             if (std.mem.eql(u8, arg, "--yes")) yes = true else return fail("plugin install: unknown argument '{s}'\n{s}", .{ arg, usage });
         }
         const dir = try loader.homePath(a, "plugins");
-        const got = install(io, a, args[1], dir, yes) catch |e| return fail("plugin install: {s}: {t}", .{ args[1], e });
+        const got = install(io, a, args[1], dir, if (yes) &confirmed else &askUser) catch |e| return fail("plugin install: {s}: {t}", .{ args[1], e });
         switch (got) {
-            .ok => |p| try out(io, "installed {s} ({t}) as {s}, sha256 {s}; it loads at the next start when plugins.json has \"enabled\": true\n", .{ p.name(), p.manifest.kind, p.path, p.sha256 }),
+            .ok => |r| try out(io, "installed {s} {s} ({s}) into {s}\n  sha256    {s}\n  signature {s}\nit loads at the next start once Settings switches plugins on\n", .{ r.name, r.version, r.kind, dir, r.sha256, r.signature }),
             .refused => |why| return fail("plugin install: {s}: {s}", .{ args[1], why }),
         }
     } else return fail("{s}", .{usage});
+}
+
+/// The dylib at `path` (or a plugin folder's), opened and negotiated, or the command's failure.
+fn opened(io: std.Io, a: Allocator, comptime cmd: []const u8, path: []const u8) !loader.Plugin {
+    const got = openForCheck(io, a, path) catch |e| return fail("plugin " ++ cmd ++ ": {s}: {t}", .{ path, e });
+    return switch (got) {
+        .ok => |p| p,
+        .refused => |why| fail("plugin " ++ cmd ++ ": {s}: {s}", .{ path, why }),
+    };
 }
 
 fn fail(comptime fmt: []const u8, args: anytype) error{PluginCommand} {
@@ -204,6 +234,62 @@ pub fn checkPlugin(io: std.Io, gpa: Allocator, p: loader.Plugin) !void {
     });
 }
 
+/// Whether `p` claims the pack in `dir` and parses it (stub and full): a one-line summary, or why not.
+pub fn checkPack(io: std.Io, a: Allocator, p: loader.Plugin, dir: []const u8) ![]const u8 {
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = std.Io.Dir.cwd().realPathFile(io, dir, &abs_buf) catch return error.NoPack;
+    var fs = FsPackDir.open(io, abs_buf[0..n]) catch return error.NoPack;
+    defer fs.close();
+    const pd = fs.packDir();
+    const cfg = std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ dir, "config.json" }), a, .limited(4 << 20)) catch "";
+    const mt = try sdk_plugin.modelTypeOf(a, cfg);
+    const e = p.entry();
+    var claim: [1]common.Claim = undefined;
+    if (sdk_plugin.claimsOf(&.{e}, mt, cfg, &pd, &claim)[0] == .no) return error.NotClaimed;
+    const t = e.model orelse return std.fmt.allocPrint(a, "claimed ({t})", .{claim[0]});
+    for ([_]bool{ true, false }) |stub| {
+        var parsed: model_abi.Parsed = .{};
+        const v = t.parse(&pd, .of(cfg), .{}, null, stub, &parsed);
+        if (!v.isOk()) {
+            log.err("parse: {s}\n", .{v.why.slice()});
+            return error.ParseRefused;
+        }
+        defer t.free_parsed(&parsed);
+        if (!stub) {
+            const sh = parsed.shell;
+            return std.fmt.allocPrint(a, "{s}, {d} layers, hidden {d}, vocab {d} ({t})", .{ sh.model_type.slice(), sh.num_hidden_layers, sh.hidden_size, sh.vocab_size, claim[0] });
+        }
+    }
+    unreachable;
+}
+
+fn packError(e: anyerror) []const u8 {
+    return switch (e) {
+        error.NoPack => "not a readable folder",
+        error.NotClaimed => "it does not claim the pack",
+        error.ParseRefused => "it refuses to parse the pack (above)",
+        else => @errorName(e),
+    };
+}
+
+/// The plugin's conformance fixture as files under `dir` (created).
+pub fn writeFixture(io: std.Io, a: Allocator, p: loader.Plugin, dir: []const u8) !void {
+    var f: dylib_abi.Fixture = .{};
+    const v = p.manifest.fixture(&f);
+    if (!v.isOk()) {
+        log.err("fixture: {s}\n", .{v.why.slice()});
+        return error.NoFixture;
+    }
+    defer p.manifest.fixture_free(&f);
+    var d = try std.Io.Dir.cwd().createDirPathOpen(io, dir, .{});
+    defer d.close(io);
+    for ((try sdk_dylib.filesOf(a, &f)).files) |file| {
+        if (std.fs.path.isAbsolute(file.name) or std.mem.indexOf(u8, file.name, "..") != null) return error.BadFixturePath;
+        if (std.fs.path.dirname(file.name)) |sub| try d.createDirPath(io, sub);
+        try d.writeFile(io, .{ .sub_path = file.name, .data = file.bytes });
+    }
+}
+
 // ── install ──
 
 /// Whether macOS marked the file as downloaded.
@@ -215,45 +301,56 @@ fn quarantined(a: Allocator, path: []const u8) bool {
     return getxattr(z, "com.apple.quarantine", null, 0, 0, 0) >= 0;
 }
 
-/// Copies `src` into `dir` as `<name>.dylib` (a fresh file, so without the quarantine mark, which `yes` confirms
-/// dropping), negotiates it, and writes `<name>.json`, the receipt of its hash.
-pub fn install(io: std.Io, a: Allocator, src: []const u8, dir: []const u8, yes: bool) !loader.Opened {
-    if (!std.mem.endsWith(u8, src, ".dylib")) return .{ .refused = try a.dupe(u8, "not a .dylib") };
-    if (quarantined(a, src) and !yes) return .{ .refused = try a.dupe(u8, "is quarantined (downloaded): check where it came from, then rerun with --yes") };
+/// What the user sees before a downloaded file is installed: nothing of it has run yet.
+pub const Pending = struct { path: []const u8, sha256: []const u8, signature: []const u8 };
+pub const Confirm = *const fn (io: std.Io, f: Pending) bool;
+
+fn confirmed(_: std.Io, _: Pending) bool {
+    return true;
+}
+
+/// Shows the file's hash and signer and asks on the terminal; no terminal is a no.
+fn askUser(io: std.Io, f: Pending) bool {
+    out(io, "{s} was downloaded (quarantined)\n  sha256    {s}\n  signature {s}\nA plugin runs with your rights. Install it? [y/N] ", .{ f.path, f.sha256, f.signature }) catch return false;
+    if (!(std.Io.File.stdin().isTty(io) catch false)) return false;
+    var buf: [64]u8 = undefined;
+    var r = std.Io.File.stdin().reader(io, &buf);
+    const line = (r.interface.takeDelimiter('\n') catch return false) orelse return false;
+    const ans = std.mem.trim(u8, line, " \t\r");
+    return std.ascii.eqlIgnoreCase(ans, "y") or std.ascii.eqlIgnoreCase(ans, "yes");
+}
+
+pub const Installed = union(enum) { ok: loader.Receipt, refused: []const u8 };
+
+/// Copies `src` into `dir` as `<name>.dylib` (a fresh file, without the quarantine mark), negotiates it, and writes
+/// `<name>.json`, its receipt. A quarantined `src` is confirmed (`confirm`) before anything of it is opened. `a`
+/// should be an arena.
+pub fn install(io: std.Io, a: Allocator, src: []const u8, dir: []const u8, confirm: Confirm) !Installed {
+    if (!std.mem.endsWith(u8, src, ".dylib")) return .{ .refused = "not a .dylib" };
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, src, a, .limited(1 << 30));
-    defer a.free(bytes);
     const hash = loader.sha256Hex(bytes);
+    const signature = loader.signatureOf(io, a, src);
+    if (quarantined(a, src) and !confirm(io, .{ .path = src, .sha256 = &hash, .signature = signature }))
+        return .{ .refused = "is quarantined (downloaded) and was not confirmed: check where it came from, then rerun with --yes" };
     var plugins = try std.Io.Dir.cwd().createDirPathOpen(io, dir, .{});
     defer plugins.close(io);
     var rnd: [8]u8 = undefined;
     io.random(&rnd);
     const tmp_name = try std.fmt.allocPrint(a, ".install-{x}.dylib", .{std.mem.readInt(u64, &rnd, .little)});
-    defer a.free(tmp_name);
     try plugins.writeFile(io, .{ .sub_path = tmp_name, .data = bytes });
-    const tmp = try std.fs.path.join(a, &.{ dir, tmp_name });
-    defer a.free(tmp);
-    var got = try loader.open(a, tmp, hash, hostMlx());
-    const p = switch (got) {
-        .ok => |*p| p,
-        .refused => {
+    const p = switch (try loader.open(a, try std.fs.path.join(a, &.{ dir, tmp_name }), hash, hostMlx())) {
+        .ok => |p| p,
+        .refused => |why| {
             plugins.deleteFile(io, tmp_name) catch {};
-            return got;
+            return .{ .refused = why };
         },
     };
-    const name = p.name();
-    const file = try std.fmt.allocPrint(a, "{s}.dylib", .{name});
-    defer a.free(file);
-    try plugins.rename(tmp_name, plugins, file, io);
-    a.free(p.path);
-    p.path = try std.fs.path.join(a, &.{ dir, file });
+    try plugins.rename(tmp_name, plugins, try std.fmt.allocPrint(a, "{s}.dylib", .{p.name()}), io);
     var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
     const source = if (std.Io.Dir.cwd().realPathFile(io, src, &abs_buf)) |n| abs_buf[0..n] else |_| src;
-    const receipt = try std.json.Stringify.valueAlloc(a, loader.Receipt{ .name = name, .kind = @tagName(p.manifest.kind), .sha256 = &hash, .source = source }, .{});
-    defer a.free(receipt);
-    const receipt_name = try std.fmt.allocPrint(a, "{s}.json", .{name});
-    defer a.free(receipt_name);
-    try plugins.writeFile(io, .{ .sub_path = receipt_name, .data = receipt });
-    return got;
+    const receipt: loader.Receipt = .{ .name = p.name(), .kind = @tagName(p.manifest.kind), .version = p.version(), .sha256 = try a.dupe(u8, &hash), .signature = signature, .source = try a.dupe(u8, source) };
+    try plugins.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}.json", .{p.name()}), .data = try std.json.Stringify.valueAlloc(a, receipt, .{}) });
+    return .{ .ok = receipt };
 }
 
 // ── tests ──
@@ -277,24 +374,47 @@ test "plugin new: the manifest's fingerprint carries the name's checksum, as Zig
     try testing.expect(std.mem.indexOf(u8, text, ".path = \"../k\"") != null and std.mem.indexOf(u8, text, ".name = .toy,") != null);
 }
 
+fn declined(_: std.Io, _: Pending) bool {
+    return false;
+}
+
 test "plugin install: a file that is not a plugin is refused and leaves nothing behind" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = buf[0..try tmp.dir.realPath(testing.io, &buf)];
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "junk.dylib", .data = "junk" });
-    const src = try std.fs.path.join(testing.allocator, &.{ root, "junk.dylib" });
-    defer testing.allocator.free(src);
-    const dir = try std.fs.path.join(testing.allocator, &.{ root, "plugins" });
-    defer testing.allocator.free(dir);
-    const got = try install(testing.io, testing.allocator, src, dir, false);
-    defer testing.allocator.free(got.refused);
+    const dir = try std.fs.path.join(a, &.{ root, "plugins" });
+    const got = try install(testing.io, a, try std.fs.path.join(a, &.{ root, "junk.dylib" }), dir, &confirmed);
     try testing.expect(std.mem.startsWith(u8, got.refused, "does not load: "));
     var plugins = try tmp.dir.openDir(testing.io, "plugins", .{ .iterate = true });
     defer plugins.close(testing.io);
     var it = plugins.iterate();
     try testing.expect(try it.next(testing.io) == null);
-    const txt = try install(testing.io, testing.allocator, root, dir, false);
-    defer testing.allocator.free(txt.refused);
-    try testing.expectEqualStrings("not a .dylib", txt.refused);
+    try testing.expectEqualStrings("not a .dylib", (try install(testing.io, a, root, dir, &confirmed)).refused);
+}
+
+test "plugin install: a quarantined file the user declines is refused before it is copied or opened" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(testing.io, &buf)];
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "dl.dylib", .data = "junk" });
+    const src = try std.fs.path.join(a, &.{ root, "dl.dylib" });
+    const setxattr = @extern(*const fn ([*:0]const u8, [*:0]const u8, *const anyopaque, usize, u32, c_int) callconv(.c) c_int, .{ .name = "setxattr" });
+    const mark = "0081;00000000;Safari;";
+    try testing.expectEqual(@as(c_int, 0), setxattr(try a.dupeSentinel(u8, src, 0), "com.apple.quarantine", mark, mark.len, 0, 0));
+    const dir = try std.fs.path.join(a, &.{ root, "plugins" });
+    const got = try install(testing.io, a, src, dir, &declined);
+    try testing.expect(std.mem.startsWith(u8, got.refused, "is quarantined"));
+    try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, "plugins", .{}));
+    // Confirmed, it goes on to be opened (and this one is not a plugin).
+    try testing.expect(std.mem.startsWith(u8, (try install(testing.io, a, src, dir, &confirmed)).refused, "does not load: "));
 }

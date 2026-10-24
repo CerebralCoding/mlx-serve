@@ -8,6 +8,9 @@ const c = @import("mlx_c");
 const abi = kit.abi.media;
 pub const config = @import("config.zig");
 
+/// Shown at install and in Settings.
+pub const version = "0.1.0";
+
 pub const plugin = kit.sdk.Plugin{
     .name = "_example_media",
     .kind = .media,

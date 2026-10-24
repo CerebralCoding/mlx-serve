@@ -22,6 +22,8 @@ const mtp = @import("../../sdk/spec/mtp/mtp.zig");
 const served_media = @import("../media_jobs/plugin/served.zig");
 const modality = @import("modality.zig");
 const served_plugin = @import("../../engines/mlx/plugin/config.zig");
+const outside_plugins = @import("../plugins/loader.zig");
+const FsPackDir = @import("pack_dir.zig").FsPackDir;
 
 /// Architecture allow-list for discovery. Must stay in sync with the
 /// `model_type` branches in `model.zig:parseConfigFromJson`. Discovery
@@ -179,7 +181,8 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
     if (dflash.isDflashConfigJson(root)) return .drafter;
     const mt_val = root.get("model_type") orelse return .missing_or_unparseable;
     if (mt_val != .string) return .missing_or_unparseable;
-    if (!isSupportedModelType(mt_val.string)) {
+    const fs: FsPackDir = .{ .io = io, .root = sub };
+    if (!isSupportedModelType(mt_val.string) and outside_plugins.winner(mt_val.string, bytes, &fs.packDir()) == null) {
         const dup = allocator.dupe(u8, mt_val.string) catch return .missing_or_unparseable;
         return .{ .unsupported_arch = dup };
     }

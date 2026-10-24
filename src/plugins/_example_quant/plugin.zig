@@ -7,6 +7,9 @@ const abi = kit.abi.quant;
 const sdk = kit.sdk;
 pub const config = @import("config.zig");
 
+/// Shown at install and in Settings.
+pub const version = "0.1.0";
+
 pub const plugin = sdk.Plugin{ .name = "_example_quant", .kind = .quant };
 
 pub const table = abi.QuantTable{
