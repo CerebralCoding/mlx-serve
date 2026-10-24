@@ -163,7 +163,8 @@ pub fn moeVerifyRows(self: *Trunk, inputs: []const mlx.mlx_array, mw: *const Moe
     if (!mlx.streamIsGpu(self.s) or !moeRouterFusedEnabled() or
         inputs.len < 2 or inputs.len > 8 or self.config.hidden_size < 32 or self.config.num_experts_per_tok >= 32 or
         mw.shared_expert_gate_w == null or qwen4Standin().moe_shared or
-        self.config.num_experts == 0 or self.config.num_experts_per_tok == 0)
+        self.config.num_experts == 0 or self.config.num_experts_per_tok == 0 or
+        mw.expert_bias != null or mw.router_scale != null or mw.per_expert_scale != null)
     {
         return self.moeVerifyRowsSolo(inputs, mw);
     }
@@ -378,6 +379,18 @@ pub fn moeMLP2WithRouter(self: *Trunk, router_x: mlx.mlx_array, expert_x_in: mlx
         try mlx.check(mlx.mlx_astype(&cast_scores, norm_scores, mlx.mlx_array_dtype(expert_x), self.s));
         _ = mlx.mlx_array_free(norm_scores);
         norm_scores = cast_scores;
+    }
+
+    // A per-expert routing scale (ModelOpt NVFP4: each expert's up x down `weight_scale_2`) multiplies the
+    // selected experts' weights; it stays outside the compiled router (per-layer weights).
+    if (mw.per_expert_scale) |pes| {
+        var selected_scales = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(selected_scales);
+        try mlx.check(mlx.mlx_take(&selected_scales, pes, inds, self.s));
+        var scaled_scores = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_multiply(&scaled_scores, norm_scores, selected_scales, self.s));
+        _ = mlx.mlx_array_free(norm_scores);
+        norm_scores = scaled_scores;
     }
 
     if (cfg.exl3) |spec| {
