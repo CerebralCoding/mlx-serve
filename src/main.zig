@@ -18,6 +18,7 @@ pub const mtp_acceptance = @import("engines/mlx/spec/mtp_acceptance.zig");
 /// The EXL3 quant format, for the plugins that reach it through their host root (`mlx_host`).
 pub const exl3 = @import("sdk/quant/exl3/format.zig");
 pub const dsa_nax = @import("plugins/glm5_next/dsa_nax.zig");
+pub const fp8_block128_gemv = @import("sdk/quant/fp8_block128_gemv.zig");
 comptime {
     // The plugins' host surface: plugin_host.zig's list, every name re-exported here.
     @import("plugin_host_check.zig").reexports(@This());

@@ -1,34 +1,107 @@
 //! `fp8_block128`: a release's FP8 projections as shipped. A projection is e4m3fn codes, U8 `[out, in]` `.weight`, with
 //! one f32 scale per 64 output rows x 128 input columns, F32 `[ceil(out / 64), ceil(in / 128)]` `.weight_scale_inv`;
 //! value = code x scale (MiMo-V2.6-Flash's fp8res pack, `{"mode":"fp8_e4m3","bits":8,"block":[64,128]}` per site). The
-//! read is the stream's prompt route (`mimo_v2/stream/fp8_linear.zig`): the weight as bf16(code x scale), one f32
-//! product and one BF16 rounding, under MLX's matmul. Not a built-in yet (`formats.tables`): no pack loads through it.
+//! read (`linear`, the shared Linear's arm for a U8 weight beside its F32 scale grid): up to 8 bf16 rows, one GEMV
+//! (`kernels/linear/fp8_block128_gemv.metal`, f32 code x scale, no weight rounding; its plan in `fp8_block128_gemv.zig`);
+//! wider, the weight as bf16(code x scale) (one f32 product, one BF16 rounding) under MLX's matmul. Packs declare it per
+//! projection inside an MLX `quantization` block, so `native` loads it; this table serves a block that names it alone.
 
 const std = @import("std");
 const abi = @import("../../abi/quant.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const native = @import("native.zig");
+const plan = @import("fp8_block128_gemv.zig");
+const kernelSource = @import("../../mlx/kernels.zig").source;
 
 const Str = abi.Str;
 const Verdict = abi.Verdict;
 
-pub const block_rows: u32 = 64;
-pub const block_cols: u32 = 128;
+pub const block_rows: u32 = plan.scale_rows;
+pub const block_cols: u32 = plan.scale_cols;
+
+const header = kernelSource("kernels/linear/fp8_block128_header.metal");
+const gemv_source = kernelSource("kernels/linear/fp8_block128_gemv.metal");
+const dequant_source = kernelSource("kernels/linear/fp8_block128_dequant.metal");
+
+/// U8 e4m3 codes `[out, in]` beside an F32 scale grid `[ceil(out / 64), ceil(in / 128)]` (Sushi's row-scaled e4m3 has
+/// one scale row per code row).
+pub fn isBlockScaled(w: mlx.mlx_array, sc: mlx.mlx_array) bool {
+    if (w.ctx == null or sc.ctx == null) return false;
+    if (mlx.mlx_array_dtype(w) != .uint8 or mlx.mlx_array_dtype(sc) != .float32) return false;
+    const ws = mlx.getShape(w);
+    const ss = mlx.getShape(sc);
+    return ws.len == 2 and ss.len == 2 and ws[0] > 1 and
+        ss[0] == @divFloor(ws[0] + block_rows - 1, block_rows) and ss[1] == @divFloor(ws[1] + block_cols - 1, block_cols);
+}
+
+/// The kernels, made once on first use (inference thread).
+var gemv_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var dequant_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+fn kernel(slot: *?mlx.mlx_fast_metal_kernel, name: [*:0]const u8, ins: []const [*:0]const u8, out: [*:0]const u8, source: [*:0]const u8) !mlx.mlx_fast_metal_kernel {
+    if (slot.*) |k| return k;
+    const in_vec = mlx.mlx_vector_string_new_data(ins.ptr, ins.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const outs = [_][*:0]const u8{out};
+    const out_vec = mlx.mlx_vector_string_new_data(&outs, 1);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const k = mlx.mlx_fast_metal_kernel_new(name, in_vec, out_vec, source, header, true, false);
+    if (k.ctx == null) return error.Fp8Block128Kernel;
+    slot.* = k;
+    return k;
+}
+
+fn applyKernel(k: mlx.mlx_fast_metal_kernel, c: mlx.mlx_fast_metal_kernel_config, ins: []const mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    const in_vec = mlx.mlx_vector_array_new_data(ins.ptr, ins.len);
+    defer _ = mlx.mlx_vector_array_free(in_vec);
+    var outs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outs);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, k, in_vec, c, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_vector_array_get(&out, outs, 0));
+    return out;
+}
+
+/// `x @ W^T` for codes `w` `[n, k]` and their scale grid `sc`: the GEMV at up to 8 bf16 rows where its plan covers the
+/// shape, else the prompt route (`matmulInto`). `x` is `[..., k]`.
+pub fn linear(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    const xs = mlx.getShape(x);
+    const ws = mlx.getShape(w);
+    var m: c_int = 1;
+    for (xs[0 .. xs.len - 1]) |d| m *= d;
+    const site = plan.plan(@intCast(ws[0]), @intCast(ws[1]));
+    if (m > plan.max_rows or site == null or mlx.mlx_array_dtype(x) != .bfloat16 or !mlx.streamIsGpu(s)) return matmulInto(w, sc, x, s);
+    const p = plan.planAt(site.?, @intCast(ws[0]), @intCast(ws[1]), @intCast(m));
+    const l = plan.launch(p, ws[0]);
+    const c = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(c);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &[_]c_int{ m, ws[0] }, 2, .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, l.grid[0], l.grid[1], l.grid[2]));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, l.tg[0], l.tg[1], l.tg[2]));
+    for ([_]struct { [*:0]const u8, c_int }{ .{ "M", m }, .{ "N", ws[0] }, .{ "K", ws[1] }, .{ "R", p.r }, .{ "KS", p.ks }, .{ "RG", p.rg } }) |t|
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, t[0], t[1]));
+    var x2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x2);
+    try mlx.check(mlx.mlx_reshape(&x2, x, &[_]c_int{ m, ws[1] }, 2, s));
+    const y = try applyKernel(try kernel(&gemv_kernel, "fp8_block128_gemv", &.{ "x", "w", "scales" }, "y", gemv_source), c, &.{ x2, w, sc }, s);
+    if (xs.len == 2) return y;
+    defer _ = mlx.mlx_array_free(y);
+    var shape: [8]c_int = undefined;
+    @memcpy(shape[0 .. xs.len - 1], xs[0 .. xs.len - 1]);
+    shape[xs.len - 1] = ws[0];
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_reshape(&out, y, &shape, xs.len, s));
+    return out;
+}
 
 /// The block names this format: e4m3 codes, 8 bits, the 64 x 128 scale grid.
 fn ownBlock(block_json: []const u8) bool {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const v = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), block_json, .{}) catch return false;
-    if (v != .object) return false;
-    const mode = v.object.get("mode") orelse return false;
-    const bits = v.object.get("bits") orelse return false;
-    const blk = v.object.get("block") orelse return false;
-    if (mode != .string or !std.mem.eql(u8, mode.string, "fp8_e4m3") or bits != .integer or bits.integer != 8) return false;
-    if (blk != .array or blk.array.items.len != 2) return false;
-    const r = blk.array.items[0];
-    const c = blk.array.items[1];
-    return r == .integer and r.integer == block_rows and c == .integer and c.integer == block_cols;
+    return v == .object and plan.isEntry(v.object);
 }
 
 fn claims(block_json: Str, _: Str) callconv(.c) abi.Claim {
@@ -76,9 +149,19 @@ fn loadBank(_: *const abi.LoadCtx, _: Str, _: u32, _: *abi.Weight) callconv(.c) 
 }
 
 /// The weight as bf16(code x scale), `[out, in]`: e4m3 exactly in f32, times its tile's scale (one f32 rounding), one
-/// BF16 rounding.
+/// BF16 rounding. One kernel on Metal over whole column blocks; MLX ops elsewhere (the same values).
 pub fn dequantize(codes: mlx.mlx_array, scales: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     const sh = mlx.getShape(codes);
+    if (mlx.streamIsGpu(s) and @rem(sh[1], block_cols) == 0) {
+        const c = mlx.mlx_fast_metal_kernel_config_new();
+        defer _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, sh.ptr, 2, .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, @divExact(sh[0] * sh[1], 4), 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 256, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "N", sh[0]));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "K", sh[1]));
+        return applyKernel(try kernel(&dequant_kernel, "fp8_block128_dequant", &.{ "w", "scales" }, "wb", dequant_source), c, &.{ codes, scales }, s);
+    }
     var f = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(f);
     try mlx.check(mlx.mlx_from_fp8(&f, codes, .float32, s));
@@ -100,16 +183,15 @@ pub fn dequantize(codes: mlx.mlx_array, scales: mlx.mlx_array, s: mlx.mlx_stream
     return out;
 }
 
-/// `x @ W^T` over the bf16 weight (the stream's prompt arithmetic at every width; its decode GEMV, which skips the
-/// weight's BF16 rounding, stays the stream's).
 fn matmul(w: *const abi.Weight, x: abi.Array, s: abi.Stream, out: *abi.Array) callconv(.c) Verdict {
-    const y = matmulInto(w, native.arr(x), .{ .ctx = s.ctx }) catch |e| return native.failed(e);
+    const y = linear(native.arr(x), native.arr(w.w), native.arr(w.scales), .{ .ctx = s.ctx }) catch |e| return native.failed(e);
     out.* = native.wrap(y);
     return .ok;
 }
 
-fn matmulInto(w: *const abi.Weight, x: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
-    const wb = try dequantize(native.arr(w.w), native.arr(w.scales), s);
+/// The prompt route: `x @ bf16(code x scale)^T` under MLX's matmul.
+fn matmulInto(codes: mlx.mlx_array, scales: mlx.mlx_array, x: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    const wb = try dequantize(codes, scales, s);
     defer _ = mlx.mlx_array_free(wb);
     var wt = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(wt);
@@ -141,7 +223,6 @@ pub const table: abi.QuantTable = .{
 // ── tests ──
 
 const testing = std.testing;
-const build_options = @import("build_options");
 
 test "fp8_block128: claims and validates its own block only" {
     const own = "{\"mode\":\"fp8_e4m3\",\"bits\":8,\"block\":[64,128]}";
@@ -151,89 +232,102 @@ test "fp8_block128: claims and validates its own block only" {
     try testing.expectEqual(abi.Claim.no, claims(.of("{}"), .of("{}")));
 }
 
-// Bar: the read is the MiMo stream's fp8 prompt route bit for bit (its dequant kernel's bf16 weight, and its matmul).
-test "fp8_block128: the weight and the product are the MiMo stream's fp8 prompt route, bit for bit" {
-    if (!build_options.mlx_stream or mlx.noGpuBackend()) return error.SkipZigTest;
-    const fp8 = @import("mlx_stream").mimo.fp8_linear;
-    const a = testing.allocator;
-    const s = mlx.gpuStream();
-    defer _ = mlx.mlx_stream_free(s);
-    // 160 rows (2.5 row blocks: ragged) x 384 columns (the kernel takes whole column blocks, its scale stride is K / 128);
-    // 16 input rows (the prompt route).
-    const n = 160;
-    const k = 384;
-    const m = 16;
-    var rnd = std.Random.DefaultPrng.init(128);
-    const codes = try a.alloc(u8, n * k);
-    defer a.free(codes);
-    for (codes) |*c| c.* = while (true) {
-        const v = rnd.random().int(u8);
+fn codesOf(r: std.Random, out: []u8) void {
+    for (out) |*c| c.* = while (true) {
+        const v = r.int(u8);
         if (v & 0x7f != 0x7f) break v;
     };
-    var scales: [3 * 3]f32 = undefined;
-    for (&scales) |*v| v.* = std.math.ldexp(1.0 + rnd.random().float(f32), -6 - rnd.random().intRangeAtMost(i32, 0, 3));
-    var xs: [m * k]f32 = undefined;
-    for (&xs) |*v| v.* = rnd.random().floatNorm(f32);
-    const w = mlx.mlx_array_new_data(codes.ptr, &[_]c_int{ n, k }, 2, .uint8);
-    defer _ = mlx.mlx_array_free(w);
-    const sc = mlx.mlx_array_new_data(&scales, &[_]c_int{ 3, 3 }, 2, .float32);
-    defer _ = mlx.mlx_array_free(sc);
-    const xf = mlx.mlx_array_new_data(&xs, &[_]c_int{ m, k }, 2, .float32);
-    defer _ = mlx.mlx_array_free(xf);
-    var x = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(x);
-    try mlx.check(mlx.mlx_astype(&x, xf, .bfloat16, s));
+}
 
-    var kernels = try fp8.Kernels.init();
-    defer kernels.deinit();
-    var cache: fp8.PromptCache = .{};
-    kernels.prompt = &cache;
-    defer kernels.prompt = null;
-    defer cache.release();
-    const want_y = try fp8.promptRun(&kernels, n, k, x, w, sc, s);
-    defer _ = mlx.mlx_array_free(want_y);
-    const want_w = cache.arrs[0];
+fn bf16Of(r: std.Random, out: []u16) void {
+    for (out) |*b| b.* = plan.f32ToBf16(1.5 * r.floatNorm(f32));
+}
 
-    var wt: abi.Weight = .{ .w = native.wrap(w), .scales = native.wrap(sc), .bits = 8, .group_size = block_cols, .block = block_rows };
-    _ = &wt;
-    const got_w = try dequantize(w, sc, s);
-    defer _ = mlx.mlx_array_free(got_w);
-    const got_y = try matmulInto(&wt, x, s);
-    defer _ = mlx.mlx_array_free(got_y);
-    for ([_][2]mlx.mlx_array{ .{ got_w, want_w }, .{ got_y, want_y } }) |pair| {
-        try mlx.check(mlx.mlx_array_eval(pair[0]));
-        try mlx.check(mlx.mlx_array_eval(pair[1]));
-        try testing.expectEqual(mlx.mlx_array_dtype(pair[1]), mlx.mlx_array_dtype(pair[0]));
-        const len = mlx.mlx_array_size(pair[1]);
-        try testing.expectEqual(len, mlx.mlx_array_size(pair[0]));
-        const g = mlx.mlx_array_data_bfloat16(pair[0]) orelse return error.NoData;
-        const h = mlx.mlx_array_data_bfloat16(pair[1]) orelse return error.NoData;
-        try testing.expectEqualSlices(u16, h[0..len], g[0..len]);
+fn evalBf16(y: mlx.mlx_array) ![]const u16 {
+    try mlx.check(mlx.mlx_array_eval(y));
+    return (mlx.mlx_array_data_bfloat16(y) orelse return error.NoData)[0..mlx.mlx_array_size(y)];
+}
+
+// Bar: bf16(code x scale) of the host, on the kernel and on MLX's ops, ragged tiles on both axes included.
+test "fp8_block128: the prompt route's weight is bf16(code x scale), each code on its own block's scale" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const n = 70;
+    var rnd = std.Random.DefaultPrng.init(64);
+    // 200 columns: ragged column blocks (MLX's ops); 384: whole blocks (the kernel on Metal).
+    inline for (.{ 200, 384 }) |k| {
+        const cols = (k + block_cols - 1) / block_cols;
+        var codes: [n * k]u8 = undefined;
+        codesOf(rnd.random(), &codes);
+        var scales: [2 * cols]f32 = undefined;
+        for (&scales) |*v| v.* = std.math.ldexp(1.0 + rnd.random().float(f32), -6 - rnd.random().intRangeAtMost(i32, 0, 3));
+        const w = mlx.mlx_array_new_data(&codes, &[_]c_int{ n, k }, 2, .uint8);
+        defer _ = mlx.mlx_array_free(w);
+        const sc = mlx.mlx_array_new_data(&scales, &[_]c_int{ 2, cols }, 2, .float32);
+        defer _ = mlx.mlx_array_free(sc);
+        for ([_]mlx.mlx_stream{ mlx.gpuStream(), mlx.mlx_default_cpu_stream_new() }) |s| {
+            defer _ = mlx.mlx_stream_free(s);
+            const got = try dequantize(w, sc, s);
+            defer _ = mlx.mlx_array_free(got);
+            const g = try evalBf16(got);
+            for (0..n) |r| for (0..k) |c| {
+                try testing.expectEqual(plan.f32ToBf16(plan.weight32(codes[r * k + c], scales[(r / block_rows) * cols + c / block_cols])), g[r * k + c]);
+            };
+        }
     }
 }
 
-test "fp8_block128: ragged tiles on both axes read their own block's scale (MiMo's host reference)" {
-    if (!build_options.mlx_stream or mlx.noGpuBackend()) return error.SkipZigTest;
-    const fp8 = @import("mlx_stream").mimo.fp8_linear;
+// Bar: every output is the kernel-order host sum (`fp8_block128_gemv.hostDot`) rounded once, at 1..8 rows and K split
+// 1, 4 and 8 ways; 9 rows take the prompt route (MLX's matmul over the bf16 weight).
+test "fp8_block128: the GEMV is the kernel-order host sum at every width up to 8 rows; wider rows take the prompt route" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
     const s = mlx.gpuStream();
     defer _ = mlx.mlx_stream_free(s);
-    const n = 70;
-    const k = 200;
-    var rnd = std.Random.DefaultPrng.init(64);
-    var codes: [n * k]u8 = undefined;
-    for (&codes) |*c| c.* = rnd.random().int(u8) & 0xf7;
-    var scales: [2 * 2]f32 = .{ 0.5, 0.25, 0.125, 0.0625 };
-    _ = &scales;
-    const w = mlx.mlx_array_new_data(&codes, &[_]c_int{ n, k }, 2, .uint8);
-    defer _ = mlx.mlx_array_free(w);
-    const sc = mlx.mlx_array_new_data(&scales, &[_]c_int{ 2, 2 }, 2, .float32);
-    defer _ = mlx.mlx_array_free(sc);
-    const got = try dequantize(w, sc, s);
-    defer _ = mlx.mlx_array_free(got);
-    try mlx.check(mlx.mlx_array_eval(got));
-    const g = mlx.mlx_array_data_bfloat16(got) orelse return error.NoData;
-    for (0..n) |r| for (0..k) |c| {
-        const want = fp8.f32ToBf16(fp8.weight32(codes[r * k + c], scales[(r / block_rows) * 2 + c / block_cols]));
-        try testing.expectEqual(want, g[r * k + c]);
-    };
+    var rnd = std.Random.DefaultPrng.init(0xf8b1);
+    const r = rnd.random();
+    for ([_][2]u32{ .{ 4096, 512 }, .{ 1024, 1024 }, .{ 256, 4096 } }, [_]c_int{ 1, 4, 8 }) |nk, ks| {
+        const n = nk[0];
+        const k = nk[1];
+        const site = plan.plan(n, k).?;
+        try testing.expectEqual(ks, site.ks);
+        const codes = try a.alloc(u8, n * k);
+        defer a.free(codes);
+        codesOf(r, codes);
+        const scales = try a.alloc(f32, (n / block_rows) * (k / block_cols));
+        defer a.free(scales);
+        for (scales) |*v| v.* = std.math.ldexp(1.0 + r.float(f32), -17 + @as(i32, @intCast(r.uintLessThan(u32, 11))));
+        const xs = try a.alloc(u16, 9 * k);
+        defer a.free(xs);
+        bf16Of(r, xs);
+        const w = mlx.mlx_array_new_data(codes.ptr, &[_]c_int{ @intCast(n), @intCast(k) }, 2, .uint8);
+        defer _ = mlx.mlx_array_free(w);
+        const sc = mlx.mlx_array_new_data(scales.ptr, &[_]c_int{ @intCast(n / block_rows), @intCast(k / block_cols) }, 2, .float32);
+        defer _ = mlx.mlx_array_free(sc);
+        const wrow = try a.alloc(f32, k);
+        defer a.free(wrow);
+        // The host sums of every output of the 8 rows (the GEMV's rows are M-invariant).
+        const want = try a.alloc(u16, 8 * n);
+        defer a.free(want);
+        for (0..n) |j| {
+            for (wrow, 0..) |*v, i| v.* = plan.weight32(codes[j * k + i], scales[(j / block_rows) * (k / block_cols) + i / block_cols]);
+            for (0..8) |m| want[m * n + j] = plan.f32ToBf16(plan.hostDot(site, xs[m * k ..][0..k], wrow));
+        }
+        for (1..10) |m| {
+            const x = mlx.mlx_array_new_data(xs.ptr, &[_]c_int{ 1, @intCast(m), @intCast(k) }, 3, .bfloat16);
+            defer _ = mlx.mlx_array_free(x);
+            const y = try linear(x, w, sc, s);
+            defer _ = mlx.mlx_array_free(y);
+            try testing.expectEqualSlices(c_int, &.{ 1, @intCast(m), @intCast(n) }, mlx.getShape(y));
+            const got = try evalBf16(y);
+            if (m <= plan.max_rows) {
+                try testing.expectEqualSlices(u16, want[0 .. m * n], got);
+                continue;
+            }
+            const x2 = mlx.mlx_array_new_data(xs.ptr, &[_]c_int{ @intCast(m), @intCast(k) }, 2, .bfloat16);
+            defer _ = mlx.mlx_array_free(x2);
+            const p = try matmulInto(w, sc, x2, s);
+            defer _ = mlx.mlx_array_free(p);
+            try testing.expectEqualSlices(u16, try evalBf16(p), got);
+        }
+    }
 }

@@ -5,6 +5,7 @@
 const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
 const generation = @import("generation.zig");
+const fp8_grid = @import("../quant/fp8_block128_gemv.zig");
 
 pub const Object = std.json.ObjectMap;
 pub const Value = std.json.Value;
@@ -85,7 +86,7 @@ pub fn quantOf(root: Object, key: []const u8, ternary_ok: bool) error{ Invalid, 
     if (string(field(q, "mode"))) |m| out.mode = quantMode(m) orelse return error.Invalid;
     var it = q.iterator();
     while (it.next()) |kv| if (kv.value_ptr.* == .object) if (kv.value_ptr.object.get("mode")) |m| {
-        if (m == .string and quantMode(m.string) == null) return error.Invalid;
+        if (m == .string and quantMode(m.string) == null and !fp8_grid.isEntry(kv.value_ptr.object)) return error.Invalid;
     };
     if (out.mode == .affine and out.bits != 0) switch (out.bits) {
         2, 3, 4, 5, 6, 8 => {},
@@ -163,6 +164,9 @@ test "plugin json: the quantization block reads as the engine reads it" {
     try testing.expectEqual(@as(u8, 0), (try quant(try parseRoot(a, "{}"))).bits);
     try testing.expectError(error.Invalid, quant(try parseRoot(a, "{\"quantization\":{\"bits\":7}}")));
     try testing.expectError(error.Invalid, quant(try parseRoot(a, "{\"quantization\":{\"bits\":4,\"mode\":\"iq2\"}}")));
+    const fp8 = try quant(try parseRoot(a, "{\"quantization\":{\"bits\":4,\"group_size\":32,\"mode\":\"mxfp4\",\"l.q\":{\"mode\":\"fp8_e4m3\",\"bits\":8,\"block\":[64,128]}}}"));
+    try testing.expect(fp8.bits == 4 and fp8.mode == .mxfp4);
+    try testing.expectError(error.Invalid, quant(try parseRoot(a, "{\"quantization\":{\"bits\":4,\"l.q\":{\"mode\":\"fp8_e4m3\",\"bits\":8,\"block\":[128,128]}}}")));
     try testing.expectError(error.Unsupported, quant(try parseRoot(a, "{\"quantization\":{\"bits\":2,\"group_size\":128}}")));
 }
 

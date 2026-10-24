@@ -129,6 +129,9 @@ test "quant block: validation refuses what the parser refuses" {
     try testing.expectEqual(Verdict.Code.unsupported, t.v("affine", "{\"bits\":4,\"mode\":\"int4\"}", "{}").code);
     try testing.expectEqual(Verdict.Code.unsupported, t.v("nvfp4", "{\"bits\":4,\"mode\":\"nvfp4\",\"x.experts\":{\"mode\":\"iq2_xxs\"}}", "{}").code);
     try testing.expect(t.v("nvfp4", "{\"quant_method\":\"modelopt\"}", "{}").isOk());
+    // A release's e4m3 projections inside an MXFP4 block (MiMo's fp8res residents); another fp8 grid is refused.
+    try testing.expect(t.v("affine", "{\"bits\":4,\"mode\":\"mxfp4\",\"l.q_proj\":{\"mode\":\"fp8_e4m3\",\"bits\":8,\"block\":[64,128]}}", "{}").isOk());
+    try testing.expectEqual(Verdict.Code.unsupported, t.v("affine", "{\"bits\":4,\"mode\":\"mxfp4\",\"l.q_proj\":{\"mode\":\"fp8_e4m3\",\"bits\":8,\"block\":[128,128]}}", "{}").code);
     try testing.expect(t.v("fp8", "{\"quant_method\":\"fp8\",\"weight_block_size\":[128,128]}", "{}").isOk());
     try testing.expectEqual(Verdict.Code.unsupported, t.v("fp8", "{\"quant_method\":\"fp8\",\"store_dtype\":\"mxfp4\"}", "{}").code);
     const prism = "{\"modules\":[{\"path\":\"a\",\"block\":1024},{\"path\":\"b\",\"block\":1024}]}";

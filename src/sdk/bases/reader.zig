@@ -106,8 +106,10 @@ pub const Reader = struct {
         var w: quant_abi.Weight = .{};
         const v = r.fmt.load_tensor(&r.qctx, abi.Str.of(base), in_dim, &w);
         if (!v.isOk()) return if (std.mem.eql(u8, v.why.slice(), "MissingWeight")) error.MissingWeight else error.QuantFormatRefused;
-        // Row-scaled e4m3 (Sushi's MiMo q/k/v): the matmul knows it by its dtypes; no affine kernel may claim it.
-        const bits: u32 = if (w.layout == @intFromEnum(native.Layout.fp8_rows)) 0 else w.bits;
+        // e4m3 (Sushi's row-scaled MiMo q/k/v, a release's 64 x 128 grid): the matmul knows it by its dtypes; no affine
+        // kernel may claim it.
+        const fp8 = w.layout == @intFromEnum(native.Layout.fp8_rows) or w.layout == @intFromEnum(native.Layout.fp8_block128);
+        const bits: u32 = if (fp8) 0 else w.bits;
         return .{ .w = ctxArr(w.w), .s = ctxArr(w.scales), .b = ctxArr(w.biases), .bits = bits, .group_size = w.group_size, .mode = native.modeOf(&w) };
     }
 
