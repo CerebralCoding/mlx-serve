@@ -1,19 +1,14 @@
-//! The resident weight source: a pack's safetensors loaded whole into one map by the engine's loader (the pack
-//! adaptations ModelOpt and Sushi packs need included), read by the quant formats through `abi.Source`.
+//! The resident weights: a pack's tensors held whole in one map by name (`Weights`, filled by the engine's loader with
+//! the adaptations ModelOpt and Sushi packs need), the source the quant formats read it through (`abi.Source`), and
+//! the shard set a safetensors index names.
 
 const std = @import("std");
 const abi = @import("../../abi/quant.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../host/log.zig");
-const model = @import("../../engines/mlx/model.zig");
 
 pub const Resident = struct {
     weights: Weights,
-
-    /// Loads `model_dir` as the engine does (`loadModelWeights`).
-    pub fn open(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *model.ModelConfig, load_vision: bool) !Resident {
-        return .{ .weights = try model.loadModelWeights(io, allocator, model_dir, config, load_vision) };
-    }
 
     /// A map already loaded (a sidecar file, a test); the source owns it from here.
     pub fn adopt(weights: Weights) Resident {
