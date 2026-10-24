@@ -23,7 +23,7 @@ const HotPrefixCache = @import("../cache/prefix_cache.zig").HotPrefixCache;
 const cache_ops = @import("../kv/cache_ops.zig");
 const dflash_mod = @import("../spec/dflash/dflash.zig");
 const Generator = @import("../generate/generator.zig").Generator;
-const Tokenizer = @import("../../../host/tokenizer/tokenizer.zig").Tokenizer;
+const Tokenizer = @import("../../../sdk/tokenizer/tokenizer.zig").Tokenizer;
 
 const testing = std.testing;
 const Array = mlx.mlx_array;

@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const kv_quant = @import("../../engines/mlx/cache/kv_quant.zig");
-const tokenizer_mod = @import("../tokenizer/tokenizer.zig");
+const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const chat_mod = @import("../chat/chat.zig");
 const model_registry_mod = @import("../registry/registry.zig");

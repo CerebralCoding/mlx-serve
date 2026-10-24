@@ -9,7 +9,7 @@ const kv_quant = @import("../../engines/mlx/cache/kv_quant.zig");
 const log = @import("../../sdk/util/log.zig");
 const mtp_acceptance = @import("../../engines/mlx/spec/mtp_acceptance.zig");
 const generation = @import("../api/generation_settings.zig");
-const engine_pick = @import("engine_pick.zig");
+const engine_pick = @import("../../sdk/quant/gguf/engine_pick.zig");
 
 /// What can serve a model; the per-model `engine` setting (Model Settings' engine picker) and each
 /// `/v1/models` row's `engines` use these names. No setting leaves the choice to the server.

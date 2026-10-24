@@ -16,6 +16,7 @@ comptime {
 }
 
 test {
+    _ = @import("sdk/quant/gguf/claim_test.zig");
     _ = @import("sdk/vision/qwen_vision_test.zig");
     _ = @import("sdk/blocks/attention/batched_test.zig");
     _ = @import("sdk/blocks/attention/kv_quant_attn_test.zig");
@@ -194,7 +195,7 @@ test {
     _ = @import("plugins/clef/clef.zig");
     _ = @import("plugins/clef/http_test.zig");
     _ = @import("plugins/kokoro/g2p.zig");
-    _ = @import("host/tokenizer/tokenizer.zig");
+    _ = @import("sdk/tokenizer/tokenizer.zig");
     _ = @import("engines/mlx/cache/prefix_cache.zig");
     _ = @import("engines/mlx/cache/restore_dump.zig");
     _ = @import("host/metrics/metrics.zig");
@@ -204,7 +205,7 @@ test {
     _ = @import("engines/mlx/cache/ssd/writer.zig");
     _ = @import("host/registry/discovery.zig");
     _ = @import("host/registry/pack_dir.zig");
-    _ = @import("host/registry/engine_pick.zig");
+    _ = @import("sdk/quant/gguf/engine_pick.zig");
     _ = @import("host/registry/registry.zig");
     _ = @import("engines/mlx/scheduler.zig");
     if (@import("build_options").ds4_engine) {

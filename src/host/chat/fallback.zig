@@ -1,7 +1,7 @@
 //! Special-token-aware encoding and `fallbackFormatChat`, the generic prompt format.
 
 const std = @import("std");
-const tokenizer_mod = @import("../tokenizer/tokenizer.zig");
+const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;
 const testing = std.testing;
 

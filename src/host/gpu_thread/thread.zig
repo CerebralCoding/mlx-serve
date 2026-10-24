@@ -1,7 +1,7 @@
 //! Inference-thread start-up context and load-error plumbing.
 
 const std = @import("std");
-const gguf_meta = @import("../registry/engine_pick.zig");
+const gguf_meta = @import("../../sdk/quant/gguf/engine_pick.zig");
 
 const Scheduler = @import("../../engines/mlx/scheduler.zig").Scheduler;
 const LoadParams = @import("../../engines/mlx/scheduler/params.zig").LoadParams;

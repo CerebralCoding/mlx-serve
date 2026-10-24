@@ -236,7 +236,7 @@ pub fn parseConfig(io: std.Io, a: std.mem.Allocator, model_dir: []const u8) !Con
 // ══════════════════════════════════════════════════════════════════════════
 
 const model_mod = @import("../../engines/mlx/model.zig");
-const tok_mod = @import("../../host/tokenizer/tokenizer.zig");
+const tok_mod = @import("../../sdk/tokenizer/tokenizer.zig");
 const Weights = model_mod.Weights;
 const S = mlx.mlx_stream;
 

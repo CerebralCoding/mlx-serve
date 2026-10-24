@@ -3914,7 +3914,7 @@ fn generateOne(
     defer mage_flow.mf_dq_gemm_override = dq_override_prev;
 
     // ── 1. tokenize (raw ids, NO special tokens and no chat template) ──
-    const tok_mod = @import("../../host/tokenizer/tokenizer.zig");
+    const tok_mod = @import("../../sdk/tokenizer/tokenizer.zig");
     var tok = try tok_mod.loadTokenizerAny(io, allocator, paths.tokenizer_dir);
     defer tok.deinit();
     const ids_u32 = try tok.encode(allocator, req.prompt);

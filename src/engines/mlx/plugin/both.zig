@@ -495,7 +495,7 @@ pub fn atGeometry(real: []const u8, fixture_json: []const u8, keep: []const []co
 pub fn dflashRun(xfm: *Transformer, tokens: []u32, accepted: *std.ArrayList(u32)) !void {
     const dflash_mod = @import("../spec/dflash/dflash.zig");
     const Generator = @import("../generate/generator.zig").Generator;
-    const Tokenizer = @import("../../../host/tokenizer/tokenizer.zig").Tokenizer;
+    const Tokenizer = @import("../../../sdk/tokenizer/tokenizer.zig").Tokenizer;
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var tmp = testing.tmpDir(.{});

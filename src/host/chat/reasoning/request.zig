@@ -2,7 +2,7 @@
 //! resolution, schema thinking policy
 
 const std = @import("std");
-const tokenizer_mod = @import("../../tokenizer/tokenizer.zig");
+const tokenizer_mod = @import("../../../sdk/tokenizer/tokenizer.zig");
 const generate_mod = @import("../../../engines/mlx/generate.zig");
 const generation_settings = @import("../../api/generation_settings.zig");
 const chat_mod = @import("../chat.zig");

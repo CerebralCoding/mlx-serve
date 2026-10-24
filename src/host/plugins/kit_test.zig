@@ -167,7 +167,7 @@ test "kit examples: the model plugin's fixture pack tokenizes and renders its ch
     const a = inst.arena.allocator();
     const pack = try inst.path("pack");
     try cli.writeFixture(testing.io, a, inst.set.plugins.items[0], pack);
-    var tok = try @import("../tokenizer/load.zig").loadTokenizer(testing.io, a, pack);
+    var tok = try @import("../../sdk/tokenizer/load.zig").loadTokenizer(testing.io, a, pack);
     defer tok.deinit();
     try testing.expectEqualSlices(u32, &.{ 258, 'h', 'i', 256 }, try tok.encode(a, "<|user|>hi<|end|>"));
     const chat_config = try @import("../chat/template_load.zig").loadChatConfig(testing.io, a, pack);

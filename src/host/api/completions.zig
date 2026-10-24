@@ -1,7 +1,7 @@
 //! completion prompt parsing, echo, n; handleCompletions, non/streaming completion
 
 const std = @import("std");
-const tokenizer_mod = @import("../tokenizer/tokenizer.zig");
+const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
 const generate_mod = @import("../../engines/mlx/generate.zig");
 const log = @import("../../sdk/util/log.zig");
 const pld_index = @import("../../engines/mlx/spec/pld_index.zig");

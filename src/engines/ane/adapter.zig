@@ -1,7 +1,7 @@
 //! The Neural Engine LM engine on the scheduler: load, admission and per-slot runs.
 
 const std = @import("std");
-const tokenizer_mod = @import("../../host/tokenizer/tokenizer.zig");
+const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
 const generate_mod = @import("../mlx/generate.zig");
 const model_mod = @import("../mlx/model.zig");
 const metrics_mod = @import("../../host/metrics/metrics.zig");

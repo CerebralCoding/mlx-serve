@@ -1,7 +1,7 @@
 //! StreamLogprobs; logprob formatting
 
 const std = @import("std");
-const tokenizer_mod = @import("../tokenizer/tokenizer.zig");
+const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
 const generate_mod = @import("../../engines/mlx/generate.zig");
 const scheduler_mod = @import("../../engines/mlx/scheduler.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;

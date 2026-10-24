@@ -4763,7 +4763,7 @@ test "dsv41 perplexity: non-overlapping windows of a token corpus through extend
     defer w.deinit();
     const m = try init(gpa, &cfg, &w, mlx.gpuStream(), .{ .head_8bit = std.c.getenv("DSV41_PPL_HEAD8") != null });
     defer m.deinit();
-    var tok = try @import("../../host/tokenizer/tokenizer.zig").loadTokenizer(io, gpa, dir);
+    var tok = try @import("../../sdk/tokenizer/tokenizer.zig").loadTokenizer(io, gpa, dir);
     defer tok.deinit();
     const text = try std.Io.Dir.cwd().readFileAlloc(io, text_path, gpa, .limited(64 << 20));
     defer gpa.free(text);
@@ -5750,7 +5750,7 @@ test "dsv41 DSpark round: draft, verify and finish timed apart, greedy (DSV41_RO
     defer gpa.free(prompt);
     for (prompt, 0..) |*t, k| t.* = @intCast((k * 7919 + 13) % @min(m.vocab, 100000));
     if (std.c.getenv("DSV41_ROUND_TEXT")) |tp| { // real prose: generated n-grams are new to the Engram tables
-        var tok = try @import("../../host/tokenizer/tokenizer.zig").loadTokenizer(io, gpa, dir);
+        var tok = try @import("../../sdk/tokenizer/tokenizer.zig").loadTokenizer(io, gpa, dir);
         defer tok.deinit();
         const off = if (std.c.getenv("DSV41_ROUND_OFFSET")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 0;
         const text = try std.Io.Dir.cwd().readFileAlloc(io, std.mem.span(tp), gpa, .limited(64 << 20));
