@@ -711,3 +711,11 @@ Defect: Super's drafter proposed through the target's head, and `/v1/messages` d
 `has_own_lm_head`; the messages surface checked only the Gemma slot. Fix: a declared head is loaded, validated and
 used for proposals only (verify keeps the target head); all four surfaces share `requestEnableDrafter`. Guard: native
 config corpus, head forwards, the HTTP defaults on all four APIs.
+
+### A plugin's copy of the MoE dropped the arm only ModelOpt packs reach
+Defect: Qwen3.8 Flash Next FP4 (NVIDIA ModelOpt) decoded garbage from the first token after the plugin moved off the
+legacy `Transformer`; the iQ pack was fine. Cause: the trunk's copy of the MoE dropped the `per_expert_scale` routing
+arm (each expert's up x down `weight_scale_2`) as unused, and every proof replayed tapes of a fixture pack that carries
+no such scale. Fix: the arm restored, plus a load-time `unservedLayout` that refuses, by name, any layout an arm the
+fork dropped would read. Guard: `a per-expert scale of 2 doubles the routed experts exactly`, the layout-guard test,
+the real-pack greedy gate.

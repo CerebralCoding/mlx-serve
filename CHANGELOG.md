@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- **Model plugins you can build and install.** `mlx-serve plugin new` starts a model or media plugin from the plugin kit, `plugin check` tests it, and `plugin install` adds it after showing its signature; Settings lists installed plugins with a switch each.
+- **DiffusionGemma is no longer supported.**
+
 ## v26.10.3 — New Models, Transcripts, RDMA, Faster
 
 ### Highlights

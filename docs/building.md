@@ -41,7 +41,7 @@ To build on Linux, run `./scripts/build-linux.sh` from a fresh checkout. On Wind
 
 ## Hermetic tests (Linux too)
 
-The per-step preview encoder (`src/host/media_jobs/preview.zig` + `src/host/media_jobs/jpeg.zig` + `src/host/media_jobs/latent_rgb.zig`) links no MLX and no Homebrew webp, so any machine, a Linux Cloud Agent included, can build and run it with no GPU:
+The per-step preview encoder (`src/sdk/media/preview.zig` + `src/sdk/media/jpeg.zig` + `src/sdk/media/latent_rgb.zig`) links no MLX and no Homebrew webp, so any machine, a Linux Cloud Agent included, can build and run it with no GPU:
 
 ```bash
 ./scripts/fetch-zig.sh

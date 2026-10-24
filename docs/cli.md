@@ -10,7 +10,11 @@ mlx-serve pull qwen3.6:27b  # just download (resumable, straight from Hugging Fa
 mlx-serve list              # what's on disk
 mlx-serve serve             # serve everything you've pulled — models load on demand by name
 mlx-serve launch claude     # configure + launch a coding agent CLI against the local server
+mlx-serve plugin new toy    # start a plugin from the plugin kit (also: check, fixture, install)
 ```
+
+Outside plugins (dylibs built with the plugin kit, [plugins.md](plugins.md)) load from `~/.mlx-serve/plugins/` when
+`~/.mlx-serve/plugins.json` says `"enabled": true`; `--no-plugins` turns them off for one run.
 
 `launch` supports claude, pi, omp, opencode, opencode2, codex, hermes, and aider. It reads the running server's model list and real context window, writes the agent's config into a dedicated `~/.mlx-serve/<agent>/` folder (never your real agent config), and starts the agent; codex writes nothing and passes its settings as `-c` overrides over your own Codex home. If the server is down it starts the MLX-Serve app first. `--model <id>` picks a model, `--print` shows the launch script instead of running, and anything after `--` goes to the agent (`mlx-serve launch codex -- resume`). `launch opencode` detects the installed OpenCode's version (even `--print` runs `opencode --version` to route) and picks its v1 or v2 integration automatically; `launch opencode2` stays as a compatibility alias that forces the v2 integration, which also installs the mlx-serve monitor plugin and needs the server started with `--metrics`. Full per-agent detail in [integrations.md](integrations.md).
 

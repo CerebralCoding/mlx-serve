@@ -132,6 +132,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 - `test_ds4_serve.sh`, `test_ds4_smoke.sh`, `test_ds4_ssd_streaming.sh` ds4 · `test_mlx_gguf.sh` MLX GGUF · `test_qwen4exp_gguf_route.sh`
 - `test_ane_prefill.sh`, `test_ane_engine.sh` Neural Engine · `test_mlx_staged_nax.sh` **H** NAX-enabled mlx stage
 - `test_phase2_forward_equivalence.sh` forward pinned vs a baseline · `test_decode_graph_dump.sh` graph dump guard
+- `test_plugin_kit.sh` **H** the kit builds `_example` from itself; `plugin new|check|fixture|install`; a kit-built dylib serves its pack
 
 **Architectures (live)**
 - `test_qwen4_exp.sh` **E** Flash Next · `test_qwen4_mtp_{padded_head,head_persist}.sh` **E** its MTP head

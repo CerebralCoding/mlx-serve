@@ -10,7 +10,7 @@
 #   [2b] low effort answers, no think tags
 #
 # Hermetic counterparts: the glm_moe_dsa parse and routing tests in engines/mlx/model.zig, the GLM-5.3 context test in
-# src/sdk/weights/streamed/glue.zig, and the GLM effort and tool-history render tests in host/chat/chat.zig.
+# src/engines/mlx/modules/stream_glue.zig, and the GLM effort and tool-history render tests in host/chat/chat.zig.
 
 set -euo pipefail
 source "$(dirname "$0")/lib/server.sh"

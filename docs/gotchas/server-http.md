@@ -832,3 +832,8 @@ it before the next starts. Guard: `tests/test_messages_stream_thinking_tools.sh`
 Defect: the second turn answered 500 `failed to find a memory slot`. Cause: on sliding-window layers the non-full SWA
 cache never exposed trimmed slots. Fix: sessions use `swa_full = true`; `syncWithFallback` resets and retries once
 cold. Guard: `tests/test_llama_persistent_session.sh`.
+
+### `/props` said `decode_attn_quant: false` for every plugin-served MoE pack
+Defect: plugin-served packs with dense attention projections reported the requant off while it ran. Cause: only the
+legacy load set the shell's `dense_attn_proj`. Fix: one predicate (`load/init.denseAttnProj`) feeds both loads.
+Guard: `laguna plugin: a served pack reports its dense attention projections to /props`.

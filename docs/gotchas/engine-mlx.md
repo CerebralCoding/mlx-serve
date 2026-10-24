@@ -1306,3 +1306,16 @@ absence under the kill switch.
 Defect: tapes recorded in isolation failed in a suite that ran TTS first. Cause: `swigluSigTable` was built once on
 its first caller's stream, the TTS CPU synth. Fix: one table per device. Guard: `the SwiGLU sigmoid table is MLX's
 sigmoid on the device that asks for it`.
+
+### A recurrent proof rolled back a full accept and read a row nothing writes
+Defect: `plugin recurrent: captured verifies…` failed only when the qmm kernel contract ran earlier in the same
+process. Cause: the proof accepted every draft and still rolled back from the capture, reading the state sequence's
+last row, which the GDN verify kernels never write (a round rolls back only on `accepted < drafts`); both lanes read
+unwritten memory, equal while the pool held zeros, different once the contract's random fill was reused. Fix: the
+step is a real partial accept. Guard: the proof itself, now order-independent.
+
+### A threadlocal the host sets was empty in every plugin unit
+Defect: under `-Dunits`, a 3D job's CPU stages neither yielded to chat nor sent keepalives, and Flash Next's M-RoPE
+path saw no engine context. Cause: each unit compiled its own copy of `gen_yield`, `stream_keepalive` and
+`engine_ctx`; `unit_globals.py` read only data/bss sections. Fix: `SharedThreadLocal` (host storage, the current
+thread's slot per access); the guard reads `__thread_vars`. Guard: `zig build units-check -Dunits=true`.

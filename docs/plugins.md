@@ -27,14 +27,19 @@ predate the plugin table and plug in at seams below it; their sections close thi
 - **The kit.** `zig build kit` stages `zig-out/kit/mlx-serve-plugin-kit-<version>/` and its tarball: `build/kit/`,
   `src/kit.zig`'s import closure, mlx-c's headers, the MLX pin and the example plugins (`src/plugins/_example*`).
   `zig build test` builds every example from the staged kit, so the kit and the server cannot drift.
+- **The kit** also carries `include/mlx_serve_plugin.h` (C/C++/Rust layouts, size-asserted; `src/kit_header.zig`) and
+  `scripts/fetch-zig.sh` for the pinned Zig.
 - **The CLI** (`src/host/plugins/cli.zig`): `mlx-serve plugin new <name> [--media|--quant]` copies the kit's example;
-  `plugin check` loads a built dylib and runs the conformance suite (`src/sdk/testing/conformance.zig`) on its
-  fixture; `plugin install` copies it into `~/.mlx-serve/plugins/` with a receipt of its hash (a quarantined
-  download needs `--yes`).
+  `plugin check <dylib> [--model <pack>]` runs the conformance suite (`src/sdk/testing/conformance.zig`) on its fixture
+  and, with `--model`, checks it claims and parses that pack; `plugin fixture <dylib> <dir>` writes its tiny pack;
+  `plugin install` shows the file's hash and signer (`codesign`), asks before a quarantined file (`--yes` confirms),
+  and copies it into `~/.mlx-serve/plugins/` with a receipt (name, kind, version, sha256, signer, model types).
 - **Loading** (`src/host/plugins/loader.zig`): at startup, when `plugins.json` says `"enabled": true`. Each dylib must
   match its receipt's hash, is negotiated (`src/abi/dylib.zig`: a plugin built against another MLX is refused) and
-  joins the claims. A refusal names the file and the reason, and the server serves on without it. A dylib is never
-  unloaded.
+  joins the claims (a same-name plugin replaces a built-in; higher rank wins; a built-in wins a tie). A refusal names
+  the file and the reason, and the server serves on without it. A dylib is never unloaded; `--no-plugins` loads none.
+  `/v1/models` marks a pack an outside plugin serves with `"plugin": "<name>"`; the app's Settings ▸ Server lists the
+  receipts with a switch each (writes `plugins.json`). macOS only, never in the Mac App Store build.
 
 ## Vendored modules: `mlx_host`, the one import
 
@@ -128,7 +133,7 @@ holds the arch contract's types. MLX-format V4.1 packs stay in-tree (`src/plugin
   in-tree arch serves it); `ModelConfig.mlxStream()` is any of them, and `loadModelWeights` loads nothing for it. The
   glue holds one arch per model (`plugin.arch` for V4.1, `plugin.mimo.arch` for MiMo, `plugin.glm.arch` for GLM-5.3)
   and leaves out at comptime the entry points an arch does not declare.
-- **Glue** (`src/sdk/weights/streamed/glue.zig`):
+- **Glue** (`src/engines/mlx/modules/stream_glue.zig`):
   - settings (GLM-5.3): after the parse, the arch's `applySettings` receives the model's `model-settings.json` entry
     (`.null` without one), then the manual context (`ctx_size`, else `--ctx-size`), which wins;
   - `loadBytes`: the preflight's bill, from the GPU ceiling, the wired margin and the memory in use before the load
@@ -151,7 +156,7 @@ holds the arch contract's types. MLX-format V4.1 packs stay in-tree (`src/plugin
 - **Build.** In-tree: two modules (`sdk`, `mlx_stream`), its C sources against the staged MLX, its suite in
   `zig build test` (`zig build mlx-stream-test`), its conformance suite (a CPU-lane binary of its
   own, which checks the plugin against the linked MLX) as `zig build mlx-stream-conformance`. macOS only; the
-  Linux and iOS graphs build `src/sdk/weights/streamed/stub.zig`, which refuses these packs by name.
+  Linux and iOS graphs build `src/engines/mlx/modules/stream_stub.zig`, which refuses these packs by name.
 
 ## Rules for plugin code
 
