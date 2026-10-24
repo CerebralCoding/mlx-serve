@@ -34,6 +34,11 @@ pub fn isBlockScaled(w: mlx.mlx_array, sc: mlx.mlx_array) bool {
         ss[0] == @divFloor(ws[0] + block_rows - 1, block_rows) and ss[1] == @divFloor(ws[1] + block_cols - 1, block_cols);
 }
 
+/// The kernels read the scale grid as `device` memory; MLX binds an input under 8 elements as `constant`.
+fn kernelsTake(sc: mlx.mlx_array, s: mlx.mlx_stream) bool {
+    return mlx.mlx_array_size(sc) >= 8 and mlx.streamIsGpu(s);
+}
+
 /// The kernels, made once on first use (inference thread).
 var gemv_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var dequant_kernel: ?mlx.mlx_fast_metal_kernel = null;
@@ -71,7 +76,7 @@ pub fn linear(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, s: mlx.mlx_
     var m: c_int = 1;
     for (xs[0 .. xs.len - 1]) |d| m *= d;
     const site = plan.plan(@intCast(ws[0]), @intCast(ws[1]));
-    if (m > plan.max_rows or site == null or mlx.mlx_array_dtype(x) != .bfloat16 or !mlx.streamIsGpu(s)) return matmulInto(w, sc, x, s);
+    if (m > plan.max_rows or site == null or mlx.mlx_array_dtype(x) != .bfloat16 or !kernelsTake(sc, s)) return matmulInto(w, sc, x, s);
     const p = plan.planAt(site.?, @intCast(ws[0]), @intCast(ws[1]), @intCast(m));
     const l = plan.launch(p, ws[0]);
     const c = mlx.mlx_fast_metal_kernel_config_new();
@@ -152,7 +157,7 @@ fn loadBank(_: *const abi.LoadCtx, _: Str, _: u32, _: *abi.Weight) callconv(.c) 
 /// BF16 rounding. One kernel on Metal over whole column blocks; MLX ops elsewhere (the same values).
 pub fn dequantize(codes: mlx.mlx_array, scales: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     const sh = mlx.getShape(codes);
-    if (mlx.streamIsGpu(s) and @rem(sh[1], block_cols) == 0) {
+    if (kernelsTake(scales, s) and @rem(sh[1], block_cols) == 0) {
         const c = mlx.mlx_fast_metal_kernel_config_new();
         defer _ = mlx.mlx_fast_metal_kernel_config_free(c);
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, sh.ptr, 2, .bfloat16));
@@ -251,18 +256,18 @@ fn evalBf16(y: mlx.mlx_array) ![]const u16 {
 // Bar: bf16(code x scale) of the host, on the kernel and on MLX's ops, ragged tiles on both axes included.
 test "fp8_block128: the prompt route's weight is bf16(code x scale), each code on its own block's scale" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const n = 70;
+    const n = 140;
     var rnd = std.Random.DefaultPrng.init(64);
-    // 200 columns: ragged column blocks (MLX's ops); 384: whole blocks (the kernel on Metal).
+    // 200 columns: ragged column blocks (MLX's ops); 384: whole blocks (the kernel on Metal: 9 scales).
     inline for (.{ 200, 384 }) |k| {
         const cols = (k + block_cols - 1) / block_cols;
         var codes: [n * k]u8 = undefined;
         codesOf(rnd.random(), &codes);
-        var scales: [2 * cols]f32 = undefined;
+        var scales: [3 * cols]f32 = undefined;
         for (&scales) |*v| v.* = std.math.ldexp(1.0 + rnd.random().float(f32), -6 - rnd.random().intRangeAtMost(i32, 0, 3));
         const w = mlx.mlx_array_new_data(&codes, &[_]c_int{ n, k }, 2, .uint8);
         defer _ = mlx.mlx_array_free(w);
-        const sc = mlx.mlx_array_new_data(&scales, &[_]c_int{ 2, cols }, 2, .float32);
+        const sc = mlx.mlx_array_new_data(&scales, &[_]c_int{ 3, cols }, 2, .float32);
         defer _ = mlx.mlx_array_free(sc);
         for ([_]mlx.mlx_stream{ mlx.gpuStream(), mlx.mlx_default_cpu_stream_new() }) |s| {
             defer _ = mlx.mlx_stream_free(s);
