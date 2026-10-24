@@ -853,19 +853,19 @@ test "gatherQmv nvfp4 is no worse than stock gather_qmm vs fp32 dequant ground t
     }
 }
 
-test "MoE decode gather µbench (MLX_SERVE_MOE_GATHER_UBENCH=1)" {
+test "MoE decode gather µbench (diag moe-gather-ubench)" {
     // Reproduces the Laguna decode expert-gather with OUR self-built MLX, to
     // compare against the pip-MLX Python sim (single gather ~133us, 47-layer
     // MoE ~7.5ms). If this is far slower, the gap is our MLX build/runtime;
     // if it matches, the gap is the live server context (stream/alloc/pipeline).
-    if (env.get(.MLX_SERVE_MOE_GATHER_UBENCH) == null) return error.SkipZigTest;
+    if (env.get(.MOE_GATHER_UBENCH) == null) return error.SkipZigTest;
     const io_util = @import("../../util/io_util.zig");
     const tio = testing.io;
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
     // Trace mode: run the gather and qmv sections in long sustained bursts so an
     // Instruments Metal System Trace shows a clean, comparable GPU timeline.
-    const gather_trace = env.get(.MLX_SERVE_MOE_GATHER_TRACE) != null;
+    const gather_trace = env.get(.MOE_GATHER_TRACE) != null;
     const E: c_int = 256;
     const N: c_int = 1024; // moe_intermediate (gate/up out)
     const K: c_int = 3072; // hidden

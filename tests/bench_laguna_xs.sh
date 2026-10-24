@@ -8,7 +8,7 @@
 #   ./tests/bench_laguna_xs.sh [--cells serial|unconstrained] [--runs N] [--label L] [--note N] [--no-csv]
 #
 # Writes ~/claude-tmp/bench-laguna/laguna-xs-<date>.csv. Exported MLX_SERVE_* reach the server (kill-switch A/Bs).
-# Rebuild ReleaseFast first. When a number looks wrong: tests/fwd_ubench.sh, MLX_SERVE_LAYER_CAP=N, and the
+# Rebuild ReleaseFast first. When a number looks wrong: tests/fwd_ubench.sh, MLX_SERVE_DIAG=layer-cap=N, and the
 # `diagProjBench` rung ladder (story in docs/gotchas/engine-mlx.md, the f32-mscale promotion).
 
 set -uo pipefail

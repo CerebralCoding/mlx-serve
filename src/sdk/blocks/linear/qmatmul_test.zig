@@ -391,14 +391,14 @@ test "qmatmulBits nvfp4 matches dequantize+matmul reference" {
     for (0..OUT) |o| try testing.expectApproxEqAbs(gt[o], got_host[o], 5e-2);
 }
 
-test "spec-verify width sweep µbench (MLX_SERVE_VERIFY_WIDTH_UBENCH=1)" {
+test "spec-verify width sweep µbench (diag verify-width-ubench)" {
     // What does one spec-verify forward cost as a function of the block width?
     // MLX routes transposed qmm by `get_qmv_batch_limit(K, N)`: below it the
     // weight-reuse qmv kernel runs (cost ~flat in M, bandwidth-bound), at and
     // above it the 32x32-tiled qmm_splitk runs (compute-bound, and a width of
     // 16 wastes half the 32-row tile). The limit is a per-shape number, so the
     // cliff is what this prints — a whole-model per-round estimate at each M.
-    if (env.get(.MLX_SERVE_VERIFY_WIDTH_UBENCH) == null) return error.SkipZigTest;
+    if (env.get(.VERIFY_WIDTH_UBENCH) == null) return error.SkipZigTest;
     const io_util = @import("../../util/io_util.zig");
     const tio = testing.io;
     const s = mlx.gpuStream();

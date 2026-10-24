@@ -166,8 +166,8 @@ test "prefillDqGemm: 2-bit weights take the dequant route from 384 rows, other w
     }
 }
 
-test "prefill qmm µbench: stock qmm vs dequant+GEMM at 27B prefill shapes (MLX_SERVE_PREFILL_QMM_UBENCH=1)" {
-    if (env.get(.MLX_SERVE_PREFILL_QMM_UBENCH) == null) return error.SkipZigTest;
+test "prefill qmm µbench: stock qmm vs dequant+GEMM at 27B prefill shapes (diag prefill-qmm-ubench)" {
+    if (env.get(.PREFILL_QMM_UBENCH) == null) return error.SkipZigTest;
     const io_util = @import("../../util/io_util.zig");
     const tio = testing.io;
     const s = mlx.gpuStream();

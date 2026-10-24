@@ -9,7 +9,7 @@ const qsa_decode = @import("../qsa_decode.zig");
 const arms_mod = @import("arms.zig");
 const transformer = @import("../../../engines/mlx/transformer.zig");
 const ProfClock = @import("../../../engines/mlx/diag/profile.zig").ProfClock;
-const diagEnvOn = @import("../../../engines/mlx/env_transformer.zig").diagEnvOn;
+const env = @import("../../../env.zig");
 const KVCache = @import("../../../engines/mlx/kv/cache.zig").KVCache;
 const scalarOf = @import("../../../engines/mlx/load/weights.zig").scalarOf;
 const QsaCfgCache = @import("../../../mlx/kernel_cache.zig").QsaCfgCache;
@@ -670,7 +670,7 @@ fn qsaSlotGathered(arms: *QsaArmCounts, seq_len: c_int, out: mlx.mlx_array, cost
 
 /// `gatherQsa256` with the `QWEN4_PROFILE_QSA` timer around it.
 fn qsaPrefillGatherProfiled(s: mlx.mlx_stream, q_rope: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, attn_scale: f32, blocks: mlx.mlx_array, ratio: c_int) !?mlx.mlx_array {
-    const prof = diagEnvOn("QWEN4_PROFILE_QSA");
+    const prof = env.on(.QWEN4_PROFILE_QSA);
     var clk: ProfClock = undefined;
     if (prof) {
         try mlx.check(mlx.mlx_array_eval(q_rope));

@@ -236,7 +236,7 @@ pub const Generator = struct {
     ssm_lag: [2]SsmLag = .{ .{}, .{} },
     /// Stats: cumulative draft tokens accepted (excluding always-accepted t1).
     dflash_accepted_tokens: u64 = 0,
-    /// Per-phase wall-time trace (MLX_SERVE_DFLASH_TRACE=1; else untouched).
+    /// Per-phase wall-time trace (diag dflash-trace; else untouched).
     /// Unlike the MTP trace this one INSERTS eval barriers to attribute a
     /// fully-lazy round — a traced round is slower than a real one by
     /// whatever overlap the barriers destroy. Diagnostic only.
@@ -393,7 +393,7 @@ pub const Generator = struct {
     /// This slot's next `mtpRoundBegin` inits the chain and returns `.open` so the
     /// scheduler can run the head step for the group in one graph.
     mtp_batch_head: bool = false,
-    /// Per-phase wall-time trace (MLX_SERVE_MTP_TRACE=1; else untouched).
+    /// Per-phase wall-time trace (diag mtp-trace; else untouched).
     mtp_trace: MtpTrace = .{},
     /// Trace-only: stopwatch running across the scheduler gap (round return
     /// → next round entry); bills the `.gap` phase. Null when not tracing.

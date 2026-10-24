@@ -539,12 +539,12 @@ test "qkv decode kernel declines non-decode widths and missing triples" {
     try testing.expectEqual(@as(?mlx.mlx_array, null), try qkvAttnDecodeKernel(s, q2, &view, 1.0, "", .{ .ctx = null }));
 }
 
-test "qkv packed-attention surface µbench (env-gated: MLX_SERVE_KVQ_UBENCH=1)" {
+test "qkv packed-attention surface µbench (diag kvq-ubench)" {
     // Per (t_q, kv): (a) packed kernel, (b) dequant + dense sdpa, (c) bf16
     // sdpa with no dequant. Arms interleave in one process and the cell order
     // reverses per pass; BATCH launches share one eval so the sync barrier
     // does not price the cell.
-    if (!env.on(.MLX_SERVE_KVQ_UBENCH)) return;
+    if (!env.on(.KVQ_UBENCH)) return;
     const old_ver = kv_quant_attn.qkv_ver_override;
     kv_quant_attn.qkv_ver_override = true;
     defer kv_quant_attn.qkv_ver_override = old_ver;

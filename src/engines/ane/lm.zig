@@ -151,9 +151,9 @@ fn runReqs(rs: []const rt.Request) !void {
 
 var trace_env: ?bool = null;
 
-/// `MLX_SERVE_ANE_TRACE` (set and not `0`, as `transformer.diagEnvValueOn`): per-call timings in the log.
+/// Diag `ane-trace`: per-call timings in the log.
 fn trace() bool {
-    if (trace_env == null) trace_env = if (env.get(.MLX_SERVE_ANE_TRACE)) |v| v[0] != '0' else false;
+    if (trace_env == null) trace_env = if (env.get(.ANE_TRACE)) |v| v[0] != '0' else false;
     return trace_env.?;
 }
 

@@ -115,7 +115,7 @@ start_server() { # $1 = log path
     done
     : > "$log"
     # Never read or write the user's round-cost table; the boots must stay independent.
-    MLX_SERVE_ROUND_COST_PERSIST=0 MLX_SERVE_MTP_TRACE=1 \
+    MLX_SERVE_ROUND_COST_PERSIST=0 MLX_SERVE_DIAG=mtp-trace \
     "$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" \
         --mtp --kv-quant 8 --ctx-size "$CTX_SIZE" --no-pld \
         --prefix-cache-entries 2 --log-level info >"$log" 2>&1 &
@@ -268,7 +268,7 @@ for _ in $(seq 1 30); do
     sleep 1
 done
 : > "$LOG_C"
-HOME="$ISO_HOME" MLX_SERVE_MTP_TRACE=1 MLX_SERVE_ROUND_COST_PERSIST=1 \
+HOME="$ISO_HOME" MLX_SERVE_DIAG=mtp-trace MLX_SERVE_ROUND_COST_PERSIST=1 \
 "$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" \
     --no-mtp --kv-quant 8 --ctx-size "$CTX_SIZE" --no-pld \
     --prefix-cache-entries 2 --log-level info >"$LOG_C" 2>&1 &

@@ -54,7 +54,7 @@ mlx-serve on NVIDIA GPUs: MLX's CUDA backend on Linux (x86_64 and aarch64) and W
 ## Measuring
 
 - **A kernel microbench must rotate its weights past L2.** The 5060 Ti's L2 held a 28 MB matrix and read it at 760 GB/s on a 448 GB/s card. Rotate copies that total more than ~5x L2.
-- **The forward ladder is the in-situ meter**: `MLX_SERVE_DECODE_FWD_UBENCH=30 MLX_SERVE_DECODE_FWD_UBENCH_S=<rows> MLX_SERVE_DECODE_FWD_UBENCH_KV=2048 tests/fwd_ubench.sh <model>`. `MLX_CUDA_QMV_MAX_ROWS=1` plus `MLX_SERVE_CUDA_QMV_TC=0` is MLX's stock path.
+- **The forward ladder is the in-situ meter**: `MLX_SERVE_DIAG=decode-fwd-ubench-s=<rows>,decode-fwd-ubench-kv=2048 tests/fwd_ubench.sh <model> 30`. `MLX_CUDA_QMV_MAX_ROWS=1` plus `MLX_SERVE_CUDA_QMV_TC=0` is MLX's stock path.
 - **Tok/s comes from llmprobe** (`tests/bench.sh --url`, `/bench`), with each arm proven by its own log: `[spec-stats] mode=` and `[qmv-cuda] tensor-core rows kernel engaged`.
 
 ## Tests

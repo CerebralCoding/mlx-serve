@@ -82,7 +82,7 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
     const batch: c_int = x_shape[0];
     const seq_len: c_int = x_shape[1];
     const is_prefill = seq_len > 1;
-    const prof = prof_on and (seq_len == 1 or env.get(.MLX_SERVE_DECODE_FWD_UBENCH) != null);
+    const prof = prof_on and (seq_len == 1 or env.get(.DECODE_FWD_UBENCH) != null);
     if (prof) {
         try mlx.check(mlx.mlx_array_eval(h));
         profile.profileState().decode_prof.embed_ns += pclk.lap();
@@ -141,7 +141,7 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
         ctx.cache.config.scheme != .off,
     );
 
-    // DIAGNOSTIC (MLX_SERVE_LAYER_CAP=N): run only the first N layers, so a
+    // DIAGNOSTIC (diag layer-cap=N): run only the first N layers, so a
     // ms-vs-N sweep separates the forward's per-layer slope from its fixed
     // cost. Every layer that runs does its complete real work, so the slope
     // is a marginal cost, not an ablation artifact.

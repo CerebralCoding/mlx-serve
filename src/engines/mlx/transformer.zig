@@ -269,8 +269,6 @@ const DtypeCastCache = @import("../../mlx/dtype.zig").DtypeCastCache;
 // sdk/diag/standin.zig
 pub const Standin = @import("../../sdk/diag/standin.zig").Standin;
 pub const qwen4Standin = @import("../../sdk/diag/standin.zig").qwen4Standin;
-// engines/mlx/env_transformer.zig
-pub const diagEnvValueOn = @import("env_transformer.zig").diagEnvValueOn;
 // sdk/blocks/linear/fused_rows.zig
 // sdk/blocks/attention/decode_attn_quant.zig
 const AttnDqCopy = @import("../../sdk/blocks/attention/decode_attn_quant.zig").AttnDqCopy;
@@ -1121,7 +1119,6 @@ test {
     _ = @import("../../mlx/dtype.zig");
     _ = @import("../../sdk/diag/standin.zig");
     _ = @import("../../plugins/qwen4_exp/prof.zig");
-    _ = @import("env_transformer.zig");
     _ = @import("../../sdk/blocks/linear/fused_rows.zig");
     _ = @import("../../sdk/blocks/attention/decode_attn_quant.zig");
     _ = @import("../../sdk/blocks/rope/qk_norm_rope.zig");

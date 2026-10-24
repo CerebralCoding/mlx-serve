@@ -437,28 +437,28 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         log.info("[dflash] MTP acceptance forced to exact while the drafter is bound\n", .{});
 
     // After the drafter binds: an exact-mode arch runs its row kernels only then.
-    // DIAGNOSTIC (MLX_SERVE_DECODE_FWD_UBENCH=N): time N decode-width forward
+    // DIAGNOSTIC (diag decode-fwd-ubench=N): time N decode-width forward
     // passes back to back, with NO sampling, detokenization, stop-checking or
     // cache bookkeeping around them. The server reports `predicted_ms` around
     // the whole decode LOOP, so this is the only way to say how much of a
     // token is the model and how much is everything else. Resets the KV cache
     // afterwards so the probe cannot pollute real requests.
-    if (env.get(.MLX_SERVE_DECODE_FWD_UBENCH)) |raw| {
+    if (env.get(.DECODE_FWD_UBENCH)) |raw| {
         const n = std.fmt.parseInt(usize, std.mem.sliceTo(raw, 0), 10) catch 0;
         if (n > 0) {
             const io_u = @import("../../sdk/util/io_util.zig");
             const tio = std.Io.Threaded.global_single_threaded.io();
             var ctx = xfm_ptr.defaultCtx();
-            // MLX_SERVE_DECODE_FWD_UBENCH_S=<rows>: verify-width forwards
+            // diag decode-fwd-ubench-s=<rows>: verify-width forwards
             // (per-position SSM capture on, as spec verify runs them).
-            // MLX_SERVE_DECODE_FWD_UBENCH_KV=<tokens>: prefill that many
+            // diag decode-fwd-ubench-kv=<tokens>: prefill that many
             // tokens first so the meter runs at a real context length.
             const rows: usize = blk: {
-                const r = env.get(.MLX_SERVE_DECODE_FWD_UBENCH_S) orelse break :blk 1;
+                const r = env.get(.DECODE_FWD_UBENCH_S) orelse break :blk 1;
                 break :blk @max(1, std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 1);
             };
             const kv_pre: usize = blk: {
-                const r = env.get(.MLX_SERVE_DECODE_FWD_UBENCH_KV) orelse break :blk 0;
+                const r = env.get(.DECODE_FWD_UBENCH_KV) orelse break :blk 0;
                 break :blk std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 0;
             };
             const tok_slice = try sch.allocator.alloc(i32, @min(rows, 4096));
@@ -486,14 +486,14 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             // Rows past 16 are a prefill chunk unless `_KV` says a context stands behind them (verify widths up to 32).
             const prefill_rows = rows > 16 and kv_pre == 0;
             ctx.capture_ssm_seq = rows > 1 and rows <= 32 and !prefill_rows and ctx.ssm_entries != null; // verify widths capture, prefill chunks do not
-            // MLX_SERVE_DECODE_FWD_UBENCH_TREE=1 at 16 rows: verify a fixed draft
+            // diag decode-fwd-ubench-tree at 16 rows: verify a fixed draft
             // tree (a 9-row trunk, siblings at depths 1-4, their children), as a round does.
             const tree_parents = [16]i32{ -1, 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 9, 10, 11 };
             var tree_depth: [16]i32 = undefined;
             for (tree_parents, 0..) |p, i| tree_depth[i] = if (p < 0) 0 else tree_depth[@intCast(p)] + 1;
             const spec_tree = generate_mod.Generator.specTreeFor(&tree_parents, &tree_depth, 8);
             defer spec_tree.deinit();
-            if (rows == 16 and env.get(.MLX_SERVE_DECODE_FWD_UBENCH_TREE) != null) ctx.tree = &spec_tree;
+            if (rows == 16 and env.get(.DECODE_FWD_UBENCH_TREE) != null) ctx.tree = &spec_tree;
             // Prefill widths: every forward starts from an empty cache (else each
             // one attends over the previous ones' rows) and skips the lm_head,
             // which a real intermediate chunk never evaluates.
@@ -508,10 +508,10 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 _ = mlx.mlx_array_eval(lg);
                 _ = mlx.mlx_array_free(lg);
             }
-            // DIAGNOSTIC (MLX_SERVE_DECODE_GRAPH_DUMP=<path>): print the lazy
+            // DIAGNOSTIC (diag decode-graph-dump=<path>): print the lazy
             // graph of ONE forward (every primitive with its shape) before it
             // is evaluated, to map which ops a decode step dispatches.
-            if (env.get(.MLX_SERVE_DECODE_GRAPH_DUMP)) |path| {
+            if (env.get(.DECODE_GRAPH_DUMP)) |path| {
                 const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
                 defer _ = mlx.mlx_array_free(ti);
                 if (xfm_ptr.forwardWith(&ctx, ti)) |lg| {

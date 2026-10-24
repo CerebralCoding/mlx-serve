@@ -237,9 +237,9 @@ test "prefill expert reduction is bit-identical to unsort multiply and sum" {
     };
 }
 
-test "prefill expert reduction µbench (MLX_SERVE_MOE_WSUM_UBENCH=1)" {
+test "prefill expert reduction µbench (diag moe-wsum-ubench)" {
     // Bar: chained marginal GPU ms per call, stock take+multiply+sum vs the fused kernel, at an 8192-token chunk.
-    if (!env.on(.MLX_SERVE_MOE_WSUM_UBENCH) or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!env.on(.MOE_WSUM_UBENCH) or mlx.noGpuBackend()) return error.SkipZigTest;
     const io_util = @import("../../util/io_util.zig");
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0xBE7C);

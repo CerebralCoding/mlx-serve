@@ -470,10 +470,10 @@ pub fn mtpRoundVerify(self: *Generator, st: *MtpRoundState) !void {
     // sequential recurrence AND a full trunk weight read, and at depth > 1
     // MOST rounds are partial, so it dominated the round cost).
     self.ctx.capture_ssm_seq = self.ctx.ssm_entries != null;
-    // DIAGNOSTIC (MLX_SERVE_MTP_TRACE_SYNC=1): drain the GPU before the
+    // DIAGNOSTIC (diag mtp-trace-sync): drain the GPU before the
     // verify build so the `sync` lap shows the pending lazy work (draft
     // chain, rollback, commit) and `verify` the forward alone.
-    if (tracing and env.get(.MLX_SERVE_MTP_TRACE_SYNC) != null) {
+    if (tracing and env.get(.MTP_TRACE_SYNC) != null) {
         var sync_watch = io_util.Stopwatch.init(self.timer.io);
         try mlx.check(mlx.mlx_array_eval(st.verify_input));
         self.mtp_trace.add(.sync, sync_watch.read());

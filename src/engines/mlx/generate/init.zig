@@ -197,10 +197,10 @@ pub fn initWithOptions(
         options.pinned_prefill_chunk,
     ), options.decode_share_width_cap);
     // Phase-level prefill instrumentation. Enabled at debug level OR via
-    // MLX_SERVE_PREFILL_TRACE=1 (which forces the trace line at info).
+    // diag prefill-trace (which forces the trace line at info).
     // Phase 0 of plan 04 — gives us a decomposed view of where cold prefill
     // time goes (chunked-forward vs eval vs last-token-forward).
-    const trace_force: bool = generate_mod.prefill_trace_force or env.one(.MLX_SERVE_PREFILL_TRACE);
+    const trace_force: bool = generate_mod.prefill_trace_force or env.one(.PREFILL_TRACE);
     const trace_enabled = log.isDebug() or trace_force;
     var prefill_sw = io_util.Stopwatch.init(io);
     var chunked_ns: u64 = 0;

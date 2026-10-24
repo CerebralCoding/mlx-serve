@@ -27,7 +27,7 @@ routed experts (switch_mlp), the n-gram table and bf16 tensors: unchanged
 
 ## Results
 
-GPU time per forward from `MLX_SERVE_DECODE_FWD_UBENCH`, same boot; accuracy with 4 concurrent
+GPU time per forward from diag `decode-fwd-ubench`, same boot; accuracy with 4 concurrent
 streams. A second mixed-4-8bit run with identical settings is the noise floor, since MTP typical
 acceptance and batching partners make greedy output vary run to run.
 

@@ -375,7 +375,7 @@ Defect: the obvious ACE-Step reading runs and produces plausible noise. Cause: t
 the conditional branch, the feedback embedding scales by 8^-0.5; square convs defeat the bias-length weight-norm
 heuristic (key the transpose by name); `_clean_caption`'s regex crosses lines. Fix: each pinned by a transcription
 oracle (`tests/dump_music3_fixtures.py`) or a table test; a finite additive vocab mask keeps CFG finite. Attribute
-stages with laps (`MUSIC3_COST_PROBE`) before pricing a lever off bandwidth arithmetic: a depth KV cache halved a
+stages with laps (`MLX_SERVE_DIAG=music3-cost-probe`) before pricing a lever off bandwidth arithmetic: a depth KV cache halved a
 stage the model said was at its read floor.
 
 ### A bare f32 scalar promotes a bf16 stream

@@ -134,7 +134,7 @@ pub fn gpuArchitecture(buf: []u8) ?[]const u8 {
 
 pub fn computeNaxAvailable() bool {
     var force = false;
-    if (env.get(.MLX_SERVE_FORCE_GPU_FAMILY_FALLBACK)) |p| {
+    if (env.get(.FORCE_GPU_FAMILY_FALLBACK)) |p| {
         const v = std.mem.span(p);
         force = v.len > 0 and v[0] == '1';
     }
@@ -201,7 +201,7 @@ test "NAX availability probe: G17 prefix + macOS 26.2 floor + fallback rehearsal
     try testing.expect(naxAvailableFrom(false, "applegpu_g17d", "26.2"));
     try testing.expect(!naxAvailableFrom(false, "applegpu_g16", "26.2"));
     try testing.expect(!naxAvailableFrom(false, "applegpu_g17d", "26.1"));
-    // MLX_SERVE_FORCE_GPU_FAMILY_FALLBACK=1 QA rehearsal: an M5 pretends the
+    // diag force-gpu-family-fallback QA rehearsal: an M5 pretends the
     // units are absent so the exact M1-M4 plain-SIMD path runs there.
     try testing.expect(!naxAvailableFrom(true, "applegpu_g17d", "26.4"));
 }

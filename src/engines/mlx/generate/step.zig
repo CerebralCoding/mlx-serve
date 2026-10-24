@@ -617,7 +617,7 @@ pub fn startAsyncForward(self: *Generator, token_id: u32) void {
     self.has_pending_logits = true;
 }
 
-/// Diagnostic (`MLX_SERVE_STEP_TRACE=1`): host time of a pipelined serial step, per phase,
+/// Diagnostic (diag `step-trace`): host time of a pipelined serial step, per phase,
 /// summed across the request and reported with the spec stats.
 pub const StepTrace = struct {
     const Phase = enum { build, flush, submit, resolve };
@@ -627,7 +627,7 @@ pub const StepTrace = struct {
 
     fn enabled() bool {
         if (on) |v| return v;
-        const raw = env.get(.MLX_SERVE_STEP_TRACE);
+        const raw = env.get(.STEP_TRACE);
         const v = raw != null and raw.?[0] != '0';
         on = v;
         return v;

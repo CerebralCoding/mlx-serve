@@ -6,7 +6,6 @@ const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../sdk/util/log.zig");
 const gather_qmv_rows = @import("../../sdk/blocks/moe/gather_qmv_rows.zig");
 const ProfClock = @import("../../engines/mlx/diag/profile.zig").ProfClock;
-const diagEnvOn = @import("../../engines/mlx/env_transformer.zig").diagEnvOn;
 
 pub const Qwen4FwdProf = struct {
     const Block = enum(u8) { ple, hc_read, gdn, attn, hc_write, mlp };
@@ -23,8 +22,8 @@ pub const Qwen4FwdProf = struct {
         const raw = env.get(.QWEN4_PROFILE_FWD);
         // `=1`: S 2..16 (verify). `=all`: any S, including decode S=1 and prefill.
         const all = raw != null and raw.?[0] == 'a';
-        const timing = diagEnvOn("QWEN4_PROFILE_FWD") and (all or (seq_len >= 2 and seq_len <= 16));
-        var p: Qwen4FwdProf = .{ .timing = timing, .ops = diagEnvOn("QWEN4_OPCOUNT"), .clock = ProfClock.init() };
+        const timing = profileFwdOn() and (all or (seq_len >= 2 and seq_len <= 16));
+        var p: Qwen4FwdProf = .{ .timing = timing, .ops = env.on(.QWEN4_OPCOUNT), .clock = ProfClock.init() };
         if (p.ops) {
             gather_qmv_rows.moeStats().moe_rows_fused_layers = 0;
             gather_qmv_rows.moeStats().moe_sorted_layers = 0;
@@ -113,7 +112,7 @@ pub const Qwen4AttnProf = struct {
 
     /// Syncs `x` and starts the clock when profiling this layer; false otherwise.
     pub fn begin(x: mlx.mlx_array, seq_len: c_int) bool {
-        if (on == null) on = diagEnvOn("QWEN4_PROFILE_ATTN");
+        if (on == null) on = env.on(.QWEN4_PROFILE_ATTN);
         if (!on.? or seq_len <= 16) return false;
         sync(x);
         clock = ProfClock.init();
@@ -140,8 +139,14 @@ pub const Qwen4AttnProf = struct {
     }
 };
 
-/// Caches for the qwen4 per-layer diagnostic switches: a `getenv` per layer per forward is a libc scan of the environ block.
+/// Caches for the qwen4 per-layer diagnostic switches: a diag read per layer per forward scans `MLX_SERVE_DIAG`.
 pub var qwen4_no_pooled_env: ?bool = null;
 pub var qwen4_debug_scores_env: ?bool = null;
 pub var qwen4_profile_fwd_env: ?bool = null;
 pub var qwen4_profile_qsa_env: ?bool = null;
+
+/// Diag `qwen4-profile-fwd` armed (`1`: verify widths, `all`: every width).
+pub fn profileFwdOn() bool {
+    if (qwen4_profile_fwd_env == null) qwen4_profile_fwd_env = env.onValue(env.get(.QWEN4_PROFILE_FWD));
+    return qwen4_profile_fwd_env.?;
+}

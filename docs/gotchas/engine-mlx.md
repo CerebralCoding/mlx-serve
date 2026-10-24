@@ -320,7 +320,7 @@ real (exactly 2.00x on the KV term) but the blended speedup falls with context (
 by different factors do not compound; `gatherQmv` now lost to stock `gather_qmm` on both Laguna sizes, so no arch opts
 in by default; the PLD yield-gate warmup dropped 32 → 8 (recovers the losses, keeps the +77% echo win; enabling
 speculation costs ~1% even when the prompt gate declines). Method: per-cell medians over repeated runs (single runs
-lied three times); check a flagged cell's reachability from the change before re-running; `MLX_SERVE_DECODE_PROFILE`
+lied three times); check a flagged cell's reachability from the change before re-running; diag `decode-profile`
 destroys pipelining and is not a sizing tool; a ladder guard must use the ladder's own geometry.
 
 ### Fusing decode dispatches: only the critical path pays
@@ -1275,7 +1275,7 @@ codesign uses. Check: `codesign -dv` on a re-signed copy prints that identifier 
 ### Bonsai 2 2B/4B/9B answered in gibberish: a decode kernel sized for one pack's block
 Defect: Bonsai 2B, 4B and 9B produced word salad from the first token; the 27B was fine. Cause: each pack picks its
 own Hadamard block (512/4096/1024) and the fused one-token GDN kernel was written for 1024. Found by matching prism's
-loader layer by layer under `MLX_SERVE_LAYER_CAP`. Fix: the kernel takes the block as a template. Guard:
+loader layer by layer under diag `layer-cap`. Fix: the kernel takes the block as a template. Guard:
 `gdn_decode.step and recur` at every block.
 
 ### GLM's KDA layers came out 1.8% short: an epsilon on the mean

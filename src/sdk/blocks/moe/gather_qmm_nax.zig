@@ -905,7 +905,7 @@ fn benchPortGateUp(c: BenchArm) anyerror!mlx.mlx_array {
 
 /// `=sweep` times every tile configuration instead of the planner's.
 fn benchPlans(buf: *[32]Plan, rows: c_int, experts: c_int, k: c_int, n: c_int, paired: bool) []const Plan {
-    const raw = env.get(.MLX_SERVE_GQMM_UBENCH) orelse return buf[0..0];
+    const raw = env.get(.GQMM_UBENCH) orelse return buf[0..0];
     if (!std.mem.eql(u8, std.mem.sliceTo(raw, 0), "sweep")) {
         buf[0] = plan(rows, experts, k, n, paired);
         return buf[0..1];
@@ -923,8 +923,8 @@ fn benchPlans(buf: *[32]Plan, rows: c_int, experts: c_int, k: c_int, n: c_int, p
     return buf[0..count];
 }
 
-test "segmented NAX sorted gather µbench vs stock at 8192-token chunks (MLX_SERVE_GQMM_UBENCH=1|sweep)" {
-    if (env.get(.MLX_SERVE_GQMM_UBENCH) == null) return error.SkipZigTest;
+test "segmented NAX sorted gather µbench vs stock at 8192-token chunks (diag gqmm-ubench, gqmm-ubench=sweep)" {
+    if (env.get(.GQMM_UBENCH) == null) return error.SkipZigTest;
     try requireNax();
     errdefer dropOwnLatch();
     const s = mlx.gpuStream();

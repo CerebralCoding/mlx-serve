@@ -29,7 +29,7 @@ pub fn dumpRestoreDir() ?[]const u8 {
         return d;
     }
     if (!dump_dir_read) {
-        dump_dir_cached = dumpRestoreDirFromEnv(env.get(.MLX_SERVE_DUMP_RESTORE));
+        dump_dir_cached = dumpRestoreDirFromEnv(env.get(.DUMP_RESTORE));
         dump_dir_read = true;
     }
     return dump_dir_cached;
