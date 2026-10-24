@@ -866,10 +866,10 @@ pub const Transformer = struct {
     pub const gdnProjGpu = @import("methods/gated_delta_net.zig").gdnProjGpu;
     pub const gdnProjArrays = @import("methods/gated_delta_net.zig").gdnProjArrays;
     // sdk/blocks/mlp/dense.zig
-    pub const residualTail = @import("../../sdk/blocks/mlp/dense.zig").residualTail;
-    pub const standardMlp = @import("../../sdk/blocks/mlp/dense.zig").standardMlp;
-    pub const rowGroupServes = @import("../../sdk/blocks/mlp/dense.zig").rowGroupServes;
-    pub const denseMLP = @import("../../sdk/blocks/mlp/dense.zig").denseMLP;
+    pub const residualTail = @import("methods/dense_mlp.zig").residualTail;
+    pub const standardMlp = @import("methods/dense_mlp.zig").standardMlp;
+    pub const rowGroupServes = @import("methods/dense_mlp.zig").rowGroupServes;
+    pub const denseMLP = @import("methods/dense_mlp.zig").denseMLP;
     // engines/mlx/ane_prefill.zig
     pub const denseMLPMaybeAne = @import("ane_prefill.zig").denseMLPMaybeAne;
     pub const gdnProjMaybeAne = @import("ane_prefill.zig").gdnProjMaybeAne;
@@ -950,20 +950,20 @@ pub const Transformer = struct {
     pub const diagProjBench = @import("diag/proj_bench.zig").diagProjBench;
     pub const projRungOnce = @import("diag/proj_bench.zig").projRungOnce;
     // sdk/blocks/norms/rms.zig
-    pub const rmsNormEps = @import("../../sdk/blocks/norms/rms.zig").rmsNormEps;
-    pub const rhtAddNormRotate = @import("../../sdk/blocks/norms/rms.zig").rhtAddNormRotate;
-    pub const narrowAddNorm = @import("../../sdk/blocks/norms/rms.zig").narrowAddNorm;
-    pub const rmsNorm = @import("../../sdk/blocks/norms/rms.zig").rmsNorm;
-    pub const layerNorm = @import("../../sdk/blocks/norms/rms.zig").layerNorm;
+    pub const rmsNormEps = @import("methods/rms.zig").rmsNormEps;
+    pub const rhtAddNormRotate = @import("methods/rms.zig").rhtAddNormRotate;
+    pub const narrowAddNorm = @import("methods/rms.zig").narrowAddNorm;
+    pub const rmsNorm = @import("methods/rms.zig").rmsNorm;
+    pub const layerNorm = @import("methods/rms.zig").layerNorm;
     // sdk/quant/ternary.zig
     pub const ternaryWideVerify = @import("methods/ternary.zig").ternaryWideVerify;
     // sdk/quant/hadamard.zig
-    pub const unrotateEmbedding = @import("../../sdk/quant/hadamard.zig").unrotateEmbedding;
+    pub const unrotateEmbedding = @import("methods/hadamard.zig").unrotateEmbedding;
     // sdk/blocks/embedding.zig
-    pub const rawEmbedding = @import("../../sdk/blocks/embedding.zig").rawEmbedding;
-    pub const embedding = @import("../../sdk/blocks/embedding.zig").embedding;
-    pub const dequantizedEmbedding = @import("../../sdk/blocks/embedding.zig").dequantizedEmbedding;
-    pub const dequantTake = @import("../../sdk/blocks/embedding.zig").dequantTake;
+    pub const rawEmbedding = @import("methods/embedding.zig").rawEmbedding;
+    pub const embedding = @import("methods/embedding.zig").embedding;
+    pub const dequantizedEmbedding = @import("methods/embedding.zig").dequantizedEmbedding;
+    pub const dequantTake = @import("methods/embedding.zig").dequantTake;
     // sdk/vision/splice.zig
     pub const spliceVisionEmbeddings = @import("methods/vision_splice.zig").spliceVisionEmbeddings;
     pub const spliceVisionRows = @import("../../sdk/vision/splice.zig").spliceVisionRows;
@@ -1058,11 +1058,11 @@ pub const Transformer = struct {
     pub const batchedGdnReady = @import("batched/caps.zig").batchedGdnReady;
     pub const supportsBatchedGdnDecode = @import("batched/caps.zig").supportsBatchedGdnDecode;
     // sdk/blocks/rope/rope.zig
-    pub const ropeInvFreq = @import("../../sdk/blocks/rope/rope.zig").ropeInvFreq;
+    pub const ropeInvFreq = @import("methods/rope.zig").ropeInvFreq;
     pub const ropeAtPositions = @import("../../sdk/blocks/rope/rope.zig").ropeAtPositions;
     pub const ropeAtFreqs = @import("../../sdk/blocks/rope/rope.zig").ropeAtFreqs;
-    pub const ropeCosSinFromFreqs = @import("../../sdk/blocks/rope/rope.zig").ropeCosSinFromFreqs;
-    pub const ropeApplyCosSin = @import("../../sdk/blocks/rope/rope.zig").ropeApplyCosSin;
+    pub const ropeCosSinFromFreqs = @import("methods/rope.zig").ropeCosSinFromFreqs;
+    pub const ropeApplyCosSin = @import("methods/rope.zig").ropeApplyCosSin;
     // plugins/qwen4_exp/qsa/indexer.zig
     pub const qsaInstallRing = @import("../../plugins/qwen4_exp/qsa/indexer.zig").qsaInstallRing;
     pub const qsaAppendKeys = @import("../../plugins/qwen4_exp/qsa/indexer.zig").qsaAppendKeys;
@@ -1100,17 +1100,17 @@ pub const Transformer = struct {
     // plugins/gemma3/encoder.zig
     pub const forwardGemma3EncoderWith = @import("../../plugins/gemma3/encoder.zig").forwardGemma3EncoderWith;
     // sdk/blocks/rope/mrope.zig
-    pub const buildMropeCosSin = @import("../../sdk/blocks/rope/mrope.zig").buildMropeCosSin;
+    pub const buildMropeCosSin = @import("methods/mrope.zig").buildMropeCosSin;
     pub const MropeCosSin = @import("../../sdk/blocks/rope/mrope.zig").MropeCosSin;
-    pub const mropeCosSinAt = @import("../../sdk/blocks/rope/mrope.zig").mropeCosSinAt;
+    pub const mropeCosSinAt = @import("methods/mrope.zig").mropeCosSinAt;
     pub const mropeContext = @import("../../sdk/blocks/rope/mrope.zig").mropeContext;
-    pub const beginMropeChunk = @import("../../sdk/blocks/rope/mrope.zig").beginMropeChunk;
+    pub const beginMropeChunk = @import("methods/mrope.zig").beginMropeChunk;
     pub const endMropeChunk = @import("../../sdk/blocks/rope/mrope.zig").endMropeChunk;
-    pub const applyMrope = @import("../../sdk/blocks/rope/mrope.zig").applyMrope;
+    pub const applyMrope = @import("methods/mrope.zig").applyMrope;
     // sdk/blocks/rope/yarn.zig
-    pub const yarnActive = @import("../../sdk/blocks/rope/yarn.zig").yarnActive;
-    pub const yarnScaleQK = @import("../../sdk/blocks/rope/yarn.zig").yarnScaleQK;
-    pub const yarnScaleRotated = @import("../../sdk/blocks/rope/yarn.zig").yarnScaleRotated;
+    pub const yarnActive = @import("methods/yarn.zig").yarnActive;
+    pub const yarnScaleQK = @import("methods/yarn.zig").yarnScaleQK;
+    pub const yarnScaleRotated = @import("methods/yarn.zig").yarnScaleRotated;
     // sdk/blocks/attention/gated_full.zig
     pub const gatedFullAttnWith = @import("methods/gated_full_attn.zig").gatedFullAttnWith;
     pub const gatedFullAttnProjected = @import("methods/gated_full_attn.zig").gatedFullAttnProjected;
@@ -1118,11 +1118,11 @@ pub const Transformer = struct {
     // sdk/blocks/attention/mla.zig
     pub const mlaAttnWith = @import("methods/mla_attn.zig").mlaAttnWith;
     // sdk/blocks/attention/proj.zig
-    pub const qkAngleFor = @import("../../sdk/blocks/attention/proj.zig").qkAngleFor;
-    pub const qkAngleRowsFor = @import("../../sdk/blocks/attention/proj.zig").qkAngleRowsFor;
-    pub const attnDqFor = @import("../../sdk/blocks/attention/proj.zig").attnDqFor;
-    pub const attnProj = @import("../../sdk/blocks/attention/proj.zig").attnProj;
-    pub const attnProjBias = @import("../../sdk/blocks/attention/proj.zig").attnProjBias;
+    pub const qkAngleFor = @import("methods/attn_proj.zig").qkAngleFor;
+    pub const qkAngleRowsFor = @import("methods/attn_proj.zig").qkAngleRowsFor;
+    pub const attnDqFor = @import("methods/attn_proj.zig").attnDqFor;
+    pub const attnProj = @import("methods/attn_proj.zig").attnProj;
+    pub const attnProjBias = @import("methods/attn_proj.zig").attnProjBias;
     // plugins/gemma4/attention.zig
     pub const gemma4MoeAttnWith = @import("../../plugins/gemma4/attention.zig").gemma4MoeAttnWith;
     // engines/mlx/verify/joined_rows.zig
@@ -1158,9 +1158,9 @@ pub const Transformer = struct {
     pub const moeDecodeGatherQmvRows = @import("methods/moe_decode.zig").moeDecodeGatherQmvRows;
     pub const moeMLP2 = @import("methods/moe_decode.zig").moeMLP2;
     // sdk/blocks/attention/masks.zig
-    pub const createCausalMask = @import("../../sdk/blocks/attention/masks.zig").createCausalMask;
-    pub const createSlidingWindowDecodeMask = @import("../../sdk/blocks/attention/masks.zig").createSlidingWindowDecodeMask;
-    pub const createSlidingWindowMask = @import("../../sdk/blocks/attention/masks.zig").createSlidingWindowMask;
+    pub const createCausalMask = @import("methods/masks.zig").createCausalMask;
+    pub const createSlidingWindowDecodeMask = @import("methods/masks.zig").createSlidingWindowDecodeMask;
+    pub const createSlidingWindowMask = @import("methods/masks.zig").createSlidingWindowMask;
 
     pub fn deinit(self: *Transformer) void {
         self.releaseJoinedVerifyLogits();
@@ -1379,7 +1379,7 @@ test {
     _ = @import("../../sdk/blocks/moe/routing.zig");
     _ = @import("../../sdk/blocks/linear/qmatmul.zig");
     _ = @import("diag/proj_bench.zig");
-    _ = @import("../../sdk/blocks/norms/rms.zig");
+    _ = @import("methods/rms.zig");
     _ = @import("../../sdk/quant/ternary.zig");
     _ = @import("../../sdk/quant/hadamard.zig");
     _ = @import("../../sdk/blocks/embedding.zig");
@@ -1410,7 +1410,7 @@ test {
     _ = @import("../../sdk/blocks/rope/yarn.zig");
     _ = @import("methods/gated_full_attn.zig");
     _ = @import("methods/mla_attn.zig");
-    _ = @import("../../sdk/blocks/attention/proj.zig");
+    _ = @import("methods/attn_proj.zig");
     _ = @import("../../plugins/laguna/ubench_test.zig");
     _ = @import("../../plugins/inkling/attention.zig");
     _ = @import("../../plugins/gemma4/attention.zig");

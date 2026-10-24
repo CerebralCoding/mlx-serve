@@ -1,5 +1,5 @@
 //! sdk/quant/hadamard, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns unrotateEmbedding, aliasFusedRotations, registerRhtSigns.
+//! Owns aliasFusedRotations, registerRhtSigns.
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
@@ -7,17 +7,7 @@ const rht = @import("hadamard/rht.zig");
 const log = @import("../../host/log.zig");
 const Weights = @import("../weights/resident.zig").Weights;
 const MoeLayerWeights = @import("../../engines/mlx/forward/layered.zig").MoeLayerWeights;
-const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
 const biasNegScalePeak = @import("ternary.zig").biasNegScalePeak;
-
-/// Hadamard packs: gathered embedding rows back to the residual basis.
-/// Takes ownership of `rows`.
-pub fn unrotateEmbedding(self: *const Transformer, rows: mlx.mlx_array) !mlx.mlx_array {
-    const reg = self.rht orelse return rows;
-    const signs = reg.get(self.emb_w) orelse return rows;
-    defer _ = mlx.mlx_array_free(rows);
-    return rht.transform(rows, signs, reg.block, true, self.s);
-}
 
 /// Hadamard packs: a row-joined group reads ONE rotation of its input, so it
 /// is served only when its parts share a sign vector; else the parts' views are.
