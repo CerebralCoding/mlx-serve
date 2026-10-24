@@ -1,5 +1,5 @@
 //! engines/mlx/layer_weights, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns LayerWeights, FullAttnWeights, QW, HybridMlpWeights, MoeLayerWeights.
+//! Owns FullAttnWeights, QW, HybridMlpWeights, MoeLayerWeights.
 
 const mlx = @import("../../mlx/ffi.zig");
 const FusedRows = @import("../../sdk/blocks/linear/fused_rows.zig").FusedRows;
@@ -8,61 +8,6 @@ const PleWeights = @import("../../plugins/qwen4_exp/weights.zig").PleWeights;
 const LinearAttnWeights = @import("../../sdk/blocks/gdn/gated_delta_net.zig").LinearAttnWeights;
 const DenseMlpWeights = @import("../../sdk/blocks/mlp/dense.zig").DenseMlpWeights;
 const MoeMlpWeights = @import("../../sdk/blocks/moe/weights.zig").MoeMlpWeights;
-
-// ── Standard decoder-only layer weights ──
-
-pub const LayerWeights = struct {
-    input_norm: mlx.mlx_array,
-    post_attn_norm: mlx.mlx_array,
-    pre_ff_norm: ?mlx.mlx_array,
-    post_ff_norm: ?mlx.mlx_array,
-    q_norm: ?mlx.mlx_array,
-    k_norm: ?mlx.mlx_array,
-    q_w: mlx.mlx_array,
-    q_s: mlx.mlx_array,
-    q_b: mlx.mlx_array,
-    // Additive qkv-projection biases (Qwen2's `q/k/v_proj.bias`), distinct from
-    // the quant `*_b` biases above. Empty-ctx when the arch has none (qwen3,
-    // llama, mistral). Applied via `qmatmulMaybeBias` in the forward.
-    q_bias: mlx.mlx_array = .{},
-    k_bias: mlx.mlx_array = .{},
-    v_bias: mlx.mlx_array = .{},
-    k_w: mlx.mlx_array,
-    k_s: mlx.mlx_array,
-    k_b: mlx.mlx_array,
-    v_w: mlx.mlx_array,
-    v_s: mlx.mlx_array,
-    v_b: mlx.mlx_array,
-    o_w: mlx.mlx_array,
-    o_s: mlx.mlx_array,
-    o_b: mlx.mlx_array,
-    gate_w: mlx.mlx_array,
-    gate_s: mlx.mlx_array,
-    gate_b: mlx.mlx_array,
-    up_w: mlx.mlx_array,
-    up_s: mlx.mlx_array,
-    up_b: mlx.mlx_array,
-    down_w: mlx.mlx_array,
-    down_s: mlx.mlx_array,
-    down_b: mlx.mlx_array,
-    // Gemma 4: per-layer scalar, PLE weights
-    layer_scalar: ?mlx.mlx_array = null,
-    ple_gate_w: ?mlx.mlx_array = null,
-    ple_gate_s: ?mlx.mlx_array = null,
-    ple_gate_b: ?mlx.mlx_array = null,
-    ple_proj_w: ?mlx.mlx_array = null,
-    ple_proj_s: ?mlx.mlx_array = null,
-    ple_proj_b: ?mlx.mlx_array = null,
-    ple_norm: ?mlx.mlx_array = null,
-    // KV sharing: source layer index (null = compute own KV)
-    kv_source: ?u32 = null,
-    // Gemma 4 (31B): V aliases K projection within this layer (no v_proj weight loaded)
-    k_eq_v: bool = false,
-    // Row-joined [q | k | v] and [gate | up] for decode widths; the
-    // separate fields above are views into these once built (fuseRowGroup).
-    qkv: FusedRows = .{},
-    gu: FusedRows = .{},
-};
 
 // ── MoE model per-layer weights ──
 

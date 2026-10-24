@@ -157,7 +157,7 @@ test "mimo_v2 Sushi served: steps, greedy and batched decode through the driver 
     defer b.close();
     try b.expectSteps(&both.long_steps);
     try b.expectGreedy();
-    try b.expectBatched(.layered);
+    try b.expectBatched();
     try heads_test.expectServedHeads(&b, 0x5a53);
     try b.expectDone();
 }

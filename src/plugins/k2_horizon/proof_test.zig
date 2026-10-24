@@ -54,12 +54,11 @@ fn caseOn(comptime quantized: bool, comptime seed: u64, comptime legacy_config: 
     defer p.deinit();
     try writePack(&p, quantized);
     const name = std.fmt.comptimePrint("fixtures/{x}{s}.tape", .{ seed, if (legacy_config) "-lc" else "" });
-    var b = try both.Both.proof(&plugin.table, &p, configJson(quantized), legacy_config, "src/plugins/k2_horizon/" ++ name, @embedFile(name));
+    var b = try both.Both.replay(&plugin.table, &p, configJson(quantized), legacy_config, @embedFile(name));
     defer b.close();
-    if (b.lg) |lg| try std.testing.expectEqual(@as(u32, 4), lg.config.norm_groups);
     try b.expectSteps(&both.steps);
     try b.expectGreedy();
-    try b.expectBatched(.dense);
+    try b.expectBatched();
     try b.expectDone();
 }
 

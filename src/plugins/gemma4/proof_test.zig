@@ -19,13 +19,10 @@ const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
 
 const testing = std.testing;
 
-/// The legacy forward is the oracle, recorded to `fixtures/` (`MLX_SERVE_PROOF_RECORD=<repo root>`) until it is
-/// deleted; then the proofs replay the recording.
-const frozen = true;
 
 fn oracle(comptime name: []const u8) proof.Oracle {
     const rel = "fixtures/" ++ name ++ ".tape";
-    return if (frozen) .{ .tape = @embedFile(rel) } else .{ .legacy = "src/plugins/gemma4/" ++ rel };
+    return .{ .tape = @embedFile(rel) };
 }
 
 pub const H = 128;
@@ -108,8 +105,8 @@ fn expectTrunk(b: *proof.Both, tied: bool) !void {
     var h: quant_abi.Weight = .{};
     try testing.expect(hook(m, .embed, &e).isOk() and hook(m, .head, &h).isOk());
     try testing.expectEqual(tied, e.w.ctx == h.w.ctx);
-    try b.check(.{ .ctx = e.w.ctx }, if (b.lg) |lg| lg.xfm.emb_w else null, false);
-    try b.check(.{ .ctx = h.w.ctx }, if (b.lg) |lg| lg.xfm.lm_head_w else null, false);
+    try b.check(.{ .ctx = e.w.ctx }, false);
+    try b.check(.{ .ctx = h.w.ctx }, false);
 }
 
 test "gemma4 plugin: an E-series 4-bit pack (PLE, KV-shared tail, K=V, layer scalars) is bit-equal to the legacy forward" {
@@ -118,7 +115,6 @@ test "gemma4 plugin: an E-series 4-bit pack (PLE, KV-shared tail, K=V, layer sca
     try writeGemma4(&p, .{}, 256, 2, true, false);
     var b = try proof.Both.openAs(&gemma4.table, &p, e_series, oracle("e-series"));
     defer b.close();
-    if (b.lg) |lg| try testing.expect(lg.xfm.layers[4].kv_source != null and lg.xfm.layers[2].k_eq_v and lg.xfm.layers[0].ple_gate_w != null);
     try expectTrunk(&b, true);
     try proof.expectSteps(&b);
     try proof.expectGreedy(&b);
@@ -270,7 +266,6 @@ test "gemma4 plugin: a 26B-A4B-shaped 4-bit pack (shared MLP + sigma-MoE experts
     try writeGemma4Moe(&p, .{}, "language_model.model", false);
     var b = try proof.Both.openAs(&gemma4.table, &p, a4b, oracle("a4b"));
     defer b.close();
-    if (b.lg) |lg| try testing.expect(lg.xfm.moe_layers != null);
     try proof.expectSteps(&b);
     try proof.expectGreedy(&b);
     try b.expectDone();
@@ -392,10 +387,10 @@ fn expectDrafter(b: *proof.Both) !void {
     const xs = b.sides(&xb);
     for (xs, 0..) |x, k| try drafterRun(x, dir, &tokens[k], &accepted[k], &logits[k]);
     const k = xs.len - 1;
-    try b.checkIds(tokens[k].items, if (k == 1) tokens[0].items else null);
-    try b.checkIds(accepted[k].items, if (k == 1) accepted[0].items else null);
+    try b.checkIds(tokens[k].items);
+    try b.checkIds(accepted[k].items);
     if (k == 1) try testing.expectEqual(logits[0].items.len, logits[1].items.len);
-    for (logits[k].items, 0..) |got, i| try b.check(got, if (k == 1) logits[0].items[i] else null, false);
+    for (logits[k].items) |got| try b.check(got, false);
 }
 
 test "gemma4 plugin: the assistant drafter over a served trunk (E-series, 26B-A4B) emits the legacy tokens, acceptance and draft logits" {
@@ -490,7 +485,7 @@ fn expectFp4Experts(b: *proof.Both) !void {
         outs[k][1] = try g.adopt(try x.forwardWith(&s.ctx, try fixture.tokens(&g, &.{ 88, 5, 61 })));
     }
     const got = outs[xs.len - 1];
-    for (0..2) |i| try b.check(got[i], if (xs.len == 2) outs[0][i] else null, false);
+    for (0..2) |i| try b.check(got[i], false);
     var s: proof.Slot = undefined;
     try s.init(n);
     defer s.deinit();
@@ -514,7 +509,6 @@ test "gemma4 plugin: ternary 2-bit packs (31B-like, E-series, 26B-A4B) arm qmv2'
         var b = try proof.Both.openAs(&gemma4.table, &p, json, oracle(kind ++ "-ternary"));
         defer b.close();
         const m: *const gemma4.Loaded = @ptrCast(@alignCast(b.xfm.plugin.?.model));
-        if (b.lg) |lg| try testing.expect(lg.xfm.ternary_2bit);
         try testing.expect(m.layers[0].attn.o.ternary);
         try proof.expectSteps(&b);
         try proof.expectGreedy(&b);
@@ -558,7 +552,6 @@ test "gemma4 plugin: an NVIDIA ModelOpt NVFP4 pack is declined, and the legacy l
     const dir = buf[0..try tmp.dir.realPath(io, &buf)];
     const out = try plugin_config.resolve(io, a, dir, json);
     try testing.expectEqualStrings("gemma: a quantization_config naming a quant_method", out.declined);
-    try testing.expectError(error.ModelOptUnsupportedGlobalScale, p.load(json));
 }
 
 // Bar: LTX 2.5's text encoder (a left-padded prompt under its additive mask, every layer's residual captured) gives
@@ -584,7 +577,6 @@ test "gemma4 plugin: LTX 2.5's text encoder states over a left-padded prompt rep
         a.free(states);
     }
     var tape = try tape_mod.Tape.player(@embedFile("fixtures/ltx-mask.tape"));
-    defer tape.finish() catch |e| std.debug.panic("proof tape: {t}", .{e});
     for (states) |x| try tape.expectNext(x, false);
     try tape.expectDone();
 }

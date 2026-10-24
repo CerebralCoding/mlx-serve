@@ -19,13 +19,10 @@ const embedding_gemma = @import("plugin.zig");
 const testing = std.testing;
 const Array = mlx.mlx_array;
 
-/// The legacy forward is the oracle, recorded to `fixtures/` (`MLX_SERVE_PROOF_RECORD=<repo root>`) until it is
-/// deleted; then the proofs replay the recording.
-const frozen = true;
 
 fn oracle(comptime name: []const u8) gemma_proof.Oracle {
     const rel = "fixtures/" ++ name ++ ".tape";
-    return if (frozen) .{ .tape = @embedFile(rel) } else .{ .legacy = "src/plugins/embedding_gemma/" ++ rel };
+    return .{ .tape = @embedFile(rel) };
 }
 
 pub const H = 128;
@@ -87,7 +84,7 @@ pub fn expectServed(b: *Both, seq: []const u32, batch: []const i32, lengths: []c
         const pooled = try g.adopt(try pooling.maskedMeanPool(a, outs[i][1], lengths, b.xfm.s));
         outs[i][2] = try g.adopt(try x.embedProjection(pooled));
     }
-    for (0..3) |j| try b.check(outs[k][j], if (k == 1) outs[0][j] else null, false);
+    for (0..3) |j| try b.check(outs[k][j], false);
     const pb = b.xfm.plugin.?;
     var refused: abi.ForwardOut = .{};
     try testing.expectEqual(abi.Verdict.Code.unsupported, pb.table.forward(pb.model, &.{ .mode = .decode, .rows = 1, .tokens = .of(seq[0..1]), .positions = .of(&.{0}) }, &refused).code);
@@ -98,7 +95,7 @@ pub fn expectServed(b: *Both, seq: []const u32, batch: []const i32, lengths: []c
         for (v) |r| a.free(r);
         a.free(v);
     };
-    for (vecs[k], 0..) |got, i| try b.checkSlice(f32, got, if (k == 1) vecs[0][i] else null, false);
+    for (vecs[k]) |got| try b.checkSlice(f32, got, false);
 }
 
 test "embedding_gemma plugin: a 4-bit pack's hidden rows (one sequence, a padded batch), projection and vectors through a served shell equal the legacy encoder's" {
@@ -134,7 +131,6 @@ test "embedding_gemma plugin: a ternary 2-bit pack arms qmv2's kernels and equal
     defer testing.allocator.free(json);
     var b = try Both.openAs(&embedding_gemma.table, &p, json, oracle("ternary"));
     defer b.close();
-    if (b.lg) |lg| try testing.expect(lg.xfm.ternary_2bit);
     const m: *const encoder.Loaded = @ptrCast(@alignCast(b.xfm.plugin.?.model));
     try testing.expect(m.layers[0].attn.o.ternary and m.base.weights.projection.?.first.ternary);
     try expectServed(&b, &.{ 2, 17, 42, 99, 7, 250, 31, 8, 66, 9, 4, 1 }, &.{ 2, 17, 42, 99, 7, 250, 31, 8, 66, 1, 2, 9, 33, 77, 140, 5, 61, 1, 0, 0 }, &.{ 10, 8 });

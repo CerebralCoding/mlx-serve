@@ -142,7 +142,7 @@ test "glm5_next served: the MTP head through MtpHeadRef.plugin equals the legacy
         if (mixed.rerank_x.ctx != null) _ = try g.adopt(mixed.rerank_x);
         const outs = [_]mlx.mlx_array{ try g.adopt(merged.logits), try g.adopt(merged.hidden_next), try g.adopt(mixed.hidden_next), try g.adopt(try h.draftSelect(x, mixed.hidden_next, null)) };
         try testing.expectEqual(@as(usize, 6), cr.step());
-        for (outs) |got| try b.check(got, null, false);
+        for (outs) |got| try b.check(got, false);
     }
     var tokens: [16]u32 = undefined;
     var accepted: std.ArrayList(u32) = .empty;
@@ -150,9 +150,9 @@ test "glm5_next served: the MTP head through MtpHeadRef.plugin equals the legacy
     try mtpRun(x, h, &tokens, &accepted);
     const got_t = mlx.mlx_array_new_data(&tokens, &[_]c_int{16}, 1, .uint32);
     defer _ = mlx.mlx_array_free(got_t);
-    try b.check(got_t, null, true);
+    try b.check(got_t, true);
     const got_a = mlx.mlx_array_new_data(accepted.items.ptr, &[_]c_int{@intCast(accepted.items.len)}, 1, .uint32);
     defer _ = mlx.mlx_array_free(got_a);
-    try b.check(got_a, null, true);
+    try b.check(got_a, true);
     try b.expectDone();
 }

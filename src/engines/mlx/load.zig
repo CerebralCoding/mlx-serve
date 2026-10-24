@@ -227,9 +227,6 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             xfm_ptr.compileGelu();
             xfm_ptr.compileGeglu();
         }
-        if (params.config.final_logit_softcapping > 0.0) {
-            xfm_ptr.compileSoftcap();
-        }
         if (xfm_ptr.moe_layers != null) {
             xfm_ptr.compileMoeRouting();
         }

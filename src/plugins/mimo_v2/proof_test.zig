@@ -169,7 +169,7 @@ fn batchedCase(comptime quantized: bool, comptime seed: u64) !void {
         for (pr, 0..) |id, k| host[k] = @intCast(id);
         const handles = [_]abi.Handle{sides[i].slot.handle()};
         const got = try tableLogits(&g, m, .{ .mode = .prefill, .rows = @intCast(pr.len), .tokens = .of(host[0..pr.len]), .positions = .of(&.{0}), .caches = .of(&handles) });
-        try b.check(got, null, false);
+        try b.check(got, false);
     }
     const ticks = [_][2][]const i32{
         .{ &.{88}, &.{12} },
@@ -188,7 +188,7 @@ fn batchedCase(comptime quantized: bool, comptime seed: u64) !void {
         const offs = [_]u32{ @intCast(sides[0].off), @intCast(sides[1].off) };
         const handles = [_]abi.Handle{ sides[0].slot.handle(), sides[1].slot.handle() };
         const got = try tableLogits(&g, m, .{ .mode = .batched_rows, .rows = @intCast(w), .tokens = .of(host[0 .. 2 * w]), .positions = .of(&offs), .caches = .of(&handles) });
-        try b.check(try g.reshape(got, &.{ @intCast(2 * w), VOCAB }), null, false);
+        try b.check(try g.reshape(got, &.{ @intCast(2 * w), VOCAB }), false);
         for (&sides) |*sd| sd.off += w;
     }
     try b.expectDone();
@@ -223,7 +223,7 @@ fn ringCase(comptime seed: u64) !void {
         for (st.ids, host[0..st.ids.len]) |id, *h| h.* = @intCast(id);
         const handles = [_]abi.Handle{side.slot.handle()};
         const got = try tableLogits(&g, b.xfm.plugin.?.model, .{ .mode = st.mode, .rows = @intCast(st.ids.len), .tokens = .of(host[0..st.ids.len]), .positions = .of(&.{@intCast(side.off)}), .caches = .of(&handles) });
-        try b.check(got, null, false);
+        try b.check(got, false);
         side.off += st.ids.len;
     }
     try b.expectDone();

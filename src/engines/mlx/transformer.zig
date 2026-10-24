@@ -213,7 +213,6 @@ pub const sliceQsaHistoryOntoCheckpoint = @import("../../plugins/qwen4_exp/qsa/c
 // engines/mlx/prompt_cache.zig
 pub const PrefillCache = @import("prompt_cache.zig").PrefillCache;
 // engines/mlx/layer_weights.zig
-const LayerWeights = @import("layer_weights.zig").LayerWeights;
 pub const QW = @import("layer_weights.zig").QW;
 // sdk/blocks/mlp/dense.zig
 // engines/mlx/ane_prefill.zig
@@ -359,14 +358,11 @@ pub const Transformer = struct {
     emb_s: mlx.mlx_array,
     emb_b: mlx.mlx_array,
     emb_scale: ?mlx.mlx_array,
-    final_norm: mlx.mlx_array,
     lm_head_w: mlx.mlx_array,
     lm_head_s: mlx.mlx_array,
     lm_head_b: mlx.mlx_array,
-    layers: []LayerWeights,
 
     owns_lm_head: bool,
-    owns_norms: bool,
     embedding_mode: bool = false,
 
     /// Layer stride for the decode async-eval ladder (0 = off; tests set it).
@@ -440,27 +436,14 @@ pub const Transformer = struct {
     /// replaces it.
     qk_angle_cache: [2]QkAngleSlot = .{ .{}, .{} },
     three: ?mlx.mlx_array,
-    neg_one: ?mlx.mlx_array,
 
     // Gemma 4 PLE (Per-Layer Embeddings) global weights
-    ple_emb_w: mlx.mlx_array, // embed_tokens_per_layer
-    ple_emb_s: mlx.mlx_array,
-    ple_emb_b: mlx.mlx_array,
-    ple_proj_w: mlx.mlx_array, // per_layer_model_projection
-    ple_proj_s: mlx.mlx_array,
-    ple_proj_b: mlx.mlx_array,
-    ple_proj_norm: mlx.mlx_array, // per_layer_projection_norm
-    ple_proj_quantized: bool, // whether per_layer_model_projection is quantized
     // Gemma 4: logit softcapping scalar and v_norm weight (ones)
-    softcap_scalar: ?mlx.mlx_array,
-    v_norm_weight: ?mlx.mlx_array, // ones(head_dim) for param-free RMS norm
-    v_norm_weight_global: ?mlx.mlx_array, // ones(global_head_dim)
 
     // ones(hidden_size) for the weight-less RMS norms (MuseGlimmer's normed embeddings, qwen4_exp).
     ones_hidden: ?mlx.mlx_array = null,
 
     // Proportional RoPE frequencies for global/full attention layers (Gemma 4)
-    rope_freqs_global: ?mlx.mlx_array,
 
     // YaRN RoPE scaling. `rope_freqs_yarn` is the per-dim RoPE DENOMINATOR
     // array handed to mlx_fast_rope (angle = pos/freqs), `yarn_mscale` the
@@ -489,7 +472,6 @@ pub const Transformer = struct {
     moe_seq_offset: usize,
     // Pre-transposed plain-bf16 linear_attn weights owned by the Transformer
     // (Unsloth Dynamic checkpoints — null for the common all-quantized case).
-    moe_owned_bf16: ?[]mlx.mlx_array = null,
     /// Prism Hadamard sign vectors keyed on weight handles; null on every other checkpoint.
     rht: ?*rht.Registry = null,
     /// A 2-bit group-128 pack without rotations whose every matmul weight has
@@ -507,7 +489,6 @@ pub const Transformer = struct {
     // Single-threaded: generation runs on one thread per Transformer.
     capture_hidden: ?*mlx.mlx_array = null,
 
-    embedding_norm: ?mlx.mlx_array, // Inkling: RMS norm on embeddings
 
     // Prompt cache for prefix reuse across requests
     prompt_cache: ?PrefillCache,
@@ -521,7 +502,6 @@ pub const Transformer = struct {
     // Compiled closures (fuse ops into single kernels, matching mlx-lm's @mx.compile)
     compiled_gelu: ?mlx.mlx_closure = null,
     compiled_geglu: ?mlx.mlx_closure = null, // gelu(gate) * up → 1 kernel
-    compiled_softcap: ?mlx.mlx_closure = null, // tanh(x/cap) * cap → 1 kernel
     compiled_moe_routing: ?mlx.mlx_closure = null, // negate→argpartition→slice→softmax→take→sum→expand→divide → 1 kernel
     compiled_hy3_routing: ?mlx.mlx_closure = null, // hy_v3 sigmoid+bias variant (2 inputs: logits, expert_bias)
     compiled_gdn_gate: ?mlx.mlx_closure = null, // exp(-exp(A_log)·softplus(a+dt_bias)) → 1 kernel (mirrors mlx-lm compute_g)
@@ -607,8 +587,6 @@ pub const Transformer = struct {
     pub const gdnProjGpu = @import("methods/gated_delta_net.zig").gdnProjGpu;
     pub const gdnProjArrays = @import("methods/gated_delta_net.zig").gdnProjArrays;
     // sdk/blocks/mlp/dense.zig
-    pub const residualTail = @import("methods/dense_mlp.zig").residualTail;
-    pub const standardMlp = @import("methods/dense_mlp.zig").standardMlp;
     pub const rowGroupServes = @import("methods/dense_mlp.zig").rowGroupServes;
     pub const denseMLP = @import("methods/dense_mlp.zig").denseMLP;
     // engines/mlx/ane_prefill.zig
@@ -642,7 +620,6 @@ pub const Transformer = struct {
     pub const compileGelu = @import("compiled.zig").compileGelu;
     pub const compileGeglu = @import("compiled.zig").compileGeglu;
     const gegluClosureCallback = @import("compiled.zig").gegluClosureCallback;
-    pub const compileSoftcap = @import("compiled.zig").compileSoftcap;
     const softcapClosureCallback = @import("compiled.zig").softcapClosureCallback;
     const geluClosureCallback = @import("compiled.zig").geluClosureCallback;
     pub const closureIn = @import("compiled.zig").closureIn;
@@ -703,7 +680,6 @@ pub const Transformer = struct {
     pub const fusedGeluTanhMul = @import("methods/activations.zig").fusedGeluTanhMul;
     pub const computeGeglu = @import("methods/activations.zig").computeGeglu;
     pub const computeClampedSwiGLU = @import("methods/activations.zig").computeClampedSwiGLU;
-    pub const applySoftcap = @import("methods/activations.zig").applySoftcap;
     pub const swiglu = @import("methods/activations.zig").swiglu;
     // sdk/blocks/conv/conv1d_cache.zig
     pub const conv1dWithCache = @import("methods/conv1d_cache.zig").conv1dWithCache;
@@ -747,9 +723,6 @@ pub const Transformer = struct {
     pub const forwardWithCapture = @import("capture.zig").forwardWithCapture;
     pub const forwardWithCaptureAll = @import("capture.zig").forwardWithCaptureAll;
     pub const captureHidden = @import("capture.zig").captureHidden;
-    // plugins/gemma4/ple.zig
-    pub const computePLEInput = @import("../../plugins/gemma4/ple.zig").computePLEInput;
-    pub const pleProject = @import("../../plugins/gemma4/ple.zig").pleProject;
     // engines/mlx/batched/row_axis_verify.zig
     pub const VerifyLaps = @import("batched/row_axis_verify.zig").VerifyLaps;
     pub const VerifyRollback = @import("batched/row_axis_verify.zig").VerifyRollback;
@@ -766,8 +739,6 @@ pub const Transformer = struct {
     pub const ropeAtFreqs = @import("methods/rope.zig").ropeAtFreqs;
     pub const ropeCosSinFromFreqs = @import("methods/rope.zig").ropeCosSinFromFreqs;
     pub const ropeApplyCosSin = @import("methods/rope.zig").ropeApplyCosSin;
-    // plugins/gemma4/moe_tail.zig
-    pub const gemma4MoeLayerTail = @import("../../plugins/gemma4/moe_tail.zig").gemma4MoeLayerTail;
     // engines/mlx/diag/profile.zig
     pub const debugTraceHead = @import("diag/profile.zig").debugTraceHead;
     // engines/mlx/forward/encoder_head.zig
@@ -798,8 +769,6 @@ pub const Transformer = struct {
     pub const attnDqFor = @import("methods/attn_proj.zig").attnDqFor;
     pub const attnProj = @import("methods/attn_proj.zig").attnProj;
     pub const attnProjBias = @import("methods/attn_proj.zig").attnProjBias;
-    // plugins/gemma4/attention.zig
-    pub const gemma4MoeAttnWith = @import("../../plugins/gemma4/attention.zig").gemma4MoeAttnWith;
     // engines/mlx/verify/joined_rows.zig
     pub const AttnVerifyInputs = @import("verify/joined_rows.zig").AttnVerifyInputs;
     const VerifyRowsKind = @import("verify/joined_rows.zig").VerifyRowsKind;
@@ -863,7 +832,6 @@ pub const Transformer = struct {
         }
         if (self.compiled_gelu) |cg| _ = mlx.mlx_closure_free(cg);
         if (self.compiled_geglu) |cg| _ = mlx.mlx_closure_free(cg);
-        if (self.compiled_softcap) |cs| _ = mlx.mlx_closure_free(cs);
         if (self.compiled_moe_routing) |cmr| _ = mlx.mlx_closure_free(cmr);
         if (self.compiled_hy3_routing) |chr| _ = mlx.mlx_closure_free(chr);
         if (self.compiled_gdn_gate) |cgg| _ = mlx.mlx_closure_free(cgg);
@@ -874,7 +842,6 @@ pub const Transformer = struct {
         if (self.grouped_norm_ones) |o| _ = mlx.mlx_array_free(o);
         if (self.ones_hidden) |o| _ = mlx.mlx_array_free(o);
         if (self.rope_freqs_yarn) |f| _ = mlx.mlx_array_free(f);
-        if (self.rope_freqs_global) |f| _ = mlx.mlx_array_free(f);
         if (self.yarn_mscale) |m| _ = mlx.mlx_array_free(m);
         if (self.yarn_inv_freq) |f| self.allocator.free(f);
         if (self.suppress_mask) |m| _ = mlx.mlx_array_free(m);
@@ -882,7 +849,6 @@ pub const Transformer = struct {
         if (self.prompt_cache) |*pc| pc.deinit();
         self.cache.deinit();
         if (self.emb_scale) |es| _ = mlx.mlx_array_free(es);
-        if (self.owns_norms) _ = mlx.mlx_array_free(self.final_norm);
         if (self.gelu_coeff) |g| _ = mlx.mlx_array_free(g);
         if (self.gelu_inner) |g| _ = mlx.mlx_array_free(g);
         _ = mlx.mlx_array_free(self.half);
@@ -902,18 +868,6 @@ pub const Transformer = struct {
             if (slot.arr.ctx != null) _ = mlx.mlx_array_free(slot.arr);
         }
         if (self.three) |t| _ = mlx.mlx_array_free(t);
-        if (self.neg_one) |n| _ = mlx.mlx_array_free(n);
-        for (self.layers) |lw| {
-            if (self.owns_norms) {
-                _ = mlx.mlx_array_free(lw.input_norm);
-                _ = mlx.mlx_array_free(lw.post_attn_norm);
-                if (lw.pre_ff_norm) |n| _ = mlx.mlx_array_free(n);
-                if (lw.post_ff_norm) |n| _ = mlx.mlx_array_free(n);
-                if (lw.q_norm) |n| _ = mlx.mlx_array_free(n);
-                if (lw.k_norm) |n| _ = mlx.mlx_array_free(n);
-            }
-        }
-        self.allocator.free(self.layers);
         if (self.ssm_entries) |entries| {
             for (entries) |*e| {
                 ssmFreeSpecCapture(e);
@@ -925,10 +879,6 @@ pub const Transformer = struct {
         }
         self.ssm_group.deinit();
         if (self.moe_layers) |ml| self.allocator.free(ml);
-        if (self.moe_owned_bf16) |arrs| {
-            for (arrs) |a| _ = mlx.mlx_array_free(a);
-            self.allocator.free(arrs);
-        }
         // self.s is the thread's default GPU stream (not owned by us) — don't free it.
         _ = mlx.mlx_stream_free(self.s);
         // The free above is a no-op on the default stream's wrapper but we keep it for symmetry
@@ -1050,13 +1000,11 @@ test {
     _ = @import("spec/trunk_hooks.zig");
     _ = @import("warmup.zig");
     _ = @import("capture.zig");
-    _ = @import("../../plugins/gemma4/ple.zig");
     _ = @import("batched/row_axis_verify.zig");
     _ = @import("batched/caps.zig");
     _ = @import("../../sdk/blocks/rope/rope.zig");
     _ = @import("../../plugins/qwen4_exp/qsa/indexer.zig");
     _ = @import("../../plugins/qwen4_exp/attention.zig");
-    _ = @import("../../plugins/gemma4/moe_tail.zig");
     _ = @import("diag/profile.zig");
     _ = @import("forward/encoder_head.zig");
     _ = @import("../../sdk/blocks/rope/mrope.zig");
@@ -1065,7 +1013,6 @@ test {
     _ = @import("methods/attn_proj.zig");
     _ = @import("../../plugins/laguna/ubench_test.zig");
     _ = @import("../../plugins/inkling/attention.zig");
-    _ = @import("../../plugins/gemma4/attention.zig");
     _ = @import("verify/joined_rows.zig");
     _ = @import("../../plugins/inkling/moe.zig");
     _ = @import("methods/moe.zig");

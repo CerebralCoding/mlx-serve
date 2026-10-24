@@ -112,7 +112,7 @@ const wide_steps = [_]proof.Step{
 /// The legacy forward's values on the legacy parse's config, recorded to `fixtures/<seed>.tape`.
 fn open(p: *fixture.Pack, json: []const u8, comptime seed: u64) !both.Both {
     const name = std.fmt.comptimePrint("fixtures/{x}.tape", .{seed});
-    return both.Both.proof(&hy3.table, p, json, true, "src/plugins/hy_v3/" ++ name, @embedFile(name));
+    return both.Both.replay(&hy3.table, p, json, true, @embedFile(name));
 }
 
 fn case(comptime quantized: bool, comptime seed: u64) !void {
@@ -225,7 +225,7 @@ test "hy_v3 served: lm_head_mxfp8 (LOSSY) quantizes a bf16 pack's head as the le
     var p = fixture.Pack.init(0x4a7);
     defer p.deinit();
     try writePack(&p, false);
-    var b = try both.Both.proof(&hy3.table, &p, configJson(false), true, "src/plugins/hy_v3/fixtures/mxfp8-4a7.tape", @embedFile("fixtures/mxfp8-4a7.tape"));
+    var b = try both.Both.replay(&hy3.table, &p, configJson(false), true, @embedFile("fixtures/mxfp8-4a7.tape"));
     defer b.close();
     try testing.expect(b.xfm.lm_head_s.ctx != null);
     try b.expectSteps(&both.long_steps);

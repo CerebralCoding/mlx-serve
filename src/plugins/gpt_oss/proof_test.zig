@@ -61,14 +61,10 @@ fn case(comptime quantized: bool, comptime seed: u64) !void {
     return caseOn(quantized, seed, false);
 }
 
-/// The legacy forward is the oracle, recorded to `fixtures/` (`MLX_SERVE_PROOF_RECORD=<repo root>`), until it is
-/// deleted; then the proofs replay the recording.
-const frozen = true;
 
 fn openCase(p: *fixture.Pack, json: []const u8, comptime legacy_config: bool, comptime seed: u64) !both.Both {
     const name = std.fmt.comptimePrint("fixtures/{x}{s}.tape", .{ seed, if (legacy_config) "-lc" else "" });
-    if (frozen) return both.Both.replay(&plugin.table, p, json, legacy_config, @embedFile(name));
-    return both.Both.openAs(&plugin.table, p, json, legacy_config, .{ .legacy = "src/plugins/gpt_oss/" ++ name });
+    return both.Both.replay(&plugin.table, p, json, legacy_config, @embedFile(name));
 }
 
 fn caseOn(comptime quantized: bool, comptime seed: u64, comptime legacy_config: bool) !void {
@@ -77,7 +73,6 @@ fn caseOn(comptime quantized: bool, comptime seed: u64, comptime legacy_config: 
     try writePack(&p, quantized);
     var b = try openCase(&p, configJson(quantized), legacy_config, seed);
     defer b.close();
-    if (b.lg) |lg| try std.testing.expect(lg.config.has_attn_sinks and lg.config.rope_yarn and lg.config.swiglu_limit > 0 and lg.xfm.moe_layers != null);
     try b.expectSteps(&both.long_steps);
     try b.expectGreedy();
     try b.expectDone();
@@ -207,18 +202,13 @@ fn ggufCase(comptime seed: u64, comptime legacy_config: bool) !void {
     defer p.deinit();
     try writeGgufPack(&p, seed);
     const name = std.fmt.comptimePrint("fixtures/gguf-{x}{s}.tape", .{ seed, if (legacy_config) "-lc" else "" });
-    var b = if (frozen_gguf)
-        try both.Both.replay(&plugin.table, &p, gguf_json, legacy_config, @embedFile(name))
-    else
-        try both.Both.openAs(&plugin.table, &p, gguf_json, legacy_config, .{ .legacy = "src/plugins/gpt_oss/" ++ name });
+    var b = try both.Both.replay(&plugin.table, &p, gguf_json, legacy_config, @embedFile(name));
     defer b.close();
-    if (b.lg) |lg| try std.testing.expect(lg.config.quant_mode == .gguf);
     try b.expectSteps(&both.long_steps);
     try b.expectGreedy();
     try b.expectDone();
 }
 
-const frozen_gguf = true;
 
 test "gpt_oss plugin: a --mlx-gguf pack (q8_0 attention, table and head, mxfp4 experts, bf16 router) is bit-equal to the legacy forward" {
     try ggufCase(0x9a1, false);
@@ -239,7 +229,6 @@ fn realCase(comptime seed: u64) !void {
     try writePack(&p, true);
     var b = try openCase(&p, json, true, seed);
     defer b.close();
-    if (b.lg) |lg| try std.testing.expect(lg.config.rope_yarn and lg.config.swiglu_limit > 0);
     try b.expectSteps(&both.long_steps);
     try b.expectGreedy();
     try b.expectDone();

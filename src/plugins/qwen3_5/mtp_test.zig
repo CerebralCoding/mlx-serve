@@ -173,11 +173,6 @@ pub fn expectHeadAt(table: *const @import("../../abi/plugin.zig").ModelTable, pk
     defer heads.deinit();
     const loaded: *qwen3_5.Loaded = @ptrCast(@alignCast(p.xfm.plugin.?.model));
     try testing.expectEqual(moe, loaded.head.?.moe != null);
-    if (heads.legacy) |*lm| {
-        try testing.expectEqual(moe, lm.mlp == .moe);
-        try testing.expectEqual(lm.draft_head != null, heads.served.draft_head != null);
-        try testing.expectEqual(lm.rerank_coarse != null, heads.served.rerank_coarse != null);
-    }
 
     const hs = heads.refs();
     const xs = p.shells();
@@ -212,40 +207,29 @@ pub fn expectHeadAt(table: *const @import("../../abi/plugin.zig").ModelTable, pk
     defer for (&accepted) |*l| l.deinit(a);
     for (hs, xs, 0..) |h, x, k| try mtpRun(x, h, &tokens[k], &accepted[k]);
     const last = xs.len - 1;
-    try p.oracle.stream(&tokens[last], if (last == 1) &tokens[0] else null);
-    try p.oracle.stream(accepted[last].items, if (last == 1) accepted[0].items else null);
+    try p.oracle.stream(&tokens[last]);
+    try p.oracle.stream(accepted[last].items);
     try p.oracle.done();
 }
 
-/// The served head beside the pair's shell, and the legacy sidecar arm bound to the legacy shell while recording.
+/// The served head beside the pair's shell.
 const Heads = struct {
-    legacy: ?mtp_mod.MtpModel,
     served: *plugin_head.Head,
-    buf: [2]MtpHeadRef = undefined,
+    buf: [1]MtpHeadRef = undefined,
 
     fn open(p: *served_test.Pair) !Heads {
-        const a = testing.allocator;
         const io = std.Io.Threaded.global_single_threaded.io();
-        var legacy: ?mtp_mod.MtpModel = null;
-        if (p.lg) |lg| {
-            legacy = try mtp_mod.loadMtp(io, a, fixture.stream(), p.dir);
-            errdefer legacy.?.deinit();
-            try legacy.?.bind(&lg.xfm);
-        }
-        errdefer if (legacy) |*lm| lm.deinit();
-        const served = plugin_head.load(io, a, &p.xfm, p.dir) orelse return error.HeadNotLoaded;
-        return .{ .legacy = legacy, .served = served };
+        return .{ .served = plugin_head.load(io, testing.allocator, &p.xfm, p.dir) orelse return error.HeadNotLoaded };
     }
 
     fn deinit(h: *Heads) void {
         plugin_head.destroy(h.served, testing.allocator);
-        if (h.legacy) |*lm| lm.deinit();
     }
 
-    /// The heads in `Pair.shells` order: the legacy arm first while recording, the served one last.
+    /// The heads in `Pair.shells` order.
     fn refs(h: *Heads) []const MtpHeadRef {
-        h.buf = .{ if (h.legacy) |*lm| .{ .qwen = lm } else .{ .plugin = h.served }, .{ .plugin = h.served } };
-        return if (h.legacy != null) &h.buf else h.buf[1..];
+        h.buf = .{.{ .plugin = h.served }};
+        return &h.buf;
     }
 };
 
@@ -272,8 +256,6 @@ fn writeQuantHead(path: []const u8) !void {
     try mlx.check(mlx.mlx_save_safetensors(file.ptr, hp.map, meta));
 }
 
-const nax_profile = @import("../../engines/mlx/spec/mtp_nax_profile.zig");
-
 test "qwen3_5 MTP head: the measured-cost fingerprint, trunk projections and profile are the legacy sidecar arm's" {
     var pk = fixture.Pack.init(0x47a4);
     defer pk.deinit();
@@ -287,35 +269,8 @@ test "qwen3_5 MTP head: the measured-cost fingerprint, trunk projections and pro
     const served = heads.served;
     try testing.expectEqual(@as(?mtp_mod.HeadFingerprint, .{ .bits = 4, .group_size = 64 }), served.fingerprint);
     const got = [_]u32{ @intFromEnum(served.m5NaxCostProfile(&p.xfm)), @intFromBool(served.draft_head != null), @intFromBool(served.rerank_coarse != null), @intFromBool(p.xfm.mtp_uniform_affine_trunk), @intFromBool(p.xfm.mtp_oqe_affine_trunk) };
-    var want: ?[5]u32 = null;
-    if (heads.legacy) |*legacy| {
-        const lg = p.lg.?;
-        const c = &lg.xfm.config;
-        const fp = legacy.m5NaxHeadFingerprint(.{ .hidden = c.hidden_size, .heads = c.num_attention_heads, .kv_heads = c.num_key_value_heads, .head_dim = c.head_dim, .intermediate = c.intermediate_size }) orelse return error.TestExpectedFingerprint;
-        try testing.expectEqual(served.fingerprint, fp);
-        want = .{ @intFromEnum(legacy.m5NaxCostProfile(&lg.xfm)), @intFromBool(legacy.draft_head != null), @intFromBool(legacy.rerank_coarse != null), @intFromBool(lg.xfm.mtp_uniform_affine_trunk), @intFromBool(lg.xfm.mtp_oqe_affine_trunk) };
-        // The served shell reads the trunk off the pack's tensors, the legacy one off its layers: the same projections.
-        const by_layers: nax_profile.TrunkSource = .{ .layers = lg.xfm.moe_layers };
-        const by_names: nax_profile.TrunkSource = .{ .weights = .{ .w = &lg.weights, .prefix = c.weight_prefix } };
-        for (0..c.num_hidden_layers) |i| {
-            const x = by_layers.at(c, i) orelse return error.TestExpectedLayer;
-            const y = by_names.at(c, i) orelse return error.TestExpectedLayer;
-            try testing.expectEqual(x.linear, y.linear);
-            const n: usize = if (x.linear) 5 else 4;
-            for (x.attn[0..n], y.attn[0..n]) |u, v| try expectProj(u, v);
-            for (x.mlp, y.mlp) |u, v| try expectProj(u, v);
-        }
-        inline for (.{ false, true }) |oqe| try testing.expectEqual(nax_profile.trunkMatches(c, by_layers, oqe), nax_profile.trunkMatches(c, by_names, oqe));
-    }
-    try p.oracle.stream(&got, if (want) |*w| w else null);
+    try p.oracle.stream(&got);
     try p.oracle.done();
-}
-
-fn expectProj(want: anytype, got: anytype) !void {
-    for ([_]Array{ want.w, want.s, want.b }, [_]Array{ got.w, got.s, got.b }) |x, y| {
-        try testing.expectEqual(x.ctx == null, y.ctx == null);
-        if (x.ctx != null) try ops.expectBitEqual(y, x);
-    }
 }
 
 /// One request on `xfm` with its own trunk cache, drafting on `head`.

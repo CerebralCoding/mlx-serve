@@ -3,67 +3,12 @@
 const mlx = @import("../../../mlx/ffi.zig");
 const lane_qmm = @import("../../../sdk/blocks/qmm/lane_qmm.zig");
 const simd_qmm = @import("../../../sdk/blocks/qmm/simd_qmm.zig");
-const LayerWeights = @import("../layer_weights.zig").LayerWeights;
 const Transformer = @import("../transformer.zig").Transformer;
 const naxAvailable = @import("../../../mlx/device.zig").naxAvailable;
 const FUSED_ROWS_MAX_M = @import("../../../sdk/blocks/linear/fused_rows.zig").FUSED_ROWS_MAX_M;
 const fusedResidualNorm = @import("../../../sdk/blocks/norms/residual_norm.zig").fusedResidualNorm;
 const swigluJoined = @import("../../../sdk/blocks/mlp/fused_activations.zig").swigluJoined;
 const DenseMlpWeights = @import("../../../sdk/blocks/mlp/dense.zig").DenseMlpWeights;
-
-/// The residual seam: `h = (h + [rms(b, w_pre)]) [* scale]`, then
-/// `rms(h, w_post)` if asked (null-ctx otherwise). One dispatch when
-/// `fused` and the kernel takes the shape (fusedResidualNorm), else the
-/// composed ops. `pre_is_post_eps` picks the post-norm eps for w_pre.
-pub fn residualTail(self: *const Transformer, h: *mlx.mlx_array, b: mlx.mlx_array, w_pre: mlx.mlx_array, pre_is_post_eps: bool, scale: mlx.mlx_array, w_post: mlx.mlx_array, fused: bool) !mlx.mlx_array {
-    const eps_pre = if (pre_is_post_eps) self.post_eps_arr else self.rms_eps_arr;
-    if (fused and self.config.norm_groups <= 1) {
-        if (try fusedResidualNorm(self.s, h.*, b, .{ .w1 = w_pre, .eps1 = eps_pre, .scale = scale, .w_post = w_post, .eps = self.rms_eps_arr })) |r| {
-            _ = mlx.mlx_array_free(h.*);
-            h.* = r.sum;
-            return r.normed;
-        }
-    }
-    var nb = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(nb);
-    if (w_pre.ctx != null) {
-        nb = try self.rmsNormEps(b, w_pre, if (pre_is_post_eps) self.config.postNormEps() else self.config.rms_norm_eps);
-    } else {
-        _ = mlx.mlx_array_set(&nb, b);
-    }
-    var sum = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_add(&sum, h.*, nb, self.s));
-    _ = mlx.mlx_array_free(h.*);
-    h.* = sum;
-    if (scale.ctx != null) {
-        var scaled = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_multiply(&scaled, h.*, scale, self.s));
-        _ = mlx.mlx_array_free(h.*);
-        h.* = scaled;
-    }
-    if (w_post.ctx == null) return .{ .ctx = null };
-    return self.rmsNorm(h.*, w_post);
-}
-
-/// gate/up (one row-fused matmul when `fused_rows`) -> activation -> down.
-pub fn standardMlp(self: *const Transformer, x: mlx.mlx_array, lw: *const LayerWeights, fused_rows: bool) !mlx.mlx_array {
-    var gate_raw = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(gate_raw);
-    var up = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(up);
-    if (fused_rows and lw.gu.w.ctx != null) {
-        const both = try self.qmatmul(x, lw.gu.w, lw.gu.s, lw.gu.b);
-        defer _ = mlx.mlx_array_free(both);
-        try lw.gu.part(&gate_raw, both, 0, self.s);
-        try lw.gu.part(&up, both, 1, self.s);
-    } else {
-        gate_raw = try self.qmatmul(x, lw.gate_w, lw.gate_s, lw.gate_b);
-        up = try self.qmatmul(x, lw.up_w, lw.up_s, lw.up_b);
-    }
-    const gate_up = try self.computeGeglu(gate_raw, up);
-    defer _ = mlx.mlx_array_free(gate_up);
-    return self.qmatmul(gate_up, lw.down_w, lw.down_s, lw.down_b);
-}
 
 /// A joined row group serves one-row steps, and every width while the
 /// exact path runs: serial steps and verify rows then share its shapes.

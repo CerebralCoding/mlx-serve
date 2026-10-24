@@ -1724,9 +1724,6 @@ pub fn main(init: std.process.Init) !void {
             xfm.compileGelu();
             xfm.compileGeglu();
         }
-        if (config.final_logit_softcapping > 0.0) {
-            xfm.compileSoftcap();
-        }
         if (xfm.moe_layers != null) {
             xfm.compileMoeRouting();
         }

@@ -75,8 +75,6 @@ src/engines/mlx/grammar/constraint.zig	advanceStep(1)	a forced grammar recovery 
 src/sdk/blocks/attention/attn256.zig	if (qs[2] < FUSED256_MIN_Q_LEN) return null;	the hd-256 decline and the sliding trim read one constant
 src/engines/mlx/kv/sliding.zig	cfg.head_dim == 256 and seq_len >= FUSED256_MIN_Q_LEN	the hd-256 decline and the sliding trim read one constant
 src/sdk/blocks/attention/attn256.zig	!if (qs[2] < 16)	the hd-256 floor is never respelled as a literal
-src/plugins/gemma4/attention.zig	sliding.span	a sliding arm sizes its KV view from slidingViewFor, never the raw window
-src/plugins/gemma4/attention.zig	!max_kv: u32 = if (is_global) 0 else cfg.sliding_window	a sliding arm sizes its KV view from slidingViewFor, never the raw window
 src/engines/mlx/kv/cache.zig	!.cache = try 	a live KV cache re-inits through KVCache.reinit, which builds before it frees
 src/engines/mlx/prompt_cache.zig	!.cache = try 	a live KV cache re-inits through KVCache.reinit, which builds before it frees
 src/engines/mlx/scheduler.zig	!.cache = try 	a live KV cache re-inits through KVCache.reinit, which builds before it frees

@@ -114,9 +114,6 @@ const wide_steps = [_]proof.Step{
     .{ .mode = .decode, .ids = &.{64} },
 };
 
-/// The legacy forward is the oracle, recorded to `fixtures/` (`MLX_SERVE_PROOF_RECORD=<repo root>`), until it is
-/// deleted; then the proofs replay the recording.
-const frozen = true;
 
 /// `sh`'s pack served by the driver on the legacy parse's config (recurrent entries per slot), against its oracle.
 fn openCase(p: *fixture.Pack, sh: Shape, comptime seed: u64) !both.Both {
@@ -124,8 +121,7 @@ fn openCase(p: *fixture.Pack, sh: Shape, comptime seed: u64) !both.Both {
     var cbuf: [2048]u8 = undefined;
     const json = try configJson(&cbuf, sh);
     const name = std.fmt.comptimePrint("fixtures/{x}.tape", .{seed});
-    if (frozen) return both.Both.replay(&lfm2.table, p, json, true, @embedFile(name));
-    return both.Both.openAs(&lfm2.table, p, json, true, .{ .legacy = "src/plugins/lfm2/" ++ name });
+    return both.Both.replay(&lfm2.table, p, json, true, @embedFile(name));
 }
 
 /// Prefill, decode and verify past a chunk and a conv window carried across chunks, then the pipelined greedy decode.
@@ -243,7 +239,6 @@ test "lfm2 served: 2-bit group-128 packs, plain (stock qmm) and ternary (qmv2's 
         var b = try openCase(&p, .{ .two_bit = two, .tied = false }, seed);
         defer b.close();
         const m: *const lfm2.Loaded = @ptrCast(@alignCast(b.xfm.plugin.?.model));
-        if (b.lg) |lg| try testing.expectEqual(two == .ternary, lg.xfm.ternary_2bit);
         try testing.expectEqual(two == .ternary, m.base.weights.head.ternary and m.layers[0].op.first.in_proj.ternary);
         try b.expectSteps(&both.long_steps);
         try b.expectGreedy();
@@ -350,7 +345,6 @@ fn writeGgufPack(p: *fixture.Pack, moe: bool) !void {
     }
 }
 
-const frozen_gguf = true;
 
 fn ggufCase(moe: bool, comptime seed: u64) !void {
     var p = fixture.Pack.init(seed);
@@ -359,9 +353,8 @@ fn ggufCase(moe: bool, comptime seed: u64) !void {
     const json = try ggufConfig(moe);
     defer testing.allocator.free(json);
     const name = std.fmt.comptimePrint("fixtures/gguf-{x}.tape", .{seed});
-    var b = if (frozen_gguf) try both.Both.replay(&lfm2.table, &p, json, true, @embedFile(name)) else try both.Both.openAs(&lfm2.table, &p, json, true, .{ .legacy = "src/plugins/lfm2/" ++ name });
+    var b = try both.Both.replay(&lfm2.table, &p, json, true, @embedFile(name));
     defer b.close();
-    if (b.lg) |lg| try testing.expect(lg.config.quant_mode == .gguf);
     const m: *const lfm2.Loaded = @ptrCast(@alignCast(b.xfm.plugin.?.model));
     try testing.expect(m.layers[0].op.first.in_proj.mode == .gguf and m.base.weights.embed.table.mode == .gguf);
     try b.expectSteps(&(proof.steps ++ wide_steps));
@@ -458,9 +451,8 @@ fn ggufFileCase(moe: bool, by_file: bool, comptime seed: u64) !void {
     defer g.deinit();
     try writeGgufFile(&g, moe, seed);
     const name = std.fmt.comptimePrint("fixtures/gguf-file-{x}.tape", .{seed});
-    var b = try proof.openGguf(&lfm2.table, &g, by_file, if (frozen_gguf) .{ .tape = @embedFile(name) } else .{ .legacy = "src/plugins/lfm2/" ++ name });
+    var b = try proof.openGguf(&lfm2.table, &g, by_file, .{ .tape = @embedFile(name) });
     defer b.close();
-    if (b.lg) |lg| try testing.expect(lg.config.quant_mode == .gguf);
     try b.expectSteps(&(proof.steps ++ wide_steps));
     try b.expectSteps(&both.long_steps);
     try b.expectGreedy();

@@ -1100,7 +1100,6 @@ test "clef: the served qwen3_5 trunk's hidden rows are bit-equal to the engine's
     const h = try eng.hidden(a, &ids, &.{});
     defer free(h);
     var tape = try tape_mod.Tape.player(@embedFile("fixtures/trunk.tape"));
-    defer tape.finish() catch |e| std.debug.panic("proof tape: {t}", .{e});
     try tape.expectNext(h, false);
     try tape.expectDone();
 }

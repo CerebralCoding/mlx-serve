@@ -23,119 +23,6 @@ const Array = mlx.mlx_array;
 pub const Step = fixture.Step;
 pub const steps = fixture.steps;
 
-/// A pack loaded by the legacy path and by plugin `P`'s table.
-pub fn Twin(comptime P: type) type {
-    return struct {
-        lg: *fixture.Legacy,
-        parsed: abi.Parsed = .{},
-        m: *anyopaque,
-        /// A DFlash drafter bound: the legacy `dflash_bound`, the table's `Forward.row_exact`.
-        row_exact: bool = false,
-
-        /// Writes `p` and `config_json` (plus `extra` files) to disk and loads both sides.
-        pub fn open(p: *fixture.Pack, config_json: []const u8, extra: []const fixture_file) !@This() {
-            const a = testing.allocator;
-            const io = std.Io.Threaded.global_single_threaded.io();
-            const lg = try p.load(config_json);
-            errdefer lg.deinit();
-            try lg.tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = config_json });
-            for (extra) |f| try lg.tmp.dir.writeFile(io, .{ .sub_path = f.name, .data = f.bytes });
-            var path_buf: [512]u8 = undefined;
-            const dir = path_buf[0..try lg.tmp.dir.realPath(io, &path_buf)];
-            var fs = try FsPackDir.open(io, dir);
-            defer fs.close();
-            const pd = fs.packDir();
-            var t: @This() = .{ .lg = lg, .m = undefined };
-            const v = P.table.parse(&pd, .of(config_json), .{}, null, false, &t.parsed);
-            if (!v.isOk()) {
-                std.debug.print("parse: {s}\n", .{v.why.slice()});
-                return error.PluginParse;
-            }
-            errdefer P.table.free_parsed(&t.parsed);
-            // The engine's loader, as the driver runs it for a served pack.
-            var cfg = try model.parseConfigFromJson(a, config_json);
-            defer cfg.deinit(a);
-            var res = Resident.adopt(try model.loadModelWeights(io, a, dir, &cfg, false));
-            defer res.deinit();
-            const src = res.source();
-            var why: abi.Verdict = .{};
-            t.m = P.table.load(&.{ .model_dir = .of(dir), .dir = &pd, .parsed = &t.parsed, .stream = .{ .ctx = lg.xfm.s.ctx }, .weights = &src }, &why) orelse {
-                std.debug.print("load: {s}\n", .{why.why.slice()});
-                return error.PluginLoad;
-            };
-            return t;
-        }
-
-        pub fn close(t: *@This()) void {
-            P.table.unload(t.m);
-            P.table.free_parsed(&t.parsed);
-            t.lg.deinit();
-        }
-
-        /// Runs `seq` through the legacy forward and the table on caches of their own (once per twin: the legacy cache
-        /// is the Transformer's), logits bit-equal at every step; decode steps hand the token as a device array
-        /// (`Forward.ids`), as the pipelined decode does, and verify steps are the legacy speculative verify.
-        pub fn expectSteps(t: *@This(), seq: []const Step) !void {
-            return t.expectMediaSteps(seq, .{}, &.{});
-        }
-
-        /// `expectSteps` with media rows on the first `offsets.len` steps (prompt chunks), each resuming at its offset.
-        pub fn expectMediaSteps(t: *@This(), seq: []const Step, media: Array, offsets: []const u32) !void {
-            const a = testing.allocator;
-            const n_layers = t.lg.config.num_hidden_layers;
-            t.lg.xfm.config.dflash_bound = t.row_exact;
-            defer t.lg.xfm.config.dflash_bound = false;
-            var kvc = try KVCache.init(a, n_layers);
-            defer kvc.deinit();
-            const entries = try fixture.newEntries(n_layers);
-            defer fixture.freeEntries(entries);
-            var slot: cache_ops.Slot = .{ .kv = &kvc, .ssm = entries };
-            const handles = [_]abi.Handle{slot.handle()};
-            var pos: u32 = 0;
-            for (seq, 0..) |st, i| {
-                const rows: Array = if (i < offsets.len) media else .{};
-                const offset: u32 = if (i < offsets.len) offsets[i] else 0;
-                var g = ops.Graph.init(a, t.lg.xfm.s);
-                defer g.deinit();
-                const ids = try fixture.tokens(&g, st.ids);
-                // A verify step is the legacy speculative verify (`spec_verify`), as the driver maps it.
-                var lctx = t.lg.xfm.defaultCtx();
-                lctx.spec_verify = st.mode == .verify;
-                lctx.vision_embeddings = if (rows.ctx != null) rows else null;
-                lctx.vision_splice_offset = offset;
-                const want = try fixture.rows2(&g, try g.adopt(try t.lg.xfm.forwardWith(&lctx, ids)));
-                const host = try a.alloc(u32, st.ids.len);
-                defer a.free(host);
-                for (st.ids, 0..) |id, k| host[k] = @intCast(id);
-                const lazy = st.mode == .decode;
-                var out: abi.ForwardOut = .{};
-                const v = P.table.forward(t.m, &.{
-                    .mode = st.mode,
-                    .logits = .all_rows,
-                    .rows = @intCast(st.ids.len),
-                    .tokens = if (lazy) .{} else .of(host),
-                    .ids = if (lazy) .{ .ctx = ids.ctx } else .{},
-                    .positions = .of(&.{pos}),
-                    .caches = .of(&handles),
-                    .cache_ops = &cache_ops.ops,
-                    .media = .{ .ctx = rows.ctx },
-                    .row_exact = t.row_exact,
-                    .media_offset = offset,
-                }, &out);
-                if (!v.isOk()) {
-                    std.debug.print("forward: {s}\n", .{v.why.slice()});
-                    return error.PluginForward;
-                }
-                if (out.hidden.ctx != null) _ = mlx.mlx_array_free(.{ .ctx = out.hidden.ctx });
-                const got = try g.adopt(.{ .ctx = out.logits.ctx });
-                try ops.expectBitEqual(got, want);
-                pos += @intCast(st.ids.len);
-            }
-        }
-    };
-}
-
-/// Plugin `P`'s logits `[rows, V]` for one forward of `ids` at `pos` on `slot`, owned by `g`.
 fn tableStep(comptime P: type, m: *anyopaque, g: *ops.Graph, slot: *cache_ops.Slot, mode: abi.Mode, ids: []const u32, pos: u32, row_exact: bool) !mlx.mlx_array {
     const handles = [_]abi.Handle{slot.handle()};
     var out: abi.ForwardOut = .{};
@@ -155,12 +42,6 @@ fn tableStep(comptime P: type, m: *anyopaque, g: *ops.Graph, slot: *cache_ops.Sl
     }
     if (out.hidden.ctx != null) _ = mlx.mlx_array_free(.{ .ctx = out.hidden.ctx });
     return g.adopt(.{ .ctx = out.logits.ctx });
-}
-
-/// The exactness bar of `Caps.exact_drafted`: after `prompt`, a verify of `drafts` gives each row the logits serial
-/// decode of the same tokens gives, bit for bit, with `Forward.row_exact` set.
-pub fn expectVerifyEqualsSerial(comptime P: type, t: *Twin(P), prompt: []const u32, drafts: []const u32) !void {
-    return expectVerifyEqualsSerialOn(P, t.m, t.lg.config.num_hidden_layers, t.lg.xfm.s, prompt, drafts);
 }
 
 /// As `expectVerifyEqualsSerial`, on a loaded model `m` of `n_layers` layers, on stream `s`.
@@ -358,7 +239,7 @@ pub const Gguf = struct {
 };
 
 /// A GGUF file (`write` fills `model.gguf`) served through the engine's `--mlx-gguf` path by plugin `table`, addressed
-/// by its directory or by the file itself, against the legacy load of the same file (or the tape `name` under `rel`).
+/// by its directory or by the file itself, against its tape.
 pub fn openGguf(table: *const abi.ModelTable, g: *const Gguf, by_file: bool, oracle: both.Oracle) !both.Both {
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -370,8 +251,6 @@ pub fn openGguf(table: *const abi.ModelTable, g: *const Gguf, by_file: bool, ora
     try g.write(io, tmp.dir, "model.gguf");
     var path_buf: [512]u8 = undefined;
     const root = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
-    const lg: ?*fixture.Legacy = if (oracle == .legacy) try legacyGguf(g, io) else null;
-    errdefer if (lg) |l| l.deinit();
     const dir = if (by_file) try std.fmt.allocPrint(a, "{s}/model.gguf", .{root}) else try a.dupe(u8, root);
     errdefer a.free(dir);
     var cfg = try model.parseConfig(io, a, dir);
@@ -382,26 +261,6 @@ pub fn openGguf(table: *const abi.ModelTable, g: *const Gguf, by_file: bool, ora
     const t: tape_mod.Tape = switch (oracle) {
         .tape => |bytes| try tape_mod.Tape.player(bytes),
         .none => .{},
-        .legacy => |rel| if (rel) |r| if (tape_mod.recordRoot()) |rr| try tape_mod.Tape.recorder(rr, r) else .{} else .{},
     };
-    return .{ .lg = lg, .tmp = tmp, .dir = dir, .cfg = cfg, .xfm = xfm, .tape = t };
-}
-
-/// The engine's legacy load of `g` (its own copy of the file).
-fn legacyGguf(g: *const Gguf, io: std.Io) !*fixture.Legacy {
-    const a = testing.allocator;
-    const lg = try a.create(fixture.Legacy);
-    errdefer a.destroy(lg);
-    lg.tmp = testing.tmpDir(.{});
-    errdefer lg.tmp.cleanup();
-    try g.write(io, lg.tmp.dir, "model.gguf");
-    var path_buf: [512]u8 = undefined;
-    const dir = path_buf[0..try lg.tmp.dir.realPath(io, &path_buf)];
-    lg.config = try model.parseConfigLegacy(io, a, dir);
-    errdefer lg.config.deinit(a);
-    lg.weights = try model.loadModelWeights(io, a, dir, &lg.config, false);
-    errdefer lg.weights.deinit();
-    model.resolveWeightPrefix(&lg.config, &lg.weights);
-    lg.xfm = try @import("../../engines/mlx/transformer.zig").Transformer.init(io, a, lg.config);
-    return lg;
+    return .{ .tmp = tmp, .dir = dir, .cfg = cfg, .xfm = xfm, .tape = t };
 }

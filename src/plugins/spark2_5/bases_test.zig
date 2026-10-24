@@ -79,28 +79,10 @@ fn sparkWeights(m: *const plugin.Loaded, layers: []Spark.Layer) Spark.Weights {
     return .{ .embed = pw.embed, .layers = layers, .final_norm = pw.final_norm, .head = pw.head };
 }
 
-/// Recorded from the legacy forward (`MLX_SERVE_PROOF_RECORD=<repo root>`) until it was deleted; replayed since.
-const frozen = true;
-
 fn open(p: *fixture.Pack, comptime seed: u64) !both.Both {
     const name = std.fmt.comptimePrint("fixtures/bases-{x}.tape", .{seed});
-    if (frozen) return both.Both.openAs(&plugin.table, p, spark_config, false, .{ .tape = @embedFile(name) });
-    return both.Both.openAs(&plugin.table, p, spark_config, false, .{ .legacy = "src/plugins/spark2_5/" ++ name });
+    return both.Both.openAs(&plugin.table, p, spark_config, false, .{ .tape = @embedFile(name) });
 }
-
-/// One slot's legacy cache and context (recording only).
-const Legacy = struct {
-    kv: KVCache,
-    off: usize = 0,
-    ctx: ForwardCtx = undefined,
-
-    fn init(l: *Legacy, x: anytype) !void {
-        l.* = .{ .kv = try KVCache.init(testing.allocator, 4) };
-        l.ctx = x.defaultCtx();
-        l.ctx.cache = &l.kv;
-        l.ctx.moe_seq_offset = &l.off;
-    }
-};
 
 test "spark2_5 bases: the per-head sigmoid gate and sliding layers are bit-equal to the recorded forwardStandardWith" {
     const a = testing.allocator;
@@ -116,17 +98,13 @@ test "spark2_5 bases: the per-head sigmoid gate and sliding layers are bit-equal
     defer kvc.deinit();
     var slot: cache_ops.Slot = .{ .kv = &kvc };
     const handles = [_]abi.Handle{slot.handle()};
-    var lg: Legacy = undefined;
-    if (bt.lg) |l| try lg.init(&l.xfm);
-    defer if (bt.lg != null) lg.kv.deinit();
     var pos: u32 = 0;
     for (both.long_steps) |st| {
         var g = ops.Graph.init(a, bt.xfm.s);
         defer g.deinit();
         const ids = try fixture.tokens(&g, st.ids);
-        const want: ?Array = if (bt.lg) |l| try fixture.rows2(&g, try g.adopt(try l.xfm.forwardWith(&lg.ctx, ids))) else null;
         const got = try Spark.forward(&w, &m.base.shared, &g, ids, .{ .mode = st.mode, .rows = @intCast(st.ids.len), .positions = &.{pos}, .caches = &handles, .cache_ops = &cache_ops.ops, .logits = .all_rows });
-        try bt.check(got.logits, want, false);
+        try bt.check(got.logits, false);
         pos += @intCast(st.ids.len);
     }
     try bt.expectDone();
@@ -146,18 +124,14 @@ test "spark2_5 bases: batched rows are bit-equal to the recorded forwardBatchedD
     defer for (&base_kv) |*c| c.deinit();
     var slots: [2]cache_ops.Slot = .{ .{ .kv = &base_kv[0] }, .{ .kv = &base_kv[1] } };
     const handles = [_]abi.Handle{ slots[0].handle(), slots[1].handle() };
-    var lgs: [2]Legacy = undefined;
-    if (bt.lg) |l| for (&lgs) |*x| try x.init(&l.xfm);
-    defer if (bt.lg != null) for (&lgs) |*x| x.kv.deinit();
     const prompts = [_][]const i32{ &.{ 4, 8, 15, 16, 23, 42, 9 }, &.{ 42, 101, 7 } };
     var positions: [2]u32 = undefined;
     for (prompts, 0..) |pr, i| {
         var g = ops.Graph.init(a, bt.xfm.s);
         defer g.deinit();
         const ids = try fixture.tokens(&g, pr);
-        const want: ?Array = if (bt.lg) |l| try fixture.rows2(&g, try g.adopt(try l.xfm.forwardWith(&lgs[i].ctx, ids))) else null;
         const got = try Spark.forward(&w, &m.base.shared, &g, ids, .{ .mode = .prefill, .rows = @intCast(pr.len), .positions = &.{0}, .caches = handles[i .. i + 1], .cache_ops = &cache_ops.ops, .logits = .all_rows });
-        try bt.check(got.logits, want, false);
+        try bt.check(got.logits, false);
         positions[i] = @intCast(pr.len);
     }
     for ([_][2]u32{ .{ 77, 3 }, .{ 190, 64 }, .{ 11, 12 }, .{ 13, 250 } }) |next| {
@@ -165,12 +139,7 @@ test "spark2_5 bases: batched rows are bit-equal to the recorded forwardBatchedD
         defer g.deinit();
         const ids = try g.fromSlice(i32, &.{ @intCast(next[0]), @intCast(next[1]) }, &.{ 2, 1 });
         const got = try Spark.forward(&w, &m.base.shared, &g, ids, .{ .mode = .batched_rows, .rows = 1, .slots = 2, .positions = &positions, .caches = &handles, .cache_ops = &cache_ops.ops, .logits = .last_row });
-        if (bt.lg) |l| {
-            const ctx_ptrs = [_]*ForwardCtx{ &lgs[0].ctx, &lgs[1].ctx };
-            const legacy = try l.xfm.forwardBatchedDecode(&next, &ctx_ptrs, &positions);
-            defer a.free(legacy);
-            for (legacy, 0..) |x, i| try bt.check(try g.sliceAxis(got.logits, 0, @intCast(i), @intCast(i + 1)), try fixture.rows2(&g, try g.adopt(x)), false);
-        } else for (0..2) |i| try bt.check(try g.sliceAxis(got.logits, 0, @intCast(i), @intCast(i + 1)), null, false);
+        for (0..2) |i| try bt.check(try g.sliceAxis(got.logits, 0, @intCast(i), @intCast(i + 1)), false);
         for (&positions) |*pp| pp.* += 1;
     }
     try bt.expectDone();

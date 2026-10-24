@@ -158,32 +158,6 @@ pub fn computeClampedSwiGLU(self: *const Transformer, gate: mlx.mlx_array, up: m
         clampedSwiGLU(self.s, gate, up, self.config.swiglu_limit);
 }
 
-/// Fused logit softcap: tanh(x/cap) * cap in a single compiled kernel.
-pub fn applySoftcap(self: *const Transformer, logits: mlx.mlx_array) !mlx.mlx_array {
-    if (self.compiled_softcap) |compiled| {
-        const in_arr = [_]mlx.mlx_array{logits};
-        const in_vec = mlx.mlx_vector_array_new_data(&in_arr, 1);
-        defer _ = mlx.mlx_vector_array_free(in_vec);
-        var out_vec = mlx.mlx_vector_array{ .ctx = null };
-        defer _ = mlx.mlx_vector_array_free(out_vec);
-        try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
-        var result = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_vector_array_get(&result, out_vec, 0));
-        return result;
-    }
-    // Fallback: separate ops
-    const cap = self.softcap_scalar.?;
-    var scaled = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_divide(&scaled, logits, cap, self.s));
-    defer _ = mlx.mlx_array_free(scaled);
-    var tanh_val = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_tanh(&tanh_val, scaled, self.s));
-    defer _ = mlx.mlx_array_free(tanh_val);
-    var result = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_multiply(&result, tanh_val, cap, self.s));
-    return result;
-}
-
 /// SwiGLU: silu(gate) * x
 pub fn swiglu(self: *const Transformer, gate: mlx.mlx_array, x: mlx.mlx_array) !mlx.mlx_array {
     const activated = try self.silu(gate);

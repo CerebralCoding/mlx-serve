@@ -76,16 +76,7 @@ const Step = struct { ids: []const i32, logits: abi.Logits, want_hidden: bool };
 /// The trunk served on the legacy config, the legacy values recorded to `fixtures/head-<seed>.tape`.
 fn open(p: *fixture.Pack, comptime seed: u64) !both.Both {
     const name = std.fmt.comptimePrint("fixtures/head-{x}.tape", .{seed});
-    return both.Both.proof(&hy3.table, p, trunk.configJson(true), true, "src/plugins/hy_v3/" ++ name, @embedFile(name));
-}
-
-/// The legacy head bound to the legacy trunk (recording only).
-fn legacyHead(b: *both.Both) !?mtp_mod.MtpModel {
-    const lg = b.lg orelse return null;
-    var lm = try mtp_mod.loadMtp(std.Io.Threaded.global_single_threaded.io(), testing.allocator, lg.xfm.s, b.dir);
-    errdefer lm.deinit();
-    try lm.bind(&lg.xfm);
-    return lm;
+    return both.Both.replay(&hy3.table, p, trunk.configJson(true), true, @embedFile(name));
 }
 
 fn headCase(q: Quant, comptime seed: u64) !void {
@@ -101,9 +92,6 @@ fn headCase(q: Quant, comptime seed: u64) !void {
     defer b.close();
     try saveHead(&hp, b.dir);
     const s = b.xfm.s;
-    var legacy = try legacyHead(&b);
-    defer if (legacy) |*lm| lm.deinit();
-    if (legacy) |lm| try testing.expectEqual(mtp_mod.Layout.hy3, lm.layout);
     var fs = try FsPackDir.open(io, b.dir);
     defer fs.close();
     const pd = fs.packDir();
@@ -111,8 +99,6 @@ fn headCase(q: Quant, comptime seed: u64) !void {
     const m = b.xfm.plugin.?.model;
     try testing.expect(hooks.load(m, &.{ .model_dir = .of(b.dir), .dir = &pd, .parsed = &b.cfg.plugin.?.parsed, .stream = .{ .ctx = s.ctx } }).isOk());
 
-    var lcache = try KVCache.init(a, 1);
-    defer lcache.deinit();
     var pcache = try KVCache.init(a, 1);
     defer pcache.deinit();
     var slot: cache_ops.Slot = .{ .kv = &pcache };
@@ -149,20 +135,10 @@ fn headCase(q: Quant, comptime seed: u64) !void {
             return error.PluginForward;
         }
         if (st.logits == .none and !st.want_hidden) {
-            if (legacy) |*lm| try mtp_mod.appendKvOnly(lm, &b.lg.?.xfm, &lcache, ids, hid, pos, null);
             try testing.expect(out.hidden.ctx == null);
-        } else {
-            var want: ?mlx.mlx_array = null;
-            if (legacy) |*lm| {
-                const r = try mtp_mod.forwardWithMrope(lm, &b.lg.?.xfm, &lcache, ids, hid, pos, st.logits == .last_row, null);
-                if (r.logits.ctx != null) _ = mlx.mlx_array_free(r.logits);
-                want = try g.adopt(r.hidden_next);
-            }
-            try b.check(try g.adopt(.{ .ctx = out.hidden.ctx }), want, false);
-        }
+        } else try b.check(try g.adopt(.{ .ctx = out.hidden.ctx }), false);
         pos += n;
     }
-    if (legacy != null) try testing.expectEqual(lcache.step, pcache.step);
     try b.expectDone();
 }
 
@@ -183,28 +159,10 @@ fn servedCase(q: Quant, comptime seed: u64) !void {
     try b.expectSteps(&both.long_steps);
     try b.expectGreedy();
     try saveHead(&hp, b.dir);
-    var legacy = try legacyHead(&b);
-    defer if (legacy) |*lm| lm.deinit();
     const served = plugin_head.load(io, a, &b.xfm, b.dir) orelse return error.TestHeadNotLoaded;
     defer plugin_head.destroy(served, a);
-    if (legacy) |lm| {
-        try testing.expectEqual(lm.draft_head != null, served.draft_head != null);
-        try testing.expectEqual(lm.rerank_coarse != null, served.rerank_coarse != null);
-    }
-    // The legacy side first when recording, the plugin's last.
-    var heads_buf: [2]MtpHeadRef = undefined;
-    var xs_buf: [2]*Transformer = undefined;
-    var sides: usize = 0;
-    if (legacy) |*lm| {
-        heads_buf[0] = .{ .qwen = lm };
-        xs_buf[0] = &b.lg.?.xfm;
-        sides = 1;
-    }
-    heads_buf[sides] = .{ .plugin = served };
-    xs_buf[sides] = &b.xfm;
-    sides += 1;
-    const heads = heads_buf[0..sides];
-    const xs = xs_buf[0..sides];
+    const h: MtpHeadRef = .{ .plugin = served };
+    const x = &b.xfm;
     {
         // The engine's head calls: history, a multi-row `.logits` step, a `.mixed` step and its draft pick.
         var g = ops.Graph.init(a, b.xfm.s);
@@ -212,29 +170,23 @@ fn servedCase(q: Quant, comptime seed: u64) !void {
         const hist = try rows(&g, 3, seed + 2);
         const step = try rows(&g, 2, seed + 3);
         const one = try rows(&g, 1, seed + 4);
-        var outs: [2][4]mlx.mlx_array = undefined;
-        for (heads, xs, 0..) |h, x, k| {
-            var cr = try h.makeCache(a);
-            defer cr.deinit();
-            try h.appendHistory(x, &cr, &.{ 5, 9, 40 }, hist, 0, null, a);
-            const merged = try h.forward(x, &cr, try g.fromSlice(i32, &.{ 7, 11 }, &.{2}), step, 3, .logits, null, null);
-            const mixed = try h.forward(x, &cr, try g.fromSlice(i32, &.{60}, &.{1}), one, 5, .mixed, null, null);
-            outs[k] = .{ try g.adopt(merged.logits), try g.adopt(merged.hidden_next), try g.adopt(mixed.hidden_next), try g.adopt(try h.draftSelect(x, mixed.hidden_next, null)) };
-            try testing.expectEqual(@as(usize, 6), cr.step());
-        }
-        for (outs[sides - 1], 0..) |got, i| try b.check(got, if (sides == 2) outs[0][i] else null, false);
+        var cr = try h.makeCache(a);
+        defer cr.deinit();
+        try h.appendHistory(x, &cr, &.{ 5, 9, 40 }, hist, 0, null, a);
+        const merged = try h.forward(x, &cr, try g.fromSlice(i32, &.{ 7, 11 }, &.{2}), step, 3, .logits, null, null);
+        const mixed = try h.forward(x, &cr, try g.fromSlice(i32, &.{60}, &.{1}), one, 5, .mixed, null, null);
+        const outs = [_]mlx.mlx_array{ try g.adopt(merged.logits), try g.adopt(merged.hidden_next), try g.adopt(mixed.hidden_next), try g.adopt(try h.draftSelect(x, mixed.hidden_next, null)) };
+        try testing.expectEqual(@as(usize, 6), cr.step());
+        for (outs) |got| try b.check(got, false);
     }
-    var tokens: [2][16]u32 = undefined;
-    var accepted: [2]std.ArrayList(u32) = .{ .empty, .empty };
-    defer for (&accepted) |*l| l.deinit(a);
-    for (heads, xs, 0..) |h, x, k| try mtpRun(x, h, &tokens[k], &accepted[k]);
-    const last = sides - 1;
-    for ([_][]const u32{ &tokens[last], accepted[last].items }, [_][]const u32{ &tokens[0], accepted[0].items }) |got, want| {
+    var tokens: [16]u32 = undefined;
+    var accepted: std.ArrayList(u32) = .empty;
+    defer accepted.deinit(a);
+    try mtpRun(x, h, &tokens, &accepted);
+    for ([_][]const u32{ &tokens, accepted.items }) |got| {
         const g_arr = mlx.mlx_array_new_data(got.ptr, &[_]c_int{@intCast(got.len)}, 1, .uint32);
         defer _ = mlx.mlx_array_free(g_arr);
-        const w_arr = mlx.mlx_array_new_data(want.ptr, &[_]c_int{@intCast(want.len)}, 1, .uint32);
-        defer _ = mlx.mlx_array_free(w_arr);
-        try b.check(g_arr, if (sides == 2) w_arr else null, true);
+        try b.check(g_arr, true);
     }
     try b.expectDone();
 }

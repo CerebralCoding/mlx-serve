@@ -165,62 +165,6 @@ pub const Pack = struct {
         try mlx.check(mlx.mlx_save_safetensors(file.ptr, p.map, meta));
     }
 
-    /// Writes the pack and loads it through the legacy path.
-    pub fn load(p: *Pack, config_json: []const u8) !*Legacy {
-        return p.loadEdited(config_json, null);
-    }
-
-    /// `load`, with `edit` applied to the parsed config first (a per-model load setting).
-    pub fn loadEdited(p: *Pack, config_json: []const u8, edit: ?*const fn (*model.ModelConfig) void) !*Legacy {
-        const a = testing.allocator;
-        const io = std.Io.Threaded.global_single_threaded.io();
-        const lg = try a.create(Legacy);
-        errdefer a.destroy(lg);
-        lg.tmp = testing.tmpDir(.{});
-        errdefer lg.tmp.cleanup();
-        var path_buf: [512]u8 = undefined;
-        const n = try lg.tmp.dir.realPath(io, &path_buf);
-        const dir = path_buf[0..n];
-        try p.save(dir);
-        lg.config = try model.parseConfigFromJson(a, config_json);
-        errdefer lg.config.deinit(a);
-        if (edit) |e| e(&lg.config);
-        lg.weights = try model.loadModelWeights(io, a, dir, &lg.config, false);
-        errdefer lg.weights.deinit();
-        model.resolveWeightPrefix(&lg.config, &lg.weights);
-        try model.narrowHadamardPackTables(&lg.config, &lg.weights, stream());
-        lg.xfm = try Transformer.init(io, a, lg.config);
-        return lg;
-    }
-};
-
-/// A pack loaded through the legacy path. Freed with `deinit`.
-pub const Legacy = struct {
-    tmp: testing.TmpDir,
-    config: model.ModelConfig,
-    weights: Weights,
-    xfm: Transformer,
-
-    pub fn deinit(lg: *Legacy) void {
-        lg.xfm.deinit();
-        lg.weights.deinit();
-        lg.config.deinit(testing.allocator);
-        lg.tmp.cleanup();
-        testing.allocator.destroy(lg);
-    }
-
-    /// A projection as the legacy `qmatmul` resolves it (`in_dim` = the activation's width).
-    pub fn lin(lg: *const Legacy, w: Array, s: Array, b: Array, bias: Array, in_dim: u32) linear.Linear {
-        if (s.ctx == null) return .{ .w = w, .bias = bias };
-        const qp = computeQuantParams(.of(&lg.config), w, s, in_dim);
-        return .{ .w = w, .s = s, .b = b, .bias = bias, .bits = qp.bits, .group_size = qp.group_size, .mode = qp.mode };
-    }
-
-    /// A row-joined group as a base's `Joined` (empty when the loader built none).
-    pub fn joined(lg: *const Legacy, r: FusedRows, in_dim: u32) linear.Joined {
-        if (r.w.ctx == null) return .{};
-        return .{ .lin = lg.lin(r.w, r.s, r.b, .{}, in_dim), .widths = r.widths };
-    }
 };
 
 /// `ids` `[1, n]` int32.
@@ -305,48 +249,6 @@ fn expectStateEqual(got: Array, want: Array) !void {
     if (sh.len == 5 and sh[0] > 1 and ops.shape(got).len == 5)
         return ops.expectBitEqual(try g.sliceAxis(got, 0, 0, sh[0] - 1), try g.sliceAxis(want, 0, 0, sh[0] - 1));
     return ops.expectBitEqual(got, want);
-}
-
-/// Runs `steps` through the legacy forward and base `M` on caches of their own, each step's logits bit-equal, and
-/// on a recurrent trunk every state and verify capture too.
-pub fn expectSteps(comptime M: type, lg: *Legacy, w: *const M.Weights) !void {
-    return expectStepsOf(M, lg, w, &steps);
-}
-
-/// `expectSteps` over the sequence `seq`.
-pub fn expectStepsOf(comptime M: type, lg: *Legacy, w: *const M.Weights, seq: []const Step) !void {
-    const a = testing.allocator;
-    var shared = block.Shared.init(lg.config.rms_norm_eps, lg.config.postNormEps());
-    defer shared.deinit();
-    const n_layers = lg.config.num_hidden_layers;
-    var kvc = try KVCache.init(a, n_layers);
-    defer kvc.deinit();
-    const entries = try newEntries(n_layers);
-    defer freeEntries(entries);
-    var slot: cache_ops.Slot = .{ .kv = &kvc, .ssm = entries };
-    const handles = [_]abi.Handle{slot.handle()};
-    var pos: u32 = 0;
-    for (seq) |st| {
-        var g = ops.Graph.init(a, lg.xfm.s);
-        defer g.deinit();
-        const ids = try tokens(&g, st.ids);
-        var ctx = lg.xfm.defaultCtx();
-        const capture = st.mode == .verify;
-        ctx.capture_ssm_seq = capture and ctx.ssm_entries != null;
-        const want = try rows2(&g, try g.adopt(try lg.xfm.forwardWith(&ctx, ids)));
-        const got = try M.forward(w, &shared, &g, ids, .{
-            .mode = st.mode,
-            .rows = @intCast(st.ids.len),
-            .positions = &.{pos},
-            .caches = &handles,
-            .cache_ops = &cache_ops.ops,
-            .logits = .all_rows,
-            .capture_spec = capture,
-        });
-        try ops.expectBitEqual(got.logits, want);
-        if (lg.xfm.ssm_entries) |legacy| try expectEntries(legacy, entries);
-        pos += @intCast(st.ids.len);
-    }
 }
 
 /// The base's test cache slot behind a block's `Ctx`.

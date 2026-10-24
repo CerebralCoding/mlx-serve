@@ -1,8 +1,7 @@
-//! Family proofs of a plugin table against the legacy forward: one tiny random pack on disk, loaded by the legacy
-//! `Transformer` and by the plugin behind the driver's shell (`driver.load`), whether or not its type is in the served
-//! set yet. Steps (prefill, decode, verify, captures), the pipelined greedy decode and batched rows are compared
-//! bit-equal; `expectGenericFieldsEqual` diffs the engine's `ModelConfig` of both parses. Once a type's legacy forward
-//! is deleted its proofs replay a tape recorded from it (`tape.zig`, `Both.replay`).
+//! Family proofs of a plugin table against tapes recorded from the legacy forward (`tape.zig`): one tiny random pack
+//! on disk served behind the driver's shell (`driver.load`). Steps (prefill, decode, verify, captures), the pipelined
+//! greedy decode and batched rows replay their recording; `expectGenericFieldsEqual` diffs the engine's `ModelConfig`
+//! of the plugin's parse and the legacy parse.
 
 const std = @import("std");
 const abi = @import("../../../abi/plugin.zig");
@@ -42,76 +41,36 @@ pub const long_steps = [_]Step{
     .{ .mode = .decode, .ids = &.{12} },
 };
 
-/// Which legacy entry decodes a batched tick of this pack.
-pub const Batched = enum { dense, layered };
-
-/// Where a proof's expected values come from: the legacy forward (`Both.open`, recorded when
-/// `MLX_SERVE_PROOF_RECORD` names the repo root and the proof names its tape), or a tape recorded from it
-/// (`Both.replay`, once that forward is deleted).
+/// Where a proof's expected values come from: a tape recorded from the legacy forward, or none (a proof that
+/// compares two of the plugin's own runs).
 pub const Oracle = union(enum) {
-    legacy: ?[]const u8,
     tape: []const u8,
-    /// The plugin alone (a proof that compares two of its own runs).
     none,
 };
 
-/// The same pack served both ways.
+/// A tiny pack served by its plugin, against its tape.
 pub const Both = struct {
-    /// The legacy load; null when the values come from a tape.
-    lg: ?*fixture.Legacy,
     tmp: testing.TmpDir,
     dir: []u8,
     cfg: model.ModelConfig,
     xfm: Transformer,
     tape: Tape = .{},
 
-    /// Writes `pack` with `config_json`, loads it through the legacy path and through `table` (its parse, the driver's
-    /// config adapter and load).
-    pub fn open(table: *const abi.ModelTable, pack: *fixture.Pack, config_json: []const u8) !Both {
-        return openWith(table, pack, config_json, false);
+    /// The plugin against `recorded` (`tape.zig`), on the legacy parse's `ModelConfig` when `legacy_config`.
+    pub fn replay(table: *const abi.ModelTable, pack: *fixture.Pack, config_json: []const u8, legacy_config: bool, recorded: []const u8) !Both {
+        return openAs(table, pack, config_json, legacy_config, .{ .tape = recorded });
     }
 
-    /// As `open`, with the served shell on the legacy parse's `ModelConfig` carrying the plugin's binding.
-    pub fn openOnLegacyConfig(table: *const abi.ModelTable, pack: *fixture.Pack, config_json: []const u8) !Both {
-        return openWith(table, pack, config_json, true);
-    }
-
-    pub fn openWith(table: *const abi.ModelTable, pack: *fixture.Pack, config_json: []const u8, legacy_config: bool) !Both {
-        return openAs(table, pack, config_json, legacy_config, .{ .legacy = null });
-    }
-
-    /// The plugin against a tape (`tape.zig`), on the legacy parse's `ModelConfig` when `legacy_config`.
-    pub fn replay(table: *const abi.ModelTable, pack: *fixture.Pack, config_json: []const u8, legacy_config: bool, tape: []const u8) !Both {
-        return openAs(table, pack, config_json, legacy_config, .{ .tape = tape });
-    }
-
-    /// The plugin against `recorded`, the tape at `rel` (a path under the repo root); an empty tape is recorded from
-    /// the legacy forward (`tape.records`).
-    pub fn proof(table: *const abi.ModelTable, pack: *fixture.Pack, config_json: []const u8, legacy_config: bool, comptime rel: []const u8, recorded: []const u8) !Both {
-        if (tape_mod.records(recorded)) return openAs(table, pack, config_json, legacy_config, .{ .legacy = rel });
-        return replay(table, pack, config_json, legacy_config, recorded);
-    }
-
-    /// `oracle.legacy` names the tape (a path under the repo root) the legacy values are recorded to.
     pub fn openAs(table: *const abi.ModelTable, pack: *fixture.Pack, config_json: []const u8, legacy_config: bool, oracle: Oracle) !Both {
         const a = testing.allocator;
         const io = std.Io.Threaded.global_single_threaded.io();
-        const lg: ?*fixture.Legacy = if (oracle == .legacy) try pack.load(config_json) else null;
-        errdefer if (lg) |l| l.deinit();
         var tmp = testing.tmpDir(.{});
         errdefer tmp.cleanup();
-        const dir_h = if (lg) |l| l.tmp.dir else tmp.dir;
-        try dir_h.writeFile(io, .{ .sub_path = "config.json", .data = config_json });
+        try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = config_json });
         var path_buf: [512]u8 = undefined;
-        const dir = try a.dupe(u8, path_buf[0..try dir_h.realPath(io, &path_buf)]);
+        const dir = try a.dupe(u8, path_buf[0..try tmp.dir.realPath(io, &path_buf)]);
         errdefer a.free(dir);
-        if (lg == null) {
-            const file = try std.fmt.allocPrintSentinel(a, "{s}/model.safetensors", .{dir}, 0);
-            defer a.free(file);
-            const meta = mlx.mlx_map_string_to_string_new();
-            defer _ = mlx.mlx_map_string_to_string_free(meta);
-            try mlx.check(mlx.mlx_save_safetensors(file.ptr, pack.map, meta));
-        }
+        try pack.save(dir);
         var cfg = try parse(table, dir, config_json);
         errdefer cfg.deinit(a);
         if (legacy_config) {
@@ -125,57 +84,38 @@ pub const Both = struct {
         const t: Tape = switch (oracle) {
             .tape => |bytes| try Tape.player(bytes),
             .none => .{},
-            .legacy => |rel| if (rel) |r| if (tape_mod.recordRoot()) |root| try Tape.recorder(root, r) else .{} else .{},
         };
-        return .{ .lg = lg, .tmp = tmp, .dir = dir, .cfg = cfg, .xfm = xfm, .tape = t };
+        return .{ .tmp = tmp, .dir = dir, .cfg = cfg, .xfm = xfm, .tape = t };
     }
 
-    /// A playback read every recorded value (the last call of a replayed proof).
+    /// A playback read every recorded value (the last call of a proof).
     pub fn expectDone(b: *const Both) !void {
         try b.tape.expectDone();
     }
 
-    /// Writes a recording and frees both loads.
     pub fn close(b: *Both) void {
-        b.tape.finish() catch |e| std.debug.panic("proof tape: {t}", .{e});
         b.xfm.deinit();
         b.cfg.deinit(testing.allocator);
         testing.allocator.free(b.dir);
         b.tmp.cleanup();
-        if (b.lg) |l| l.deinit();
     }
 
     pub fn layers(b: *const Both) usize {
         return b.cfg.num_hidden_layers;
     }
 
-    /// The shells to run: the legacy one first when loaded, the plugin's last.
-    fn sides(b: *Both, buf: *[2]*Transformer) []const *Transformer {
-        buf[1] = &b.xfm;
-        if (b.lg) |l| {
-            buf[0] = &l.xfm;
-            return buf[0..2];
-        }
-        return buf[1..2];
+    /// `got` against the tape's next value.
+    pub fn check(b: *Both, got: Array, tokens: bool) !void {
+        try b.tape.expectNext(got, tokens);
     }
 
-    /// `got` (the plugin's) against `want` (the legacy's, when loaded) or the tape.
-    pub fn check(b: *Both, got: Array, want: ?Array, tokens: bool) !void {
-        if (want) |w| {
-            try ops.expectBitEqual(got, w);
-            if (b.tape.recording()) try b.tape.put(w);
-        } else try b.tape.expectNext(got, tokens);
-    }
-
-    /// Prefill, decode and verify steps on caches of their own: logits, the last hidden row and every layer's captured
-    /// output bit-equal.
+    /// Prefill, decode and verify steps on a cache of its own: logits, the last hidden row and every layer's captured
+    /// output.
     pub fn expectSteps(b: *Both, seq: []const Step) !void {
         const n = b.layers();
-        var xb: [2]*Transformer = undefined;
-        const xs = b.sides(&xb);
-        var slots: [2]Slot = undefined;
-        for (slots[0..xs.len], xs) |*s, x| try s.init(b, x);
-        defer for (slots[0..xs.len]) |*s| s.deinit();
+        var s: Slot = undefined;
+        try s.init(b, &b.xfm);
+        defer s.deinit();
         const ids_all = try testing.allocator.alloc(u32, n);
         defer testing.allocator.free(ids_all);
         for (ids_all, 0..) |*id, i| id.* = @intCast(i);
@@ -183,77 +123,59 @@ pub const Both = struct {
             var g = ops.Graph.init(testing.allocator, b.xfm.s);
             defer g.deinit();
             const ids = try fixture.tokens(&g, st.ids);
-            var outs: [2][]Array = undefined;
-            for (xs, slots[0..xs.len], 0..) |x, *s, k| {
-                var hidden = mlx.mlx_array_new();
-                const caps = try testing.allocator.alloc(Array, n);
-                for (caps) |*c| c.* = mlx.mlx_array_new();
-                var cl: CaptureLayers = .{ .ids = ids_all, .out = caps };
-                s.ctx.capture_layers = &cl;
-                s.ctx.spec_verify = st.mode == .verify;
-                defer s.ctx.capture_layers = null;
-                const logits = try g.adopt(try x.forwardWithCapture(&s.ctx, ids, &hidden));
-                _ = try g.adopt(hidden);
-                const all = try testing.allocator.alloc(Array, n + 2);
-                all[0] = logits;
-                all[1] = hidden;
-                for (caps, 0..) |c, i| all[i + 2] = try g.adopt(c);
-                testing.allocator.free(caps);
-                outs[k] = all;
-            }
-            defer for (outs[0..xs.len]) |o| testing.allocator.free(o);
-            for (outs[xs.len - 1], 0..) |got, i| try b.check(got, if (xs.len == 2) outs[0][i] else null, false);
+            var hidden = mlx.mlx_array_new();
+            const caps = try testing.allocator.alloc(Array, n);
+            defer testing.allocator.free(caps);
+            for (caps) |*c| c.* = mlx.mlx_array_new();
+            var cl: CaptureLayers = .{ .ids = ids_all, .out = caps };
+            s.ctx.capture_layers = &cl;
+            s.ctx.spec_verify = st.mode == .verify;
+            defer s.ctx.capture_layers = null;
+            const logits = try g.adopt(try b.xfm.forwardWithCapture(&s.ctx, ids, &hidden));
+            _ = try g.adopt(hidden);
+            try b.check(logits, false);
+            try b.check(hidden, false);
+            for (caps) |c| try b.check(try g.adopt(c), false);
         }
     }
 
     /// Greedy decode through the pipelined step (`lazyForward`: the next token stays a lazy argmax), tokens equal.
     pub fn expectGreedy(b: *Both) !void {
-        var xb: [2]*Transformer = undefined;
-        const xs = b.sides(&xb);
-        var tokens: [2][8]u32 = undefined;
-        for (xs, 0..) |x, k| {
-            var s: Slot = undefined;
-            try s.init(b, x);
-            defer s.deinit();
-            var g = ops.Graph.init(testing.allocator, b.xfm.s);
-            defer g.deinit();
-            var logits = try g.adopt(try x.forwardWith(&s.ctx, try fixture.tokens(&g, &.{ 7, 8, 9, 10 })));
-            for (&tokens[k]) |*t| {
-                const sh = ops.shape(logits);
-                const last = try g.reshape(try g.sliceAxis(logits, 1, sh[1] - 1, sh[1]), &.{ 1, sh[2] });
-                const next = try g.argmax(last, -1, false);
-                logits = try g.adopt(try lazyForward(x, &s.ctx, next));
-                const host = try g.astype(next, .uint32);
-                try mlx.check(mlx.mlx_array_eval(host));
-                t.* = mlx.mlx_array_data_uint32(host).?[0];
-            }
+        var tokens: [8]u32 = undefined;
+        var s: Slot = undefined;
+        try s.init(b, &b.xfm);
+        defer s.deinit();
+        var g = ops.Graph.init(testing.allocator, b.xfm.s);
+        defer g.deinit();
+        var logits = try g.adopt(try b.xfm.forwardWith(&s.ctx, try fixture.tokens(&g, &.{ 7, 8, 9, 10 })));
+        for (&tokens) |*t| {
+            const sh = ops.shape(logits);
+            const last = try g.reshape(try g.sliceAxis(logits, 1, sh[1] - 1, sh[1]), &.{ 1, sh[2] });
+            const next = try g.argmax(last, -1, false);
+            logits = try g.adopt(try lazyForward(&b.xfm, &s.ctx, next));
+            const host = try g.astype(next, .uint32);
+            try mlx.check(mlx.mlx_array_eval(host));
+            t.* = mlx.mlx_array_data_uint32(host).?[0];
         }
-        const got = mlx.mlx_array_new_data(&tokens[xs.len - 1], &[_]c_int{8}, 1, .uint32);
+        const got = mlx.mlx_array_new_data(&tokens, &[_]c_int{8}, 1, .uint32);
         defer _ = mlx.mlx_array_free(got);
-        const want: ?Array = if (xs.len == 2) mlx.mlx_array_new_data(&tokens[0], &[_]c_int{8}, 1, .uint32) else null;
-        defer if (want) |w| {
-            _ = mlx.mlx_array_free(w);
-        };
-        try b.check(got, want, true);
+        try b.check(got, true);
     }
 
     /// A prompt with `n` media rows at placeholder id `image` (one split across a chunk boundary, the second chunk
-    /// resuming at its row offset), then decode: logits bit-equal.
+    /// resuming at its row offset), then decode: logits equal.
     pub fn expectMedia(b: *Both, image: i32, hidden: c_int) !void {
         const a = testing.allocator;
-        var xb: [2]*Transformer = undefined;
-        const xs = b.sides(&xb);
-        var slots: [2]Slot = undefined;
-        for (slots[0..xs.len], xs) |*s, x| try s.init(b, x);
-        defer for (slots[0..xs.len]) |*s| s.deinit();
+        var s: Slot = undefined;
+        try s.init(b, &b.xfm);
+        defer s.deinit();
         var g0 = ops.Graph.init(a, b.xfm.s);
         defer g0.deinit();
         var prng = std.Random.DefaultPrng.init(0x3ed1a);
         const buf = try a.alloc(f32, @intCast(5 * hidden));
         defer a.free(buf);
         for (buf) |*x| x.* = prng.random().floatNorm(f32) * 0.5;
-        const rows = try g0.astype(try g0.adopt(mlx.mlx_array_new_data(buf.ptr, &[_]c_int{ 1, 5, hidden }, 3, .float32)), .bfloat16);
-        for (slots[0..xs.len]) |*s| s.ctx.vision_embeddings = rows;
+        s.ctx.vision_embeddings = try g0.astype(try g0.adopt(mlx.mlx_array_new_data(buf.ptr, &[_]c_int{ 1, 5, hidden }, 3, .float32)), .bfloat16);
         const chunks = [_]struct { ids: []const i32, offset: usize }{
             .{ .ids = &.{ 3, 17, image, image, image }, .offset = 0 },
             .{ .ids = &.{ image, image, 7, 8 }, .offset = 3 },
@@ -262,53 +184,36 @@ pub const Both = struct {
         for (chunks) |ch| {
             var g = ops.Graph.init(a, b.xfm.s);
             defer g.deinit();
-            const t = try fixture.tokens(&g, ch.ids);
-            var outs: [2]Array = undefined;
-            for (xs, slots[0..xs.len], 0..) |x, *s, k| {
-                s.ctx.vision_splice_offset = ch.offset;
-                outs[k] = try g.adopt(try x.forwardWith(&s.ctx, t));
-            }
-            try b.check(outs[xs.len - 1], if (xs.len == 2) outs[0] else null, false);
+            s.ctx.vision_splice_offset = ch.offset;
+            try b.check(try g.adopt(try b.xfm.forwardWith(&s.ctx, try fixture.tokens(&g, ch.ids))), false);
         }
     }
 
-    /// Two slots prefilled apart, then decoded together: each slot's logits bit-equal to the legacy batched tick's.
-    pub fn expectBatched(b: *Both, legacy: Batched) !void {
+    /// Two slots prefilled apart, then decoded together: each slot's logits.
+    pub fn expectBatched(b: *Both) !void {
         const a = testing.allocator;
-        var xb: [2]*Transformer = undefined;
-        const xs = b.sides(&xb);
-        var slots: [2][2]Slot = undefined;
-        for (slots[0..xs.len], xs) |*pair, x| for (pair) |*s| try s.init(b, x);
-        defer for (slots[0..xs.len]) |*pair| for (pair) |*s| s.deinit();
+        var slots: [2]Slot = undefined;
+        for (&slots) |*s| try s.init(b, &b.xfm);
+        defer for (&slots) |*s| s.deinit();
         const prompts = [_][]const i32{ &.{ 4, 8, 15, 16, 23, 42, 9 }, &.{ 42, 101, 7 } };
         var positions: [2]u32 = undefined;
-        for (prompts, 0..) |pr, i| {
+        for (prompts, &slots, 0..) |pr, *s, i| {
             var g = ops.Graph.init(a, b.xfm.s);
             defer g.deinit();
-            var outs: [2]Array = undefined;
-            for (xs, 0..) |x, k| outs[k] = try g.adopt(try x.forwardWith(&slots[k][i].ctx, try fixture.tokens(&g, pr)));
-            try b.check(outs[xs.len - 1], if (xs.len == 2) outs[0] else null, false);
+            try b.check(try g.adopt(try b.xfm.forwardWith(&s.ctx, try fixture.tokens(&g, pr))), false);
             positions[i] = @intCast(pr.len);
         }
         for ([_][2]u32{ .{ 77, 3 }, .{ 190, 64 }, .{ 11, 12 }, .{ 13, 250 } }) |next| {
             var g = ops.Graph.init(a, b.xfm.s);
             defer g.deinit();
-            var rows: [2][]Array = undefined;
-            for (xs, 0..) |x, k| {
-                const ctxs = [_]*ForwardCtx{ &slots[k][0].ctx, &slots[k][1].ctx };
-                rows[k] = if (xs.len == 2 and k == 0 and legacy == .layered)
-                    try x.forwardMoeBatchedDecode(&next, &ctxs, &positions, null)
-                else
-                    try x.forwardBatchedDecode(&next, &ctxs, &positions);
-                for (rows[k]) |r| _ = try g.adopt(r);
-            }
-            defer for (rows[0..xs.len]) |r| a.free(r);
-            for (rows[xs.len - 1], 0..) |got, i| try b.check(got, if (xs.len == 2) rows[0][i] else null, false);
+            const ctxs = [_]*ForwardCtx{ &slots[0].ctx, &slots[1].ctx };
+            const rows = try b.xfm.forwardBatchedDecode(&next, &ctxs, &positions);
+            defer a.free(rows);
+            for (rows) |r| _ = try g.adopt(r);
+            for (rows) |r| try b.check(r, false);
             for (&positions) |*p| p.* += 1;
             // The scheduler's tick advances each slot's offset after the forward (`batched/tick.zig`).
-            for (slots[0..xs.len]) |*pair| for (pair) |*s| {
-                s.off += 1;
-            };
+            for (&slots) |*s| s.off += 1;
         }
     }
 };

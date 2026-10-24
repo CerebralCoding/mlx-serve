@@ -135,7 +135,7 @@ fn headCase(comptime tf: bool, comptime seed: u64) !void {
         if (st.logits == .none and !st.want_hidden) {
             try testing.expect(out.hidden.ctx == null);
         } else {
-            try b.check(try g.adopt(.{ .ctx = out.hidden.ctx }), null, false);
+            try b.check(try g.adopt(.{ .ctx = out.hidden.ctx }), false);
         }
         pos += n;
     }
@@ -171,7 +171,7 @@ fn servedCase(comptime tf: bool, comptime seed: u64) !void {
         const mixed = try h.forward(x, &cr, try g.fromSlice(i32, &.{60}, &.{1}), one, 5, .mixed, null, null);
         const outs = [_]mlx.mlx_array{ try g.adopt(merged.logits), try g.adopt(merged.hidden_next), try g.adopt(mixed.hidden_next), try g.adopt(try h.draftSelect(x, mixed.hidden_next, null)) };
         try testing.expectEqual(@as(usize, 6), cr.step());
-        for (outs) |got| try b.check(got, null, false);
+        for (outs) |got| try b.check(got, false);
     }
     var tokens: [16]u32 = undefined;
     var accepted: std.ArrayList(u32) = .empty;
@@ -179,7 +179,7 @@ fn servedCase(comptime tf: bool, comptime seed: u64) !void {
     try mtpRun(x, h, &tokens, &accepted);
     var g = ops.Graph.init(a, b.xfm.s);
     defer g.deinit();
-    for ([_][]const u32{ &tokens, accepted.items }) |got| try b.check(try g.fromSlice(u32, got, &.{@intCast(got.len)}), null, true);
+    for ([_][]const u32{ &tokens, accepted.items }) |got| try b.check(try g.fromSlice(u32, got, &.{@intCast(got.len)}), true);
     try b.expectDone();
 }
 
