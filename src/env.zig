@@ -289,10 +289,8 @@ pub const vars = struct {
     pub const MLX_SERVE_CACHE_LIMIT: Var = .{ .kind = .public, .type = .text, .default = "by RAM", .owner = "mlx", .since = "26.7.12", .doc = "MLX allocator cache cap" };
     pub const MLX_SERVE_DIAG: Var = .{ .kind = .public, .type = .text, .default = "unset", .owner = ".", .since = "-", .doc = "comma list of diag tokens (`step-trace`, `decode-graph-dump=/path`): arms each diag variable by name" };
     pub const MLX_SERVE_GPU_CEILING_MB: Var = .{ .kind = .public, .type = .int, .default = "0 (the machine's)", .owner = "host/registry", .since = "26.9.5", .doc = "GPU memory ceiling for the admission guards, MiB" };
-    pub const MLX_SERVE_INT8_QK: Var = .{ .kind = .public, .type = .flag, .default = "off", .owner = "sdk/blocks/attention", .since = "26.10.3", .doc = "int8 Q and K causal hd-256 prefill attention (lossy, NAX; --int8-qk)" };
     pub const MLX_SERVE_KERNEL_DIR: Var = .{ .kind = .public, .type = .text, .default = "unset", .owner = "mlx", .since = "unreleased", .doc = "dir of .metal files that replace the built-in kernel sources by name" };
     pub const MLX_SERVE_KIT: Var = .{ .kind = .public, .type = .text, .default = "~/.mlx-serve/kit", .owner = "host/plugins", .since = "unreleased", .doc = "the plugin kit dir `mlx-serve plugin` builds against" };
-    pub const MLX_SERVE_PREFILL_DECODE_SHARE: Var = .{ .kind = .public, .type = .float, .default = "0.25", .owner = "engines/mlx", .since = "26.10.1", .doc = "--prefill-decode-share: wall-time share decode keeps during a prefill (the flag wins)" };
     pub const MLX_SERVE_RAW_DUMP_FILE: Var = .{ .kind = .public, .type = .text, .default = "unset", .owner = "host/api", .since = "26.7.2", .doc = "path: append every tools request's full pre-parse text (debug log level)" };
     pub const MLX_SERVE_WIRED: Var = .{ .kind = .public, .type = .text, .default = "the default policy", .owner = "mlx", .since = "26.7.12", .doc = "Metal wired-memory policy" };
     pub const PATH: Var = .{ .kind = .public, .type = .text, .default = "empty", .owner = "mlx", .since = "-", .doc = "executable search path; Windows CUDA prepends its bin" };

@@ -244,7 +244,7 @@ fn printUsage(io: std.Io) void {
         \\                        The share is measured per silicon.
         \\  --int8-qk           Run the hd-256 prefill attention of dense Qwen
         \\                        models with int8 Q/K (NAX GPUs, lossy, wins
-        \\                        from ~32k tokens). Also MLX_SERVE_INT8_QK=1.
+        \\                        from ~32k tokens).
         \\  --lm-head-mxfp8 / --no-lm-head-mxfp8
         \\                      Quantize a dense bf16 lm_head to MXFP8 at load, vLLM's
         \\                        VLLM_MXFP8_LM_HEAD bytes (lossy; half the head's bytes
@@ -363,7 +363,7 @@ fn printUsage(io: std.Io) void {
         \\                      Target fraction of wall time (0..0.9) the
         \\                        decoding streams keep while another request
         \\                        prefills; also narrows that prefill's chunks.
-        \\                        Default 0.25; 0 = the old schedule (env MLX_SERVE_PREFILL_DECODE_SHARE).
+        \\                        Default 0.25; 0 = the old schedule.
         \\  --prefix-cache-entries <n>
         \\                      Hot prefix cache LRU capacity in entries
         \\                        (default: 32). 0 disables all prefix reuse.
@@ -1195,9 +1195,8 @@ pub fn main(init: std.process.Init) !void {
     // server config in reach); the env stays the benching override.
     ane_mod.aneState().media_offload = ane_media;
 
-    const decode_share_env: ?[]const u8 = env.span(.MLX_SERVE_PREFILL_DECODE_SHARE);
-    scheduler_mod.prefill_decode_share = scheduler_mod.resolveDecodeShare(decode_share_flag, decode_share_env) catch {
-        log.err("--prefill-decode-share / MLX_SERVE_PREFILL_DECODE_SHARE: expected a number >= 0 (above 0.9 clamps to 0.9), got '{s}'\n", .{decode_share_flag orelse decode_share_env.?});
+    scheduler_mod.prefill_decode_share = scheduler_mod.resolveDecodeShare(decode_share_flag) catch {
+        log.err("--prefill-decode-share: expected a number >= 0 (above 0.9 clamps to 0.9), got '{s}'\n", .{decode_share_flag.?});
         std.process.exit(1);
     };
 
