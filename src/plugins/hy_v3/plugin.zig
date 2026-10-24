@@ -18,12 +18,7 @@ const EitherMlp = @import("../lfm2/plugin.zig").EitherMlp;
 const mtp_head = @import("mtp_head.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "hy_v3",
-    .kind = .model,
-    .claims = &config.model_types,
-    .gate_models = &.{"mlx-community/Hy3-oQ2e"},
-};
+pub const plugin = config.plugin;
 
 const b = bases.blocks;
 const Array = mlx.mlx_array;

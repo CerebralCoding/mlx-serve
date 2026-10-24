@@ -8,6 +8,13 @@ const sdk = @import("../../sdk/root.zig");
 const generation = @import("../../sdk/config/generation.zig");
 const json = @import("../../sdk/config/json.zig");
 
+pub const plugin = sdk.Plugin{
+    .name = "hy_v3",
+    .kind = .model,
+    .claims = &model_types,
+    .gate_models = &.{"mlx-community/Hy3-oQ2e"},
+};
+
 pub const model_types = [_][]const u8{"hy_v3"};
 
 pub const claims = sdk.claimsByType(&model_types);

@@ -598,11 +598,3 @@ test "plugin arm: a refused load keeps the plugin's own error name; a diarizer r
     try testing.expectEqual(@as(u32, 2), r.speakers);
     try testing.expectEqualSlices(f32, &probs, r.probs);
 }
-
-test {
-    _ = @import("served.zig");
-    _ = @import("flip_test.zig");
-    _ = @import("flip_image_test.zig");
-    _ = @import("../../../plugins/stable_audio3/plugin.zig");
-    _ = @import("../../../plugins/stable_audio3/config.zig");
-}

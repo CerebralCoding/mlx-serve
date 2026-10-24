@@ -38,8 +38,10 @@ pub fn build(b: *std.Build) void {
     });
     const optimize = b.standardOptimizeOption(.{});
 
+    // `-Dunits`: every plugin compiles as its own object (src/unit.zig) beside the host, in parallel.
+    const units = b.option(bool, "units", "Compile each plugin as its own unit, in parallel") orelse false;
     // A plugin registers by its folder: the scan writes src/plugins/registry.zig, every graph compiles it.
-    const plugin_names = plugins.generate(b);
+    const plugin_names = plugins.generate(b, units);
 
     // `zig build lint`: the house rules over src/ (scripts/lint.py), no Zig compile. Report-only unless
     // -Dlint-strict, which fails on the rules listed in scripts/lint_enforced.txt. `--all`: run the script directly.
@@ -140,8 +142,6 @@ pub fn build(b: *std.Build) void {
     // builds its own options with ios=true so the engine swaps the embedded
     // ds4 + llama.cpp engines for no-op stubs (iOS serves MLX safetensors only).
     build_options.addOption(bool, "ios", false);
-    // `-Dunits`: every plugin compiles as its own object (src/unit.zig) beside the host, in parallel.
-    const units = b.option(bool, "units", "Compile each plugin as its own unit, in parallel") orelse false;
     build_options.addOption(bool, "units", units);
     // True when the embedded engines (ds4, libllama) are actually linked:
     // macOS (Metal) and Linux (CUDA) exe = yes; the iOS static lib = no, it
