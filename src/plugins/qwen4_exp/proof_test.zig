@@ -296,3 +296,217 @@ test "qwen4_exp plugin: a position that does not follow the slot's state is refu
     const v = q4.table.forward(t.m, &.{ .mode = .decode, .rows = 1, .tokens = .of(&.{4}), .positions = .of(&.{5}) }, &bad);
     try testing.expect(!v.isOk() and bad.logits.ctx == null);
 }
+
+/// The routed experts' output of layer 0 on `x` (shared expert skipped), evaluated.
+fn routedOut(t: *Trunk, x: Array) !Array {
+    const y = try t.moeMLP2WithRouter(x, x, &t.moe_layers[0].mlp.moe, null, true);
+    try mlx.check(mlx.mlx_array_eval(y));
+    return y;
+}
+
+/// `x * k` in `x`'s dtype, evaluated.
+fn scaled(x: Array, k: f32) !Array {
+    const s = mlx.gpuStream();
+    const kk = mlx.mlx_array_new_float(k);
+    defer _ = mlx.mlx_array_free(kk);
+    var kd = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(kd);
+    try mlx.check(mlx.mlx_astype(&kd, kk, mlx.mlx_array_dtype(x), s));
+    var y = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_multiply(&y, x, kd, s));
+    try mlx.check(mlx.mlx_array_eval(y));
+    return y;
+}
+
+test "qwen4_exp plugin: a per-expert scale of 2 doubles the routed experts exactly, at decode, verify and prefill widths" {
+    // ModelOpt packs carry each expert's up x down weight_scale_2 as `mlp.switch_mlp.expert_scale`, on the routing
+    // weight; dropping it decodes garbage. Doubling every routing weight doubles the routed sum bit for bit.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    for ([_]fixture.Precision{ .bf16, .q4 }) |prec| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const t = try Twin.open(try fixture.filesWith(arena.allocator(), 61, prec, .{ .expert_scale = 2.0 }));
+        defer t.close();
+        // The plugin's own load binds the scale on every layer.
+        for (t.inner().moe_layers) |*lw| try testing.expect(lw.mlp.moe.per_expert_scale != null);
+        const mw = &t.xfm.moe_layers[0].mlp.moe;
+        const bound = mw.*;
+        var prng = std.Random.DefaultPrng.init(0x5CA1E);
+        for ([_]c_int{ 1, 3, 9 }) |rows| {
+            const x = try randRows(prng.random(), rows);
+            defer _ = mlx.mlx_array_free(x);
+            const with = try routedOut(&t.xfm, x);
+            defer _ = mlx.mlx_array_free(with);
+            mw.per_expert_scale = null;
+            const without = routedOut(&t.xfm, x);
+            mw.* = bound;
+            const plain = try without;
+            defer _ = mlx.mlx_array_free(plain);
+            const want = try scaled(plain, 2.0);
+            defer _ = mlx.mlx_array_free(want);
+            try ops.expectBitEqual(with, want);
+        }
+        // A grouped verify's joined rows equal each row's own MoE with the scale bound.
+        var inputs: [2]Array = undefined;
+        for (&inputs) |*in| in.* = try randRows(prng.random(), 3);
+        defer for (inputs) |in| {
+            _ = mlx.mlx_array_free(in);
+        };
+        const rows = try t.xfm.moeVerifyRows(&inputs, mw);
+        defer {
+            for (rows) |r| _ = mlx.mlx_array_free(r);
+            testing.allocator.free(rows);
+        }
+        for (inputs, rows) |in, got| {
+            const solo = try t.xfm.moeMLP(in, mw);
+            defer _ = mlx.mlx_array_free(solo);
+            try mlx.check(mlx.mlx_array_eval(got));
+            try mlx.check(mlx.mlx_array_eval(solo));
+            try ops.expectBitEqual(got, solo);
+        }
+    }
+}
+
+test "qwen4_exp plugin: a per-expert gate scale equals the gate projection scaled by it" {
+    // ModelOpt's gate weight_scale_2 (`gate_proj.expert_scale`) multiplies the gate before the SiLU; on a bf16 bank a
+    // scale of 2 is the bank times 2, exactly. Prompt widths: both sides take the sorted path.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const t = try Twin.open(try fixture.filesWith(arena.allocator(), 63, .bf16, .{ .gate_expert_scale = 2.0 }));
+    defer t.close();
+    for (t.inner().moe_layers) |*lw| try testing.expect(lw.mlp.moe.gate_expert_scale.ctx != null);
+    const mw = &t.xfm.moe_layers[0].mlp.moe;
+    const bound = mw.*;
+    const doubled = try scaled(mw.switch_gate_w, 2.0);
+    defer _ = mlx.mlx_array_free(doubled);
+    var prng = std.Random.DefaultPrng.init(0x6A7E);
+    for ([_]c_int{ 1, 3, 9 }) |rows| {
+        const x = try randRows(prng.random(), rows);
+        defer _ = mlx.mlx_array_free(x);
+        const with = try routedOut(&t.xfm, x);
+        defer _ = mlx.mlx_array_free(with);
+        mw.gate_expert_scale = .{ .ctx = null };
+        mw.switch_gate_w = doubled;
+        const folded = routedOut(&t.xfm, x);
+        mw.* = bound;
+        const want = try folded;
+        defer _ = mlx.mlx_array_free(want);
+        if (rows == 1) try testing.expect(try relErr(with, want) < 1e-2) else try ops.expectBitEqual(with, want);
+    }
+}
+
+/// `rows` random bf16 hidden rows `[1, rows, 64]`.
+fn randRows(r: std.Random, rows: c_int) !Array {
+    var buf: [9 * 64]f32 = undefined;
+    for (buf[0..@intCast(rows * 64)]) |*v| v.* = r.floatNorm(f32) * 0.5;
+    const xf = mlx.mlx_array_new_data(&buf, &[_]c_int{ 1, rows, 64 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(xf);
+    var x = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&x, xf, .bfloat16, mlx.gpuStream()));
+    return x;
+}
+
+/// Columns `[lo, lo + n)` of a `[in, out]` weight.
+fn cols(w: Array, lo: c_int, n: c_int) !Array {
+    const sh = mlx.getShape(w);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_slice(&out, w, &[_]c_int{ 0, lo }, 2, &[_]c_int{ sh[0], lo + n }, 2, &[_]c_int{ 1, 1 }, 2, mlx.gpuStream()));
+    return out;
+}
+
+/// A fresh recurrent entry.
+fn freshEntry() SSMCacheEntry {
+    return .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
+}
+
+fn freeEntry(e: *SSMCacheEntry) void {
+    _ = mlx.mlx_array_free(e.conv_state);
+    _ = mlx.mlx_array_free(e.ssm_state);
+    ssmFreeQsaState(e);
+}
+
+/// `|got - want|` over `|want|`, in f32.
+fn relErr(got: Array, want: Array) !f32 {
+    const read = @import("../../sdk/testing/parity.zig").qwen4ReadF32;
+    const a = try read(testing.allocator, got, mlx.gpuStream());
+    defer testing.allocator.free(a);
+    const b = try read(testing.allocator, want, mlx.gpuStream());
+    defer testing.allocator.free(b);
+    var err: f64 = 0;
+    var ref: f64 = 0;
+    for (a, b) |x, y| {
+        try testing.expect(std.math.isFinite(x));
+        err += (x - y) * (x - y);
+        ref += y * y;
+    }
+    return @floatCast(@sqrt(err / @max(ref, 1e-30)));
+}
+
+test "qwen4_exp plugin: a GDN layer with the combined in_proj_qkvz/in_proj_ba projections equals the separate ones" {
+    // The binder takes `linear_attn.in_proj_qkvz` (qwen3_next's interleaved layout) whenever a pack ships it.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const t = try Twin.open(try fixture.files(arena.allocator(), 71, .bf16));
+    defer t.close();
+    const la = &t.xfm.moe_layers[0].attn.linear;
+    try testing.expect(la.qkv_s.ctx == null and la.in.w.ctx == null); // bf16: [in, out], no joined rows
+    const cfg = &t.xfm.config;
+    const hk: c_int = @intCast(cfg.linear_num_key_heads);
+    const dk: c_int = @intCast(cfg.linear_key_head_dim);
+    const dv: c_int = @intCast(cfg.linear_value_head_dim);
+    const vph: c_int = @divExact(@as(c_int, @intCast(cfg.linear_num_value_heads)), hk);
+    const key_dim = hk * dk;
+    // Per key head: [q, k, v, z] and [b, a].
+    var qkvz_parts: std.ArrayList(Array) = .empty;
+    defer {
+        for (qkvz_parts.items) |p| _ = mlx.mlx_array_free(p);
+        qkvz_parts.deinit(testing.allocator);
+    }
+    var ba_parts: std.ArrayList(Array) = .empty;
+    defer {
+        for (ba_parts.items) |p| _ = mlx.mlx_array_free(p);
+        ba_parts.deinit(testing.allocator);
+    }
+    var g: c_int = 0;
+    while (g < hk) : (g += 1) {
+        try qkvz_parts.append(testing.allocator, try cols(la.qkv_w, g * dk, dk));
+        try qkvz_parts.append(testing.allocator, try cols(la.qkv_w, key_dim + g * dk, dk));
+        try qkvz_parts.append(testing.allocator, try cols(la.qkv_w, 2 * key_dim + g * vph * dv, vph * dv));
+        try qkvz_parts.append(testing.allocator, try cols(la.z_w, g * vph * dv, vph * dv));
+        try ba_parts.append(testing.allocator, try cols(la.b_w, g * vph, vph));
+        try ba_parts.append(testing.allocator, try cols(la.a_w, g * vph, vph));
+    }
+    const qkvz = try @import("../../mlx/array.zig").concatAxis1(mlx.gpuStream(), qkvz_parts.items);
+    defer _ = mlx.mlx_array_free(qkvz);
+    const ba = try @import("../../mlx/array.zig").concatAxis1(mlx.gpuStream(), ba_parts.items);
+    defer _ = mlx.mlx_array_free(ba);
+    var comb = la.*;
+    comb.combined_proj = true;
+    comb.qkv_w = qkvz;
+    comb.b_w = ba;
+    comb.z_w = .{ .ctx = null };
+    comb.a_w = .{ .ctx = null };
+
+    var e_sep = freshEntry();
+    defer freeEntry(&e_sep);
+    var e_comb = freshEntry();
+    defer freeEntry(&e_comb);
+    var prng = std.Random.DefaultPrng.init(0xC0B);
+    for ([_]c_int{ 5, 1, 3 }, [_]bool{ true, false, false }) |rows, prefill| {
+        var buf: [5 * 64]f32 = undefined;
+        for (buf[0..@intCast(rows * 64)]) |*v| v.* = prng.random().floatNorm(f32) * 0.5;
+        const xf = mlx.mlx_array_new_data(&buf, &[_]c_int{ 1, rows, 64 }, 3, .float32);
+        defer _ = mlx.mlx_array_free(xf);
+        var x = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x);
+        try mlx.check(mlx.mlx_astype(&x, xf, .bfloat16, mlx.gpuStream()));
+        const want = try t.xfm.gatedDeltaNet(x, la, &e_sep, 0, 1, rows, prefill);
+        defer _ = mlx.mlx_array_free(want);
+        const got = try t.xfm.gatedDeltaNet(x, &comb, &e_comb, 0, 1, rows, prefill);
+        defer _ = mlx.mlx_array_free(got);
+        try testing.expect(try relErr(got, want) < 1e-2);
+        try testing.expect(try relErr(e_comb.ssm_state, e_sep.ssm_state) < 1e-2);
+    }
+}

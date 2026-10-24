@@ -77,7 +77,7 @@ const Pack = struct {
 
 /// One layer under `L` (`{d}` = `li`): GDN or QSA attention, its two hyper-connection blocks, the routed + shared
 /// MoE, and the PLE on the layer that carries it.
-fn writeLayer(p: *Pack, comptime L: []const u8, li: usize, full: bool, with_ple: bool) !void {
+fn writeLayer(p: *Pack, comptime L: []const u8, li: usize, full: bool, with_ple: bool, opts: Opts) !void {
     try p.hcBlock(L ++ ".attn_hyper_connection", .{li}, true);
     try p.hcBlock(L ++ ".mlp_hyper_connection", .{li}, true);
     if (!full) {
@@ -110,6 +110,8 @@ fn writeLayer(p: *Pack, comptime L: []const u8, li: usize, full: bool, with_ple:
     try p.proj(L ++ ".mlp.switch_mlp.gate_proj", .{li}, &.{experts}, inter, hidden, 0.1);
     try p.proj(L ++ ".mlp.switch_mlp.up_proj", .{li}, &.{experts}, inter, hidden, 0.1);
     try p.proj(L ++ ".mlp.switch_mlp.down_proj", .{li}, &.{experts}, hidden, inter, 0.1);
+    if (opts.expert_scale) |v| try p.t.fill(L ++ ".mlp.switch_mlp.expert_scale", .{li}, &.{experts}, .BF16, v);
+    if (opts.gate_expert_scale) |v| try p.t.fill(L ++ ".mlp.switch_mlp.gate_proj.expert_scale", .{li}, &.{experts}, .BF16, v);
     if (with_ple) {
         try p.t.rand(L ++ ".ple.conv1d.weight", .{li}, &.{ hc * hidden, 4, 1 }, .BF16, 0.3);
         try p.proj(L ++ ".ple.key_proj", .{li}, &.{}, hc * hidden, ple_dim, 0.1);
@@ -130,6 +132,10 @@ pub const Opts = struct {
     sign_head: bool = false,
     /// A Qwen3-VL pack's text side: image/video ids and an interleaved M-RoPE spectrum (no tower weights).
     vision: bool = false,
+    /// Every expert's routing scale (`mlp.switch_mlp.expert_scale`, ModelOpt's up x down `weight_scale_2`).
+    expert_scale: ?f32 = null,
+    /// Every expert's gate-projection scale (`mlp.switch_mlp.gate_proj.expert_scale`, applied before the SiLU).
+    gate_expert_scale: ?f32 = null,
 };
 
 /// The image placeholder of a `vision` pack.
@@ -143,17 +149,16 @@ pub fn filesWith(a: std.mem.Allocator, seed: u64, precision: Precision, opts: Op
         @memset(head[5 * hidden ..][0..hidden], 0.05);
         @memset(head[6 * hidden ..][0..hidden], -0.05);
         try p.t.values("language_model.lm_head.weight", .{}, &.{ vocab, hidden }, .BF16, &head);
-    } else
-        try p.proj("language_model.lm_head", .{}, &.{}, vocab, hidden, 0.1);
+    } else try p.proj("language_model.lm_head", .{}, &.{}, vocab, hidden, 0.1);
     try p.hcBlock("language_model.model.hyper_connection_mixer", .{}, false);
-    for (0..layers) |li| try writeLayer(&p, "language_model.model.layers.{d}", li, li % 2 == 1, li == 2);
+    for (0..layers) |li| try writeLayer(&p, "language_model.model.layers.{d}", li, li % 2 == 1, li == 2, opts);
     const M = "language_model.mtp";
     try p.proj(M ++ ".fc_embedding", .{}, &.{}, hidden, hidden, 0.1);
     try p.proj(M ++ ".fc_hidden", .{}, &.{}, hidden, hidden, 0.1);
     try p.t.fill(M ++ ".pre_fc_norm_embedding.weight", .{}, &.{hidden}, .BF16, 1.0);
     try p.t.fill(M ++ ".pre_fc_norm_hidden.weight", .{}, &.{hc * hidden}, .BF16, 1.0);
     try p.hcBlock(M ++ ".hyper_connection_mixer", .{}, false);
-    try writeLayer(&p, M ++ ".layers.{d}", 0, true, false);
+    try writeLayer(&p, M ++ ".layers.{d}", 0, true, false, opts);
     var cfg: []const u8 = config_json;
     if (opts.vision) {
         const rope = try std.mem.replaceOwned(u8, a, cfg, "\"partial_rotary_factor\":0.25}", "\"partial_rotary_factor\":0.25,\"mrope_section\":[2,1,1],\"mrope_interleaved\":true}");

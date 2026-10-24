@@ -36,6 +36,8 @@ pub const Trunk = struct {
     lm_head_w: mlx.mlx_array,
     lm_head_s: mlx.mlx_array,
     lm_head_b: mlx.mlx_array,
+    /// A ternary 2-bit pack: its projections read the 2-bit kernels (`trunk/linear.zig` `qmatmul`).
+    ternary_2bit: bool = false,
     moe_layers: []MoeLayerWeights,
     /// Arrays the loader built (transposed bf16, folded hyper-connection weights): freed with the trunk.
     moe_owned_bf16: []mlx.mlx_array = &.{},

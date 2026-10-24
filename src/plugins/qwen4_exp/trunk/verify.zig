@@ -197,6 +197,7 @@ pub const GdnVerifyInputs = struct {
 };
 
 pub fn gdnVerifyRows(self: *Trunk, inputs: []const mlx.mlx_array, entries: []const *SSMCacheEntry, generations: []const u64, layer: usize, la: *const LinearAttnWeights) !?[]mlx.mlx_array {
+    if (la.combined_proj) return null;
     return self.verifyRowsJoined(.gdn, inputs, entries, &.{}, generations, layer, la);
 }
 

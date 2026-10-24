@@ -22,6 +22,8 @@ const BitsCache = @import("../../../sdk/quant/params.zig").BitsCache;
 const QuantParams = @import("../../../sdk/quant/params.zig").QuantParams;
 const computeQuantParams = @import("../../../sdk/quant/params.zig").computeQuantParams;
 const qmatmulBits = @import("../../../sdk/blocks/linear/qmatmul.zig").qmatmulBits;
+const qmv2 = @import("../../../sdk/blocks/qmm/qmv2.zig");
+const qmv_nax2 = @import("../../../sdk/blocks/qmm/qmv_nax2.zig");
 const msvQmvRows = @import("../../../sdk/blocks/linear/qmv_rows.zig").msvQmvRows;
 const FUSED_ROWS_MAX_M = @import("../../../sdk/blocks/linear/fused_rows.zig").FUSED_ROWS_MAX_M;
 const AttnDqCopy = decode_attn_quant.AttnDqCopy;
@@ -32,6 +34,11 @@ const spliceVisionRows = @import("../../../sdk/vision/splice.zig").spliceVisionR
 pub inline fn qmatmul(self: *const Trunk, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array) !mlx.mlx_array {
     if (sushi_pack.isRowScaledFp8(w, sc)) return sushi_pack.fp8Linear(x, w, sc, self.s);
     const qp = self.quantParamsHinted(w, sc, lastDim(x));
+    // A ternary 2-bit pack (bias == -scale on every weight) reads the 2-bit kernels; they decline other shapes.
+    if (self.ternary_2bit) {
+        if (try qmv_nax2.qmm(x, w, sc, bi, qp.bits, qp.group_size, self.s)) |y| return y;
+        if (try qmv2.qmm(x, w, sc, bi, qp.bits, qp.group_size, true, false, self.s)) |y| return y;
+    }
     return qmatmulBits(x, w, sc, bi, qp.bits, qp.group_size, qp.mode, self.s);
 }
 
@@ -285,4 +292,72 @@ pub fn lmHeadForeign(self: *const Trunk, x: mlx.mlx_array) !mlx.mlx_array {
     defer _ = mlx.mlx_array_free(xc);
     try mlx.check(mlx.mlx_astype(&xc, x, self.actDtype(), self.s));
     return self.lmHeadProject(xc);
+}
+test "trunk qmatmul: a ternary 2-bit pack routes through qmv2; without the flag it stays stock" {
+    const transformer = @import("../../../engines/mlx/transformer.zig");
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const n: c_int = 2048;
+    const k: c_int = 512;
+    var prng = std.Random.DefaultPrng.init(11);
+    const rnd = prng.random();
+    const codes = try std.testing.allocator.alloc(u32, @divExact(2048 * 512, 16));
+    defer std.testing.allocator.free(codes);
+    for (codes) |*wd| wd.* = rnd.int(u32);
+    const scv = try std.testing.allocator.alloc(f32, @divExact(2048 * 512, 128));
+    defer std.testing.allocator.free(scv);
+    for (scv) |*e| e.* = 0.01 + 0.01 * rnd.float(f32);
+    var xv: [2 * 512]f32 = undefined;
+    for (&xv) |*e| e.* = rnd.floatNorm(f32);
+    const w = mlx.mlx_array_new_data(codes.ptr, &[_]c_int{ n, @divExact(k, 16) }, 2, .uint32);
+    defer _ = mlx.mlx_array_free(w);
+    const sc32 = mlx.mlx_array_new_data(scv.ptr, &[_]c_int{ n, @divExact(k, 128) }, 2, .float32);
+    defer _ = mlx.mlx_array_free(sc32);
+    var sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc);
+    try mlx.check(mlx.mlx_astype(&sc, sc32, .bfloat16, s));
+    // bias = +scale: the ternary kernel never reads biases, so it disagrees with stock by construction.
+    var bi = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(bi);
+    try mlx.check(mlx.mlx_copy(&bi, sc, s));
+    const x32 = mlx.mlx_array_new_data(&xv, &[_]c_int{ 1, 2, k }, 3, .float32);
+    defer _ = mlx.mlx_array_free(x32);
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
+
+    transformer.device_gen_override = .{ .gen = 13, .phone = false };
+    defer transformer.device_gen_override = null;
+    var xfm: Trunk = undefined;
+    xfm.s = s;
+    xfm.bits_cache = .{};
+    xfm.config = std.mem.zeroes(@TypeOf(xfm.config));
+    xfm.config.quant_mode = .affine;
+    xfm.config.quant_bits = 2;
+    xfm.config.quant_group_size = 128;
+
+    const kernel = (try qmv2.qmm(x, w, sc, bi, 2, 128, true, false, s)).?;
+    defer _ = mlx.mlx_array_free(kernel);
+    const stock = try qmatmulBits(x, w, sc, bi, 2, 128, .affine, s);
+    defer _ = mlx.mlx_array_free(stock);
+    {
+        // The two paths must be tellable apart, or the routing check below is vacuous.
+        var eq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(eq);
+        try mlx.check(mlx.mlx_array_equal(&eq, kernel, stock, false, s));
+        var same = true;
+        try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+        try std.testing.expect(!same);
+    }
+    for ([_]bool{ true, false }) |flag| {
+        xfm.ternary_2bit = flag;
+        const got = try xfm.qmatmul(x, w, sc, bi);
+        defer _ = mlx.mlx_array_free(got);
+        var eq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(eq);
+        try mlx.check(mlx.mlx_array_equal(&eq, got, if (flag) kernel else stock, false, s));
+        var same = false;
+        try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+        try std.testing.expect(same);
+    }
 }
