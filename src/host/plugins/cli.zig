@@ -348,7 +348,9 @@ pub fn install(io: std.Io, a: Allocator, src: []const u8, dir: []const u8, confi
     try plugins.rename(tmp_name, plugins, try std.fmt.allocPrint(a, "{s}.dylib", .{p.name()}), io);
     var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
     const source = if (std.Io.Dir.cwd().realPathFile(io, src, &abs_buf)) |n| abs_buf[0..n] else |_| src;
-    const receipt: loader.Receipt = .{ .name = p.name(), .kind = @tagName(p.manifest.kind), .version = p.version(), .sha256 = try a.dupe(u8, &hash), .signature = signature, .source = try a.dupe(u8, source) };
+    const types = try a.alloc([]const u8, p.manifest.claims.len);
+    for (p.manifest.claims.slice(), types) |c, *t| t.* = c.slice();
+    const receipt: loader.Receipt = .{ .name = p.name(), .kind = @tagName(p.manifest.kind), .version = p.version(), .sha256 = try a.dupe(u8, &hash), .signature = signature, .source = try a.dupe(u8, source), .model_types = types };
     try plugins.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}.json", .{p.name()}), .data = try std.json.Stringify.valueAlloc(a, receipt, .{}) });
     return .{ .ok = receipt };
 }

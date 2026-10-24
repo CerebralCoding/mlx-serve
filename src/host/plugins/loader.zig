@@ -45,6 +45,8 @@ pub const Receipt = struct {
     /// Who signed the file, as `codesign` reports it (`signatureOf`).
     signature: []const u8 = "",
     source: []const u8 = "",
+    /// The `model_type`s it declares: the app lists their packs as the plugin's.
+    model_types: []const []const u8 = &.{},
 };
 
 /// The signer of a code-signed file from `codesign -dvv`'s report: its first `Authority=` (with the team), "ad-hoc", or

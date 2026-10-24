@@ -74,6 +74,7 @@ test "kit examples: built from the kit, installed with receipts, loaded, negotia
     // The receipt Settings lists: the plugin's own version and the file's signer beside its hash.
     for (inst.receipts, inst.set.plugins.items) |r, p| {
         try testing.expectEqualStrings("0.1.0", r.version);
+        if (p.manifest.kind != .quant) try testing.expectEqualStrings(p.name(), r.model_types[0]);
         try testing.expectEqualStrings(&p.sha256, r.sha256);
         try testing.expect(r.signature.len > 0);
     }
