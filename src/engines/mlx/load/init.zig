@@ -24,7 +24,6 @@ const checkQsaCompressRatio = @import("../../../plugins/qwen4_exp/qsa/history.zi
 const ssmFreeQsaState = @import("../../../plugins/qwen4_exp/qsa/history.zig").ssmFreeQsaState;
 const qsaScoreFusedArm = @import("../../../plugins/qwen4_exp/qsa/score.zig").qsaScoreFusedArm;
 const HcWeights = @import("../../../plugins/qwen4_exp/weights.zig").HcWeights;
-const attnProjRouted = @import("../../../sdk/blocks/attention/decode_attn_quant.zig").attnProjRouted;
 const weightsHaveDenseAttnProj = @import("../../../sdk/blocks/attention/decode_attn_quant.zig").weightsHaveDenseAttnProj;
 const DenseMlpWeights = @import("../../../sdk/blocks/mlp/dense.zig").DenseMlpWeights;
 const computeLlama3Freqs = @import("../../../sdk/blocks/rope/rope.zig").computeLlama3Freqs;
@@ -744,4 +743,16 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
         .mtp_uniform_affine_trunk = mtp_uniform_affine_trunk,
         .mtp_oqe_affine_trunk = mtp_oqe_affine_trunk,
     };
+}
+
+/// `attnProj` is reached only from the MoE/qwen4 forward, and not by its MLA or Gemma 4 arms.
+fn attnProjRouted(config: *const ModelConfig, moe_forward: bool) bool {
+    return moe_forward and !config.isMla() and !config.isGemma4Layers();
+}
+
+test "attnProj is routed on a MoE forward that is neither MLA nor Gemma 4" {
+    try std.testing.expect(attnProjRouted(&.{ .model_type = "laguna" }, true));
+    try std.testing.expect(!attnProjRouted(&.{ .model_type = "llama" }, false));
+    try std.testing.expect(!attnProjRouted(&.{ .model_type = "gemma4" }, true));
+    try std.testing.expect(!attnProjRouted(&.{ .model_type = "bailing_hybrid", .mla_kv_lora_rank = 512 }, true));
 }

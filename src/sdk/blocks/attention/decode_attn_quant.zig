@@ -4,10 +4,8 @@
 const std = @import("std");
 const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
-const ModelConfig = @import("../../../engines/mlx/model.zig").ModelConfig;
 const QuantMode = @import("../../quant/params.zig").QuantMode;
 const Weights = @import("../../weights/resident.zig").Weights;
-const transformer = @import("../../../engines/mlx/transformer.zig");
 const attn256MaxDiff = @import("attn256.zig").attn256MaxDiff;
 const attn256RandBf16 = @import("attn256.zig").attn256RandBf16;
 
@@ -57,6 +55,17 @@ pub var attn_dq_nvfp4_engaged: bool = false;
 /// `ServerOptions` default.
 pub const DECODE_ATTN_QUANT_DEFAULT = true;
 
+/// Process-wide under `-Dunits` (sdk/util/shared.zig): one copy in the host.
+const CliState = struct {
+    /// Set by the CLI (`--decode-attn-quant` / `--no-decode-attn-quant`) before any load, so every serve path
+    /// (headless included) sees one value.
+    decode_attn_quant_flag: ?bool = null,
+};
+const cli_shared = @import("../../util/shared.zig").Shared(CliState, "decode_attn_quant_cli", .{});
+pub inline fn cli() *CliState {
+    return cli_shared.get();
+}
+
 /// Whether the user EXPLICITLY asked for --decode-attn-quant (CLI flag, app
 /// toggle) as opposed to riding the silent default. Archs whose
 /// characterization showed ANSWER MOVEMENT under the requant gate on this
@@ -64,7 +73,7 @@ pub const DECODE_ATTN_QUANT_DEFAULT = true;
 /// 2026-08-01); laguna's clean characterization keeps the plain default.
 pub fn decodeAttnQuantExplicit() bool {
     if (decode_attn_quant_override) |v| return v; // test seam counts as explicit
-    return transformer.cli().decode_attn_quant_flag orelse false;
+    return cli().decode_attn_quant_flag orelse false;
 }
 
 /// LOSSY opt-in (`MLX_SERVE_DECODE_ATTN_QUANT_REQUANT=1`): 8-bit affine
@@ -76,12 +85,7 @@ pub fn attnDqRequantEnabled() bool {
 
 pub fn decodeAttnQuantEnabled() bool {
     if (decode_attn_quant_override) |v| return v;
-    return transformer.cli().decode_attn_quant_flag orelse DECODE_ATTN_QUANT_DEFAULT;
-}
-
-/// `attnProj` is reached only from the MoE/qwen4 forward, and not by its MLA or Gemma 4 arms.
-pub fn attnProjRouted(config: *const ModelConfig, moe_forward: bool) bool {
-    return moe_forward and !config.isMla() and !config.isGemma4Layers();
+    return cli().decode_attn_quant_flag orelse DECODE_ATTN_QUANT_DEFAULT;
 }
 
 /// Whether `--decode-attn-quant` has anything to requantize: a text-trunk attention
@@ -311,11 +315,6 @@ test "weightsHaveDenseAttnProj: decode-attn-quant applies only to a dense text a
     defer dense.deinit();
     try put(&dense, "model.layers.3.self_attn.o_proj.weight", .bfloat16, s);
     try std.testing.expect(weightsHaveDenseAttnProj(&dense));
-
-    try std.testing.expect(attnProjRouted(&.{ .model_type = "laguna" }, true));
-    try std.testing.expect(!attnProjRouted(&.{ .model_type = "llama" }, false));
-    try std.testing.expect(!attnProjRouted(&.{ .model_type = "gemma4" }, true));
-    try std.testing.expect(!attnProjRouted(&.{ .model_type = "bailing_hybrid", .mla_kv_lora_rank = 512 }, true));
 
     var inkling = Weights.init(allocator);
     defer inkling.deinit();

@@ -943,9 +943,9 @@ pub fn main(init: std.process.Init) !void {
             // DSpark support GGUF sits beside a served .gguf model.
             ds4_dspark = true;
         } else if (std.mem.eql(u8, args[i], "--decode-attn-quant")) {
-            transformer_mod.cli().decode_attn_quant_flag = true;
+            @import("sdk/blocks/attention/decode_attn_quant.zig").cli().decode_attn_quant_flag = true;
         } else if (std.mem.eql(u8, args[i], "--no-decode-attn-quant")) {
-            transformer_mod.cli().decode_attn_quant_flag = false;
+            @import("sdk/blocks/attention/decode_attn_quant.zig").cli().decode_attn_quant_flag = false;
         } else if (std.mem.eql(u8, args[i], "--mtp-min-depth") or std.mem.eql(u8, args[i], "--mtp-max-depth") or std.mem.eql(u8, args[i], "--mtp-depth")) {
             const is_min = std.mem.eql(u8, args[i], "--mtp-min-depth");
             const deprecated = std.mem.eql(u8, args[i], "--mtp-depth");

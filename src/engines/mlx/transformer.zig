@@ -443,10 +443,6 @@ pub var qsa_verify_gather_min_kv_override: ?c_int = null;
 
 /// Process-wide under `-Dunits` (sdk/util/shared.zig): one copy in the host.
 const CliState = struct {
-    /// Set by the CLI (`--decode-attn-quant` / `--no-decode-attn-quant`) before
-    /// any load; a transformer-level global so every serve path (headless
-    /// included — the runHeadlessServe flag-eater class) sees one value.
-    decode_attn_quant_flag: ?bool = null,
     /// `--lm-head-mxfp8` / `--no-lm-head-mxfp8`; null = the default below.
     lm_head_mxfp8_cli: ?bool = null,
     deferred_ple_group_syncs: u64 = 0,
