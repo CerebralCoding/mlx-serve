@@ -1,85 +1,35 @@
-//! The loaded model both KDA-hybrid plugins run their forwards on: the engine's layered `Transformer` built from the
-//! pack's tensors as the legacy load builds it (prefix probe, layered weights, the compiled MoE router and GDN gate),
-//! owning the map. Its shared helpers (projections, KDA, MoE, embedding, head) are what the
-//! table forwards call; per-request state lives in the slots' caches, never here.
+//! The table glue both KDA-hybrid plugins share: load and unload of the trunk (`trunk.zig`), the trunk weights a
+//! drafter reads, a forward's token ids, one slot's rows through a table forward module and its head into
+//! `ForwardOut`. Per-request state lives in the slots' caches, never here.
 
 const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
 const mlx = @import("../../mlx/ffi.zig");
-const model = @import("../../engines/mlx/model.zig");
-const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
-const intree = @import("../../engines/mlx/plugin/intree.zig");
 const quant_abi = @import("../../abi/quant.zig");
 const Layout = @import("../../sdk/quant/native.zig").Layout;
-const config = @import("config.zig");
-const glm_mtp = @import("mtp.zig");
-const toModelConfig = @import("model_config.zig").toModelConfig;
-const glm_moe = @import("moe.zig");
+const trunk = @import("trunk.zig");
 
 const gpa = std.heap.c_allocator;
+const Array = mlx.mlx_array;
 
-pub const Model = struct {
-    weights: model.Weights,
-    xfm: Transformer,
-    caps: abi.Caps,
-    /// Every layer's MoE as the shared block reads it, borrowed from `xfm`.
-    moe: glm_moe.Table = .{ .layers = &.{} },
-    /// The MTP head (GLM's `mtp.0`), once `HeadHooks.load` found one.
-    head: ?*glm_mtp.Head = null,
-    /// The head's MoE as the shared block reads it.
-    head_moe: ?glm_moe.MoeWeights = null,
-};
-
-/// The map the driver already loaded, adopted; else the pack read from disk.
-fn weightsFor(ctx: *const abi.LoadCtx, cfg: *model.ModelConfig) !model.Weights {
-    if (intree.takeWeights(ctx)) |w| return w;
-    return model.loadModelWeights(std.Io.Threaded.global_single_threaded.io(), gpa, ctx.model_dir.slice(), cfg, false);
-}
-
-fn build(ctx: *const abi.LoadCtx) !*Model {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const m = try gpa.create(Model);
-    errdefer gpa.destroy(m);
-    m.head = null;
-    var cfg = try toModelConfig(config.of(ctx.parsed));
-    m.weights = try weightsFor(ctx, &cfg);
-    errdefer m.weights.deinit();
-    model.resolveWeightPrefix(&cfg, &m.weights);
-    try model.narrowHadamardPackTables(&cfg, &m.weights, mlx.gpuStream());
-    m.xfm = try Transformer.init(io, gpa, cfg, &m.weights);
-    errdefer m.xfm.deinit();
-    if (!mlx.noGpuBackend()) {
-        if (m.xfm.moe_layers != null) m.xfm.compileMoeRouting();
-        if (cfg.linear_num_key_heads > 0) m.xfm.compileGdnGate();
-    }
-    m.moe = try glm_moe.build(gpa, &m.xfm);
-    m.caps = ctx.parsed.caps;
-    return m;
-}
+pub const Model = trunk.Model;
 
 pub fn load(comptime name: []const u8, ctx: *const abi.LoadCtx, out: *abi.Verdict) ?*anyopaque {
-    return build(ctx) catch |e| {
+    return trunk.load(ctx) catch |e| {
         out.* = switch (e) {
             error.OutOfMemory => abi.Verdict.refuse(.failed, name ++ ": out of memory"),
             // The driver maps this name to the engine's own refusal.
             error.MissingWeight => abi.Verdict.refuse(.failed, "MissingWeight"),
             error.UnsupportedWeightSource => abi.Verdict.refuse(.unsupported, name ++ ": a weight source other than the resident map"),
-            else => abi.Verdict.refuse(.failed, name ++ ": the pack does not load"),
+            else => abi.Verdict.named(.failed, @errorName(e)),
         };
         return null;
     };
 }
 
 pub fn unload(mp: *anyopaque) callconv(.c) void {
-    const m: *Model = @ptrCast(@alignCast(mp));
-    if (m.head_moe) |*w| glm_moe.free(w);
-    if (m.head) |h| {
-        h.deinit();
-        gpa.destroy(h);
-    }
-    m.moe.deinit(gpa);
-    m.xfm.deinit();
-    m.weights.deinit();
+    const m = of(mp);
+    m.deinit();
     gpa.destroy(m);
 }
 
@@ -89,18 +39,17 @@ pub fn of(mp: *anyopaque) *Model {
 
 /// `SpecHooks.trunk_weight`: the loaded embedding table or head, borrowed (a tied head is the table).
 pub fn trunkWeight(mp: *anyopaque, which: abi.TrunkWeight, out: *quant_abi.Weight) callconv(.c) abi.Verdict {
-    const x = &of(mp).xfm;
-    const w, const sc, const b = switch (which) {
-        .embed => .{ x.emb_w, x.emb_s, x.emb_b },
-        .head => .{ x.lm_head_w, x.lm_head_s, x.lm_head_b },
+    const m = of(mp);
+    const l = switch (which) {
+        .embed => &m.embed,
+        .head => &m.head,
     };
-    if (w.ctx == null) return abi.Verdict.refuse(.unsupported, "the trunk has no such weight");
-    out.* = .{ .w = .{ .ctx = w.ctx }, .scales = .{ .ctx = sc.ctx }, .biases = .{ .ctx = b.ctx } };
-    if (sc.ctx == null) return .ok;
-    const qp = x.quantParamsFor(w, sc);
-    out.bits = @intCast(qp.bits);
-    out.group_size = qp.group_size;
-    out.layout = @backingInt(switch (qp.mode) {
+    if (l.w.ctx == null) return abi.Verdict.refuse(.unsupported, "the trunk has no such weight");
+    out.* = .{ .w = .{ .ctx = l.w.ctx }, .scales = .{ .ctx = l.s.ctx }, .biases = .{ .ctx = l.b.ctx } };
+    if (l.s.ctx == null) return .ok;
+    out.bits = @intCast(l.bits);
+    out.group_size = l.group_size;
+    out.layout = @backingInt(switch (l.mode) {
         .nvfp4 => Layout.nvfp4,
         .mxfp4 => Layout.mxfp4,
         .mxfp8 => Layout.mxfp8,
@@ -127,8 +76,6 @@ pub fn hostIds(tokens: []const u32) !Array {
     return mlx.mlx_array_new_data(buf.ptr, &[_]c_int{ 1, @intCast(tokens.len) }, 2, .int32);
 }
 
-const Array = mlx.mlx_array;
-
 /// Fills `out` from the final-normed hidden `[1, S, H]` (consumed): the hidden when asked, and the logits the
 /// forward wants (`[S, V]` or the last row `[1, V]`).
 pub fn finish(m: *Model, f: *const abi.Forward, hidden: Array, out: *abi.ForwardOut) !void {
@@ -139,8 +86,8 @@ pub fn finish(m: *Model, f: *const abi.Forward, hidden: Array, out: *abi.Forward
         out.hidden = .{ .ctx = h.ctx };
     }
     if (f.logits == .none) return;
-    const s = m.xfm.s;
-    const logits = try m.xfm.lmHeadProject(hidden);
+    const s = m.s;
+    const logits = try m.lmHead(hidden);
     defer _ = mlx.mlx_array_free(logits);
     const sh = mlx.getShape(logits);
     var rows = mlx.mlx_array_new();
@@ -192,7 +139,6 @@ fn one(comptime fwd: type, m: *Model, ops: *const abi.CacheOps, f: *const abi.Fo
     };
     var st: fwd.Step = .{
         .slots = .{ .ops = ops, .caches = f.caches.slice(), .positions = f.positions.slice() },
-        .moe = m.moe.layers,
         // A verify's rows capture their recurrent states for a partial accept's rollback.
         .capture = f.mode == .verify,
         .capture_ids = f.capture_layers.slice(),
@@ -203,7 +149,7 @@ fn one(comptime fwd: type, m: *Model, ops: *const abi.CacheOps, f: *const abi.Fo
         st.media = .{ .ctx = f.media.ctx };
         st.media_offset = f.media_offset;
     }
-    try finish(m, f, try fwd.hidden(&m.xfm, &st, ids), out);
+    try finish(m, f, try fwd.hidden(m, &st, ids), out);
     for (caps[0..n_cap], 0..) |c, i| {
         var r = mlx.mlx_array_new();
         _ = mlx.mlx_array_set(&r, c);

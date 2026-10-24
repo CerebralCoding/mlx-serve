@@ -1,6 +1,6 @@
 //! GLM-5.3-Flash (`glm5_next`): KDA linear attention and DeepSeek sparse attention inside DeepSeek-V4's 4-stream
-//! Sinkhorn hyper-connections, a 288-expert sigmoid MoE. Its own forward (`table_forward.zig`) over the layered
-//! weights (`host.zig`); batched rows advance each slot's state by its own call.
+//! Sinkhorn hyper-connections, a 288-expert sigmoid MoE. Its own trunk (`trunk.zig`) and forward
+//! (`table_forward.zig`); batched rows advance each slot's state by its own call.
 
 const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
@@ -97,12 +97,11 @@ fn batched(m: *host.Model, ops: *const abi.CacheOps, f: *const abi.Forward, out:
         defer _ = mlx.mlx_array_free(ids);
         const st: fwd.Step = .{
             .slots = .{ .ops = ops, .caches = f.caches.slice()[start..end], .positions = f.positions.slice()[start..end] },
-            .moe = m.moe.layers,
             .batched = true,
         };
-        const hidden = try fwd.hidden(&m.xfm, &st, ids);
+        const hidden = try fwd.hidden(m, &st, ids);
         defer _ = mlx.mlx_array_free(hidden);
-        const logits = try m.xfm.lmHeadProject(hidden);
+        const logits = try m.lmHead(hidden);
         defer _ = mlx.mlx_array_free(logits);
         parts[made] = .{ mlx.mlx_array_new(), mlx.mlx_array_new() };
         made += 1;
@@ -116,7 +115,7 @@ fn batched(m: *host.Model, ops: *const abi.CacheOps, f: *const abi.Forward, out:
 /// `[1, R, W]` as `[R, W]`.
 fn rows2d(m: *host.Model, x: Array, dst: *Array) !void {
     const sh = mlx.getShape(x);
-    try mlx.check(mlx.mlx_reshape(dst, x, &[_]c_int{ sh[1], sh[2] }, 2, m.xfm.s));
+    try mlx.check(mlx.mlx_reshape(dst, x, &[_]c_int{ sh[1], sh[2] }, 2, m.s));
 }
 
 /// The groups' rows `which` (0 logits, 1 hidden) stacked in slot order, a new reference.
@@ -130,7 +129,7 @@ fn joinRows(m: *host.Model, parts: []const [2]Array, which: usize) !Array {
     const vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(vec);
     for (parts) |p| _ = mlx.mlx_vector_array_append_value(vec, p[which]);
-    try mlx.check(mlx.mlx_concatenate_axis(&all, vec, 0, m.xfm.s));
+    try mlx.check(mlx.mlx_concatenate_axis(&all, vec, 0, m.s));
     return all;
 }
 
