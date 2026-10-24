@@ -32,6 +32,7 @@ const transformer = @import("../../engines/mlx/transformer.zig");
 const decode_attn_quant = @import("../../sdk/blocks/attention/decode_attn_quant.zig");
 const params_mod = @import("../../sdk/quant/params.zig");
 const log = @import("../../sdk/util/log.zig");
+const clampedSwiGLU = @import("../../sdk/blocks/mlp/activations.zig").clampedSwiGLU;
 
 const ModelConfig = model.ModelConfig;
 const QuantParams = params_mod.QuantParams;
@@ -1816,36 +1817,16 @@ fn gatherQmmESorted(q: *const Q, xin: mlx.mlx_array, indices_: mlx.mlx_array, s:
     return out;
 }
 
-/// Clipped SwiGLU in f32 (reference computes it in float32), back to bf16.
+/// The SDK's clamped SwiGLU in f32 (the reference computes it in float32), back to bf16.
 fn clippedSwigluG(gate_in: mlx.mlx_array, up_in: mlx.mlx_array, limit: f32, s: mlx.mlx_stream) !mlx.mlx_array {
-    const lim = mlx.mlx_array_new_float(limit);
-    defer _ = mlx.mlx_array_free(lim);
-    const neg_lim = mlx.mlx_array_new_float(-limit);
-    defer _ = mlx.mlx_array_free(neg_lim);
     var gate32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(gate32);
     try mlx.check(mlx.mlx_astype(&gate32, gate_in, .float32, s));
     var up32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(up32);
     try mlx.check(mlx.mlx_astype(&up32, up_in, .float32, s));
-    var g_cl = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(g_cl);
-    try mlx.check(mlx.mlx_minimum(&g_cl, gate32, lim, s));
-    var u_lo = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(u_lo);
-    try mlx.check(mlx.mlx_maximum(&u_lo, up32, neg_lim, s));
-    var u_cl = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(u_cl);
-    try mlx.check(mlx.mlx_minimum(&u_cl, u_lo, lim, s));
-    var sig = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sig);
-    try mlx.check(mlx.mlx_sigmoid(&sig, g_cl, s));
-    var silu = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(silu);
-    try mlx.check(mlx.mlx_multiply(&silu, g_cl, sig, s));
-    var act32 = mlx.mlx_array_new();
+    const act32 = try clampedSwiGLU(s, gate32, up32, limit);
     defer _ = mlx.mlx_array_free(act32);
-    try mlx.check(mlx.mlx_multiply(&act32, silu, u_cl, s));
     var act = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_astype(&act, act32, .bfloat16, s));
     return act;
@@ -9149,4 +9130,33 @@ test "dsv4: comp_in decode requant rides --decode-attn-quant (DSV4_MINI)" {
             try testing.expectEqual(hits0, comp_in_q_hits); // dense arm never engages
         }
     }
+}
+
+test "dsv4 clippedSwigluG: the SDK clamped SwiGLU in f32 gives the bytes the plugin's own chain recorded" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 0x5A16));
+    var n = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(n);
+    try mlx.check(mlx.mlx_random_normal(&n, &[_]c_int{ 2, 64, 96 }, 3, .float32, 0.0, 12.0, key, s));
+    var gu = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(gu);
+    try mlx.check(mlx.mlx_astype(&gu, n, .bfloat16, s));
+    var g = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(g);
+    var u = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(u);
+    const idx0 = mlx.mlx_array_new_int(0);
+    defer _ = mlx.mlx_array_free(idx0);
+    const idx1 = mlx.mlx_array_new_int(1);
+    defer _ = mlx.mlx_array_free(idx1);
+    try mlx.check(mlx.mlx_take_axis(&g, gu, idx0, 0, s));
+    try mlx.check(mlx.mlx_take_axis(&u, gu, idx1, 0, s));
+    const got = try clippedSwigluG(g, u, 10.0, s);
+    defer _ = mlx.mlx_array_free(got);
+    try mlx.check(mlx.mlx_array_eval(got));
+    const gb = @as([*]const u8, @ptrCast(mlx.mlx_array_data_bfloat16(got).?))[0 .. 2 * 64 * 96];
+    try std.testing.expectEqual(@as(u64, 0xdb0cdacd4c0f33e9), std.hash.Wyhash.hash(0, gb));
 }

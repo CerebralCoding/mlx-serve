@@ -21,6 +21,7 @@ const gather_qmv = @import("../../sdk/blocks/moe/gather_qmv.zig");
 const params = @import("../../sdk/quant/params.zig");
 const gather_nax = @import("../../sdk/blocks/moe/gather_qmm_nax.zig");
 const log = @import("../../sdk/util/log.zig");
+const clampedSwiGLU = @import("../../sdk/blocks/mlp/activations.zig").clampedSwiGLU;
 const engram = @import("engram.zig");
 const glm5 = @import("../glm5_next/glm5_next.zig");
 const mxfp8_qmv = @import("../../sdk/blocks/qmm/mxfp8_qmv.zig");
@@ -2014,13 +2015,11 @@ fn hcExpand(sc: *Scope, x: A, y: A, sp: *const Split) !A {
     return sc.reshape(o, mlx.getShape(x));
 }
 
+/// The SDK's clamped SwiGLU in f32; a limit of 0 or below clamps nothing.
 fn clampedSwiglu(sc: *Scope, gate: A, up: A, limit: f32) !A {
-    var g = try sc.astype(gate, .float32);
-    var u_ = try sc.astype(up, .float32);
-    if (limit > 0) {
-        g = try sc.op2(mlx.mlx_minimum, g, try sc.f(limit));
-        u_ = try sc.clip(u_, -limit, limit);
-    }
+    const g = try sc.astype(gate, .float32);
+    const u_ = try sc.astype(up, .float32);
+    if (limit > 0) return sc.keep(try clampedSwiGLU(sc.s, g, u_, limit));
     return sc.mul(try sc.mul(g, try sc.sigmoid(g)), u_);
 }
 
@@ -6446,4 +6445,29 @@ test "dsv41 head: the 8-bit head is the default, MLX_SERVE_DSV41_HEAD8=0 keeps t
     try testing.expect(head8From(null));
     try testing.expect(head8From("1"));
     try testing.expect(!head8From("0"));
+}
+
+test "dsv41 clampedSwiglu: the SDK clamped SwiGLU in f32 gives the bytes the plugin's own chain recorded" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    var sc = Scope.init(std.testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 0x5A17));
+    var n = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(n);
+    try mlx.check(mlx.mlx_random_normal(&n, &[_]c_int{ 2, 64, 96 }, 3, .float32, 0.0, 12.0, key, sc.s));
+    const gu = try sc.astype(n, .bfloat16);
+    var g = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(g);
+    var u = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(u);
+    try mlx.check(mlx.mlx_take_axis(&g, gu, try sc.i(0), 0, sc.s));
+    try mlx.check(mlx.mlx_take_axis(&u, gu, try sc.i(1), 0, sc.s));
+    for ([_]f32{ 10, 0 }, [_]u64{ 0xbe27feb4140c40b5, 0x9944cdebb7f0adc7 }) |limit, want| {
+        const got = try sc.astype(try clampedSwiglu(&sc, g, u, limit), .bfloat16);
+        try mlx.check(mlx.mlx_array_eval(got));
+        const gb = @as([*]const u8, @ptrCast(mlx.mlx_array_data_bfloat16(got).?))[0 .. 2 * 64 * 96];
+        try std.testing.expectEqual(want, std.hash.Wyhash.hash(0, gb));
+    }
 }
