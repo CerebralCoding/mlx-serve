@@ -70,6 +70,7 @@ comptime {
     _ = @import("plugins/deepseek_v41/stream/dspark_loop.zig");
     _ = @import("sdk/weights/streamed/expert/bank.zig");
     _ = @import("sdk/weights/streamed/expert/io_test.zig");
+    _ = @import("sdk/weights/streamed/mlx_pack.zig");
     _ = @import("sdk/weights/streamed/expert/lookahead.zig");
     _ = @import("sdk/weights/streamed/expert/event_test.zig");
     _ = @import("sdk/weights/streamed/expert/admission.zig");
