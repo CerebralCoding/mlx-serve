@@ -7,6 +7,8 @@ const chat_mod = @import("../chat/chat.zig");
 const log = @import("../../sdk/util/log.zig");
 const responses_mod = @import("responses/model.zig");
 const tokenize_cache_mod = @import("../tokenizer/cache.zig");
+const engine_prompt = @import("../engines/prompt.zig");
+const Served = @import("../engines/served.zig").Served;
 const model_registry_mod = @import("../registry/registry.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;
 const LoadedModel = model_registry_mod.LoadedModel;
@@ -99,11 +101,10 @@ pub fn cachedFormatChat(
     // continuation without asking first gets that ugly failure rather than a
     // silently doubled assistant turn; the scan below is what stops it
     // shipping.
-    if (continue_final and lm.ds4_engine != null) return error.ContinuationUnsupported;
-    const ids = if (lm.ds4_engine) |engine|
-        try chat_mod.encodeChatViaDs4(allocator, engine, messages, tools_json, tool_choice_instruction, enable_thinking)
-    else if (lm.llama_engine) |engine|
-        try chat_mod.encodeChatViaLlama(allocator, engine, chat_config, messages, tools_json, tool_choice_instruction, enable_thinking, reasoning_effort, continue_final)
+    const engine: ?*const Served = if (lm.engine) |e| (if (e.caps().owns_tokenizer) e else null) else null;
+    if (continue_final and engine != null and engine.?.caps().owns_template) return error.ContinuationUnsupported;
+    const ids = if (engine) |e|
+        try engine_prompt.encodeChat(allocator, e, chat_config, messages, tools_json, tool_choice_instruction, enable_thinking, reasoning_effort, continue_final)
     else
         try chat_mod.formatChat(allocator, tok, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, reasoning_effort, continue_final);
     if (cache_ptr) |cache| if (key_opt) |key| {

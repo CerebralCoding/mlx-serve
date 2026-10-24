@@ -32,9 +32,7 @@ const rp_mod = @import("../chat/reasoning/protocol.zig");
 const model_discovery = @import("discovery.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
 const load_progress = @import("load_progress.zig");
-const arch_ds4 = if (@import("build_options").ds4_engine) @import("../../engines/ds4/bridge.zig") else @import("../../engines/ds4/stub.zig");
-const arch_llama = if (@import("build_options").llama_engine) @import("../../engines/llama/bridge.zig") else @import("../../engines/llama/stub.zig");
-const arch_ane = @import("../../engines/ane/lm.zig");
+const Served = @import("../engines/served.zig").Served;
 const gen_mod = @import("../media_jobs/gen.zig");
 const generate_mod = @import("../../engines/mlx/generate.zig");
 const log = @import("../../sdk/util/log.zig");
@@ -240,25 +238,9 @@ pub const LoadedModel = struct {
     /// the token-byte lock and retained until model teardown.
     reasoning_markers: std.ArrayList(*ReasoningMarker) = .empty,
 
-    /// Embedded ds4 engine (DeepSeek-V4-Flash via GGUF). When non-null,
-    /// `transformer` / `weights` / `tokenizer` / `chat_config` stay null and
-    /// the request handlers route through `Ds4Engine` / `Ds4Session` instead
-    /// of the MLX path. Mutually exclusive with the safetensors fields.
-    ds4_engine: ?*arch_ds4.Ds4Engine = null,
-    /// The ONE ds4 session per model (a 131k-context session is ~13 GB of
-    /// buffers, so one per request starved the box under concurrency). Created
-    /// on first prefill, driven by one slot at a time (`session_claims`), freed
-    /// with the engine.
-    ds4_session: ?*arch_ds4.Ds4Session = null,
-
-    /// Embedded llama.cpp engine (generic GGUF via libllama). Like `ds4_engine`,
-    /// when non-null the MLX fields stay null and request handlers route through
-    /// `LlamaEngine` / `llama_ctx`. Mutually exclusive with the safetensors
-    /// fields and `ds4_engine` (set for every `.gguf` except DeepSeek-V4-Flash).
-    llama_engine: ?*arch_llama.LlamaEngine = null,
-    /// An MLX pack served on the Neural Engine on its own threads (`arch/ane_lm.zig`): like the
-    /// embedded engines, the MLX fields stay null; the tokenizer and chat template are MLX-serve's.
-    ane: ?*arch_ane.Worker = null,
+    /// An engine beside MLX serving this model (ds4 or llama.cpp for a GGUF, the Neural Engine for an MLX pack;
+    /// `host/engines/`): the MLX fields stay null. A GGUF's tokenizer and template are the engine's.
+    engine: ?*Served = null,
     /// Whether src/sdk/quant/gguf would claim this (unloaded) entry; answered
     /// once, on the first `/v1/models` render.
     mlx_gguf_claim: ?bool = null,
@@ -274,14 +256,9 @@ pub const LoadedModel = struct {
     /// the in-flight state visible (set around the gen job).
     gen_busy: bool = false,
 
-    /// The llama.cpp context: one sequence per concurrent request, each
-    /// keeping its prompt KV for prefix reuse (`runPrefillLlama` picks by best
-    /// prefix match). Created at load, freed BEFORE `llama_engine` (it is bound
-    /// to the engine's model).
-    llama_ctx: ?*arch_llama.LlamaContext = null,
-    /// Requests holding a persistent engine session (a llama sequence or the
-    /// ds4 session), taken in `Scheduler.submit`, released in `complete`, both
-    /// under the scheduler's `queue_mu`. Bounded by `sessionCapacity`.
+    /// Requests holding one of the engine's sessions (ds4's one, a llama.cpp sequence, a Neural Engine slot), taken
+    /// in `Scheduler.submit`, released in `complete`, both under the scheduler's `queue_mu`. Bounded by
+    /// `sessionCapacity`.
     session_claims: u32 = 0,
 
     // ── Bookkeeping. Updated under `ModelRegistry.mutex`. ──
@@ -361,30 +338,39 @@ pub const LoadedModel = struct {
         return marker;
     }
 
-    /// Requests that may hold an engine session at once: one per llama
-    /// sequence, one per ANE slot, one for ds4; null for every other engine (no claim).
+    /// Requests the engine beside MLX runs at once (its sessions); null on MLX (no claim).
     pub fn sessionCapacity(self: *const LoadedModel) ?u32 {
-        if (self.llama_ctx) |ctx| return @intCast(ctx.seqs.len);
-        if (self.ane) |w| return @intCast(w.engines.len);
-        if (self.ds4_engine != null) return 1;
-        return null;
+        const e = self.engine orelse return null;
+        return e.info.max_concurrent;
     }
 
-    /// A drafter is loaded: the GPU's (Gemma assistant or DFlash), or the Neural Engine's
-    /// (its dir in `drafter_path`).
+    /// A drafter is loaded: the GPU's (Gemma assistant or DFlash), or the engine's (its dir in `drafter_path`).
     pub fn hasDrafter(self: *const LoadedModel) bool {
-        return self.drafter != null or self.dflash != null or (self.ane != null and self.drafter_path.len > 0);
+        return self.drafter != null or self.dflash != null or (self.engine != null and self.drafter_path.len > 0);
     }
 
     /// Served by an engine that is not MLX (no Transformer, no MLX memory).
     pub fn engineBacked(self: *const LoadedModel) bool {
-        return self.ds4_engine != null or self.llama_engine != null or self.ane != null;
+        return self.engine != null;
     }
 
-    fn closeAne(self: *LoadedModel) void {
-        const w = self.ane orelse return;
-        w.close();
-        self.ane = null;
+    /// Its engine renders its own chat prompt (ds4's template): a continuation has nowhere to go.
+    pub fn engineOwnsTemplate(self: *const LoadedModel) bool {
+        const e = self.engine orelse return false;
+        return e.caps().owns_template;
+    }
+
+    /// Served by a GGUF engine (ds4, llama.cpp): it reads its mmapped file and allocates outside MLX.
+    pub fn servesGguf(self: *const LoadedModel) bool {
+        const e = self.engine orelse return false;
+        return e.kind == .ds4 or e.kind == .llama;
+    }
+
+    fn closeEngine(self: *LoadedModel) void {
+        self.session_claims = 0;
+        const e = self.engine orelse return;
+        e.close();
+        self.engine = null;
     }
 
     /// Free all owned state. Safe to call regardless of `state` — null
@@ -395,24 +381,7 @@ pub const LoadedModel = struct {
     /// stream); the caller arranges this via `unloadResident` invoked
     /// from the inference thread before registry teardown.
     pub fn deinit(self: *LoadedModel) void {
-        if (self.llama_ctx) |ctx| {
-            ctx.free();
-            self.llama_ctx = null;
-        }
-        self.session_claims = 0;
-        if (self.ds4_session) |session| {
-            session.free();
-            self.ds4_session = null;
-        }
-        if (self.ds4_engine) |engine| {
-            engine.close();
-            self.ds4_engine = null;
-        }
-        if (self.llama_engine) |engine| {
-            engine.close();
-            self.llama_engine = null;
-        }
-        self.closeAne();
+        self.closeEngine();
         if (self.media_plugin) |e| {
             e.deinit();
             self.media_plugin = null;
@@ -558,24 +527,7 @@ pub const LoadedModel = struct {
     pub fn unloadResident(self: *LoadedModel) void {
         // A Thunderbolt pair's model unloads on both Macs; its next load plans again.
         if (distributed.serves(self.path)) distributed.release();
-        if (self.llama_ctx) |ctx| {
-            ctx.free();
-            self.llama_ctx = null;
-        }
-        self.session_claims = 0;
-        if (self.ds4_session) |session| {
-            session.free();
-            self.ds4_session = null;
-        }
-        if (self.ds4_engine) |engine| {
-            engine.close();
-            self.ds4_engine = null;
-        }
-        if (self.llama_engine) |engine| {
-            engine.close();
-            self.llama_engine = null;
-        }
-        self.closeAne();
+        self.closeEngine();
         if (self.media_plugin) |e| {
             e.deinit();
             self.media_plugin = null;
@@ -848,7 +800,6 @@ pub const ModelRegistry = struct {
             .drafter_path = "",
             .drafter_block_size = 0,
             .prefix_cache = null,
-            .ds4_engine = null,
             .refcount = std.atomic.Value(u32).init(0),
             .last_used_ns = 0,
             .last_used_ms = std.atomic.Value(i64).init(0),
@@ -1450,7 +1401,7 @@ pub const ModelRegistry = struct {
         while (it.next()) |entry_ptr| {
             const e = entry_ptr.*;
             if (e.state != .ready or e.refcount.load(.acquire) != 0 or std.mem.eql(u8, e.id, exclude_id)) continue;
-            if (e.ds4_engine != null or e.llama_engine != null or n_idle == idle.len) continue;
+            if (e.servesGguf() or n_idle == idle.len) continue;
             if (distributed.holds(e.path)) continue;
             idle[n_idle] = e;
             n_idle += 1;

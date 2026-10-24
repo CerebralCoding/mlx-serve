@@ -151,10 +151,9 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "ios", false);
     build_options.addOption(bool, "units", units);
     // True when the embedded engines (ds4, libllama) are actually linked:
-    // macOS (Metal) and Linux (CUDA) exe = yes; the iOS static lib = no, it
-    // gets compile-time stubs (src/arch/*_stub.zig, src/engines/ds4/ffi_stub.zig).
-    // The stub selection reads this option, NOT `ios` — `ios` keeps its own
-    // meaning (low-mem policy, sandboxing assumptions).
+    // macOS (Metal) and Linux (CUDA) exe = yes; the iOS static lib = no, and the
+    // host leaves their tables out (`src/host/engines/served.zig`). Read this
+    // option, NOT `ios` — `ios` keeps its own meaning (low-mem policy, sandboxing).
     build_options.addOption(bool, "ds4_engine", true);
     build_options.addOption(bool, "llama_engine", true);
     // DeepSeek-V4.1's EXL3 repack through mlx-stream (macOS only; Linux and iOS build the stub).

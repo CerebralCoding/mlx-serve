@@ -105,8 +105,9 @@ pub fn armThinkBound(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const
 /// tracked. `forced` is allocated; the caller frees it after generation.
 pub fn armToolForce(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32, forced_tool: ?chat_mod.ForcedTool) ?generate_mod.ToolForce {
     const ft = forced_tool orelse return null;
-    // Armed on the Neural Engine too, so `aneServes` refuses the request by name.
-    if (lm.transformer == null and lm.ane == null) return null;
+    // Armed wherever the host's tokenizer is the model's (the Neural Engine too), so an engine that cannot force
+    // a call refuses the request by name.
+    if (lm.transformer == null and (lm.engine == null or lm.engine.?.caps().owns_tokenizer)) return null;
     const cc = lm.chat_config orelse return null;
     const text = (chat_mod.forcedToolOpener(allocator, cc.chat_template, ft) catch return null) orelse return null;
     defer allocator.free(text);

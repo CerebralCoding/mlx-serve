@@ -256,7 +256,7 @@ fn takeBoundaryCandidate(sch: *Scheduler, outer: *Slot) ?*Slot {
             .exclusive = slotExclusiveDecode(s),
             .has_media = s.vision_embeddings != null or s.media.len > 0,
             .prompt_logprobs = s.prompt_logprobs,
-            .generator_path = s.model.transformer != null and s.model.ds4_engine == null and s.model.llama_engine == null,
+            .generator_path = s.model.transformer != null,
             .module_state = if (s.model.transformer) |xf| xf.config.isQwen4() else false,
             .tail = slotUncachedTail(s),
         };

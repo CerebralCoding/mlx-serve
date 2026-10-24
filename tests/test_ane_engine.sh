@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # test_ane_engine.sh — the Neural Engine engine over HTTP (src/engines/ane/lm.zig). `"ane": true` in a scratch
 # model-settings.json serves a dense qwen3_5 pack on the ANE (`[ane] ready`, meta.engine ane, 64K context): stream ==
-# non-stream bytes; logprobs, forced tool calls and images are 400s naming the Neural Engine; a ~15K-token prompt
+# non-stream bytes; logprobs are served; forced tool calls and images are 400s naming the Neural Engine; a ~15K-token prompt
 # finds its needle across `context 4096 -> 16384` and its repeat restores a checkpoint. Without the setting the pack
 # stays on the GPU; `--ane` on a pack the engine cannot run serves it on the GPU by name.
 #
 #   ./tests/test_ane_engine.sh [port]   # ANE_MODEL (Qwen3.5-0.8B), ANE_OTHER_MODEL (LFM2.5-2.6B)
 #
 # Keeps the real compile cache (MLX_SERVE_ANE_CACHE_DIR): only a Mac's first run compiles. SKIPs without the packs or
-# the private framework. Hermetic twins: the ane engine unit tests, `aneServes`; pack-gated:
+# the private framework. Hermetic twins: the ane engine unit tests, `requests.missingCap`; pack-gated:
 # `ANE_TEST_PACK=<pack> zig build test -Dtest-filter="pack on the ANE"`.
 
 set -uo pipefail
@@ -89,9 +89,9 @@ for line in sys.stdin:
 print(out)")"
 check "[2] stream == non-stream" "$([ "$ST" = "$NS" ] && echo 1 || echo 0)"
 
-echo "[3] what the engine cannot serve is refused by name"
+echo "[3] logprobs are served on the host's logits rows; what the engine cannot serve is refused by name"
 R="$(chat "$BODY,\"logprobs\":true,\"top_logprobs\":2}")"
-check "[3] logprobs -> 400 naming the Neural Engine" "$([ "$(code "$R")" = "400" ] && grep -q "Neural Engine" <<<"$R" && echo 1 || echo 0)"
+check "[3] logprobs -> 200 with top_logprobs" "$([ "$(code "$R")" = "200" ] && grep -q '"top_logprobs"' <<<"$R" && echo 1 || echo 0)"
 R="$(chat '{"messages":[{"role":"user","content":"Call it."}],"max_tokens":20,"tools":[{"type":"function","function":{"name":"ping","parameters":{"type":"object","properties":{}}}}],"tool_choice":"required"}')"
 check "[3] forced tool call -> 400 naming the Neural Engine" "$([ "$(code "$R")" = "400" ] && grep -q "Neural Engine" <<<"$R" && echo 1 || echo 0)"
 PNG="iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=="

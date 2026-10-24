@@ -1,8 +1,6 @@
-//! Which sequence a llama.cpp prompt claims, and how many drafts an MTP round takes: the scheduler arm and the
-//! engine adapter decide both here.
+//! Which sequence a llama.cpp prompt claims, and how many drafts an MTP round takes.
 
 const std = @import("std");
-const arch_llama = if (@import("build_options").llama_engine) @import("bridge.zig") else @import("stub.zig");
 
 /// Chat templates open every prompt with a fixed prologue (system header, BOS,
 /// role markers: Gemma 12 tokens, Qwen 8, Llama 4). A shared prefix this short
@@ -19,7 +17,7 @@ pub fn pickSeq(seqs: anytype, prompt: []const i32) ?usize {
     var lru: ?usize = null;
     for (seqs, 0..) |*seq, i| {
         if (seq.busy) continue;
-        const shared = arch_llama.commonPrefixLen(seq.resident.items, prompt);
+        const shared = std.mem.indexOfDiff(i32, seq.resident.items, prompt) orelse prompt.len;
         if (shared > best_shared) {
             best_shared = shared;
             best = i;
@@ -42,7 +40,7 @@ pub fn draftsThisTick(live: usize, mtp_drafts: u32, remaining: u32) u32 {
 
 // ── tests ──
 
-test "llamaDraftsThisTick: a solo slot drafts within its budget, company decodes plain" {
+test "draftsThisTick: a solo slot drafts within its budget, company decodes plain" {
     try std.testing.expectEqual(@as(u32, 2), draftsThisTick(1, 2, 100));
     try std.testing.expectEqual(@as(u32, 1), draftsThisTick(1, 2, 1));
     try std.testing.expectEqual(@as(u32, 0), draftsThisTick(2, 2, 100));
@@ -50,10 +48,10 @@ test "llamaDraftsThisTick: a solo slot drafts within its budget, company decodes
     try std.testing.expectEqual(@as(u32, max_drafts), draftsThisTick(1, 64, 100));
 }
 
-test "pickLlamaSeq: longest shared prefix past the prologue, else least recently used, never a busy one" {
+test "pickSeq: longest shared prefix past the prologue, else least recently used, never a busy one" {
     const gpa = std.testing.allocator;
-    var seqs: [3]arch_llama.LlamaSeq = undefined;
-    for (&seqs, 0..) |*q, i| q.* = .{ .ctx = undefined, .id = @intCast(i) };
+    const Seq = struct { resident: std.ArrayList(i32) = .empty, last_used_ns: i64 = 0, busy: bool = false };
+    var seqs: [3]Seq = .{ .{}, .{}, .{} };
     defer for (&seqs) |*q| q.resident.deinit(gpa);
     var prompt: [40]i32 = undefined;
     for (&prompt, 0..) |*t, i| t.* = @intCast(i);

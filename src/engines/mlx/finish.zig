@@ -145,12 +145,6 @@ pub fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // Emit the `[spec-stats]` summary (no-op for non-speculative slots).
     // The legacy generate() path logs this itself; scheduler-driven slots
     // finalize here instead.
-    if (slot.llama_mtp_rounds > 0) log.info("  [spec-stats] mode=llama-mtp attempts={d} accepts={d} drafted={d} per_draft_pct={d:.1}%\n", .{
-        slot.llama_mtp_rounds,
-        slot.llama_mtp_accepted,
-        slot.llama_mtp_drafted,
-        100.0 * @as(f64, @floatFromInt(slot.llama_mtp_accepted)) / @as(f64, @floatFromInt(@max(slot.llama_mtp_drafted, 1))),
-    });
     if (slot.legacy_gen) |*g| {
         g.logSpecStats();
         // `[qsa-arms]` rides the same seam: the SERVE path finalizes here, so

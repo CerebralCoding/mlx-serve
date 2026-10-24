@@ -11,9 +11,6 @@ const KVCache = transformer_mod.KVCache;
 const Generator = generate_mod.Generator;
 const testing = std.testing;
 
-const runDs4DecodeTick = @import("../ds4/adapter.zig").runDs4DecodeTick;
-const runLlamaGroups = @import("../llama/adapter.zig").runLlamaGroups;
-const runLlamaDecodeTick = @import("../llama/adapter.zig").runLlamaDecodeTick;
 const runBatchedDecodeTick = @import("batching/tick.zig").runBatchedDecodeTick;
 const MAX_BATCH_GROUP = @import("batching/verdict.zig").MAX_BATCH_GROUP;
 const noteSerial = @import("batching/verdict.zig").noteSerial;
@@ -99,14 +96,7 @@ pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     var batchable_n: usize = 0;
     var mtp_buf: [MAX_BATCH_GROUP]*Slot = undefined;
     var mtp_n: usize = 0;
-    var llama_buf: [MAX_BATCH_GROUP]*Slot = undefined;
-    var llama_n: usize = 0;
     for (active) |s| {
-        if (s.llama_seq != null and llama_n < llama_buf.len) {
-            llama_buf[llama_n] = s;
-            llama_n += 1;
-            continue;
-        }
         const why = sch.batchVerdict(s);
         if (why == .ok and batchable_n < batchable_buf.len) {
             batchable_buf[batchable_n] = s;
@@ -156,7 +146,6 @@ pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         }
     }
     try runMtpGroups(sch, mtp_buf[0..mtp_group_n]);
-    runLlamaGroups(sch, llama_buf[0..llama_n]);
     if (batchable_n == 0) {
         if (sch.metrics) |m| m.batched_group_size.set(0);
         return;
@@ -256,16 +245,6 @@ pub fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
 }
 
 fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
-    // ds4-backed slot: drive the engine's session forward by one token. No
-    // PLD / drafter / batched paths apply — ds4 has its own internal MTP
-    // (see TODO: wire `evalSpeculative` when temp=0 and engine.hasMtp()).
-    if (slot.ds4_session) |session| {
-        return runDs4DecodeTick(sch, slot, session);
-    }
-    if (slot.llama_seq != null) {
-        var one = [_]*Slot{slot};
-        return runLlamaDecodeTick(sch, &one);
-    }
     const gen = if (slot.legacy_gen) |*g| g else {
         slot.markError("no_generator");
         return;
@@ -406,8 +385,6 @@ test "single MTP slot reaches the round entry through runDecodeTick" {
     var slot: Slot = undefined;
     slot.allocator = testing.allocator;
     slot.model = &model;
-    slot.ds4_session = null;
-    slot.llama_seq = null;
     slot.legacy_gen = gen;
     slot.enable_mtp = true;
     slot.enable_drafter = false;

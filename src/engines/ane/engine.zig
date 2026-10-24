@@ -24,7 +24,7 @@ const io = book_mod.io;
 /// The table the host loads for the Neural Engine.
 pub const table = Adapter(lm, std.heap.smp_allocator).table;
 
-/// What shapes a load, resolved by the host as the scheduler arm resolves it (`aneBuild`).
+/// What shapes a load, resolved by the host (`host/engines/load.zig`).
 pub const Settings = struct {
     slots: u32 = 1,
     /// The DFlash2 drafter's dir; null decodes one token per call.
@@ -95,7 +95,7 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
             return std.json.parseFromSlice(Settings, gpa, if (json.len == 0) "{}" else json, .{ .ignore_unknown_fields = true });
         }
 
-        /// The int8 weights and each slot's KV at its top context (`lm.loadBytes`, the scheduler arm's preflight).
+        /// The int8 weights and each slot's KV at its top context (`lm.loadBytes`, the host's preflight).
         fn loadBytes(o: *const abi.Open, bytes: *u64) callconv(.c) abi.Verdict {
             const settings = parseSettings(abi.items(u8, o.settings_json)) catch return abi.Verdict.refuse(.unsupported, "settings_json does not parse");
             defer settings.deinit();
@@ -126,8 +126,10 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
                 .drafter = s.drafter,
                 .suppress_ids = s.suppress_ids,
                 .defined_vocab = s.defined_vocab,
+                .progress = o.host,
             }, s.cache);
             errdefer pool.close(gpa);
+            for (pool.engines) |eng| eng.gauges = o.host;
             const eos = try gpa.dupe(u32, cfg.eosTokenSlice());
             errdefer gpa.free(eos);
             const st = try gpa.create(State);
@@ -247,11 +249,14 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
             }
         };
 
-        /// The scheduler arm's `runAneRequest`: sync the engine to the prompt, then sample, emit and feed one
+        /// Sync the engine to the prompt, then sample, emit and feed one
         /// token at a time, or run DFlash cycles (anchor + accepted drafts + the next token) while they fit.
         fn serve(engine: *B.Engine, r: *Req) !Reason {
             if (r.isCancelled()) return .cancelled;
-            const synced = try engine.sync(r.prompt, &r.cancelled);
+            const synced = synced: {
+                defer engine.ungauge();
+                break :synced try engine.sync(r.prompt, &r.cancelled);
+            };
             if (r.prefilled(@intCast(synced.cached))) |why| return why;
             var prng = std.Random.DefaultPrng.init(r.seed());
             const shaped = logits.shapes(r.sampling);
@@ -336,6 +341,7 @@ const FakeLm = struct {
     pub const Engine = struct {
         model: *Model,
         drafter: ?u8,
+        gauges: ?*const abi.Host = null,
         fed: std.ArrayList(u32) = .empty,
         row: [vocab]f16 = @splat(0),
 
@@ -371,6 +377,7 @@ const FakeLm = struct {
             return c;
         }
         pub fn checkpoint(_: *Engine) void {}
+        pub fn ungauge(_: *Engine) void {}
     };
     pub const Pool = struct {
         model: *Model,
@@ -510,11 +517,11 @@ test "ane adapter: the contract holds on a real pack" {
     try contract.run(&R.table, .{ .model_dir = dir, .model_type = "qwen3", .config_json = "", .prompt = &real_prompt, .settings_json = "{\"slots\":2}", .timeout_ms = 600_000, .gate_ms = 10_000 });
 }
 
-test "ane adapter: greedy tokens equal the scheduler arm's sequence on a real pack" {
+test "ane adapter: greedy tokens equal the plain engine sequence on a real pack" {
     const dir = realPack() orelse return error.SkipZigTest;
     const R = Adapter(lm, testing.allocator);
     const n = 16;
-    // The scheduler arm's sequence (`runAneRequest`, no drafter): sync, then draw, emit and step per token.
+    // The plain sequence (no drafter): sync, then draw, emit and step per token.
     var want: [n]u32 = undefined;
     {
         var cfg = try model_mod.parseConfig(io, testing.allocator, dir);

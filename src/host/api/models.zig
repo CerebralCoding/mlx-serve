@@ -12,6 +12,7 @@ const log = @import("../../sdk/util/log.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const model_discovery = @import("../registry/discovery.zig");
 const mlx_gguf = @import("../../sdk/quant/gguf/claim.zig");
+const EngineKind = @import("../engines/served.zig").Kind;
 const media_mod = @import("../media_jobs/gen.zig");
 const metrics = @import("../status.zig");
 const ModelRegistry = model_registry_mod.ModelRegistry;
@@ -48,10 +49,8 @@ const jsonEscape = @import("format.zig").jsonEscape;
 /// unloaded GGUF stub whose engine (llama vs ds4) is only known once the
 /// header is read at load time. A loaded model's `config` names the MLX path's own engines: the
 /// mlx-stream DeepSeek-V4.1 repack and a Sushi pack's EXL3 experts.
-fn modelEngineName(has_ds4: bool, has_llama: bool, has_ane: bool, mlx_gguf_served: bool, config: ?*const model_mod.ModelConfig, path: []const u8, arch_hint: []const u8) []const u8 {
-    if (has_ane) return "ane";
-    if (has_ds4) return "ds4";
-    if (has_llama) return "llama";
+fn modelEngineName(engine: ?EngineKind, mlx_gguf_served: bool, config: ?*const model_mod.ModelConfig, path: []const u8, arch_hint: []const u8) []const u8 {
+    if (engine) |k| return @tagName(k);
     if (config) |c| {
         if (c.dsv41_stream) return "mlx-stream";
         if (c.exl3 != null) return "sushi";
@@ -224,7 +223,7 @@ pub fn renderModelEntry(
         const model_id_json = try jsonEscape(allocator, if (entry.id.len > 0) entry.id else config.model_type);
         defer allocator.free(model_id_json);
         const drafter_loaded = entry.hasDrafter();
-        const mtp_loaded = entry.mtp != null or if (entry.llama_ctx) |c| c.mtpDrafts() > 0 else false;
+        const mtp_loaded = entry.mtp != null or if (entry.engine) |e| e.kind == .llama and e.caps().drafts else false;
         const drafter_path_json = if (drafter_loaded)
             try jsonEscape(allocator, entry.drafter_path)
         else
@@ -274,7 +273,7 @@ pub fn renderModelEntry(
             mods.items,
             facts,
             arch_label,
-            modelEngineName(entry.ds4_engine != null, entry.llama_engine != null, entry.ane != null, entry.config != null and entry.config.?.quant_mode == .gguf, entry.config, entry.path, entry.arch_hint),
+            modelEngineName(if (entry.engine) |e| e.kind else null, entry.config != null and entry.config.?.quant_mode == .gguf, entry.config, entry.path, entry.arch_hint),
             config.vocab_size,
             config.hidden_size,
             config.num_hidden_layers,
@@ -410,7 +409,7 @@ pub fn renderModelEntry(
     // MLX GGUF engine would claim the file, else "gguf" (undetermined
     // llama-vs-ds4) for GGUF paths/stubs, "mlx" for everything else.
     const engine_part = try std.fmt.allocPrint(allocator, "\"engine\":\"{s}\",", .{
-        modelEngineName(false, false, false, mlxGgufClaims(io, entry), null, entry.path, entry.arch_hint),
+        modelEngineName(null, mlxGgufClaims(io, entry), null, entry.path, entry.arch_hint),
     });
     defer allocator.free(engine_part);
 
@@ -1153,24 +1152,24 @@ test "readyHasChat: embedded-engine GGUF without a chat template still advertise
 
 test "modelEngineName: native dsv4 reports mlx, embedded engines report themselves" {
     // Loaded entries: the attached engine pointer decides.
-    try testing.expectEqualStrings("ds4", modelEngineName(true, false, false, false, null, "/m/DeepSeek-V4-Flash.gguf", ""));
-    try testing.expectEqualStrings("llama", modelEngineName(false, true, false, false, null, "/m/qwen.gguf", ""));
-    try testing.expectEqualStrings("ane", modelEngineName(false, false, true, false, null, "/m/Qwen3.8-27B-MLX-Serve-4bit", "qwen3_5"));
+    try testing.expectEqualStrings("ds4", modelEngineName(.ds4, false, null, "/m/DeepSeek-V4-Flash.gguf", ""));
+    try testing.expectEqualStrings("llama", modelEngineName(.llama, false, null, "/m/qwen.gguf", ""));
+    try testing.expectEqualStrings("ane", modelEngineName(.ane, false, null, "/m/Qwen3.8-27B-MLX-Serve-4bit", "qwen3_5"));
     // A GGUF on the MLX path (src/sdk/quant/gguf) is its own engine: the app
     // reads "gguf" as llama.cpp.
-    try testing.expectEqualStrings("mlx-gguf", modelEngineName(false, false, false, true, null, "/m/qwen.gguf", ""));
+    try testing.expectEqualStrings("mlx-gguf", modelEngineName(null, true, null, "/m/qwen.gguf", ""));
     // The MLX path's own engines, from a loaded model's config.
     var stream: model_mod.ModelConfig = .{ .dsv41_stream = true };
-    try testing.expectEqualStrings("mlx-stream", modelEngineName(false, false, false, false, &stream, "/m/DeepSeek-V4.1-Flash-MLX", "deepseek_v41"));
+    try testing.expectEqualStrings("mlx-stream", modelEngineName(null, false, &stream, "/m/DeepSeek-V4.1-Flash-MLX", "deepseek_v41"));
     var sushi: model_mod.ModelConfig = .{};
     sushi.exl3 = @as(@typeInfo(@TypeOf(sushi.exl3)).optional.child, undefined);
-    try testing.expectEqualStrings("sushi", modelEngineName(false, false, false, false, &sushi, "/m/GLM-5.3-Flash-Sushi", "glm5_next"));
-    try testing.expectEqualStrings("mlx", modelEngineName(false, false, false, false, &(model_mod.ModelConfig{}), "/m/gemma-4-12b", "gemma4"));
+    try testing.expectEqualStrings("sushi", modelEngineName(null, false, &sushi, "/m/GLM-5.3-Flash-Sushi", "glm5_next"));
+    try testing.expectEqualStrings("mlx", modelEngineName(null, false, &(model_mod.ModelConfig{}), "/m/gemma-4-12b", "gemma4"));
     // NATIVE deepseek_v4 (safetensors dir): architecture alone can't
     // distinguish it from the ds4 GGUF — meta.engine must.
-    try testing.expectEqualStrings("mlx", modelEngineName(false, false, false, false, null, "/m/ddalcu/DeepSeek-V4-Flash-MLX-Serve", "deepseek_v4"));
+    try testing.expectEqualStrings("mlx", modelEngineName(null, false, null, "/m/ddalcu/DeepSeek-V4-Flash-MLX-Serve", "deepseek_v4"));
     // Unloaded GGUF stubs: engine undetermined until the header is read.
-    try testing.expectEqualStrings("gguf", modelEngineName(false, false, false, false, null, "/m/x.gguf", ""));
-    try testing.expectEqualStrings("gguf", modelEngineName(false, false, false, false, null, "/m/dir", "gguf"));
-    try testing.expectEqualStrings("mlx", modelEngineName(false, false, false, false, null, "/m/gemma-4-12b", "gemma4"));
+    try testing.expectEqualStrings("gguf", modelEngineName(null, false, null, "/m/x.gguf", ""));
+    try testing.expectEqualStrings("gguf", modelEngineName(null, false, null, "/m/dir", "gguf"));
+    try testing.expectEqualStrings("mlx", modelEngineName(null, false, null, "/m/gemma-4-12b", "gemma4"));
 }

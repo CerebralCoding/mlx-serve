@@ -653,7 +653,7 @@ pub fn handleAnthropicMessages(
     // continuation, so refusing its request would take away an answer this
     // endpoint has always given.
     const continue_final = chat_mod.continuationRequested(messages.items) and
-        continuationRejectReason(lm.ds4_engine != null) == null;
+        continuationRejectReason(lm.engineOwnsTemplate()) == null;
     if (lm.vision_encoder == null) {
         if (mediaRejectReason(messages.items, continue_final)) |reason| {
             log.warn("POST /v1/messages -> 400 ({s})\n", .{reason});

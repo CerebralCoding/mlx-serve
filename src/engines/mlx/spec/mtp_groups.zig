@@ -59,7 +59,6 @@ pub fn slotMtpGroupable(slot: *const Slot) bool {
     if (gen.mtp.?.moduleOwned()) return false;
     if (gen.spec_disabled_runtime or gen.mtp_serial_left > 0 or gen.mtp_serial_exit != .none) return false;
     if (slot.sampling.constraint != null or slot.logprobs_n > 0) return false;
-    if (slot.model.ds4_engine != null or slot.model.llama_engine != null) return false;
     const t = slot.model.transformer orelse return false;
     if (!t.supportsBatchedGdnDecode()) return false;
     if (gen.ctx.ssm_entries == null and t.hasRecurrentLayers()) return false;

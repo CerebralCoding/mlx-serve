@@ -4,16 +4,12 @@
 //! on a ready row and an unloaded stub.
 
 const std = @import("std");
-const build_options = @import("build_options");
 const abi = @import("../../abi/engine.zig");
 const agent_budget = @import("../launch/budget.zig");
 const modality = @import("../registry/modality.zig");
 const discovery = @import("../registry/discovery.zig");
 const gen = @import("../media_jobs/gen.zig");
-const ds4_engine = @import("../../engines/ds4/engine.zig");
-const llama_engine = @import("../../engines/llama/engine.zig");
-const ane_engine = @import("../../engines/ane/engine.zig");
-const ane_lm = @import("../../engines/ane/lm.zig");
+const served = @import("../engines/served.zig");
 const ane_rt = @import("../../engines/ane/rt.zig");
 const outside = @import("../plugins/loader.zig");
 
@@ -40,13 +36,12 @@ pub fn enginesFor(io: std.Io, allocator: std.mem.Allocator, path: []const u8, mo
         if (mlx_gguf) set.insert(.mlx);
         const file = discovery.resolveGgufFile(io, allocator, path) catch return set;
         defer allocator.free(file);
-        if (build_options.ds4_engine and accepts(ds4_engine.probe, file)) set.insert(.ds4);
-        if (build_options.llama_engine and accepts(llama_engine.probe, file)) set.insert(.llama);
+        inline for (.{ .ds4, .llama }) |kind| if (served.table(kind)) |tbl| if (accepts(tbl.probe, file)) set.insert(kind);
         return set;
     }
     set.insert(.mlx);
     if (modality.fromType(model_type) == null and ane_rt.available() and
-        accepts(ane_engine.Adapter(ane_lm, std.heap.smp_allocator).probe, path)) set.insert(.ane);
+        accepts(served.table(.ane).?.probe, path)) set.insert(.ane);
     return set;
 }
 

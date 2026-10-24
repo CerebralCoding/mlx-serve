@@ -70,8 +70,7 @@ const sendStreamKeepalive = @import("../http/sse.zig").sendStreamKeepalive;
 /// The vocabulary a request's token ids index. An embedded engine's stub config keeps the
 /// default vocab; its ids are the engine's, and an id past its vocab aborts inside llama.cpp.
 pub fn tokenVocabSize(lm: *const LoadedModel) u32 {
-    if (lm.ds4_engine) |e| return e.vocabSize();
-    if (lm.llama_engine) |e| return @intCast(e.nVocab());
+    if (lm.engine) |e| if (e.caps().owns_tokenizer) return e.vocabSize();
     return if (lm.config) |c| c.vocab_size else 0;
 }
 

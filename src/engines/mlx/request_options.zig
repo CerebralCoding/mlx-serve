@@ -194,7 +194,7 @@ pub const PldDefaults = struct {
 /// The request's `enable_pld`, else the launch default; never on a Neural Engine model, whose
 /// engine drafts on its own.
 pub fn requestPld(root: std.json.ObjectMap, lm: *const LoadedModel) bool {
-    if (lm.ane != null) return false;
+    if (lm.engine != null) return false; // PLD runs in the MLX generator only
     return if (root.get("enable_pld")) |v| v == .bool and v.bool else http_server.serverState().server_config.default_enable_pld;
 }
 
@@ -408,13 +408,13 @@ test "requestSpecModes: a loaded DFlash sidecar outranks the checkpoint's MTP he
     try std.testing.expect(r.use_drafter and !r.use_mtp);
 }
 
-test "PLD: the request's flag, else the default; never on a Neural Engine model" {
+test "PLD: the request's flag, else the default; never on a model served beside MLX" {
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"enable_pld\":true}", .{});
     defer parsed.deinit();
     var lm: LoadedModel = undefined;
-    lm.ane = null;
+    lm.engine = null;
     try testing.expect(requestPld(parsed.value.object, &lm));
-    lm.ane = @ptrFromInt(0x1000);
+    lm.engine = @ptrFromInt(0x1000);
     try testing.expect(!requestPld(parsed.value.object, &lm));
 }
 
@@ -481,7 +481,7 @@ test "native speculation: resolved opt-out gates capability and API defaults" {
     lm.config = &cfg;
     lm.transformer = &xfm;
     lm.mtp = null;
-    lm.llama_engine = null;
+    lm.engine = null;
     lm.dflash = null;
     lm.drafter = null;
     lm.mtp_depth = 6;
