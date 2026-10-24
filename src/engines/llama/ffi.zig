@@ -70,6 +70,7 @@ pub const GgmlType = struct {
 pub extern fn mlx_llama_ctx_create(e: *Engine, p: *const CtxParams, err: ?[*]u8, errlen: usize) ?*Ctx;
 pub extern fn mlx_llama_ctx_free(c: ?*Ctx) void;
 pub extern fn mlx_llama_ctx_mtp_drafts(c: *Ctx) i32;
+pub extern fn mlx_llama_seq_logits(c: *Ctx, seq: i32) ?[*]f32;
 
 pub extern fn mlx_llama_seq_prefill(c: *Ctx, seq: i32, tokens: [*]const i32, n_tokens: i32, err: ?[*]u8, errlen: usize) i32;
 pub extern fn mlx_llama_step(c: *Ctx, seqs: [*]const i32, tokens: [*]const i32, n: i32, err: ?[*]u8, errlen: usize) i32;

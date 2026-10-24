@@ -17,7 +17,17 @@ pub threadlocal var refused: ?struct { kind: Kind, cap: []const u8 } = null;
 
 /// What the request asks that the engine does not declare (`abi.Caps` field name), or null when it serves it.
 pub fn missingCap(s: *const Served, p: SubmitParams) ?[]const u8 {
-    return abi.missing(s.caps(), needs(p.sampling, p.logprobs_n, p.prompt_logprobs));
+    return abi.missing(s.caps(), without(needs(p.sampling, p.logprobs_n, p.prompt_logprobs), ignored(s.kind)));
+}
+
+/// What a GGUF engine has always accepted and ignored: a grammar (`response_format`). Its request is served
+/// unconstrained, named in one log line, never refused.
+fn ignored(kind: Kind) abi.Caps {
+    return .{ .grammar = kind == .ds4 or kind == .llama };
+}
+
+fn without(a: abi.Caps, b: abi.Caps) abi.Caps {
+    return @bitCast(@as(u64, @bitCast(a)) & ~@as(u64, @bitCast(b)));
 }
 
 fn needs(sampling: generate_mod.SamplingParams, logprobs_n: u32, prompt_logprobs: bool) abi.Caps {
@@ -71,6 +81,8 @@ pub fn submit(slot: *Slot, s: *Served) !void {
     const grammar: abi.Grammar = .{ .kind = .json_schema, .text = .{} };
     const tool_gate: abi.ToolGate = .{ .opener = .{}, .names = .{} };
     const think: abi.Think = .{ .budget = 0, .open = .{}, .opened_in_prompt = false, .close = .{}, .end = abi.no_token };
+    const ask_grammar = sp.constraint != null and !ignored(s.kind).grammar;
+    if (sp.constraint != null and !ask_grammar) log.info("[{s}] response_format ignored: the engine has no grammar sampler\n", .{@tagName(s.kind)});
     const r: abi.Request = .{
         .prompt = abi.span(u32, slot.full_prompt),
         .max_tokens = slot.max_tokens,
@@ -87,7 +99,7 @@ pub fn submit(slot: *Slot, s: *Served) !void {
         },
         .eos = abi.span(u32, eos.items),
         .logprobs = @intCast(@min(slot.logprobs_n, std.math.maxInt(u8))),
-        .grammar = if (sp.constraint != null) &grammar else null,
+        .grammar = if (ask_grammar) &grammar else null,
         .think = if (sp.think_bound != null) &think else null,
         .tool_gate = if (sp.tool_force != null) &tool_gate else null,
         .prompt_logprobs = slot.prompt_logprobs,
@@ -202,6 +214,21 @@ test "missingCap: plain sampling is served; a grammar, a penalty, logprobs, a fo
     try testing.expectEqualStrings("logprobs", abi.missing(.{ .penalties = true }, needs(.{}, 5, false)).?);
     try testing.expectEqualStrings("prompt_logprobs", abi.missing(.{ .logprobs = true }, needs(.{}, 0, true)).?);
     try testing.expect(abi.missing(.{ .logprobs = true, .penalties = true }, needs(.{ .presence_penalty = 0.5 }, 2, false)) == null);
+}
+
+test "missingCap: a GGUF engine accepts a grammar and ignores it, as it always has; the Neural Engine refuses it" {
+    const grammar: generate_mod.SamplingParams = .{ .constraint = @ptrFromInt(8) };
+    var s: Served = undefined;
+    s.info.caps = .{ .owns_tokenizer = true, .penalties = true, .logprobs = true };
+    inline for (.{ .ds4, .llama }) |kind| {
+        s.kind = kind;
+        try testing.expect(missingCap(&s, .{ .prompt_ids = &.{1}, .sampling = grammar, .eos_token_ids = &.{}, .max_tokens = 1, .model = undefined }) == null);
+    }
+    s.kind = .ane;
+    try testing.expectEqualStrings("grammar", missingCap(&s, .{ .prompt_ids = &.{1}, .sampling = grammar, .eos_token_ids = &.{}, .max_tokens = 1, .model = undefined }).?);
+    // Penalties and logprobs are served where declared: no 400 for what 26.10.3 answered.
+    s.kind = .llama;
+    try testing.expect(missingCap(&s, .{ .prompt_ids = &.{1}, .sampling = .{ .presence_penalty = 0.5, .frequency_penalty = 0.2 }, .eos_token_ids = &.{}, .max_tokens = 1, .logprobs_n = 2, .model = undefined }) == null);
 }
 
 test "refusalMessage: names the engine, the feature and the fix, once" {
