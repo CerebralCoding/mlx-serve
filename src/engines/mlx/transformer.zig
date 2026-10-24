@@ -929,13 +929,13 @@ pub const Transformer = struct {
     pub const hcReadNormed = @import("../../plugins/qwen4_exp/hc.zig").hcReadNormed;
     pub const hcWrite = @import("../../plugins/qwen4_exp/hc.zig").hcWrite;
     // sdk/blocks/moe/routing.zig
-    pub const compileMoeRouting = @import("../../sdk/blocks/moe/routing.zig").compileMoeRouting;
+    pub const compileMoeRouting = @import("methods/moe_routing.zig").compileMoeRouting;
     pub const MoeRouting = @import("../../sdk/blocks/moe/routing.zig").MoeRouting;
-    const moeRoutingClosureCallback = @import("../../sdk/blocks/moe/routing.zig").moeRoutingClosureCallback;
-    pub const moeRoutingUncompiled = @import("../../sdk/blocks/moe/routing.zig").moeRoutingUncompiled;
-    const hy3RoutingClosureCallback = @import("../../sdk/blocks/moe/routing.zig").hy3RoutingClosureCallback;
-    pub const computeHy3Routing = @import("../../sdk/blocks/moe/routing.zig").computeHy3Routing;
-    pub const computeMoeRouting = @import("../../sdk/blocks/moe/routing.zig").computeMoeRouting;
+    const moeRoutingClosureCallback = @import("methods/moe_routing.zig").moeRoutingClosureCallback;
+    pub const moeRoutingUncompiled = @import("methods/moe_routing.zig").moeRoutingUncompiled;
+    const hy3RoutingClosureCallback = @import("methods/moe_routing.zig").hy3RoutingClosureCallback;
+    pub const computeHy3Routing = @import("methods/moe_routing.zig").computeHy3Routing;
+    pub const computeMoeRouting = @import("methods/moe_routing.zig").computeMoeRouting;
     // sdk/blocks/linear/qmatmul.zig
     pub const qmatmul = @import("methods/qmatmul.zig").qmatmul;
     pub const lmHeadProject = @import("methods/qmatmul.zig").lmHeadProject;
@@ -984,7 +984,7 @@ pub const Transformer = struct {
     // sdk/blocks/conv/conv1d_cache.zig
     pub const conv1dWithCache = @import("../../sdk/blocks/conv/conv1d_cache.zig").conv1dWithCache;
     // sdk/blocks/moe/experts.zig
-    pub const scaleExperts = @import("../../sdk/blocks/moe/experts.zig").scaleExperts;
+    pub const scaleExperts = @import("methods/moe_experts.zig").scaleExperts;
     // engines/mlx/eval_cadence.zig
     pub const EVAL_EVERY_N_LAYERS = @import("eval_cadence.zig").EVAL_EVERY_N_LAYERS;
     pub const PREFILL_EVAL_CADENCE_DEFAULT = @import("eval_cadence.zig").PREFILL_EVAL_CADENCE_DEFAULT;
@@ -1150,13 +1150,13 @@ pub const Transformer = struct {
     pub const moeExpertsRouted = @import("../../sdk/blocks/moe/moe.zig").moeExpertsRouted;
     pub const moeMLP2WithRouter = @import("../../sdk/blocks/moe/moe.zig").moeMLP2WithRouter;
     // sdk/blocks/moe/decode.zig
-    pub const glmMoeDecode = @import("../../sdk/blocks/moe/decode.zig").glmMoeDecode;
-    pub const moeDecodeGatherQmv = @import("../../sdk/blocks/moe/decode.zig").moeDecodeGatherQmv;
-    pub const moeFp4Decode = @import("../../sdk/blocks/moe/decode.zig").moeFp4Decode;
-    pub const moeAffine4Decode = @import("../../sdk/blocks/moe/decode.zig").moeAffine4Decode;
-    pub const moeCudaDecode = @import("../../sdk/blocks/moe/decode.zig").moeCudaDecode;
-    pub const moeDecodeGatherQmvRows = @import("../../sdk/blocks/moe/decode.zig").moeDecodeGatherQmvRows;
-    pub const moeMLP2 = @import("../../sdk/blocks/moe/decode.zig").moeMLP2;
+    pub const glmMoeDecode = @import("methods/moe_decode.zig").glmMoeDecode;
+    pub const moeDecodeGatherQmv = @import("methods/moe_decode.zig").moeDecodeGatherQmv;
+    pub const moeFp4Decode = @import("methods/moe_decode.zig").moeFp4Decode;
+    pub const moeAffine4Decode = @import("methods/moe_decode.zig").moeAffine4Decode;
+    pub const moeCudaDecode = @import("methods/moe_decode.zig").moeCudaDecode;
+    pub const moeDecodeGatherQmvRows = @import("methods/moe_decode.zig").moeDecodeGatherQmvRows;
+    pub const moeMLP2 = @import("methods/moe_decode.zig").moeMLP2;
     // sdk/blocks/attention/masks.zig
     pub const createCausalMask = @import("../../sdk/blocks/attention/masks.zig").createCausalMask;
     pub const createSlidingWindowDecodeMask = @import("../../sdk/blocks/attention/masks.zig").createSlidingWindowDecodeMask;

@@ -7,10 +7,10 @@ const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 const testing = std.testing;
-const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
 const testRandUniformBf16 = @import("../../testing/parity.zig").testRandUniformBf16;
 const testReadF32 = @import("../../testing/parity.zig").testReadF32;
 const groupLimitedRouting = @import("routing.zig").groupLimitedRouting;
+const MoeRouting = @import("routing.zig").MoeRouting;
 const hy3RoutingChain = @import("routing.zig").hy3RoutingChain;
 const kolibriRoutingChain = @import("routing.zig").kolibriRoutingChain;
 const moeRoutingChain = @import("routing.zig").moeRoutingChain;
@@ -258,7 +258,7 @@ pub fn moeRouterTopK(
     n_group: c_int,
     topk_group: c_int,
     gate: ?RouterGate,
-) !?Transformer.MoeRouting {
+) !?MoeRouting {
     if (!moeRouterFusedEnabled() or !mlx.streamIsGpu(s)) return null;
     const mode: RouterMode = if (gate != null and mode_in == .softmax) .softmax_gate else mode_in;
     const sigmoid_mode = mode == .sigmoid_bias or mode == .sigmoid_bias_grouped or mode == .logit_bias;
