@@ -78,7 +78,7 @@ A seam is added with its first consumer and generalized with its second.
    The plugin's C sources go into its module in the same function. Plain C (a pthread read pool) and Objective-C over
    public Metal API are fine.
 3. **Glue it.** `src/arch/<name>.zig` is the only host file that imports the plugin, unless the seam is a single call
-   (EXL3's MoE call sits in `transformer.zig`). The glue translates host types (`ModelConfig`, `Transformer`,
+   (EXL3's MoE call sits in `engines/mlx/transformer.zig`). The glue translates host types (`ModelConfig`, `Transformer`,
    `ForwardCtx`) into the plugin's plain arguments: slices, integers, `mlx_array`.
 4. **Platforms.** Pure Zig over `mlx_host.mlx` compiles on every graph. macOS-only code (Objective-C, Metal events)
    gets a stub glue file chosen by a build option (`build_options.mlx_stream`, as `macos_engines` picks
@@ -92,7 +92,7 @@ A seam is added with its first consumer and generalized with its second.
 ## Developing a plugin on its own
 
 The plugin's `build.zig` builds against an mlx-serve checkout (`-Dmlx-serve=../mlx-serve`). A three-line
-`standalone/mlx_host.zig` re-exports the host's `src/mlx/ffi.zig` (plus `log.zig` and `io_util.zig` if it uses them).
+`standalone/mlx_host.zig` re-exports the host's `src/mlx/ffi.zig` (plus `host/log.zig` and `sdk/util/io_util.zig` if it uses them).
 To serve, build mlx-serve with `-D<name>-dir=$PWD`. No slim host and no fork are needed. mlx-stream's `build.zig`
 drives the host's own build instead (`zig build test` runs the host's `mlx-stream-test` step, `zig build conformance`
 its `mlx-stream-conformance` step).
