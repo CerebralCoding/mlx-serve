@@ -11,7 +11,7 @@
 const std = @import("std");
 const sdk = @import("sdk");
 const mlx = sdk.mlx;
-const ops = @import("../../deepseek_v41/stream/ops.zig");
+const ops = @import("../../../sdk/weights/streamed/ops.zig");
 const bank = @import("bank.zig");
 const decode_kernels = @import("decode_kernels.zig");
 

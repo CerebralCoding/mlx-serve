@@ -13,7 +13,7 @@ const model = @import("host.zig").model;
 /// for the next window (served run 3 found 4.2 GB).
 const bank_load: model.LoadOpts = .{ .nocache = true };
 const v41 = @import("deepseek_v41.zig");
-const ops = @import("ops.zig");
+const ops = @import("../../../sdk/weights/streamed/ops.zig");
 const graph = @import("graph.zig");
 const engram = @import("engram.zig");
 const routes = @import("routes.zig");

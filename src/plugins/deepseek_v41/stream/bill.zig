@@ -9,9 +9,9 @@ const sdk = @import("sdk");
 const sdk_ext = @import("../../../sdk/weights/streamed/sdk_ext.zig");
 const settings = @import("settings.zig");
 const v41 = @import("deepseek_v41.zig");
-const ops = @import("ops.zig");
+const ops = @import("../../../sdk/weights/streamed/ops.zig");
 const mdl = @import("model.zig");
-const xp = @import("experts.zig");
+const xp = @import("../../../sdk/weights/streamed/experts.zig");
 const expert_stream = @import("../../../sdk/weights/streamed/expert/stream.zig");
 const exl3 = @import("../../../sdk/quant/exl3/stream/quant.zig");
 const engram = @import("engram.zig");
@@ -208,9 +208,7 @@ pub fn wiredOf(t: PhaseTerms) u64 {
 /// The page granule and the page tables of a phase's wired bytes (`phase_memory.wireTables`, shared with GLM-5.3's bill).
 pub const wireTables = phase_mem.wireTables;
 
-/// The wiring overhead per live buffer if all of it were per buffer (measured): the largest
-/// construction reading, 125,852,608 B (run 3bk control1), over the 4,493 buffers live there, rounded up to a KiB.
-pub const wire_buffer_bytes: u64 = 28_672;
+pub const wire_buffer_bytes = phase_mem.wire_buffer_bytes;
 
 /// Decode's provisional buffer allowance (re-frozen on run 3br's decode-mark readings): the decode wave's
 /// buffers (live + cached, 2 x `wire_arrays_decode_wave`) at `wire_buffer_bytes` each, on top of wire_tables. run 3br

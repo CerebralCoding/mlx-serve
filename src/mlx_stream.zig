@@ -59,8 +59,10 @@ pub const arch = @import("plugins/deepseek_v41/stream/plugin.zig");
 /// (the conformance suite's list; the host's glue binds each arch by its own entry: the root's, `mimo` and `glm`).
 pub const archs = .{ @import("plugins/deepseek_v41/stream/plugin.zig"), @import("plugins/glm_moe_dsa/stream/plugin.zig") };
 pub const sdk = @import("sdk");
-/// DeepSeek-V4.1's routed experts streamed for the resident trunk (`sdk/weights/streamed.zig` `Streamed`).
+/// DeepSeek-V4.1's EXL3 repack experts for the resident trunk (the fold moves them into `sdk/quant/exl3/`).
 pub const dsv41_streamed = @import("plugins/deepseek_v41/stream/streamed.zig");
+/// The expert bank source a resident trunk streams its routed experts from (`sdk/weights/streamed.zig` `Streamed`).
+pub const bank_source = @import("sdk/weights/streamed/bank_source.zig");
 /// A standard MLX pack's routed experts streamed for the resident trunk as downloaded (`Streamed.openPack`).
 pub const mlx_pack = @import("sdk/weights/streamed/mlx_pack.zig");
 /// The streamed halves of the dupes parity harnesses (test builds only): each arch's trunk over a pack, for the main

@@ -55,7 +55,7 @@ comptime {
     if (@import("sdk/weights/streamed/host_caps.zig").dsa_nax) _ = @import("plugins/glm5_next/stream/exl3_kbench.zig");
     _ = @import("plugins/mimo_v2/stream/stream_source.zig");
     _ = @import("plugins/deepseek_v41/stream/deepseek_v41.zig");
-    _ = @import("plugins/deepseek_v41/stream/ops.zig");
+    _ = @import("sdk/weights/streamed/ops.zig");
     _ = @import("plugins/deepseek_v41/stream/graph.zig");
     _ = @import("plugins/deepseek_v41/stream/engram.zig");
     _ = @import("plugins/deepseek_v41/stream/reference_test.zig");
@@ -64,7 +64,7 @@ comptime {
     _ = @import("plugins/deepseek_v41/stream/model.zig");
     _ = @import("plugins/deepseek_v41/stream/dspark.zig");
     _ = @import("plugins/deepseek_v41/stream/parity.zig");
-    _ = @import("plugins/deepseek_v41/stream/experts.zig");
+    _ = @import("sdk/weights/streamed/experts.zig");
     _ = @import("plugins/deepseek_v41/stream/ar.zig");
     _ = @import("plugins/deepseek_v41/stream/dspark_head.zig");
     _ = @import("plugins/deepseek_v41/stream/dspark_loop.zig");
@@ -86,10 +86,10 @@ comptime {
     _ = @import("plugins/deepseek_v41/stream/bill.zig");
     _ = @import("plugins/deepseek_v41/stream/bill_receipts_test.zig");
     _ = @import("plugins/deepseek_v41/stream/bill_mini_test.zig");
-    _ = @import("plugins/deepseek_v41/stream/decode_timers.zig");
-    _ = @import("plugins/deepseek_v41/stream/decode_first.zig");
+    _ = @import("sdk/weights/streamed/profile/decode_timers.zig");
+    _ = @import("sdk/weights/streamed/profile/decode_first.zig");
     _ = @import("plugins/deepseek_v41/stream/draft_routes.zig");
-    _ = @import("plugins/deepseek_v41/stream/verify_timeline.zig");
+    _ = @import("sdk/weights/streamed/profile/verify_timeline.zig");
     _ = @import("plugins/deepseek_v41/stream/host_heap.zig");
     _ = @import("sdk/weights/streamed/expert/policy_test.zig");
     _ = @import("sdk/weights/streamed/expert/stream.zig");
@@ -99,7 +99,7 @@ comptime {
     _ = @import("sdk/quant/exl3/stream/selfcheck.zig");
     _ = @import("sdk/quant/exl3/stream/kernel_ops_gate.zig");
     _ = @import("sdk/quant/exl3/stream/quant.zig");
-    _ = @import("plugins/deepseek_v41/stream/kernel_routes.zig");
+    _ = @import("sdk/quant/exl3/stream/kernel_routes.zig");
     _ = @import("plugins/deepseek_v41/stream/kernels_test.zig");
     _ = @import("sdk/weights/streamed/sdk_ext.zig");
     _ = @import("sdk/weights/streamed/ngram_table.zig");

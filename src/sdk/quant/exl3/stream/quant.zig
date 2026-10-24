@@ -2063,7 +2063,7 @@ test "dsv41 kernels ops: L1: a K16 group call packs the tier's 8 experts per wav
 test "dsv41 smoke 0b: L1: DIG-X prefill waves at 8 experts per wave equal Record 3's 4, bit for bit, on real records" {
     _ = env.get(.DSV41_PHASE0B_MLX) orelse return error.SkipZigTest;
     const dir = std.mem.span(env.get(.DSV41_BANK) orelse return error.SkipZigTest);
-    const ops = @import("../../../../plugins/deepseek_v41/stream/ops.zig");
+    const ops = @import("../../../weights/streamed/ops.zig");
     const es = @import("../../../weights/streamed/expert/stream.zig");
     const eb = @import("../../../weights/streamed/expert/bank.zig");
     const a = testing.allocator;
@@ -2698,7 +2698,7 @@ test "dsv41 smoke 0b: take2 retune: the lane's take2 words on real records, bit 
         std.debug.print("\ntake2 retune smoke: DSV41_PHASE0B_MLX without DSV41_BANK (the real records): refused\n", .{});
         return error.TestUnexpectedResult;
     });
-    const ops = @import("../../../../plugins/deepseek_v41/stream/ops.zig");
+    const ops = @import("../../../weights/streamed/ops.zig");
     const es = @import("../../../weights/streamed/expert/stream.zig");
     const eb = @import("../../../weights/streamed/expert/bank.zig");
     const G = ops.MlxOps;
@@ -2923,7 +2923,7 @@ test "dsv41 smoke 0b: m128: the 128-row DIG-X GEMMs' z words equal the 64-row te
         std.debug.print("\nm128 smoke: DSV41_PHASE0B_MLX without DSV41_BANK (the real records): refused\n", .{});
         return error.TestUnexpectedResult;
     });
-    const ops = @import("../../../../plugins/deepseek_v41/stream/ops.zig");
+    const ops = @import("../../../weights/streamed/ops.zig");
     const es = @import("../../../weights/streamed/expert/stream.zig");
     const eb = @import("../../../weights/streamed/expert/bank.zig");
     const G = ops.MlxOps;
@@ -3152,7 +3152,7 @@ test "dsv41 smoke 0b: fused down: the fused down GEMM's words equal the 128-row 
         std.debug.print("\nfused down smoke: DSV41_PHASE0B_MLX without DSV41_BANK (the real records): refused\n", .{});
         return error.TestUnexpectedResult;
     });
-    const ops = @import("../../../../plugins/deepseek_v41/stream/ops.zig");
+    const ops = @import("../../../weights/streamed/ops.zig");
     const es = @import("../../../weights/streamed/expert/stream.zig");
     const eb = @import("../../../weights/streamed/expert/bank.zig");
     const G = ops.MlxOps;
@@ -3347,7 +3347,7 @@ test "dsv41 smoke 0b: lut: the table-codebook gate|up GEMM's z words equal the 1
         std.debug.print("\nlut smoke: DSV41_PHASE0B_MLX without DSV41_BANK (the real records): refused\n", .{});
         return error.TestUnexpectedResult;
     });
-    const ops = @import("../../../../plugins/deepseek_v41/stream/ops.zig");
+    const ops = @import("../../../weights/streamed/ops.zig");
     const es = @import("../../../weights/streamed/expert/stream.zig");
     const eb = @import("../../../weights/streamed/expert/bank.zig");
     const G = ops.MlxOps;
@@ -3568,7 +3568,7 @@ test "dsv41 smoke 0b: lut: the table-codebook gate|up GEMM's z words equal the 1
 // (PASS / FAIL, words / bad, metric / limit, the reference side), then the module's verdict. No model, no bank.
 test "dsv41 pre-ship gate: the kernels' full self-check plan on the device, every result printed (DSV41_SELFCHECK_DEVICE)" {
     if (env.get(.DSV41_SELFCHECK_DEVICE) == null) return error.SkipZigTest;
-    const trunk = @import("../../../../plugins/deepseek_v41/stream/kernel_routes.zig");
+    const trunk = @import("kernel_routes.zig");
     @import("sdk").log.enableStderr(); // the results are this test's output
     const a = testing.allocator;
     const s = mlx.mlx_default_gpu_stream_new();

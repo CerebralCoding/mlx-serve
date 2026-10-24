@@ -1091,10 +1091,8 @@ test "glm5_next settings: the draft head: bf16 unless named (nothing installed w
     try testing.expect(draft_filter_k <= c.model.vocab_size);
 }
 
-test "glm5_next settings: the resolved draft depth per arch (glm5_next depth 2, gate 0.75; MiMo its trained 3; DSV4.1's DSpark schedule unchanged)" {
+test "glm5_next settings: the resolved draft depth per arch (glm5_next depth 2, gate 0.75; MiMo its trained 3)" {
     const mimo = @import("../../mimo_v2/stream/settings.zig");
-    const dsv41_graph = @import("../../deepseek_v41/stream/graph.zig");
-    const dspark = @import("../../deepseek_v41/stream/dspark.zig");
     const base: Config = .{};
     try testing.expectEqual(@as(u32, 2), base.draft_depth);
     try testing.expectEqual(@as(f32, 0.75), base.draft_gate);
@@ -1102,8 +1100,6 @@ test "glm5_next settings: the resolved draft depth per arch (glm5_next depth 2, 
     const m: mimo.Config = .{};
     try testing.expectEqual(@as(u32, 3), m.draft_depth);
     try testing.expectEqual(mimo.trained_draft_depth, m.draft_depth);
-    try testing.expectEqual(@as(u32, 32), dsv41_graph.draft_compile_max_rows);
-    try testing.expectEqual(@as(u32, 16), dspark.max_block);
 }
 
 test "glm5_next settings: expert_rows_by_layer: the calibrated offsets by default, uniform by name; lr2: prompt rows uniform, decode = rows + offset floored at the prompt rows and paid back from the widest layers; refusals by name" {

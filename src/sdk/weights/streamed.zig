@@ -1,8 +1,8 @@
 //! The streamed weight source: routed experts read from SSD into slot rows, for a trunk whose MoE reads them through
 //! `Routed`. The streamer is mlx-stream's (`streamed/expert/`, `streamed/sdk_ext/expert/`, the read pool in
-//! `streamed/csrc/`; module `mlx_stream`). Sources: a repacked bank (`experts.bin` + `expert-manifest.json`: the MXFP4
-//! record bank of MiMo's and DeepSeek-V4.1's experts, DeepSeek-V4.1's EXL3 repack) and a standard MLX pack's affine
-//! experts as downloaded (`openPack`, `streamed/mlx_pack.zig`). Without mlx-stream, or without a bank, opening refuses
+//! `streamed/csrc/`; module `mlx_stream`). Sources: the MXFP4 record bank (`experts.bin` + `expert-manifest.json`,
+//! `streamed/bank_source.zig`; MiMo's and DeepSeek-V4.1's experts) and a standard MLX pack's affine experts as
+//! downloaded (`openPack`, `streamed/mlx_pack.zig`). Without mlx-stream, or without a bank, opening refuses
 //! by name.
 
 const std = @import("std");
@@ -59,20 +59,18 @@ pub const Streamed = struct {
         rows: ?[]const u32 = null,
     };
 
-    const Mxfp4 = if (build_options.mlx_stream) plugin.dsv41_streamed.Mxfp4 else void;
-    const Exl3 = if (build_options.mlx_stream) plugin.dsv41_streamed.Exl3 else void;
+    const Mxfp4 = if (build_options.mlx_stream) plugin.bank_source.Mxfp4 else void;
     const Pack = if (build_options.mlx_stream) plugin.mlx_pack.Source else void;
 
-    src: union(enum) { mxfp4: *Mxfp4, exl3: *Exl3, pack: *Pack },
+    src: union(enum) { mxfp4: *Mxfp4, pack: *Pack },
 
     pub fn open(a: std.mem.Allocator, io: std.Io, dir: []const u8, s: mlx.mlx_stream, opt: Options) !Streamed {
         if (comptime !build_options.mlx_stream) return error.StreamedWeightsUnsupported;
         var d = std.Io.Dir.openDirAbsolute(io, dir, .{}) catch return error.StreamedWeightsUnsupported;
         defer d.close(io);
         _ = d.statFile(io, "expert-manifest.json", .{}) catch return error.StreamedWeightsUnsupported;
-        return switch (try plugin.dsv41_streamed.Source.open(a, io, dir, s, .{ .rows = opt.rows })) {
+        return switch (try plugin.bank_source.Source.open(a, io, dir, s, .{ .rows = opt.rows })) {
             .mxfp4 => |x| .{ .src = .{ .mxfp4 = x } },
-            .exl3 => |x| .{ .src = .{ .exl3 = x } },
         };
     }
 
@@ -126,10 +124,6 @@ pub const Streamed = struct {
             fn proj(p: anytype) Proj {
                 return .{ .w = p.w, .scales = p.scales, .biases = if (@hasField(@TypeOf(p), "biases")) p.biases else .{ .ctx = null } };
             }
-            fn rows(ctx: *anyopaque, layer: u32, x: mlx.mlx_array, idx: mlx.mlx_array, wts: mlx.mlx_array) anyerror!mlx.mlx_array {
-                const src: *Exl3 = @ptrCast(@alignCast(ctx));
-                return src.rows(layer, x, idx, wts);
-            }
             fn settle(comptime Src: type) fn (*anyopaque) anyerror!void {
                 return struct {
                     fn f(ctx: *anyopaque) anyerror!void {
@@ -141,7 +135,6 @@ pub const Streamed = struct {
         };
         return switch (self.src) {
             .mxfp4 => |x| .{ .ctx = x, .math = .{ .trunk = C.fetch(Mxfp4) }, .settle_fn = C.settle(Mxfp4) },
-            .exl3 => |x| .{ .ctx = x, .math = .{ .source = C.rows }, .settle_fn = C.settle(Exl3) },
             .pack => |x| .{ .ctx = x, .math = .{ .trunk = C.fetch(Pack) }, .settle_fn = C.settle(Pack) },
         };
     }

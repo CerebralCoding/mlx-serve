@@ -21,7 +21,7 @@ const env = @import("mlx_host").env;
 const mlx = @import("sdk").mlx;
 /// MLX custom kernels through the plugin's launch cache (sdk_ext/metal_launch.zig).
 const mtl = @import("../../../sdk/weights/streamed/sdk_ext/metal_launch.zig");
-const ops = @import("../../deepseek_v41/stream/ops.zig");
+const ops = @import("../../../sdk/weights/streamed/ops.zig");
 const quant = @import("../../../sdk/weights/streamed/sdk_ext.zig").quant;
 const bank_mod = @import("bank.zig");
 

@@ -15,7 +15,7 @@ const sdk = @import("sdk");
 const mlx = sdk.mlx;
 /// MLX custom kernels through the plugin's launch cache (sdk_ext/metal_launch.zig).
 const mtl = @import("../../../sdk/weights/streamed/sdk_ext/metal_launch.zig");
-const ops_be = @import("../../deepseek_v41/stream/ops.zig");
+const ops_be = @import("../../../sdk/weights/streamed/ops.zig");
 const glm = @import("config.zig");
 const fp8 = @import("fp8.zig");
 const kda_percore = @import("kda_percore.zig");

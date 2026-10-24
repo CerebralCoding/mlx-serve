@@ -14,7 +14,7 @@ const ks = sdk_ext.kernels.KernelSet(xk);
 const kt = sdk_ext.kernels.Trace(xk);
 const quant = @import("../../../sdk/weights/streamed/sdk_ext.zig").quant;
 const eq = @import("../../../sdk/quant/exl3/stream/quant.zig");
-const tr = @import("kernel_routes.zig");
+const tr = @import("../../../sdk/quant/exl3/stream/kernel_routes.zig");
 
 const testing = std.testing;
 const Allocator = std.mem.Allocator;

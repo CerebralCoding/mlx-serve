@@ -10,7 +10,7 @@ const std = @import("std");
 const env = @import("mlx_host").env;
 const kset = @import("../../../sdk/weights/streamed/sdk_ext/kernel_set.zig");
 const v41 = @import("deepseek_v41.zig");
-const ops = @import("ops.zig");
+const ops = @import("../../../sdk/weights/streamed/ops.zig");
 const graph = @import("graph.zig");
 const mdl = @import("model.zig");
 const ds = @import("dspark.zig");
@@ -19,10 +19,10 @@ comptime {
     std.debug.assert(ds.max_block + 1 <= acc.max_rows); // a verify block fits the acceptance graphs' row buffers
 }
 const dh = @import("dspark_head.zig");
-const first_cycle = @import("decode_first.zig");
-const dt = @import("decode_timers.zig");
+const first_cycle = @import("../../../sdk/weights/streamed/profile/decode_first.zig");
+const dt = @import("../../../sdk/weights/streamed/profile/decode_timers.zig");
 const draft_routes = @import("draft_routes.zig");
-const timeline = @import("verify_timeline.zig");
+const timeline = @import("../../../sdk/weights/streamed/profile/verify_timeline.zig");
 
 pub const Config = struct {
     /// Requested native draft depth (capped by the head's block size).
@@ -815,7 +815,7 @@ pub fn Loop(comptime G: type) type {
 const testing = std.testing;
 const TraceOps = ops.TraceOps;
 const routes = @import("routes.zig");
-const xp = @import("experts.zig");
+const xp = @import("../../../sdk/weights/streamed/experts.zig");
 
 /// Host reads of a scripted run: routed ids from a PRNG, the prompt's pick,
 /// and per cycle the draft ids, their sigmoid confidences, the verify

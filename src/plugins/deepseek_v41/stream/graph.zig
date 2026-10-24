@@ -11,10 +11,10 @@ const std = @import("std");
 const env = @import("mlx_host").env;
 const sdk = @import("sdk");
 const v41 = @import("deepseek_v41.zig");
-const ops = @import("ops.zig");
+const ops = @import("../../../sdk/weights/streamed/ops.zig");
 const kvc = @import("cache.zig");
 const xk = @import("../../../sdk/quant/exl3/stream/kernels.zig");
-const kr = @import("kernel_routes.zig");
+const kr = @import("../../../sdk/quant/exl3/stream/kernel_routes.zig");
 
 const Dtype = ops.Dtype;
 

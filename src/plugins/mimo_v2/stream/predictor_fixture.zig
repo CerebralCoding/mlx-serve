@@ -6,7 +6,7 @@ const stream_mod = @import("stream.zig");
 const bank_mod = @import("bank.zig");
 const math = @import("math.zig").Math;
 const expert = @import("../../../sdk/weights/streamed/sdk_ext.zig").expert;
-const ops = @import("../../deepseek_v41/stream/ops.zig");
+const ops = @import("../../../sdk/weights/streamed/ops.zig");
 
 test "mimo lookahead: F32 promotion precedes borrowed transposed sigmoid correction" {
     var g: ScalarOps = .{};

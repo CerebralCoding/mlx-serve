@@ -6,11 +6,11 @@
 
 const std = @import("std");
 const host_caps = @import("../../../sdk/weights/streamed/host_caps.zig");
-const v41 = @import("../../deepseek_v41/stream/deepseek_v41.zig");
+const checkpoint = @import("../../../sdk/weights/streamed/checkpoint.zig");
 
-/// The shard headers of a pack (`deepseek_v41.Checkpoint`: 8-byte length + JSON, never tensor data).
-pub const Checkpoint = v41.Checkpoint;
-pub const StDtype = v41.StDtype;
+/// The shard headers of a pack (`sdk/weights/streamed/checkpoint.zig`: 8-byte length + JSON, never tensor data).
+pub const Checkpoint = checkpoint.Checkpoint;
+pub const StDtype = checkpoint.StDtype;
 pub const Diag = @import("sdk").Diag;
 
 pub const model_type = "glm_moe_dsa";
@@ -108,7 +108,7 @@ pub const Refusal = error{
     TensorUnexpected,
     ExpertsInResidents,
 };
-pub const Error = Refusal || v41.Error;
+pub const Error = Refusal || checkpoint.Error;
 
 fn refuse(diag: ?*Diag, err: Refusal, comptime fmt: []const u8, args: anytype) Refusal {
     if (diag) |d| d.set(fmt, args);

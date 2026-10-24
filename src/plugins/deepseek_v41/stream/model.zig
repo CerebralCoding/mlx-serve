@@ -11,16 +11,16 @@
 
 const std = @import("std");
 const v41 = @import("deepseek_v41.zig");
-const ops = @import("ops.zig");
+const ops = @import("../../../sdk/weights/streamed/ops.zig");
 const graph = @import("graph.zig");
-const kr = @import("kernel_routes.zig");
+const kr = @import("../../../sdk/quant/exl3/stream/kernel_routes.zig");
 const kvc = @import("cache.zig");
 const eng = @import("engram.zig");
 const xk = @import("../../../sdk/quant/exl3/stream/kernels.zig");
 const routes = @import("routes.zig");
 const expert_policy = @import("../../../sdk/weights/streamed/sdk_ext.zig").expert.policy;
 /// PROFILE builds only: P1's read-ahead record (compiles to nothing otherwise).
-const prof = @import("prefill_timers.zig");
+const prof = @import("../../../sdk/weights/streamed/profile/prefill_timers.zig");
 const ngram = @import("../../../sdk/weights/streamed/ngram_table.zig");
 
 /// K16: each chunk's DSpark main tap is evaluated in its chunk fence (`forwardLayerMajor`), so the tap's mean does
@@ -1725,7 +1725,7 @@ test "dsv41 model: the K16 profile charges a chunk's carry-over to its own stage
 }
 
 test "dsv41 model: the AR dry path routes every layer call of every forward through the expert source" {
-    const xp = @import("experts.zig");
+    const xp = @import("../../../sdk/weights/streamed/experts.zig");
     const m = try Mini.init();
     defer m.deinit();
     var g = TraceOps.init(testing.allocator);
@@ -1794,7 +1794,7 @@ test "dsv41 model: the AR dry path routes every layer call of every forward thro
 }
 
 test "dsv41 model: a prompt forward wider than a route takes runs every layer's routed call through the wide lane" {
-    const xp = @import("experts.zig");
+    const xp = @import("../../../sdk/weights/streamed/experts.zig");
     const quant = @import("../../../sdk/weights/streamed/sdk_ext.zig").quant;
     const m = try Mini.init();
     defer m.deinit();
@@ -1857,7 +1857,7 @@ test "dsv41 model: a prompt forward wider than a route takes runs every layer's 
 }
 
 test "dsv41 model: P1: each layer's predictor pass counts its chunks' predicted ids, hands the seed's ranking to the hook, and the call lands it before routing" {
-    const xp = @import("experts.zig");
+    const xp = @import("../../../sdk/weights/streamed/experts.zig");
     const quant = @import("../../../sdk/weights/streamed/sdk_ext.zig").quant;
     const m = try Mini.init();
     defer m.deinit();
@@ -1932,7 +1932,7 @@ test "dsv41 model: P1: each layer's predictor pass counts its chunks' predicted 
 }
 
 test "dsv41 model: P1 in the one-span prompt pass: every layer's predictor runs before its call and the read-ahead lands before routing; a decode forward predicts nothing" {
-    const xp = @import("experts.zig");
+    const xp = @import("../../../sdk/weights/streamed/experts.zig");
     const quant = @import("../../../sdk/weights/streamed/sdk_ext.zig").quant;
     const m = try Mini.init();
     defer m.deinit();

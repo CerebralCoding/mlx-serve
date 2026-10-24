@@ -5,7 +5,7 @@
 //! (`size_allocated - size_in_use`, what the host-relief route could return) is read from inside the process, per zone.
 //! `HOST_HEAP {...}` and the receipt's `host_heap`.
 const std = @import("std");
-const dt = @import("decode_timers.zig");
+const dt = @import("../../../sdk/weights/streamed/profile/decode_timers.zig");
 
 pub const enabled = dt.enabled;
 

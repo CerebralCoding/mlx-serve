@@ -7,9 +7,9 @@
 
 const std = @import("std");
 const mlx = @import("sdk").mlx;
-const xk = @import("../../../sdk/quant/exl3/stream/kernels.zig");
-const sdk_ext = @import("../../../sdk/weights/streamed/sdk_ext.zig");
-const selfcheck = @import("../../../sdk/quant/exl3/stream/selfcheck.zig");
+const xk = @import("kernels.zig");
+const sdk_ext = @import("../../../weights/streamed/sdk_ext.zig");
+const selfcheck = @import("selfcheck.zig");
 const kr = sdk_ext.kernels.Routes(xk);
 const ks = sdk_ext.kernels.KernelSet(xk);
 

@@ -4,7 +4,7 @@
 //! after the draft block's own eval (no extra sync), and folded into static storage; printed after the decode
 //! (`DRAFT_ROUTE_HIST` per stage, `DRAFT_ROUTE_LRU`) and written whole into the receipt (`draftStreamJson`).
 const std = @import("std");
-const dt = @import("decode_timers.zig");
+const dt = @import("../../../sdk/weights/streamed/profile/decode_timers.zig");
 
 pub const enabled = dt.enabled;
 

@@ -27,7 +27,7 @@ const mlx = @import("sdk").mlx;
 const io_util = @import("sdk").io_util;
 const xk = @import("decode_kernels.zig");
 const ref = @import("decode_kernels_ref.zig");
-const ops = @import("../../deepseek_v41/stream/ops.zig");
+const ops = @import("../../../sdk/weights/streamed/ops.zig");
 const quant = @import("../../../sdk/weights/streamed/sdk_ext.zig").quant;
 
 const testing = std.testing;

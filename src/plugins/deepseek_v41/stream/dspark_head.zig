@@ -10,11 +10,11 @@
 const std = @import("std");
 const kset = @import("../../../sdk/weights/streamed/sdk_ext/kernel_set.zig");
 const v41 = @import("deepseek_v41.zig");
-const ops = @import("ops.zig");
+const ops = @import("../../../sdk/weights/streamed/ops.zig");
 const graph = @import("graph.zig");
 const mdl = @import("model.zig");
 const xk = @import("../../../sdk/quant/exl3/stream/kernels.zig");
-const kr = @import("kernel_routes.zig");
+const kr = @import("../../../sdk/quant/exl3/stream/kernel_routes.zig");
 const draft_routes = @import("draft_routes.zig");
 
 /// Bytes of one DSpark head expert (gate, up and down, mxfp4 with one e8m0

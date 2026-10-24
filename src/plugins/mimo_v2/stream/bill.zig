@@ -13,13 +13,13 @@ const prefill_math = @import("math.zig");
 const kv = @import("kv.zig");
 const mtp_mod = @import("mtp.zig");
 const io_util = sdk.io_util;
-const dsv_bill = @import("../../deepseek_v41/stream/bill.zig");
+const phase_mem = @import("../../../sdk/weights/streamed/phase_memory.zig");
 const prefill_attention = @import("prefill_attention.zig");
 // The same ARM64 16 KiB CPU/GPU wiring geometry as DeepSeek on this host.
-const wireTables = dsv_bill.wireTables;
+const wireTables = phase_mem.wireTables;
 /// DeepSeek's measured wiring cost per live buffer (`deepseek_v41_bill.zig` `wire_buffer_bytes`: the largest
 /// construction reading over the buffers live there). The device constant is shared; the buffer counts are MiMo's.
-pub const wire_buffer_bytes = dsv_bill.wire_buffer_bytes;
+pub const wire_buffer_bytes = phase_mem.wire_buffer_bytes;
 const Term = sdk.MemoryBill.Term;
 const log = std.log.scoped(.mimo);
 

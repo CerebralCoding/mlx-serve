@@ -13,11 +13,11 @@
 const std = @import("std");
 const env = @import("mlx_host").env;
 const mlx = @import("sdk").mlx;
-const xk = @import("../../../sdk/quant/exl3/stream/kernels.zig");
+const xk = @import("../../quant/exl3/stream/kernels.zig");
 const sdk = @import("sdk");
-const sdk_ext = @import("../../../sdk/weights/streamed/sdk_ext.zig");
-const first_cycle = @import("decode_first.zig");
-const prefill_timers = @import("prefill_timers.zig");
+const sdk_ext = @import("sdk_ext.zig");
+const first_cycle = @import("profile/decode_first.zig");
+const prefill_timers = @import("profile/prefill_timers.zig");
 
 /// G7: the package's profile probes, injected into the quant and the kernel registry through the backend type
 /// (`sdk_ext.profile.of`); every probe compiles to nothing outside the profile builds.

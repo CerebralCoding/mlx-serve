@@ -4,8 +4,8 @@
 //! timer, branch or counter).
 
 const std = @import("std");
-const bo = @import("../../../sdk/weights/streamed/build_flags.zig");
-const sdk_ext = @import("../../../sdk/weights/streamed/sdk_ext.zig");
+const bo = @import("../build_flags.zig");
+const sdk_ext = @import("../sdk_ext.zig");
 
 pub const enabled: bool = if (@hasDecl(bo, "dsv41_prefill_timers")) bo.dsv41_prefill_timers else false;
 
@@ -32,7 +32,7 @@ pub var wide_calls: u64 = 0;
 /// (the top of its ranking the layer's empty rows hold), the admissions and reads, the predicted experts no empty row
 /// took (blocked: every row held by a resident), and at the barrier the hits, the seed's demand records and their
 /// predicted counts against the cut (the last predicted rank's count): within x0.8-1.25 (near) or beyond (far).
-pub const max_layers = @import("deepseek_v41.zig").max_layers;
+pub const max_layers = @import("decode_timers.zig").max_layers;
 pub const max_experts = 512;
 pub const ReadAheadLayer = struct { predicted: u32 = 0, admitted: u32 = 0, posted: u32 = 0, blocked: u32 = 0, cut: u32 = 0, hits: u32 = 0, demand: u32 = 0, near: u32 = 0, far: u32 = 0 };
 pub var ra: [max_layers]ReadAheadLayer = @splat(.{});

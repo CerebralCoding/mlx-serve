@@ -12,7 +12,7 @@ const arm_mod = @import("arm.zig");
 const settings = @import("settings.zig");
 const expert_bank = @import("../../../sdk/weights/streamed/expert/bank.zig");
 const dsl = @import("dspark_loop.zig");
-const xp = @import("experts.zig");
+const xp = @import("../../../sdk/weights/streamed/experts.zig");
 const plugin = @import("plugin.zig");
 
 const testing = std.testing;
