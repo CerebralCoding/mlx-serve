@@ -172,7 +172,9 @@ const steps = [_]Step{
     .{ .ids = &.{88} },
     .{ .ids = &.{ 5, 61, 200 }, .verify = true, .accept = 1 },
     .{ .ids = &.{12} },
-    .{ .ids = &.{ 9, 33, 77, 140, 2 }, .verify = true, .accept = 4 },
+    // A rollback keeps fewer rows than the verify wrote (`accepted < drafts`, as every round does): the last row of a
+    // state sequence is never written, so a full accept never rolls back.
+    .{ .ids = &.{ 9, 33, 77, 140, 2 }, .verify = true, .accept = 3 },
     .{ .ids = &.{64} },
     .{ .ids = &.{ 6, 7, 8, 9 }, .verify = true, .accept = 0 },
     .{ .ids = &ids(6, 5) },
