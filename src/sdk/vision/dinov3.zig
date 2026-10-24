@@ -10,7 +10,6 @@
 const std = @import("std");
 const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
 const scope_mod = @import("../../mlx/scope.zig");
 const qvis = @import("qwen_vision.zig");
 
@@ -18,6 +17,7 @@ const A = mlx.mlx_array;
 const Scope = scope_mod.Scope;
 const Linear = scope_mod.Linear;
 const Weights = @import("../weights/resident.zig").Weights;
+const loadWeightsFile = @import("../weights/resident.zig").loadWeightsFile;
 const NONE = A{ .ctx = null };
 
 const FINAL_LN_EPS: f32 = 1e-5;
@@ -84,7 +84,7 @@ pub const Encoder = struct {
         const r = parsed.value;
         if (r.use_gated_mlp) return error.UnsupportedDinov3;
         if (r.hidden_size % r.num_attention_heads != 0 or (r.hidden_size / r.num_attention_heads) % 4 != 0) return error.UnsupportedDinov3;
-        const w = try model_mod.loadWeightsFile(gpa, dir, "model.safetensors");
+        const w = try loadWeightsFile(gpa, dir, "model.safetensors");
         return load(gpa, w, .{
             .hidden = r.hidden_size,
             .heads = r.num_attention_heads,
@@ -280,7 +280,7 @@ test "dinov3 oracle: every token matches transformers' DINOv3ViTModel on a tiny 
     defer gpa.free(dir);
     var enc = try Encoder.open(io, gpa, dir);
     defer enc.deinit();
-    var fx = try model_mod.loadWeightsFile(gpa, fixtures, "dinov3.safetensors");
+    var fx = try loadWeightsFile(gpa, fixtures, "dinov3.safetensors");
     defer fx.deinit();
 
     const s = mlx.gpuStream();

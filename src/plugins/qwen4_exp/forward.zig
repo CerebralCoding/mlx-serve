@@ -568,7 +568,7 @@ test "qwen4 fixture vision: tower parity, pre-tile splice + M-RoPE prefill/decod
     xfm.compileQwen4Hc();
     xfm.compileGdnGate();
     xfm.compileMoeRouting();
-    var qv = try qwen_vision.QwenVision.init(allocator, config, &weights);
+    var qv = try qwen_vision.QwenVision.init(allocator, .of(&config), &weights);
     defer qv.deinit();
 
     var fx = try model_mod.loadWeightsSingleFile(allocator, std.mem.span(fixture_path));

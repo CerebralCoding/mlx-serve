@@ -12,8 +12,6 @@
 const std = @import("std");
 const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
-const ModelConfig = model_mod.ModelConfig;
 const Weights = @import("../weights/resident.zig").Weights;
 const log = @import("../../host/log.zig");
 
@@ -617,7 +615,24 @@ pub const QwenVision = struct {
     merger_fc2_w: mlx.mlx_array,
     merger_fc2_b: mlx.mlx_array,
 
-    pub fn init(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !QwenVision {
+    /// The tower's geometry as a config declares it (`qv_*`).
+    pub const Geometry = struct {
+        patch: u32,
+        temporal_patch: u32,
+        depth: u32,
+        hidden: u32,
+        heads: u32,
+        head_dim: u32,
+        merge: u32,
+        num_pos_emb: u32,
+        out_hidden: u32,
+
+        pub fn of(cfg: anytype) Geometry {
+            return .{ .patch = cfg.qv_patch, .temporal_patch = cfg.qv_temporal_patch, .depth = cfg.qv_depth, .hidden = cfg.qv_hidden, .heads = cfg.qv_heads, .head_dim = cfg.qv_head_dim, .merge = cfg.qv_merge, .num_pos_emb = cfg.qv_num_pos_emb, .out_hidden = cfg.qv_out_hidden };
+        }
+    };
+
+    pub fn init(allocator: std.mem.Allocator, config: Geometry, weights: *const Weights) !QwenVision {
         const s = mlx.mlx_default_gpu_stream_new();
         var buf: [256]u8 = undefined;
         var kbuf: [256]u8 = undefined;
@@ -646,8 +661,8 @@ pub const QwenVision = struct {
         std.debug.assert(cw_shape.len == 5);
         const out_c = cw_shape[0];
         const flat_in = cw_shape[1] * cw_shape[2] * cw_shape[3] * cw_shape[4];
-        const layout = patchProjLayout(cw_shape, config.qv_temporal_patch, config.qv_patch) orelse {
-            log.warn("QWEN VISION: unreadable patch_embed.proj.weight shape (tps={d}, ps={d})\n", .{ config.qv_temporal_patch, config.qv_patch });
+        const layout = patchProjLayout(cw_shape, config.temporal_patch, config.patch) orelse {
+            log.warn("QWEN VISION: unreadable patch_embed.proj.weight shape (tps={d}, ps={d})\n", .{ config.temporal_patch, config.patch });
             return error.MissingVisionWeights;
         };
         log.info("[vision] qwen patch_embed layout: {s}\n", .{@tagName(layout)});
@@ -669,7 +684,7 @@ pub const QwenVision = struct {
         const patch_b = try must(weights, &buf, fmtKey(&kbuf, prefix, "patch_embed.proj.bias"));
         const pos_embed = try must(weights, &buf, fmtKey(&kbuf, prefix, "pos_embed.weight"));
 
-        const depth = config.qv_depth;
+        const depth = config.depth;
         var blocks = try allocator.alloc(QBlock, depth);
         errdefer allocator.free(blocks);
         for (0..depth) |i| {
@@ -693,12 +708,12 @@ pub const QwenVision = struct {
             .s = s,
             .allocator = allocator,
             .depth = depth,
-            .hidden = config.qv_hidden,
-            .heads = config.qv_heads,
-            .head_dim = config.qv_head_dim,
-            .merge = config.qv_merge,
-            .num_grid_per_side = @intFromFloat(@sqrt(@as(f64, @floatFromInt(config.qv_num_pos_emb)))),
-            .out_hidden = config.qv_out_hidden,
+            .hidden = config.hidden,
+            .heads = config.heads,
+            .head_dim = config.head_dim,
+            .merge = config.merge,
+            .num_grid_per_side = @intFromFloat(@sqrt(@as(f64, @floatFromInt(config.num_pos_emb)))),
+            .out_hidden = config.out_hidden,
             .patch_w = patch_w,
             .patch_b = patch_b,
             .pos_embed = pos_embed,
@@ -1760,11 +1775,12 @@ test "qwen vision parity vs reference embeddings (QWEN_VISION_TEST_MODEL)" {
     const alloc = std.testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
 
+    const model_mod = @import("../../engines/mlx/model.zig");
     const config = try model_mod.parseConfig(io, alloc, dir);
     try std.testing.expect(config.qwen_vision);
     var weights = try model_mod.loadWeightsWithVision(io, alloc, dir);
     defer weights.deinit();
-    var qv = try QwenVision.init(alloc, config, &weights);
+    var qv = try QwenVision.init(alloc, .of(&config), &weights);
     defer qv.deinit();
 
     // Reference pixel_values [N, C*tps*ps*ps] and post-merger embeddings.

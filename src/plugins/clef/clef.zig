@@ -631,7 +631,7 @@ pub const Engine = struct {
         errdefer _ = mlx.mlx_closure_free(self.gelu);
         try mlx.check(mlx.mlx_compile(&self.gelu, raw_gelu, true));
         self.vision = if (self.config.qwen_vision and qwen_vision.resolveVisionPrefix(&self.weights) != null)
-            try qwen_vision.QwenVision.init(a, self.config, &self.weights)
+            try qwen_vision.QwenVision.init(a, .of(&self.config), &self.weights)
         else
             null;
         return self;

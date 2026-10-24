@@ -484,7 +484,7 @@ pub const VisionEncoder = struct {
     }
 
     fn initQwen(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !VisionEncoder {
-        const qv = try qwen_vision.QwenVision.init(allocator, config, weights);
+        const qv = try qwen_vision.QwenVision.init(allocator, .of(&config), weights);
         log.info("Vision encoder: Qwen3-VL ViT (depth={d}, hidden={d}, heads={d}, merge={d}, out_hidden={d})\n", .{
             config.qv_depth, config.qv_hidden, config.qv_heads, config.qv_merge, config.qv_out_hidden,
         });
