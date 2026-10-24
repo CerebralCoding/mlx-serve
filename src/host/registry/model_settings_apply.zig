@@ -21,6 +21,7 @@ pub fn applyModelSettings(config: *ModelConfig, chat_config: *ChatConfig, o: *mo
     config.int8_prefill_override = o.int8_prefill;
     config.lm_head_mxfp8_override = o.lm_head_mxfp8;
     config.ane_override = o.aneChoice();
+    config.stream_experts_override = o.stream_experts;
     config.drafter_override = o.drafter;
     o.drafter = null;
     chat_config.chat_template_kwargs = o.chat_template_kwargs;

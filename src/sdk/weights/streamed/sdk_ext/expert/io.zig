@@ -28,6 +28,7 @@ const c = if (builtin.os.tag == .macos) struct {
     pub extern fn q3ld_direct_config(on: i32) c_int;
     pub extern fn q3ld_start(nw: i32, staging_ptrs: [*]const u64, sbytes: i64, psize: i64, res: [*]i64, n_tickets: i64, log: [*]i64, n_log: i64, gauge: *[6]i64) c_int;
     pub extern fn q3ld_submit(fd: i32, file_size: i64, deadline: i64, n: i32, ngu: i32, ndown: i32, offsets: [*]const i64, rows: [*]const [*]const u64, lens: [*]const i64, first: i64) c_int;
+    pub extern fn q3ld_submit_scatter(n: i32, ngu: i32, ndown: i32, fds: [*]const i32, sizes: [*]const i64, offsets: [*]const i64, rows: [*]const [*]const u64, lens: [*]const i64, first: i64) c_int;
     pub extern fn q3ld_withdraw(first: i64) c_int;
     pub extern fn q3ld_spec_step_len(fd: i32, file_size: i64, cur: i64, n: i32, bases: ?[*]const i64, len: i64) i32;
     pub extern fn q3ld_spec_step_lens(fd: i32, file_size: i64, cur: i64, n: i32, bases: ?[*]const i64, lens: ?[*]const i64) i32;
@@ -66,7 +67,7 @@ pub const test_abi = if (builtin.is_test) struct {
 
 /// The C pool's ABI (`q3ld_abi`): 2026101401, DIRECT reads as a construction-time route (2026101201: the submit-wide
 /// WITHDRAW over the range-job queue).
-pub const abi_version = 2026101401;
+pub const abi_version = 2026102401;
 pub const max_workers = 8;
 /// Records per job (one fill unit).
 pub const max_items = 8;
@@ -495,6 +496,13 @@ pub const Pool = struct {
             self.published[@intCast(t)] = true;
         }
     }
+
+    /// The first of `count` tickets in [lo, hi) for the next submit, wrapping to `lo` (the log drained first).
+    fn claimTickets(self: *Pool, lo: u32, hi: u32, next: *u32, count: u32) u32 {
+        self.drain();
+        if (next.* + count > hi) next.* = lo;
+        return next.*;
+    }
 };
 
 test "mimo sdk2 stageB shared: phase quiescence rejects unbounded deadlines before touching the native pool" {
@@ -535,13 +543,38 @@ pub fn Records(comptime components: usize, comptime gate_up: usize) type {
             return submitOn(pool, 0, pool.demand_tickets, &pool.next_ticket, fd, gu_offsets, down_offsets, rows, lens);
         }
 
+        /// A part's place in a pack whose parts live apart (`submitScatter`): its file and offset.
+        pub const Part = struct { fd: UncachedFd, offset: u64 };
+
+        /// `submit` for records whose parts are not contiguous: part `c` of record `i` read from `parts[i][c]`. The
+        /// tickets are `submit`'s; no speculative or pre-read class serves them.
+        pub fn submitScatter(pool: *Pool, parts: []const [components]Part, rows: []const Rows, lens: *const Rows) !u32 {
+            const n = rows.len;
+            if (n == 0 or n > max_items or parts.len != n) return error.InvalidJob;
+            var fds: [max_items * components]i32 = undefined;
+            var sizes: [max_items * components]i64 = undefined;
+            var offsets: [max_items * components]i64 = undefined;
+            var row_ptrs: [max_items][*]const u64 = undefined;
+            for (parts, 0..) |rec, i| {
+                for (rec, 0..) |p, k| {
+                    fds[i * components + k] = p.fd.fd;
+                    sizes[i * components + k] = @intCast(p.fd.size);
+                    offsets[i * components + k] = @intCast(p.offset);
+                }
+                row_ptrs[i] = &rows[i];
+            }
+            var lens_i: [components]i64 = undefined;
+            for (lens.*, &lens_i) |l, *li| li.* = @intCast(l);
+            const first = pool.claimTickets(0, pool.demand_tickets, &pool.next_ticket, @intCast(2 * n));
+            try submitted(pool, first, @intCast(2 * n), c.q3ld_submit_scatter(@intCast(n), gate_up, components - gate_up, &fds, &sizes, &offsets, &row_ptrs, &lens_i, first), &pool.next_ticket);
+            return first;
+        }
+
         fn submitOn(pool: *Pool, lo: u32, hi: u32, next: *u32, fd: UncachedFd, gu_offsets: []const u64, down_offsets: []const u64, rows: []const Rows, lens: *const Rows) !u32 {
             const n = rows.len;
             if (n == 0 or n > max_items or gu_offsets.len != n or down_offsets.len != n) return error.InvalidJob;
             const count: u32 = @intCast(2 * n);
-            pool.drain();
-            if (next.* + count > hi) next.* = lo;
-            const first = next.*;
+            const first = pool.claimTickets(lo, hi, next, count);
             var offsets: [2 * max_items]i64 = undefined;
             var row_ptrs: [max_items][*]const u64 = undefined;
             for (0..n) |i| {
@@ -551,7 +584,12 @@ pub fn Records(comptime components: usize, comptime gate_up: usize) type {
             }
             var lens_i: [components]i64 = undefined;
             for (lens.*, &lens_i) |l, *li| li.* = @intCast(l);
-            switch (c.q3ld_submit(fd.fd, @intCast(fd.size), no_deadline, @intCast(n), gate_up, components - gate_up, &offsets, &row_ptrs, &lens_i, first)) {
+            try submitted(pool, first, count, c.q3ld_submit(fd.fd, @intCast(fd.size), no_deadline, @intCast(n), gate_up, components - gate_up, &offsets, &row_ptrs, &lens_i, first), next);
+            return first;
+        }
+
+        fn submitted(pool: *Pool, first: u32, count: u32, rc: c_int, next: *u32) !void {
+            switch (rc) {
                 0 => {},
                 -2 => return error.TicketsBusy,
                 -3 => return error.QueueFull,
@@ -559,7 +597,6 @@ pub fn Records(comptime components: usize, comptime gate_up: usize) type {
             }
             @memset(pool.published[first..][0..count], false);
             next.* = first + count;
-            return first;
         }
 
         /// Arms the pre-read class with one geometry's component lengths (needs the speculative class). The pool

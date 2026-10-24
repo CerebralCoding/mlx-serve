@@ -242,7 +242,7 @@ pub fn mlp(w: *const Moe.Weights, parent: *Graph, x: Array) !Array {
         const xs = ops.shape(x);
         if (xs[0] * xs[1] <= f.rows) if (try f.run(f, w, g.s, x, r.inds, r.scores)) |y| return parent.keep(try g.adopt(y));
     }
-    const y = try routedExperts(w, g, x, r, shared_down);
+    const y = try routedExperts(w, g, x, r, shared_down, null);
     if (y.shared_fused) return parent.keep(y.sum);
     const se = w.shared orelse return parent.keep(y.sum);
     if (!se.gated()) return parent.keep(try g.add(y.sum, try sharedDown(w, g, &se, x)));
@@ -256,11 +256,14 @@ pub fn mlp(w: *const Moe.Weights, parent: *Graph, x: Array) !Array {
 pub fn routedSum(w: *const Moe.Weights, parent: *Graph, x: Array, inds: Array, scores: Array) !Array {
     var t = parent.scope();
     defer t.deinit();
-    return parent.keep((try routedExperts(w, &t, x, .{ .inds = inds, .scores = scores }, null)).sum);
+    return parent.keep((try routedExperts(w, &t, x, .{ .inds = inds, .scores = scores }, null, null)).sum);
 }
 
-/// The routed experts' sum; `shared_fused` when the kernel added the shared expert (`shared_down`) itself.
-fn routedExperts(w: *const Moe.Weights, g: *Graph, x: Array, r: Routed, shared_down: ?Array) !struct { sum: Array, shared_fused: bool } {
+const Summed = struct { sum: Array, shared_fused: bool };
+
+/// The routed experts' sum; `shared_fused` when the kernel added the shared expert (`shared_down`) itself. `slots`: `w`'s
+/// banks hold a streamed call's experts, whose sorted arm runs on the call's slot banks (`sortedSlots`).
+fn routedExperts(w: *const Moe.Weights, g: *Graph, x: Array, r: Routed, shared_down: ?Array, slots: ?SlotCall) anyerror!Summed {
     const xs = ops.shape(x);
     const B = xs[0];
     const S = xs[1];
@@ -283,7 +286,7 @@ fn routedExperts(w: *const Moe.Weights, g: *Graph, x: Array, r: Routed, shared_d
         out = try formatSwiglu(w, &fb, g, x, r);
         reduced = true;
     } else if (w.streamed) |*st| {
-        const y = try streamedRouted(w, st, g, x, r, fp4_shared, cuda_fmt != null);
+        const y = try streamedRouted(w, st, g, x, r, shared_down, fp4_shared, cuda_fmt != null);
         out = y.out;
         reduced = y.reduced;
         shared_fused = y.shared_fused;
@@ -308,7 +311,7 @@ fn routedExperts(w: *const Moe.Weights, g: *Graph, x: Array, r: Routed, shared_d
         reduced = true;
     } else if (do_sort) {
         gather_qmv_rows.moeStats().moe_sorted_layers +%= 1;
-        const s = try sorted(w, g, x, r, B, S, D, K);
+        const s = if (slots) |sc| try sortedSlots(w, g, x, r, sc.sl, sc.n, B, S, D, K) else try sorted(w, g, x, r, B, S, D, K);
         out = s.out;
         reduced = s.reduced;
     } else if (B * S == 1 and useGatherQmv(w) and w.gate.s.ctx != null and w.up.s.ctx != null and w.down.s.ctx != null and
@@ -596,34 +599,49 @@ fn rows2(g: *Graph, y: Array, n: c_int) !Array {
 // ── streamed experts ──
 
 /// A call's slot banks (`routed.Fetched`): per bank its gate, up and down at the pack's quant params, and per routed
-/// pair (`inds`' order) its bank and row.
+/// pair (the fetched ids' order) its bank and row.
 const Slots = struct { banks: [3]?[3]Bank = @splat(null), kind: []const u8, row: []const u32 };
 
-fn fetchSlots(w: *const Moe.Weights, st: *const Streamed, g: *Graph, inds: Array) !Slots {
+/// A streamed call's slots and the call's routed pairs, whose count sets the sorted gathers' kernel class.
+const SlotCall = struct { sl: *const Slots, n: usize };
+
+/// The routes `inds` as host expert ids (owned by `g.a`).
+fn hostIds(g: *Graph, inds: Array) ![]u16 {
     const host = try g.astype(inds, .uint32);
     try mlx.check(mlx.mlx_array_eval(host));
     const n = mlx.mlx_array_size(host);
     if (n > routed.max_call_ids) return error.StreamedCallTooWide;
     const src = (mlx.mlx_array_data_uint32(host) orelse return error.NoData)[0..n];
     const ids = try g.a.alloc(u16, n);
-    defer g.a.free(ids);
     for (ids, src) |*d, v| d.* = @intCast(v);
+    return ids;
+}
+
+fn fetchSlots(w: *const Moe.Weights, st: *const Streamed, ids: []const u16) !Slots {
     const f = try st.routed.math.trunk(st.routed.ctx, st.layer, ids);
     var out: Slots = .{ .kind = f.kind, .row = f.row };
     for (f.banks, &out.banks) |maybe, *o| if (maybe) |bk| {
         o.* = .{
-            .{ .w = bk.gate.w, .s = bk.gate.scales, .qp = w.gate.qp },
-            .{ .w = bk.up.w, .s = bk.up.scales, .qp = w.up.qp },
-            .{ .w = bk.down.w, .s = bk.down.scales, .qp = w.down.qp },
+            .{ .w = bk.gate.w, .s = bk.gate.scales, .b = bk.gate.biases, .qp = w.gate.qp },
+            .{ .w = bk.up.w, .s = bk.up.scales, .b = bk.up.biases, .qp = w.up.qp },
+            .{ .w = bk.down.w, .s = bk.down.scales, .b = bk.down.biases, .qp = w.down.qp },
         };
     };
     return out;
 }
 
-/// The routed experts of a streamed bank: the source's sum (`source`), or (`trunk`) the arm the in-memory banks take,
-/// run on the call's slot banks so each pair's rows and the k-sum's order are that arm's. An arm whose kernels read
-/// one bank only is refused by name.
-fn streamedRouted(w: *const Moe.Weights, st: *const Streamed, g: *Graph, x: Array, r: Routed, shared: ?moe_affine4.Shared, cuda: bool) !Sorted {
+/// Distinct experts among `ids`.
+fn distinctCount(ids: []const u16) usize {
+    var seen = std.StaticBitSet(1 << 16).empty;
+    for (ids) |e| seen.set(e);
+    return seen.count();
+}
+
+/// The routed experts of a streamed bank: the source's sum (`source`), or (`trunk`) the in-memory arms run on the call's
+/// slots, so each pair's rows and the k-sum's order are the arm's over the in-memory banks: one token and the rows arm
+/// on one bank holding the call's experts (`slotArms`), the sorted gathers on the slot banks a group of experts at a
+/// time (`sortedGroups`).
+fn streamedRouted(w: *const Moe.Weights, st: *const Streamed, g: *Graph, x: Array, r: Routed, shared_down: ?Array, fp4_shared: ?moe_affine4.Shared, cuda: bool) anyerror!Sorted {
     const xs = ops.shape(x);
     const B = xs[0];
     const S = xs[1];
@@ -636,22 +654,168 @@ fn streamedRouted(w: *const Moe.Weights, st: *const Streamed, g: *Graph, x: Arra
         },
         .trunk => {},
     }
-    const gq = w.gate.qp;
-    const uq = w.up.qp;
-    const dq = w.down.qp;
     if (cuda) return error.StreamedArmUnsupported;
     if (w.gate.expert_scale.ctx != null or w.up.expert_scale.ctx != null) return error.StreamedExpertScales;
-    const sl = try fetchSlots(w, st, g, r.inds);
-    if (moe_decode.moeFp4DecodeEligible(B * S, false, w.clamp, ops.dtype(x), gq.mode, uq.mode, dq.mode)) {
-        if (try fp4DecodeSlots(w, g, x, r, &sl, shared)) |y| return .{ .out = y, .reduced = true, .shared_fused = shared != null };
+    const ids = try hostIds(g, r.inds);
+    defer g.a.free(ids);
+    const n: usize = ids.len;
+    const gq = w.gate.qp;
+    if (moe_decode.moeFp4DecodeEligible(B * S, false, w.clamp, ops.dtype(x), gq.mode, w.up.qp.mode, w.down.qp.mode)) {
+        const sl = try fetchSlots(w, st, ids);
+        if (try fp4DecodeSlots(w, g, x, r, &sl, fp4_shared)) |y| return .{ .out = y, .reduced = true, .shared_fused = fp4_shared != null };
+        return slotArms(w, g, x, r, &sl, shared_down, n);
     }
-    const one_bank_kernels = (B * S == 1 and (w.clamp orelse 1) == 0 and gq.mode == .affine and uq.mode == .affine and dq.mode == .affine) or
-        (gather_qmv_rows.moeDecodeDispatchArm(B, S, K, false, (w.clamp orelse 1) != 0) == .rows and useGatherQmv(w) and
-            down_reduce.gatherQmvDownReduceRowsEligible(HiddenAct.silu, gq, uq, dq, D));
-    if (one_bank_kernels) return error.StreamedArmUnsupported;
-    if (B * S > 1 or B * S * K >= 64) return sortedSlots(w, g, x, r, &sl, B, S, D, K);
-    if (useGatherQmv(w) and (gq.mode == .affine or gq.mode == .nvfp4)) return error.StreamedArmUnsupported;
-    return unsortedSlots(w, g, x, &sl, B, S, D, K);
+    const one_row = B * S == 1;
+    const rows_arm = gather_qmv_rows.moeDecodeDispatchArm(B, S, K, false, (w.clamp orelse 1) != 0) == .rows;
+    if (!one_row and !rows_arm) return sortedGroups(w, st, g, x, r, ids, B, S, D, K);
+    if (distinctCount(ids) <= routed.max_call_experts) return slotArms(w, g, x, r, &(try fetchSlots(w, st, ids)), shared_down, n);
+    return rowChunks(w, st, g, x, r, ids, B, S, D, K);
+}
+
+/// The in-memory arms of `routedExperts` on a bank holding the call's experts (`callBank`), every pair's route its row
+/// there; the sorted arm on the slot banks themselves, in the class of the call's `n` pairs.
+fn slotArms(w: *const Moe.Weights, g: *Graph, x: Array, r: Routed, sl: *const Slots, shared_down: ?Array, n: usize) anyerror!Sorted {
+    const k = ops.shape(r.inds).len;
+    const cb = try callBank(g, sl, ops.shape(r.inds)[0..k]);
+    var wv = w.*;
+    wv.gate = cb.banks[0];
+    wv.up = cb.banks[1];
+    wv.down = cb.banks[2];
+    wv.bank_views = null;
+    wv.streamed = null;
+    const y = try routedExperts(&wv, g, x, .{ .inds = cb.inds, .scores = r.scores, .gate_logit = r.gate_logit }, shared_down, .{ .sl = sl, .n = n });
+    return .{ .out = y.sum, .reduced = true, .shared_fused = y.shared_fused };
+}
+
+/// One bank holding the call's experts and each pair's row in it (`shape`: the routes'): the slot bank itself when
+/// every pair sits in one, else the call's slots gathered from their banks (a pair's rows are a copy of its slot's).
+fn callBank(g: *Graph, sl: *const Slots, shape: []const c_int) !struct { banks: [3]Bank, inds: Array } {
+    const n = sl.kind.len;
+    const first = sl.kind[0];
+    const one = for (sl.kind) |k| {
+        if (k != first) break false;
+    } else true;
+    if (one) return .{ .banks = sl.banks[first].?, .inds = try g.fromSlice(u32, sl.row, shape) };
+    const at = try g.a.alloc(u32, n);
+    defer g.a.free(at);
+    var taken: [3]std.ArrayList(u32) = @splat(.empty);
+    defer for (&taken) |*t| t.deinit(g.a);
+    for (sl.kind, sl.row, at) |b, row, *o| {
+        const i = std.mem.indexOfScalar(u32, taken[b].items, row) orelse blk: {
+            try taken[b].append(g.a, row);
+            break :blk taken[b].items.len - 1;
+        };
+        o.* = @intCast(i);
+    }
+    var base: [3]u32 = undefined;
+    var total: u32 = 0;
+    for (taken, &base) |t, *bs| {
+        bs.* = total;
+        total += @intCast(t.items.len);
+    }
+    for (sl.kind, at) |b, *o| o.* += base[b];
+    var banks: [3]Bank = undefined;
+    for (&banks, 0..) |*out, p| {
+        var parts: [3][3]Array = undefined;
+        var np: usize = 0;
+        for (sl.banks, taken) |maybe, t| if (t.items.len > 0) {
+            const bk = &maybe.?[p];
+            const rows = try g.fromSlice(u32, t.items, &.{@intCast(t.items.len)});
+            parts[np] = .{ try g.take(bk.w, rows, 0), try g.take(bk.s, rows, 0), if (bk.b.ctx != null) try g.take(bk.b, rows, 0) else .{ .ctx = null } };
+            np += 1;
+        };
+        var cat: [3]Array = undefined;
+        for (0..3) |c| {
+            if (parts[0][c].ctx == null) {
+                cat[c] = .{ .ctx = null };
+                continue;
+            }
+            var list: [3]Array = undefined;
+            for (parts[0..np], list[0..np]) |pt, *l| l.* = pt[c];
+            cat[c] = try g.concat(list[0..np], 0);
+        }
+        out.* = .{ .w = cat[0], .s = cat[1], .b = cat[2], .qp = sl.banks[first].?[p].qp };
+    }
+    return .{ .banks = banks, .inds = try g.fromSlice(u32, at, shape) };
+}
+
+/// A call of 2..8 rows whose experts outnumber one fetch: its rows in chunks of at least two (the arm the whole call
+/// takes; each row's sum is its own), each fetched, run and evaluated before the next.
+fn rowChunks(w: *const Moe.Weights, st: *const Streamed, g: *Graph, x: Array, r: Routed, ids: []const u16, B: c_int, S: c_int, D: c_int, K: c_int) anyerror!Sorted {
+    const rows: usize = @intCast(B * S);
+    const k: usize = @intCast(K);
+    const per = routed.max_call_experts / k;
+    if (per < 2) return error.StreamedCallTooWide;
+    const chunks = std.math.divCeil(usize, rows, per) catch unreachable;
+    const xf = try g.reshape(x, &.{ B * S, D });
+    const inds = try g.reshape(r.inds, &.{ B * S, K });
+    const scores = try g.reshape(r.scores, &.{ B * S, K });
+    var outs: std.ArrayList(Array) = .empty;
+    defer outs.deinit(g.a);
+    var lo: usize = 0;
+    for (0..chunks) |c| {
+        const hi = rows * (c + 1) / chunks;
+        const m: c_int = @intCast(hi - lo);
+        const sh: [2]c_int = if (B == 1) .{ 1, m } else .{ m, 1 };
+        const lo_i: c_int = @intCast(lo);
+        const hi_i: c_int = @intCast(hi);
+        const rc: Routed = .{
+            .inds = try g.reshape(try g.sliceAxis(inds, 0, lo_i, hi_i), &.{ sh[0], sh[1], K }),
+            .scores = try g.reshape(try g.sliceAxis(scores, 0, lo_i, hi_i), &.{ sh[0], sh[1], K }),
+        };
+        const sl = try fetchSlots(w, st, ids[lo * k .. hi * k]);
+        const y = try slotArms(w, g, try g.reshape(try g.sliceAxis(xf, 0, lo_i, hi_i), &.{ sh[0], sh[1], D }), rc, &sl, null, ids.len);
+        const yr = try g.reshape(y.out, &.{ m, D });
+        try mlx.check(mlx.mlx_array_eval(yr));
+        try outs.append(g.a, yr);
+        lo = hi;
+    }
+    return .{ .out = try g.reshape(try g.concat(outs.items, 0), &.{ B, S, D }), .reduced = true };
+}
+
+/// `sorted` on a streamed bank: the call's distinct experts a fetch's worth at a time, each group's pairs gathered on its
+/// slot banks in the class of the whole call (`slotDown`) and evaluated before the next group's fetch, the rows put back
+/// in the router's order and weighted and summed as `sorted` does.
+fn sortedGroups(w: *const Moe.Weights, st: *const Streamed, g: *Graph, x: Array, r: Routed, ids: []const u16, B: c_int, S: c_int, D: c_int, K: c_int) anyerror!Sorted {
+    const a = g.a;
+    const n = ids.len;
+    var experts = std.StaticBitSet(1 << 16).empty;
+    for (ids) |e| experts.set(e);
+    const x_flat = try g.reshape(x, &.{ B * S, D });
+    const order = try a.alloc(u32, n);
+    defer a.free(order);
+    const group_ids = try a.alloc(u16, n);
+    defer a.free(group_ids);
+    var parts: std.ArrayList(Array) = .empty;
+    defer parts.deinit(a);
+    var at: usize = 0;
+    var it = experts.iterator(.{});
+    var group = std.StaticBitSet(1 << 16).empty;
+    var more = true;
+    while (more) {
+        group = std.StaticBitSet(1 << 16).empty;
+        var count: usize = 0;
+        while (count < routed.max_call_experts) : (count += 1) group.set(it.next() orelse {
+            more = false;
+            break;
+        });
+        if (count == 0) break;
+        const first = at;
+        for (ids, 0..) |e, i| if (group.isSet(e)) {
+            order[at] = @intCast(i);
+            group_ids[at - first] = e;
+            at += 1;
+        };
+        const sl = try fetchSlots(w, st, group_ids[0 .. at - first]);
+        const d = try slotDown(w, g, x_flat, &sl, order[first..at], n, K);
+        try mlx.check(mlx.mlx_array_eval(d));
+        try parts.append(a, d);
+    }
+    const inv = try a.alloc(u32, n);
+    defer a.free(inv);
+    for (order, 0..) |p, j| inv[p] = @intCast(j);
+    const down = try g.take(try g.concat(parts.items, 0), try g.fromSlice(u32, inv, &.{@intCast(n)}), 0);
+    return sortedSum(g, down, try g.arange(0, @floatFromInt(n), 1, .uint32), r.scores, B, S, K);
 }
 
 /// The slot banks present, in order, and each pair's index among them (`kinds`).
@@ -686,26 +850,35 @@ fn fp4DecodeSlots(w: *const Moe.Weights, g: *Graph, x: Array, r: Routed, sl: *co
     return try g.reshape(try g.adopt(v), &.{ xs[0], xs[1], xs[2] });
 }
 
-/// `sorted` over the slot banks, each gather in the kernel class `sorted` takes. MLX and the NAX gathers choose it by
-/// rows per expert, `n / E` over a bank of `E` rows, and within a class a row's sums are its own. In the row-block
-/// class (`q = n / experts` >= 4) a bank's pairs run, sorted by row, in calls of `B` pairs with `B / E` = q (padded
-/// with row 0's); below it, unsorted (the per-pair kernel, as MLX runs a sorted call there).
-fn sortedSlots(w: *const Moe.Weights, g: *Graph, x: Array, r: Routed, sl: *const Slots, B: c_int, S: c_int, D: c_int, K: c_int) !Sorted {
+/// `sorted` over the slot banks for a call of `n` pairs.
+fn sortedSlots(w: *const Moe.Weights, g: *Graph, x: Array, r: Routed, sl: *const Slots, n: usize, B: c_int, S: c_int, D: c_int, K: c_int) !Sorted {
+    const pairs = try g.a.alloc(u32, sl.kind.len);
+    defer g.a.free(pairs);
+    for (pairs, 0..) |*p, i| p.* = @intCast(i);
+    const down = try slotDown(w, g, try g.reshape(x, &.{ B * S, D }), sl, pairs, n, K);
+    return sortedSum(g, down, try g.arange(0, @floatFromInt(pairs.len), 1, .uint32), r.scores, B, S, K);
+}
+
+/// The down rows `[pairs.len, D]` of a call's pairs `pairs` (flat router indices, pair i at slot `sl.kind[i]` /
+/// `sl.row[i]`), in `pairs`' order, each gather in the kernel class `sorted` takes for the whole call of `n` pairs. MLX
+/// and the NAX gathers choose it by rows per expert, `n / E` over a bank of `E` rows, and within a class a row's sums are
+/// its own. In the row-block class (`q = n / experts` >= 4) a bank's pairs run, sorted by row, in calls of `B` pairs
+/// with `B / E` = q (padded with row 0's); below it, unsorted (the per-pair kernel, as MLX runs a sorted call there).
+fn slotDown(w: *const Moe.Weights, g: *Graph, x_flat: Array, sl: *const Slots, pairs: []const u32, n: usize, K: c_int) !Array {
     const a = g.a;
-    const n: usize = @intCast(B * S * K);
+    const m = pairs.len;
     const q: usize = n / @as(usize, @intCast(w.experts));
     const blocked = n >= 16 and q >= 4;
-    const x_flat = try g.reshape(x, &.{ B * S, D });
-    const inv = try a.alloc(u32, n);
+    const inv = try a.alloc(u32, m);
     defer a.free(inv);
-    const own = try a.alloc(u32, n);
+    const own = try a.alloc(u32, m);
     defer a.free(own);
     var parts: std.ArrayList(Array) = .empty;
     defer parts.deinit(a);
     var at: u32 = 0;
     for (sl.banks, 0..) |maybe, b| if (maybe) |*bk| {
         var cnt: usize = 0;
-        for (0..n) |i| if (sl.kind[i] == b) {
+        for (0..m) |i| if (sl.kind[i] == b) {
             own[cnt] = @intCast(i);
             cnt += 1;
         };
@@ -728,54 +901,19 @@ fn sortedSlots(w: *const Moe.Weights, g: *Graph, x: Array, r: Routed, sl: *const
             defer a.free(tok_rows);
             @memset(tok_rows, 0);
             for (own[off..][0..take_n], pad..) |i, j| {
-                tok_rows[j] = i / @as(u32, @intCast(K));
+                tok_rows[j] = pairs[i] / @as(u32, @intCast(K));
                 tok_rows[calls + j] = sl.row[i];
                 inv[i] = at + @as(u32, @intCast(j));
             }
-            const m: c_int = @intCast(calls);
-            const lhs = try g.fromSlice(u32, tok_rows[0..calls], &.{m});
-            const idx = try g.fromSlice(u32, tok_rows[calls..], &.{m});
+            const c: c_int = @intCast(calls);
+            const lhs = try g.fromSlice(u32, tok_rows[0..calls], &.{c});
+            const idx = try g.fromSlice(u32, tok_rows[calls..], &.{c});
             try parts.append(a, try sortedDown(w, g, x_flat, lhs, &bk[0], &bk[1], &bk[2], idx, blocked, blocked));
             at += @intCast(calls);
             off += take_n;
         }
     };
-    const down = try g.take(try g.concat(parts.items, 0), try g.fromSlice(u32, inv, &.{@intCast(n)}), 0);
-    return sortedSum(g, down, try g.arange(0, @floatFromInt(n), 1, .uint32), r.scores, B, S, K);
-}
-
-/// The last arm (`mlp`'s unsorted gathers) on each slot bank, a pair's rows taken from its own bank's call.
-fn unsortedSlots(w: *const Moe.Weights, g: *Graph, x: Array, sl: *const Slots, B: c_int, S: c_int, D: c_int, K: c_int) !Sorted {
-    const n: usize = @intCast(B * S * K);
-    const rows = try g.a.alloc(u32, n);
-    defer g.a.free(rows);
-    const on = try g.a.alloc(bool, n);
-    defer g.a.free(on);
-    var idx: [3]Array = undefined;
-    var mask: [3]Array = undefined;
-    for (sl.banks, 0..) |maybe, b| if (maybe != null) {
-        for (0..n) |i| {
-            on[i] = sl.kind[i] == b;
-            rows[i] = if (on[i]) sl.row[i] else 0;
-        }
-        idx[b] = try g.fromSlice(u32, rows, &.{ B, S, K });
-        mask[b] = try g.fromSlice(bool, on, &.{ B, S, K, 1, 1 });
-    };
-    const Pick = struct {
-        fn gather(gg: *Graph, s: *const Slots, xin: Array, proj: usize, ix: *const [3]Array, mk: *const [3]Array) !Array {
-            var acc: ?Array = null;
-            for (s.banks, 0..) |maybe, b| if (maybe) |*bk| {
-                const y = try expertMm(gg, xin, &bk[proj], .{ .ctx = null }, ix[b], false);
-                acc = if (acc) |prev| try gg.where(mk[b], y, prev) else y;
-            };
-            return gg.call(mlx.mlx_squeeze, .{acc orelse return error.StreamedNoBank});
-        }
-    };
-    const x5 = try g.reshape(x, &.{ B, S, 1, 1, D });
-    const gate = try Pick.gather(g, sl, x5, 0, &idx, &mask);
-    const up = try Pick.gather(g, sl, x5, 1, &idx, &mask);
-    const act = try g.expandDims(try geglu(w, g, gate, up), -2);
-    return .{ .out = try Pick.gather(g, sl, act, 2, &idx, &mask), .reduced = false };
+    return g.take(try g.concat(parts.items, 0), try g.fromSlice(u32, inv, &.{@intCast(m)}), 0);
 }
 
 var route_pack_logged = false;

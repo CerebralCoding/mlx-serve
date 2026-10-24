@@ -10,6 +10,7 @@ const log = @import("../../sdk/util/log.zig");
 const mtp_acceptance = @import("../../engines/mlx/spec/mtp_acceptance.zig");
 const generation = @import("../api/generation_settings.zig");
 const engine_pick = @import("../../sdk/quant/gguf/engine_pick.zig");
+const streamed = @import("../../sdk/weights/streamed.zig");
 
 /// What can serve a model; the per-model `engine` setting (Model Settings' engine picker) and each
 /// `/v1/models` row's `engines` use these names. No setting leaves the choice to the server.
@@ -27,6 +28,8 @@ pub const Override = struct {
     lm_head_mxfp8: ?bool = null,
     /// Serve this model on the Neural Engine (`arch/ane_lm.zig`) instead of the GPU.
     ane: ?bool = null,
+    /// Stream the routed experts from the pack as downloaded: `true`, or the slot rows per layer.
+    stream_experts: ?streamed.Setting = null,
     /// The engine serving the model; outranks `ane` and, on a GGUF, `--engine`.
     engine: ?Engine = null,
     /// Extra template variables as a JSON object (vLLM/llama.cpp
@@ -38,7 +41,7 @@ pub const Override = struct {
 
     pub fn isEmpty(o: Override) bool {
         return o.ctx_size == null and o.kv_quant == null and o.mtp == null and o.mtp_acceptance == null and
-            o.mtp_greedy_tail == null and o.int8_prefill == null and o.lm_head_mxfp8 == null and o.ane == null and o.engine == null and o.chat_template_kwargs == null and o.drafter == null;
+            o.mtp_greedy_tail == null and o.int8_prefill == null and o.lm_head_mxfp8 == null and o.ane == null and o.stream_experts == null and o.engine == null and o.chat_template_kwargs == null and o.drafter == null;
     }
 
     /// Whether the model runs on the Neural Engine: the engine setting's choice, else the `ane` switch.
@@ -191,6 +194,7 @@ fn fromValue(alloc: std.mem.Allocator, v: std.json.Value) Override {
         .bool => |b| o.ane = b,
         else => {},
     };
+    if (obj.get("stream_experts")) |se| o.stream_experts = streamed.Setting.of(se);
     if (obj.get("engine")) |e| if (e == .string) {
         o.engine = std.meta.stringToEnum(Engine, e.string);
     };
@@ -368,7 +372,8 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
             o.drafter = null;
         };
     };
-    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} greedy_tail={s} int8={s} lm_head_mxfp8={s} ane={s} engine={s} drafter={s} kwargs={s}\n", .{
+    var rows_buf: [16]u8 = undefined;
+    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} greedy_tail={s} int8={s} lm_head_mxfp8={s} ane={s} stream_experts={s} engine={s} drafter={s} kwargs={s}\n", .{
         model_path,
         o.ctx_size orelse 0,
         if (o.kv_quant) |k| k.wireName() else "default",
@@ -378,6 +383,10 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
         if (o.int8_prefill) |b| (if (b) "on" else "off") else "default",
         if (o.lm_head_mxfp8) |b| (if (b) "on" else "off") else "default",
         if (o.ane) |b| (if (b) "on" else "off") else "default",
+        if (o.stream_experts) |x| switch (x) {
+            .on => "on",
+            .rows => |n| std.fmt.bufPrint(&rows_buf, "{d} rows", .{n}) catch "on",
+        } else "off",
         if (o.engine) |e| @tagName(e) else "auto",
         o.drafter orelse "auto",
         o.chat_template_kwargs orelse "none",
@@ -531,6 +540,18 @@ test "model_settings: lm_head_mxfp8 is a boolean, anything else is unset" {
     try std.testing.expectEqual(@as(?bool, false), s.lookup(t, "/m/b").lm_head_mxfp8);
     try std.testing.expect(!s.lookup(t, "/m/b").isEmpty());
     try std.testing.expect(s.lookup(t, "/m/c").isEmpty());
+}
+
+test "model_settings: stream_experts is true or a row count, anything else is unset" {
+    var s = try parse(std.testing.allocator,
+        \\{"/m/a": {"stream_experts": true}, "/m/b": {"stream_experts": 32}, "/m/c": {"stream_experts": false}, "/m/d": {"stream_experts": "on"}}
+    );
+    defer s.deinit();
+    const t = std.testing.allocator;
+    try std.testing.expectEqual(@as(?streamed.Setting, .on), s.lookup(t, "/m/a").stream_experts);
+    try std.testing.expectEqual(@as(?streamed.Setting, .{ .rows = 32 }), s.lookup(t, "/m/b").stream_experts);
+    try std.testing.expect(s.lookup(t, "/m/c").isEmpty());
+    try std.testing.expect(s.lookup(t, "/m/d").isEmpty());
 }
 
 test "model_settings: bad values ignored, bad JSON = empty" {

@@ -74,6 +74,7 @@ test {
     _ = @import("plugins/qwen3_5/served_test.zig");
     _ = @import("plugins/qwen3_5/mtp_test.zig");
     _ = @import("plugins/qwen3_5/ane_test.zig");
+    _ = @import("plugins/qwen3_5/streamed_test.zig");
     _ = @import("plugins/flint/proof_test.zig");
     _ = @import("plugins/llama/proof_test.zig");
     _ = @import("engines/mlx/kv/cache_ops.zig");
@@ -93,6 +94,7 @@ test {
     _ = @import("sdk/quant/gguf/claim.zig");
     if (@import("build_options").mlx_stream) _ = @import("engines/mlx/modules/stream_glue.zig");
     _ = @import("sdk/weights/streamed/dupes_test.zig");
+    _ = @import("sdk/weights/streamed/mlx_pack_test.zig");
     _ = @import("plugins/deepseek_v41/stream/dupes_test.zig");
     _ = @import("version.zig");
     _ = @import("mlx/ops.zig");
