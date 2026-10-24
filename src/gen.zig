@@ -2826,8 +2826,8 @@ pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     if (text.len == 0) return sendError(conn, 400, "empty 'input'");
 
     // Optional reference voice for zero-shot cloning: `ref_audio` is a base64
-    // WAV (24 kHz mono, the app normalizes it). Decode → f32 samples. Ignored
-    // (plain voice) when the model has no speaker encoder or the WAV is bad.
+    // WAV (24 kHz mono, the app normalizes it). Reject unusable references
+    // before synthesis or SSE headers rather than silently changing the voice.
     var ref_samples: ?[]f32 = null;
     defer if (ref_samples) |r| allocator.free(r);
     if (extractJsonString(body, "ref_audio")) |raw_ref| {
@@ -2845,10 +2845,10 @@ pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
                         log.info("[audio] ref decode {d:.2} ms; reference voice: {d} samples → cloning\n", .{ @as(f64, @floatFromInt(dec_ns)) / 1e6, samples.len });
                     } else {
                         allocator.free(samples);
-                        log.warn("[audio] model has no speaker encoder — ignoring ref_audio\n", .{});
+                        return sendError(conn, 400, "ref_audio requires a model with a speaker encoder");
                     }
-                } else |e| log.warn("[audio] ref_audio WAV decode failed: {} — plain voice\n", .{e});
-            } else |e| log.warn("[audio] ref_audio base64 decode failed: {} — plain voice\n", .{e});
+                } else |_| return sendError(conn, 400, "ref_audio is not a decodable WAV");
+            } else |_| return sendError(conn, 400, "ref_audio is not valid base64");
         }
     }
 

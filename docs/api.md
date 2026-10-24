@@ -78,7 +78,7 @@ Every media endpoint takes `"stream": true` for SSE progress ending in a base64 
 On `POST /v1/audio/speech`, Qwen3-TTS uses `ref_audio` (a base64-encoded WAV) to produce a speaker embedding. This is not transcript-conditioned cloning:
 
 - The current backend does not read `language` or `ref_text`. Sending these fields does not select a language or supply a reference transcript. The `language` option on `/v1/audio/transcriptions` does not apply to speech generation.
-- During normal synthesis, invalid base64/WAV or a model without a speaker encoder falls back to the plain voice. A successful response alone does not prove the reference voice was applied.
+- A non-empty `ref_audio` must be a decodable WAV and the model must have a speaker encoder. Invalid base64/WAV or a missing encoder returns HTTP 400 before synthesis or SSE headers. Omit `ref_audio` (or send an empty string) to use the plain voice.
 - To check a reference without generating speech, send `"warm_only": true` with `ref_audio` to the same endpoint. Missing or undecodable reference audio and a missing speaker encoder return HTTP 400 instead of silently falling back. This checks reference handling, not pronunciation or accent quality.
 
 ### Qwen-Image transparent PNG output
