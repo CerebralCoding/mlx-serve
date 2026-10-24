@@ -17,6 +17,8 @@ const compiled = @import("../../sdk/bases/blocks/compiled.zig");
 const row_exact = @import("../../sdk/bases/blocks/row_exact.zig");
 const naxAvailable = @import("../../mlx/device.zig").naxAvailable;
 const rht = @import("../../sdk/quant/hadamard/rht.zig");
+const lane_qmm = @import("../../sdk/blocks/qmm/lane_qmm.zig");
+const log = @import("../../sdk/util/log.zig");
 const prism_seam = @import("../prism_hadamard_qwen35/seam.zig");
 const weights_mod = @import("../../sdk/weights/load.zig");
 const ld = @import("../qwen3/load.zig");
@@ -73,7 +75,7 @@ pub const table = abi.ModelTable{
     .unload = &unload,
     .forward = &forward,
     .cache = &.{ .layout = &config.layout },
-    .spec = &.{ .head = &head_hooks, .trunk_weight = &trunkWeight },
+    .spec = &.{ .head = &head_hooks, .trunk_weight = &trunkWeight, .tile_lanes = &tileLanes },
     .weights = &.{ .layer_weight = &layerWeight },
 };
 
@@ -118,6 +120,7 @@ pub const Loaded = struct {
     head: ?mtp.Head = null,
 
     fn release(m: *Loaded) void {
+        lane_qmm.release(@intFromPtr(m));
         if (m.head) |*h| h.deinit();
         switch (m.body) {
             .none => {},
@@ -313,6 +316,51 @@ fn fitAll(ls: []const *const Linear) bool {
     for (ls) |l| if (!row_exact.fits(l)) return false;
     return true;
 }
+
+/// `SpecHooks.tile_lanes`: the dense trunk's projections on the `.mma` lane re-ordered in place (`lane_qmm.tileInPlace`),
+/// joined groups with their parts' row views; the head and the table keep MLX's layout (other readers).
+fn tileLanes(mp: *anyopaque, lane: u32) callconv(.c) Verdict {
+    const m: *Loaded = @ptrCast(@alignCast(mp));
+    const d = switch (m.body) {
+        .dense => |*d| d,
+        else => return .ok,
+    };
+    if (lane != @intFromEnum(row_exact.Lane.mma) or d.base.row_exact != .mma) return .ok;
+    const t: Tiler = .{ .owner = @intFromPtr(m), .s = d.base.s };
+    var bytes: u64 = 0;
+    for (d.layers) |*L| {
+        bytes += t.layer(L) catch |e| return ld.failed(e);
+    }
+    if (bytes > 0) log.info("[lane] trunk projections tiled in place ({d:.1} GB, no copy)\n", .{@as(f64, @floatFromInt(bytes)) / (1 << 30)});
+    return .ok;
+}
+
+const Tiler = struct {
+    owner: usize,
+    s: mlx.mlx_stream,
+
+    fn layer(t: Tiler, L: *const Dense.Layer) !u64 {
+        var sum: u64 = switch (L.mixer) {
+            .first => |*g| (if (g.combined) 0 else try t.group(&g.in, &.{ &g.qkv, &g.qkv_parts[0], &g.qkv_parts[1], &g.qkv_parts[2], &g.z, &g.a, &g.b })) + try t.one(&g.out, &.{}),
+            .second => |*a| try t.group(&a.qkv, &.{ &a.q.lin, &a.k.lin, &a.v.lin }) + try t.one(&a.o.lin, &.{}),
+        };
+        sum += try t.group(&L.mlp.gu, &.{ &L.mlp.gate, &L.mlp.up });
+        return sum + try t.one(&L.mlp.down, &.{});
+    }
+
+    fn one(t: Tiler, l: *const Linear, widths: []const c_int) !u64 {
+        if (l.w.ctx == null or l.s.ctx == null or l.mode != .affine) return 0;
+        return lane_qmm.tileInPlace(t.owner, l.w, l.s, l.b, l.bits, l.group_size, widths, t.s);
+    }
+
+    /// A joined group tiles once, with its parts' row views (the parts are views of it); unjoined parts one by one.
+    fn group(t: Tiler, j: *const b.linear.Joined, parts: []const *const Linear) !u64 {
+        if (j.built()) return t.one(&j.lin, j.widths[0 .. std.mem.indexOfScalar(c_int, &j.widths, 0) orelse j.widths.len]);
+        var sum: u64 = 0;
+        for (parts) |p| sum += try t.one(p, &.{});
+        return sum;
+    }
+};
 
 /// A norm weight as base `D` holds it: `Prism`'s carries the registry and whether its reader needs it unrotated.
 fn normOf(comptime D: type, m: *const Loaded, w: Array, want_normed: bool) @FieldType(D.Layer, "input_norm") {

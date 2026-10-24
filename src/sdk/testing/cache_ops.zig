@@ -158,6 +158,7 @@ fn state(h: abi.Handle, layer: u32, which: abi.StateSlot) callconv(.c) abi.Array
         .ssm => l.ssm,
         .conv_input => l.conv_input,
         .state_seq => l.state_seq,
+        .state_in, .prework_k, .prework_v, .prework_gb => Array{ .ctx = null },
     });
 }
 
@@ -168,6 +169,7 @@ fn setState(h: abi.Handle, layer: u32, which: abi.StateSlot, value: abi.Array) c
         .ssm => &l.ssm,
         .conv_input => &l.conv_input,
         .state_seq => &l.state_seq,
+        .state_in, .prework_k, .prework_v, .prework_gb => return abi.Verdict.refuse(.unsupported, "no draft-tree state"),
     };
     var r = mlx.mlx_array_new();
     _ = mlx.mlx_array_set(&r, mx(value));

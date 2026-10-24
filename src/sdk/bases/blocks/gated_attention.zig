@@ -2,8 +2,8 @@
 //! (YaRN-scaled where the pack asks, M-RoPE rows on an image chunk), causal attention over the slot's KV cache and a
 //! sigmoid output gate. Decode rows take the fused norm+RoPE kernels (hd 128 and 256), prompt chunks the hd-256
 //! prefill kernel; batched rows rope each slot at its own position and read per slot or padded.
-//! copied_from: sdk/blocks/attention/gated_full.zig (`gatedFullAttnProjected` without the qwen4 QSA, spec-tree
-//! and grouped-verify arms), sdk/blocks/attention/proj.zig (`attnProj`), sdk/blocks/rope/mrope.zig
+//! copied_from: sdk/blocks/attention/gated_full.zig (`gatedFullAttnProjected` without the qwen4 QSA and
+//! grouped-verify arms), sdk/blocks/attention/proj.zig (`attnProj`), sdk/blocks/rope/mrope.zig
 //! (`applyMrope`), sdk/blocks/rope/yarn.zig (`yarnScaleQK`).
 
 const mlx = @import("../../../mlx/ffi.zig");
@@ -172,14 +172,18 @@ fn mix(w: *const GatedAttention.Weights, c: *Ctx, x: Array) !Array {
         };
         k_rope = try g.adopt(pair[1]);
     }
-    // The hd-256 kernel serves decode and verify widths; YaRN's factor rides the angle rows.
+    // The hd-256 kernel serves decode and verify widths; YaRN's factor rides the angle rows. A tree row sits at the
+    // slot's position + its depth.
     if (q_rope == null and fusable and hd == 256 and s <= 32) blk: {
-        const ang = qk_rope.angles(c, w.angles, family, rd, geo.base(), geo.yarn_freqs, off, s, mscale, 1.0) catch break :blk;
+        const tree_rows: ?c_int = if (c.tree) |t| t.attn.max_depth + 1 else null;
+        var ang = qk_rope.angles(c, w.angles, family, rd, geo.base(), geo.yarn_freqs, off, tree_rows orelse s, mscale, 1.0) catch break :blk;
+        if (c.tree) |t| ang = try g.reshape(try g.take(try g.reshape(ang, &.{ tree_rows.?, rd }), t.attn.depth, 0), &.{s * rd});
         const none = Array{ .ctx = null };
         const r = (try qk_rope.fused256(g, queries, k_r, none, w.q_norm, w.k_norm, none, ang, c.shared.eps_arr, h, kvh, s, rd)) orelse break :blk;
         q_rope = r[0];
         k_rope = r[1];
     }
+    if (q_rope == null and c.tree != null) return error.SpecTreeUnsupported;
     if (q_rope == null) {
         const q_t = try g.transpose(try g.rmsNorm(queries, w.q_norm, c.shared.eps), &perm);
         const k_t = try g.transpose(try g.rmsNorm(k_r, w.k_norm, c.shared.eps), &perm);
@@ -220,6 +224,8 @@ fn soloRead(c: *Ctx, q: Array, k: Array, v: Array, s: c_int, scale: f32) !Array 
     const mode: []const u8 = if (c.wide()) "causal" else "";
     const none = Array{ .ctx = null };
     var out: ?Array = null;
+    // A tree's rows read their own ancestors' keys only (the packed kernels read a chain).
+    if (c.tree) |t| return try row_exact.attendFixed(c.row_exact, g, q, dv.k, dv.v, scale, s, t.attn) orelse error.SpecTreeUnsupported;
     if (view.packed_reads and kvq.kvAttnFusedEligible(&dv, s)) {
         out = try own(g, try kvq.qkvAttnDecodeKernel(g.s, q, &dv, scale, mode, none));
         if (out != null) kvq.logKvAttnFusedEngaged(&dv, q, s);
@@ -227,7 +233,7 @@ fn soloRead(c: *Ctx, q: Array, k: Array, v: Array, s: c_int, scale: f32) !Array 
         out = try own(g, try kvq.qkvAttnVerifyKernel(g.s, q, &dv, scale, mode));
     }
     if (out) |o| return o;
-    if (try row_exact.attendFixed(c.row_exact, g, q, dv.k, dv.v, scale, s)) |o| return o;
+    if (try row_exact.attendFixed(c.row_exact, g, q, dv.k, dv.v, scale, s, null)) |o| return o;
     if (try row_exact.attend(c.row_exact, g, q, dv.k, dv.v, scale, s)) |o| return o;
     if (c.wide()) {
         if (try own(g, try attn256.fusedSdpa256Prefill(g.s, q, dv.k, dv.v, scale, 0))) |o| return o;

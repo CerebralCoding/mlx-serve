@@ -7,6 +7,8 @@ const lane_qmm = @import("../../../sdk/blocks/qmm/lane_qmm.zig");
 const naxAvailable = @import("../../../mlx/device.zig").naxAvailable;
 const gdnDecodeRecurEnabled = @import("../../../sdk/blocks/gdn/decode_fused.zig").gdnDecodeRecurEnabled;
 const FusedRows = @import("../../../sdk/blocks/linear/fused_rows.zig").FusedRows;
+const row_exact = @import("../../../sdk/bases/blocks/row_exact.zig");
+const log = @import("../../../sdk/util/log.zig");
 const Transformer = @import("../transformer.zig").Transformer;
 
 /// Project a hidden state through the trunk's lm_head, dense (no argmax
@@ -21,8 +23,19 @@ pub fn lmHeadForDraft(self: *const Transformer, x: mlx.mlx_array) !mlx.mlx_array
 /// layout, in the weight's own buffer (no copy stays resident): the exact
 /// path reads them there at every width, the prompt path through the same
 /// layout. The lm_head and embeddings keep MLX's layout (other readers).
+/// A served model tiles its own projections (`SpecHooks.tile_lanes`) and logs what it tiled; 0 is returned.
 pub fn tileLaneWeights(self: *Transformer) !u64 {
     if (!naxAvailable() or !self.config.rowExactDecode() or self.rht != null or self.actDtype() != .bfloat16) return 0;
+    if (self.plugin) |b| {
+        const tile = (b.table.spec orelse return 0).tile_lanes orelse return 0;
+        try mlx.check(mlx.mlx_synchronize(self.s));
+        const v = tile(b.model, @intFromEnum(row_exact.Lane.mma));
+        if (!v.isOk()) {
+            log.err("[plugin] {s}: tiling the trunk's lane weights failed: {s}\n", .{ b.table.name.slice(), v.why.slice() });
+            return error.PluginTileFailed;
+        }
+        return 0;
+    }
     const layers = self.moe_layers orelse return 0;
     try mlx.check(mlx.mlx_synchronize(self.s));
     const owner = @intFromPtr(self);
@@ -69,7 +82,8 @@ pub fn tileLaneWeights(self: *Transformer) !u64 {
 /// follows a row's ancestors (row-exact kernels, the GDN fold).
 pub fn specTreeSupported(self: *const Transformer) bool {
     // The tree verify's GDN kernels are Metal-only; elsewhere a tree round fails, so draft chains.
-    return self.config.rowExactDecode() and self.moe_layers != null and self.rht == null and gdnDecodeRecurEnabled() and mlx.metalKernelsAvailable();
+    const forward = if (self.config.plugin) |pb| self.plugin != null and pb.parsed.caps.spec_tree else self.moe_layers != null;
+    return self.config.rowExactDecode() and forward and self.rht == null and gdnDecodeRecurEnabled() and mlx.metalKernelsAvailable();
 }
 
 /// The quantized head's first `rows` vocab rows only (a draft vocabulary).

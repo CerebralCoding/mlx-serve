@@ -39,6 +39,10 @@ pub const Run = struct {
     row_exact: row_exact.Lane = .off,
     /// `Ctx.mrope`: the chunk's M-RoPE cos/sin (`Forward.mrope`).
     mrope: ?[2]Array = null,
+    /// `Ctx.tree` (`Forward.tree`).
+    tree: ?block.Tree = null,
+    /// Hand the residual to the GPU every this many layers (`Forward.pipeline_every`; 0 = never).
+    pipeline_every: u32 = 0,
     /// Media rows spliced after the embedding at the placeholder ids, from row `media_offset` (`Forward.media`).
     media: Array = .{},
     media_offset: u32 = 0,
@@ -47,7 +51,7 @@ pub const Run = struct {
     offload: ?*const abi.Offload = null,
 
     pub fn ctx(r: *const Run, g: *Graph, shared: *const block.Shared) Ctx {
-        return .{ .g = g, .mode = r.mode, .rows = r.rows, .slots = r.slots, .positions = r.positions, .caches = r.caches, .cache_ops = r.cache_ops, .shared = shared, .mask = r.mask, .capture_spec = r.capture_spec, .mrope = r.mrope, .row_exact = r.row_exact, .offload = r.offload };
+        return .{ .g = g, .mode = r.mode, .rows = r.rows, .slots = r.slots, .positions = r.positions, .caches = r.caches, .cache_ops = r.cache_ops, .shared = shared, .mask = r.mask, .capture_spec = r.capture_spec, .mrope = r.mrope, .row_exact = r.row_exact, .offload = r.offload, .tree = r.tree };
     }
 
     /// The embedded rows `h` with the media rows at their placeholders (a prompt chunk only, as the engine splices).
@@ -69,6 +73,11 @@ pub const Run = struct {
     /// Evaluates `h`, layer `layer` of `n`'s output, at the forward's eval cadence, with every slot's conv state: a
     /// conv state is a copy off the chunk, outside the residual's graph, and left lazy it holds the whole chunk.
     pub fn cadence(r: *const Run, layer: usize, n: usize, h: Array) !void {
+        if (r.eval_every == 0 and r.pipeline_every > 0 and (layer + 1) % r.pipeline_every == 0 and layer + 1 < n) {
+            const v = mlx.mlx_vector_array_new_value(h);
+            defer _ = mlx.mlx_vector_array_free(v);
+            return mlx.check(mlx.mlx_async_eval(v));
+        }
         if (r.eval_every == 0 or ((layer + 1) % r.eval_every != 0 and layer + 1 != n)) return;
         const vec = mlx.mlx_vector_array_new_value(h);
         defer _ = mlx.mlx_vector_array_free(vec);
@@ -138,6 +147,7 @@ pub fn tableForward(comptime Base: type, m: *Model(Base), f: *const abi.Forward,
     const n_ids: usize = if (f.ids.ctx != null) idCount(f.ids) else f.tokens.len;
     if (f.rows == 0 or n_ids != slots * f.rows or f.positions.len < slots) return abi.Verdict.refuse(.failed, "tokens, rows and positions disagree");
     if (f.mode == .decode and f.rows != 1) return abi.Verdict.refuse(.failed, "a decode step is one row");
+    if (f.tree.table.ctx != null and f.mode != .verify) return abi.Verdict.refuse(.failed, "a draft tree is a solo verify");
     run(Base, m, f, out, slots) catch |e| return failed(e);
     return .ok;
 }
@@ -194,6 +204,11 @@ fn run(comptime Base: type, m: *Model(Base), f: *const abi.Forward, out: *abi.Fo
         .placeholders = m.placeholders,
         .row_exact = if (f.row_exact) m.row_exact else .off,
         .offload = f.offload,
+        .tree = if (f.tree.table.ctx == null) null else .{
+            .table = .{ .ctx = f.tree.table.ctx },
+            .attn = .{ .depth = .{ .ctx = f.tree.depth.ctx }, .path = .{ .ctx = f.tree.path.ctx }, .max_depth = f.tree.max_depth },
+        },
+        .pipeline_every = f.pipeline_every,
     };
     const res = try Base.forward(&m.weights, &m.shared, &g, ids, r);
     if (caps.len > 0) {

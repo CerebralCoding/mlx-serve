@@ -273,7 +273,7 @@ pub fn unbind(b: *Bound, a: std.mem.Allocator) void {
 fn unservedFeature(xfm: *const Transformer, ctx: *const ForwardCtx) ?[]const u8 {
     if (ctx.stream_in != null) return "a pipeline rank's stream input";
     if (ctx.prefill_mask_add != null) return "an additive prefill mask";
-    if (ctx.tree != null) return "a draft tree";
+    if (ctx.tree != null and !(if (xfm.config.plugin) |pb| pb.parsed.caps.spec_tree else false)) return "a draft tree";
     if (ctx.key_pad_mask != null and !xfm.embedding_mode) return "a key padding mask";
     if (ctx.capture_stream_all != null) return "the hyper-connection stream";
     if (ctx.head_place != null) return "an MTP head placement";
@@ -385,6 +385,13 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
         .cache_ops = &cache_ops.ops,
         .eval_every = evalEvery(&xfm.config, b.positions, rows, base + rows, ctx.cache.config.scheme != .off),
         .offload = if (offload) |*o| o else null,
+        .tree = if (ctx.tree) |t| .{
+            .table = .{ .ctx = t.parents.ctx },
+            .depth = .{ .ctx = t.attn.depth.ctx },
+            .path = .{ .ctx = t.attn.path.ctx },
+            .max_depth = t.attn.max_depth,
+        } else .{},
+        .pipeline_every = ctx.pipeline_build,
     };
     var out: abi.ForwardOut = .{ .captured = &captured };
     intree.enter(ctx);

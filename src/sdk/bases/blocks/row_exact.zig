@@ -87,12 +87,13 @@ pub fn attend(lane: Lane, g: *Graph, q: Array, k: Array, v: Array, scale: f32, r
 }
 
 /// A solo window of up to `row_attn.MAX_ROWS` rows, a serial step included, through one fixed arithmetic whatever the
-/// width (`lane_attn` on NAX, else `row_attn`); null = off, or both decline.
-pub fn attendFixed(lane: Lane, g: *Graph, q: Array, k: Array, v: Array, scale: f32, rows: c_int) !?Array {
-    if (lane == .off or rows > row_attn.MAX_ROWS) return null;
+/// width (`lane_attn` on NAX, else `row_attn`); a draft tree's rows over their own ancestors' keys. Null = off, or
+/// both decline.
+pub fn attendFixed(lane: Lane, g: *Graph, q: Array, k: Array, v: Array, scale: f32, rows: c_int, tree: ?row_attn.Tree) !?Array {
+    if ((lane == .off and tree == null) or rows > row_attn.MAX_ROWS) return null;
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
-    if ((naxAvailable() and try lane_attn.sdpa(&out, q, k, v, scale, null, g.s)) or try row_attn.sdpa(&out, q, k, v, scale, null, g.s))
+    if ((naxAvailable() and try lane_attn.sdpa(&out, q, k, v, scale, tree, g.s)) or try row_attn.sdpa(&out, q, k, v, scale, tree, g.s))
         return try g.adopt(out);
     _ = mlx.mlx_array_free(out);
     return null;
