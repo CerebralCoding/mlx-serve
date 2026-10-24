@@ -104,6 +104,79 @@ pub fn gatedDeltaNetProjected(
         z_proj = values.z;
         a_proj = values.a;
         b_proj = values.b;
+    } else if (la.combined_proj) {
+        // Combined QKVZ: output is interleaved by key-head groups.
+        // Reshape to [B, S, nk, per_head], split per-head into q/k/v/z, then flatten back.
+        const vph = @divExact(num_v_heads, num_k_heads); // value heads per key head group
+        const qkvz_raw = try self.qmatmul(x, la.qkv_w, la.qkv_s, la.qkv_b);
+        defer _ = mlx.mlx_array_free(qkvz_raw);
+        const per_head = dk + dk + vph * dv + vph * dv;
+        const gh_shape = [_]c_int{ batch, seq_len, num_k_heads, per_head };
+        var qkvz_g = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(qkvz_g);
+        try mlx.check(mlx.mlx_reshape(&qkvz_g, qkvz_raw, &gh_shape, 4, self.s));
+
+        const strides4 = [_]c_int{ 1, 1, 1, 1 };
+        // q: [B,S,nk,dk]
+        var q_g = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(q_g);
+        try mlx.check(mlx.mlx_slice(&q_g, qkvz_g, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ batch, seq_len, num_k_heads, dk }, 4, &strides4, 4, self.s));
+        // k: [B,S,nk,dk]
+        var k_g = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k_g);
+        try mlx.check(mlx.mlx_slice(&k_g, qkvz_g, &[_]c_int{ 0, 0, 0, dk }, 4, &[_]c_int{ batch, seq_len, num_k_heads, dk * 2 }, 4, &strides4, 4, self.s));
+        // v: [B,S,nk,vph*dv]
+        const v_off = dk * 2;
+        const v_end = v_off + vph * dv;
+        var v_g = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(v_g);
+        try mlx.check(mlx.mlx_slice(&v_g, qkvz_g, &[_]c_int{ 0, 0, 0, v_off }, 4, &[_]c_int{ batch, seq_len, num_k_heads, v_end }, 4, &strides4, 4, self.s));
+        // z: [B,S,nk,vph*dv]
+        var z_g = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(z_g);
+        try mlx.check(mlx.mlx_slice(&z_g, qkvz_g, &[_]c_int{ 0, 0, 0, v_end }, 4, &[_]c_int{ batch, seq_len, num_k_heads, per_head }, 4, &strides4, 4, self.s));
+
+        // Flatten: q/k -> [B,S,key_dim], v/z -> [B,S,value_dim]
+        const flat3_qk = [_]c_int{ batch, seq_len, key_dim };
+        const flat3_vz = [_]c_int{ batch, seq_len, value_dim };
+        var q_flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(q_flat);
+        var k_flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k_flat);
+        var v_flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(v_flat);
+        try mlx.check(mlx.mlx_reshape(&q_flat, q_g, &flat3_qk, 3, self.s));
+        try mlx.check(mlx.mlx_reshape(&k_flat, k_g, &flat3_qk, 3, self.s));
+        try mlx.check(mlx.mlx_reshape(&v_flat, v_g, &flat3_vz, 3, self.s));
+        z_proj = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&z_proj, z_g, &flat3_vz, 3, self.s));
+
+        // Concatenate [q, k, v] -> qkv [B,S,conv_dim]
+        const qkv_arr = [_]mlx.mlx_array{ q_flat, k_flat, v_flat };
+        const qkv_vec = mlx.mlx_vector_array_new_data(&qkv_arr, 3);
+        defer _ = mlx.mlx_vector_array_free(qkv_vec);
+        qkv = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_concatenate_axis(&qkv, qkv_vec, 2, self.s));
+
+        // Combined BA: interleaved by key-head groups
+        const ba_raw = try self.qmatmul(x, la.b_w, la.b_s, la.b_b);
+        defer _ = mlx.mlx_array_free(ba_raw);
+        const ba_per_head = vph * 2;
+        const ba_shape = [_]c_int{ batch, seq_len, num_k_heads, ba_per_head };
+        var ba_g = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ba_g);
+        try mlx.check(mlx.mlx_reshape(&ba_g, ba_raw, &ba_shape, 4, self.s));
+        var b_g = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(b_g);
+        var a_g = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(a_g);
+        try mlx.check(mlx.mlx_slice(&b_g, ba_g, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ batch, seq_len, num_k_heads, vph }, 4, &strides4, 4, self.s));
+        try mlx.check(mlx.mlx_slice(&a_g, ba_g, &[_]c_int{ 0, 0, 0, vph }, 4, &[_]c_int{ batch, seq_len, num_k_heads, ba_per_head }, 4, &strides4, 4, self.s));
+        const flat3_ba = [_]c_int{ batch, seq_len, num_v_heads };
+        b_proj = mlx.mlx_array_new();
+        a_proj = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&b_proj, b_g, &flat3_ba, 3, self.s));
+        try mlx.check(mlx.mlx_reshape(&a_proj, a_g, &flat3_ba, 3, self.s));
     } else if (qwen4Standin().gdn_proj) {
         qkv = try standinOnes(&[_]c_int{ batch, seq_len, conv_dim }, self.s);
         z_proj = try standinOnes(&[_]c_int{ batch, seq_len, value_dim }, self.s);

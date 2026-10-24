@@ -23,6 +23,39 @@ const quantizeHeadMxfp8 = @import("../../sdk/quant/mxfp8.zig").quantizeHeadMxfp8
 const computeYarnFreqs = @import("../../sdk/blocks/rope/yarn.zig").computeYarnFreqs;
 const yarnSpec = @import("../../engines/mlx/methods/yarn.zig").yarnSpec;
 const mtp_nax_profile = @import("../../engines/mlx/spec/mtp_nax_profile.zig");
+const MoeLayerWeights = @import("../../engines/mlx/forward/layered.zig").MoeLayerWeights;
+const ternaryKernelCandidate = @import("../../sdk/quant/ternary.zig").ternaryKernelCandidate;
+const firstNonTernaryBias = @import("../../sdk/quant/ternary.zig").firstNonTernaryBias;
+
+/// A config field or bound weight the trunk's forward never reads (its arms are another family's), named; null when
+/// none. The plugin's config and the layer binder produce none of these for a qwen4_exp pack, so a hit is a layout
+/// the trunk has to learn before it serves it.
+pub fn unservedLayout(config: *const model.ModelConfig, layers: []const MoeLayerWeights) ?[]const u8 {
+    if (config.hadamard_block != 0) return "Hadamard rotations";
+    if (config.norm_groups > 1) return "grouped norms";
+    if (config.moe_sigmoid_router or config.moe_logit_select) return "a sigmoid router";
+    if (config.kda_vector_gate or config.kda_gate_lower_bound != 0) return "a KDA gate";
+    if (!config.kda_sigmoid_out_gate) return "a swish output gate";
+    if (config.swiglu_clamp or config.swiglu_limit != 0) return "a clamped SwiGLU";
+    if (config.hidden_act != .silu) return "a non-SiLU activation";
+    if (config.scale_embeddings) return "scaled embeddings";
+    for (layers) |*lw| {
+        if (lw.shared_mlp != null or lw.mhc_attn != null or lw.mhc_ffn != null) return "another family's layer blocks";
+        switch (lw.mlp) {
+            .moe => |*mw| {
+                if (mw.expert_bias != null) return "an expert selection bias";
+                if (mw.router_scale != null) return "a router norm scale";
+                if (mw.shared_ungated) return "an ungated shared expert";
+            },
+            .dense => {},
+        }
+        switch (lw.attn) {
+            .linear => |*la| if (la.a2.w.ctx != null or la.z2.w.ctx != null) return "KDA low-rank gates",
+            .full => {},
+        }
+    }
+    return null;
+}
 
 pub const Options = struct {
     /// Quantize a dense bf16 head to MXFP8 at load (the lossy `lm_head_mxfp8` setting).
@@ -107,6 +140,10 @@ pub fn load(io: std.Io, a: std.mem.Allocator, config: *const model.ModelConfig, 
         owned.deinit(a);
     }
     errdefer a.free(ml.moe_layers);
+    if (unservedLayout(config, ml.moe_layers)) |what| {
+        log.err("[qwen4] this pack carries {s}, which the trunk does not run\n", .{what});
+        return error.Qwen4UnservedLayout;
+    }
     // The layers' recurrent state lives on each slot; the binder's template entries are not kept.
     for (ml.ssm_entries) |*e| {
         _ = mlx.mlx_array_free(e.conv_state);
@@ -218,6 +255,19 @@ pub fn load(io: std.Io, a: std.mem.Allocator, config: *const model.ModelConfig, 
     errdefer if (head) |*h| h.deinit(a);
     log.info("[qwen4] n-gram table {d} rows x {d} ({d}-bit, mmapped), PLE at layer {d}, QSA budget {d}/{d}\n", .{ st.table.rows, st.table.dim, st.table.bits, config.ple_layer_idx, config.indexer_budget, config.indexer_compress_ratio });
 
+    // Prism's ternary codec writes every affine bias as exactly -scale; only then do the 2-bit kernels serve.
+    var ternary_2bit = false;
+    if (ternaryKernelCandidate(config)) {
+        // An embedding that is not also the lm_head is only ever gathered.
+        const gather_only = if (lm_head_b.ctx == emb_b.ctx) mlx.mlx_array{ .ctx = null } else emb_b;
+        if (try firstNonTernaryBias(weights, gather_only, s)) |key| {
+            log.info("[qmv2] 2-bit pack is not ternary ({s}): stock qmm\n", .{key});
+        } else {
+            ternary_2bit = true;
+            log.info("[qmv2] ternary 2-bit pack (bias == -scale): ternary kernels armed\n", .{});
+        }
+    }
+
     const head_n: c_int = blk: {
         const sh = mlx.getShape(lm_head_w);
         break :blk if (sh.len == 2) sh[0] else 0;
@@ -235,6 +285,7 @@ pub fn load(io: std.Io, a: std.mem.Allocator, config: *const model.ModelConfig, 
         .lm_head_s = lm_head_s,
         .lm_head_b = lm_head_b,
         .moe_layers = ml.moe_layers,
+        .ternary_2bit = ternary_2bit,
         .moe_owned_bf16 = try owned.toOwnedSlice(a),
         .qwen4_mixer = mixer,
         .qwen4 = st,
@@ -250,4 +301,23 @@ pub fn load(io: std.Io, a: std.mem.Allocator, config: *const model.ModelConfig, 
         .mtp_uniform_affine_trunk = calibrated and uniform_bits and mtp_nax_profile.mtpNaxUniformAffineTrunkFrom(config, ml.moe_layers),
         .mtp_oqe_affine_trunk = calibrated and config.quant_bits == 4 and mtp_nax_profile.mtpNaxOqeAffineTrunkFrom(config, ml.moe_layers),
     };
+}
+
+test "qwen4_exp trunk: a layout the trunk does not run is refused by name, the plugin's own config is not" {
+    const testing = std.testing;
+    const toModelConfig = @import("model_config.zig").toModelConfig;
+    const config = @import("config.zig");
+    const mem: @import("../../sdk/testing/fixture.zig").MemDir = .{ .files = &.{} };
+    const pd = mem.packDir();
+    var p: @import("../../abi/plugin.zig").Parsed = .{};
+    try testing.expect(config.parse(&pd, .of(config.tiny_text), .{}, null, true, &p).isOk());
+    defer config.freeParsed(&p);
+    var c = try toModelConfig(testing.allocator, config.of(&p), null);
+    defer c.deinit(testing.allocator);
+    try testing.expect(unservedLayout(&c, &.{}) == null);
+    inline for (.{ .{ "hadamard_block", 512 }, .{ "norm_groups", 4 }, .{ "moe_sigmoid_router", true }, .{ "kda_vector_gate", true }, .{ "kda_sigmoid_out_gate", false }, .{ "swiglu_limit", 7.0 }, .{ "scale_embeddings", true } }) |m| {
+        var bad = c;
+        @field(bad, m[0]) = m[1];
+        try testing.expect(unservedLayout(&bad, &.{}) != null);
+    }
 }
