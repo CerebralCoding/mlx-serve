@@ -150,6 +150,13 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
     }
     m.layers = try gpa.alloc(Model.Layer, c.num_hidden_layers);
     for (m.layers, 0..) |*L, i| L.* = try loadLayer(m, &r, if (xr) |*x| x else null, c, @intCast(i));
+    // A streamed layer's decode calls predict the next routed layer's experts with its router.
+    if (m.experts != null) for (m.layers[0 .. m.layers.len - 1], m.layers[1..]) |*L, *next| switch (L.mlp) {
+        .second => |*w| if (next.mlp == .second and next.mlp.second.router.s.ctx == null) {
+            w.streamed.?.next = .{ .router = next.mlp.second.router.w, .bias = next.mlp.second.route.sigmoid_bias.expert_bias };
+        },
+        .first => {},
+    };
 
     var nb: [256]u8 = undefined;
     const hidden = c.hidden_size;

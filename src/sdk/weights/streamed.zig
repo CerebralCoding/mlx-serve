@@ -145,11 +145,11 @@ pub const Streamed = struct {
     pub fn routedSource(self: *Streamed) Routed {
         if (comptime !build_options.mlx_stream) unreachable;
         const C = struct {
-            fn fetch(comptime Src: type) fn (*anyopaque, u32, []const u16) anyerror!Fetched {
+            fn fetch(comptime Src: type) fn (*anyopaque, u32, []const u16, []const f32) anyerror!Fetched {
                 return struct {
-                    fn f(ctx: *anyopaque, layer: u32, ids: []const u16) anyerror!Fetched {
+                    fn f(ctx: *anyopaque, layer: u32, ids: []const u16, scores: []const f32) anyerror!Fetched {
                         const src: *Src = @ptrCast(@alignCast(ctx));
-                        const got = try src.fetch(layer, ids);
+                        const got = if (comptime Src == Mxfp4) try src.fetch(layer, ids, scores) else try src.fetch(layer, ids);
                         var banks: [3]?Banks = @splat(null);
                         for (got.banks, &banks) |b, *o| if (b) |x| {
                             o.* = .{ .gate = proj(x.gate), .up = proj(x.up), .down = proj(x.down) };

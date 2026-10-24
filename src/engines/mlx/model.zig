@@ -483,8 +483,8 @@ pub const ModelConfig = struct {
     dsv41_dspark_experts: u32 = 0,
     dsv41_dspark_top_k: u32 = 0,
     /// The pack's routed experts are an mlx-stream `experts.bin` bank (a MiMo pack whose config declares
-    /// `expert_streaming`): the plugin streams them into slot rows (`stream_experts`, a quarter of the experts when the
-    /// model sets none). Set by `parseConfig`.
+    /// `expert_streaming`): the plugin streams them into slot rows (`stream_experts`, else the fill,
+    /// `bills.expertBankFillRows`). Set by `parseConfig`.
     expert_bank: bool = false,
     /// A GLM-5.3 pack (`glm_moe_dsa`, its routed experts in an `experts.bin` bank): mlx-stream serves it
     /// (`arch/mlx_stream.zig`) and loads its weights. Set by `parseConfig`.
@@ -1210,11 +1210,6 @@ pub const ModelConfig = struct {
     /// The pack is mlx-stream's (`arch/mlx_stream.zig`): a GLM-5.3 or GLM-5.3-Flash pack.
     pub fn mlxStream(self: *const ModelConfig) bool {
         return self.glm_stream or self.glm5_stream;
-    }
-
-    /// The slot rows an `expert_bank` pack streams into: the model's `stream_experts`, else a quarter of the experts.
-    pub fn streamExperts(self: *const ModelConfig) ?@import("../../sdk/weights/streamed.zig").Setting {
-        return self.stream_experts_override orelse if (self.expert_bank) .on else null;
     }
 
     pub fn isMoe(self: *const ModelConfig) bool {
@@ -7339,13 +7334,13 @@ test "parseConfig: a MiMo pack that declares expert_streaming streams its expert
     const dir = buf[0..try tmp.dir.realPath(io, &buf)];
     var upstream = try parseConfig(io, testing.allocator, dir);
     defer upstream.deinit(testing.allocator);
-    try testing.expect(upstream.isMimo() and !upstream.expert_bank and upstream.streamExperts() == null);
+    try testing.expect(upstream.isMimo() and !upstream.expert_bank);
     const marked = try std.mem.replaceOwned(u8, testing.allocator, mimo_v2_pack_json, "\"model_type\": \"mimo_v2\",", "\"model_type\": \"mimo_v2_flash\", \"expert_streaming\": {\"family\": \"mlx-stream\", \"format\": \"mlx-stream-mxfp4-expert-bank-v1\", \"manifest\": \"expert-manifest.json\"},");
     defer testing.allocator.free(marked);
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = marked });
     var pack = try parseConfig(io, testing.allocator, dir);
     defer pack.deinit(testing.allocator);
-    try testing.expect(pack.isMimo() and pack.expert_bank and !pack.mlxStream() and pack.streamExperts().? == .on);
+    try testing.expect(pack.isMimo() and pack.expert_bank and !pack.mlxStream());
     try testing.expectEqualStrings(dir, pack.pack_dir.?);
 }
 

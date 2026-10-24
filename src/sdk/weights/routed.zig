@@ -16,14 +16,15 @@ pub const max_call_ids: usize = 1 << 14;
 pub const max_call_experts: usize = 48;
 
 /// How a trunk's MoE reads a streamed bank, by whose math runs it. `trunk`: the source fetches, `fetch` making model
-/// layer `layer`'s routed experts `ids` resident and naming each pair's slot, and the trunk runs its own gathers on
-/// them, so its weighted rows are its own op order. `source`: a format the trunk has no math for (EXL3), the source's
+/// layer `layer`'s routed experts `ids` resident and naming each pair's slot (a decode call's `scores`, the next
+/// layer's predictor on its rows, `[rows * n_experts]`, start that layer's likely reads; empty: none), and the trunk
+/// runs its own gathers on them, so its weighted rows are its own op order. `source`: a format the trunk has no math for (EXL3), the source's
 /// routed sum `[n, hidden]` f32 for the normed input, the routes and their weights. `settle` after the eval that
 /// consumed a forward's calls.
 pub const Routed = struct {
     ctx: *anyopaque,
     math: union(enum) {
-        trunk: *const fn (*anyopaque, u32, []const u16) anyerror!Fetched,
+        trunk: *const fn (*anyopaque, u32, []const u16, []const f32) anyerror!Fetched,
         source: *const fn (*anyopaque, u32, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array) anyerror!mlx.mlx_array,
     },
     settle_fn: *const fn (*anyopaque) anyerror!void,

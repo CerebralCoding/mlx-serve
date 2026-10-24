@@ -75,10 +75,17 @@ fn configJson(a: std.mem.Allocator, n: u32) ![]const u8 {
     return std.mem.replaceOwned(u8, a, sized, "\"eos_token_id\":[2,151645]}", "\"eos_token_id\":[2,151645],\"quantization\":{\"group_size\":32,\"bits\":4,\"mode\":\"mxfp4\"}}");
 }
 
-/// Every MoE layer's hook set to `r` (null: the in-memory banks).
+/// Every MoE layer's hook set to `r` (null: the in-memory banks), each decode call predicting the next layer's reads
+/// with its router as the plugin installs it.
 fn hook(m: *mimo.Loaded, r: ?streamed.Routed) void {
     for (m.layers, 0..) |*L, i| switch (L.mlp) {
-        .second => |*w| w.streamed = if (r) |x| .{ .routed = x, .layer = @intCast(i) } else null,
+        .second => |*w| {
+            w.streamed = if (r) |x| .{ .routed = x, .layer = @intCast(i) } else null;
+            if (r != null and i + 1 < m.layers.len and m.layers[i + 1].mlp == .second) {
+                const nx = &m.layers[i + 1].mlp.second;
+                if (nx.router.s.ctx == null) w.streamed.?.next = .{ .router = nx.router.w, .bias = nx.route.sigmoid_bias.expert_bias };
+            }
+        },
         .first => {},
     };
 }
@@ -175,6 +182,8 @@ fn parity(n_experts: u32) !void {
         std.debug.print("mimo_v2 streamed ({d} experts, {s}): {d} routes, {d} hits, {d} misses, {d} evictions\n", .{ n_experts, if (rows == null) "every expert resident" else if (rows.?[0] == 3) "3 rows a layer" else "2/3 of the experts a layer", st.route_calls, st.expert_cache_hits, st.expert_cache_misses, st.expert_cache_evictions });
         // With three rows a layer, decode reads pairs from more than one slot bank.
         if (rows != null and rows.?[0] == 3) try testing.expect(st.expert_cache_evictions > 0 and moe_fp4.banked_dispatches != banked);
+        // Short of every expert, decode calls read the next layer's predicted experts ahead.
+        if (rows != null) try testing.expect(st.spec_issued > 0);
     }
 }
 
