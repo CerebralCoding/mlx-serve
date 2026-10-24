@@ -10,6 +10,7 @@ const mlx = @import("../../mlx/ffi.zig");
 const ops = @import("../../mlx/ops.zig");
 const fixture = @import("../../sdk/bases/proof/fixture.zig");
 const both = @import("../../engines/mlx/plugin/both.zig");
+const driver = @import("../../engines/mlx/plugin/driver.zig");
 const moe = @import("../../sdk/bases/blocks/moe.zig");
 const moe_fp4 = @import("../../sdk/blocks/moe/moe_fp4.zig");
 const streamed = @import("../../sdk/weights/streamed.zig");
@@ -183,6 +184,89 @@ test "mimo_v2 streamed: the resident's experts through the Routed hook from an e
     // 8 experts: the prompt's gathers take the row-block class (40 pairs, 5 a row); 32: the per-pair one.
     try parity(8);
     try parity(32);
+}
+
+/// Every layer's q/k/v and layer 0's dense MLP as fp8res packs them: e4m3 codes (no NaN code) beside an f32 scale per
+/// 64 x 128 tile (`fp8_block128`).
+fn fp8Residents(p: *fixture.Pack, seed: u64) !void {
+    var rnd = std.Random.DefaultPrng.init(seed);
+    var buf: [96]u8 = undefined;
+    for (0..4) |i| for ([_][]const u8{ "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj" }) |leaf| {
+        const base = try std.fmt.bufPrint(&buf, "model.layers.{d}.{s}", .{ i, leaf });
+        var old = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(old);
+        const z = try std.fmt.allocPrintSentinel(testing.allocator, "{s}.weight", .{base}, 0);
+        defer testing.allocator.free(z);
+        if (mlx.mlx_map_string_to_array_get(&old, p.map, z.ptr) != 0 or old.ctx == null) continue;
+        const sh = mlx.getShape(old);
+        const n: usize = @intCast(sh[0]);
+        const k: usize = @intCast(sh[1]);
+        const codes = try testing.allocator.alloc(u8, n * k);
+        defer testing.allocator.free(codes);
+        for (codes) |*c| c.* = rnd.random().int(u8) & 0xf7;
+        const sc = try testing.allocator.alloc(f32, (n / 64) * (k / 128));
+        defer testing.allocator.free(sc);
+        for (sc) |*v| v.* = std.math.ldexp(1.0 + rnd.random().float(f32), -12);
+        const w = mlx.mlx_array_new_data(codes.ptr, &[_]c_int{ sh[0], sh[1] }, 2, .uint8);
+        defer _ = mlx.mlx_array_free(w);
+        const g = mlx.mlx_array_new_data(sc.ptr, &[_]c_int{ @intCast(n / 64), @intCast(k / 128) }, 2, .float32);
+        defer _ = mlx.mlx_array_free(g);
+        try p.put(z, w);
+        try p.put(try std.fmt.bufPrint(&buf, "model.layers.{d}.{s}.weight_scale_inv", .{ i, leaf }), g);
+    };
+}
+
+/// `p`'s tensors but the routed experts (`switch_mlp`), as `dir/model.safetensors`.
+fn saveResidents(p: *const fixture.Pack, dir: []const u8) !void {
+    const map = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(map);
+    const it = mlx.mlx_map_string_to_array_iterator_new(p.map);
+    defer _ = mlx.mlx_map_string_to_array_iterator_free(it);
+    while (true) {
+        var key: ?[*:0]const u8 = null;
+        var v = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(v);
+        if (mlx.mlx_map_string_to_array_iterator_next(&key, &v, it) != 0 or key == null) break;
+        if (std.mem.indexOf(u8, std.mem.span(key.?), "switch_mlp") == null) try mlx.check(mlx.mlx_map_string_to_array_insert(map, key.?, v));
+    }
+    const file = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/model.safetensors", .{dir}, 0);
+    defer testing.allocator.free(file);
+    const meta = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(meta);
+    try mlx.check(mlx.mlx_save_safetensors(file.ptr, map, meta));
+}
+
+test "mimo_v2 streaming pack: fp8 residents and experts read from its experts.bin serve the in-memory pack's logits bit for bit" {
+    if (!build_options.mlx_stream or mlx.noGpuBackend()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = testing.io;
+    const bank = try Bank.init(a, 0x5715, 8);
+    var p = fixture.Pack.init(0x5716);
+    defer p.deinit();
+    try writePack(&p, &bank, 8);
+    try fp8Residents(&p, 0x5717);
+    const mem_json = try configJson(a, 8);
+    var mem = try both.Both.openAs(&mimo.table, &p, mem_json, false, .none);
+    defer mem.close();
+    const want = try logits(&mem, a, null);
+
+    // The streaming pack: the residents, the bank and its manifest, and the config's expert_streaming block.
+    var tmp = testing.tmpDir(.{});
+    var buf: [512]u8 = undefined;
+    const dir = try testing.allocator.dupe(u8, buf[0..try tmp.dir.realPath(io, &buf)]);
+    try saveResidents(&p, dir);
+    try stream.dsv41_streamed.writeBank(a, io, tmp.dir, bank.geo, bank.bytes, "synthetic/mimo-tiny", "0000000000000000000000000000000000000000");
+    const js = try std.mem.replaceOwned(u8, a, mem_json, "\"quantization\":{", "\"residents_format\":\"fp8_block128\",\"expert_streaming\":{\"family\":\"mlx-stream\",\"format\":\"mlx-stream-mxfp4-expert-bank-v1\",\"manifest\":\"expert-manifest.json\"},\"quantization\":{");
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = js });
+    var cfg = try both.parse(&mimo.table, dir, js);
+    const xfm = try driver.load(std.Io.Threaded.global_single_threaded.io(), testing.allocator, &cfg, dir, fixture.stream());
+    var b: both.Both = .{ .lg = null, .tmp = tmp, .dir = dir, .cfg = cfg, .xfm = xfm };
+    defer b.close();
+    const m: *mimo.Loaded = @ptrCast(@alignCast(b.xfm.plugin.?.model));
+    try testing.expect(m.experts != null and m.layers[FIRST_MOE].mlp.second.streamed != null);
+    try testing.expectEqualSlices(u32, want, try logits(&b, a, m.experts.?.routedSource()));
 }
 
 /// One expert projection of `bank` (model layer 0) dequantized to f32 `[out, in]`, owned by `g`.

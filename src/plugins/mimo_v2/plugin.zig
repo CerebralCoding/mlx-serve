@@ -15,6 +15,7 @@ const reader = @import("../../sdk/bases/reader.zig");
 const EitherMlp = @import("../lfm2/plugin.zig").EitherMlp;
 const SinkAttention = @import("sink_attention.zig").SinkAttention;
 const mtp_head = @import("mtp_head.zig");
+const streamed = @import("../../sdk/weights/streamed.zig");
 pub const config = @import("config.zig");
 
 pub const plugin = config.plugin;
@@ -74,12 +75,15 @@ pub const Loaded = struct {
     route_fn: compiled.Closure = .{ .ctx = null },
     /// The MTP heads, once `HeadHooks.load` found them.
     head: ?*mtp_head.Heads = null,
+    /// A streaming pack's routed experts (`experts.bin`).
+    experts: ?streamed.Streamed = null,
 
     fn release(m: *Loaded) void {
         if (m.head) |h| {
             h.deinit();
             gpa.destroy(h);
         }
+        if (m.experts) |*x| x.close();
         compiled.free(&m.route_fn);
         m.owned.deinit();
         gpa.free(m.layers);
@@ -105,6 +109,7 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
     errdefer gpa.destroy(m);
     m.* = .{ .base = .{ .weights = undefined, .shared = bases.Shared.init(c.rms_norm_eps, c.rms_norm_eps), .a = gpa, .s = r.s } };
     errdefer m.release();
+    if (c.streamed) m.experts = try streamed.Streamed.open(gpa, std.Io.Threaded.global_single_threaded.io(), ctx.model_dir.slice(), r.s, .{});
     m.layers = try gpa.alloc(Model.Layer, c.num_hidden_layers);
     for (m.layers, 0..) |*L, i| L.* = try loadLayer(m, &r, if (xr) |*x| x else null, c, @intCast(i));
 
@@ -207,6 +212,10 @@ fn mlpOf(m: *Loaded, r: *reader.Reader, xr: ?*reader.Reader, c: *const config.Co
             for ([_]@import("../../abi/quant.zig").Array{ w.w, w.scales, w.biases }) |a| try m.owned.own(.{ .ctx = a.ctx });
         }
         fb = .{ .table = x.fmt, .gate = fw[0], .up = fw[1], .down = fw[2] };
+    } else if (m.experts != null) {
+        // The bank's quant params only: each call's fetch names the slots.
+        if (c.quant.mode != .mxfp4) return error.MimoStreamedBankNotMxfp4;
+        banks = @splat(reader.bank(.{}, c.quant));
     } else for (&banks, [_][]const u8{ "gate_proj", "up_proj", "down_proj" }, [_]u32{ hidden, hidden, c.moe_intermediate }) |*bk, leaf, in_dim| {
         const l = try r.proj(try r.name(&nb, "layers.{d}.mlp.switch_mlp.{s}", .{ i, leaf }), in_dim);
         try m.owned.linear(l);
@@ -226,6 +235,7 @@ fn mlpOf(m: *Loaded, r: *reader.Reader, xr: ?*reader.Reader, c: *const config.Co
         .experts = @intCast(c.experts),
         .format_banks = fb,
     };
+    if (m.experts) |*x| w.streamed = .{ .routed = x.routedSource(), .layer = i };
     if (m.route_fn.ctx == null) m.route_fn = moe.compileRouting(&w, r.s);
     w.route_fn = m.route_fn;
     return .{ .second = w };
