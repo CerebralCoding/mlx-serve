@@ -1098,7 +1098,7 @@ test "lilicorr missing restored anchor takes a plain round and recovers it" {
     try dflash_mod.TinyFix.writeAssistant(io, asst_tmp.dir, asst_path, s);
     var cfg = try model_mod.parseConfig(io, a, trunk_path);
     defer cfg.deinit(a);
-    var xfm = try plugin_driver.load(io, a, &cfg, trunk_path, s);
+    var xfm = try plugin_driver.load(io, a, &cfg, trunk_path, mlx.gpuStream());
     defer xfm.deinit();
     var dm = try dflash_mod.loadDflash(io, a, s, asst_path);
     defer dm.deinit();
@@ -1170,7 +1170,7 @@ test "dflash: nextDflash greedy equals serial decode, invariants exact each roun
     // Serial baseline.
     var serial: [want]u32 = undefined;
     {
-        var xfm = try plugin_driver.load(io, allocator, &config, trunk_path, s);
+        var xfm = try plugin_driver.load(io, allocator, &config, trunk_path, mlx.gpuStream());
         defer xfm.deinit();
         var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, @intCast(want), greedy, &.{}, .{
             .skip_lazy_preforward = true,
@@ -1187,7 +1187,7 @@ test "dflash: nextDflash greedy equals serial decode, invariants exact each roun
 
     // DFlash arm.
     {
-        var xfm = try plugin_driver.load(io, allocator, &config, trunk_path, s);
+        var xfm = try plugin_driver.load(io, allocator, &config, trunk_path, mlx.gpuStream());
         defer xfm.deinit();
         var dm = try dflash_mod.loadDflash(io, allocator, s, asst_path);
         defer dm.deinit();
@@ -1242,7 +1242,7 @@ test "dflash: nextDflash greedy equals serial decode, invariants exact each roun
         const a2_path = a2_buf[0..try tmp_a2.dir.realPath(io, &a2_buf)];
         try dflash_mod.TinyFix.writeAssistant2(io, tmp_a2.dir, a2_path, s, false);
 
-        var xfm = try plugin_driver.load(io, allocator, &config, trunk_path, s);
+        var xfm = try plugin_driver.load(io, allocator, &config, trunk_path, mlx.gpuStream());
         defer xfm.deinit();
         var dm = try dflash_mod.loadDflash(io, allocator, s, a2_path);
         defer dm.deinit();
@@ -1312,7 +1312,7 @@ fn policyArm(arm: PolicyArm, serial: []const u32) !dflash_policy.PositionStats {
     const asst_path = asst_buf[0..try tmp_asst.dir.realPath(io, &asst_buf)];
     if (arm.v2) try dflash_mod.TinyFix.writeAssistant2(io, tmp_asst.dir, asst_path, s, false) else try dflash_mod.TinyFix.writeAssistant(io, tmp_asst.dir, asst_path, s);
 
-    var xfm = try plugin_driver.load(io, allocator, &config, trunk_path, s);
+    var xfm = try plugin_driver.load(io, allocator, &config, trunk_path, mlx.gpuStream());
     defer xfm.deinit();
     var dm = try dflash_mod.loadDflash(io, allocator, s, asst_path);
     defer dm.deinit();
@@ -1324,7 +1324,7 @@ fn policyArm(arm: PolicyArm, serial: []const u32) !dflash_policy.PositionStats {
     const prompt: []const u32 = if (arm.copy) &copy_prompt else &plain_prompt;
     var copy_serial: [16]u32 = undefined;
     if (arm.copy) {
-        var sx = try plugin_driver.load(io, allocator, &config, trunk_path, s);
+        var sx = try plugin_driver.load(io, allocator, &config, trunk_path, mlx.gpuStream());
         defer sx.deinit();
         var sg = try Generator.initWithOptions(io, allocator, &sx, &tok_dummy, prompt, 16, SamplingParams{ .temperature = 0.0 }, &.{}, .{ .skip_lazy_preforward = true });
         defer sg.deinit(allocator);
@@ -1403,7 +1403,7 @@ test "dflash: the round policy runs plain rounds between drafted ones, the strea
     const prompt = [_]u32{ 3, 7, 1, 12, 30, 5, 9, 22, 4, 17, 2, 28 };
     var serial: [16]u32 = undefined;
     {
-        var xfm = try plugin_driver.load(io, allocator, &config, trunk_path, s);
+        var xfm = try plugin_driver.load(io, allocator, &config, trunk_path, mlx.gpuStream());
         defer xfm.deinit();
         var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, 16, SamplingParams{ .temperature = 0.0 }, &.{}, .{ .skip_lazy_preforward = true });
         defer gen.deinit(allocator);

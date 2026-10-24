@@ -8068,7 +8068,7 @@ test "parseConfig prefers processor_config and fills missing Qwen bounds from pr
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path_len = try tmp.dir.realPath(io, &path_buf);
-    const config = try parseConfig(io, testing.allocator, path_buf[0..path_len]);
+    const config = try parseConfigLegacy(io, testing.allocator, path_buf[0..path_len]);
     try testing.expect(config.qwen_vision);
     try testing.expectEqual(@as(u32, 65536), config.qv_min_pixels);
     try testing.expectEqual(@as(u32, 16777216), config.qv_max_pixels);

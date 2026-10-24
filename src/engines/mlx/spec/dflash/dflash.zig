@@ -3632,7 +3632,7 @@ test "dflash own head: dense and affine projections preserve trained logits and 
     try TinyFix.writeTrunk(io, trunk.dir, trunk_path, s);
     var config = try model_mod.parseConfig(io, allocator, trunk_path);
     defer config.deinit(allocator);
-    var xfm = try plugin_driver.load(io, allocator, &config, trunk_path, s);
+    var xfm = try plugin_driver.load(io, allocator, &config, trunk_path, mlx.gpuStream());
     defer xfm.deinit();
     const ids = mlx.mlx_array_new_data(&[_]i32{ 2, 3, 7 }, &[_]c_int{ 1, 3 }, 2, .int32);
     defer _ = mlx.mlx_array_free(ids);
@@ -4274,7 +4274,7 @@ test "dflash: the draft-only lm_head shrinks the draft read and leaves verify al
 
     var config = try model_mod.parseConfig(io, allocator, trunk_path);
     defer config.deinit(allocator);
-    var xfm = try plugin_driver.load(io, allocator, &config, trunk_path, s);
+    var xfm = try plugin_driver.load(io, allocator, &config, trunk_path, mlx.gpuStream());
     defer xfm.deinit();
 
     const bits: u32 = 3;
@@ -4348,7 +4348,7 @@ test "served forward: skip_lm_head hands back the hidden the head reads, never l
     try TinyFix.writeTrunk(io, tmp_dir.dir, dir_path, s);
     var config = try model_mod.parseConfig(io, allocator, dir_path);
     defer config.deinit(allocator);
-    var xfm = try plugin_driver.load(io, allocator, &config, dir_path, s);
+    var xfm = try plugin_driver.load(io, allocator, &config, dir_path, mlx.gpuStream());
     defer xfm.deinit();
 
     const prompt = [_]i32{ 3, 7, 1, 12, 30, 5, 9, 22 };
@@ -4388,7 +4388,7 @@ test "dflash: trunk capture_layers = hidden_states[i+1], consistent across chunk
 
     var config = try model_mod.parseConfig(io, allocator, dir_path);
     defer config.deinit(allocator);
-    var xfm = try plugin_driver.load(io, allocator, &config, dir_path, s);
+    var xfm = try plugin_driver.load(io, allocator, &config, dir_path, mlx.gpuStream());
     defer xfm.deinit();
 
     const prompt = [_]i32{ 3, 7, 1, 12, 30, 5, 9, 22 };
@@ -4482,7 +4482,7 @@ test "dflash: trunk rawEmbedding is the bare table row" {
 
     var config = try model_mod.parseConfig(io, allocator, dir_path);
     defer config.deinit(allocator);
-    var xfm = try plugin_driver.load(io, allocator, &config, dir_path, s);
+    var xfm = try plugin_driver.load(io, allocator, &config, dir_path, mlx.gpuStream());
     defer xfm.deinit();
 
     const ids = [_]i32{ 4, 31 };

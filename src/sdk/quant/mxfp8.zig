@@ -98,7 +98,7 @@ test "lm_head mxfp8: a dense head loads as vLLM's MXFP8 bytes in place of the bf
         var config = try model_mod.parseConfig(io, allocator, dir);
         defer config.deinit(allocator);
         config.lm_head_mxfp8_override = mxfp8;
-        var xfm = try plugin_driver.load(io, allocator, &config, dir, s);
+        var xfm = try plugin_driver.load(io, allocator, &config, dir, mlx.gpuStream());
         defer xfm.deinit();
         const head = xfm.lm_head_w;
         try t.expectEqual(mxfp8, xfm.lm_head_s.ctx != null);
