@@ -5,7 +5,6 @@ const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 const model_mod = @import("../../../engines/mlx/model.zig");
-const model_discovery = @import("../../../host/registry/discovery.zig");
 
 const Weights = @import("../../weights/resident.zig").Weights;
 const indexShardSet = @import("../../weights/resident.zig").indexShardSet;
