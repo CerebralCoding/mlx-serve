@@ -16,6 +16,7 @@ const run_mod = @import("../../sdk/bases/run.zig");
 const compiled = @import("../../sdk/bases/blocks/compiled.zig");
 const row_exact = @import("../../sdk/bases/blocks/row_exact.zig");
 const naxAvailable = @import("../../mlx/device.zig").naxAvailable;
+const qmm_int8 = @import("../../sdk/blocks/qmm/qmm_int8.zig");
 const rht = @import("../../sdk/quant/hadamard/rht.zig");
 const lane_qmm = @import("../../sdk/blocks/qmm/lane_qmm.zig");
 const log = @import("../../sdk/util/log.zig");
@@ -143,6 +144,14 @@ pub const Loaded = struct {
     }
 };
 
+/// The LOSSY `int8_prefill` load setting (a Prism pack's rotated projections only).
+fn int8Prefill(settings_json: []const u8) bool {
+    const S = struct { int8_prefill: ?bool = null };
+    const parsed = std.json.parseFromSlice(S, gpa, settings_json, .{ .ignore_unknown_fields = true }) catch return false;
+    defer parsed.deinit();
+    return parsed.value.int8_prefill orelse false;
+}
+
 pub fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     return loadModel(ctx) catch |e| {
         out.* = ld.failed(e);
@@ -183,6 +192,10 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
         const reg = try gpa.create(rht.Registry);
         reg.* = .init(gpa, c.hadamard_block);
         m.rht = reg;
+        if (int8Prefill(ctx.settings_json.slice()) and mlx.metalKernelsAvailable()) {
+            reg.int8 = try gpa.create(qmm_int8.Cache);
+            reg.int8.?.* = .{};
+        }
     }
     try gdn.consts(&m.geo, act, s);
     // The engine compiles its chains only where a GPU runs them.

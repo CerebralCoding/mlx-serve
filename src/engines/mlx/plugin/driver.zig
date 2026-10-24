@@ -15,6 +15,9 @@ const eval_cadence = @import("../eval_cadence.zig");
 const transformer_mod = @import("../transformer.zig");
 const qmm_int8 = @import("../../../sdk/blocks/qmm/qmm_int8.zig");
 const lmHeadMxfp8On = @import("../../../sdk/quant/mxfp8.zig").lmHeadMxfp8On;
+const quantizeHeadMxfp8 = @import("../../../sdk/quant/mxfp8.zig").quantizeHeadMxfp8;
+const floatDtypeTable = @import("../load/weights.zig").floatDtypeTable;
+const plugin_config = @import("config.zig");
 const Resident = @import("../../../sdk/weights/resident.zig").Resident;
 const mtp_nax_profile = @import("../spec/mtp_nax_profile.zig");
 const firstRowExactMiss = @import("../../../sdk/quant/ternary.zig").firstRowExactMiss;
@@ -96,35 +99,43 @@ fn loadSplit(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, config: *M
     return w;
 }
 
-/// The lossy load setting a served pack has on that the plugin path does not run yet, by its settings name.
-fn lossyUnserved(config: *const ModelConfig) ?[]const u8 {
-    const table = (config.plugin orelse return null).table;
-    if ((config.int8_prefill_override orelse false) and mlx.metalKernelsAvailable() and !intree.servesLossy(table, .int8_prefill)) return "int8_prefill";
-    if (lmHeadMxfp8On(headMxfp8Setting(config), null, mlx.cudaIntegrated(), false, config.quant_bits) and !intree.servesLossy(table, .lm_head_mxfp8)) return "lm_head_mxfp8";
-    return null;
-}
-
 /// `lm_head_mxfp8` as the model's settings, else the launch flag, state it; null = the model's default.
 fn headMxfp8Setting(config: *const ModelConfig) ?bool {
     return config.lm_head_mxfp8_override orelse transformer_mod.cli().lm_head_mxfp8_cli;
 }
 
-/// `LoadCtx.settings_json`: the lossy load settings stated for this model (a plugin that serves them reads them).
+/// `LoadCtx.settings_json`: the lossy load settings for this model (null = the model's default), which the plugin
+/// reads.
 fn loadSettings(buf: []u8, config: *const ModelConfig) []const u8 {
-    const head = headMxfp8Setting(config) orelse return "{}";
-    return std.fmt.bufPrint(buf, "{{\"lm_head_mxfp8\":{s}}}", .{if (head) "true" else "false"}) catch unreachable;
+    const Settings = struct { lm_head_mxfp8: ?bool, int8_prefill: ?bool };
+    var w: std.Io.Writer = .fixed(buf);
+    std.json.Stringify.value(Settings{ .lm_head_mxfp8 = headMxfp8Setting(config), .int8_prefill = config.int8_prefill_override }, .{}, &w) catch unreachable;
+    return w.buffered();
 }
 
-/// A pack with a lossy setting its plugin does not run goes back to the legacy path while one exists (a type whose
-/// legacy is gone keeps the binding, and the load refuses it by name). True when the binding was dropped.
-pub fn declineLossy(a: std.mem.Allocator, config: *ModelConfig) bool {
-    const b = config.plugin orelse return false;
-    const what = lossyUnserved(config) orelse return false;
-    if (served.legacyRemoved(config.model_type) or b.outside) return false;
-    log.info("[plugin] {s}: {s} is on, which the plugin does not run; the legacy path loads it\n", .{ b.table.name.slice(), what });
-    b.destroy(a);
-    config.plugin = null;
-    return true;
+/// The lossy `lm_head_mxfp8` setting: an untied bf16 head (`<prefix>.lm_head.weight`, else a root `lm_head.weight`)
+/// quantized to MXFP8 in the map, where the plugin reads it as any MXFP8 projection. A plugin that builds its own
+/// MXFP8 head is left to it (`intree.buildsMxfp8Head`).
+fn quantizeHead(w: *model.Weights, b: *const plugin_config.Binding, config: *const ModelConfig, s: mlx.mlx_stream) !void {
+    if (intree.buildsMxfp8Head(b.table)) return;
+    if (!lmHeadMxfp8On(headMxfp8Setting(config), null, mlx.cudaIntegrated(), false, config.quant_bits)) return;
+    var c = config.*;
+    model.resolveWeightPrefix(&c, w);
+    const lm_prefix = if (std.mem.eql(u8, c.weight_prefix, "language_model.model")) "language_model" else c.weight_prefix;
+    var nb: [160]u8 = undefined;
+    const nested = try std.fmt.bufPrint(&nb, "{s}.lm_head.weight", .{lm_prefix});
+    const key = if (w.get(nested) != null) nested else if (w.get("lm_head.weight") != null) "lm_head.weight" else {
+        log.info("[lm-head] mxfp8 declined: the head is the embedding\n", .{});
+        return;
+    };
+    const head = w.get(key).?;
+    if (!floatDtypeTable(mlx.mlx_array_dtype(head))) {
+        log.info("[lm-head] mxfp8 declined: the head is already quantized\n", .{});
+        return;
+    }
+    const sc = try quantizeHeadMxfp8(w, key, head, s);
+    const shape = mlx.getShape(sc);
+    log.info("[lm-head] mxfp8 (lossy): the {d}x{d} bf16 head quantized at load\n", .{ shape[0], shape[1] * 32 });
 }
 
 /// Loads the served pack at `model_dir` (`config.plugin` set) and returns the shell that forwards through it.
@@ -135,26 +146,18 @@ pub fn load(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir: [
 /// `load`; with `tower`, the vision tower's tensors load too and move into it (the engine's encoder reads them, the
 /// plugin never sees them).
 pub fn loadWith(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir: []const u8, s: mlx.mlx_stream, tower: ?*model.Weights) !Transformer {
-    try preflight(config);
+    if (config.plugin == null) return error.NotPluginServed;
     return loadTensors(io, a, config, model_dir, s, try loadSplit(io, a, model_dir, config, tower));
 }
 
 /// `load` over a tensor map the caller prepared (renamed or converted from the pack's own), which it hands over.
 pub fn loadMap(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir: []const u8, s: mlx.mlx_stream, map: model.Weights) !Transformer {
-    preflight(config) catch |e| {
+    if (config.plugin == null) {
         var m = map;
         m.deinit();
-        return e;
-    };
-    return loadTensors(io, a, config, model_dir, s, map);
-}
-
-fn preflight(config: *const ModelConfig) !void {
-    const b = config.plugin orelse return error.NotPluginServed;
-    if (lossyUnserved(config)) |what| {
-        log.err("[plugin] {s}: {s} is not served on the plugin path yet; turn the model's {s} setting off\n", .{ b.table.name.slice(), what, what });
-        return error.PluginServedLossySetting;
+        return error.NotPluginServed;
     }
+    return loadTensors(io, a, config, model_dir, s, map);
 }
 
 fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir: []const u8, s: mlx.mlx_stream, map: model.Weights) !Transformer {
@@ -162,6 +165,7 @@ fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
     var res = Resident.adopt(map);
     // The model holds its own references: the map's go once the plugin has read it.
     defer res.deinit();
+    try quantizeHead(&res.weights, b, config, s);
     const src = res.source();
     var fs = try FsPackDir.open(io, model_dir);
     defer fs.close();

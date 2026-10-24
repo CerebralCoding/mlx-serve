@@ -17,8 +17,10 @@ Owns `prism_hadamard_qwen35` (prism-ml Bonsai 2 packs). Table = `plugins/qwen3_5
   served packs too), depth 2 by default (`spec.mtp_default_depth`).
 - Proofs (`proof_test.zig`, tapes in `fixtures/`): steps, rollbacks, the lookup loop, a tied pack, batched ticks and a
   batched verify, an image prompt, and the MTP head (steps, picks, rounds) bit-equal to the legacy shell.
+- The LOSSY `int8_prefill` setting arms the registry's int8 route (`Registry.int8`, `qmm_int8`) on prompt-width
+  projections, as the legacy shell's.
 - Not served: a DFlash drafter (its head reads the trunk's in f32, `lmHeadForeign`): a pack carrying one stays legacy;
-  int8 prefill (the driver refuses it by name); routed experts (the format refuses rotated banks).
+  routed experts (the format refuses rotated banks).
 
 ## The row from the root architecture table
 

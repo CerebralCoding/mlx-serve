@@ -9,6 +9,7 @@
 const std = @import("std");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
+const qmm_int8 = @import("../../blocks/qmm/qmm_int8.zig");
 
 pub const SIGNS_SUFFIX = ".signs";
 
@@ -234,6 +235,9 @@ pub const Registry = struct {
     memo_signs: ?*anyopaque = null,
     memo_x: mlx.mlx_array = .{ .ctx = null },
     memo_out: mlx.mlx_array = .{ .ctx = null },
+    /// The LOSSY `int8_prefill` setting: prompt-width projections quantize their activation to int8 (`qmm_int8`);
+    /// owned, null = off.
+    int8: ?*qmm_int8.Cache = null,
 
     pub fn init(allocator: std.mem.Allocator, block: u32) Registry {
         return .{ .allocator = allocator, .block = @intCast(block) };
@@ -247,6 +251,10 @@ pub const Registry = struct {
         self.width_conflict.deinit(self.allocator);
         self.map.deinit(self.allocator);
         self.dropMemo();
+        if (self.int8) |c| {
+            c.deinit();
+            self.allocator.destroy(c);
+        }
     }
 
     pub fn count(self: *const Registry) usize {

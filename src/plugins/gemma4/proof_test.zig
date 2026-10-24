@@ -185,6 +185,22 @@ test "gemma4 plugin: a 31B-like bf16 pack (no PLE, K=V full layers, untied head)
     try b.expectDone();
 }
 
+test "gemma4 plugin: lm_head_mxfp8 (LOSSY) quantizes the 31B-like pack's untied head as the legacy load does" {
+    const cli = &@import("../../engines/mlx/transformer.zig").cli().lm_head_mxfp8_cli;
+    const was = cli.*;
+    defer cli.* = was;
+    cli.* = true;
+    var p = fixture.Pack.init(0x9e4c);
+    defer p.deinit();
+    try writeGemma4(&p, null, 0, 0, true, true);
+    var b = try proof.Both.openAs(&gemma4.table, &p, dense31b, oracle("31b-mxfp8"));
+    defer b.close();
+    try testing.expect(b.xfm.lm_head_s.ctx != null);
+    try proof.expectSteps(&b);
+    try proof.expectGreedy(&b);
+    try b.expectDone();
+}
+
 /// A 26B-A4B-shaped layer stack: the attention of `writeGemma4` (no PLE, K=V full layers), a shared GeGLU MLP and
 /// `E` experts of width `MI` under the sigma-MoE router, the two extra feed-forward norms, layer scalars.
 const E = 8;

@@ -124,3 +124,18 @@ test "llama plugin: a launch override the forward reads (rope_theta, the context
     defer served.deinit(testing.allocator);
     try testing.expect(served.rope_theta == 12345.0 and served.max_position_embeddings == 8192);
 }
+
+test "llama plugin: lm_head_mxfp8 (LOSSY) quantizes a bf16 Mistral pack's head as the legacy load does" {
+    const cli = &@import("../../engines/mlx/transformer.zig").cli().lm_head_mxfp8_cli;
+    const was = cli.*;
+    defer cli.* = was;
+    cli.* = true;
+    var p = fixture.Pack.init(0x3158);
+    defer p.deinit();
+    try writePack(&p, false, false, false);
+    var b = try both.Both.openAs(&plugin.table, &p, configJson("mistral", false, false, ",\"head_dim\":null,\"sliding_window\":4096"), false, .{ .legacy = "src/plugins/llama/fixtures/mxfp8-3158.tape" });
+    defer b.close();
+    try testing.expect(b.lg.?.xfm.lm_head_s.ctx != null and b.xfm.lm_head_s.ctx != null);
+    try expectAll(&b);
+    try b.expectDone();
+}

@@ -1687,7 +1687,6 @@ pub fn main(init: std.process.Init) !void {
         //    scheduler. The same load path as pre-A1.
         log.info("Loading weights...\n", .{});
         // A served model loads through its plugin, as the serve path does (`engines/mlx/load.zig`).
-        _ = plugin_driver.declineLossy(allocator, config);
         const served = config.plugin != null;
         var weights = if (served) model_mod.Weights.init(allocator) else try model_mod.loadModelWeights(io, allocator, model_dir, config, load_vision);
         defer weights.deinit();

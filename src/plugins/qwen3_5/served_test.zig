@@ -46,9 +46,18 @@ pub const Pair = struct {
 
     /// `open`, with `edit` applied to the plugin's parse.
     pub fn openWith(p: *Pair, table: *const abi.ModelTable, pk: *fixture.Pack, json: []const u8, edit: ?*const fn (*abi.Parsed) void) !void {
+        return p.openAs(table, pk, json, edit, null);
+    }
+
+    /// `open`, with `settings` applied to both sides' config before they load (a per-model load setting).
+    pub fn openSettings(p: *Pair, table: *const abi.ModelTable, pk: *fixture.Pack, json: []const u8, settings: *const fn (*model.ModelConfig) void) !void {
+        return p.openAs(table, pk, json, null, settings);
+    }
+
+    fn openAs(p: *Pair, table: *const abi.ModelTable, pk: *fixture.Pack, json: []const u8, edit: ?*const fn (*abi.Parsed) void, settings: ?*const fn (*model.ModelConfig) void) !void {
         const a = testing.allocator;
         const io = std.Io.Threaded.global_single_threaded.io();
-        p.lg = try pk.load(json);
+        p.lg = try pk.loadEdited(json, settings);
         errdefer p.lg.deinit();
         p.lg.xfm.compileGdnGate();
         p.lg.xfm.compileMoeRouting();
@@ -69,6 +78,7 @@ pub const Pair = struct {
         p.cfg = try model.parseConfigFromJson(a, json);
         p.cfg.plugin = b;
         errdefer p.cfg.deinit(a);
+        if (settings) |e| e(&p.cfg);
         p.xfm = try driver.load(io, a, &p.cfg, p.dir, fixture.stream());
     }
 
@@ -578,6 +588,18 @@ test "qwen3_5 served: a bf16 pack (decode side copies) equals the legacy shell" 
     var p: Pair = undefined;
     try openPack(&p, false, false, 8, 0x5e03, pack.config(false, false, 8));
     defer p.close();
+    try expectSolo(&p);
+}
+
+test "qwen3_5 served: lm_head_mxfp8 (LOSSY) quantizes a bf16 pack's head as the legacy load does, steps equal" {
+    const cli = &@import("../../engines/mlx/transformer.zig").cli().lm_head_mxfp8_cli;
+    const was = cli.*;
+    defer cli.* = was;
+    cli.* = true;
+    var p: Pair = undefined;
+    try openPack(&p, false, false, 8, 0x5e0a, pack.config(false, false, 8));
+    defer p.close();
+    try testing.expect(p.lg.xfm.lm_head_s.ctx != null and p.xfm.lm_head_s.ctx != null);
     try expectSolo(&p);
 }
 

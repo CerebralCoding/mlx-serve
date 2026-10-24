@@ -146,6 +146,24 @@ test "prism served: steps, rollbacks and the lookup loop equal the legacy shell"
     try served.expectSolo(&p);
 }
 
+fn int8Prefill(c: *@import("../../engines/mlx/model.zig").ModelConfig) void {
+    c.int8_prefill_override = true;
+}
+
+test "prism served: int8_prefill (LOSSY) takes the int8 route on a 70-row chunk as the legacy shell does, steps equal" {
+    if (!mlx.metalKernelsAvailable() or !@import("../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
+    var pk = fixture.Pack.init(0xb006);
+    defer pk.deinit();
+    try writePack(&pk, false);
+    var p: served.Pair = undefined;
+    try p.openSettings(&prism.table, &pk, config(false, false), &int8Prefill);
+    defer p.close();
+    p.oracle = try served.oracle("prism_hadamard_qwen35", "served-b006");
+    const m: *q35.Loaded = @ptrCast(@alignCast(p.xfm.plugin.?.model));
+    try testing.expect(p.lg.xfm.int8_cache != null and m.rht.?.int8 != null);
+    try served.expectSolo(&p);
+}
+
 test "prism served: a tied pack (the head reads the rotated table) equals the legacy shell" {
     var p: served.Pair = undefined;
     try openPack(&p, true, false, 0xb002);

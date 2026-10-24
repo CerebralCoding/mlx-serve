@@ -209,6 +209,22 @@ test "hy_v3 served: a bf16 pack with decode-attn-quant on (its side copies) is b
     try servedCase(false, 0x4a6);
 }
 
+test "hy_v3 served: lm_head_mxfp8 (LOSSY) quantizes a bf16 pack's head as the legacy load does, steps equal" {
+    const cli = &transformer.cli().lm_head_mxfp8_cli;
+    const was = cli.*;
+    defer cli.* = was;
+    cli.* = true;
+    var p = fixture.Pack.init(0x4a7);
+    defer p.deinit();
+    try writePack(&p, false);
+    var b = try both.Both.openAs(&hy3.table, &p, configJson(false), true, .{ .legacy = "src/plugins/hy_v3/fixtures/mxfp8-4a7.tape" });
+    defer b.close();
+    try testing.expect(b.lg.?.xfm.lm_head_s.ctx != null and b.xfm.lm_head_s.ctx != null);
+    try b.expectSteps(&both.long_steps);
+    try b.expectGreedy();
+    try b.expectDone();
+}
+
 test "hy_v3 served: a 2-bit group-128 pack with mlx-lm's quantization_config copy (stock qmm) is bit-equal" {
     try shapeCase(.q2, true, ",\"quantization_config\":{\"group_size\":128,\"bits\":2}", 0x4b1);
 }

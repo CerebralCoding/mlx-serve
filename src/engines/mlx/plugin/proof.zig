@@ -564,16 +564,3 @@ test {
     _ = plugin_config;
 }
 
-test "plugin load: a lossy setting the plugin does not run sends the pack back to the legacy path" {
-    const a = testing.allocator;
-    var b = try Both.open(.{}, 0xc1a6);
-    defer b.close();
-    var cfg = try model.parseConfig(std.Io.Threaded.global_single_threaded.io(), a, b.dir);
-    defer cfg.deinit(a);
-    cfg.int8_prefill_override = false;
-    cfg.lm_head_mxfp8_override = false;
-    try testing.expect(!driver.declineLossy(a, &cfg) and cfg.plugin != null);
-    cfg.lm_head_mxfp8_override = true;
-    try testing.expect(driver.declineLossy(a, &cfg) and cfg.plugin == null);
-}
-

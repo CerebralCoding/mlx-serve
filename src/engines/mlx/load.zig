@@ -189,7 +189,6 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     errdefer sch.allocator.destroy(weights_ptr);
     // A Thunderbolt pair plans the model before it loads (a type with no multi-Mac path is refused by name there).
     if (params.config.plugin != null) _ = try distributed.planFor(params.model_dir, params.config);
-    _ = plugin_driver.declineLossy(sch.allocator, params.config);
     // A served plugin reads the pack's tensors itself (`plugin/driver.zig`): the entry's map holds only the vision
     // tower, for the encoder below.
     const served = params.config.plugin != null;
