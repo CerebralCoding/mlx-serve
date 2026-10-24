@@ -512,7 +512,6 @@ pub const Generator = struct {
     pub const DsparkArm = @import("../spec/dspark.zig").DsparkArm;
     pub const dsparkArmFor = @import("../spec/dspark.zig").dsparkArmFor;
     pub const dsparkEnabled = @import("../spec/dspark.zig").dsparkEnabled;
-    const dsparkPolicyEnabled = @import("../spec/dspark.zig").dsparkPolicyEnabled;
     pub const initWithOptions = @import("init.zig").initWithOptions;
 
     /// Return the prefill's parked transients once, at the handover to decode.
@@ -663,7 +662,6 @@ pub const Generator = struct {
     pub const commitForcedTokens = @import("pipeline.zig").commitForcedTokens;
     pub const PldStepResult = @import("../spec/pld.zig").PldStepResult;
     pub const nextDspark = @import("../spec/dspark.zig").nextDspark;
-    const dsparkCopyOff = @import("../spec/dspark.zig").dsparkCopyOff;
     pub const dsparkCopyStep = @import("../spec/dspark.zig").dsparkCopyStep;
     pub const dsparkStep = @import("../spec/dspark.zig").dsparkStep;
     pub const dsparkPlainPipelined = @import("../spec/dspark.zig").dsparkPlainPipelined;
@@ -681,7 +679,6 @@ pub const Generator = struct {
     pub const nextDflash = @import("../spec/dflash.zig").nextDflash;
     const VerifyIn = @import("../spec/dflash.zig").VerifyIn;
     pub const dflashVerify = @import("../spec/dflash.zig").dflashVerify;
-    const dflashCopyOff = @import("../spec/dflash.zig").dflashCopyOff;
     const DFLASH_COPY_MAX = @import("../spec/dflash.zig").DFLASH_COPY_MAX;
     pub const dflashCopyRound = @import("../spec/dflash.zig").dflashCopyRound;
     const DFLASH_PENDING_MAX = @import("../spec/dflash.zig").DFLASH_PENDING_MAX;

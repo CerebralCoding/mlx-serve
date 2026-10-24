@@ -37,9 +37,7 @@ pub const DsparkArm = enum { off, greedy, stochastic };
 /// contract this generalizes). A clean greedy request (temp < 0.01 or
 /// top_k == 1) gets the raw argmax-equality accept; a clean SAMPLED
 /// request gets the stochastic arm (MTP one-hot Leviathan acceptance over
-/// filtered target probs) unless `stoch_enabled` is false — the
-/// MLX_SERVE_DSV4_DSPARK_STOCH=0 kill switch, which restores greedy-only
-/// gating.
+/// filtered target probs).
 pub fn dsparkArmFor(sampling: SamplingParams, logprobs_n: u32) DsparkArm {
     const clean = !sampling.penalized() and
         sampling.constraint == null and
@@ -53,11 +51,6 @@ pub fn dsparkArmFor(sampling: SamplingParams, logprobs_n: u32) DsparkArm {
 /// Shared by dispatch and /props; this disables drafting, not resident stages.
 pub fn dsparkEnabled() bool {
     return if (env.get(.MLX_SERVE_DSV4_DSPARK)) |v| v[0] != '0' else true;
-}
-
-/// `MLX_SERVE_DSV4_DSPARK_POLICY=0` verifies the whole block every stage round (the A/B arm of `dspark_pol`).
-pub fn dsparkPolicyEnabled() bool {
-    return if (env.get(.MLX_SERVE_DSV4_DSPARK_POLICY)) |v| v[0] != '0' else true;
 }
 
 /// PLD draft+verify decode step. The draft comes from an n-gram lookup
@@ -109,27 +102,15 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
     }
     if (intree.dsv41(self.xfm)) |mdl| {
         if (try self.dsparkCopyStep(allocator, mdl)) |res| return res;
-        if (self.dspark_pol != null) return self.dsparkPolicyStep(allocator, mdl);
-        return self.dsparkStep(allocator, dsv41_mod, mdl);
+        return self.dsparkPolicyStep(allocator, mdl);
     }
     return self.dsparkStep(allocator, dsv4_mod, intree.dsv4(self.xfm).?);
-}
-
-var dspark_copy_off_cache: ?bool = null;
-/// `MLX_SERVE_DSV4_DSPARK_COPY=0` drafts only from the stages (the A/B arm for copied continuations).
-pub fn dsparkCopyOff() bool {
-    if (dspark_copy_off_cache) |v| return v;
-    const raw = env.get(.MLX_SERVE_DSV4_DSPARK_COPY);
-    const off = raw != null and raw.?[0] == '0';
-    dspark_copy_off_cache = off;
-    return off;
 }
 
 /// A DSpark round whose drafts are the context's own continuation after `t1` (an echo, an edit):
 /// no stage forward, and up to `VERIFY_MAX_DRAFTS` drafts where the block holds `ds_block`.
 /// Null when the context holds no copy worth verifying.
 pub fn dsparkCopyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *dsv41_mod.Dsv41Model) !?DrafterStepResult {
-    if (dsparkCopyOff()) return null;
     const t1 = self.next_token_id;
     const idx = try self.mtpLookupIndex(allocator);
     const found = idx.matchBest(t1, dsv41_mod.VERIFY_MAX_DRAFTS);

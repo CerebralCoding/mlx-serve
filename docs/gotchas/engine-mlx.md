@@ -486,7 +486,7 @@ inheritance.
 Defect: agent CLIs omit temperature (generation_config 0.6), so every agent request ran serial and only `--temp 0` got
 DSpark. Fix: the one-hot-proposal arm of the MTP accept graph (accept with `min(1, p)`, residual correction from the
 original verify logits) on a split begin/finish seam that the greedy path also rides; `dsparkArmFor` picks the arm.
-2.0-2.3x on code and echo, parity on prose. Default on (`MLX_SERVE_DSV4_DSPARK_STOCH=0`).
+2.0-2.3x on code and echo, parity on prose.
 
 ## Media DiTs and loop tiers
 

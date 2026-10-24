@@ -47,7 +47,7 @@ Batched verify rows (`batched_rows`, rows > 1) are refused by name: the engine k
 ## Rules (from root AGENTS.md)
 - A norm's epsilon sits where the REFERENCE puts it: fla's l2norm adds it to the SUM (`gdnQkNormEps`: 1e-6/dk).
 - A capture gate is a promise the forward keeps: GLM taps the MEAN of its hyper-connection streams.
-- A sparse target's DFlash is policy-driven (`dflash_policy.zig`, `MLX_SERVE_DFLASH_POLICY=0`).
+- A sparse target's DFlash is policy-driven (`dflash_policy.zig`).
 - Generation growth is billed to the KV reserve's HEADROOM, never the auto budget (`glm5PrefillMemoryNeeded`).
 - A cache row no op reads is never computed: the indexer's rows below its budget ride `mlx_depends`.
 - Partials crossing threadgroups in ONE dispatch go by atomic store/load (`hcPre`).

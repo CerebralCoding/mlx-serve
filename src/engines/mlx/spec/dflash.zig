@@ -1,6 +1,5 @@
 //! DFlash block-drafter rounds: verify, copy, plain/pipelined policy rounds, parked taps.
 const std = @import("std");
-const env = @import("../../../env.zig");
 const DFLASH_GATE_WARMUP = @import("gates.zig").DFLASH_GATE_WARMUP;
 const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
@@ -56,7 +55,6 @@ pub const DflashPol = struct {
     calib: dflash_policy.Calibration = .{},
     drafting: dflash_policy.Drafting = .{},
     /// Verify exactly this many rows (t1 included) whenever the draft has them; 0 = the policy chooses.
-    /// `MLX_SERVE_DFLASH_ROWS`: how width costs and accepts are measured.
     pin_rows: u32 = 0,
     /// What a plain tick costs on this machine at this context, from this request's own pipelined ticks.
     /// The shared round-cost table is no source: its plain cell folds transition ticks and, once stale,
@@ -796,23 +794,12 @@ pub fn dflashVerify(self: *Generator, allocator: std.mem.Allocator, r: VerifyIn)
     };
 }
 
-var dflash_copy_off_cache: ?bool = null;
-/// `MLX_SERVE_DFLASH_COPY=0` drafts only from the assistant (the A/B arm for copied continuations).
-pub fn dflashCopyOff() bool {
-    if (dflash_copy_off_cache) |v| return v;
-    const raw = env.get(.MLX_SERVE_DFLASH_COPY);
-    const off = raw != null and raw.?[0] == '0';
-    dflash_copy_off_cache = off;
-    return off;
-}
-
 /// Longest copied continuation a round verifies: the fused row kernels reach 16 rows.
 pub const DFLASH_COPY_MAX: u32 = dflash_policy.MAX_DRAFTS;
 
 /// A round whose drafts are the context's own continuation after `t1` (an echo, an edit, a repeated block):
 /// no assistant forward, and as many rows as the cost ladder and the copies' record pay for.
 pub fn dflashCopyRound(self: *Generator, allocator: std.mem.Allocator, t1: u32, anchor_pos: usize, kv_step_snap: usize, serial: bool, stochastic: bool, tracing: bool, ph: *io_util.Stopwatch, watch: io_util.Stopwatch) !?DrafterStepResult {
-    if (dflashCopyOff()) return null;
     const pol = &self.dflash_pol.?;
     const idx = try self.mtpLookupIndex(allocator);
     const found = idx.matchBest(t1, DFLASH_COPY_MAX) orelse return null;

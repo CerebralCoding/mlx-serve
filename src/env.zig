@@ -309,15 +309,10 @@ pub const vars = struct {
     pub const MLX_SERVE_ANE_FORCE: Var = .{ .kind = .fixture, .type = .text, .default = "unset", .owner = "engines/mlx", .since = "26.8.10", .doc = "allows --ane-prefill on NAX GPUs, where it measured a loss" };
     pub const MLX_SERVE_CUDA_QMV_TC: Var = .{ .kind = .kill, .type = .flag, .default = "on where measured (sm_120)", .owner = "sdk/blocks/qmm", .since = "26.10.3", .doc = "CUDA tensor-core 4-bit GEMV for 2..8 rows" };
     pub const MLX_SERVE_DECODE_ATTN_QUANT_REQUANT: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "sdk/blocks/attention", .since = "26.10.2", .doc = "requantize the decode-attention side copies" };
-    pub const MLX_SERVE_DFLASH_COPY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "engines/mlx/spec", .since = "26.10.2", .doc = "DFlash copied continuations (=0 drafts only from the assistant)" };
-    pub const MLX_SERVE_DFLASH_POLICY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "engines/mlx/spec", .since = "26.10.2", .doc = "sparse-target DFlash round policy (GLM; =0 off)" };
     pub const MLX_SERVE_DSV41_ATTN_F16: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 f16 attention (=0: f32)" };
     pub const MLX_SERVE_DSV41_CED: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 CED prefill chunks (=0: full forward)" };
     pub const MLX_SERVE_DSV41_HEAD8: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 dense LM head requantized to 8-bit (=0: as shipped)" };
     pub const MLX_SERVE_DSV4_DSPARK: Var = .{ .kind = .public, .type = .flag, .default = "on (drafting; --dspark sets 1 to load the stages)", .owner = "engines/mlx/spec", .since = "26.7.12", .doc = "DeepSeek-V4 DSpark drafting (=0 off)" };
-    pub const MLX_SERVE_DSV4_DSPARK_COPY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "engines/mlx/spec", .since = "26.10.3", .doc = "DSpark copied continuations (=0 drafts only from the stages)" };
-    pub const MLX_SERVE_DSV4_DSPARK_POLICY: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "engines/mlx/spec", .since = "26.10.3", .doc = "DSpark round policy (=0 verifies the whole block every round)" };
-    pub const MLX_SERVE_DSV4_DSPARK_STOCH: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "engines/mlx/spec", .since = "26.8.1", .doc = "DSpark on sampled requests (=0: greedy only)" };
     pub const MLX_SERVE_FORCE_BATCHED: Var = .{ .kind = .fixture, .type = .flag, .default = "off", .owner = "engines/mlx", .since = "26.5.6", .doc = "=1: batched decode even with one slot" };
     pub const MLX_SERVE_GDN_STATE_F32: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "engines/mlx", .since = "26.10.2", .doc = "f32 GDN recurrent state (=0: bf16)" };
     pub const MLX_SERVE_GEN_YIELD: Var = .{ .kind = .kill, .type = .flag, .default = "off on CUDA, on elsewhere", .owner = "host/http", .since = "26.10.3", .doc = "chat interleaves with media jobs" };
@@ -336,7 +331,6 @@ pub const vars = struct {
 
     // ── tuning numbers ──
     pub const DFLASH_GATE_WARMUP: Var = .{ .kind = .tuning, .type = .int, .default = "DFLASH_GATE_WARMUP", .owner = "engines/mlx/spec", .since = "26.8.6", .doc = "rounds before the DFlash yield gate decides" };
-    pub const MLX_SERVE_DFLASH_ROWS: Var = .{ .kind = .tuning, .type = .int, .default = "0 (policy)", .owner = "engines/mlx/generate", .since = "26.10.2", .doc = "pins the DFlash policy's verify rows" };
     pub const MLX_SERVE_HC_DECODE2_ROWS: Var = .{ .kind = .tuning, .type = .int, .default = "16", .owner = "sdk/blocks/hc", .since = "26.10.2", .doc = "rows the two-launch HC decode read takes (1..16)" };
     pub const MLX_SERVE_LAYA_BATCH_WINDOW_US: Var = .{ .kind = .public, .type = .int, .default = "0", .owner = "host/media_jobs", .since = "26.9.6", .doc = "Laya decision batch window, microseconds" };
     pub const MLX_SERVE_LAYA_MAX_INPUT_TOKENS: Var = .{ .kind = .public, .type = .int, .default = "DecisionLimits default", .owner = "host/media_jobs", .since = "26.9.6", .doc = "Laya input token limit" };
