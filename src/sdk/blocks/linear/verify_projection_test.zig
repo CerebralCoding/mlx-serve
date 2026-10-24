@@ -25,7 +25,7 @@ const mtp_mod = @import("../../spec/mtp/mtp.zig");
 
 const qmatmulBits = @import("qmatmul.zig").qmatmulBits;
 
-const model_mod = @import("../../../engines/mlx/model.zig");
+const model_mod = @import("../../weights/load.zig");
 
 const qsaArraysAllEqual = @import("../../testing/parity.zig").qsaArraysAllEqual;
 

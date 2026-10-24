@@ -280,7 +280,7 @@ test "hy3d-paint-unet: 2-batch CFG equals the reference 3-batch collapse" {
 // namespaces); `is_main` gates the 12-vs-4-ch conv_in and the 2.5D modules.
 // ════════════════════════════════════════════════════════════════════════
 
-const Weights = @import("../../engines/mlx/model.zig").Weights;
+const Weights = @import("../../sdk/weights/load.zig").Weights;
 
 /// head_dim is 64 everywhere → SDPA scale is a constant 1/sqrt(64).
 const ATTN_SCALE: f32 = 0.125;

@@ -668,7 +668,7 @@ test "trellis2 mesh: simplifyAndClean closes the cube's hole, drops a floater an
 test "trellis2 oracle: the dual grid mesh equals the reference's vertices and triangles (TRELLIS2_FIXTURES)" {
     const gpa = testing.allocator;
     const dir = std.mem.span(std.c.getenv("TRELLIS2_FIXTURES") orelse return error.SkipZigTest);
-    const model_mod = @import("../../engines/mlx/model.zig");
+    const model_mod = @import("../../sdk/weights/load.zig");
     const mlx = @import("../../mlx/ffi.zig");
     var fx = try model_mod.loadWeightsFile(gpa, dir, "shape_dec.safetensors");
     defer fx.deinit();

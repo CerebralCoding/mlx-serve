@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const Weights = @import("../../engines/mlx/model.zig").Weights;
+const Weights = @import("../../sdk/weights/load.zig").Weights;
 const testing = @import("../../engines/mlx/kv/cache.zig").testing;
 const getWeightAtOpt = @import("../../engines/mlx/load/weights.zig").getWeightAtOpt;
 const layerBase = @import("../../engines/mlx/load/weights.zig").layerBase;

@@ -235,7 +235,7 @@ pub fn parseConfig(io: std.Io, a: std.mem.Allocator, model_dir: []const u8) !Con
 // (`student.dconv_encoder.*`) is loaded lazily elsewhere for img2img.
 // ══════════════════════════════════════════════════════════════════════════
 
-const model_mod = @import("../../engines/mlx/model.zig");
+const model_mod = @import("../../sdk/weights/load.zig");
 const tok_mod = @import("../../sdk/tokenizer/tokenizer.zig");
 const Weights = model_mod.Weights;
 const S = mlx.mlx_stream;

@@ -12,7 +12,7 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
+const model_mod = @import("../../sdk/weights/load.zig");
 const scope_mod = @import("../../mlx/scope.zig");
 
 const A = mlx.mlx_array;
