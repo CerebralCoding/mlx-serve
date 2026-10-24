@@ -4,7 +4,7 @@ const std = @import("std");
 const env = @import("../env.zig");
 const mlx = @import("ffi.zig");
 const log = @import("../host/log.zig");
-const metrics = @import("../host/status.zig");
+const metrics = @import("../sdk/util/system.zig");
 const testing = std.testing;
 
 /// PURE (unit-testable): the cap to put on MLX's reclaimable buffer pool for a

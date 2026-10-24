@@ -9,7 +9,7 @@ const log = @import("../../../host/log.zig");
 const crt = @import("../../util/crt.zig");
 const Weights = @import("../../weights/resident.zig").Weights;
 const sushi_pack = @import("../exl3/sushi_pack.zig");
-const status = @import("../../../host/status.zig");
+const status = @import("../../util/system.zig");
 
 /// True for a config whose `quantization_config.quant_method` is `modelopt`.
 pub fn declared(root: std.json.ObjectMap) bool {

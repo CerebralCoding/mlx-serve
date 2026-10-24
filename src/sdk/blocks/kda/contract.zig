@@ -610,7 +610,7 @@ test "kernel contract kda: each declared launch is the shipped wrapper's, byte f
     var set = kc.Set.init(a);
     defer set.deinit();
     try register(&set);
-    const cores: c_int = @intCast(@import("../../../host/status.zig").gpuCoreCount());
+    const cores: c_int = @intCast(@import("../../util/system.zig").gpuCoreCount());
     for (set.kernels.items) |k| {
         const shape = k.spec.served[k.spec.served.len - 1];
         if (std.mem.startsWith(u8, k.spec.name, "kda_percore")) {

@@ -141,7 +141,7 @@ test {
     _ = @import("engines/mlx/cache/prefix_cache.zig");
     _ = @import("engines/mlx/cache/restore_dump.zig");
     _ = @import("host/metrics/metrics.zig");
-    _ = @import("host/status.zig");
+    _ = @import("sdk/util/system.zig");
     _ = @import("host/gpu_thread/sleep_inhibit.zig");
     _ = @import("engines/mlx/cache/ssd/disk_tier.zig");
     _ = @import("engines/mlx/cache/ssd/writer.zig");

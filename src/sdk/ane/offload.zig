@@ -31,7 +31,7 @@ const env = @import("../../env.zig");
 const builtin = @import("builtin");
 const log = @import("../../host/log.zig");
 const mlx = @import("../../mlx/ffi.zig");
-const status = @import("../../host/status.zig");
+const status = @import("../util/system.zig");
 
 // ── C ABI (lib/ane/ane_mlp.h) ──
 
