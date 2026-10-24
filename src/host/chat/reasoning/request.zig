@@ -7,6 +7,8 @@ const generate_mod = @import("../../../engines/mlx/generate.zig");
 const generation_settings = @import("../../api/generation_settings.zig");
 const chat_mod = @import("../chat.zig");
 const rp_mod = @import("protocol.zig");
+const abi = @import("../../../abi/plugin.zig");
+const ModelConfig = @import("../../../engines/mlx/model.zig").ModelConfig;
 const log = @import("../../../sdk/util/log.zig");
 const responses_mod = @import("../../api/responses/model.zig");
 const model_registry_mod = @import("../../registry/registry.zig");
@@ -128,9 +130,14 @@ pub fn armToolForce(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const 
     return .{ .closer_id = closer, .forced = forced, .opener_at = head, .in_think = opened };
 }
 
+/// The reasoning channels the model's plugin declares (`ChatFacts.reasoning_dialect`); unset off the plugin path.
+pub fn reasoningDialect(c: *const ModelConfig) abi.ReasoningDialect {
+    return if (c.plugin) |b| b.parsed.chat.reasoning_dialect else .unset;
+}
+
 pub fn promptOpensMuseHeader(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32) bool {
     const c = lm.config orelse return false;
-    if (!std.mem.eql(u8, c.model_type, "muse_glimmer") or prompt_ids.len == 0) return false;
+    if (reasoningDialect(c) != .muse or prompt_ids.len == 0) return false;
     const n = @min(prompt_ids.len, 8);
     const tail = decodeTokens(allocator, lm, tok, prompt_ids[prompt_ids.len - n ..], false) catch return false;
     defer allocator.free(tail);
