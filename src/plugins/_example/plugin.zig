@@ -154,12 +154,16 @@ const Graph = struct {
 fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) Verdict {
     const m: *Model = @ptrCast(@alignCast(mp));
     if (!abi.declaresMode(m.caps, f.mode) or f.mode == .canvas) return Verdict.refuse(.unsupported, "_example: forward mode not declared");
-    if (f.capture_layers.len > 0 or f.ids.ctx != null) return Verdict.refuse(.unsupported, "_example: no layer capture or device token ids");
+    if (f.capture_layers.len > 0) return Verdict.refuse(.unsupported, "_example: no layer capture");
     const ops = f.cache_ops orelse return Verdict.refuse(.failed, "_example: a decoder needs the engine's cache");
     const slots = f.caches.len;
-    const ids = f.tokens.slice();
-    if (slots == 0 or f.rows == 0 or ids.len != f.rows * slots or f.positions.len != slots) return Verdict.refuse(.failed, "_example: tokens are not rows x slots");
-    for (ids) |t| if (t >= m.cfg.vocab_size) return Verdict.refuse(.failed, "_example: token id past the vocabulary");
+    if (slots == 0 or f.rows == 0 or f.positions.len != slots) return Verdict.refuse(.failed, "_example: tokens are not rows x slots");
+    // The engine hands its ids either on the host (`tokens`) or as a device array `[slots, rows]` (`ids`).
+    if (f.ids.ctx == null) {
+        const ids = f.tokens.slice();
+        if (ids.len != f.rows * slots) return Verdict.refuse(.failed, "_example: tokens are not rows x slots");
+        for (ids) |t| if (t >= m.cfg.vocab_size) return Verdict.refuse(.failed, "_example: token id past the vocabulary");
+    }
     run(m, f, ops, out) catch return Verdict.refuse(.failed, "_example: an MLX op failed");
     return .ok;
 }
@@ -172,8 +176,16 @@ fn run(m: *Model, f: *const abi.Forward, ops: *const abi.CacheOps, out: *abi.For
     var hiddens: std.ArrayList(c.mlx_array) = .empty;
     defer hiddens.deinit(gpa);
     for (f.caches.slice(), f.positions.slice(), 0..) |cache, pos, i| {
-        const toks = f.tokens.slice()[i * f.rows ..][0..f.rows];
-        const x = try decoder(m, &g, ops, cache, toks, @intCast(pos));
+        const slot: c_int = @intCast(i);
+        const ids = if (f.ids.ctx != null)
+            try g.reshape(try g.op(c.mlx_slice, .{ c.mlx_array{ .ctx = f.ids.ctx }, &[_]c_int{ slot, 0 }, 2, &[_]c_int{ slot + 1, rows }, 2, &[_]c_int{ 1, 1 }, 2 }), &.{rows})
+        else blk: {
+            const toks = f.tokens.slice()[i * f.rows ..][0..f.rows];
+            const a = c.mlx_array_new_data(toks.ptr, &[_]c_int{rows}, 1, c.MLX_UINT32);
+            try g.live.append(gpa, a);
+            break :blk a;
+        };
+        const x = try decoder(m, &g, ops, cache, ids, @intCast(pos));
         const h = if (f.logits == .last_row) try g.op(c.mlx_slice, .{ x, &[_]c_int{ rows - 1, 0 }, 2, &[_]c_int{ rows, @intCast(m.cfg.hidden_size) }, 2, &[_]c_int{ 1, 1 }, 2 }) else x;
         try hiddens.append(gpa, h);
     }
@@ -185,11 +197,9 @@ fn run(m: *Model, f: *const abi.Forward, ops: *const abi.CacheOps, out: *abi.For
 }
 
 /// One slot's rows through the trunk: the final-normed hidden `[rows, hidden]`.
-fn decoder(m: *Model, g: *Graph, ops: *const abi.CacheOps, cache: abi.Handle, toks: []const u32, pos: c_int) !c.mlx_array {
+fn decoder(m: *Model, g: *Graph, ops: *const abi.CacheOps, cache: abi.Handle, ids: c.mlx_array, pos: c_int) !c.mlx_array {
     const k = m.cfg;
-    const t: c_int = @intCast(toks.len);
-    const ids = c.mlx_array_new_data(toks.ptr, &[_]c_int{t}, 1, c.MLX_UINT32);
-    try g.live.append(gpa, ids);
+    const t: c_int = @intCast(c.mlx_array_size(ids));
     var x = try g.reshape(try g.op(c.mlx_take_axis, .{ m.embed, ids, 0 }), &.{ 1, t, @intCast(k.hidden_size) });
     const nh: c_int = @intCast(k.num_attention_heads);
     const nkv: c_int = @intCast(k.num_key_value_heads);

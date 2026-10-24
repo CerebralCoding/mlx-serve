@@ -88,7 +88,7 @@ if srv_wait_health "$URL" 120 0.5 "$SRV"; then
     check "it generated tokens ($TOKS)" "$([ "${TOKS:-0}" -gt 0 ] && echo 1 || echo 0)"
     STREAM=$(curl -sN "$URL/v1/chat/completions" -H 'Content-Type: application/json' \
         -d '{"model":"t/example","messages":[{"role":"user","content":"hi"}],"max_tokens":8,"temperature":0,"stream":true}')
-    check "a streamed chat ends with [DONE]" "$(echo "$STREAM" | grep -q '\[DONE\]' && echo 1 || echo 0)"
+    check "a streamed chat carries content and ends with [DONE]" "$(echo "$STREAM" | grep -q '"content":"[^"]' && echo "$STREAM" | grep -q '\[DONE\]' && ! echo "$STREAM" | grep -q '"error"' && echo 1 || echo 0)"
 else
     check "server with plugins on became healthy" 0
     tail -20 "$LOG"
