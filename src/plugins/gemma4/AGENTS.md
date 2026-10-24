@@ -4,9 +4,7 @@ Owns `gemma4`, `gemma4_text`, `gemma4_unified(_text)` (mlx-lm's layouts). The te
 per-layer embeddings and a KV-shared tail, 12B/31B, the 26B-A4B experts), with image and audio rows spliced at their
 placeholders (a unified pack's encoder-free embedder rows too), are served bit-equal to the legacy forward
 (`gemma4`, `gemma4_text`, `gemma4_unified(_text)` in `served.zig`); draft-model configs (DSpark / DFlash / EAGLE-3
-keys) are declined `unsupported`. The decoder also
-serves DiffusionGemma's encoder passes and canvas steps (`decoder.canvas`), and `bidirectional.zig` is the encoder
-base of both EmbeddingGemma plugins.
+keys) are declined `unsupported`. `bidirectional.zig` is the encoder base of both EmbeddingGemma plugins.
 
 ## Files
 - `config.zig`: MLX-free claim + parse over Gemma 3's `readCommon`/`finish` with the Gemma 4 traits (nested
