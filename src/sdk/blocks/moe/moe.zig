@@ -7,7 +7,6 @@ const exl3 = @import("../../quant/exl3/format.zig");
 const gather_qmm_nax = @import("gather_qmm_nax.zig");
 const log = @import("../../../host/log.zig");
 const moe_affine4 = @import("../../../plugins/qwen4_exp/moe_affine4.zig");
-const glm5 = @import("../../../plugins/glm5_next/glm5_next.zig");
 const gather_qmv_rows = @import("gather_qmv_rows.zig");
 const profile = @import("../../../engines/mlx/diag/profile.zig");
 const transformer = @import("../../../engines/mlx/transformer.zig");
@@ -433,10 +432,6 @@ pub fn moeMLP2WithRouter(self: *Transformer, router_x: mlx.mlx_array, expert_x_i
         try mlx.check(mlx.mlx_multiply(&scaled_scores, norm_scores, selected_scales, self.s));
         _ = mlx.mlx_array_free(norm_scores);
         norm_scores = scaled_scores;
-    }
-
-    if (cfg.isGlm5() and cfg.exl3 == null and !skip_shared and mlx.mlx_array_size(expert_x) <= @as(usize, glm5.MOE_DECODE_MAX_ROWS) * cfg.hidden_size) {
-        if (try self.glmMoeDecode(expert_x, inds, norm_scores, mw, gate_qp, up_qp, down_qp)) |y| return y;
     }
 
     if (cfg.exl3) |spec| {

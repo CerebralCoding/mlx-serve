@@ -1,5 +1,5 @@
 //! sdk/blocks/moe/decode, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns glmMoeDecode, batchedExpertMm, moeDecodeGatherQmv, moeFp4Decode, moeAffine4Decode, moeCudaDecode, and 9 more.
+//! Owns batchedExpertMm, moeDecodeGatherQmv, moeFp4Decode, moeAffine4Decode, moeCudaDecode, and 9 more.
 
 const std = @import("std");
 const env = @import("../../../env.zig");
@@ -10,7 +10,6 @@ const ModelConfig = @import("../../../engines/mlx/model.zig").ModelConfig;
 const QuantMode = @import("../../../engines/mlx/model.zig").QuantMode;
 const moe_fp4 = @import("moe_fp4.zig");
 const moe_affine4 = @import("../../../plugins/qwen4_exp/moe_affine4.zig");
-const glm5 = @import("../../../plugins/glm5_next/glm5_next.zig");
 const down_reduce = @import("down_reduce.zig");
 const gather_qmv = @import("gather_qmv.zig");
 const gather_qmv_rows = @import("gather_qmv_rows.zig");
@@ -30,39 +29,6 @@ const gatherQmvGateUp = @import("gather_qmv.zig").gatherQmvGateUp;
 const gatherQmvGateUpEnabled = @import("gather_qmv.zig").gatherQmvGateUpEnabled;
 const gatherQmvGateUpRows = @import("gather_qmv_rows.zig").gatherQmvGateUpRows;
 const MoeMlpWeights = @import("weights.zig").MoeMlpWeights;
-
-/// GLM-5-Next one-token MoE (`glm5.moeDecode`): routed and shared experts in two dispatches.
-pub fn glmMoeDecode(self: *Transformer, x: mlx.mlx_array, inds: mlx.mlx_array, scores: mlx.mlx_array, mw: *const MoeMlpWeights, gate_qp: QuantParams, up_qp: QuantParams, down_qp: QuantParams) !?mlx.mlx_array {
-    const inter: ?u32 = if (self.config.shared_expert_intermediate_size > 0) self.config.shared_expert_intermediate_size else null;
-    const sg = self.quantParamsHinted(mw.shared_gate_w, mw.shared_gate_s, lastDim(x));
-    const su = self.quantParamsHinted(mw.shared_up_w, mw.shared_up_s, lastDim(x));
-    const sd = self.quantParamsHinted(mw.shared_down_w, mw.shared_down_s, inter);
-    inline for (.{ gate_qp, up_qp, down_qp, sg, su, sd }) |qp| if (qp.mode != .affine) return null;
-    const k: c_int = @intCast(mlx.mlx_array_size(inds));
-    var flat = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(flat);
-    try mlx.check(mlx.mlx_reshape(&flat, inds, &[_]c_int{k}, 1, self.s));
-    var ids = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(ids);
-    try mlx.check(mlx.mlx_astype(&ids, flat, .uint32, self.s));
-    var sc = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sc);
-    try mlx.check(mlx.mlx_reshape(&sc, scores, &[_]c_int{k}, 1, self.s));
-    const y = (try glm5.moeDecode(self.s, x, ids, sc, //
-        .{ .w = mw.switch_gate_w, .s = mw.switch_gate_s, .b = mw.switch_gate_b, .bits = gate_qp.bits, .gs = gate_qp.group_size }, //
-        .{ .w = mw.switch_up_w, .s = mw.switch_up_s, .b = mw.switch_up_b, .bits = up_qp.bits, .gs = up_qp.group_size }, //
-        .{ .w = mw.switch_down_w, .s = mw.switch_down_s, .b = mw.switch_down_b, .bits = down_qp.bits, .gs = down_qp.group_size }, //
-        .{ .w = mw.shared_gate_w, .s = mw.shared_gate_s, .b = mw.shared_gate_b, .bits = sg.bits, .gs = sg.group_size }, //
-        .{ .w = mw.shared_up_w, .s = mw.shared_up_s, .b = mw.shared_up_b, .bits = su.bits, .gs = su.group_size }, //
-        .{ .w = mw.shared_down_w, .s = mw.shared_down_s, .b = mw.shared_down_b, .bits = sd.bits, .gs = sd.group_size }, //
-        self.config.swiglu_limit)) orelse return null;
-    defer _ = mlx.mlx_array_free(y);
-    const xs = mlx.getShape(x);
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_reshape(&out, y, xs.ptr, xs.len, self.s));
-    return out;
-}
 
 /// Decode-width MoE expert compute through the in-place gather-qmv kernel
 /// (`gatherQmv`), which indexes the expert bank directly instead of

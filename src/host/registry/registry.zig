@@ -428,10 +428,6 @@ pub const LoadedModel = struct {
                     self.allocator.destroy(q);
                 },
                 .qwen4 => {}, // in-trunk head, owned by the Transformer
-                .glm => |m| {
-                    m.deinit();
-                    self.allocator.destroy(m);
-                },
                 .plugin => |m| {
                     m.deinit();
                     self.allocator.destroy(m);
@@ -595,10 +591,6 @@ pub const LoadedModel = struct {
                     self.allocator.destroy(q);
                 },
                 .qwen4 => {}, // in-trunk head, owned by the Transformer
-                .glm => |m| {
-                    m.deinit();
-                    self.allocator.destroy(m);
-                },
                 .plugin => |m| {
                     m.deinit();
                     self.allocator.destroy(m);

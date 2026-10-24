@@ -1,8 +1,8 @@
 //! Parity proof for the KDA-hybrid plugins: on a tiny random pack, the table's forward over the engine's own cache
-//! adapter (`engines/mlx/kv/cache_ops.zig`) is bit-equal to the legacy forward at every step: logits of every row,
-//! captured layers, each KDA layer's recurrent state and a verify's per-row capture. Shared by glm5_next and
+//! adapter (`engines/mlx/kv/cache_ops.zig`) is bit-equal to the deleted legacy forward at every step: logits of every
+//! row, captured layers, each KDA layer's recurrent state and a verify's per-row capture. Shared by glm5_next and
 //! bailing_hybrid (`expectSteps`); GLM's batched rows, MTP head and media rows too. The legacy values replay from
-//! `fixtures/*.tape`; with `MLX_SERVE_PROOF_RECORD` set they are recorded from the legacy forward instead.
+//! `fixtures/*.tape`, recorded from that forward before it was deleted.
 
 const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
@@ -12,16 +12,11 @@ const ops = @import("../../mlx/ops.zig");
 const model = @import("../../engines/mlx/model.zig");
 const cache_ops = @import("../../engines/mlx/kv/cache_ops.zig");
 const tape_mod = @import("../../engines/mlx/plugin/tape.zig");
-const legacy_fwd = @import("forward.zig");
-const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
 const KVCache = @import("../../engines/mlx/kv/cache.zig").KVCache;
 const SSMCacheEntry = @import("../../engines/mlx/ssm/entry.zig").SSMCacheEntry;
-const ForwardCtx = @import("../../engines/mlx/forward_ctx.zig").ForwardCtx;
-const CaptureLayers = @import("../../engines/mlx/forward_ctx.zig").CaptureLayers;
 const Resident = @import("../../sdk/weights/resident.zig").Resident;
 const sdk = @import("../../sdk/root.zig");
 const fixture = @import("fixture.zig");
-const glm_mtp = @import("mtp.zig");
 const parity = @import("../../sdk/testing/parity.zig");
 const glm = @import("plugin.zig");
 const ling = @import("../bailing_hybrid/plugin.zig");
@@ -31,18 +26,16 @@ const testing = std.testing;
 const Array = mlx.mlx_array;
 const Tape = tape_mod.Tape;
 
-/// One slot's engine cache: the KV cache, a recurrent state per layer and the legacy context over them.
+/// One slot's engine cache: the KV cache and a recurrent state per layer behind the engine's adapter.
 const Slot = struct {
     kv: KVCache,
     ssm: []SSMCacheEntry,
     off: usize = 0,
-    ctx: ForwardCtx = undefined,
     adapter: cache_ops.Slot = undefined,
 
     fn init(s: *Slot, layers: u32) !void {
         s.* = .{ .kv = try KVCache.init(testing.allocator, layers), .ssm = try testing.allocator.alloc(SSMCacheEntry, layers) };
         for (s.ssm) |*e| e.* = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = false };
-        s.ctx = .{ .cache = &s.kv, .moe_seq_offset = &s.off, .ssm_entries = s.ssm, .capture_hidden = null, .vision_embeddings = null };
         s.adapter = .{ .kv = &s.kv, .ssm = s.ssm };
     }
 
@@ -55,37 +48,8 @@ const Slot = struct {
     }
 };
 
-/// The legacy load of the same pack, present only while recording.
-const Legacy = struct {
-    cfg: model.ModelConfig,
-    weights: model.Weights,
-    xfm: Transformer,
-
-    fn open(dir: []const u8) !*Legacy {
-        const a = testing.allocator;
-        const io = std.Io.Threaded.global_single_threaded.io();
-        const l = try a.create(Legacy);
-        errdefer a.destroy(l);
-        l.cfg = try model.parseConfigLegacy(io, a, dir);
-        errdefer l.cfg.deinit(a);
-        l.weights = try model.loadModelWeights(io, a, dir, &l.cfg, false);
-        errdefer l.weights.deinit();
-        l.xfm = try Transformer.init(io, a, l.cfg, &l.weights);
-        l.xfm.compileMoeRouting();
-        l.xfm.compileGdnGate();
-        return l;
-    }
-
-    fn close(l: *Legacy) void {
-        l.xfm.deinit();
-        l.weights.deinit();
-        l.cfg.deinit(testing.allocator);
-        testing.allocator.destroy(l);
-    }
-};
-
-/// A pack on disk served by plugin `P` over the engine's resident source, checked against the tape `tape` (a path
-/// under the repo root; none for a proof comparing the plugin with itself) or, recording, the legacy load.
+/// A pack on disk served by plugin `P` over the engine's resident source, checked against the tape `tape` (under
+/// `src/plugins/`; none for a proof comparing the plugin with itself).
 fn Twin(comptime P: type) type {
     return struct {
         tmp: testing.TmpDir,
@@ -95,7 +59,6 @@ fn Twin(comptime P: type) type {
         parsed: abi.Parsed = .{},
         m: *anyopaque,
         tape: Tape = .{},
-        lg: ?*Legacy = null,
         s: mlx.mlx_stream,
 
         fn open(files: []const sdk.fixture.File, comptime tape: ?[]const u8) !*@This() {
@@ -114,13 +77,9 @@ fn Twin(comptime P: type) type {
             errdefer t.res.deinit();
             t.src = t.res.source();
             if (tape) |rel| {
-                if (tape_mod.recordRoot()) |root| {
-                    t.lg = try Legacy.open(dir);
-                    t.tape = try Tape.recorder(root, rel);
-                } else t.tape = try Tape.player(@embedFile("../" ++ rel["src/plugins/".len..]));
+                t.tape = try Tape.player(@embedFile("../" ++ rel));
                 t.tape.compact_over = tape_compact_over;
             }
-            errdefer if (t.lg) |l| l.close();
             const mem: sdk.fixture.MemDir = .{ .files = files };
             const pd = mem.packDir();
             try testing.expect(P.table.parse(&pd, .of(files[0].bytes), .{}, null, false, &t.parsed).isOk());
@@ -134,10 +93,8 @@ fn Twin(comptime P: type) type {
         }
 
         fn close(t: *@This()) void {
-            t.tape.finish() catch |e| std.debug.panic("proof tape: {t}", .{e});
             P.table.unload(t.m);
             P.table.free_parsed(&t.parsed);
-            if (t.lg) |l| l.close();
             t.res.deinit();
             t.cfg.deinit(testing.allocator);
             t.tmp.cleanup();
@@ -148,12 +105,9 @@ fn Twin(comptime P: type) type {
             return t.cfg.num_hidden_layers;
         }
 
-        /// `got` (the plugin's) against `want` (the legacy's, recorded) or the tape.
-        fn check(t: *@This(), got: Array, want: ?Array) !void {
-            if (want) |w| {
-                try ops.expectBitEqual(got, w);
-                if (t.tape.recording()) try t.tape.put(w);
-            } else try t.tape.expectNext(got, false);
+        /// `got` (the plugin's) against the tape's next value.
+        fn check(t: *@This(), got: Array) !void {
+            try t.tape.expectNext(got, false);
         }
 
         /// The plugin's `[S, V]` logits and two captured layers for one step of slot `s`.
@@ -174,58 +128,19 @@ fn Twin(comptime P: type) type {
             return l;
         }
 
-        /// The legacy forward's `[S, V]` logits and the same captured layers (none when `caps` is null: a capture
-        /// materializes the deferred hyper-connection expand, so both sides capture alike).
-        fn legacy(t: *@This(), s: *Slot, verify: bool, ids: []const u32, caps: ?*[2]Array) !Array {
-            const lx = &t.lg.?.xfm;
-            const arr = try idsArray(ids);
-            defer _ = mlx.mlx_array_free(arr);
-            var cl: CaptureLayers = undefined;
-            if (caps) |cp| {
-                cp.* = .{ mlx.mlx_array_new(), mlx.mlx_array_new() };
-                cl = .{ .ids = &capture_ids, .out = cp };
-                s.ctx.capture_layers = &cl;
-            }
-            s.ctx.capture_ssm_seq = verify;
-            s.ctx.spec_verify = verify;
-            defer {
-                s.ctx.capture_layers = null;
-                s.ctx.capture_ssm_seq = false;
-                s.ctx.spec_verify = false;
-            }
-            const l = try lx.forwardWith(&s.ctx, arr);
-            defer _ = mlx.mlx_array_free(l);
-            var o = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_reshape(&o, l, &[_]c_int{ @intCast(ids.len), @intCast(t.cfg.vocab_size) }, 2, t.s));
-            try settle(s, if (caps) |cp| &.{ o, cp[0], cp[1] } else &.{o});
-            return o;
-        }
-
-        /// Every KDA layer's state of `ps` against `ls` (the legacy slot, recording) or the tape: which states are
-        /// set, then each set one, and a verify's per-row capture up to its last row (which the verify kernel may
-        /// leave unwritten: the final state is its own output).
-        fn expectStates(t: *@This(), ls: ?*const Slot, ps: *const Slot) !void {
-            const flags_p = try stateFlags(ps);
-            defer _ = mlx.mlx_array_free(flags_p);
-            const flags_l: ?Array = if (ls) |l| try stateFlags(l) else null;
-            defer if (flags_l) |f| {
-                _ = mlx.mlx_array_free(f);
-            };
-            try t.check(flags_p, flags_l);
-            for (ps.ssm, 0..) |y, i| {
-                const x: ?SSMCacheEntry = if (ls) |l| l.ssm[i] else null;
-                for ([_]Array{ y.conv_state, y.ssm_state, y.spec_conv_input }, 0..) |got, k| if (got.ctx != null) {
-                    const want: ?Array = if (x) |e| ([_]Array{ e.conv_state, e.ssm_state, e.spec_conv_input })[k] else null;
-                    try t.check(got, want);
-                };
+        /// Every KDA layer's state of `ps` against the tape: which states are set, then each set one, and a
+        /// verify's per-row capture up to its last row (which the verify kernel may leave unwritten: the final state
+        /// is its own output).
+        fn expectStates(t: *@This(), ps: *const Slot) !void {
+            const flags = try stateFlags(ps);
+            defer _ = mlx.mlx_array_free(flags);
+            try t.check(flags);
+            for (ps.ssm) |y| {
+                for ([_]Array{ y.conv_state, y.ssm_state, y.spec_conv_input }) |got| if (got.ctx != null) try t.check(got);
                 if (y.spec_state_seq.ctx == null or mlx.getShape(y.spec_state_seq)[0] < 2) continue;
                 const got = try leadingRows(y.spec_state_seq);
                 defer _ = mlx.mlx_array_free(got);
-                const want: ?Array = if (x) |e| try leadingRows(e.spec_state_seq) else null;
-                defer if (want) |w| {
-                    _ = mlx.mlx_array_free(w);
-                };
-                try t.check(got, want);
+                try t.check(got);
             }
         }
     };
@@ -312,22 +227,16 @@ const runs = [_][]const Step{
 
 fn expectSteps(comptime P: type, t: *Twin(P)) !void {
     for (runs) |run| {
-        var ls: Slot = undefined;
-        try ls.init(t.layers());
-        defer ls.deinit();
         var ps: Slot = undefined;
         try ps.init(t.layers());
         defer ps.deinit();
         for (run) |st| {
-            var lc: [2]Array = .{ .{ .ctx = null }, .{ .ctx = null } };
-            const want: ?Array = if (t.lg != null) try t.legacy(&ls, st.mode == .verify, st.ids, &lc) else null;
-            defer freeAll(&.{ want orelse .{ .ctx = null }, lc[0], lc[1] });
             var pc: [2]Array = undefined;
             const got = try t.plugin(&ps, st.mode, st.ids, &pc);
             defer freeAll(&.{ got, pc[0], pc[1] });
-            try t.check(got, want);
-            for (pc, lc) |g, w| try t.check(g, if (want != null) w else null);
-            try t.expectStates(if (t.lg != null) &ls else null, &ps);
+            try t.check(got);
+            for (pc) |g| try t.check(g);
+            try t.expectStates(&ps);
         }
     }
 }
@@ -336,7 +245,7 @@ test "glm5_next plugin: prefill, decode, verify and later chunks equal the legac
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const t = try Twin(glm).open(try fixture.glmFiles(arena.allocator(), 7), "src/plugins/glm5_next/fixtures/steps.tape");
+    const t = try Twin(glm).open(try fixture.glmFiles(arena.allocator(), 7), "glm5_next/fixtures/steps.tape");
     defer t.close();
     try expectSteps(glm, t);
     try t.tape.expectDone();
@@ -346,7 +255,7 @@ test "bailing_hybrid plugin: prefill, decode, verify and later chunks equal the 
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const t = try Twin(ling).open(try fixture.lingFiles(arena.allocator(), 11), "src/plugins/bailing_hybrid/fixtures/steps.tape");
+    const t = try Twin(ling).open(try fixture.lingFiles(arena.allocator(), 11), "bailing_hybrid/fixtures/steps.tape");
     defer t.close();
     try expectSteps(ling, t);
     try t.tape.expectDone();
@@ -357,7 +266,7 @@ test "glm5_next plugin: batched rows equal the legacy batched decode bit for bit
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const t = try Twin(glm).open(try fixture.glmFiles(arena.allocator(), 7), "src/plugins/glm5_next/fixtures/batched.tape");
+    const t = try Twin(glm).open(try fixture.glmFiles(arena.allocator(), 7), "glm5_next/fixtures/batched.tape");
     defer t.close();
     try expectBatched(t);
     try t.tape.expectDone();
@@ -369,7 +278,7 @@ test "glm5_next plugin: a Sushi pack's EXL3 experts equal the legacy forward bit
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const t = try Twin(glm).open(try fixture.glmSushiFiles(arena.allocator(), 7), "src/plugins/glm5_next/fixtures/sushi.tape");
+    const t = try Twin(glm).open(try fixture.glmSushiFiles(arena.allocator(), 7), "glm5_next/fixtures/sushi.tape");
     defer t.close();
     try testing.expect(t.cfg.exl3 != null);
     try expectSteps(glm, t);
@@ -392,62 +301,31 @@ fn pluginTick(t: *Twin(glm), ps: []Slot, toks: []const u32) !Array {
 
 fn expectBatched(t: *Twin(glm)) !void {
     const N = fwd.MOE_DECODE_BATCH_MAX + 2;
-    var ls: [N]Slot = undefined;
     var ps: [N]Slot = undefined;
     var made: usize = 0;
-    defer for (ls[0..made], ps[0..made]) |*l, *p| {
-        l.deinit();
-        p.deinit();
-    };
-    const recording = t.lg != null;
-    for (0..N) |i| {
-        try ls[i].init(t.layers());
-        ps[i].init(t.layers()) catch |e| {
-            ls[i].deinit();
-            return e;
-        };
+    defer for (ps[0..made]) |*p| p.deinit();
+    for (&ps, 0..) |*p, i| {
+        try p.init(t.layers());
         made += 1;
         // Prompts of different lengths, so the slots attend over different histories.
-        const prompt = long_prompt[0 .. 3 + i];
         var c: [2]Array = undefined;
-        if (recording) {
-            freeAll(&.{try t.legacy(&ls[i], false, prompt, &c)});
-            freeAll(&c);
-        }
-        freeAll(&.{try t.plugin(&ps[i], .prefill, prompt, &c)});
+        freeAll(&.{try t.plugin(p, .prefill, long_prompt[0 .. 3 + i], &c)});
         freeAll(&c);
-        try t.expectStates(if (recording) &ls[i] else null, &ps[i]);
+        try t.expectStates(p);
     }
     for (0..3) |tick| {
         var toks: [N]u32 = undefined;
         for (&toks, 0..) |*tk, i| tk.* = @intCast((tick * 31 + i * 7 + 5) % fixture.glm.V);
-        var rows: []Array = &.{};
-        defer {
-            freeAll(rows);
-            if (rows.len > 0) testing.allocator.free(rows);
-        }
-        if (recording) {
-            var ctxs: [N]*ForwardCtx = undefined;
-            for (0..N) |i| ctxs[i] = &ls[i].ctx;
-            const r = try legacy_fwd.forwardGlmBatchedDecode(&t.lg.?.xfm, &toks, &ctxs, null);
-            rows = try testing.allocator.dupe(Array, r);
-            t.lg.?.xfm.allocator.free(r);
-            for (0..N) |i| try settle(&ls[i], rows[i .. i + 1]);
-            for (0..N) |i| ls[i].off += 1;
-        }
         const got = try pluginTick(t, &ps, &toks);
         defer _ = mlx.mlx_array_free(got);
-        for (0..N) |i| try settle(&ps[i], &.{got});
-        for (0..N) |i| {
-            ps[i].off += 1;
+        for (&ps) |*p| try settle(p, &.{got});
+        for (&ps, 0..) |*p, i| {
+            p.off += 1;
             var row = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(row);
             try mlx.check(mlx.mlx_slice(&row, got, &[_]c_int{ @intCast(i), 0 }, 2, &[_]c_int{ @intCast(i + 1), @intCast(fixture.glm.V) }, 2, &[_]c_int{ 1, 1 }, 2, t.s));
-            var want = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(want);
-            if (recording) try mlx.check(mlx.mlx_reshape(&want, rows[i], &[_]c_int{ 1, @intCast(fixture.glm.V) }, 2, t.s));
-            try t.check(row, if (recording) want else null);
-            try t.expectStates(if (recording) &ls[i] else null, &ps[i]);
+            try t.check(row);
+            try t.expectStates(p);
         }
     }
 }
@@ -476,16 +354,11 @@ test "glm5_next plugin: the MTP head equals the legacy head" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const t = try Twin(glm).open(try fixture.glmFiles(arena.allocator(), 7), "src/plugins/glm5_next/fixtures/head.tape");
+    const t = try Twin(glm).open(try fixture.glmFiles(arena.allocator(), 7), "glm5_next/fixtures/head.tape");
     defer t.close();
     const s = t.s;
-    var lh: ?glm_mtp.Head = if (t.lg) |l| (try glm_mtp.Head.load(testing.allocator, s, &l.cfg, &l.weights)) orelse return error.NoLegacyHead else null;
-    defer if (lh) |*h| h.deinit();
     const hooks = glm.table.spec.?.head.?;
     try testing.expect(hooks.load(t.m, undefined).isOk());
-    var lc: HeadCache = undefined;
-    try lc.init();
-    defer lc.kv.deinit();
     var pc: HeadCache = undefined;
     try pc.init();
     defer pc.kv.deinit();
@@ -503,7 +376,6 @@ test "glm5_next plugin: the MTP head equals the legacy head" {
             .rows => |r| r,
             .chain => |*c| c[0..1],
             .truncate => |len| {
-                try lc.kv.truncate(len, s);
                 try pc.kv.truncate(len, s);
                 continue;
             },
@@ -516,25 +388,16 @@ test "glm5_next plugin: the MTP head equals the legacy head" {
         };
         const flat = try idsArray(ids);
         defer _ = mlx.mlx_array_free(flat);
-        var ids1 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(ids1);
-        try mlx.check(mlx.mlx_reshape(&ids1, flat, &[_]c_int{n}, 1, s));
-        const want: ?Array = if (lh) |*h| (try h.forward(&t.lg.?.xfm, &lc.kv, ids1, hidden, .none)).hidden_next else null;
-        defer if (want) |w| {
-            _ = mlx.mlx_array_free(w);
-        };
         const handles = [_]abi.Handle{pc.adapter.handle()};
         const pos = [_]u32{0};
         var out: abi.ForwardOut = .{};
         try testing.expect(hooks.forward(t.m, &.{ .mode = if (n == 1) .decode else .prefill, .logits = .none, .want_hidden = true, .rows = @intCast(n), .tokens = .{}, .ids = .{ .ctx = flat.ctx }, .positions = .of(&pos), .caches = .of(&handles), .cache_ops = &cache_ops.ops, .hidden_in = .{ .ctx = hidden.ctx } }, &out).isOk());
         const got: Array = .{ .ctx = out.hidden.ctx };
-        try t.check(got, want);
+        try t.check(got);
         var pv = try pc.view();
         defer cache_ops.ops.release(&pv);
-        var lv: ?abi.KvView = if (lh != null) try lc.view() else null;
-        defer if (lv) |*v| cache_ops.ops.release(v);
-        try t.check(.{ .ctx = pv.k.ctx }, if (lv) |v| .{ .ctx = v.k.ctx } else null);
-        try t.check(.{ .ctx = pv.v.ctx }, if (lv) |v| .{ .ctx = v.v.ctx } else null);
+        try t.check(.{ .ctx = pv.k.ctx });
+        try t.check(.{ .ctx = pv.v.ctx });
         if (prev.ctx != null) _ = mlx.mlx_array_free(prev);
         prev = got;
     }
@@ -559,16 +422,13 @@ test "glm5_next plugin: media rows splice as the legacy forward splices them" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const t = try Twin(glm).open(try fixture.glmFiles(arena.allocator(), 7), "src/plugins/glm5_next/fixtures/media.tape");
+    const t = try Twin(glm).open(try fixture.glmFiles(arena.allocator(), 7), "glm5_next/fixtures/media.tape");
     defer t.close();
     const img: u32 = 500;
     try testing.expectEqual(img, t.cfg.image_token_id);
     var prng = std.Random.DefaultPrng.init(0x1a6e);
     const media = try parity.testRandWeightBf16(prng.random(), &.{ 1, 5, fixture.glm.H }, t.s);
     defer _ = mlx.mlx_array_free(media);
-    var ls: Slot = undefined;
-    try ls.init(t.layers());
-    defer ls.deinit();
     var ps: Slot = undefined;
     try ps.init(t.layers());
     defer ps.deinit();
@@ -578,20 +438,10 @@ test "glm5_next plugin: media rows splice as the legacy forward splices them" {
         .{ .ids = &.{140}, .offset = 0 },
     };
     for (chunks) |c| {
-        var want: ?Array = null;
-        defer if (want) |w| {
-            _ = mlx.mlx_array_free(w);
-        };
-        if (t.lg != null) {
-            ls.ctx.vision_embeddings = media;
-            ls.ctx.vision_splice_offset = c.offset;
-            want = try t.legacy(&ls, false, c.ids, null);
-            ls.ctx.vision_embeddings = null;
-        }
         const got = try plainStep(t, &ps, c.ids, media, c.offset);
         defer _ = mlx.mlx_array_free(got);
-        try t.check(got, want);
-        try t.expectStates(if (t.lg != null) &ls else null, &ps);
+        try t.check(got);
+        try t.expectStates(&ps);
     }
     // The splice moved the logits: without the rows the same prompt reads differently.
     var bare: Slot = undefined;

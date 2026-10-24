@@ -45,8 +45,6 @@ pub const depthwiseConvNeedsTranspose = @import("load/weights.zig").depthwiseCon
 pub const maybeTransposeForBf16 = @import("load/weights.zig").maybeTransposeForBf16;
 pub const floatDtypeTable = @import("load/weights.zig").floatDtypeTable;
 pub const getWeightAt = @import("load/weights.zig").getWeightAt;
-pub const loadQWAt = @import("load/weights.zig").loadQWAt;
-pub const loadRoutedMoeAt = @import("load/weights.zig").loadRoutedMoeAt;
 pub const scalarOf = @import("load/weights.zig").scalarOf;
 // sdk/blocks/gdn/kernels.zig
 pub const gdnBlockedEnabled = @import("../../sdk/blocks/gdn/kernels.zig").gdnBlockedEnabled;
@@ -320,8 +318,6 @@ pub const PrefillCache = @import("prompt_cache.zig").PrefillCache;
 // engines/mlx/layer_weights.zig
 const LayerWeights = @import("layer_weights.zig").LayerWeights;
 pub const QW = @import("layer_weights.zig").QW;
-// plugins/glm5_next/weights.zig
-pub const DsaWeights = @import("../../plugins/glm5_next/weights.zig").DsaWeights;
 // plugins/qwen4_exp/weights.zig
 const HcWeights = @import("../../plugins/qwen4_exp/weights.zig").HcWeights;
 // sdk/blocks/mlp/dense.zig
@@ -360,8 +356,6 @@ pub const decodeProfReport = @import("diag/profile.zig").decodeProfReport;
 pub const encoderBandMask = @import("../../sdk/blocks/attention/masks.zig").encoderBandMask;
 // sdk/quant/mxfp8.zig
 pub const lmHeadMxfp8On = @import("../../sdk/quant/mxfp8.zig").lmHeadMxfp8On;
-// plugins/glm5_next/load.zig
-pub const loadDsaWeightsAt = @import("../../plugins/glm5_next/load.zig").loadDsaWeightsAt;
 // sdk/blocks/moe/router_kernel.zig
 pub const RouterGate = @import("../../sdk/blocks/moe/router_kernel.zig").RouterGate;
 // mlx/dtype.zig
@@ -505,8 +499,6 @@ const mxfp8_qmv = @import("../../sdk/blocks/qmm/mxfp8_qmv.zig");
 const qsa_row_mask = @import("../../plugins/qwen4_exp/qsa_mask.zig");
 const qsa_decode = @import("../../plugins/qwen4_exp/qsa_decode.zig");
 const moe_affine4 = @import("../../plugins/qwen4_exp/moe_affine4.zig");
-const glm5 = @import("../../plugins/glm5_next/glm5_next.zig");
-const glm_mtp = @import("../../plugins/glm5_next/mtp.zig");
 const kda_recurrence = @import("../../sdk/blocks/kda/recurrence.zig");
 const Weights = model_mod.Weights;
 
@@ -838,17 +830,6 @@ pub const Transformer = struct {
     pub const forwardMoeBatchedVerify = @import("batched/layered.zig").forwardMoeBatchedVerify;
     pub const sliceBatchRows = @import("batched/layered.zig").sliceBatchRows;
     pub const forwardMoeBatchedRows = @import("batched/layered.zig").forwardMoeBatchedRows;
-    // plugins/glm5_next/forward.zig
-    pub const glmHeadMm = @import("../../plugins/glm5_next/forward.zig").glmHeadMm;
-    pub const forwardGlm5With = @import("../../plugins/glm5_next/forward.zig").forwardGlm5With;
-    pub const glmSublayer = @import("../../plugins/glm5_next/forward.zig").glmSublayer;
-    pub const glmBranch = @import("../../plugins/glm5_next/forward.zig").glmBranch;
-    pub const glmBranchSlots = @import("../../plugins/glm5_next/forward.zig").glmBranchSlots;
-    pub const kdaLows = @import("../../plugins/glm5_next/forward.zig").kdaLows;
-    pub const glmKdaSlots = @import("../../plugins/glm5_next/forward.zig").glmKdaSlots;
-    const MOE_DECODE_BATCH_MAX = @import("../../plugins/glm5_next/forward.zig").MOE_DECODE_BATCH_MAX;
-    pub const forwardGlmBatchedDecode = @import("../../plugins/glm5_next/forward.zig").forwardGlmBatchedDecode;
-    pub const glmDsaAttn = @import("../../plugins/glm5_next/forward.zig").glmDsaAttn;
     // plugins/qwen4_exp/ple.zig
     const advancePlePrev = @import("../../plugins/qwen4_exp/ple.zig").advancePlePrev;
     const pleDeferrable = @import("../../plugins/qwen4_exp/ple.zig").pleDeferrable;
@@ -1148,8 +1129,6 @@ pub const Transformer = struct {
     pub const gatedFullAttnWith = @import("../../sdk/blocks/attention/gated_full.zig").gatedFullAttnWith;
     pub const gatedFullAttnProjected = @import("../../sdk/blocks/attention/gated_full.zig").gatedFullAttnProjected;
     pub const gatedAttnTail = @import("../../sdk/blocks/attention/gated_full.zig").gatedAttnTail;
-    // sdk/blocks/attention/mla.zig
-    pub const mlaAttnWith = @import("../../sdk/blocks/attention/mla.zig").mlaAttnWith;
     // sdk/blocks/attention/proj.zig
     pub const qkAngleFor = @import("../../sdk/blocks/attention/proj.zig").qkAngleFor;
     pub const qkAngleRowsFor = @import("../../sdk/blocks/attention/proj.zig").qkAngleRowsFor;
@@ -1183,7 +1162,6 @@ pub const Transformer = struct {
     pub const moeExpertsRouted = @import("../../sdk/blocks/moe/moe.zig").moeExpertsRouted;
     pub const moeMLP2WithRouter = @import("../../sdk/blocks/moe/moe.zig").moeMLP2WithRouter;
     // sdk/blocks/moe/decode.zig
-    pub const glmMoeDecode = @import("../../sdk/blocks/moe/decode.zig").glmMoeDecode;
     pub const moeDecodeGatherQmv = @import("../../sdk/blocks/moe/decode.zig").moeDecodeGatherQmv;
     pub const moeFp4Decode = @import("../../sdk/blocks/moe/decode.zig").moeFp4Decode;
     pub const moeAffine4Decode = @import("../../sdk/blocks/moe/decode.zig").moeAffine4Decode;
@@ -1382,7 +1360,6 @@ test {
     _ = @import("../../sdk/blocks/attention/kv_view.zig");
     _ = @import("kv/sliding.zig");
     _ = @import("batched/layered.zig");
-    _ = @import("../../plugins/glm5_next/forward.zig");
     _ = @import("../../plugins/qwen4_exp/ple.zig");
     _ = @import("forward_ctx.zig");
     _ = @import("ssm/entry.zig");
@@ -1394,7 +1371,6 @@ test {
     _ = @import("../../plugins/qwen4_exp/qsa/checkpoint.zig");
     _ = @import("prompt_cache.zig");
     _ = @import("layer_weights.zig");
-    _ = @import("../../plugins/glm5_next/weights.zig");
     _ = @import("../../plugins/qwen4_exp/weights.zig");
     _ = @import("../../sdk/blocks/gdn/gated_delta_net.zig");
     _ = @import("../../sdk/blocks/mlp/dense.zig");
@@ -1442,7 +1418,6 @@ test {
     _ = @import("../../sdk/blocks/rope/mrope.zig");
     _ = @import("../../sdk/blocks/rope/yarn.zig");
     _ = @import("../../sdk/blocks/attention/gated_full.zig");
-    _ = @import("../../sdk/blocks/attention/mla.zig");
     _ = @import("../../sdk/blocks/attention/proj.zig");
     _ = @import("../../plugins/laguna/ubench_test.zig");
     _ = @import("../../plugins/inkling/attention.zig");
@@ -1454,7 +1429,6 @@ test {
     _ = @import("../../sdk/blocks/attention/masks.zig");
     _ = @import("load/layers_dense.zig");
     _ = @import("../../sdk/quant/mxfp8.zig");
-    _ = @import("../../plugins/glm5_next/load.zig");
     _ = @import("../../plugins/qwen4_exp/load.zig");
     _ = @import("load/layers_layered.zig");
     _ = @import("../../sdk/blocks/kda/gate.zig");
@@ -1477,7 +1451,6 @@ test {
     _ = @import("../../sdk/blocks/moe/verify_kernels.zig");
     _ = @import("../../sdk/quant/exl3.zig");
     _ = @import("../../plugins/hy_v3/load.zig");
-    _ = @import("../../plugins/bailing_hybrid/load.zig");
     _ = @import("modules/mlx_stream.zig");
     _ = @import("modules/shell.zig");
     _ = @import("../../plugins/mimo_v2/fixtures.zig");

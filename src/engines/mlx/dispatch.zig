@@ -129,7 +129,6 @@ pub fn forwardWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_arra
     // EmbeddingGemma (a bidirectional gemma3 trunk) never runs causal decode.
     if (self.config.use_bidirectional_attention) return self.forwardGemma3EncoderWith(ctx, token_ids);
     if (self.qwen4 != null) return self.forwardQwen4With(ctx, token_ids);
-    if (self.config.isGlm5()) return self.forwardGlm5With(ctx, token_ids);
     if (self.moe_layers != null) return self.forwardMoeWith(ctx, token_ids);
     return self.forwardStandardWith(ctx, token_ids);
 }

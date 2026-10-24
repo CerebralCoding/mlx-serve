@@ -11,8 +11,6 @@ const Weights = @import("../model.zig").Weights;
 const concatRows = @import("../../../mlx/array.zig").concatRows;
 const materializedOwnedCopy = @import("../../../mlx/array.zig").materializedOwnedCopy;
 const naxAvailable = @import("../../../mlx/device.zig").naxAvailable;
-const loadDsaWeightsAt = @import("../../../plugins/glm5_next/load.zig").loadDsaWeightsAt;
-const loadMhcWeights = @import("../../../plugins/glm5_next/load.zig").loadMhcWeights;
 const hy3ExpertContainer = @import("../../../plugins/hy_v3/load.zig").hy3ExpertContainer;
 const loadHcWeights = @import("../../../plugins/qwen4_exp/load.zig").loadHcWeights;
 const loadPleWeights = @import("../../../plugins/qwen4_exp/load.zig").loadPleWeights;
@@ -33,7 +31,6 @@ const getLayerWeightOpt = @import("weights.zig").getLayerWeightOpt;
 const lastDim = @import("weights.zig").lastDim;
 const layerBase = @import("weights.zig").layerBase;
 const loadQW = @import("weights.zig").loadQW;
-const loadRoutedMoeAt = @import("weights.zig").loadRoutedMoeAt;
 const maybeTransposeForBf16 = @import("weights.zig").maybeTransposeForBf16;
 const moeExpertSuffix = @import("weights.zig").moeExpertSuffix;
 const splitPackedGateUp = @import("weights.zig").splitPackedGateUp;
@@ -52,9 +49,7 @@ pub fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights:
     // both take the gemma4 binding/forward arms here.
     const is_gemma4 = config.isGemma4Layers();
     const is_hy3 = std.mem.eql(u8, config.model_type, "hy_v3");
-    const is_bailing = std.mem.eql(u8, config.model_type, "bailing_hybrid");
     const is_qwen4 = config.isQwen4();
-    const is_glm = config.isGlm5();
     // Attention projections that may ship dense bf16 beside quantized experts.
     const probe_attn_scales = config.modelopt;
 
@@ -88,12 +83,6 @@ pub fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights:
         lw.hc_attn = null;
         lw.hc_mlp = null;
         lw.ple = null;
-        lw.mhc_attn = null;
-        lw.mhc_ffn = null;
-        if (is_glm) {
-            lw.mhc_attn = try loadMhcWeights(weights, name_buf, prefix, li, "attn_hc", &owned_bf16, allocator, s);
-            lw.mhc_ffn = try loadMhcWeights(weights, name_buf, prefix, li, "ffn_hc", &owned_bf16, allocator, s);
-        }
         if (is_qwen4) {
             var hb: [96]u8 = undefined;
             lw.hc_attn = try loadHcWeights(weights, std.fmt.bufPrint(&hb, "{s}.layers.{d}.attn_hyper_connection", .{ prefix, li }) catch unreachable, true, config.hc_count, config.hidden_size, &owned_bf16, allocator, s);
@@ -133,181 +122,7 @@ pub fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights:
             }
         }
 
-        if (is_linear and (is_bailing or is_glm)) {
-            // Ling names the block `attention.*` with full-rank gates; GLM-5-Next
-            // `self_attn.*` with low-rank ones (f_a→f_b, g_a→g_b).
-            const ab: []const u8 = if (is_glm) "self_attn" else "attention";
-            // KDA. The checkpoint ships q/k/v as three separate projections and
-            // three separate depthwise convs; joining them here is EXACT (the
-            // convs are depthwise, so channel blocks never mix, and affine
-            // groups run along the input axis) and leaves the recurrence's hot
-            // path byte-for-byte the qwen3.5 GatedDeltaNet one.
-            //   f_proj → the per-channel gate (`a`)
-            //   b_proj → beta,  g_proj → the output gate (`z`),  o_norm → norm
-            const qkv_names = [_][]const u8{ "q_proj", "k_proj", "v_proj" };
-            var qkv_w: [3]mlx.mlx_array = undefined;
-            var qkv_s: [3]mlx.mlx_array = undefined;
-            var qkv_b: [3]mlx.mlx_array = undefined;
-            var conv_w: [3]mlx.mlx_array = undefined;
-            var any_scales = false;
-            // oMLX 0.7.1 packs ship the three convs already joined ([C, K, 1]) and
-            // the gate (A_log, dt_bias, f_a/f_b_proj) under `forget_gate.`.
-            const fused_conv = getLayerWeightAtOpt(weights, name_buf, prefix, li, ab, "conv1d.weight");
-            var fg_buf: [64]u8 = undefined;
-            const fg: []const u8 = if (getLayerWeightAtOpt(weights, name_buf, prefix, li, ab, "forget_gate.A_log") != null)
-                std.fmt.bufPrint(&fg_buf, "{s}.forget_gate", .{ab}) catch unreachable
-            else
-                ab;
-            for (qkv_names, 0..) |base, n| {
-                var nb: [256]u8 = undefined;
-                qkv_w[n] = try getLayerWeightAt(weights, name_buf, prefix, li, ab, std.fmt.bufPrint(&nb, "{s}.weight", .{base}) catch unreachable);
-                qkv_s[n] = getLayerWeightAtOpt(weights, name_buf, prefix, li, ab, std.fmt.bufPrint(&nb, "{s}.scales", .{base}) catch unreachable) orelse mlx.mlx_array_new();
-                qkv_b[n] = getLayerWeightAtOpt(weights, name_buf, prefix, li, ab, std.fmt.bufPrint(&nb, "{s}.biases", .{base}) catch unreachable) orelse mlx.mlx_array_new();
-                if (qkv_s[n].ctx != null) any_scales = true;
-                // The depthwise conv is `<x>_conv1d.conv.weight` in the reference
-                // HF checkpoint, where it sits inside a ShortConvolution module.
-                // mlx-lm's converter flattens that module away and emits
-                // `<x>_conv1d.weight` instead — same [C, 1, K] tensor, one name
-                // segment shorter. Both public MLX Ling-3.0 quants ship the flat
-                // form (djrsystemservices/Ling-3.0-tiny-oQ8e,
-                // d1sl1ke/Ling-3.0-flash-oQ4e-mtp), so a nested-only lookup
-                // aborts the load on every one of them. Prefer the nested name
-                // so reference checkpoints bind exactly as before, then fall
-                // back to the flat one.
-                const conv_nested = switch (n) {
-                    0 => "q_conv1d.conv.weight",
-                    1 => "k_conv1d.conv.weight",
-                    else => "v_conv1d.conv.weight",
-                };
-                const conv_flat = switch (n) {
-                    0 => "q_conv1d.weight",
-                    1 => "k_conv1d.weight",
-                    else => "v_conv1d.weight",
-                };
-                if (fused_conv == null) conv_w[n] = getLayerWeightAtOpt(weights, name_buf, prefix, li, ab, conv_nested) orelse
-                    try getLayerWeightAt(weights, name_buf, prefix, li, ab, conv_flat);
-            }
-            // The three projections join only when quantized IDENTICALLY: a q at
-            // 5-bit beside an 8-bit k (TensorFold's GLM pack, layer 6) has other
-            // packed widths, and a dense q beside a quantized k has scales for
-            // part of the rows. Such a layer projects q, k and v one by one.
-            const joinable = blk: {
-                var w_cols: [3]c_int = undefined;
-                var s_cols: [3]c_int = undefined;
-                for (qkv_w, 0..) |w, n| {
-                    if (any_scales and qkv_s[n].ctx == null) break :blk false;
-                    w_cols[n] = @intCast(lastDim(w) orelse 0);
-                    s_cols[n] = @intCast(lastDim(qkv_s[n]) orelse 0);
-                }
-                break :blk joinableCols(&w_cols) and joinableCols(&s_cols);
-            };
-            var qkv_parts: [3]QW = .{ .{}, .{}, .{} };
-            var joined_w = mlx.mlx_array_new();
-            if (joinable) {
-                joined_w = try concatRows(&qkv_w, s);
-                try owned_bf16.append(allocator, joined_w);
-            } else {
-                for (&qkv_parts, 0..) |*q, n| q.* = .{ .w = qkv_w[n], .s = qkv_s[n], .b = qkv_b[n] };
-            }
-            var joined_conv = fused_conv orelse blk: {
-                const j = try concatRows(&conv_w, s);
-                try owned_bf16.append(allocator, j);
-                break :blk j;
-            };
-            // HF-layout packs store the depthwise conv [C, 1, K]; MLX's conv1d reads [C, K, 1].
-            const csh = mlx.getShape(joined_conv);
-            if (csh.len == 3 and csh[1] == 1 and csh[2] > 1) {
-                var t = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(t);
-                try mlx.check(mlx.mlx_swapaxes(&t, joined_conv, 1, 2, s));
-                joined_conv = try materializedOwnedCopy(s, t);
-                try mlx.check(mlx.mlx_array_eval(joined_conv));
-                try owned_bf16.append(allocator, joined_conv);
-            }
-            var joined_s = mlx.mlx_array_new();
-            var joined_b = mlx.mlx_array_new();
-            if (any_scales and joinable) {
-                joined_s = try concatRows(&qkv_s, s);
-                try owned_bf16.append(allocator, joined_s);
-                if (qkv_b[0].ctx != null) {
-                    joined_b = try concatRows(&qkv_b, s);
-                    try owned_bf16.append(allocator, joined_b);
-                }
-            }
-
-            // A_log is [Hv] but the gate is per KEY CHANNEL — expand once here
-            // so the hot path stays elementwise over flat [B,S,Hv*Dk] arrays
-            // (no reshape, no per-head broadcast, per layer per token).
-            const a_log_raw = try getLayerWeightAt(weights, name_buf, prefix, li, fg, "A_log");
-            const dk_c: c_int = @intCast(config.linear_key_head_dim);
-            const hv_c: c_int = @intCast(config.linear_num_value_heads);
-            var a_log_exp = mlx.mlx_array_new();
-            {
-                var a_col = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(a_col);
-                try mlx.check(mlx.mlx_reshape(&a_col, a_log_raw, &[_]c_int{ hv_c, 1 }, 2, s));
-                var a_bc = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(a_bc);
-                try mlx.check(mlx.mlx_broadcast_to(&a_bc, a_col, &[_]c_int{ hv_c, dk_c }, 2, s));
-                try mlx.check(mlx.mlx_reshape(&a_log_exp, a_bc, &[_]c_int{hv_c * dk_c}, 1, s));
-                try mlx.check(mlx.mlx_array_eval(a_log_exp));
-            }
-            try owned_bf16.append(allocator, a_log_exp);
-
-            var gb: [64]u8 = undefined;
-            const z = try loadQW(weights, name_buf, prefix, li, std.fmt.bufPrint(&gb, "{s}.{s}", .{ ab, if (is_glm) "g_a_proj" else "g_proj" }) catch unreachable);
-            const f = try loadQW(weights, name_buf, prefix, li, std.fmt.bufPrint(&gb, "{s}.{s}", .{ fg, if (is_glm) "f_a_proj" else "f_proj" }) catch unreachable);
-            const bq = try loadQW(weights, name_buf, prefix, li, std.fmt.bufPrint(&gb, "{s}.b_proj", .{ab}) catch unreachable);
-            const oq = try loadQW(weights, name_buf, prefix, li, std.fmt.bufPrint(&gb, "{s}.o_proj", .{ab}) catch unreachable);
-            lw.attn = .{ .linear = .{
-                .qkv_w = joined_w,
-                .qkv_s = joined_s,
-                .qkv_b = joined_b,
-                .z_w = z.w,
-                .z_s = z.s,
-                .z_b = z.b,
-                .a_w = f.w,
-                .a_s = f.s,
-                .a_b = f.b,
-                .b_w = bq.w,
-                .b_s = bq.s,
-                .b_b = bq.b,
-                .conv1d_w = joined_conv,
-                .A_log = a_log_exp,
-                .dt_bias = try getLayerWeightAt(weights, name_buf, prefix, li, fg, "dt_bias"),
-                .norm_w = try getLayerWeightAt(weights, name_buf, prefix, li, ab, "o_norm.weight"),
-                .out_w = oq.w,
-                .out_s = oq.s,
-                .out_b = oq.b,
-                .a2 = if (is_glm) try loadQW(weights, name_buf, prefix, li, std.fmt.bufPrint(&gb, "{s}.f_b_proj", .{fg}) catch unreachable) else .{},
-                .z2 = if (is_glm) try loadQW(weights, name_buf, prefix, li, std.fmt.bufPrint(&gb, "{s}.g_b_proj", .{ab}) catch unreachable) else .{},
-                .qkv_parts = qkv_parts,
-            } };
-            const la = &lw.attn.linear;
-            if (is_glm) {
-                inline for (.{ .{ &la.a_log_h, a_log_raw }, .{ &la.dt_f32, la.dt_bias } }) |pair| {
-                    pair[0].* = mlx.mlx_array_new();
-                    try mlx.check(mlx.mlx_astype(pair[0], pair[1], .float32, s));
-                    try mlx.check(mlx.mlx_array_eval(pair[0].*));
-                    try owned_bf16.append(allocator, pair[0].*);
-                }
-            }
-            try maybeTransposeForBf16(&la.qkv_w, la.qkv_s, &owned_bf16, allocator, s);
-            for (&la.qkv_parts) |*q| try maybeTransposeForBf16(&q.w, q.s, &owned_bf16, allocator, s);
-            try maybeTransposeForBf16(&la.z_w, la.z_s, &owned_bf16, allocator, s);
-            try maybeTransposeForBf16(&la.a_w, la.a_s, &owned_bf16, allocator, s);
-            try maybeTransposeForBf16(&la.b_w, la.b_s, &owned_bf16, allocator, s);
-            try maybeTransposeForBf16(&la.out_w, la.out_s, &owned_bf16, allocator, s);
-            if (la.a2.w.ctx != null) try maybeTransposeForBf16(&la.a2.w, la.a2.s, &owned_bf16, allocator, s);
-            if (la.z2.w.ctx != null) try maybeTransposeForBf16(&la.z2.w, la.z2.s, &owned_bf16, allocator, s);
-            // Decode reads q|k|v and the first gate stages as one row-joined matmul.
-            if (is_glm and la.qkv_s.ctx != null) {
-                var parts = [_][3]*mlx.mlx_array{ .{ &la.qkv_w, &la.qkv_s, &la.qkv_b }, .{ &la.z_w, &la.z_s, &la.z_b }, .{ &la.a_w, &la.a_s, &la.a_b }, .{ &la.b_w, &la.b_s, &la.b_b } };
-                var fa_buf: [64]u8 = undefined;
-                const names = [_][]const u8{ "self_attn.g_a_proj", std.fmt.bufPrint(&fa_buf, "{s}.f_a_proj", .{fg}) catch unreachable, "self_attn.b_proj" };
-                la.in = try fuseRowsInPlace(&parts, 1, &names, weights, name_buf, prefix, li, &owned_bf16, allocator, s);
-            }
-        } else if (is_linear) {
+        if (is_linear) {
             // Detect combined (qkvz+ba) vs separate (qkv+z+a+b) projections.
             // Each projection's `*_s`/`*_b` are loaded optionally — Unsloth Dynamic
             // checkpoints (e.g. Qwen3.6 UD) leave linear_attn projections as plain
@@ -375,84 +190,6 @@ pub fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights:
                     const names = [_][]const u8{ "linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.in_proj_a", "linear_attn.in_proj_b" };
                     la.in = try fuseRowsInPlace(&parts, 0, &names, weights, name_buf, prefix, li, &owned_bf16, allocator, s);
                 }
-            }
-        } else if (is_glm) {
-            // Sparse latent attention: no q/k/v projections; `o_proj` is the output.
-            var base_buf: [96]u8 = undefined;
-            const dsa = try loadDsaWeightsAt(weights, name_buf, layerBase(&base_buf, prefix, li), &owned_bf16, allocator, s);
-            lw.attn = .{ .full = .{
-                .q_w = mlx.mlx_array_new(),
-                .q_s = mlx.mlx_array_new(),
-                .q_b = mlx.mlx_array_new(),
-                .k_w = mlx.mlx_array_new(),
-                .k_s = mlx.mlx_array_new(),
-                .k_b = mlx.mlx_array_new(),
-                .v_w = mlx.mlx_array_new(),
-                .v_s = mlx.mlx_array_new(),
-                .v_b = mlx.mlx_array_new(),
-                .o_w = dsa.o.w,
-                .o_s = dsa.o.s,
-                .o_b = dsa.o.b,
-                .q_norm = mlx.mlx_array_new(),
-                .k_norm = mlx.mlx_array_new(),
-                .dsa = dsa,
-            } };
-        } else if (is_bailing) {
-            // MLA. There are no q/k/v projections at all — the low-rank Q and
-            // the compressed KV latent replace them, and `dense` is the output
-            // projection. q_w/k_w/v_w stay null-ctx (skipped by the eval batch
-            // and by every fused-QKV probe, which all key on q_w).
-            lw.attn = .{
-                .full = .{
-                    .q_w = mlx.mlx_array_new(),
-                    .q_s = mlx.mlx_array_new(),
-                    .q_b = mlx.mlx_array_new(),
-                    .k_w = mlx.mlx_array_new(),
-                    .k_s = mlx.mlx_array_new(),
-                    .k_b = mlx.mlx_array_new(),
-                    .v_w = mlx.mlx_array_new(),
-                    .v_s = mlx.mlx_array_new(),
-                    .v_b = mlx.mlx_array_new(),
-                    .o_w = try getLayerWeight(weights, name_buf, prefix, li, "attention.dense.weight"),
-                    .o_s = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.dense.scales") orelse mlx.mlx_array_new(),
-                    .o_b = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.dense.biases") orelse mlx.mlx_array_new(),
-                    // MLA norms the LATENTS, not the per-head q/k.
-                    .q_norm = mlx.mlx_array_new(),
-                    .k_norm = mlx.mlx_array_new(),
-                    .g_w = try getLayerWeight(weights, name_buf, prefix, li, "attention.g_proj.weight"),
-                    .g_s = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.g_proj.scales") orelse mlx.mlx_array_new(),
-                    .g_b = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.g_proj.biases") orelse mlx.mlx_array_new(),
-                    // Exactly ONE Q arm per checkpoint: the low-rank pair
-                    // (tiny) or a direct q_proj (flash, `q_lora_rank: null`).
-                    // Asking for the absent one would abort the load.
-                    .mla_q_direct_w = if (config.mlaHasQLora()) mlx.mlx_array_new() else try getLayerWeight(weights, name_buf, prefix, li, "attention.q_proj.weight"),
-                    .mla_q_direct_s = if (config.mlaHasQLora()) mlx.mlx_array_new() else (getLayerWeightOpt(weights, name_buf, prefix, li, "attention.q_proj.scales") orelse mlx.mlx_array_new()),
-                    .mla_q_direct_b = if (config.mlaHasQLora()) mlx.mlx_array_new() else (getLayerWeightOpt(weights, name_buf, prefix, li, "attention.q_proj.biases") orelse mlx.mlx_array_new()),
-                    .mla_q_a_w = if (config.mlaHasQLora()) try getLayerWeight(weights, name_buf, prefix, li, "attention.q_a_proj.weight") else mlx.mlx_array_new(),
-                    .mla_q_a_s = if (config.mlaHasQLora()) (getLayerWeightOpt(weights, name_buf, prefix, li, "attention.q_a_proj.scales") orelse mlx.mlx_array_new()) else mlx.mlx_array_new(),
-                    .mla_q_a_b = if (config.mlaHasQLora()) (getLayerWeightOpt(weights, name_buf, prefix, li, "attention.q_a_proj.biases") orelse mlx.mlx_array_new()) else mlx.mlx_array_new(),
-                    .mla_q_a_norm = if (config.mlaHasQLora()) try getLayerWeight(weights, name_buf, prefix, li, "attention.q_a_layernorm.weight") else mlx.mlx_array_new(),
-                    .mla_q_b_w = if (config.mlaHasQLora()) try getLayerWeight(weights, name_buf, prefix, li, "attention.q_b_proj.weight") else mlx.mlx_array_new(),
-                    .mla_q_b_s = if (config.mlaHasQLora()) (getLayerWeightOpt(weights, name_buf, prefix, li, "attention.q_b_proj.scales") orelse mlx.mlx_array_new()) else mlx.mlx_array_new(),
-                    .mla_q_b_b = if (config.mlaHasQLora()) (getLayerWeightOpt(weights, name_buf, prefix, li, "attention.q_b_proj.biases") orelse mlx.mlx_array_new()) else mlx.mlx_array_new(),
-                    .mla_kv_a_w = try getLayerWeight(weights, name_buf, prefix, li, "attention.kv_a_proj_with_mqa.weight"),
-                    .mla_kv_a_s = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.kv_a_proj_with_mqa.scales") orelse mlx.mlx_array_new(),
-                    .mla_kv_a_b = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.kv_a_proj_with_mqa.biases") orelse mlx.mlx_array_new(),
-                    .mla_kv_a_norm = try getLayerWeight(weights, name_buf, prefix, li, "attention.kv_a_layernorm.weight"),
-                    .mla_kv_b_w = try getLayerWeight(weights, name_buf, prefix, li, "attention.kv_b_proj.weight"),
-                    .mla_kv_b_s = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.kv_b_proj.scales") orelse mlx.mlx_array_new(),
-                    .mla_kv_b_b = getLayerWeightOpt(weights, name_buf, prefix, li, "attention.kv_b_proj.biases") orelse mlx.mlx_array_new(),
-                },
-            };
-            {
-                const fa = &lw.attn.full;
-                try maybeTransposeForBf16(&fa.o_w, fa.o_s, &owned_bf16, allocator, s);
-                try maybeTransposeForBf16(&fa.g_w, fa.g_s, &owned_bf16, allocator, s);
-                try maybeTransposeForBf16(&fa.mla_q_direct_w, fa.mla_q_direct_s, &owned_bf16, allocator, s);
-                try maybeTransposeForBf16(&fa.mla_q_a_w, fa.mla_q_a_s, &owned_bf16, allocator, s);
-                try maybeTransposeForBf16(&fa.mla_q_b_w, fa.mla_q_b_s, &owned_bf16, allocator, s);
-                try maybeTransposeForBf16(&fa.mla_kv_a_w, fa.mla_kv_a_s, &owned_bf16, allocator, s);
-                try maybeTransposeForBf16(&fa.mla_kv_b_w, fa.mla_kv_b_s, &owned_bf16, allocator, s);
             }
         } else {
             // MiMo and ModelOpt packs may ship attention DENSE bf16 (no scales)
@@ -544,10 +281,7 @@ pub fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights:
         // 295B) — they take the dense binding arm below. Every established
         // arch has first_k_dense_replace == 0, so layer_is_moe == isMoe() there.
         const layer_is_moe = config.isMoe() and li >= config.first_k_dense_replace;
-        if (layer_is_moe and (is_bailing or is_glm)) {
-            var base_buf: [96]u8 = undefined;
-            lw.mlp = .{ .moe = try loadRoutedMoeAt(weights, name_buf, layerBase(&base_buf, prefix, li), is_glm, &config, &owned_bf16, allocator, s) };
-        } else if (layer_is_moe and is_gemma4) {
+        if (layer_is_moe and is_gemma4) {
             // Gemma 4 MoE: different weight naming, Sigma-MoE routing, no shared expert gate.
             // Each `*_s`/`*_b` is loaded optionally for Unsloth Dynamic compatibility —
             // bf16 layers carry only the weight, no scales/biases. The post-construction

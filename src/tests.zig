@@ -86,7 +86,6 @@ test {
     _ = @import("sdk/blocks/attention/lane_attn.zig");
     _ = @import("sdk/blocks/norms/add_norm.zig");
     _ = @import("sdk/blocks/moe/moe_fp4.zig");
-    _ = @import("plugins/glm5_next/mtp.zig");
     _ = @import("sdk/quant/exl3/sushi_pack.zig");
     _ = @import("sdk/quant/nvfp4/modelopt_pack.zig");
     _ = @import("sdk/quant/formats.zig");

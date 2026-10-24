@@ -1,22 +1,19 @@
 //! Served proofs of the KDA hybrids: the pack through the driver's shell on the legacy parse's config against the
-//! legacy forward's values (`engines/mlx/plugin/both.zig`, replayed from `fixtures/*.tape`): steps past a chunk with
-//! every layer captured, the pipelined greedy decode and media rows (the batched tick is `proof_test.zig`'s); GLM's
-//! MTP head through `MtpHeadRef.plugin` against the legacy `.glm` arm, its engine calls and a pinned-depth round loop.
-//! With `MLX_SERVE_PROOF_RECORD` set the values are recorded from the legacy forward instead.
+//! deleted legacy forward's values (`engines/mlx/plugin/both.zig`, replayed from `fixtures/*.tape`): steps past a
+//! chunk with every layer captured, the pipelined greedy decode and media rows (the batched tick is
+//! `proof_test.zig`'s); GLM's MTP head through `MtpHeadRef.plugin` against the legacy `.glm` arm's recorded values,
+//! its engine calls and a pinned-depth round loop.
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const ops = @import("../../mlx/ops.zig");
 const proof_fixture = @import("../../sdk/bases/proof/fixture.zig");
 const both = @import("../../engines/mlx/plugin/both.zig");
-const tape_mod = @import("../../engines/mlx/plugin/tape.zig");
 const plugin_head = @import("../../engines/mlx/plugin/head.zig");
 const mtpRun = @import("../../engines/mlx/plugin/proof_mtp.zig").mtpRun;
 const MtpHeadRef = @import("../../engines/mlx/spec/mtp_head_ref.zig").MtpHeadRef;
-const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
 const File = @import("../../sdk/root.zig").fixture.File;
 const fixture = @import("fixture.zig");
-const glm_mtp = @import("mtp.zig");
 const glm = @import("plugin.zig");
 const ling = @import("../bailing_hybrid/plugin.zig");
 const tape_compact_over = @import("proof_test.zig").tape_compact_over;
@@ -54,10 +51,9 @@ fn packOf(files: []const File) !proof_fixture.Pack {
     return p;
 }
 
-/// The tape at `rel` (a path under the repo root): replayed, or recorded from the legacy forward.
+/// The tape at `rel` (under `src/plugins/`).
 fn oracle(comptime rel: []const u8) both.Oracle {
-    if (tape_mod.recordRoot() != null) return .{ .legacy = rel };
-    return .{ .tape = @embedFile("../" ++ rel["src/plugins/".len..]) };
+    return .{ .tape = @embedFile("../" ++ rel) };
 }
 
 fn glmServed(files: []const File, comptime tape: []const u8) !void {
@@ -86,14 +82,14 @@ test "glm5_next served: a 4-bit pack through the driver on the legacy config is 
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    try glmServed(try fixture.glmFiles(arena.allocator(), 7), "src/plugins/glm5_next/fixtures/served.tape");
+    try glmServed(try fixture.glmFiles(arena.allocator(), 7), "glm5_next/fixtures/served.tape");
 }
 
 test "glm5_next served: a Sushi pack (EXL3 experts) through the driver is bit-equal, greedy decode and media too" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    try glmServed(try fixture.glmSushiFiles(arena.allocator(), 7), "src/plugins/glm5_next/fixtures/served_sushi.tape");
+    try glmServed(try fixture.glmSushiFiles(arena.allocator(), 7), "glm5_next/fixtures/served_sushi.tape");
 }
 
 test "bailing_hybrid served: a 4-bit pack through the driver on the legacy config is bit-equal, greedy decode too" {
@@ -103,7 +99,7 @@ test "bailing_hybrid served: a 4-bit pack through the driver on the legacy confi
     const files = try fixture.lingFiles(arena.allocator(), 11);
     var p = try packOf(files);
     defer p.deinit();
-    var b = try both.Both.openAs(&ling.table, &p, files[0].bytes, true, oracle("src/plugins/bailing_hybrid/fixtures/served.tape"));
+    var b = try both.Both.openAs(&ling.table, &p, files[0].bytes, true, oracle("bailing_hybrid/fixtures/served.tape"));
     defer b.close();
     b.tape.compact_over = tape_compact_over;
     try b.expectSteps(&both.long_steps);
@@ -123,68 +119,40 @@ test "glm5_next served: the MTP head through MtpHeadRef.plugin equals the legacy
     const files = try fixture.glmFiles(arena.allocator(), 7);
     var p = try packOf(files);
     defer p.deinit();
-    var b = try both.Both.openAs(&glm.table, &p, files[0].bytes, true, oracle("src/plugins/glm5_next/fixtures/served_head.tape"));
+    var b = try both.Both.openAs(&glm.table, &p, files[0].bytes, true, oracle("glm5_next/fixtures/served_head.tape"));
     defer b.close();
     b.tape.compact_over = tape_compact_over;
-    // The legacy load's head (`mtp_load.loadGlmHead`): the layer and its coarse rerank readout.
-    var legacy: ?glm_mtp.Head = if (b.lg) |l| (try glm_mtp.Head.load(a, l.xfm.s, &l.config, &l.weights)) orelse return error.NoLegacyHead else null;
-    defer if (legacy) |*h| h.deinit();
-    if (legacy) |*h| h.bindRerank(&b.lg.?.xfm);
     const served = plugin_head.load(io, a, &b.xfm, b.dir) orelse return error.TestHeadNotLoaded;
     defer plugin_head.destroy(served, a);
     // A GLM vocab is past the coarse readout's floor: the served head builds it and keeps no low-bit draft head.
     try testing.expect(served.rerank_coarse != null and served.draft_head == null);
-    if (legacy) |*h| try testing.expect(h.rerank_coarse != null);
-    var heads_buf: [2]MtpHeadRef = undefined;
-    var xs_buf: [2]*Transformer = undefined;
-    var n: usize = 0;
-    if (legacy) |*h| {
-        heads_buf[n] = .{ .glm = h };
-        xs_buf[n] = &b.lg.?.xfm;
-        n += 1;
-    }
-    heads_buf[n] = .{ .plugin = served };
-    xs_buf[n] = &b.xfm;
-    n += 1;
-    const heads = heads_buf[0..n];
-    const xs = xs_buf[0..n];
+    const h: MtpHeadRef = .{ .plugin = served };
+    const x = &b.xfm;
     {
         var g = ops.Graph.init(a, b.xfm.s);
         defer g.deinit();
         const hist = try rows(&g, 3, 0x91);
         const step = try rows(&g, 2, 0x92);
         const one = try rows(&g, 1, 0x93);
-        var outs: [2][4]mlx.mlx_array = undefined;
-        for (heads, xs, 0..) |h, x, k| {
-            var cr = try h.makeCache(a);
-            defer cr.deinit();
-            try h.appendHistory(x, &cr, &.{ 5, 9, 40 }, hist, 0, null, a);
-            const merged = try h.forward(x, &cr, try g.fromSlice(i32, &.{ 7, 11 }, &.{2}), step, 3, .logits, null, null);
-            const mixed = try h.forward(x, &cr, try g.fromSlice(i32, &.{60}, &.{1}), one, 5, .mixed, null, null);
-            if (mixed.rerank_x.ctx != null) _ = try g.adopt(mixed.rerank_x);
-            outs[k] = .{ try g.adopt(merged.logits), try g.adopt(merged.hidden_next), try g.adopt(mixed.hidden_next), try g.adopt(try h.draftSelect(x, mixed.hidden_next, null)) };
-            try testing.expectEqual(@as(usize, 6), cr.step());
-        }
-        for (outs[n - 1], 0..) |got, i| try b.check(got, if (n == 2) outs[0][i] else null, false);
+        var cr = try h.makeCache(a);
+        defer cr.deinit();
+        try h.appendHistory(x, &cr, &.{ 5, 9, 40 }, hist, 0, null, a);
+        const merged = try h.forward(x, &cr, try g.fromSlice(i32, &.{ 7, 11 }, &.{2}), step, 3, .logits, null, null);
+        const mixed = try h.forward(x, &cr, try g.fromSlice(i32, &.{60}, &.{1}), one, 5, .mixed, null, null);
+        if (mixed.rerank_x.ctx != null) _ = try g.adopt(mixed.rerank_x);
+        const outs = [_]mlx.mlx_array{ try g.adopt(merged.logits), try g.adopt(merged.hidden_next), try g.adopt(mixed.hidden_next), try g.adopt(try h.draftSelect(x, mixed.hidden_next, null)) };
+        try testing.expectEqual(@as(usize, 6), cr.step());
+        for (outs) |got| try b.check(got, null, false);
     }
-    var tokens: [2][16]u32 = undefined;
-    var accepted: [2]std.ArrayList(u32) = .{ .empty, .empty };
-    defer for (&accepted) |*l| l.deinit(a);
-    for (heads, xs, 0..) |h, x, k| try mtpRun(x, h, &tokens[k], &accepted[k]);
-    const got_t = mlx.mlx_array_new_data(&tokens[n - 1], &[_]c_int{16}, 1, .uint32);
+    var tokens: [16]u32 = undefined;
+    var accepted: std.ArrayList(u32) = .empty;
+    defer accepted.deinit(a);
+    try mtpRun(x, h, &tokens, &accepted);
+    const got_t = mlx.mlx_array_new_data(&tokens, &[_]c_int{16}, 1, .uint32);
     defer _ = mlx.mlx_array_free(got_t);
-    const want_t: ?mlx.mlx_array = if (n == 2) mlx.mlx_array_new_data(&tokens[0], &[_]c_int{16}, 1, .uint32) else null;
-    defer if (want_t) |w| {
-        _ = mlx.mlx_array_free(w);
-    };
-    try b.check(got_t, want_t, true);
-    const ga = accepted[n - 1].items;
-    const got_a = mlx.mlx_array_new_data(ga.ptr, &[_]c_int{@intCast(ga.len)}, 1, .uint32);
+    try b.check(got_t, null, true);
+    const got_a = mlx.mlx_array_new_data(accepted.items.ptr, &[_]c_int{@intCast(accepted.items.len)}, 1, .uint32);
     defer _ = mlx.mlx_array_free(got_a);
-    const want_a: ?mlx.mlx_array = if (n == 2) mlx.mlx_array_new_data(accepted[0].items.ptr, &[_]c_int{@intCast(accepted[0].items.len)}, 1, .uint32) else null;
-    defer if (want_a) |w| {
-        _ = mlx.mlx_array_free(w);
-    };
-    try b.check(got_a, want_a, true);
+    try b.check(got_a, null, true);
     try b.expectDone();
 }
