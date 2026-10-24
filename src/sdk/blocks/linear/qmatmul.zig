@@ -25,7 +25,6 @@ const lastDim = @import("../../../mlx/array.zig").lastDim;
 const transposeBf16Weight = @import("../../../mlx/array.zig").transposeBf16Weight;
 const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
 const naxAvailable = @import("../../../mlx/device.zig").naxAvailable;
-const qsaArraysAllEqual = @import("../../../plugins/qwen4_exp/qsa/select.zig").qsaArraysAllEqual;
 const BITS_CACHE_CAP = @import("../../quant/params.zig").BITS_CACHE_CAP;
 const BitsCache = @import("../../quant/params.zig").BitsCache;
 const QuantParams = @import("../../quant/params.zig").QuantParams;
@@ -321,6 +320,8 @@ pub fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: ml
 }
 
 // ── tests ──
+
+const qsaArraysAllEqual = @import("../../../plugins/qwen4_exp/qsa/select.zig").qsaArraysAllEqual;
 
 test "qmvBatchLimit mirrors MLX's qmv/qmm split on single- and dual-die gen-17 GPUs" {
     try testing.expectEqual(@as(c_int, 25), qmvBatchLimit(false, 2560, 640));

@@ -8,14 +8,6 @@ const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 const transformer = @import("../../../engines/mlx/transformer.zig");
 const testing = std.testing;
-const OQE_FULL_O_BITS = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").OQE_FULL_O_BITS;
-const OQE_FULL_QK_BITS = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").OQE_FULL_QK_BITS;
-const OQE_FULL_V_BITS = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").OQE_FULL_V_BITS;
-const OQE_LINEAR_AB_BITS = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").OQE_LINEAR_AB_BITS;
-const OQE_LINEAR_OUT_BITS = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").OQE_LINEAR_OUT_BITS;
-const OQE_LINEAR_Z_BITS = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").OQE_LINEAR_Z_BITS;
-const OQE_MLP_DOWN_BITS = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").OQE_MLP_DOWN_BITS;
-const oqeLayerBits = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").oqeLayerBits;
 const gpuArchitecture = @import("../../../mlx/device.zig").gpuArchitecture;
 const macosProductVersion = @import("../../../mlx/device.zig").macosProductVersion;
 const macosVersionAtLeast = @import("../../../mlx/device.zig").macosVersionAtLeast;
@@ -711,6 +703,15 @@ pub fn runVerifyQmmMsg(
 }
 
 // ── tests ──
+
+const OQE_FULL_O_BITS = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").OQE_FULL_O_BITS;
+const OQE_FULL_QK_BITS = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").OQE_FULL_QK_BITS;
+const OQE_FULL_V_BITS = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").OQE_FULL_V_BITS;
+const OQE_LINEAR_AB_BITS = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").OQE_LINEAR_AB_BITS;
+const OQE_LINEAR_OUT_BITS = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").OQE_LINEAR_OUT_BITS;
+const OQE_LINEAR_Z_BITS = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").OQE_LINEAR_Z_BITS;
+const OQE_MLP_DOWN_BITS = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").OQE_MLP_DOWN_BITS;
+const oqeLayerBits = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").oqeLayerBits;
 
 test "vqmm scalar cache never evicts a scalar the caller is still holding" {
     // The live crash, as a pure decision: every verifyQmm-family call site

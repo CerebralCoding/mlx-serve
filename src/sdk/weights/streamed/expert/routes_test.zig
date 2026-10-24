@@ -6,9 +6,6 @@
 const std = @import("std");
 const host_caps = @import("../host_caps.zig");
 const sdk_ext = @import("../sdk_ext.zig");
-const bank_mod = @import("../../../../plugins/glm_moe_dsa/stream/bank.zig");
-const exl3 = @import("../../../../plugins/glm_moe_dsa/stream/exl3_bank.zig");
-const glm = @import("../../../../plugins/glm_moe_dsa/stream/glm_moe_dsa.zig");
 const policy = sdk_ext.expert.policy;
 const routes = sdk_ext.expert.routes;
 const Flag = routes.Flag;
@@ -34,6 +31,12 @@ fn pickRows(rnd: std.Random, out: []u16, rows: usize, k: usize, n_experts: u16) 
     }
     return out[0 .. rows * k];
 }
+
+// ── tests ──
+
+const bank_mod = @import("../../../../plugins/glm_moe_dsa/stream/bank.zig");
+const exl3 = @import("../../../../plugins/glm_moe_dsa/stream/exl3_bank.zig");
+const glm = @import("../../../../plugins/glm_moe_dsa/stream/glm_moe_dsa.zig");
 
 test "glm routes: the recorder keeps every decode route as the stream served it, and its file reads back" {
     if (comptime !host_caps.glm) return error.SkipZigTest;

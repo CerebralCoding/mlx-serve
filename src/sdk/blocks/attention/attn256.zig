@@ -8,8 +8,6 @@ const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 const sdpa = @import("sdpa.zig");
 const transformer = @import("../../../engines/mlx/transformer.zig");
-const attn256QsaMask = @import("../../../plugins/qwen4_exp/qsa/gather.zig").attn256QsaMask;
-const qsaMaskArm = @import("../../../plugins/qwen4_exp/qsa/sparse_attn.zig").qsaMaskArm;
 const naxSdpaPreferred = @import("sdpa.zig").naxSdpaPreferred;
 
 // ── Fused head_dim-256 prefill attention (flash-style Metal kernel) ──
@@ -483,6 +481,9 @@ pub fn attn256MaxDiff(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !f3
 pub var fused256_override: ?bool = null;
 
 // ── tests ──
+
+const attn256QsaMask = @import("../../../plugins/qwen4_exp/qsa/gather.zig").attn256QsaMask;
+const qsaMaskArm = @import("../../../plugins/qwen4_exp/qsa/sparse_attn.zig").qsaMaskArm;
 
 // ── fused hd-256 prefill attention parity ──
 

@@ -5,8 +5,6 @@ const std = @import("std");
 const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const materializedOwnedCopy = @import("../../mlx/array.zig").materializedOwnedCopy;
-const Qwen4RowCmp = @import("../../plugins/qwen4_exp/forward.zig").Qwen4RowCmp;
-const Qwen4Ties = @import("../../plugins/qwen4_exp/forward.zig").Qwen4Ties;
 
 /// An evaluated f32 array's host values (test inputs only: reading migrates the buffer).
 pub fn hostF32(a: mlx.mlx_array) ![]const f32 {
@@ -104,6 +102,9 @@ pub fn decidedMisses(ours: []const f32, ref: []const f32, rows: usize, v: usize)
 }
 
 // ── tests ──
+
+const Qwen4RowCmp = @import("../../plugins/qwen4_exp/forward.zig").Qwen4RowCmp;
+const Qwen4Ties = @import("../../plugins/qwen4_exp/forward.zig").Qwen4Ties;
 
 /// Root-mean-square error of an array against an f64 truth of the same size.
 pub fn rmsVsTruth(a: mlx.mlx_array, truth: []const f64) !f64 {

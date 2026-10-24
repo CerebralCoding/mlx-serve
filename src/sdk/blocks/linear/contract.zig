@@ -17,7 +17,6 @@ const qmv_rows = @import("qmv_rows.zig");
 const vp = @import("verify_projection.zig");
 const vq = @import("verify_qmm.zig");
 const vqn = @import("verify_qmm_nax.zig");
-const transformer = @import("../../../engines/mlx/transformer.zig");
 
 const spec = kc.spec;
 const metal = kc.metal;

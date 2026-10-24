@@ -95,12 +95,13 @@ pub const table: abi.QuantTable = blk: {
 
 // ── tests ──
 
+const transformer = @import("../../../engines/mlx/transformer.zig");
+
 const testing = std.testing;
 const ops = @import("../../../mlx/ops.zig");
 const parity = @import("../../testing/parity.zig");
 const resident = @import("../../weights/resident.zig");
 const registerRhtSigns = @import("../hadamard.zig").registerRhtSigns;
-const transformer = @import("../../../engines/mlx/transformer.zig");
 
 fn f16Rand(rnd: std.Random, shape: []const c_int, s: mlx.mlx_stream) !mlx.mlx_array {
     const b = try parity.testRandWeightBf16(rnd, shape, s);

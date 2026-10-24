@@ -259,8 +259,9 @@ fn isUint(v: Value, want: i64) bool {
 
 // ── tests ──
 
-const testing = std.testing;
 const registry = @import("../../plugins/registry.zig");
+
+const testing = std.testing;
 
 fn expectClaimant(want: ?[]const u8, block_json: []const u8, config_json: []const u8) !void {
     const got = try claimant(block_json, config_json);

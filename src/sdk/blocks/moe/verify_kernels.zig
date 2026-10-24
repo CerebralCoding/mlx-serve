@@ -5,15 +5,9 @@ const std = @import("std");
 const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
-const model_mod = @import("../../../engines/mlx/model.zig");
-const ModelConfig = @import("../../../engines/mlx/model.zig").ModelConfig;
 const verify_projection = @import("../linear/verify_projection.zig");
-const expectRowsByteEqual = @import("../../../engines/mlx/batched/row_axis_verify.zig").expectRowsByteEqual;
-const MoeLayerWeights = @import("../../../engines/mlx/forward/layered.zig").MoeLayerWeights;
 const testing = std.testing;
-const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
 const QsaCfgCache = @import("../../../mlx/kernel_cache.zig").QsaCfgCache;
-const qsaArraysAllEqual = @import("../../../plugins/qwen4_exp/qsa/select.zig").qsaArraysAllEqual;
 const bf16BitsEqual = @import("../../testing/parity.zig").bf16BitsEqual;
 const testRandUniformBf16 = @import("../../testing/parity.zig").testRandUniformBf16;
 const testRandWeightBf16 = @import("../../testing/parity.zig").testRandWeightBf16;
@@ -319,6 +313,11 @@ pub fn verifyIndexedExpertInput(s: mlx.mlx_stream, x: mlx.mlx_array, lhs: mlx.ml
 }
 
 // ── tests ──
+
+const model_mod = @import("../../../engines/mlx/model.zig");
+const expectRowsByteEqual = @import("../../../engines/mlx/batched/row_axis_verify.zig").expectRowsByteEqual;
+const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
+const qsaArraysAllEqual = @import("../../../plugins/qwen4_exp/qsa/select.zig").qsaArraysAllEqual;
 
 test "verify MoE rows preserve every value with fewer graph operations" {
     const path = env.get(.MTP_TEST_MODEL) orelse return error.SkipZigTest;

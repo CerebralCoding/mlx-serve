@@ -6,7 +6,6 @@ const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const Weights = @import("../../weights/resident.zig").Weights;
 const testing = std.testing;
-const FullAttnWeights = @import("../../../engines/mlx/layer_weights.zig").FullAttnWeights;
 const transposeBf16Weight = @import("../../../mlx/array.zig").transposeBf16Weight;
 const QuantParams = @import("../../quant/params.zig").QuantParams;
 const testReadF32 = @import("../../testing/parity.zig").testReadF32;

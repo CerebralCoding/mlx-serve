@@ -3,7 +3,6 @@
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const model_mod = @import("../../../engines/mlx/model.zig");
 const testing = std.testing;
 const qwen4ReadF32 = @import("../../testing/parity.zig").qwen4ReadF32;
 
@@ -56,6 +55,8 @@ pub fn kdaGateChain(A_log: mlx.mlx_array, a: mlx.mlx_array, dt_bias: mlx.mlx_arr
 }
 
 // ── tests ──
+
+const model_mod = @import("../../../engines/mlx/model.zig");
 
 test "kdaGateChain is the bounded-sigmoid gate, not a clamped softplus" {
     // g = exp(bound * sigmoid(exp(A_log) * (a + dt_bias))). Two properties

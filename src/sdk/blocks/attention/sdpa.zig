@@ -7,7 +7,6 @@ const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 const testing = std.testing;
 const computeNaxAvailable = @import("../../../mlx/device.zig").computeNaxAvailable;
-const attn256QsaMask = @import("../../../plugins/qwen4_exp/qsa/gather.zig").attn256QsaMask;
 const FUSED256_MIN_Q_LEN = @import("attn256.zig").FUSED256_MIN_Q_LEN;
 const attn256MaxDiff = @import("attn256.zig").attn256MaxDiff;
 const attn256RandBf16 = @import("attn256.zig").attn256RandBf16;
@@ -247,6 +246,8 @@ pub fn rowByRowSdpa(out: *mlx.mlx_array, q: mlx.mlx_array, k: mlx.mlx_array, v: 
 }
 
 // ── tests ──
+
+const attn256QsaMask = @import("../../../plugins/qwen4_exp/qsa/gather.zig").attn256QsaMask;
 
 test "splitMaskedSdpa256: verify-width array-mask rows split through the vector kernel match one dispatch" {
     const s = mlx.gpuStream();

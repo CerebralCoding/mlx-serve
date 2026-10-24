@@ -6,7 +6,6 @@ const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mtp_mod = @import("../../spec/mtp/mtp.zig");
 const mlx = @import("../../../mlx/ffi.zig");
-const model_mod = @import("../../../engines/mlx/model.zig");
 const log = @import("../../../host/log.zig");
 const transformer = @import("../../../engines/mlx/transformer.zig");
 const verify_qmm = @import("verify_qmm.zig");
@@ -17,7 +16,6 @@ const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
 const concatAxis0 = @import("../../../mlx/array.zig").concatAxis0;
 const gpuArchitecture = @import("../../../mlx/device.zig").gpuArchitecture;
 const QsaCfgCache = @import("../../../mlx/kernel_cache.zig").QsaCfgCache;
-const qsaArraysAllEqual = @import("../../../plugins/qwen4_exp/qsa/select.zig").qsaArraysAllEqual;
 const affineParamsFromGeometry = @import("../../quant/params.zig").affineParamsFromGeometry;
 const attn256RandBf16 = @import("../attention/attn256.zig").attn256RandBf16;
 const qmatmulBits = @import("qmatmul.zig").qmatmulBits;
@@ -338,6 +336,9 @@ pub var mtp_coarse_pair_dispatches: u64 = 0;
 pub var mtp_verify_kernel_calls: [3]u64 = @splat(0);
 
 // ── tests ──
+
+const model_mod = @import("../../../engines/mlx/model.zig");
+const qsaArraysAllEqual = @import("../../../plugins/qwen4_exp/qsa/select.zig").qsaArraysAllEqual;
 
 test "shared expert gate tail admits the joined verifier envelope only" {
     try testing.expect(sharedGateRowsEligible(&.{ 2, 2, 2, 2 }));

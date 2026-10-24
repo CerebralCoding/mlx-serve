@@ -4,7 +4,6 @@
 const std = @import("std");
 const mlx = @import("ffi.zig");
 const log = @import("../host/log.zig");
-const model_mod = @import("../engines/mlx/model.zig");
 const params = @import("../sdk/quant/params.zig");
 
 const S = mlx.mlx_stream;

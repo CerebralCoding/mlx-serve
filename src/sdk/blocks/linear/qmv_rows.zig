@@ -5,7 +5,6 @@ const std = @import("std");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
-const ModelConfig = @import("../../../engines/mlx/model.zig").ModelConfig;
 const Weights = @import("../../weights/resident.zig").Weights;
 const transformer = @import("../../../engines/mlx/transformer.zig");
 const testing = std.testing;
@@ -143,6 +142,8 @@ pub fn msvQmvRows(
 pub var mtp_head_row_dispatches: usize = 0;
 
 // ── tests ──
+
+const ModelConfig = @import("../../../engines/mlx/model.zig").ModelConfig;
 
 test "firstRowExactMiss: 4, 6 and 8-bit trunk projections are inside the row kernels, 3-bit is not; vision and mtp never count" {
     const Q = struct {

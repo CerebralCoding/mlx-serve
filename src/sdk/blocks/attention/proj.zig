@@ -5,7 +5,6 @@ const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 const decode_attn_quant = @import("decode_attn_quant.zig");
 const fused_rows = @import("../linear/fused_rows.zig");
-const FullAttnWeights = @import("../../../engines/mlx/layer_weights.zig").FullAttnWeights;
 const lastDim = @import("../../../mlx/array.zig").lastDim;
 const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
 const qmatmulBits = @import("../linear/qmatmul.zig").qmatmulBits;

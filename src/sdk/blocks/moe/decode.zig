@@ -4,9 +4,7 @@
 const std = @import("std");
 const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
-const model_mod = @import("../../../engines/mlx/model.zig");
 const log = @import("../../../host/log.zig");
-const ModelConfig = @import("../../../engines/mlx/model.zig").ModelConfig;
 const QuantMode = @import("../../quant/params.zig").QuantMode;
 const moe_fp4 = @import("moe_fp4.zig");
 const moe_affine4 = @import("../../../plugins/qwen4_exp/moe_affine4.zig");
@@ -414,6 +412,8 @@ pub fn moeFp4DecodeEligible(rows: c_int, has_expert_bias: bool, clamp: ?u32, act
 }
 
 // ── tests ──
+
+const ModelConfig = @import("../../../engines/mlx/model.zig").ModelConfig;
 
 test "moe fp4 decode: expert biases or a clamp no kernel serves keep the composed chain" {
     var cfg: ModelConfig = undefined;

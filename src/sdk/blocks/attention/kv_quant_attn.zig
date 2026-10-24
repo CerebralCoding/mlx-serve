@@ -5,9 +5,7 @@ const std = @import("std");
 const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
-const kv_quant = @import("../../../engines/mlx/cache/kv_quant.zig");
 const log = @import("../../../host/log.zig");
-const KVCache = @import("../../../engines/mlx/kv/cache.zig").KVCache;
 const testing = std.testing;
 const QSA_SCORE_KERNEL_HEADER = @import("../../../plugins/qwen4_exp/qsa/score.zig").QSA_SCORE_KERNEL_HEADER;
 const verifyQmmNaxAvailable = @import("../linear/verify_qmm_nax.zig").verifyQmmNaxAvailable;
@@ -788,6 +786,9 @@ pub fn logKvAttnFusedEngaged(view: *const DenseKVView, q: mlx.mlx_array, t_q: c_
 }
 
 // ── tests ──
+
+const kv_quant = @import("../../../engines/mlx/cache/kv_quant.zig");
+const KVCache = @import("../../../engines/mlx/kv/cache.zig").KVCache;
 
 /// Shared harness for the decode quantized-KV kernel parity tests: prefill
 /// `t_prefill` tokens + one decode token through a real affine KVCache (so

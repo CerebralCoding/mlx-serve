@@ -8,17 +8,11 @@ const mlx = @import("../../../mlx/ffi.zig");
 const rht = @import("../../quant/hadamard/rht.zig");
 const qmv2 = @import("../qmm/qmv2.zig");
 const gdn_decode = @import("decode.zig");
-const model_mod = @import("../../../engines/mlx/model.zig");
 const log = @import("../../../host/log.zig");
 const ModelConfig = @import("../../../engines/mlx/model.zig").ModelConfig;
-const SpecTree = @import("../../../engines/mlx/forward_ctx.zig").SpecTree;
-const KVCache = @import("../../../engines/mlx/kv/cache.zig").KVCache;
 const testing = std.testing;
 const bf16Scalar = @import("../../../mlx/array.zig").bf16Scalar;
 const scalarOf = @import("../../../mlx/array.zig").scalarOf;
-const SSMCacheEntry = @import("../../../engines/mlx/ssm/entry.zig").SSMCacheEntry;
-const ssmCommitTreePath = @import("../../../engines/mlx/ssm/entry.zig").ssmCommitTreePath;
-const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
 const sliceLastDim = @import("../../../mlx/array.zig").sliceLastDim;
 const attn256MaxDiff = @import("../attention/attn256.zig").attn256MaxDiff;
 const attn256RandBf16 = @import("../attention/attn256.zig").attn256RandBf16;
@@ -357,6 +351,13 @@ pub fn gdnNormGateFused(
 }
 
 // ── tests ──
+
+const model_mod = @import("../../../engines/mlx/model.zig");
+const SpecTree = @import("../../../engines/mlx/forward_ctx.zig").SpecTree;
+const KVCache = @import("../../../engines/mlx/kv/cache.zig").KVCache;
+const SSMCacheEntry = @import("../../../engines/mlx/ssm/entry.zig").SSMCacheEntry;
+const ssmCommitTreePath = @import("../../../engines/mlx/ssm/entry.zig").ssmCommitTreePath;
+const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
 
 test "gdn packed prework: bit-identical to the composed chain at decode and prefill widths incl. gate/beta + folded layout" {
     const s = mlx.gpuStream();

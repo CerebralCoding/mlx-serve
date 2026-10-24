@@ -31,7 +31,6 @@ const gqr = @import("gather_qmv_rows.zig");
 const dr = @import("down_reduce.zig");
 const fa = @import("../mlp/fused_activations.zig");
 const activations = @import("../mlp/activations.zig");
-const transformer = @import("../../../engines/mlx/transformer.zig");
 const device_mod = @import("../../../mlx/device.zig");
 const moe_fp4 = @import("moe_fp4.zig");
 const rk = @import("router_kernel.zig");

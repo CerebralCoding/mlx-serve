@@ -8,7 +8,6 @@ const std = @import("std");
 const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
-const xfm = @import("../../../engines/mlx/transformer.zig");
 const down_reduce = @import("down_reduce.zig");
 const gather_qmv = @import("gather_qmv.zig");
 const gather_qmv_rows = @import("gather_qmv_rows.zig");
