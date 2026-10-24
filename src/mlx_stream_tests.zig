@@ -56,6 +56,7 @@ comptime {
     _ = @import("plugins/mimo_v2/stream/stream_source.zig");
     _ = @import("plugins/deepseek_v41/stream/deepseek_v41.zig");
     _ = @import("sdk/weights/streamed/ops.zig");
+    _ = @import("sdk/weights/streamed/exl3_source.zig");
     _ = @import("plugins/deepseek_v41/stream/graph.zig");
     _ = @import("plugins/deepseek_v41/stream/engram.zig");
     _ = @import("plugins/deepseek_v41/stream/reference_test.zig");

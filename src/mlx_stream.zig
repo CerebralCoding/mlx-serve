@@ -65,6 +65,8 @@ pub const dsv41_streamed = @import("plugins/deepseek_v41/stream/streamed.zig");
 pub const bank_source = @import("sdk/weights/streamed/bank_source.zig");
 /// A standard MLX pack's routed experts streamed for the resident trunk as downloaded (`Streamed.openPack`).
 pub const mlx_pack = @import("sdk/weights/streamed/mlx_pack.zig");
+/// An EXL3 expert bank streamed for a resident trunk (`sdk/weights/streamed.zig` `Exl3`).
+pub const exl3_source = @import("sdk/weights/streamed/exl3_source.zig");
 /// The streamed halves of the dupes parity harnesses (test builds only): each arch's trunk over a pack, for the main
 /// test module's `plugins/<model>/stream/dupes_test.zig` to compare against the resident arch.
 pub const dupes = if (@import("builtin").is_test) struct {
