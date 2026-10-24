@@ -720,6 +720,8 @@ pub fn facts(c: *Config) abi.Parsed {
         .ssm_state = .{
             .entries = c.num_hidden_layers,
             .dtype = if (c.ssm_state_f32) .f32 else .bf16,
+            // The aux buffers (PLE window, QSA keys) are written in place.
+            .snapshot_policy = .in_place,
             .checkpoint_bytes = ssmCheckpointBytes(c),
         },
     };

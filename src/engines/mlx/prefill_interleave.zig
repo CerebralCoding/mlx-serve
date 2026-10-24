@@ -157,7 +157,7 @@ pub const BoundaryCand = struct {
     has_media: bool,
     prompt_logprobs: bool,
     generator_path: bool,
-    /// Module-side per-request state (qwen4_exp) that a declined restore would reset under the outer.
+    /// Module-side per-request state (`Caps.shared_readonly_state`) that a declined restore would reset under the outer.
     module_state: bool,
     /// Uncached tail, from `peekMatchedTokens`.
     tail: usize,
@@ -257,7 +257,7 @@ fn takeBoundaryCandidate(sch: *Scheduler, outer: *Slot) ?*Slot {
             .has_media = s.vision_embeddings != null or s.media.len > 0,
             .prompt_logprobs = s.prompt_logprobs,
             .generator_path = s.model.transformer != null,
-            .module_state = if (s.model.transformer) |xf| xf.config.isQwen4() else false,
+            .module_state = if (s.model.transformer) |xf| xf.config.caps().shared_readonly_state else false,
             .tail = slotUncachedTail(s),
         };
         if (!boundaryEligible(c, x)) continue;

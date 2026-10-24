@@ -59,7 +59,7 @@ pub fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.Vi
         .min_tokens = config.glmv_min_image_tokens,
         .max_tokens = config.glmv_max_image_tokens,
     };
-    if (config.isEmbeddingGemma2()) return .{
+    if (config.gv_budgeted) return .{
         .mode = .gemma_budget,
         .patch = config.vision_patch_size,
         .merge = config.vision_pooling_kernel,
@@ -81,7 +81,7 @@ pub fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.Vi
 /// The video processor's view of `visionPreprocFromConfig`: frames get their own, smaller, token budget.
 pub fn videoPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.VisionPreproc {
     var vp = visionPreprocFromConfig(config);
-    if (config.isEmbeddingGemma2()) {
+    if (config.gv_budgeted) {
         vp.max_tokens = config.gv_video_tokens;
         vp.max_frames = config.gv_video_frames;
     }
@@ -165,7 +165,7 @@ test "an x-mlx-pixels payload is refused by a patch-grid tower (it is a Gemma fo
 }
 
 pub fn eg2ProcessorConfig() model_mod.ModelConfig {
-    var config = model_mod.ModelConfig{ .model_type = "embedding_gemma2" };
+    var config = model_mod.ModelConfig{ .model_type = "embedding_gemma2", .gv_budgeted = true };
     config.vision_patch_size = 16;
     config.vision_pooling_kernel = 3;
     config.gv_image_tokens = 70;

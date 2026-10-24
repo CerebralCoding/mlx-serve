@@ -504,6 +504,7 @@ test "ctxSizingCacheReserve: the advertised context is unchanged on every other 
     var q4 = longCtxTestConfig(); // declares qwen4_exp
     var other = longCtxTestConfig();
     other.model_type = "qwen3_5_moe";
+    other.legacy.caps.long_ctx = std.mem.eql(u8, other.model_type, "qwen4_exp");
 
     for ([_]u64{ 0, 2 * GiB, 10 * GiB, 60 * GiB }) |ask| {
         http_server.prefix_cache_mem_bytes = ask;

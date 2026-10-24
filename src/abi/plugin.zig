@@ -118,7 +118,11 @@ pub const Caps = packed struct(u64) {
     /// The model reads a Thunderbolt cluster's plan itself (`distributed.planFor`); a planned pack whose plugin does
     /// not is loaded by the legacy path.
     cluster_plan: bool = false,
-    _: u39 = 0,
+    /// DFlash rounds follow the round policy (`dflash_policy.zig`): a sparse target whose verify rows cost.
+    dflash_policy: bool = false,
+    /// A rejected draft rolls back by truncating the KV cache (an attention trunk): no snapshot, no re-forward.
+    verify_truncates: bool = false,
+    _: u37 = 0,
 };
 
 pub const ThinkingDefault = enum(u8) { unset, off, on, on_with_tools };

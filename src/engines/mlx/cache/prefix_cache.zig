@@ -757,8 +757,7 @@ pub const HotPrefixCache = struct {
     ) bool {
         // Module-owned request state (a served pack's caps; DeepSeek-V4.1 and GLM-5.3 on mlx-stream) is not in the
         // KVCache: a snapshot restore would advance cache.step without rebuilding it.
-        if (config.plugin) |b| if (!b.parsed.caps.prefix_cache) return false;
-        if (config.isDsv41() or config.glm_stream) return false;
+        if (!config.caps().prefix_cache or config.glm_stream) return false;
         // A pipeline worker holds the later layers' state at the live position only: a restore
         // here would rewind this rank and not the worker.
         if (config.dist_span != null) return false;
@@ -3189,10 +3188,11 @@ test "HotPrefixCache: shouldUse gates hybrid by enable_ssm_checkpoints" {
 test "HotPrefixCache: shouldUse rejects a streamed pack's module-owned decode state" {
     // The state lives on the module, NOT in the 0-entry KVCache shell: a snapshot restore would set cache.step
     // without rebuilding it. A served DeepSeek pack says so in its caps (`plugins/deepseek_v4/served_test.zig`).
-    var cfg = model_mod.ModelConfig{};
-    cfg.model_type = "deepseek_v41";
+    var cfg = try model_mod.parseConfigFromJson(testing.allocator, model_mod.dsv41_release_config);
+    defer cfg.deinit(testing.allocator);
     try testing.expect(!HotPrefixCache.shouldUse(&cfg, true));
     // A GLM-5.3 pack on mlx-stream keeps its decode state on the plugin's module.
+    cfg.legacy.caps.prefix_cache = true;
     cfg.model_type = "glm_moe_dsa";
     cfg.glm_stream = true;
     try testing.expect(!HotPrefixCache.shouldUse(&cfg, true));

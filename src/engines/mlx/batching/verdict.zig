@@ -116,7 +116,7 @@ pub fn groupCtxMax(caches: []const *const KVCache) u32 {
 /// slot at any length, so it has no padding to cap.
 pub fn groupPadsKv(slot: *const Slot) bool {
     const cfg = slot.model.config orelse return true;
-    return !cfg.isGlm5();
+    return cfg.caps().batch_pads_kv;
 }
 
 /// The per-slot attention arm serves every batched trunk but qwen4's QSA reads.
@@ -376,7 +376,7 @@ test "the pad-waste cap reads the arch's TRUE attention KV length, not cache.ste
         try testing.expectEqual(@as(usize, 0), caches[i].step); // the trap
     }
 
-    var q4 = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
+    var q4 = model_mod.ModelConfig{ .model_type = "qwen4_exp", .legacy = .{ .caps = .{ .long_ctx = true } } };
     var kv_lens: [3]u32 = undefined;
     for (caches[0..], 0..) |*c, i| kv_lens[i] = batchKvLenOf(c, &q4);
     try testing.expectEqualSlices(u32, &[_]u32{ 1_000, 1_000, 60_000 }, &kv_lens);
@@ -412,7 +412,7 @@ test "an attention-first trunk's batching lengths are unchanged by the fix" {
         kv_lens[i] = batchKvLenOf(&caches[i], &llama);
     }
     try testing.expectEqualSlices(u32, &[_]u32{ 1_000, 1_000, 1_000, 100_000 }, &kv_lens);
-    var q4b = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
+    var q4b = model_mod.ModelConfig{ .model_type = "qwen4_exp", .legacy = .{ .caps = .{ .long_ctx = true } } };
     for (caches[0..], 0..) |*c, i| try testing.expectEqual(kv_lens[i], batchKvLenOf(c, &q4b));
     try testing.expectEqual(@as(usize, 3), batchedKvKeepCount(&kv_lens));
     try testing.expectEqual(
@@ -427,6 +427,7 @@ test "batchKvLenOf bills qwen4 selected length when the gather arm is on" {
     transformer_mod.qsa_batched_gather_override = true;
     var q4 = model_mod.ModelConfig{
         .model_type = "qwen4_exp",
+        .legacy = .{ .caps = .{ .long_ctx = true } },
         .indexer_budget = 2048,
         .indexer_compress_ratio = 4,
     };
@@ -462,6 +463,7 @@ test "batchKvLenOf bills raw when any gather switch is off or the slot is vision
     @import("../../../plugins/qwen4_exp/qsa/verify_gather.zig").qsa_verify_gather_override = true;
     var q4 = model_mod.ModelConfig{
         .model_type = "qwen4_exp",
+        .legacy = .{ .caps = .{ .long_ctx = true } },
         .indexer_budget = 2048,
         .indexer_compress_ratio = 4,
     };
@@ -505,6 +507,7 @@ test "a 300k slot beside a 1k slot is billed sparse, so the pair groups (M-RoPE 
     transformer_mod.qsa_decode_gather_override = true;
     var q4 = model_mod.ModelConfig{
         .model_type = "qwen4_exp",
+        .legacy = .{ .caps = .{ .long_ctx = true } },
         .indexer_budget = 2048,
         .indexer_compress_ratio = 4,
     };
@@ -549,6 +552,7 @@ test "S>=2 pad-waste floor: none under the fused verify kernel, else max of gath
     @import("../../../plugins/qwen4_exp/qsa/verify_gather.zig").qsa_verify_gather_min_kv_override = 16_384;
     var q4 = model_mod.ModelConfig{
         .model_type = "qwen4_exp",
+        .legacy = .{ .caps = .{ .long_ctx = true } },
         .indexer_budget = 2048,
         .indexer_compress_ratio = 4,
     };
@@ -571,6 +575,7 @@ test "S>=2 pad-waste floor: none under the fused verify kernel, else max of gath
 test "batchedEffectiveKvLen: qwen4 bills selected length, other archs keep raw kv" {
     var q4 = model_mod.ModelConfig{
         .model_type = "qwen4_exp",
+        .legacy = .{ .caps = .{ .long_ctx = true } },
         .indexer_budget = 2048,
         .indexer_compress_ratio = 4,
     };
@@ -645,34 +650,12 @@ test "supportsBatchedGdnDecode refuses every arch the batched GDN path does not 
         try testing.expect(!kda.supportsBatchedGdnDecode());
     }
     {
-        var ink = std.mem.zeroes(model_mod.ModelConfig);
-        ink.model_type = "inkling_mm_model";
-        ink.full_attention_interval = 4;
-        try testing.expect(!ink.supportsBatchedGdnDecode());
-    }
-    {
         // Pure attention: not a GDN trunk at all, rides the standard kernel.
         var dense = std.mem.zeroes(model_mod.ModelConfig);
         dense.model_type = "qwen3";
         try testing.expect(!dense.supportsBatchedGdnDecode());
     }
-    {
-        // qwen4_exp: MoE, but every per-slot piece is on the SSMCacheEntry.
-        var q4 = std.mem.zeroes(model_mod.ModelConfig);
-        q4.model_type = "qwen4_exp";
-        q4.full_attention_interval = 4;
-        q4.num_experts = 256;
-        q4.num_experts_per_tok = 8;
-        try testing.expect(q4.supportsBatchedGdnDecode());
-    }
-    {
-        // GLM-5-Next shares bailing's per-channel KDA gate, which is refused above; its own arm batches.
-        var glm = std.mem.zeroes(model_mod.ModelConfig);
-        glm.model_type = "glm5_next";
-        glm.kda_vector_gate = true;
-        try testing.expect(glm.supportsBatchedGdnDecode());
-        try testing.expect(configBatchesDecode(&glm));
-    }
+    // Served models (qwen4_exp, GLM-5-Next, Inkling) answer from their plugin's caps.
 }
 
 test "S21: a released module head drops the slot's exclusivity, and the MODEL bit is untouched" {

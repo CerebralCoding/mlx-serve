@@ -406,11 +406,12 @@ pub fn mtpRoundAfterChain(
     // target is qwen3_5-family hybrid) rollback needs only the pre-verify
     // LENGTH (KV truncate is offset-only; the stale tail past it is
     // unreachable) plus the verify pass's per-position SSM capture, so no
-    // snapshot is taken at all; nor on MiMo, whose attention-only trunk
-    // rolls back by the same truncate. Any other pure-attention target
-    // keeps the proven snapshot + re-forward path.
+    // snapshot is taken at all; nor on a model that declares its
+    // attention-only trunk rolls back by the same truncate
+    // (`Caps.verify_truncates`). Any other pure-attention target keeps the
+    // proven snapshot + re-forward path.
     const kv_step_snap = self.ctx.cache.step;
-    const truncate_only = self.xfm.config.isMimo();
+    const truncate_only = self.xfm.config.caps().verify_truncates;
     var kv_snap: ?transformer_mod.KVCacheSnapshot = if (self.ctx.ssm_entries != null or truncate_only) null else try self.ctx.cache.snapshot();
     errdefer if (kv_snap) |*snap| snap.deinit();
     const moe_seq_offset_snap = self.ctx.moe_seq_offset.*;
