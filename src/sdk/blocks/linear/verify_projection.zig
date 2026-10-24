@@ -4,7 +4,6 @@
 const std = @import("std");
 const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
-const mtp_mod = @import("../../spec/mtp/mtp.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 const verify_qmm = @import("verify_qmm.zig");
@@ -293,6 +292,8 @@ pub var mtp_coarse_pair_dispatches: u64 = 0;
 pub var mtp_verify_kernel_calls: [3]u64 = @splat(0);
 
 // ── tests ──
+
+const mtp_mod = @import("../../spec/mtp/mtp.zig");
 
 const qmatmulBits = @import("qmatmul.zig").qmatmulBits;
 
