@@ -976,7 +976,6 @@ pub const Transformer = struct {
     // sdk/blocks/embedding.zig
     pub const rawEmbedding = @import("../../sdk/blocks/embedding.zig").rawEmbedding;
     pub const embedding = @import("../../sdk/blocks/embedding.zig").embedding;
-    pub const dequantizedEmbedding = @import("../../sdk/blocks/embedding.zig").dequantizedEmbedding;
     pub const dequantTake = @import("../../sdk/blocks/embedding.zig").dequantTake;
     // sdk/vision/splice.zig
     pub const spliceVisionEmbeddings = @import("../../sdk/vision/splice.zig").spliceVisionEmbeddings;
@@ -1104,7 +1103,6 @@ pub const Transformer = struct {
     pub const gemma4MoeLayerTail = @import("../../plugins/gemma4/moe_tail.zig").gemma4MoeLayerTail;
     // engines/mlx/diag/profile.zig
     pub const debugTraceHead = @import("diag/profile.zig").debugTraceHead;
-    pub const forwardDiffusionDecoder = @import("plugin/driver.zig").diffusionDecoder;
     // engines/mlx/forward/encoder_head.zig
     pub const forwardEmbedding = @import("forward/encoder_head.zig").forwardEmbedding;
     pub const forwardEmbeddingMasked = @import("forward/encoder_head.zig").forwardEmbeddingMasked;

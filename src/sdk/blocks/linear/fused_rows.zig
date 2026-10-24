@@ -190,7 +190,7 @@ pub fn sliceQkvPart(out: *mlx.mlx_array, qkv: mlx.mlx_array, start: c_int, width
     try mlx.check(mlx.mlx_slice(out, qkv, &lo, 3, &hi, 3, &st, 3, s));
 }
 
-/// DiffusionGemma packs each expert's gate and up projections in one tensor
+/// A packed bank holds each expert's gate and up projections in one tensor
 /// `experts.gate_up_proj` of shape [E, 2*M, X], gate rows first (HF chunks
 /// the projected output in halves: gate = [..., :M], up = [..., M:]).
 /// Slicing axis 1 maps the packed layout onto MoeMlpWeights' separate

@@ -43,7 +43,7 @@ fn claimantIn(list: []const sdk_plugin.Entry, model_type: []const u8, config_jso
     return list[i].model;
 }
 
-/// The table hands drafters (and the canvas loop) the trunk's embedding table and head.
+/// The table hands drafters the trunk's embedding table and head.
 pub fn lendsTrunk(table: *const abi.ModelTable) bool {
     const sp = table.spec orelse return false;
     return sp.trunk_weight != null;
@@ -136,11 +136,6 @@ pub fn resolve(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, raw_json
         b.destroy(a);
         return .{ .legacy = "pooling from the folder name on a decoder" };
     }
-    if (b.parsed.caps.block_diffusion and !lendsTrunk(table)) {
-        // The canvas loop's self-conditioning reads the trunk's embedding table.
-        b.destroy(a);
-        return .{ .legacy = "canvas model without trunk_weight" };
-    }
     return .{ .bound = b };
 }
 
@@ -205,14 +200,6 @@ pub fn modelConfig(p: *const abi.Parsed) ModelConfig {
         .has_qk_norm = false,
         .hidden_act = .silu,
         .has_vision = p.caps.images,
-        .canvas_length = if (p.caps.block_diffusion) p.canvas.length else 0,
-        .diffusion_max_steps = p.canvas.max_steps,
-        .diffusion_t_min = p.canvas.t_min,
-        .diffusion_t_max = p.canvas.t_max,
-        .diffusion_entropy_bound = p.canvas.entropy_bound,
-        .diffusion_confidence_threshold = p.canvas.confidence_threshold,
-        .diffusion_stability_threshold = p.canvas.stability_threshold,
-        .diffusion_pad_token = p.canvas.pad_token,
         .image_token_id = p.placeholder_ids.image,
         .video_token_id = p.placeholder_ids.video,
         .audio_token_id = p.placeholder_ids.audio,

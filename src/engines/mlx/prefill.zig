@@ -42,7 +42,6 @@ const Slot = @import("slot.zig").Slot;
 const dflashGateMinimum = @import("spec/dflash_gate.zig").dflashGateMinimum;
 const specInitWiring = @import("spec/wiring.zig").specInitWiring;
 const publishLiveKvResidency = @import("step.zig").publishLiveKvResidency;
-const runPrefillDiffusion = @import("../../plugins/diffusion_gemma/scheduler_arm.zig").runPrefillDiffusion;
 const scheduler_mod = @import("scheduler.zig");
 const intree = @import("plugin/intree.zig");
 
@@ -77,12 +76,6 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     }
     if (slot.model.llama_engine != null) {
         return runPrefillLlama(sch, slot);
-    }
-    // DiffusionGemma: generation is a canvas-denoising loop, not
-    // autoregressive decode — no Generator. The encoder prefill fills the
-    // slot's own KV cache; PLD/drafter/MTP/batching never apply.
-    if (slot.model.transformer.?.config.isDiffusion()) {
-        return runPrefillDiffusion(sch, slot);
     }
     const sampling = slot.sampling;
     // Refresh ctx in case slot was relocated (paranoia — slot is heap so no,

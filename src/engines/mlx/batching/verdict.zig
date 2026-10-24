@@ -170,8 +170,6 @@ pub fn modelBatchable(cfg: *const model_mod.ModelConfig) bool {
     if (cfg.full_attention_interval > 0) return false;
     if (cfg.is_encoder_only) return false;
     if (cfg.isMoe()) return false;
-    // Block diffusion denoises whole canvases — no per-token batched decode.
-    if (cfg.isDiffusion()) return false;
     return true;
 }
 

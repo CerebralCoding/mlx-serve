@@ -118,13 +118,12 @@ fn parseCompletionPrompt(allocator: std.mem.Allocator, v: ?std.json.Value, vocab
 
 pub const PROMPT_LOGPROBS_UNAVAILABLE_MSG = "'echo' with 'logprobs' is not supported on this model: its prefill does not return every prompt position's logits";
 
-/// Prompt logprobs read every row of the MLX prefill's logits. An embedded engine and the
-/// diffusion canvas never forward the prompt row by row; the module-owned DeepSeek forwards
-/// return the last row only.
-const PromptLogprobsSupport = struct { engine_backed: bool = false, diffusion: bool = false, module_owned: bool = false };
+/// Prompt logprobs read every row of the MLX prefill's logits. An embedded engine never
+/// forwards the prompt row by row; the module-owned DeepSeek forwards return the last row only.
+const PromptLogprobsSupport = struct { engine_backed: bool = false, module_owned: bool = false };
 
 fn promptLogprobsRejectReason(model: PromptLogprobsSupport) ?[]const u8 {
-    return if (model.engine_backed or model.diffusion or model.module_owned) PROMPT_LOGPROBS_UNAVAILABLE_MSG else null;
+    return if (model.engine_backed or model.module_owned) PROMPT_LOGPROBS_UNAVAILABLE_MSG else null;
 }
 
 fn echoRequested(root: std.json.ObjectMap) bool {
@@ -199,7 +198,6 @@ pub fn handleCompletions(
     const prompt_logprobs = echoRequested(root) and logprobs_n > 0;
     if (prompt_logprobs) if (promptLogprobsRejectReason(.{
         .engine_backed = lm.engineBacked(),
-        .diffusion = config.isDiffusion(),
         .module_owned = if (lm.transformer) |t| t.ownsModuleDecodeState() else false,
     })) |reason| {
         log.warn("POST /v1/completions -> 400 (echo logprobs: prefill returns no per-row logits)\n", .{});
@@ -758,7 +756,6 @@ test "parseTokenIds: only integers inside the vocabulary reach the decoder" {
 test "promptLogprobsRejectReason: only a prefill that returns every row can score the prompt" {
     try std.testing.expect(promptLogprobsRejectReason(.{}) == null);
     try std.testing.expect(promptLogprobsRejectReason(.{ .engine_backed = true }) != null);
-    try std.testing.expect(promptLogprobsRejectReason(.{ .diffusion = true }) != null);
     try std.testing.expect(promptLogprobsRejectReason(.{ .module_owned = true }) != null);
 }
 

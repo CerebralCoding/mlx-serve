@@ -144,15 +144,9 @@ pub const ForwardCtx = struct {
     /// by the BERT encoder forward so padded positions never attend. Null
     /// (the default) keeps the unmasked single-sequence path.
     key_pad_mask: ?mlx.mlx_array = null,
-    /// DiffusionGemma encoder pass: multiply each layer's output by the
-    /// ENCODER layer scalar instead of the decoder's. Set by the diffusion
-    /// runner for prompt prefill and committed-canvas re-encode passes.
-    use_encoder_scalars: bool = false,
     /// Return the post-final-norm hidden instead of logits (caller frees
     /// either way), skipping the 262K-vocab lm_head projection. Set by the
-    /// DiffusionGemma encoder pass (which exists only to fill the KV cache)
-    /// and by the LTX text encoder (which wants the residual stream, not a
-    /// next token).
+    /// LTX text encoder (which wants the residual stream, not a next token).
     skip_lm_head: bool = false,
     /// Batched decode over a GatedDeltaNet trunk (`forwardMoeBatchedDecode`).
     /// Non-null means: this forward runs at `batch == batch_slots.len`,

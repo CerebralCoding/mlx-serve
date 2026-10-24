@@ -247,7 +247,6 @@ fn expectForward(a: Allocator, pack: *Loaded, mode: model_abi.Mode) !void {
         .decode => .{ 1, 1, .last_row },
         .verify => .{ 1, 3, .all_rows },
         .batched_rows => .{ 2, 1, .last_row },
-        .canvas => .{ 1, 4, .all_rows },
     };
     const tokens = try a.alloc(u32, slots * rows);
     for (tokens, 0..) |*tok, i| tok.* = @intCast((i * 7 + 1) % vocab);

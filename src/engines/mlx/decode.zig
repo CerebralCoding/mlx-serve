@@ -38,7 +38,6 @@ const specTickMode = @import("spec/wiring.zig").specTickMode;
 const plannerOutputClock = @import("spec/wiring.zig").plannerOutputClock;
 const publishSpeculativeBlock = @import("spec/wiring.zig").publishSpeculativeBlock;
 const loopGuardTick = @import("../../host/chat/loop_stop.zig").loopGuardTick;
-const runDiffusionDecodeTick = @import("../../plugins/diffusion_gemma/scheduler_arm.zig").runDiffusionDecodeTick;
 
 var kv_skew_split_logged: bool = false; // one-shot log guard
 
@@ -267,9 +266,6 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
         var one = [_]*Slot{slot};
         return runLlamaDecodeTick(sch, &one);
     }
-    if (slot.diffusion) |runner| {
-        return runDiffusionDecodeTick(sch, slot, runner);
-    }
     const gen = if (slot.legacy_gen) |*g| g else {
         slot.markError("no_generator");
         return;
@@ -413,7 +409,6 @@ test "single MTP slot reaches the round entry through runDecodeTick" {
     slot.model = &model;
     slot.ds4_session = null;
     slot.llama_seq = null;
-    slot.diffusion = null;
     slot.legacy_gen = gen;
     slot.enable_mtp = true;
     slot.enable_drafter = false;

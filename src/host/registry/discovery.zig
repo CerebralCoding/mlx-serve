@@ -36,14 +36,14 @@ const served_plugin = @import("../../engines/mlx/plugin/config.zig");
 /// drafters can't decode on their own, and users shouldn't see them in
 /// `/v1/models`.
 const supported_model_types = [_][]const u8{
-    "gemma3",           "gemma3_text",
-    "gemma4",           "gemma4_text",
-    "gemma4_unified",   "gemma4_unified_text",
-    "diffusion_gemma",  "qwen2",
-    "qwen3",            "qwen3_5",
-    "qwen3_5_text",     "qwen3_5_moe",
-    "qwen3_5_moe_text", "qwen3_moe",
-    "qwen3_moe_text",   "qwen3_next",
+    "gemma3",         "gemma3_text",
+    "gemma4",         "gemma4_text",
+    "gemma4_unified", "gemma4_unified_text",
+    "qwen2",          "qwen3",
+    "qwen3_5",        "qwen3_5_text",
+    "qwen3_5_moe",    "qwen3_5_moe_text",
+    "qwen3_moe",      "qwen3_moe_text",
+    "qwen3_next",
     "qwen4_exp", "qwen4_exp_text", // Qwen3.8-Flash-Next (GDN + QSA + n-gram PLE MoE)
     "llama",     "mistral",
     "lfm2",       "lfm2_vl", "lfm2_moe", // any other "lfm2*" passes by prefix, as model.zig parses it
@@ -2034,13 +2034,10 @@ test "resolveGgufFile: deterministic pick, mmproj filtering, precise errors" {
 }
 
 test "modelKindFromType labels every family (list TYPE column + run preflight)" {
-    // Chat: MLX archs, the synthetic gguf type, and DiffusionGemma (which
-    // was missing from the discovery allowlist despite being servable).
+    // Chat: MLX archs and the synthetic gguf type.
     try testing.expectEqual(ModelKind.chat, modelKindFromType("gemma4"));
     try testing.expectEqual(ModelKind.chat, modelKindFromType("qwen3_5_moe"));
     try testing.expectEqual(ModelKind.chat, modelKindFromType("gguf"));
-    try testing.expectEqual(ModelKind.chat, modelKindFromType("diffusion_gemma"));
-    try testing.expect(isSupportedModelType("diffusion_gemma"));
     // Media modalities.
     try testing.expectEqual(ModelKind.image, modelKindFromType("flux2-klein-4b"));
     try testing.expectEqual(ModelKind.image, modelKindFromType("krea2_turbo"));

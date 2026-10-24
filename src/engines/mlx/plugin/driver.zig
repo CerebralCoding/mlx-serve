@@ -164,8 +164,7 @@ pub fn loadWith(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_di
     xfm.cache.deinit();
     xfm.cache = try KVCache.init(a, config.num_hidden_layers);
     // A drafter embedding through the trunk's table re-applies its scale (`Transformer.emb_scale`, freed by deinit).
-    // bf16, as the legacy load builds it: an f32 scalar promotes every bf16 row it multiplies (the canvas loop's
-    // self-conditioning signal).
+    // bf16, as the legacy load builds it: an f32 scalar promotes every bf16 row it multiplies.
     if (b.parsed.spec.embed_scale > 0) xfm.emb_scale = bf16Scalar(b.parsed.spec.embed_scale, s);
     // The shell's own context's recurrent entries (a slot brings its own), freed by `Transformer.deinit`.
     if (config.needsSsmEntries()) {
@@ -174,13 +173,11 @@ pub fn loadWith(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_di
         xfm.ssm_entries = entries;
     }
     const caps = b.parsed.caps;
-    // Drafters, an MTP head and the canvas loop's self-conditioning read the trunk's table and head.
+    // Drafters and an MTP head read the trunk's table and head.
     const has_head = if (b.table.spec) |sp| sp.head != null else false;
-    const trunk = (caps.dflash_capture or caps.block_diffusion or has_head) and adoptTrunkWeights(&xfm, b.table, m);
+    const trunk = (caps.dflash_capture or has_head) and adoptTrunkWeights(&xfm, b.table, m);
     if (trunk) try adoptRotations(&xfm, b.table, m);
     intree.lendTrunk(&xfm);
-    // The canvas loop's self-conditioning cannot run without the trunk's table.
-    if (caps.block_diffusion and !trunk) return error.PluginLoadFailed;
     // The engine's row-exact sampling reads coverage off the config, measured over the pack as the legacy load does.
     if (trunk and xfm.config.rowExactArch()) {
         const gather_only: Array = if (xfm.lm_head_w.ctx == xfm.emb_w.ctx) .{ .ctx = null } else xfm.emb_w;
@@ -263,8 +260,6 @@ fn unservedFeature(xfm: *const Transformer, ctx: *const ForwardCtx) ?[]const u8 
     if (ctx.prefill_mask_add != null) return "an additive prefill mask";
     if (ctx.tree != null) return "a draft tree";
     if (ctx.key_pad_mask != null and !xfm.embedding_mode) return "a key padding mask";
-    // A block-diffusion model's prefill IS its encoder pass.
-    if (ctx.use_encoder_scalars and !xfm.config.plugin.?.parsed.caps.block_diffusion) return "encoder scalars";
     if (ctx.capture_stream_all != null) return "the hyper-connection stream";
     if (ctx.head_place != null) return "an MTP head placement";
     if (ctx.batch_slots != null) return "a batched GDN tick";
@@ -454,45 +449,6 @@ fn forwardEncoderBatch(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids
     return .{ .ctx = out.hidden.ctx };
 }
 
-/// `forwardDiffusionDecoder`: one denoising step over the canvas `canvas_ids` `[1, L]` at the committed length, with
-/// the self-conditioning signal when there is one; logits `[1, L, vocab]`. The cache is read, never written.
-pub fn forwardCanvas(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, canvas_ids: Array, self_cond: ?Array) !Array {
-    if (unservedFeature(xfm, ctx)) |what| {
-        log.err("[plugin] {s}: {s} is not served on the plugin path yet\n", .{ b.table.name.slice(), what });
-        return error.PluginForwardUnsupported;
-    }
-    const rows: u32 = @intCast(mlx.getShape(canvas_ids)[1]);
-    var slot = slotFor(xfm, ctx);
-    const handles = [_]abi.Handle{slot.handle()};
-    const slot_ids = [_]u32{settle.slotId(b, ctx)};
-    const pos = [_]u32{@intCast(if (b.positions == .kv_step) ctx.cache.step else ctx.moe_seq_offset.*)};
-    const f: abi.Forward = .{
-        .mode = .canvas,
-        .logits = .all_rows,
-        .rows = rows,
-        .tokens = .{},
-        .ids = .{ .ctx = canvas_ids.ctx },
-        .slots = .of(&slot_ids),
-        .positions = .of(&pos),
-        .caches = .of(&handles),
-        .cache_ops = &cache_ops.ops,
-        .hidden_in = .{ .ctx = if (self_cond) |sc| sc.ctx else null },
-    };
-    var out: abi.ForwardOut = .{};
-    const v = b.table.forward(b.model, &f, &out);
-    if (!v.isOk()) {
-        freeOut(&out, &.{});
-        log.err("[plugin] {s}: canvas forward failed: {s}\n", .{ b.table.name.slice(), v.why.slice() });
-        return error.PluginForwardFailed;
-    }
-    if (out.hidden.ctx != null) _ = mlx.mlx_array_free(.{ .ctx = out.hidden.ctx });
-    const logits: Array = .{ .ctx = out.logits.ctx };
-    defer _ = mlx.mlx_array_free(logits);
-    var shaped = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_reshape(&shaped, logits, &[_]c_int{ 1, @intCast(rows), -1 }, 3, xfm.s));
-    return shaped;
-}
-
 /// The prompt tokens a served model's own conversation state already holds (`CacheHooks.resume_prompt`), at most all
 /// but the last (a resumed prefill still forwards a token); null when the model keeps no such state.
 pub fn resumePrompt(xfm: *const Transformer, prompt: []const u32, media: ?Array) ?u64 {
@@ -507,12 +463,6 @@ pub fn stateBytes(xfm: *const Transformer) u64 {
     const b = xfm.plugin orelse return 0;
     const f = b.table.cache.state_bytes orelse return 0;
     return f(b.model);
-}
-
-/// `Transformer.forwardDiffusionDecoder`: the served model's canvas forward (a canvas model is only ever served).
-pub fn diffusionDecoder(xfm: *Transformer, ctx: *ForwardCtx, canvas_ids: Array, self_cond: ?Array) !Array {
-    const b = xfm.plugin orelse return error.PluginForwardUnsupported;
-    return forwardCanvas(xfm, b, ctx, canvas_ids, self_cond);
 }
 
 /// `forwardBatchedDecode` / `forwardMoeBatchedDecode` for a served model: one row per slot at its own position, each

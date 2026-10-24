@@ -43,7 +43,6 @@ pub const types = [_][]const u8{
     "gemma3",
     "gemma4",
     "gemma4_text",
-    "diffusion_gemma",
     "gemma3_text",
     "embedding_gemma2",
     "gemma4_unified",
@@ -64,7 +63,6 @@ pub const legacy_removed = [_][]const u8{
     "gpt_oss",
     "spark2_5",
     "embedding_gemma2",
-    "diffusion_gemma",
     "deepseek_v4",
     "inkling_mm_model",
     "muse_glimmer",
@@ -104,5 +102,5 @@ pub fn serves(model_type: []const u8) bool {
 }
 
 test "served: the listed types only" {
-    try std.testing.expect(serves("llama") and serves("qwen2") and serves("laguna") and serves("gemma4") and serves("diffusion_gemma") and serves("gemma3_text") and !serves(""));
+    try std.testing.expect(serves("llama") and serves("qwen2") and serves("laguna") and serves("gemma4") and serves("gemma3_text") and !serves(""));
 }

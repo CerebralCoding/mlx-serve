@@ -99,7 +99,6 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
     const o = &m.owned;
     const sh = try load_mod.AttnShared.build(o, c, s);
     const ple_dim = c.hidden_size_per_layer_input;
-    const diffusion = std.mem.eql(u8, c.model_type, "diffusion_gemma");
     var nb: [256]u8 = undefined;
     for (m.layers, 0..) |*L, i| {
         const li: u32 = @intCast(i);
@@ -123,11 +122,6 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
             } else null,
             .moe = if (c.num_experts > 0) try moeAt(&r, o, c, li, &m.compiled, m.routing) else null,
         };
-        // DiffusionGemma: the causal encoder pass's own scalar, an absolute name outside the decoder's prefix.
-        if (diffusion) if (L.moe) |*mt| {
-            mt.encoder_scalar = try r.share(try std.fmt.bufPrint(&nb, "model.encoder.language_model.layers.{d}.layer_scalar", .{li}));
-            if (mt.encoder_scalar.ctx != null) try o.own(mt.encoder_scalar);
-        };
     }
 
     const embed = try r.tableAt(try r.name(&nb, "embed_tokens", .{}), c.hidden_size);
@@ -145,18 +139,6 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
         },
         .compiled = &m.compiled,
     };
-    if (diffusion) {
-        const gate_w = r.src.tensor(try r.name(&nb, "self_conditioning.gate_proj.weight", .{}));
-        if (gate_w.ctx == null) return error.MissingWeight;
-        const inter: u32 = @intCast(mlx.getShape(.{ .ctx = gate_w.ctx })[0]);
-        w.self_cond = .{
-            .pre_norm = try r.norm(o, try r.name(&nb, "self_conditioning.pre_norm.weight", .{}), false),
-            .gate = try ownedProj(&r, o, try r.name(&nb, "self_conditioning.gate_proj", .{}), c.hidden_size),
-            .up = try ownedProj(&r, o, try r.name(&nb, "self_conditioning.up_proj", .{}), c.hidden_size),
-            .down = try ownedProj(&r, o, try r.name(&nb, "self_conditioning.down_proj", .{}), inter),
-            .ones = try load_mod.ones(o, c.hidden_size, s),
-        };
-    }
     if (ple_dim > 0) {
         w.ple_dim = @intCast(ple_dim);
         // The engine's gather resolves the per-layer table's quant params without a width hint.
@@ -167,12 +149,12 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
         w.ple_proj_norm = try r.norm(o, try r.name(&nb, "per_layer_projection_norm.weight", .{}), false);
     }
     m.base.weights = w;
-    if (gemma.ternaryCandidate(c)) try load_mod.armTernary(.{ &m.layers, &m.base.weights.head.head, &m.base.weights.self_cond, &m.base.weights.ple_table, &m.base.weights.ple_proj }, null, load_mod.gatherOnly(&m.base.weights.head.head, embed), s);
+    if (gemma.ternaryCandidate(c)) try load_mod.armTernary(.{ &m.layers, &m.base.weights.head.head, &m.base.weights.ple_table, &m.base.weights.ple_proj }, null, load_mod.gatherOnly(&m.base.weights.head.head, embed), s);
     return m;
 }
 
 /// Layer `li`'s routed half: the router (its scale folded with `hidden^-0.5`, as the engine folds it), the expert
-/// banks (`experts.switch_glu.*`, or DiffusionGemma's packed `experts.gate_up_proj` split gate rows first).
+/// banks (`experts.switch_glu.*`, or a packed `experts.gate_up_proj` split gate rows first).
 pub fn moeAt(r: *load_mod.Reader, o: *load_mod.Owned, c: *const config.Config, li: u32, compiled: *const compiled_mod.Compiled, routing: bases_compiled.Closure) !decoder.MoeTail {
     var nb: [256]u8 = undefined;
     const hidden = c.hidden_size;
@@ -289,44 +271,10 @@ pub fn unload(mp: *anyopaque) callconv(.c) void {
 
 pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) Verdict {
     const m: *Loaded = @ptrCast(@alignCast(mp));
-    if (f.mode == .canvas) return canvasForward(m, f, out);
-    // Packs with experts and canvas models decode serial: their parse declares no batched rows.
-    if (f.mode == .batched_rows and (m.base.weights.self_cond != null or m.layers.len > 0 and m.layers[0].moe != null))
+    // Packs with experts decode serial: their parse declares no batched rows.
+    if (f.mode == .batched_rows and m.layers.len > 0 and m.layers[0].moe != null)
         return Verdict.refuse(.unsupported, "forward mode not declared");
     return run_mod.tableForward(decoder, &m.base, f, out);
-}
-
-/// A block-diffusion denoising step (`decoder.canvas`): one slot, the canvas ids, the self-conditioning signal in
-/// `hidden_in`; logits for every row.
-fn canvasForward(m: *Loaded, f: *const abi.Forward, out: *abi.ForwardOut) Verdict {
-    if (m.base.weights.self_cond == null) return Verdict.refuse(.unsupported, "forward mode not declared");
-    if (f.rows == 0 or f.positions.len < 1 or f.caches.len < 1) return Verdict.refuse(.failed, "tokens, rows and positions disagree");
-    canvasRun(m, f, out) catch |e| return .{ .code = .failed, .why = abi.Str.of(@errorName(e)) };
-    return .ok;
-}
-
-fn canvasRun(m: *Loaded, f: *const abi.Forward, out: *abi.ForwardOut) !void {
-    var g = ops.Graph.init(m.base.a, m.base.s);
-    defer g.deinit();
-    const sh = [_]c_int{ 1, @intCast(f.rows) };
-    const ids = if (f.ids.ctx != null) try g.reshape(.{ .ctx = f.ids.ctx }, &sh) else blk: {
-        const buf = try m.base.a.alloc(i32, f.tokens.len);
-        defer m.base.a.free(buf);
-        for (f.tokens.slice(), buf) |t, *i| i.* = @intCast(t);
-        break :blk try g.fromSlice(i32, buf, &sh);
-    };
-    const r: run_mod.Run = .{
-        .mode = .canvas,
-        .rows = @intCast(f.rows),
-        .positions = f.positions.slice()[0..1],
-        .caches = f.caches.slice(),
-        .cache_ops = f.cache_ops,
-        .logits = f.logits,
-        .want_hidden = f.want_hidden,
-    };
-    const res = try decoder.canvas(&m.base.weights, &m.base.shared, &g, ids, r, .{ .ctx = f.hidden_in.ctx });
-    out.logits = if (res.logits.ctx != null) .{ .ctx = g.escape(res.logits).ctx } else .{};
-    out.hidden = if (res.hidden.ctx != null) .{ .ctx = g.escape(res.hidden).ctx } else .{};
 }
 
 /// The trunk's embedding table or LM head for a drafter, borrowed until unload (a tied head is the table). A dense

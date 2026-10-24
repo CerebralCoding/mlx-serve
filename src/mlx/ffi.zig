@@ -628,10 +628,10 @@ pub extern "c" fn mlx_random_split(res_0: *mlx_array, res_1: *mlx_array, key: ml
 pub extern "c" fn mlx_random_uniform(res: *mlx_array, low: mlx_array, high: mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, key: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_random_seed(seed: u64) c_int;
 pub extern "c" fn mlx_random_bits(res: *mlx_array, shape: [*]const c_int, shape_num: usize, width: c_int, key: mlx_array, s: mlx_stream) c_int;
-// Uniform random integers in [low, high) — DiffusionGemma canvas init/renoise.
+// Uniform random integers in [low, high).
 pub extern "c" fn mlx_random_randint(res: *mlx_array, low: mlx_array, high: mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, key: mlx_array, s: mlx_stream) c_int;
 
-// ── Diffusion sampler ops ──
+// ── Sampler ops ──
 pub extern "c" fn mlx_cummax(res: *mlx_array, a: mlx_array, axis: c_int, reverse: bool, inclusive: bool, s: mlx_stream) c_int;
 pub extern "c" fn mlx_logsumexp_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
 pub extern "c" fn mlx_all(res: *mlx_array, a: mlx_array, keepdims: bool, s: mlx_stream) c_int;

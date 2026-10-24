@@ -71,7 +71,6 @@ const cases = [_]Case{
     gemma("gemma-3-4b-it-4bit"),
     gemma("gemma-4-e4b-it-4bit"),
     gemma("embeddinggemma-300m-8bit"),
-    gemma("diffusiongemma-26B-A4B-it-4bit"),
     gemma("gemma-4-12b-it-4bit"),
 };
 

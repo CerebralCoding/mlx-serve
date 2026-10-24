@@ -184,7 +184,7 @@ pub fn gemma4MoeAttnWith(
             // mask degenerates to plain causal — same kernel and reduction
             // order the mlx-lm/mlx-vlm reference picks for short prompts,
             // which keeps near-tie MoE router decisions from flipping vs
-            // the reference; DiffusionGemma parity).
+            // the reference).
             if (try fusedSdpa256Prefill(self.s, q_rope, full_k, full_v, attn_scale, 0)) |fused| {
                 _ = mlx.mlx_array_free(attn_out);
                 attn_out = fused;

@@ -45,8 +45,6 @@ pub fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights:
         for (owned_bf16.items) |a| _ = mlx.mlx_array_free(a);
         owned_bf16.deinit(allocator);
     }
-    // DiffusionGemma reuses the Gemma 4 26B-A4B layer structure verbatim —
-    // both take the gemma4 binding/forward arms here.
     const is_gemma4 = config.isGemma4Layers();
     const is_hy3 = std.mem.eql(u8, config.model_type, "hy_v3");
     const is_qwen4 = config.isQwen4();
@@ -289,7 +287,7 @@ pub fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights:
             //
             // Expert naming variants:
             //   Gemma 4 26B-A4B:  experts.switch_glu.{gate,up,down}_proj.*
-            //   DiffusionGemma:   experts.gate_up_proj.* (PACKED [E, 2M, X],
+            //   packed:           experts.gate_up_proj.* (PACKED [E, 2M, X],
             //                     gate rows first) + experts.down_proj.*
             // The packed variant is sliced into gate/up halves at load
             // (splitPackedGateUp) so both feed the same MoeMlpWeights fields.
