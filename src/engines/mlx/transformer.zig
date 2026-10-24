@@ -796,8 +796,8 @@ pub const Transformer = struct {
     pub const qwen4DraftSelectBatched = @import("../../plugins/qwen4_exp/mtp.zig").qwen4DraftSelectBatched;
     pub const Qwen4Trace = @import("../../plugins/qwen4_exp/mtp.zig").Qwen4Trace;
     // sdk/blocks/linear/verify_projection.zig
-    pub const verifyFeatureEnabled = @import("../../sdk/blocks/linear/verify_projection.zig").verifyFeatureEnabled;
-    pub const mtpProjectionRows = @import("../../sdk/blocks/linear/verify_projection.zig").mtpProjectionRows;
+    pub const verifyFeatureEnabled = @import("methods/verify_projection.zig").verifyFeatureEnabled;
+    pub const mtpProjectionRows = @import("methods/verify_projection.zig").mtpProjectionRows;
     // mlx/array.zig
     pub const concatAxis0 = @import("../../mlx/array.zig").concatAxis0;
     pub const axisView = @import("../../mlx/array.zig").axisView;

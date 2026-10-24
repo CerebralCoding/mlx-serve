@@ -7,12 +7,10 @@ const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mtp_mod = @import("../../spec/mtp/mtp.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
-const transformer = @import("../../../engines/mlx/transformer.zig");
 const verify_qmm = @import("verify_qmm.zig");
 const MAX_BATCH_ROWS = @import("../../bases/run.zig").MAX_BATCH_ROWS;
 const testing = std.testing;
 const lastDim = @import("../../../mlx/array.zig").lastDim;
-const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
 const concatAxis0 = @import("../../../mlx/array.zig").concatAxis0;
 const gpuArchitecture = @import("../../../mlx/device.zig").gpuArchitecture;
 const QsaCfgCache = @import("../../../mlx/kernel_cache.zig").QsaCfgCache;
@@ -66,46 +64,6 @@ pub fn mtpHeadRowsFit(widths: []const c_int, hc: u32) bool {
     if (@as(u64, hc) * widths.len > 16) return false;
     for (widths) |width| if (width != 1) return false;
     return true;
-}
-
-pub fn verifyFeatureEnabled(self: *const Transformer, comptime feature: SingleVerifyFeature, grouped: bool, batch: c_int, width: c_int) bool {
-    if (self.qwen4 == null) return false;
-    if (grouped) return true;
-    if (@import("builtin").is_test and !single_verify_test_features[@backingInt(feature)]) return false;
-    // Capture marks speculative verification. A short prefill tail has the
-    // same shape but must keep the ordinary forward path and shared expert.
-    return self.spec_capture_ssm and batch == 1 and width >= 2 and width <= 6;
-}
-
-pub fn mtpProjectionRows(self: *Transformer, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, lm_head: bool) !mlx.mlx_array {
-    const sh = mlx.getShape(x);
-    if (sh.len < 2 or sh.len > 8 or sh[0] < 1 or sh[0] > MAX_BATCH_ROWS) return error.MtpProjectionShape;
-    const n: usize = @intCast(sh[0]);
-    var virtual_rows: c_int = 1;
-    for (sh[1 .. sh.len - 1]) |d| virtual_rows *= d;
-    if (virtual_rows == 1) {
-        const qp = self.quantParamsHinted(w, sc, lastDim(x));
-        if (qp.mode == .affine) {
-            if (try msvQmvRows(self.s, x, w, sc, bi, qp.bits, qp.group_size)) |y| return y;
-        }
-    }
-    var parts: [MAX_BATCH_ROWS]mlx.mlx_array = @splat(.{ .ctx = null });
-    defer for (parts[0..n]) |a| {
-        if (a.ctx != null) _ = mlx.mlx_array_free(a);
-    };
-    for (0..n) |row| {
-        var starts: [8]c_int = @splat(0);
-        var stops: [8]c_int = @splat(0);
-        const strides: [8]c_int = @splat(1);
-        @memcpy(stops[0..sh.len], sh);
-        starts[0] = @intCast(row);
-        stops[0] = @intCast(row + 1);
-        var xrow = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(xrow);
-        try mlx.check(mlx.mlx_slice(&xrow, x, &starts, @intCast(sh.len), &stops, @intCast(sh.len), &strides, @intCast(sh.len), self.s));
-        parts[row] = if (lm_head) try self.lmHeadProject(xrow) else try self.qmatmul(xrow, w, sc, bi);
-    }
-    return concatAxis0(self.s, parts[0..n]);
 }
 
 var verify_arch_buf: [128]u8 = undefined;

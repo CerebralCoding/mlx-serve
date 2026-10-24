@@ -19,7 +19,6 @@ const QuantMode = @import("../../quant/params.zig").QuantMode;
 const mxfp8_qmv = @import("../qmm/mxfp8_qmv.zig");
 const prefill_dq_gemm = @import("prefill_dq_gemm.zig");
 const qmv_rows = @import("qmv_rows.zig");
-const transformer = @import("../../../engines/mlx/transformer.zig");
 const testing = std.testing;
 const lastDim = @import("../../../mlx/array.zig").lastDim;
 const transposeBf16Weight = @import("../../../mlx/array.zig").transposeBf16Weight;

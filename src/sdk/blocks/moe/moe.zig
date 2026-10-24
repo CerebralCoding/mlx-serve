@@ -10,7 +10,6 @@ const moe_affine4 = @import("../../../plugins/qwen4_exp/moe_affine4.zig");
 const glm5 = @import("../../../plugins/glm5_next/glm5_next.zig");
 const gather_qmv_rows = @import("gather_qmv_rows.zig");
 const profile = @import("../../../engines/mlx/diag/profile.zig");
-const transformer = @import("../../../engines/mlx/transformer.zig");
 const verify_projection = @import("../linear/verify_projection.zig");
 const MAX_BATCH_ROWS = @import("../../bases/run.zig").MAX_BATCH_ROWS;
 const ProfClock = @import("../../../engines/mlx/diag/profile.zig").ProfClock;
