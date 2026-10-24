@@ -297,7 +297,7 @@ pub var mtp_verify_kernel_calls: [3]u64 = @splat(0);
 const qmatmulBits = @import("qmatmul.zig").qmatmulBits;
 
 const model_mod = @import("../../../engines/mlx/model.zig");
-const qsaArraysAllEqual = @import("../../../plugins/qwen4_exp/qsa/select.zig").qsaArraysAllEqual;
+const qsaArraysAllEqual = @import("../../testing/parity.zig").qsaArraysAllEqual;
 
 test "shared expert gate tail admits the joined verifier envelope only" {
     try testing.expect(sharedGateRowsEligible(&.{ 2, 2, 2, 2 }));

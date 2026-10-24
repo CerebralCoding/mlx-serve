@@ -345,18 +345,7 @@ fn qsaSelectTopBlocksSplit(
     return out;
 }
 
-pub fn qsaArraysAllEqual(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !bool {
-    var eq = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(eq);
-    try mlx.check(mlx.mlx_equal(&eq, a, b, s));
-    var all = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(all);
-    try mlx.check(mlx.mlx_all(&all, eq, false, s));
-    try mlx.check(mlx.mlx_array_eval(all));
-    var out: bool = false;
-    try mlx.check(mlx.mlx_array_item_bool(&out, all));
-    return out;
-}
+pub const qsaArraysAllEqual = @import("../../../sdk/testing/parity.zig").qsaArraysAllEqual;
 
 // ── tests ──
 

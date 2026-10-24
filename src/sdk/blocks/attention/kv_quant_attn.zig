@@ -7,7 +7,6 @@ const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 const testing = std.testing;
-const QSA_SCORE_KERNEL_HEADER = @import("../../../plugins/qwen4_exp/qsa/score.zig").QSA_SCORE_KERNEL_HEADER;
 const verifyQmmNaxAvailable = @import("../linear/verify_qmm_nax.zig").verifyQmmNaxAvailable;
 const verifyQmmTile = @import("../linear/verify_qmm_nax.zig").verifyQmmTile;
 const DenseKVView = @import("kv_view.zig").DenseKVView;
@@ -570,6 +569,8 @@ const QKV_MPP_PAGE: c_int = 32;
 const QKV_MPP_MAX_SPLITS: c_int = 128;
 const QKV_MPP_PAGES_PER_SPLIT: c_int = 8;
 
+/// The QSA score sheet's matmul2d header, shared by the quantized-KV MPP kernel.
+pub const QSA_SCORE_KERNEL_HEADER = kernelSource("kernels/attention/qsa_score_header.metal");
 pub const QKV_MPP_KERNEL_SOURCE = kernelSource("kernels/attention/qkv_mpp.metal");
 
 var qkv_mpp_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;

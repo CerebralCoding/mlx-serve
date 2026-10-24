@@ -209,7 +209,7 @@ pub fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: ml
 
 const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
 
-const qsaArraysAllEqual = @import("../../../plugins/qwen4_exp/qsa/select.zig").qsaArraysAllEqual;
+const qsaArraysAllEqual = @import("../../testing/parity.zig").qsaArraysAllEqual;
 
 test "qmvBatchLimit mirrors MLX's qmv/qmm split on single- and dual-die gen-17 GPUs" {
     try testing.expectEqual(@as(c_int, 25), qmvBatchLimit(false, 2560, 640));

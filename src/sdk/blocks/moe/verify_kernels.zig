@@ -317,7 +317,7 @@ pub fn verifyIndexedExpertInput(s: mlx.mlx_stream, x: mlx.mlx_array, lhs: mlx.ml
 const model_mod = @import("../../../engines/mlx/model.zig");
 const expectRowsByteEqual = @import("../../../engines/mlx/batched/row_axis_verify.zig").expectRowsByteEqual;
 const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
-const qsaArraysAllEqual = @import("../../../plugins/qwen4_exp/qsa/select.zig").qsaArraysAllEqual;
+const qsaArraysAllEqual = @import("../../testing/parity.zig").qsaArraysAllEqual;
 
 test "verify MoE rows preserve every value with fewer graph operations" {
     const path = env.get(.MTP_TEST_MODEL) orelse return error.SkipZigTest;

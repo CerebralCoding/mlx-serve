@@ -151,7 +151,7 @@ pub fn qsaScoreNsh(nslab: u32, ngrp: u32, layout: QsaScoreLayout) u32 {
     return nsh;
 }
 
-pub const QSA_SCORE_KERNEL_HEADER = kernelSource("plugins/qwen4_exp/kernels/qsa_score_header.metal");
+pub const QSA_SCORE_KERNEL_HEADER = @import("../../../sdk/blocks/attention/kv_quant_attn.zig").QSA_SCORE_KERNEL_HEADER;
 
 // The lane -> (row, col) map (`fm`/`fn`) is the matmul2d cooperative-fragment layout,
 // hand-derived from the SDK; every A, B and C fragment must use it. K stays 8 ascending

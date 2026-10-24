@@ -5,6 +5,7 @@ const std = @import("std");
 const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const materializedOwnedCopy = @import("../../mlx/array.zig").materializedOwnedCopy;
+const Weights = @import("../weights/resident.zig").Weights;
 
 /// An evaluated f32 array's host values (test inputs only: reading migrates the buffer).
 pub fn hostF32(a: mlx.mlx_array) ![]const f32 {
@@ -101,10 +102,21 @@ pub fn decidedMisses(ours: []const f32, ref: []const f32, rows: usize, v: usize)
     return misses;
 }
 
+pub fn qsaArraysAllEqual(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !bool {
+    var eq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eq);
+    try mlx.check(mlx.mlx_equal(&eq, a, b, s));
+    var all = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(all);
+    try mlx.check(mlx.mlx_all(&all, eq, false, s));
+    try mlx.check(mlx.mlx_array_eval(all));
+    var out: bool = false;
+    try mlx.check(mlx.mlx_array_item_bool(&out, all));
+    return out;
+}
+
 // ── tests ──
 
-const Qwen4RowCmp = @import("../../plugins/qwen4_exp/forward.zig").Qwen4RowCmp;
-const Qwen4Ties = @import("../../plugins/qwen4_exp/forward.zig").Qwen4Ties;
 
 /// Root-mean-square error of an array against an f64 truth of the same size.
 pub fn rmsVsTruth(a: mlx.mlx_array, truth: []const f64) !f64 {
@@ -194,6 +206,63 @@ pub fn qwen4ReadF32(alloc: std.mem.Allocator, arr: mlx.mlx_array, s: mlx.mlx_str
     @memcpy(out, src[0..n]);
     return out;
 }
+
+pub const Qwen4RowCmp = struct { min_cos: f64, argmax_agree: usize, rows: usize };
+
+/// Per-row cosine + argmax agreement between `a` and `b`, both `[rows][v]`.
+/// The tiny random oracle's near ties, acquitted by the REFERENCE's own
+/// numbers, never ours: a row whose QSA block selection (`qsa_gap`, the
+/// relative margin between the last selected and first rejected block score,
+/// min over the QSA layers — relu leaves exact zeros) sits under 3% flips
+/// under 1% kernel noise and its whole row differs; a row whose top-2 logit
+/// margin (`logit_margin`) is under 3% of the row's RMS logit has a coin-flip
+/// argmax. Rows without a tensor are never acquitted.
+const QWEN4_TIE_REL: f32 = 0.03;
+/// Expert-selection acquittal: the router sees a bf16 residual (noisier than
+/// the f32 QSA scores) — a k=2 tiny fixture flipped a row at a 3.5% margin.
+const QWEN4_TIE_REL_ROUTE: f32 = 0.05;
+
+pub const Qwen4Ties = struct {
+    qsa_gap: ?[]const f32,
+    /// Min over MoE layers of the relative softmax margin at the top-k
+    /// boundary (k < E fixtures; absent or 1.0 when every expert runs).
+    route_gap: ?[]const f32,
+    logit_margin: ?[]const f32,
+    pub fn read(alloc: std.mem.Allocator, fx: *const Weights, s: mlx.mlx_stream) !Qwen4Ties {
+        return .{
+            .qsa_gap = if (fx.get("qsa_gap")) |g| try qwen4ReadF32(alloc, g, s) else null,
+            .route_gap = if (fx.get("route_gap")) |g| try qwen4ReadF32(alloc, g, s) else null,
+            .logit_margin = if (fx.get("logit_margin")) |g| try qwen4ReadF32(alloc, g, s) else null,
+        };
+    }
+    pub fn deinit(self: Qwen4Ties, alloc: std.mem.Allocator) void {
+        if (self.qsa_gap) |g| alloc.free(g);
+        if (self.route_gap) |g| alloc.free(g);
+        if (self.logit_margin) |g| alloc.free(g);
+    }
+    /// Row-level acquittal: a QSA block selection OR an expert selection
+    /// near-tie in the reference.
+    pub fn rowTied(self: Qwen4Ties, row: usize) bool {
+        if (self.qsa_gap) |g| if (g[row] < QWEN4_TIE_REL) return true;
+        if (self.route_gap) |g| if (g[row] < QWEN4_TIE_REL_ROUTE) return true;
+        return false;
+    }
+    pub fn margin(self: Qwen4Ties, row: usize) f32 {
+        var m: f32 = 1.0;
+        if (self.qsa_gap) |g| m = @min(m, g[row]);
+        if (self.route_gap) |g| m = @min(m, g[row]);
+        return m;
+    }
+    /// Argmax acquittal: row-tied OR a near-tie top-2 logit.
+    pub fn argmaxTied(self: Qwen4Ties, row: usize, ref_row: []const f32) bool {
+        if (self.rowTied(row)) return true;
+        const mg = self.logit_margin orelse return false;
+        var ss: f64 = 0;
+        for (ref_row) |x| ss += @as(f64, x) * x;
+        const rms: f32 = @floatCast(@sqrt(ss / @as(f64, @floatFromInt(ref_row.len))));
+        return mg[row] < QWEN4_TIE_REL * rms;
+    }
+};
 
 pub const Qwen4TiedCmp = struct { min_cos: f64, agree: usize, decisive: usize, tied: usize };
 
