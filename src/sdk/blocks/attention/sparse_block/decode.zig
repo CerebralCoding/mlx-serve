@@ -24,7 +24,7 @@ var merge_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 const Key = struct { hq: c_int, hk: c_int, kb: c_int, ratio: c_int };
 const Cfgs = struct { key: Key, parts: mlx.mlx_fast_metal_kernel_config, merge: mlx.mlx_fast_metal_kernel_config };
-var cfgs: ?Cfgs = null;
+var decode_cfgs: ?Cfgs = null;
 
 fn newKernel(name: [*:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0]const u8, source: [*:0]const u8) !mlx.mlx_fast_metal_kernel {
     const in_vec = mlx.mlx_vector_string_new_data(ins.ptr, ins.len);
@@ -38,11 +38,11 @@ fn newKernel(name: [*:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0
 }
 
 fn configsFor(key: Key, ns: c_int) !Cfgs {
-    if (cfgs) |c| {
+    if (decode_cfgs) |c| {
         if (std.meta.eql(c.key, key)) return c;
         _ = mlx.mlx_fast_metal_kernel_config_free(c.parts);
         _ = mlx.mlx_fast_metal_kernel_config_free(c.merge);
-        cfgs = null;
+        decode_cfgs = null;
     }
     const gqa = @divExact(key.hq, key.hk);
     const parts = mlx.mlx_fast_metal_kernel_config_new();
@@ -62,8 +62,8 @@ fn configsFor(key: Key, ns: c_int) !Cfgs {
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(merge, BD, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(merge, "T", .bfloat16));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(merge, "NS", ns));
-    cfgs = .{ .key = key, .parts = parts, .merge = merge };
-    return cfgs.?;
+    decode_cfgs = .{ .key = key, .parts = parts, .merge = merge };
+    return decode_cfgs.?;
 }
 
 /// `[1, Hq, 1, 256]` bf16 attention of one query row `q` over the keys `blocks` `[1, 1, kb]` int32
