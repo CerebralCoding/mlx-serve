@@ -223,6 +223,13 @@ pub fn joinableCols(cols: []const c_int) bool {
     return true;
 }
 
+/// A projection triple (`scales`/`biases` null-ctx when dense). Borrowed handles.
+pub const QW = struct {
+    w: mlx.mlx_array = .{ .ctx = null },
+    s: mlx.mlx_array = .{ .ctx = null },
+    b: mlx.mlx_array = .{ .ctx = null },
+};
+
 // ── tests ──
 
 const qmatmulBits = @import("qmatmul.zig").qmatmulBits;

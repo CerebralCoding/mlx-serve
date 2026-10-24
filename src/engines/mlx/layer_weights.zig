@@ -138,9 +138,4 @@ pub const FullAttnWeights = struct {
     dsa: ?DsaWeights = null,
 };
 
-/// A projection triple (`scales`/`biases` null-ctx when dense). Borrowed handles.
-pub const QW = struct {
-    w: mlx.mlx_array = .{ .ctx = null },
-    s: mlx.mlx_array = .{ .ctx = null },
-    b: mlx.mlx_array = .{ .ctx = null },
-};
+pub const QW = @import("../../sdk/blocks/linear/fused_rows.zig").QW;
