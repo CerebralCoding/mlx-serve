@@ -68,6 +68,14 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
         /// call routed.
         pub const ByRank = [sides][expert_lookahead.max_k][2]u64;
 
+        /// A bank whose records' parts live apart (`B.scatter`: an MLX pack's stacked tensors): every read goes part by
+        /// part (`Bank.parts(layer, expert)`, a `B.Records.Part` per component); one record per id, and no read is
+        /// speculative, pre-read or direct (those are keyed by one file's record spans). Its `sidecar` is unread.
+        pub const scatter = @hasDecl(B, "scatter") and B.scatter;
+        comptime {
+            if (scatter and @hasField(Layer, "minis")) @compileError("expert stream: a scatter bank has one record per id");
+        }
+
         /// Two layers whose slot rows are interchangeable: the same records per id and the same segments.
         pub fn sameGeometry(x: *const Layer, y: *const Layer) bool {
             if (minisOf(x) != minisOf(y)) return false;
@@ -860,6 +868,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     }
                 }
                 if (opt.event != null and opt.lookahead == null) return error.InvalidOptions;
+                if (scatter and (opt.lookahead != null or opt.pool.direct)) return error.InvalidOptions;
                 if (opt.event) |ev| if (ev.watchdog_ms < 50 or ev.watchdog_ms > 60_000) return error.InvalidOptions;
                 var pool_opt = opt.pool;
                 if (opt.staging_from_bank) pool_opt.staging_bytes = stagingBytes(bank);
@@ -1742,14 +1751,15 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     var rows: [expert_io.max_items][n_components]u64 = undefined;
                     var gu: [expert_io.max_items]u64 = undefined;
                     var down: [expert_io.max_items]u64 = undefined;
+                    var ids: [expert_io.max_items]u16 = undefined;
                     var nr: u32 = 0;
                     for (r.order[start..end]) |li| {
                         if (!r.reads[li]) continue;
                         const l = plan.loads[li];
-                        nr = self.entries(r.layer, l.slot, l.expert, &rows, &gu, &down, nr);
+                        nr = self.entries(r.layer, l.slot, l.expert, &rows, &gu, &down, &ids, nr);
                     }
                     if (nr > 0) {
-                        part.ticket = B.Records.submit(self.pool, bank.sidecar, gu[0..nr], down[0..nr], rows[0..nr], &ls.lens) catch |e| return self.fail(e);
+                        part.ticket = try self.submit(r.layer, ids[0..nr], gu[0..nr], down[0..nr], rows[0..nr], &ls.lens);
                         part.n_reads = nr;
                     } else part.settled = true;
                     r.parts[r.n_parts] = part;
@@ -1758,10 +1768,21 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 }
             }
 
+            /// One pool job over records of `layer` (experts `ids`): their gate/up and down spans in the bank's file, or
+            /// each part's own place in a scatter bank.
+            fn submit(self: *Stream, layer: u32, ids: []const u16, gu: []const u64, down: []const u64, rows: []const [n_components]u64, lens: *const [n_components]u64) Error!u32 {
+                if (comptime scatter) {
+                    var parts: [expert_io.max_items][n_components]B.Records.Part = undefined;
+                    for (ids, parts[0..ids.len]) |e, *p| p.* = self.bank.parts(layer, e);
+                    return B.Records.submitScatter(self.pool, parts[0..ids.len], rows, lens) catch |err| self.fail(err);
+                }
+                return B.Records.submit(self.pool, self.bank.sidecar, gu, down, rows, lens) catch |err| self.fail(err);
+            }
+
             /// Load (`slot`, `e`)'s read entries from index `at`, one per record of the id (its records adjacent in the file
-            /// at `miniStride` and in the slot rows at each segment's length): each record's gate/up and down spans and its
-            /// rows' addresses. Returns the next index.
-            fn entries(self: *Stream, layer: u32, slot: u32, e: u16, rows: *[expert_io.max_items][n_components]u64, gu: *[expert_io.max_items]u64, down: *[expert_io.max_items]u64, at: u32) u32 {
+            /// at `miniStride` and in the slot rows at each segment's length): each record's gate/up and down spans, its
+            /// expert and its rows' addresses. Returns the next index.
+            fn entries(self: *Stream, layer: u32, slot: u32, e: u16, rows: *[expert_io.max_items][n_components]u64, gu: *[expert_io.max_items]u64, down: *[expert_io.max_items]u64, ids: *[expert_io.max_items]u16, at: u32) u32 {
                 const geom = &self.bank.layers[layer];
                 const loc = self.locate(layer, slot);
                 const d0 = loc.rows.rowDest(loc.row);
@@ -1773,6 +1794,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     for (&rows[k], d0, geom.segments) |*d, base, sg| d.* = base + m * sg.length;
                     gu[k] = sp.gu_offset + m * stride;
                     down[k] = sp.down_offset + m * stride;
+                    ids[k] = e;
                     k += 1;
                 }
                 return k;
@@ -1924,16 +1946,17 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     var rows: [expert_io.max_items][n_components]u64 = undefined;
                     var gu: [expert_io.max_items]u64 = undefined;
                     var down: [expert_io.max_items]u64 = undefined;
+                    var ids: [expert_io.max_items]u16 = undefined;
                     var nr: u32 = 0;
                     var posted: u32 = 0;
                     for (ah.loads[start..end], ah.reads[start..end]) |l, rd| {
                         if (self.ahead_job.len > 0) self.ahead_job[l.slot] = @intCast(ah.n_parts);
                         if (!rd) continue;
-                        nr = self.entries(layer, l.slot, l.expert, &rows, &gu, &down, nr);
+                        nr = self.entries(layer, l.slot, l.expert, &rows, &gu, &down, &ids, nr);
                         posted += 1;
                     }
                     if (nr > 0) {
-                        part.ticket = B.Records.submit(self.pool, self.bank.sidecar, gu[0..nr], down[0..nr], rows[0..nr], lens) catch |e| return self.fail(e);
+                        part.ticket = try self.submit(layer, ids[0..nr], gu[0..nr], down[0..nr], rows[0..nr], lens);
                         part.n_reads = nr;
                         self.counters.ahead_posted += posted;
                         if (comptime read_ahead_probed) if (self.probe) |pr| pr.posted(layer, posted);
@@ -2347,6 +2370,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 var rows: [expert_io.max_items][n_components]u64 = undefined;
                 var gu: [expert_io.max_items]u64 = undefined;
                 var down: [expert_io.max_items]u64 = undefined;
+                var ids: [expert_io.max_items]u16 = undefined;
                 var nr: u32 = 0;
                 for (r.order[part.first..][0..part.n]) |li| {
                     const l = plan.loads[li];
@@ -2359,12 +2383,13 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         const sp = self.bank.spans(r.layer, l.expert);
                         gu[nr] = sp.gu_offset;
                         down[nr] = sp.down_offset;
+                        ids[nr] = l.expert;
                         nr += 1;
                     }
                     m.pins = 1;
                 }
                 if (nr > 0) {
-                    part.ticket = B.Records.submit(self.pool, self.bank.sidecar, gu[0..nr], down[0..nr], rows[0..nr], &ls.lens) catch |e| return self.fail(e);
+                    part.ticket = try self.submit(r.layer, ids[0..nr], gu[0..nr], down[0..nr], rows[0..nr], &ls.lens);
                     part.n_reads = nr;
                 } else part.settled = true;
             }
