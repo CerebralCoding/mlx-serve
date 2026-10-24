@@ -73,6 +73,14 @@ Stateful chains via `previous_response_id`, full streaming SSE with per-event `s
 
 Every media endpoint takes `"stream": true` for SSE progress ending in a base64 `complete` payload. Video streams also accept `"preview": true` for a cheap JPEG on each denoise step (off by default; cached-velocity H3 steps stay preview-less). Media LoRAs use one grammar everywhere: `lora_paths` + `lora_scales`, up to 8, stacked. The paths are files on the server's disk, so only a client on the server's own machine may send them; from anyone else (LAN sharing, `--api-key`) a request carrying them is a 403.
 
+### Qwen3-TTS voice cloning limits
+
+On `POST /v1/audio/speech`, Qwen3-TTS uses `ref_audio` (a base64-encoded WAV) to produce a speaker embedding. This is not transcript-conditioned cloning:
+
+- The current backend does not read `language` or `ref_text`. Sending these fields does not select a language or supply a reference transcript. The `language` option on `/v1/audio/transcriptions` does not apply to speech generation.
+- During normal synthesis, invalid base64/WAV or a model without a speaker encoder falls back to the plain voice. A successful response alone does not prove the reference voice was applied.
+- To check a reference without generating speech, send `"warm_only": true` with `ref_audio` to the same endpoint. Missing or undecodable reference audio and a missing speaker encoder return HTTP 400 instead of silently falling back. This checks reference handling, not pronunciation or accent quality.
+
 ### Qwen-Image transparent PNG output
 
 `POST /v1/images/generations` accepts `"transparent": true` for Qwen-Image-2.1.
