@@ -23,11 +23,8 @@ const qmatmulBits = qmatmul.qmatmulBits;
 const qmvBatchLimit = qmatmul.qmvBatchLimit;
 const simdQmmDecode = qmatmul.simdQmmDecode;
 const simdQmmDecodeMinRows = qmatmul.simdQmmDecodeMinRows;
-
 const ModelConfig = @import("../../../engines/mlx/model.zig").ModelConfig;
-
 const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
-
 const qsaArraysAllEqual = @import("../../testing/parity.zig").qsaArraysAllEqual;
 
 test "qmvBatchLimit mirrors MLX's qmv/qmm split on single- and dual-die gen-17 GPUs" {

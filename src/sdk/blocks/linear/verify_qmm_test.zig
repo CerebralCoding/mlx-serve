@@ -31,21 +31,13 @@ const vqmmLaneForTile = verify_qmm.vqmmLaneForTile;
 const vqmmScalarEvictIndex = verify_qmm.vqmmScalarEvictIndex;
 const vqmmTileFrom = verify_qmm.vqmmTileFrom;
 const vqmmTileRows = verify_qmm.vqmmTileRows;
-
 const OQE_FULL_O_BITS = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").OQE_FULL_O_BITS;
-
 const OQE_FULL_QK_BITS = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").OQE_FULL_QK_BITS;
-
 const OQE_FULL_V_BITS = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").OQE_FULL_V_BITS;
-
 const OQE_LINEAR_AB_BITS = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").OQE_LINEAR_AB_BITS;
-
 const OQE_LINEAR_OUT_BITS = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").OQE_LINEAR_OUT_BITS;
-
 const OQE_LINEAR_Z_BITS = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").OQE_LINEAR_Z_BITS;
-
 const OQE_MLP_DOWN_BITS = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").OQE_MLP_DOWN_BITS;
-
 const oqeLayerBits = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").oqeLayerBits;
 
 test "vqmm scalar cache never evicts a scalar the caller is still holding" {

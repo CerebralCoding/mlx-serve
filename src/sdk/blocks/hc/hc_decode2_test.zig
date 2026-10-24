@@ -4,7 +4,6 @@ const hc_decode2 = @import("hc_decode2.zig");
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const upVectorized = hc_decode2.upVectorized;
-
 const testing = std.testing;
 
 fn randBf16(rnd: std.Random, shape: []const c_int, scale: f32, offset: f32, s: mlx.mlx_stream) !mlx.mlx_array {

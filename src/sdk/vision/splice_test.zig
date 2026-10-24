@@ -2,8 +2,13 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-
 const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
+
+// ── Chunked vision splice (issue #197) ───────────────────────────────────────
+// A vision prompt prefills in chunks; the splice's row lookup is a cumsum over
+// the CURRENT forward's placeholder mask, so each chunk passes the rows earlier
+// chunks consumed as `row_offset` — a restarted scatter silently reuses the
+// first image rows in every chunk (coherent output, wrong image content).
 
 test "spliceVisionRows: two chunks with row offsets equal the whole-prompt splice" {
     const s = mlx.mlx_default_gpu_stream_new();

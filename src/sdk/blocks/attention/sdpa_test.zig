@@ -10,7 +10,6 @@ const attn256Reference = @import("attn256.zig").attn256Reference;
 const sdpaForceFusedFor = sdpa.sdpaForceFusedFor;
 const splitCausalSdpa = sdpa.splitCausalSdpa;
 const splitMaskedSdpa256 = sdpa.splitMaskedSdpa256;
-
 const attn256QsaMask = @import("../../../plugins/qwen4_exp/qsa/gather.zig").attn256QsaMask;
 
 test "splitMaskedSdpa256: verify-width array-mask rows split through the vector kernel match one dispatch" {

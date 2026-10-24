@@ -4,7 +4,6 @@ const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const testRandWeightBf16 = @import("../../testing/parity.zig").testRandWeightBf16;
 const DenseKVView = @import("kv_view.zig").DenseKVView;
-
 const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
 
 test "batched decode mask at verify width: row j of slot n sees its own causal prefix only" {

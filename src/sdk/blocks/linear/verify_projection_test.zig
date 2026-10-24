@@ -20,13 +20,9 @@ const verifySharedFor = verify_projection.verifySharedFor;
 const verifySharedHardware = verify_projection.verifySharedHardware;
 const verifySharedProjection = verify_projection.verifySharedProjection;
 const verifyWideProjection = verify_projection.verifyWideProjection;
-
 const mtp_mod = @import("../../spec/mtp/mtp.zig");
-
 const qmatmulBits = @import("qmatmul.zig").qmatmulBits;
-
 const model_mod = @import("../../weights/load.zig");
-
 const qsaArraysAllEqual = @import("../../testing/parity.zig").qsaArraysAllEqual;
 
 test "shared expert gate tail admits the joined verifier envelope only" {

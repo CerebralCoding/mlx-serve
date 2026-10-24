@@ -19,13 +19,9 @@ const verifyExpertReduce = verify_kernels.verifyExpertReduce;
 const verifyExpertReuse = verify_kernels.verifyExpertReuse;
 const verifyIndexedExpertInput = verify_kernels.verifyIndexedExpertInput;
 const verifyRoutePack = verify_kernels.verifyRoutePack;
-
 const model_mod = @import("../../../engines/mlx/model.zig");
-
 const expectRowsByteEqual = @import("../../../engines/mlx/batched/row_axis_verify.zig").expectRowsByteEqual;
-
 const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
-
 const qsaArraysAllEqual = @import("../../testing/parity.zig").qsaArraysAllEqual;
 
 test "verify MoE rows preserve every value with fewer graph operations" {

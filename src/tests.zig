@@ -16,6 +16,7 @@ comptime {
 }
 
 test {
+    _ = @import("plugins/gemma4/gelu_ple_test.zig");
     _ = @import("sdk/quant/gguf/claim_test.zig");
     _ = @import("sdk/vision/qwen_vision_test.zig");
     _ = @import("sdk/blocks/attention/batched_test.zig");

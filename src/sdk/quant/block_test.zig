@@ -9,9 +9,7 @@ const builtins = block_mod.builtins;
 const claimant = block_mod.claimant;
 const declared = block_mod.declared;
 const hadamardBlock = block_mod.hadamardBlock;
-
 const registry = @import("../../plugins/registry.zig");
-
 const testing = std.testing;
 
 fn expectClaimant(want: ?[]const u8, block_json: []const u8, config_json: []const u8) !void {

@@ -24,19 +24,12 @@ const GdnPreworkArgs = decode_fused.GdnPreworkArgs;
 const gdnNormGateFused = decode_fused.gdnNormGateFused;
 const gdnParityRand = decode_fused.gdnParityRand;
 const gdnPreworkFused = decode_fused.gdnPreworkFused;
-
 const ModelConfig = @import("../../../engines/mlx/model.zig").ModelConfig;
-
 const model_mod = @import("../../../engines/mlx/model.zig");
-
 const SpecTree = @import("../../../engines/mlx/forward_ctx.zig").SpecTree;
-
 const KVCache = @import("../../../engines/mlx/kv/cache.zig").KVCache;
-
 const SSMCacheEntry = @import("../../../engines/mlx/ssm/entry.zig").SSMCacheEntry;
-
 const ssmCommitTreePath = @import("../../../engines/mlx/ssm/entry.zig").ssmCommitTreePath;
-
 const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
 
 test "gdn packed prework: bit-identical to the composed chain at decode and prefill widths incl. gate/beta + folded layout" {

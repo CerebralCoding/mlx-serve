@@ -18,9 +18,7 @@ const qkvAttnVerifyKernel = kv_quant_attn.qkvAttnVerifyKernel;
 const qkvMppWins = kv_quant_attn.qkvMppWins;
 const qkvVerifyKernelEnabledFrom = kv_quant_attn.qkvVerifyKernelEnabledFrom;
 const qkvVerifyRowsPay = kv_quant_attn.qkvVerifyRowsPay;
-
 const kv_quant = @import("kv_quant.zig");
-
 const KVCache = @import("../../../engines/mlx/kv/cache.zig").KVCache;
 
 /// Shared harness for the decode quantized-KV kernel parity tests: prefill

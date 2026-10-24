@@ -11,17 +11,11 @@ const arr = native.arr;
 const wrap = native.wrap;
 const NEG_SCALE = format.NEG_SCALE;
 const table = format.table;
-
 const transformer = @import("../../../engines/mlx/transformer.zig");
-
 const testing = std.testing;
-
 const ops = @import("../../../mlx/ops.zig");
-
 const parity = @import("../../testing/parity.zig");
-
 const resident = @import("../../weights/resident.zig");
-
 const registerRhtSigns = @import("../hadamard.zig").registerRhtSigns;
 
 fn f16Rand(rnd: std.Random, shape: []const c_int, s: mlx.mlx_stream) !mlx.mlx_array {

@@ -19,9 +19,7 @@ const fusedSwiGLU = fused_activations.fusedSwiGLU;
 const geluErfChain = fused_activations.geluErfChain;
 const swigluJoined = fused_activations.swigluJoined;
 const swigluSigTable = fused_activations.swigluSigTable;
-
 const qmatmulBits = @import("../linear/qmatmul.zig").qmatmulBits;
-
 const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
 
 test "fused SwiGLU is bit-identical to the sigmoid+multiply+multiply chain" {

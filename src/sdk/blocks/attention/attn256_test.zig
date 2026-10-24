@@ -14,10 +14,10 @@ const fused256KvChunkLen = attn256.fused256KvChunkLen;
 const fusedSdpa256Masked = attn256.fusedSdpa256Masked;
 const fusedSdpa256Prefill = attn256.fusedSdpa256Prefill;
 const fusedSinkAttnPrefill = attn256.fusedSinkAttnPrefill;
-
 const attn256QsaMask = @import("../../../plugins/qwen4_exp/qsa/gather.zig").attn256QsaMask;
-
 const qsaMaskArm = @import("../../../plugins/qwen4_exp/qsa/sparse_attn.zig").qsaMaskArm;
+
+// ── fused hd-256 prefill attention parity ──
 
 test "fusedSdpa256Prefill: causal parity vs composed SDPA (GQA, ragged shapes, chunk offset)" {
     const s = mlx.gpuStream();
