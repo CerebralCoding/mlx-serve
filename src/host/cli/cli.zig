@@ -23,6 +23,7 @@ const env = @import("../../env.zig");
 const build_options = @import("build_options");
 const ollama = @import("../api/ollama/translate.zig");
 const model_discovery = @import("../registry/discovery.zig");
+const served_media = @import("../media_jobs/plugin/served.zig");
 const log = @import("../../sdk/util/log.zig");
 
 // ── Unparsed-argument reporting ─────────────────────────────────────────
@@ -715,7 +716,7 @@ fn listTree(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, dir: *s
         if (entry.name.len == 0 or entry.name[0] == '.') continue;
         var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
         defer sub.close(io);
-        if (isModelDir(io, allocator, &sub)) {
+        if (isModelDir(io, &sub)) {
             try printModelRow(io, allocator, w, &sub, entry.name, root);
             count += 1;
             continue;
@@ -726,7 +727,7 @@ fn listTree(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, dir: *s
             if (!treeEntryDescends(sub_entry.kind)) continue;
             var leaf = sub.openDir(io, sub_entry.name, .{ .iterate = true }) catch continue;
             defer leaf.close(io);
-            if (!isModelDir(io, allocator, &leaf)) continue;
+            if (!isModelDir(io, &leaf)) continue;
             var name_buf: [512]u8 = undefined;
             const full = std.fmt.bufPrint(&name_buf, "{s}/{s}", .{ entry.name, sub_entry.name }) catch continue;
             try printModelRow(io, allocator, w, &leaf, full, root);
@@ -744,7 +745,7 @@ fn treeEntryDescends(kind: std.Io.File.Kind) bool {
     return kind == .directory or kind == .sym_link;
 }
 
-fn isModelDir(io: std.Io, allocator: std.mem.Allocator, dir: *std.Io.Dir) bool {
+fn isModelDir(io: std.Io, dir: *std.Io.Dir) bool {
     if (dir.statFile(io, "config.json", .{})) |st| {
         if (st.kind == .file) return true;
     } else |_| {}
@@ -755,13 +756,9 @@ fn isModelDir(io: std.Io, allocator: std.mem.Allocator, dir: *std.Io.Dir) bool {
         const st = dir.statFile(io, entry.name, .{}) catch continue;
         if (st.kind == .file) return true;
     }
-    // A MageFlow repo has neither: every config lives in a component subdir and
-    // `model_index.json` is the only signal. An mflux FLUX.2 conversion may
-    // carry neither file NOR an index — it is recognized by the DiT's own
-    // weight names. Both shared with discovery so `list` and `/v1/models`
-    // cannot disagree about what counts as a model.
-    if (model_discovery.peekMageFlowIndex(io, allocator, dir.*)) return true;
-    return model_discovery.peekMfluxFlux2(io, allocator, dir.*);
+    // A configless media pack (MageFlow, an mflux FLUX.2 conversion, Laya, ...) is its plugin's claim, the one
+    // discovery reads, so `list` and `/v1/models` cannot disagree about what counts as a model.
+    return served_media.claimIn(io, dir.*) != null;
 }
 
 fn printModelRow(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, dir: *std.Io.Dir, name: []const u8, root: []const u8) !void {
@@ -1304,9 +1301,8 @@ test "cli: a serving boot with no model named falls back to the shared models ro
     try testing.expect(!shouldDefaultModelsRoot(.{ .subcommand = false, .serve_mode = false, .has_explicit_model = false }));
 }
 
-test "cli: isModelDir accepts a MageFlow repo (model_index.json, no config.json)" {
+test "cli: isModelDir accepts a configless media pack (MageFlow, Laya), not a stranger's" {
     const io = std.testing.io;
-    const a = testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
@@ -1323,7 +1319,7 @@ test "cli: isModelDir accepts a MageFlow repo (model_index.json, no config.json)
     });
     var mage = try tmp.dir.openDir(io, "mage", .{ .iterate = true });
     defer mage.close(io);
-    try testing.expect(isModelDir(io, a, &mage));
+    try testing.expect(isModelDir(io, &mage));
 
     // An unrelated diffusers pipeline is NOT ours — it must stay hidden.
     try tmp.dir.createDirPath(io, "other");
@@ -1335,18 +1331,25 @@ test "cli: isModelDir accepts a MageFlow repo (model_index.json, no config.json)
     });
     var other = try tmp.dir.openDir(io, "other", .{ .iterate = true });
     defer other.close(io);
-    try testing.expect(!isModelDir(io, a, &other));
+    try testing.expect(!isModelDir(io, &other));
+
+    // Every configless pack a media plugin claims counts, a Laya checkpoint too.
+    try tmp.dir.createDirPath(io, "laya/encoder");
+    try tmp.dir.writeFile(io, .{ .sub_path = "laya/rl_agent_config.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "laya/encoder/config.json", .data = "{}" });
+    var laya = try tmp.dir.openDir(io, "laya", .{ .iterate = true });
+    defer laya.close(io);
+    try testing.expect(isModelDir(io, &laya));
 
     // An org dir (no config, no index, no gguf) stays a directory to descend.
     try tmp.dir.createDirPath(io, "org/repo");
     var org = try tmp.dir.openDir(io, "org", .{ .iterate = true });
     defer org.close(io);
-    try testing.expect(!isModelDir(io, a, &org));
+    try testing.expect(!isModelDir(io, &org));
 }
 
 test "cli: isModelDir accepts an mflux FLUX.2 repo (no config.json at all)" {
     const io = std.testing.io;
-    const a = testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
@@ -1360,7 +1363,7 @@ test "cli: isModelDir accepts an mflux FLUX.2 repo (no config.json at all)" {
     });
     var klein = try tmp.dir.openDir(io, "klein9", .{ .iterate = true });
     defer klein.close(io);
-    try testing.expect(isModelDir(io, a, &klein));
+    try testing.expect(isModelDir(io, &klein));
 
     // A different DiT with the same directory shape is not ours.
     try tmp.dir.createDirPath(io, "notflux/transformer");
@@ -1370,7 +1373,7 @@ test "cli: isModelDir accepts an mflux FLUX.2 repo (no config.json at all)" {
     });
     var notflux = try tmp.dir.openDir(io, "notflux", .{ .iterate = true });
     defer notflux.close(io);
-    try testing.expect(!isModelDir(io, a, &notflux));
+    try testing.expect(!isModelDir(io, &notflux));
 }
 
 test "cli: an unparsed argument is classified, never silently ignored" {

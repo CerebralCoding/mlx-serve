@@ -35,8 +35,14 @@ const ane_lm = @import("engines/ane/lm.zig");
 const status = @import("host/status.zig");
 const model_settings_mod = @import("host/registry/model_settings.zig");
 const vision_mod = @import("engines/mlx/vision_encoder.zig");
-const ds4_arch = if (build_options.ds4_engine) @import("engines/ds4/bridge.zig") else @import("engines/ds4/stub.zig");
-const llama_arch = if (build_options.llama_engine) @import("engines/llama/bridge.zig") else @import("engines/llama/stub.zig");
+const engines_served = @import("host/engines/served.zig");
+const engines_prompt = @import("host/engines/prompt.zig");
+const abi_engine = @import("abi/engine.zig");
+const cpu_state_mod = @import("host/registry/cpu_state.zig");
+const ds4_load = @import("engines/ds4/load.zig");
+const llama_load = @import("engines/llama/load.zig");
+const llama_policy = @import("engines/llama/policy.zig");
+const llama_adapter = @import("engines/llama/engine.zig");
 const gen_mod = @import("host/media_jobs/gen.zig");
 const cli_mod = @import("host/cli/cli.zig");
 
@@ -87,7 +93,7 @@ const DEFAULT_MODEL_DIR = ""; // pass --model <path> to specify
 
 // --ssd-streaming (issue #39): ds4 weight-streaming toggle. Set during arg
 // parsing, read by the ds4 serve + offline open paths. Module-level to avoid
-// threading it through runDs4Serve's already-long parameter list.
+// threading it through runGgufServe's already-long parameter list.
 var ds4_ssd_streaming: bool = false;
 // --mlx-gguf: opt-in, experimental. Lets src/sdk/quant/gguf claim the GGUFs it
 // supports; off, every .gguf goes to ds4 or llama.cpp as before.
@@ -244,7 +250,7 @@ fn printUsage(io: std.Io) void {
         \\                        The share is measured per silicon.
         \\  --int8-qk           Run the hd-256 prefill attention of dense Qwen
         \\                        models with int8 Q/K (NAX GPUs, lossy, wins
-        \\                        from ~32k tokens). Also MLX_SERVE_INT8_QK=1.
+        \\                        from ~32k tokens).
         \\  --lm-head-mxfp8 / --no-lm-head-mxfp8
         \\                      Quantize a dense bf16 lm_head to MXFP8 at load, vLLM's
         \\                        VLLM_MXFP8_LM_HEAD bytes (lossy; half the head's bytes
@@ -363,7 +369,7 @@ fn printUsage(io: std.Io) void {
         \\                      Target fraction of wall time (0..0.9) the
         \\                        decoding streams keep while another request
         \\                        prefills; also narrows that prefill's chunks.
-        \\                        Default 0.25; 0 = the old schedule (env MLX_SERVE_PREFILL_DECODE_SHARE).
+        \\                        Default 0.25; 0 = the old schedule.
         \\  --prefix-cache-entries <n>
         \\                      Hot prefix cache LRU capacity in entries
         \\                        (default: 32). 0 disables all prefix reuse.
@@ -1043,10 +1049,10 @@ pub fn main(init: std.process.Init) !void {
             server_mod.tokenize_cache_entries = std.fmt.parseInt(u32, args[i], 10) catch 4;
         } else if (std.mem.eql(u8, args[i], "--llama-cache-entries") and i + 1 < args.len) {
             i += 1;
-            server_mod.llama_settings.seqs = parseLlamaInt(args[i], "--llama-cache-entries", 1, llama_arch.MAX_SEQS);
+            server_mod.llama_settings.seqs = parseLlamaInt(args[i], "--llama-cache-entries", 1, llama_load.max_seqs);
         } else if (std.mem.eql(u8, args[i], "--llama-mtp-drafts") and i + 1 < args.len) {
             i += 1;
-            server_mod.llama_settings.mtp_drafts = parseLlamaInt(args[i], "--llama-mtp-drafts", 0, scheduler_mod.MAX_LLAMA_DRAFTS);
+            server_mod.llama_settings.mtp_drafts = parseLlamaInt(args[i], "--llama-mtp-drafts", 0, llama_policy.max_drafts);
         } else if (std.mem.eql(u8, args[i], "--llama-ubatch") and i + 1 < args.len) {
             i += 1;
             server_mod.llama_settings.ubatch = parseLlamaInt(args[i], "--llama-ubatch", 0, 8192);
@@ -1078,7 +1084,7 @@ pub fn main(init: std.process.Init) !void {
             // some quality impact). Auto-enables flash-attn in the shim
             // because llama's plain SDPA needs F16/F32 KV.
             i += 1;
-            if (llama_arch.LlamaKvQuant.fromString(args[i])) |q| {
+            if (llama_load.LlamaKvQuant.fromString(args[i])) |q| {
                 server_mod.llama_settings.kv_quant = q;
             } else {
                 log.err("--llama-kv-quant: expected off|q8|q4 (or 8/4), got '{s}'\n", .{args[i]});
@@ -1195,9 +1201,8 @@ pub fn main(init: std.process.Init) !void {
     // server config in reach); the env stays the benching override.
     ane_mod.aneState().media_offload = ane_media;
 
-    const decode_share_env: ?[]const u8 = env.span(.MLX_SERVE_PREFILL_DECODE_SHARE);
-    scheduler_mod.prefill_decode_share = scheduler_mod.resolveDecodeShare(decode_share_flag, decode_share_env) catch {
-        log.err("--prefill-decode-share / MLX_SERVE_PREFILL_DECODE_SHARE: expected a number >= 0 (above 0.9 clamps to 0.9), got '{s}'\n", .{decode_share_flag orelse decode_share_env.?});
+    scheduler_mod.prefill_decode_share = scheduler_mod.resolveDecodeShare(decode_share_flag) catch {
+        log.err("--prefill-decode-share: expected a number >= 0 (above 0.9 clamps to 0.9), got '{s}'\n", .{decode_share_flag.?});
         std.process.exit(1);
     };
 
@@ -1374,19 +1379,13 @@ pub fn main(init: std.process.Init) !void {
     defer if (mlx_gguf_path) |p| allocator.free(p);
     if (mlx_gguf_path != null) log.info("[gguf] engine: mlx (src/sdk/quant/gguf)\n", .{});
     if (mlx_gguf_path == null and isGgufPath(io, model_dir)) {
-        const chosen = chooseGgufEngine(io, allocator, model_dir, gguf_setting orelse engine_override);
+        const chosen = engines_served.ggufEngine(io, allocator, model_dir, gguf_setting orelse engine_override);
         if (serve_mode) {
-            switch (chosen) {
-                .ds4 => try runDs4Serve(io, allocator, model_dir, host, port, ctx_size, timeout, reasoning_budget, if (temp_explicit) temperature else null, top_p_flag, top_k_flag, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs),
-                .llama => try runLlamaServe(io, allocator, model_dir, host, port, ctx_size, timeout, reasoning_budget, if (temp_explicit) temperature else null, top_p_flag, top_k_flag, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs),
-            }
+            try runGgufServe(io, allocator, model_dir, chosen, host, port, ctx_size, timeout, reasoning_budget, if (temp_explicit) temperature else null, top_p_flag, top_k_flag, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs);
             return;
         }
-        const prompt_text = prompt.?; // offline mode only runs with --prompt
-        switch (chosen) {
-            .ds4 => try runDs4Offline(io, allocator, model_dir, prompt_text, max_tokens, temperature, ctx_size),
-            .llama => try runLlamaOffline(io, allocator, model_dir, prompt_text, max_tokens, temperature),
-        }
+        // Offline mode only runs with --prompt.
+        try runGgufOffline(io, allocator, model_dir, chosen, prompt.?, max_tokens, temperature, ctx_size);
         return;
     }
 
@@ -1849,147 +1848,6 @@ const isGgufPath = model_discovery.isGgufModelPath;
 const resolveGgufFile = model_discovery.resolveGgufFile;
 const logResolveGgufError = model_discovery.logResolveGgufError;
 
-/// Decide which embedded engine serves a `.gguf` file (or dir containing one).
-///
-/// Priority: an explicit override (the model's engine setting, else `--engine`) wins. Otherwise we read the file's
-/// GGUF metadata (cheap, header-only) and route on `general.architecture`:
-/// `deepseek4` + the antirez-style MLA key, or a ds4-only arch (V4.1, Qwen3.8
-/// Flash Next, GLM 5.x) → ds4; everything else → llama.cpp.
-/// Issue #15 — the previous basename heuristic mis-routed two real-world
-/// files; see `src/sdk/quant/gguf/engine_pick.zig` for the rule.
-///
-/// On any inspection failure (file unreadable, malformed header, etc.) we
-/// default to llama.cpp and log the reason. Caller still gets a sane attempt
-/// (libllama will produce its own actionable error if the file isn't loadable).
-fn chooseGgufEngine(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    override: ?gguf_meta.Engine,
-) gguf_meta.Engine {
-    if (override) |e| {
-        log.info("[gguf] engine: {s} (forced by the model's engine setting or --engine)\n", .{@tagName(e)});
-        return e;
-    }
-    const gguf_path = resolveGgufFile(io, allocator, path) catch |err| {
-        log.warn("[gguf] route: cannot resolve gguf file ({s}); defaulting to llama\n", .{@errorName(err)});
-        return .llama;
-    };
-    defer allocator.free(gguf_path);
-
-    var info = gguf_meta.readFromFile(io, allocator, gguf_path) catch |err| {
-        log.warn("[gguf] route: metadata read failed ({s}); defaulting to llama\n", .{@errorName(err)});
-        return .llama;
-    };
-    defer info.deinit(allocator);
-
-    const e = gguf_meta.preferredEngine(info);
-    log.info("[gguf] engine: {s} (arch={s}, ds4-lora={}, ds4-unloadable={}, shards={d})\n", .{
-        @tagName(e),
-        info.architecture orelse "?",
-        info.has_ds4_lora_rank,
-        info.ds4_unloadable,
-        info.split_count,
-    });
-    return e;
-}
-
-/// Offline single-prompt generation through the embedded ds4 engine.
-/// Skips the MLX/safetensors scaffolding entirely — there's no `Transformer`,
-/// no `Generator`, no scheduler. ds4 owns its own tokenizer, KV cache, and
-/// sampler; we just feed it the user prompt and stream the decoded tokens.
-fn runDs4Offline(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    model_dir: []const u8,
-    prompt: []const u8,
-    max_tokens: u32,
-    temp: f32,
-    ctx_size: u32,
-) !void {
-    const gguf_path = resolveGgufFile(io, allocator, model_dir) catch |err| {
-        logResolveGgufError(model_dir, err);
-        return err;
-    };
-    defer allocator.free(gguf_path);
-
-    log.info("[ds4] backend: Metal, model: {s}\n", .{gguf_path});
-
-    // Auto-load the MTP draft head beside the model for speculative decode
-    // (mirrors the serve path); skipped under ssd-streaming (ds4 refuses both).
-    const mtp_path: ?[]u8 = if (ds4_mtp and !ds4_ssd_streaming)
-        model_discovery.findDs4MtpSidecar(io, allocator, gguf_path)
-    else
-        null;
-    defer if (mtp_path) |p| allocator.free(p);
-    if (mtp_path) |p| log.info("[ds4] MTP draft head: {s}\n", .{p});
-
-    var engine = ds4_arch.Ds4Engine.open(allocator, gguf_path, .{
-        .warm_weights = true,
-        .ssd_streaming = ds4_ssd_streaming,
-        .prefill_chunk = generate_mod.explicitPrefillChunkU32(),
-        .mtp_path = mtp_path,
-        .mtp_draft_tokens = if (mtp_path != null) 4 else 0,
-        .mtp_margin = 3.0,
-        .dspark = ds4_dspark,
-        .embedded_mtp = ds4_mtp and !ds4_ssd_streaming and ds4_arch.ggufDeclaresEmbeddedMtp(io, allocator, gguf_path),
-    }) catch |err| {
-        log.err("[ds4] engine open failed: {s}\n", .{@errorName(err)});
-        return err;
-    };
-    defer engine.close();
-
-    log.info("[ds4] engine ready (EOS={d}, has_mtp={})\n", .{ engine.eosToken(), engine.hasMtp() });
-
-    // Render the prompt through ds4's built-in chat template. `prompt` is the
-    // raw user text; the engine adds BOS, system markers, and the assistant
-    // prefix according to the GGUF's vocab.
-    const prompt_ids = try engine.encodeChatPrompt(allocator, null, prompt, .none);
-    defer allocator.free(prompt_ids);
-
-    log.info("[ds4] prompt: {d} tokens\n", .{prompt_ids.len});
-
-    // ds4's session API decouples cache lifetime from a single request — one
-    // session can be reused across multiple `sync` calls. ds4 sizes its
-    // prefill buffers against the requested ctx (`prefill_chunk = 2048` per
-    // the CLI default), and sessions smaller than the prefill chunk produce
-    // junk output — so the user's --ctx-size is floored at the chunk; 0/unset
-    // → ds4's default of 32768.
-    const sess_ctx: i32 = @intCast(ds4_arch.clampSessionCtx(ctx_size));
-    var sess = try engine.createSession(sess_ctx);
-    defer sess.free();
-
-    try sess.sync(prompt_ids);
-
-    var rng: u64 = @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds());
-
-    var stdout_buf: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(io, &stdout_buf);
-    const out_w = &stdout.interface;
-    try out_w.writeAll("\n");
-
-    var generated: u32 = 0;
-    while (generated < max_tokens) : (generated += 1) {
-        const next_id: i32 = if (temp <= 0.0)
-            sess.argmax()
-        else
-            sess.sample(temp, 0, 1.0, 0.05, &rng);
-
-        if (engine.isStop(next_id)) break;
-
-        const piece = try engine.detokenizeOne(allocator, next_id);
-        defer allocator.free(piece);
-        try out_w.writeAll(piece);
-        try out_w.flush();
-
-        try sess.eval(next_id);
-    }
-
-    try out_w.writeAll("\n");
-    try out_w.flush();
-    log.info("[ds4] generated {d} tokens (max={d})\n", .{ generated, max_tokens });
-}
-
 /// Registry resident-memory cap: the user's explicit value, or Metal's working-set limit.
 /// 0 = query failed → unlimited (the count cap still applies).
 fn autoResidentMemBytes(explicit: bool, val: u64) u64 {
@@ -2009,7 +1867,7 @@ fn dirBasename(path: []const u8) []const u8 {
 /// (config/tok/chat_config) and hands it to `Scheduler.init`; the gen load arm
 /// dispatches off the stub config's media `model_type` and opens the modality
 /// engine on the inference thread. Coexists with on-demand chat/media loads via
-/// the registry (`discovery`). Mirrors `runDs4Serve`.
+/// the registry (`discovery`). Mirrors `runGgufServe`.
 fn runGenServe(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -2262,218 +2120,6 @@ fn runHeadlessServe(
     });
 }
 
-/// ds4 serve mode. Builds a stub LoadedModel + ModelConfig + ChatConfig
-/// (the engine owns the real tokenizer and chat template internally) and
-/// hands them to `Scheduler.init` via `LoadParams.ds4_path` — the scheduler's
-/// inference thread opens the engine on the right GPU-stream thread. All
-/// MLX-specific load steps (weights, Transformer, vision, drafter, JIT,
-/// warmup) are skipped.
-fn runDs4Serve(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    model_dir: []const u8,
-    host: []const u8,
-    port: u16,
-    ctx_size: u32,
-    timeout: u32,
-    reasoning_budget: i32,
-    default_temperature: ?f32,
-    default_top_p: ?f32,
-    default_top_k: ?u32,
-    max_resident_models: u32,
-    max_resident_mem: u64,
-    max_resident_mem_explicit: bool,
-    idle_evict_secs: ?u32,
-) !void {
-    var settings = model_settings_mod.overrideFor(allocator, io, model_dir);
-    defer settings.deinit(allocator);
-    const model_ctx = settings.ctx_size orelse ctx_size;
-    // Resolve the GGUF file once on this thread so the engine's open() call
-    // (running on the inference thread) gets an absolute path.
-    const gguf_path_owned = resolveGgufFile(io, allocator, model_dir) catch |err| {
-        logResolveGgufError(model_dir, err);
-        return err;
-    };
-    defer allocator.free(gguf_path_owned);
-
-    log.info("mlx-serve {s} (ds4 engine, GGUF backend)\n", .{VERSION});
-    log.info("[args] model: {s}\n", .{gguf_path_owned});
-    log.info("[args] serve: {s}:{d}, ctx-size={d}\n", .{ host, port, ctx_size });
-
-    // Build a stub ModelConfig. The fields below are read by various parts
-    // of server.zig + scheduler.zig but the ds4 path bypasses anything that
-    // actually consumes the model architecture (Transformer, KV shapes,
-    // SSM cache, MoE routing). The values picked keep `modelBatchable`
-    // returning false (we're routed through `runSingleDecodeTick`), and
-    // `getEffectiveContextLength` returning the runtime ctx size.
-    const config_storage = try allocator.create(model_mod.ModelConfig);
-    var config_owned_by_registry = false;
-    errdefer if (!config_owned_by_registry) allocator.destroy(config_storage);
-    config_storage.* = model_mod.ModelConfig{
-        .model_type = "deepseek_v4",
-        .weight_prefix = "model",
-        .num_hidden_layers = 61,
-        .hidden_size = 7168,
-        .head_dim = 128,
-        .num_attention_heads = 56,
-        .num_key_value_heads = 56,
-        // Carry the user-supplied --ctx-size (floored at ds4's prefill chunk;
-        // 0/unset → ds4's default) on the standard field. `runPrefillDs4` reads
-        // it back to size the ds4 session, and `getEffectiveContextLength` /
-        // /v1/models report it.
-        .max_position_embeddings = ds4_arch.clampSessionCtx(model_ctx),
-        .ctx_override = settings.ctx_size orelse 0,
-        .is_encoder_only = false,
-    };
-
-    // Stub tokenizer. Most server.zig fast paths read `lm.tokenizer.?` —
-    // we build a minimal empty Tokenizer here. The chat handlers route
-    // through `chat_mod.decodeViaDs4` / `encodeChatViaDs4` when
-    // `lm.ds4_engine != null`, so the stub never actually services
-    // encode/decode on the happy path.
-    const tok_storage = try allocator.create(tokenizer_mod.Tokenizer);
-    var tok_owned_by_registry = false;
-    errdefer if (!tok_owned_by_registry) {
-        tok_storage.deinit();
-        allocator.destroy(tok_storage);
-    };
-    var byte_map: [256]u21 = undefined;
-    var b: usize = 0;
-    while (b < 256) : (b += 1) byte_map[b] = @intCast(b);
-    tok_storage.* = .{
-        .vocab = std.StringHashMap(u32).init(allocator),
-        .id_to_token = std.AutoHashMap(u32, []const u8).init(allocator),
-        .merge_ranks = @TypeOf(tok_storage.merge_ranks).init(allocator),
-        .allocator = allocator,
-        .special_tokens = std.StringHashMap(u32).init(allocator),
-        .tok_type = .byte_level_bpe,
-        .byte_to_unicode = byte_map,
-        .unicode_to_byte = std.AutoHashMap(u21, u8).init(allocator),
-        .bos_id = null,
-        .eos_id = null,
-        .parsed_json = null,
-    };
-
-    // Stub chat config — chat template stays empty. The ds4 path renders
-    // chat via the engine; the stub just keeps `lm.chat_config.?` reads
-    // from crashing.
-    const chat_config_storage = try allocator.create(chat_mod.ChatConfig);
-    var chat_config_owned_by_registry = false;
-    errdefer if (!chat_config_owned_by_registry) {
-        allocator.destroy(chat_config_storage);
-    };
-    chat_config_storage.* = .{
-        .chat_template = try allocator.dupe(u8, ""),
-        .bos_token = null,
-        .eos_token = null,
-        .add_bos_token = false,
-        .allocator = allocator,
-    };
-
-    // ── Registry + scheduler scaffolding. Mirror the MLX serve branch. ──
-    const model_id = blk: {
-        var p = gguf_path_owned;
-        while (p.len > 0 and p[p.len - 1] == '/') p = p[0 .. p.len - 1];
-        if (std.mem.lastIndexOfScalar(u8, p, '/')) |slash_idx| {
-            const name = p[slash_idx + 1 ..];
-            break :blk if (std.mem.endsWith(u8, name, ".gguf")) name[0 .. name.len - 5] else name;
-        }
-        break :blk p;
-    };
-
-    const effective_max_resident_mem: u64 = if (max_resident_mem_explicit) max_resident_mem else 0;
-    if (effective_max_resident_mem > 0) {
-        log.info("[registry] max_resident_models={d}, max_resident_mem={d:.1} GB\n", .{
-            max_resident_models,
-            @as(f64, @floatFromInt(effective_max_resident_mem)) / 1_073_741_824.0,
-        });
-    } else {
-        log.info("[registry] max_resident_models={d}, max_resident_mem=unlimited\n", .{max_resident_models});
-    }
-
-    const registry = try model_registry_mod.ModelRegistry.init(
-        allocator,
-        io,
-        null,
-        max_resident_models,
-        effective_max_resident_mem,
-        idle_evict_secs,
-    );
-    defer registry.deinit();
-
-    // Stat the GGUF so the registry knows its on-disk size — used by
-    // /v1/models, /props (memory indicator), and the LRU eviction gate.
-    // Without it the Swift GPU-memory bar stays at 0 for the whole session.
-    // Path is absolute; split into parent dir + basename so we can use the
-    // 0.16-era `Dir.statFile` API.
-    const gguf_bytes: ?u64 = blk: {
-        const slash = std.mem.lastIndexOfScalar(u8, gguf_path_owned, '/') orelse break :blk null;
-        const parent = gguf_path_owned[0..slash];
-        const name = gguf_path_owned[slash + 1 ..];
-        var dir = std.Io.Dir.openDirAbsolute(io, parent, .{}) catch break :blk null;
-        defer dir.close(io);
-        const st = dir.statFile(io, name, .{}) catch break :blk null;
-        break :blk @as(u64, @intCast(st.size));
-    };
-    const entry = try registry.registerStub(model_id, gguf_path_owned, gguf_bytes);
-    try registry.setDefault(model_id);
-
-    // Once the inference thread hands ownership of the stub
-    // config/tok/chat_config to the entry, the entry's deinit owns them —
-    // we mustn't double-free here.
-    defer if (entry.config != null) {
-        config_owned_by_registry = true;
-        tok_owned_by_registry = true;
-        chat_config_owned_by_registry = true;
-    };
-
-    // ds4's process-wide flock makes >1 in-flight session per process
-    // untested; clamp serial.
-    server_mod.max_concurrent = 1;
-
-    const params = scheduler_mod.LoadParams{
-        .registry = registry,
-        .entry = entry,
-        .config = config_storage,
-        .tok = tok_storage,
-        .chat_config = chat_config_storage,
-        .model_dir = gguf_path_owned, // unused on the ds4 branch but kept symmetric
-        .ctx_size = ctx_size,
-        .drafter_dir = "",
-        .load_vision = false,
-        .warmup_eager = false,
-        .draft_block_size = 0,
-        .draft_block_size_explicit = false,
-        .kv_quant_config = transformer_mod.KVQuantConfig.dense,
-        .prefix_cache_capacity = 0,
-        .prefix_cache_mem_bytes = 0,
-        // Iteration 2: tokenize cache for ds4 too.
-        .tokenize_cache_entries = server_mod.tokenize_cache_entries,
-        .ds4_path = gguf_path_owned,
-        .ds4_ssd_streaming = ds4_ssd_streaming,
-        .ds4_mtp = ds4_mtp,
-        .ds4_dspark = ds4_dspark,
-        .metrics = server_mod.g_metrics,
-    };
-
-    try server_mod.serve(io, allocator, params, config_storage, host, port, .{
-        .max_context_size = ctx_size,
-        .request_timeout_sec = timeout,
-        .default_reasoning_budget = reasoning_budget,
-        .default_max_tokens = serve_default_max_tokens,
-        .default_temperature = default_temperature,
-        .default_top_p = default_top_p,
-        .default_top_k = default_top_k,
-        // PLD is unreachable on this path (decode never routes through the
-        // PLD-capable generator), so say so once instead of three literals
-        // that read like a decision but drift like a typo.
-        .default_enable_pld = server_mod.PldDefaults.off.enable,
-        .default_pld_draft_len = server_mod.PldDefaults.off.draft_len,
-        .default_pld_key_len = server_mod.PldDefaults.off.key_len,
-        .kv_attn_mode = .auto,
-    });
-}
-
 /// A `--llama-*` integer in [lo, hi]; anything else exits naming the flag.
 fn parseLlamaInt(raw: []const u8, flag: []const u8, lo: u32, hi: u32) u32 {
     const v = std.fmt.parseInt(u32, raw, 10) catch hi + 1;
@@ -2484,91 +2130,13 @@ fn parseLlamaInt(raw: []const u8, flag: []const u8, lo: u32, hi: u32) u32 {
     return v;
 }
 
-/// Offline single-prompt generation through the embedded llama.cpp engine.
-/// Renders the prompt via the GGUF's built-in chat template (falling back to a
-/// raw tokenize when the template isn't a recognized format) and streams
-/// decoded tokens to stdout. Mirrors `runDs4Offline`.
-fn runLlamaOffline(
+/// GGUF serve mode on ds4 or llama.cpp: a stub entry (the engine owns the real tokenizer and template) handed to
+/// `Scheduler.init`, whose startup load opens the engine (`host/engines/load.zig`).
+fn runGgufServe(
     io: std.Io,
     allocator: std.mem.Allocator,
     model_dir: []const u8,
-    prompt: []const u8,
-    max_tokens: u32,
-    temp: f32,
-) !void {
-    const gguf_path = resolveGgufFile(io, allocator, model_dir) catch |err| {
-        logResolveGgufError(model_dir, err);
-        return err;
-    };
-    defer allocator.free(gguf_path);
-
-    log.info("[llama] backend: Metal, model: {s}\n", .{gguf_path});
-
-    var engine = llama_arch.LlamaEngine.open(allocator, gguf_path, .{}) catch |err| {
-        log.err("[llama] engine open failed: {s}\n", .{@errorName(err)});
-        return err;
-    };
-    defer engine.close();
-
-    log.info("[llama] engine ready (EOS={d}, n_vocab={d})\n", .{ engine.eosToken(), engine.nVocab() });
-
-    // Render the single user turn through the model's chat template; tokenize the
-    // result with add_special=false (the template owns BOS). Fall back to a raw
-    // add-special tokenize if the GGUF's template isn't recognized.
-    const turns = [_]llama_arch.LlamaEngine.ChatTurn{.{ .role = "user", .content = prompt }};
-    const prompt_ids: []i32 = blk: {
-        if (engine.applyChatTemplate(allocator, &turns, true)) |rendered| {
-            defer allocator.free(rendered);
-            break :blk try engine.tokenizeText(allocator, rendered, false);
-        } else |_| {
-            break :blk try engine.tokenizeText(allocator, prompt, true);
-        }
-    };
-    defer allocator.free(prompt_ids);
-
-    log.info("[llama] prompt: {d} tokens\n", .{prompt_ids.len});
-
-    var ctx = try engine.createContext(.{ .ctx_size = 8192 });
-    defer ctx.free();
-    const sess = &ctx.seqs[0];
-
-    _ = try sess.sync(prompt_ids); // cold sequence: cached count is 0, unused here
-
-    var rng: u64 = @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds());
-
-    var stdout_buf: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(io, &stdout_buf);
-    const out_w = &stdout.interface;
-    try out_w.writeAll("\n");
-
-    var generated: u32 = 0;
-    while (generated < max_tokens) : (generated += 1) {
-        const next_id = sess.sample(.{ .temperature = temp }, &rng);
-
-        if (next_id < 0 or engine.isEog(next_id)) break;
-
-        const piece = try engine.detokenizeOne(allocator, next_id);
-        defer allocator.free(piece);
-        try out_w.writeAll(piece);
-        try out_w.flush();
-
-        try sess.eval(next_id);
-    }
-
-    try out_w.writeAll("\n");
-    try out_w.flush();
-    log.info("[llama] generated {d} tokens (max={d})\n", .{ generated, max_tokens });
-}
-
-/// llama.cpp serve mode. Builds a stub LoadedModel + ModelConfig + ChatConfig
-/// and hands them to `Scheduler.init` via `LoadParams.llama_path` — the
-/// scheduler's inference thread opens the engine on the GPU-stream thread and
-/// adopts the GGUF's embedded chat template into the stub ChatConfig. Mirrors
-/// `runDs4Serve`; all MLX-specific load steps are skipped.
-fn runLlamaServe(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    model_dir: []const u8,
+    engine: gguf_meta.Engine,
     host: []const u8,
     port: u16,
     ctx_size: u32,
@@ -2582,90 +2150,27 @@ fn runLlamaServe(
     max_resident_mem_explicit: bool,
     idle_evict_secs: ?u32,
 ) !void {
-    const gguf_path_owned = resolveGgufFile(io, allocator, model_dir) catch |err| {
+    var settings = model_settings_mod.overrideFor(allocator, io, model_dir);
+    defer settings.deinit(allocator);
+    const gguf_path = resolveGgufFile(io, allocator, model_dir) catch |err| {
         logResolveGgufError(model_dir, err);
         return err;
     };
-    defer allocator.free(gguf_path_owned);
+    defer allocator.free(gguf_path);
+    const model_ctx = settings.ctx_size orelse ctx_size;
 
-    // Effective context: the user's --ctx-size, else a safe 8192 default (we
-    // can't read the GGUF's trained context until the engine opens on the
-    // inference thread). Used for BOTH the llama session size (via the stub
-    // config's max_position_embeddings, read in runPrefillLlama) AND the
-    // server's context guard (server_config.max_context_size), so they agree.
-    var settings = model_settings_mod.overrideFor(allocator, io, model_dir);
-    defer settings.deinit(allocator);
-    const effective_ctx: u32 = settings.ctx_size orelse (if (ctx_size > 0) ctx_size else 8192);
+    log.info("mlx-serve {s} ({s} engine, GGUF backend)\n", .{ VERSION, if (engine == .ds4) "ds4" else "llama.cpp" });
+    log.info("[args] model: {s}\n", .{gguf_path});
+    log.info("[args] serve: {s}:{d}, ctx-size={d}\n", .{ host, port, model_ctx });
 
-    log.info("mlx-serve {s} (llama.cpp engine, GGUF backend)\n", .{VERSION});
-    log.info("[args] model: {s}\n", .{gguf_path_owned});
-    log.info("[args] serve: {s}:{d}, ctx-size={d}\n", .{ host, port, effective_ctx });
-
-    // Stub ModelConfig. The llama path bypasses everything that consumes model
-    // architecture (Transformer, KV shapes, SSM, MoE); only model_type (echoed
-    // in /v1/models) and max_position_embeddings (session sizing) matter.
-    const config_storage = try allocator.create(model_mod.ModelConfig);
-    var config_owned_by_registry = false;
-    errdefer if (!config_owned_by_registry) allocator.destroy(config_storage);
-    config_storage.* = model_mod.ModelConfig{
-        .model_type = "gguf",
-        .weight_prefix = "model",
-        .head_dim = 128,
-        .max_position_embeddings = effective_ctx,
-        .ctx_override = settings.ctx_size orelse 0,
-        .is_encoder_only = false,
-    };
-
-    // Stub tokenizer — the llama engine owns the real GGUF vocab; chat handlers
-    // route through chat_mod.{encode,decode}ViaLlama when lm.llama_engine != null,
-    // so this never services encode/decode on the happy path.
-    const tok_storage = try allocator.create(tokenizer_mod.Tokenizer);
-    var tok_owned_by_registry = false;
-    errdefer if (!tok_owned_by_registry) {
-        tok_storage.deinit();
-        allocator.destroy(tok_storage);
-    };
-    var byte_map: [256]u21 = undefined;
-    var b: usize = 0;
-    while (b < 256) : (b += 1) byte_map[b] = @intCast(b);
-    tok_storage.* = .{
-        .vocab = std.StringHashMap(u32).init(allocator),
-        .id_to_token = std.AutoHashMap(u32, []const u8).init(allocator),
-        .merge_ranks = @TypeOf(tok_storage.merge_ranks).init(allocator),
-        .allocator = allocator,
-        .special_tokens = std.StringHashMap(u32).init(allocator),
-        .tok_type = .byte_level_bpe,
-        .byte_to_unicode = byte_map,
-        .unicode_to_byte = std.AutoHashMap(u21, u8).init(allocator),
-        .bos_id = null,
-        .eos_id = null,
-        .parsed_json = null,
-    };
-
-    // Stub chat config — template starts empty and is replaced with the GGUF's
-    // embedded template by doLoadLlamaOnInferenceThread once the engine opens.
-    const chat_config_storage = try allocator.create(chat_mod.ChatConfig);
-    var chat_config_owned_by_registry = false;
-    errdefer if (!chat_config_owned_by_registry) {
-        chat_config_storage.deinit();
-        allocator.destroy(chat_config_storage);
-    };
-    chat_config_storage.* = .{
-        .chat_template = try allocator.dupe(u8, ""),
-        .bos_token = null,
-        .eos_token = null,
-        .add_bos_token = false,
-        .allocator = allocator,
-    };
+    var stub = try cpu_state_mod.buildGgufStubCpuState(allocator, engine, model_ctx);
+    var stub_owned_by_registry = false;
+    errdefer if (!stub_owned_by_registry) cpu_state_mod.freeCpuState(allocator, &stub);
+    stub.config.ctx_override = settings.ctx_size orelse 0;
 
     const model_id = blk: {
-        var p = gguf_path_owned;
-        while (p.len > 0 and p[p.len - 1] == '/') p = p[0 .. p.len - 1];
-        if (std.mem.lastIndexOfScalar(u8, p, '/')) |slash_idx| {
-            const name = p[slash_idx + 1 ..];
-            break :blk if (std.mem.endsWith(u8, name, ".gguf")) name[0 .. name.len - 5] else name;
-        }
-        break :blk p;
+        const name = dirBasename(gguf_path);
+        break :blk if (std.mem.endsWith(u8, name, ".gguf")) name[0 .. name.len - 5] else name;
     };
 
     const effective_max_resident_mem: u64 = if (max_resident_mem_explicit) max_resident_mem else 0;
@@ -2678,41 +2183,29 @@ fn runLlamaServe(
         log.info("[registry] max_resident_models={d}, max_resident_mem=unlimited\n", .{max_resident_models});
     }
 
-    const registry = try model_registry_mod.ModelRegistry.init(
-        allocator,
-        io,
-        null,
-        max_resident_models,
-        effective_max_resident_mem,
-        idle_evict_secs,
-    );
+    const registry = try model_registry_mod.ModelRegistry.init(allocator, io, null, max_resident_models, effective_max_resident_mem, idle_evict_secs);
     defer registry.deinit();
 
-    const gguf_bytes: ?u64 = blk: {
-        const slash = std.mem.lastIndexOfScalar(u8, gguf_path_owned, '/') orelse break :blk null;
-        const parent = gguf_path_owned[0..slash];
-        const name = gguf_path_owned[slash + 1 ..];
-        var dir = std.Io.Dir.openDirAbsolute(io, parent, .{}) catch break :blk null;
-        defer dir.close(io);
-        const st = dir.statFile(io, name, .{}) catch break :blk null;
-        break :blk @as(u64, @intCast(st.size));
-    };
-    const entry = try registry.registerStub(model_id, gguf_path_owned, gguf_bytes);
+    // The GGUF's size: /v1/models, /props and the eviction gate read it.
+    const gguf_bytes: ?u64 = if (std.Io.Dir.cwd().statFile(io, gguf_path, .{})) |st| st.size else |_| null;
+    const entry = try registry.registerStub(model_id, gguf_path, gguf_bytes);
     try registry.setDefault(model_id);
 
+    // Once the inference thread hands the stub to the entry, the entry's deinit owns it.
     defer if (entry.config != null) {
-        config_owned_by_registry = true;
-        tok_owned_by_registry = true;
-        chat_config_owned_by_registry = true;
+        stub_owned_by_registry = true;
     };
+
+    // ds4's process-wide flock makes >1 in-flight session per process untested; clamp serial.
+    if (engine == .ds4) server_mod.max_concurrent = 1;
 
     const params = scheduler_mod.LoadParams{
         .registry = registry,
         .entry = entry,
-        .config = config_storage,
-        .tok = tok_storage,
-        .chat_config = chat_config_storage,
-        .model_dir = gguf_path_owned, // unused on the llama branch but kept symmetric
+        .config = stub.config,
+        .tok = stub.tok,
+        .chat_config = stub.chat_config,
+        .model_dir = gguf_path,
         .ctx_size = ctx_size,
         .drafter_dir = "",
         .load_vision = false,
@@ -2724,28 +2217,103 @@ fn runLlamaServe(
         .prefix_cache_mem_bytes = 0,
         .tokenize_cache_entries = server_mod.tokenize_cache_entries,
         .llama = server_mod.llama_settings,
-        .llama_path = gguf_path_owned,
+        .gguf = .{ .path = gguf_path, .engine = engine },
+        .ds4_ssd_streaming = ds4_ssd_streaming,
         .ds4_mtp = ds4_mtp,
         .ds4_dspark = ds4_dspark,
         .metrics = server_mod.g_metrics,
     };
 
-    try server_mod.serve(io, allocator, params, config_storage, host, port, .{
-        .max_context_size = if (ctx_size > 0) ctx_size else 8192,
+    try server_mod.serve(io, allocator, params, stub.config, host, port, .{
+        .max_context_size = if (engine == .ds4 or ctx_size > 0) ctx_size else llama_adapter.default_context,
         .request_timeout_sec = timeout,
         .default_reasoning_budget = reasoning_budget,
         .default_max_tokens = serve_default_max_tokens,
         .default_temperature = default_temperature,
         .default_top_p = default_top_p,
         .default_top_k = default_top_k,
-        // PLD is unreachable on this path (decode never routes through the
-        // PLD-capable generator), so say so once instead of three literals
-        // that read like a decision but drift like a typo.
+        // PLD never runs on an engine beside MLX.
         .default_enable_pld = server_mod.PldDefaults.off.enable,
         .default_pld_draft_len = server_mod.PldDefaults.off.draft_len,
         .default_pld_key_len = server_mod.PldDefaults.off.key_len,
         .kv_attn_mode = .auto,
     });
+}
+
+/// Offline single-prompt generation on ds4 or llama.cpp: the engine's table opened directly (no scheduler), the
+/// prompt rendered as the server renders it, the decoded tokens streamed to stdout.
+fn runGgufOffline(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    engine: gguf_meta.Engine,
+    prompt: []const u8,
+    max_tokens: u32,
+    temp: f32,
+    ctx_size: u32,
+) !void {
+    const gguf_path = resolveGgufFile(io, allocator, model_dir) catch |err| {
+        logResolveGgufError(model_dir, err);
+        return err;
+    };
+    defer allocator.free(gguf_path);
+    const kind = engines_served.fromGguf(engine);
+    log.info("[{s}] model: {s}\n", .{ @tagName(kind), gguf_path });
+
+    const settings = if (engine == .ds4)
+        try std.json.Stringify.valueAlloc(allocator, ds4_load.Flags{ .mtp = ds4_mtp, .dspark = ds4_dspark, .ssd_streaming = ds4_ssd_streaming, .prefill_chunk = generate_mod.explicitPrefillChunkU32() }, .{})
+    else
+        try std.json.Stringify.valueAlloc(allocator, llama_load.Settings{ .seqs = 1, .mtp_drafts = 0 }, .{});
+    defer allocator.free(settings);
+    var progress: @import("host/registry/load_progress.zig").Progress = .{};
+    var gauges: engines_served.Gauges = .{};
+    const s = try engines_served.Served.open(allocator, kind, .{
+        .model_dir = gguf_path,
+        .context = if (engine == .ds4) ctx_size else 0,
+        .settings_json = settings,
+    }, &progress, &gauges, null);
+    defer s.close();
+
+    var cc: chat_mod.ChatConfig = .{ .chat_template = @constCast(s.chatTemplate() orelse ""), .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = allocator };
+    const messages = [_]chat_mod.Message{.{ .role = "user", .content = prompt }};
+    const ids = try engines_prompt.encodeChat(allocator, s, &cc, &messages, null, null, false, null, false);
+    defer allocator.free(ids);
+    log.info("[{s}] prompt: {d} tokens\n", .{ @tagName(kind), ids.len });
+
+    const Out = struct {
+        s: *const engines_served.Served,
+        w: *std.Io.Writer,
+        generated: u32 = 0,
+        done: std.atomic.Value(bool) = .init(false),
+        fn event(ctx: *anyopaque, _: u64, ev: *const abi_engine.Event) callconv(.c) abi_engine.Action {
+            const o: *@This() = @ptrCast(@alignCast(ctx));
+            for (abi_engine.items(u32, ev.tokens)) |t| {
+                o.w.writeAll(abi_engine.items(u8, o.s.table.token_bytes.?(o.s.handle, t))) catch {};
+                o.generated += 1;
+            }
+            o.w.flush() catch {};
+            if (ev.kind == .finished) o.done.store(true, .release);
+            return .go;
+        }
+    };
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &stdout_buf);
+    try stdout.interface.writeAll("\n");
+    var out: Out = .{ .s = s, .w = &stdout.interface };
+    const v = s.table.submit(s.handle, 1, &.{
+        .prompt = abi_engine.span(u32, ids),
+        .max_tokens = max_tokens,
+        .sampling = .{ .temperature = temp, .min_p = if (engine == .ds4) 0.05 else 0 },
+        .eos = s.info.eos,
+    }, .{ .ctx = &out, .event = Out.event });
+    if (v.code != .ok) {
+        log.err("[{s}] request refused: {s}\n", .{ @tagName(kind), abi_engine.items(u8, v.why) });
+        return error.EngineRefused;
+    }
+    while (!out.done.load(.acquire)) std.Io.sleep(io, .fromMilliseconds(5), .awake) catch {};
+    try stdout.interface.writeAll("\n");
+    try stdout.interface.flush();
+    log.info("[{s}] generated {d} tokens (max={d})\n", .{ @tagName(kind), out.generated, max_tokens });
 }
 
 /// Parse a size-style CLI argument: bare integer = bytes, suffix `KB`/`MB`/

@@ -456,10 +456,10 @@ to the plugin's draw (a follow-up: the mask in `ArmRequest`).
 A profile build (the host's `-Dplugin-profile=true`; never a served build) compiles MiMo's diagnostics in
 (`glm5_next/profile.zig`). Each switch is read once at construction:
 
-- `GLM5_NEXT_ROUTE_TRACE=<prefix>`: the request's route trace (`glm5_next-route-trace-v2`: MiMo's v2 layout with u16
+- `MLX_SERVE_DIAG=glm5-next-route-trace=<prefix>`: the request's route trace (`glm5_next-route-trace-v2`: MiMo's v2 layout with u16
   expert ids, `<prefix>-r<k>.prompt.u16`, `.decode.u16`, ...), and the prompt timeline's TSVs beside it. Line:
   `GLM5_NEXT_ROUTE_TRACE armed: prefix=<P> format=glm5_next-route-trace-v2`.
-- `GLM5_NEXT_PREFILL_TIMELINE=1` (`0` off; anything else refuses the load): MiMo's prompt-pass timeline for the first
+- `MLX_SERVE_DIAG=glm5-next-prefill-timeline` (`0` off; anything else refuses the load): MiMo's prompt-pass timeline for the first
   prompt pass, `GLM5_NEXT_PREFILL_TIMELINE armed: ...`, then `GLM5_NEXT_PREFILL_TIMELINE {...}` and
   `<P>-r0.prefill-{layers,tiles,cbs}.tsv`. Its stages, in the line's and the TSV's order: `edge predict attn indexer topk
   sparse router dense moe join gather reduce output tail`. On a DSA layer the indexer's pool scores (`indexer`), the
@@ -468,7 +468,7 @@ A profile build (the host's `-Dplugin-profile=true`; never a served build) compi
   is layers 0-2's dense MLP and, on a routed layer, the FFN's collapse and norm with the router's and the shared expert's
   commits (the routing barrier's arrays first: lever 4); `router` the routed call's barrier and setup; `tail` the expand
   and the layer's output.
-- `GLM5_NEXT_GPU_TIMELINE=1` (`0` off; anything else refuses): DSV's verify GPU timeline over the serial decode's
+- `MLX_SERVE_DIAG=glm5-next-gpu-timeline` (`0` off; anything else refuses): DSV's verify GPU timeline over the serial decode's
   forwards (`GLM5_NEXT_GPU_TIMELINE armed: serial forwards, cycles_cap=1024`): one cycle per forward with one verify,
   the first request's first 1,024 forwards; at the request's end `VERIFY_GPU_TIMELINE_REPAIR`, `VERIFY_GPU_TIMELINE {...}`
   (GPU busy, `bytes_wait_ms` read-wait, idle, per layer) and `<P>-r0.gpu-timeline.json`.

@@ -1,19 +1,20 @@
 //! Load preflight: resident and on-disk bills, the eviction gate estimate, available memory.
 
 const std = @import("std");
-const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const ple_gpu = @import("../../plugins/qwen4_exp/ple_gpu.zig");
 const gen_mod = @import("../media_jobs/gen.zig");
 const mtp_mod = @import("../../sdk/spec/mtp/mtp.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
-const sushi_pack = @import("../../engines/mlx/load/sushi_adapt.zig");
+const plugin_driver = @import("../../engines/mlx/plugin/driver.zig");
+const abi = @import("../../abi/plugin.zig");
+const log = @import("../../sdk/util/log.zig");
 const modelopt_pack = @import("../../sdk/quant/nvfp4/modelopt_pack.zig");
 const model_registry_mod = @import("registry.zig");
 const model_discovery = @import("discovery.zig");
 const mlx_gguf = @import("../../sdk/quant/gguf/claim.zig");
 const status = @import("../status.zig");
-const dsv41_mod = @import("../../plugins/deepseek_v41/deepseek_v41.zig");
+const streamed = @import("../../sdk/weights/streamed.zig");
 const mlx_stream = if (@import("build_options").mlx_stream) @import("../../engines/mlx/modules/stream_glue.zig") else @import("../../engines/mlx/modules/stream_stub.zig");
 const testing = std.testing;
 
@@ -133,15 +134,23 @@ pub fn residentModelDiskBytes(allocator: std.mem.Allocator, io: std.Io, model_di
 }
 
 fn shardResidentBytes(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, config: *const model_mod.ModelConfig) !u64 {
-    if (config.exl3 != null and (config.isGlm5() or config.isMimo())) return sushi_pack.residentBytes(io, std.heap.page_allocator, model_dir, config);
-    const total = modelDiskBytes(io, model_dir);
     if (config.mlxStream()) return mlx_stream.loadBytes(allocator, io, config);
-    if (config.isDsv41()) return dsv41_mod.residentDiskBytes(allocator, model_dir, config, total);
-    if (!config.isQwen4() or config.embedded_ple_payload_bytes == null) return total;
-    const info = (try @import("../../plugins/qwen4_exp/qwen4_exp.zig").inspectEmbedded(model_dir, try model_mod.qwen4EmbeddedSpec(config))) orelse return error.MissingEmbeddedNgramTable;
-    if (info.payload_bytes != config.embedded_ple_payload_bytes.?) return error.EmbeddedNgramTableChanged;
-    if (info.payload_bytes > total) return error.InvalidEmbeddedNgramTable;
-    return total - info.payload_bytes;
+    const shards = modelDiskBytes(io, model_dir);
+    if (config.stream_experts_override) |st| {
+        // The routed experts stay on disk; their slot rows are resident.
+        const s = try streamed.Streamed.packBytes(allocator, model_dir, st.slotRows(config.num_experts));
+        return shards -| s.experts +| s.slots;
+    }
+    const b = config.plugin orelse return shards;
+    const f = b.table.weights.resident_bytes orelse return shards;
+    var settings: [96]u8 = undefined;
+    var out = shards;
+    const v = f(&b.parsed, .of(model_dir), .of(plugin_driver.loadSettings(&settings, config)), shards, &out);
+    if (!v.isOk()) {
+        log.err("[preflight] {s}: {s}\n", .{ b.table.name.slice(), v.why.slice() });
+        return error.ResidentBytesRefused;
+    }
+    return out;
 }
 
 pub fn residentGateBytes(validated: ?u64, discovered: ?u64, mlx_text: bool) ?u64 {
@@ -305,7 +314,7 @@ test "pleTableBill: the GPU arm bills the n-gram table, embedded shards included
 
     const was = ple_gpu.pleGpu().enabled;
     defer ple_gpu.pleGpu().enabled = was;
-    var config: model_mod.ModelConfig = .{ .model_type = "qwen4_exp", .ngram_table_path = path };
+    var config: model_mod.ModelConfig = .{ .model_type = "qwen4_exp", .legacy = .{ .caps = .{ .long_ctx = true } }, .ngram_table_path = path };
     ple_gpu.pleGpu().enabled = false;
     try std.testing.expectEqual(@as(u64, 0), pleTableBill(io, &config));
     ple_gpu.pleGpu().enabled = true;
@@ -313,7 +322,7 @@ test "pleTableBill: the GPU arm bills the n-gram table, embedded shards included
     // An embedded pack bills its shards' payload; its `ngram_table.bin` path names no file.
     config.embedded_ple_payload_bytes = 120;
     try std.testing.expectEqual(@as(u64, 120), pleTableBill(io, &config));
-    config = .{ .model_type = "qwen4_exp" };
+    config = .{ .model_type = "qwen4_exp", .legacy = .{ .caps = .{ .long_ctx = true } } };
     try std.testing.expectEqual(@as(u64, 0), pleTableBill(io, &config));
 }
 
@@ -361,79 +370,31 @@ test "a load over the memory cap on its own is named as such, not as a busy regi
     try std.testing.expect(!loadExceedsMemCap(225 * GiB, 0));
 }
 
-test "validated embedded weight estimate feeds eviction preflight and residency" {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var td = std.testing.tmpDir(.{});
-    defer td.cleanup();
-    try @import("../../plugins/qwen4_exp/ple_table.zig").writeFixture(&td, .valid);
-    var path: [std.fs.max_path_bytes]u8 = undefined;
-    const len = try td.dir.realPath(io, &path);
-    const dir = path[0..len];
-    var config: model_mod.ModelConfig = .{
-        .model_type = "qwen4_exp",
-        .vocab_size = 1,
-        .ngram_size = 3,
-        .heads_per_ngram = 1,
-        .ngram_vocab_base = 2,
-        .ngram_vocab_divisor = 6,
-        .ple_embed_dim = 64,
-        .split_ngram_parts = 3,
-        .ple_layer_idx = 1,
-        .embedded_ple_payload_bytes = 120,
-        .num_hidden_layers = 2,
-        .hidden_size = 64,
+test "residentModelDiskBytes: a served pack is billed by its plugin's resident_bytes, which sees the load settings" {
+    const T = struct {
+        fn resident(_: *const abi.Parsed, _: abi.Str, settings_json: abi.Str, shards: u64, out: *u64) callconv(.c) abi.Verdict {
+            if (std.mem.eql(u8, settings_json.slice(), "{\"mtp\":false}")) return abi.Verdict.refuse(.failed, "mtp off");
+            out.* = shards - 7;
+            return .ok;
+        }
     };
-    const disk = modelDiskBytes(io, dir);
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "0123456789" });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    const table: abi.ModelTable = .{ .name = .of("t"), .claims = undefined, .parse = undefined, .free_parsed = undefined, .bill = undefined, .load = undefined, .unload = undefined, .forward = undefined, .cache = undefined, .weights = &.{ .resident_bytes = &T.resident } };
+    var binding: @import("../../engines/mlx/plugin/config.zig").Binding = .{ .table = &table };
+    var config: model_mod.ModelConfig = .{ .num_hidden_layers = 2, .hidden_size = 64 };
+    try std.testing.expectEqual(@as(u64, 10), try residentModelDiskBytes(std.testing.allocator, io, dir, &config));
+    config.plugin = &binding;
     const snapshot = try residentModelDiskBytes(std.testing.allocator, io, dir, &config);
-    try std.testing.expectEqual(disk - 120, snapshot);
+    try std.testing.expectEqual(@as(u64, 3), snapshot);
     try std.testing.expectEqual(snapshot, committedTextBytes(snapshot, &config));
     try std.testing.expectEqual(snapshot + snapshot / 10, gateEstimateBytes(0, snapshot, config.num_hidden_layers, config.hidden_size));
-    try std.testing.expectEqual(loadRequirementBytes(snapshot), loadRequirementBytes(committedTextBytes(snapshot, &config)));
-    config.embedded_ple_payload_bytes = 121;
-    try std.testing.expectError(error.EmbeddedNgramTableChanged, residentModelDiskBytes(std.testing.allocator, io, dir, &config));
-}
-
-test "residentModelDiskBytes: deepseek_v41 does not bill the Engram tables it preads" {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var td = std.testing.tmpDir(.{});
-    defer td.cleanup();
-    try @import("../../plugins/deepseek_v41/engram.zig").writeAffineFixture(io, td.dir, "");
-    var buf: [512]u8 = undefined;
-    const dir = buf[0..try td.dir.realPath(io, &buf)];
-    var config: model_mod.ModelConfig = .{ .model_type = "deepseek_v41", .dsv41_n_engram_layers = 1, .dsv41_engram_head_dim = 64 };
-    config.dsv41_engram_layers[0] = 1;
-    config.dsv41_engram_rows[0] = 4;
-    try std.testing.expectEqual(modelDiskBytes(io, dir) - 288, try residentModelDiskBytes(std.testing.allocator, io, dir, &config));
-}
-
-test "residentModelDiskBytes: deepseek_v41 bills neither the vision tower nor DSpark stages that will not load" {
-    env.unset(.MLX_SERVE_DSV4_DSPARK); // test-order hygiene: `--dspark` (and tests) force the stages on
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var td = std.testing.tmpDir(.{});
-    defer td.cleanup();
-    try @import("../../plugins/deepseek_v41/engram.zig").writeAffineFixture(io, td.dir, "");
-    const hdr = "{\"layers.0.attn_norm.weight\":{\"dtype\":\"BF16\",\"shape\":[8],\"data_offsets\":[0,16]}," ++
-        "\"vision.patch.weight\":{\"dtype\":\"BF16\",\"shape\":[16],\"data_offsets\":[16,48]}," ++
-        "\"language_model.mtp.0.norm.weight\":{\"dtype\":\"BF16\",\"shape\":[32],\"data_offsets\":[48,112]}}";
-    var shard: [8 + hdr.len + 112]u8 = @splat(0);
-    std.mem.writeInt(u64, shard[0..8], hdr.len, .little);
-    @memcpy(shard[8..][0..hdr.len], hdr);
-    try td.dir.writeFile(io, .{ .sub_path = "model-00002.safetensors", .data = &shard });
-    const e = "layers.1.engram.embed.";
-    try td.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{" ++
-        "\"" ++ e ++ "weight\":\"model-00001.safetensors\",\"" ++ e ++ "scales\":\"model-00001.safetensors\",\"" ++ e ++ "biases\":\"model-00001.safetensors\"," ++
-        "\"layers.0.attn_norm.weight\":\"model-00002.safetensors\",\"vision.patch.weight\":\"model-00002.safetensors\"," ++
-        "\"language_model.mtp.0.norm.weight\":\"model-00002.safetensors\"}}" });
-    var buf: [512]u8 = undefined;
-    const dir = buf[0..try td.dir.realPath(io, &buf)];
-    var config: model_mod.ModelConfig = .{ .model_type = "deepseek_v41", .dsv41_n_engram_layers = 1, .dsv41_engram_head_dim = 64 };
-    config.dsv41_engram_layers[0] = 1;
-    config.dsv41_engram_rows[0] = 4;
-    const disk = modelDiskBytes(io, dir);
-    // The stages load by default; the tower never does.
-    try std.testing.expectEqual(disk - 288 - 32, try residentModelDiskBytes(std.testing.allocator, io, dir, &config));
-    config.mtp_override = false; // --no-mtp, or the model's `mtp` setting
-    try std.testing.expectEqual(disk - 288 - 32 - 64, try residentModelDiskBytes(std.testing.allocator, io, dir, &config));
+    config.mtp_override = false;
+    try std.testing.expectError(error.ResidentBytesRefused, residentModelDiskBytes(std.testing.allocator, io, dir, &config));
 }
 
 test "modelDiskBytes follows HF-cache symlinks (a snapshot dir measured ZERO)" {
@@ -720,4 +681,19 @@ test "a refusal right after a two-model eviction waits for the memory to come ba
     mark.record(1_000, 100 * GiB);
     mark.record(1_100, 17 * GiB);
     try std.testing.expect(waitForUnload(211 * GiB, 108 * GiB, mark, 1_200));
+}
+
+test "residentModelDiskBytes: with stream_experts a pack bills its residents and slot rows, not the experts" {
+    if (!@import("build_options").mlx_stream) return error.SkipZigTest;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    var buf: [512]u8 = undefined;
+    const dir = buf[0..try td.dir.realPath(io, &buf)];
+    try @import("../../sdk/weights/streamed/mlx_pack_test.zig").writePack(dir);
+    var config: model_mod.ModelConfig = .{ .num_experts = @import("../../sdk/weights/streamed/mlx_pack_test.zig").E, .stream_experts_override = .{ .rows = 2 } };
+    const b = try streamed.Streamed.packBytes(std.testing.allocator, dir, 2);
+    try std.testing.expectEqual(modelDiskBytes(io, dir) - b.experts + b.slots, try residentModelDiskBytes(std.testing.allocator, io, dir, &config));
+    config.stream_experts_override = null;
+    try std.testing.expectEqual(modelDiskBytes(io, dir), try residentModelDiskBytes(std.testing.allocator, io, dir, &config));
 }

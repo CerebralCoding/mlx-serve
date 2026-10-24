@@ -32,6 +32,7 @@ const transformer = @import("../../engines/mlx/transformer.zig");
 const decode_attn_quant = @import("../../sdk/blocks/attention/decode_attn_quant.zig");
 const params_mod = @import("../../sdk/quant/params.zig");
 const log = @import("../../sdk/util/log.zig");
+const clampedSwiGLU = @import("../../sdk/blocks/mlp/activations.zig").clampedSwiGLU;
 
 const ModelConfig = model.ModelConfig;
 const QuantParams = params_mod.QuantParams;
@@ -728,7 +729,7 @@ pub const Dsv4Model = struct {
     /// default, measured: our verify is fixed-cost dominated (≈ 70 ms + ~12 ms·C), so a narrower block pays almost the
     /// same and commits less (no gate 30.7 tok/s, 0.5 → 29.9, 0.9 → 25.3).
     ds_conf_thr: f32 = -std.math.inf(f32),
-    /// Per-round cost audit, armed by `MLX_SERVE_DSPARK_PROFILE` at load.
+    /// Per-round cost audit, armed by diag `dspark-profile` at load.
     ds_prof: ?DsparkProfile = null,
     /// Scratch laps written by the last `extendChunk` (profiling only): the
     /// trunk layer loop vs the vocab head, so a round can attribute its
@@ -1258,7 +1259,7 @@ pub fn initModel(gpa: std.mem.Allocator, cfg: *const ModelConfig, dw: Dsv4Weight
         .ds_conf_proj_t = if (dspark_on) try transposedF32(dw.dspark.?.conf_proj, s) else null,
         .ds_hc_head_base = if (dspark_on) try toHostF32(a, dw.dspark.?.hc_head_base, hc, s) else &.{},
         .ds_hc_head_scale = if (dspark_on) try toHostF32(a, dw.dspark.?.hc_head_scale, 1, s) else &.{},
-        .ds_prof = if (dspark_on and env.get(.MLX_SERVE_DSPARK_PROFILE) != null) DsparkProfile{} else null,
+        .ds_prof = if (dspark_on and env.get(.DSPARK_PROFILE) != null) DsparkProfile{} else null,
     };
 }
 
@@ -1672,7 +1673,7 @@ fn compInProj(m: *const Dsv4Model, h: *const HostLayer, li: usize, x_g: mlx.mlx_
 }
 
 var lazy_decode_logged: bool = false;
-/// Per-token/per-chunk phase trace (`MLX_SERVE_DSV4_TRACE=1`): decode logs
+/// Per-token/per-chunk phase trace (diag `dsv4-trace`): decode logs
 /// pos, build/head/defer/comp µs + the gap since the previous step returned;
 /// extendChunk logs C, layers/comp/defer/head ms. Wall-clock only, no extra
 /// evals — everything is lazy until the head sync, so "build" is honest CPU
@@ -1681,7 +1682,7 @@ var lazy_decode_logged: bool = false;
 var dsv4_trace_state: ?bool = null;
 fn dsv4TraceEnabled() bool {
     if (dsv4_trace_state) |v| return v;
-    const v = if (env.get(.MLX_SERVE_DSV4_TRACE)) |e| e[0] == '1' else false;
+    const v = if (env.get(.DSV4_TRACE)) |e| e[0] == '1' else false;
     dsv4_trace_state = v;
     return v;
 }
@@ -1816,36 +1817,16 @@ fn gatherQmmESorted(q: *const Q, xin: mlx.mlx_array, indices_: mlx.mlx_array, s:
     return out;
 }
 
-/// Clipped SwiGLU in f32 (reference computes it in float32), back to bf16.
+/// The SDK's clamped SwiGLU in f32 (the reference computes it in float32), back to bf16.
 fn clippedSwigluG(gate_in: mlx.mlx_array, up_in: mlx.mlx_array, limit: f32, s: mlx.mlx_stream) !mlx.mlx_array {
-    const lim = mlx.mlx_array_new_float(limit);
-    defer _ = mlx.mlx_array_free(lim);
-    const neg_lim = mlx.mlx_array_new_float(-limit);
-    defer _ = mlx.mlx_array_free(neg_lim);
     var gate32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(gate32);
     try mlx.check(mlx.mlx_astype(&gate32, gate_in, .float32, s));
     var up32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(up32);
     try mlx.check(mlx.mlx_astype(&up32, up_in, .float32, s));
-    var g_cl = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(g_cl);
-    try mlx.check(mlx.mlx_minimum(&g_cl, gate32, lim, s));
-    var u_lo = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(u_lo);
-    try mlx.check(mlx.mlx_maximum(&u_lo, up32, neg_lim, s));
-    var u_cl = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(u_cl);
-    try mlx.check(mlx.mlx_minimum(&u_cl, u_lo, lim, s));
-    var sig = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sig);
-    try mlx.check(mlx.mlx_sigmoid(&sig, g_cl, s));
-    var silu = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(silu);
-    try mlx.check(mlx.mlx_multiply(&silu, g_cl, sig, s));
-    var act32 = mlx.mlx_array_new();
+    const act32 = try clampedSwiGLU(s, gate32, up32, limit);
     defer _ = mlx.mlx_array_free(act32);
-    try mlx.check(mlx.mlx_multiply(&act32, silu, u_cl, s));
     var act = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_astype(&act, act32, .bfloat16, s));
     return act;
@@ -5070,7 +5051,7 @@ fn moeGpuImpl(m: *const Dsv4Model, alloc: std.mem.Allocator, li: usize, x_g: mlx
     defer _ = mlx.mlx_array_free(sd_r);
     const total = try gpuOp2(mlx.mlx_add, routed, sd_r, m.s);
     defer _ = mlx.mlx_array_free(total);
-    if (li >= m.n_layers and std.c.getenv("MLX_SERVE_DSPARK_TRACE") != null) {
+    if (li >= m.n_layers and env.on(.DSPARK_TRACE)) {
         const pr = struct {
             fn f(al: std.mem.Allocator, arr: mlx.mlx_array, n: usize, s2: mlx.mlx_stream) f64 {
                 const hh = toHostF32(al, arr, n, s2) catch return -1;
@@ -5368,15 +5349,11 @@ fn attentionDecodeGpu(m: *const Dsv4Model, alloc: std.mem.Allocator, st: *Dsv4De
 /// captures when armed (sync path only — the lazy path requires DSpark off).
 fn decodeLayers(m: *Dsv4Model, a: std.mem.Allocator, st: *Dsv4DecodeState, stream_in: mlx.mlx_array, id: u32, id_arr: ?mlx.mlx_array, pos: usize, rr_plain: *const RopeRows, rr_yarn: *const RopeRows, fr_plain: *const Freqs, fr_yarn: *const Freqs, deferred: *std.ArrayList(DeferredCompRow), mh_parts: *std.ArrayList(mlx.mlx_array)) !mlx.mlx_array {
     var stream_g = stream_in;
-    // Timing-only probes (GARBAGE OUTPUT): `MLX_SERVE_DSV4_LAYER_CAP=N`
-    // truncates the walk, `MLX_SERVE_DSV4_SKIP_MOE=1` drops the ffn
+    // Timing-only probes (GARBAGE OUTPUT): diag `layer-cap=N` truncates the walk, `dsv4-skip-moe` drops the ffn
     // sublayer — slope/intercept attribution of the serial forward.
-    const cap = blk: {
-        const e = std.c.getenv("MLX_SERVE_DSV4_LAYER_CAP") orelse break :blk m.n_layers;
-        break :blk std.fmt.parseInt(usize, std.mem.span(e), 10) catch m.n_layers;
-    };
-    const skip_moe = std.c.getenv("MLX_SERVE_DSV4_SKIP_MOE") != null;
-    for (0..@min(m.n_layers, cap)) |li| {
+    const cap = env.int(.LAYER_CAP, usize, 0);
+    const skip_moe = env.on(.DSV4_SKIP_MOE);
+    for (0..if (cap == 0) m.n_layers else @min(m.n_layers, cap)) |li| {
         const h = &m.hl[li];
         const ly = &m.dw.layers[li];
         const ratio: usize = ly.compress_ratio;
@@ -7561,7 +7538,7 @@ pub const DsparkDraft = struct {
     }
 };
 
-// ── DSpark cost audit (`MLX_SERVE_DSPARK_PROFILE=1`) ───────────────────
+// ── DSpark cost audit (diag `dspark-profile`) ───────────────────
 //
 // Unlike the decode profiler (whose per-phase evals kill pipelining and make
 // it a lying sizing tool), every phase boundary measured here is ALREADY a
@@ -7725,7 +7702,7 @@ pub fn dsparkDraft(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, 
     };
     defer _ = mlx.mlx_array_free(stream_g);
 
-    const ds_trace = std.c.getenv("MLX_SERVE_DSPARK_TRACE") != null;
+    const ds_trace = env.on(.DSPARK_TRACE);
     if (ds_trace) {
         const sh = try toHostF32(a, stream_g, B * hcm * d, m.s);
         defer a.free(sh);
@@ -8084,7 +8061,7 @@ pub fn dsparkFinish(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState,
 }
 
 /// Feed a finished round's phases into the profile (armed via
-/// MLX_SERVE_DSPARK_PROFILE=1) — shared by the greedy wrapper here and the
+/// diag `dspark-profile`) — shared by the greedy wrapper here and the
 /// stochastic arm in generate.zig.
 pub fn dsparkObserve(m: *Dsv4Model, ph: DsparkPhases) void {
     if (m.ds_prof) |*p| {
@@ -8149,7 +8126,7 @@ fn dsparkRoundWith(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeState, 
     for (nrow, 0..) |v, j| {
         if (v > nrow[next_am]) next_am = j;
     }
-    if (std.c.getenv("MLX_SERVE_DSPARK_TRACE") != null) {
+    if (env.on(.DSPARK_TRACE)) {
         var vam: [16]u32 = undefined;
         for (0..B) |k| {
             const row = vl[k * m.vocab ..][0..m.vocab];
@@ -9153,4 +9130,33 @@ test "dsv4: comp_in decode requant rides --decode-attn-quant (DSV4_MINI)" {
             try testing.expectEqual(hits0, comp_in_q_hits); // dense arm never engages
         }
     }
+}
+
+test "dsv4 clippedSwigluG: the SDK clamped SwiGLU in f32 gives the bytes the plugin's own chain recorded" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 0x5A16));
+    var n = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(n);
+    try mlx.check(mlx.mlx_random_normal(&n, &[_]c_int{ 2, 64, 96 }, 3, .float32, 0.0, 12.0, key, s));
+    var gu = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(gu);
+    try mlx.check(mlx.mlx_astype(&gu, n, .bfloat16, s));
+    var g = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(g);
+    var u = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(u);
+    const idx0 = mlx.mlx_array_new_int(0);
+    defer _ = mlx.mlx_array_free(idx0);
+    const idx1 = mlx.mlx_array_new_int(1);
+    defer _ = mlx.mlx_array_free(idx1);
+    try mlx.check(mlx.mlx_take_axis(&g, gu, idx0, 0, s));
+    try mlx.check(mlx.mlx_take_axis(&u, gu, idx1, 0, s));
+    const got = try clippedSwigluG(g, u, 10.0, s);
+    defer _ = mlx.mlx_array_free(got);
+    try mlx.check(mlx.mlx_array_eval(got));
+    const gb = @as([*]const u8, @ptrCast(mlx.mlx_array_data_bfloat16(got).?))[0 .. 2 * 64 * 96];
+    try std.testing.expectEqual(@as(u64, 0xdb0cdacd4c0f33e9), std.hash.Wyhash.hash(0, gb));
 }

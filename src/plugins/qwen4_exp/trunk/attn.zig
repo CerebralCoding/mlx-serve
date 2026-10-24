@@ -954,7 +954,7 @@ pub fn perSlotBatchedAttn(
 }
 
 /// Partial neox RoPE of `x [B,1,N,hd]` at positions `base + step*i` (the QSA rope cache's oracle).
-/// copied_from: sdk/blocks/rope/rope.zig (`ropeAtPositions`).
+/// copied_from: engines/mlx/methods/rope.zig (`ropeAtPositions`).
 pub fn ropeAtPositions(self: *Trunk, x: mlx.mlx_array, rope_dims: c_int, theta: f32, base: f32, step: f32, n: c_int) !mlx.mlx_array {
     const inv_freq = try self.ropeInvFreq(rope_dims, theta);
     const cs = try self.ropeCosSinFromFreqs(rope_dims, inv_freq, base, step, n, mlx.mlx_array_dtype(x));

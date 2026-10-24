@@ -6,7 +6,7 @@ src/host/api/chat_stream.zig	in_think_block = prompt_opened_think	a stream seeds
 src/host/api/anthropic_stream.zig	in_think_block = prompt_opened_think	a stream seeds its think state from the rendered prompt, never the request flag
 src/host/api/chat_stream.zig	.content = vis_token_text }, null, null, null, .{ .logprobs_json = try lps.take() });	every streaming content emitter drains the logprobs collector
 src/host/api/chat_completions.zig	if (continue_final) if (continuationRejectReason(	every continuation surface consults continuationRejectReason before rendering
-src/host/api/anthropic.zig	continuationRejectReason(lm.ds4_engine != null) == null	every continuation surface consults continuationRejectReason before rendering
+src/host/api/anthropic.zig	continuationRejectReason(lm.engineOwnsTemplate()) == null	every continuation surface consults continuationRejectReason before rendering
 src/host/api/chat_completions.zig	switch (schemaMasksThinking(	every JSON grammar mask site consults the schema-mask thinking policy
 src/host/api/anthropic.zig	switch (schemaMasksThinking(	every JSON grammar mask site consults the schema-mask thinking policy
 src/host/api/responses/handler.zig	switch (schemaMasksThinking(	every JSON grammar mask site consults the schema-mask thinking policy

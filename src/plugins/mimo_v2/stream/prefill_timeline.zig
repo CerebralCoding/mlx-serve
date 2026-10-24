@@ -51,7 +51,7 @@ const profile = @import("profile.zig");
 const gpu_power = @import("gpu_power.zig");
 /// The command-buffer rows, the signal log's entries, the host clock and the span arithmetic are the verify timeline's
 /// (the same shim and pool log).
-const verify_timeline = @import("../../deepseek_v41/stream/verify_timeline.zig");
+const verify_timeline = @import("../../../sdk/weights/streamed/profile/verify_timeline.zig");
 
 pub const enabled = profile.enabled;
 

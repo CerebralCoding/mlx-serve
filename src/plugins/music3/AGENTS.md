@@ -23,7 +23,7 @@ a non-text2music `task`) are named refusals. The assembled prompt is capped at 5
   (`value * silu(gate)`), Snake is alpha-only (no beta, no exp), the DiT RoPE is partial (rotary 32, θ 10000).
 - A condition works only as training fed it: `instrumental` is the lyric TEXT `[Instrumental]` (the open weights have
   no flag) plus a caption clause; with real lyrics it is a named refusal (`plugin_job.instrumentalConflicts`).
-- Probe laps (`MUSIC3_COST_PROBE`) before bandwidth arithmetic.
+- Probe laps (`MLX_SERVE_DIAG=music3-cost-probe`) before bandwidth arithmetic.
 - The pruned semantic head (16385 rows) is the full head restricted to the legal outputs (row slices of a
   per-row-group affine weight are exact); a dense head falls back to the full vocabulary + mask.
 
@@ -31,7 +31,7 @@ a non-text2music `task`) are named refusals. The assembled prompt is capped at 5
 - `sdk/blocks/vae/snake.snake` with the epsilon in α's dtype (vocoder).
 
 ## Levers
-`MLX_SERVE_MUSIC3_{INST_TAG,INST_CAPTION,LMHEAD_PRUNE,DEPTH_KV,DEPTH_BITS}`, `MUSIC3_COST_PROBE`.
+`MLX_SERVE_DIAG=music3-cost-probe` (a diagnostic; no serving lever).
 
 ## Fixtures
 - `conformanceFixture`: one layer per stage at 32 over the real vocabulary layout, 4-bit head, vocoder 16 → 4.
@@ -39,4 +39,4 @@ a non-text2music `task`) are named refusals. The assembled prompt is capped at 5
 
 ## Rules (moved from the root AGENTS.md)
 
-- **Music3 is NOT an ACE-Step variant** (timestep TOKEN, reversed SwiGLU, alpha-only Snake, hardcoded DiT RoPE). Probe laps (`MUSIC3_COST_PROBE`) before bandwidth arithmetic.
+- **Music3 is NOT an ACE-Step variant** (timestep TOKEN, reversed SwiGLU, alpha-only Snake, hardcoded DiT RoPE). Probe laps (`MLX_SERVE_DIAG=music3-cost-probe`) before bandwidth arithmetic.

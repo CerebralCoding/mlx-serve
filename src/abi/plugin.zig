@@ -117,7 +117,14 @@ pub const Caps = packed struct(u64) {
     drafter: bool = false,
     /// The forward reads `Forward.mask_add`.
     prefill_mask: bool = false,
-    _: u39 = 0,
+    /// The model reads a Thunderbolt cluster's plan itself (`distributed.planFor`); a planned pack whose plugin does
+    /// not is loaded by the legacy path.
+    cluster_plan: bool = false,
+    /// DFlash rounds follow the round policy (`dflash_policy.zig`): a sparse target whose verify rows cost.
+    dflash_policy: bool = false,
+    /// A rejected draft rolls back by truncating the KV cache (an attention trunk): no snapshot, no re-forward.
+    verify_truncates: bool = false,
+    _: u36 = 0,
 };
 
 pub const ThinkingDefault = enum(u8) { unset, off, on, on_with_tools };
@@ -650,6 +657,9 @@ pub const WeightHooks = extern struct {
     keep_key: ?*const fn (p: *const Parsed, key: Str) callconv(.c) bool = null,
     /// Layer `layer`'s projection `which` as loaded (borrowed until `unload`); refused where the layer has none.
     layer_weight: ?*const fn (m: *anyopaque, layer: u32, which: LayerWeight, out: *quant.Weight) callconv(.c) Verdict = null,
+    /// The bytes a load of the pack at `model_dir` holds resident, from `shards` (the safetensors bytes its index
+    /// names) and the load's `settings_json` (`LoadCtx.settings_json`); null = `shards`.
+    resident_bytes: ?*const fn (p: *const Parsed, model_dir: Str, settings_json: Str, shards: u64, out: *u64) callconv(.c) Verdict = null,
 };
 
 // ── The table ──

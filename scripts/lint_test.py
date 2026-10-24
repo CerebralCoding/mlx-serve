@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Tests of scripts/lint.py's rules: one violation and one clean case each, on in-memory files.
+"""Tests of scripts/lint.py's rules (one violation and one clean case each, on in-memory files) and of
+scripts/unit_globals.py's scan of a unit object's symbols.
 
   python3 scripts/lint_test.py   # or: zig build lint-test
 """
@@ -7,6 +8,7 @@ import os, sys, unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import lint  # noqa: E402
+import unit_globals  # noqa: E402
 
 HDR = "//! A file.\n"
 # Plugin folders the name rules know about; each fixture tree carries them.
@@ -146,6 +148,17 @@ class PinsForksRatchets(unittest.TestCase):
         res = lint.run({"src/host/x.zig": "const a = 1;\n"}, "", ["file-header", "env-read"])
         self.assertEqual(lint.failed_rules(res), ["file-header"])
         self.assertEqual(lint.failed_rules(lint.run({"src/host/x.zig": "const a = 1;\n"}, "", [])), [])
+
+
+class UnitGlobals(unittest.TestCase):
+    def test_threadlocals_are_unit_state(self):
+        nm = "\n".join([
+            "0000000000ab7c68 (__DATA,__thread_vars) non-external _sdk.media.progress.stream_keepalive",
+            "00000000013be348 (__DATA,__thread_bss) non-external _sdk.media.progress.stream_keepalive$tlv$init",
+            "0000000000ab7c90 (__DATA,__bss) non-external _sdk.util.log.sink",
+            "0000000000ab7ca0 (__DATA,__data) external _mlx_serve_unit_table",
+        ])
+        self.assertEqual(list(unit_globals.duplicated(nm, [], {"sdk.util.log.sink"})), ["sdk.media.progress.stream_keepalive"])
 
 
 if __name__ == "__main__":

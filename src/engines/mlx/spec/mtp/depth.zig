@@ -77,12 +77,11 @@ pub const MTP_DRAFT_TEMP: f32 = 0.6;
 pub const MTP_DRAFT_TOP_P: f32 = 0.95;
 pub const MTP_DRAFT_TOP_K: u32 = 20;
 
-/// Draft temperature is per FAMILY: the sidecar head's 0.6 does not carry
-/// over, and Flash Next drafts best at the target's own temperature.
-pub const MTP_DRAFT_TEMP_QWEN4: f32 = 1.0;
-
+/// Draft temperature is per FAMILY (`SpecPolicy.draft_temperature`): the sidecar head's 0.6 does not carry over.
 pub fn mtpDraftTempFor(config: *const model_mod.ModelConfig) f32 {
-    return if (std.mem.eql(u8, config.model_type, "qwen4_exp")) MTP_DRAFT_TEMP_QWEN4 else MTP_DRAFT_TEMP;
+    const b = config.plugin orelse return MTP_DRAFT_TEMP;
+    const t = b.parsed.spec.policy.draft_temperature;
+    return if (std.math.isNan(t)) MTP_DRAFT_TEMP else t;
 }
 
 /// Draft-proposal sampler for a round: greedy targets keep greedy drafts
@@ -345,6 +344,16 @@ test "mtpDraftSamplingFor: sharpened fixed proposal for stochastic targets, gree
 
     // The draft temperature is the FAMILY's, passed in, never a global.
     try testing.expectEqual(@as(f32, 1.0), Generator.mtpDraftSamplingFor(target, false, 1.0).temperature);
+}
+
+test "mtpDraftTempFor: the plugin's declared draft temperature, else the sidecar head's" {
+    var b: @import("../../plugin/config.zig").Binding = .{ .table = undefined };
+    var c: model_mod.ModelConfig = .{ .plugin = &b };
+    try testing.expectEqual(Generator.MTP_DRAFT_TEMP, mtpDraftTempFor(&c));
+    b.parsed.spec.policy.draft_temperature = 1.0;
+    try testing.expectEqual(@as(f32, 1.0), mtpDraftTempFor(&c));
+    c.plugin = null;
+    try testing.expectEqual(Generator.MTP_DRAFT_TEMP, mtpDraftTempFor(&c));
 }
 
 test "mtpDraftGreedyFor: the proposal mode is a property of the REQUEST" {

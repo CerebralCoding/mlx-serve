@@ -23,7 +23,6 @@ const crt = @import("../../../sdk/util/crt.zig");
 const os_mutex = @import("../../../sdk/util/os_mutex.zig");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
-const transformer_mod = @import("../transformer.zig");
 
 /// Drafts per round the table covers (MTP depth <= 8, a DFlash block up to 16); index 0 is serial.
 pub const MAX_WIDTH: u32 = 16;
@@ -56,7 +55,7 @@ pub const Layout = enum {
 /// The one resolver for a model's layout; the layout decides the store version and so
 /// which persisted file a model reads. `anytype`: this module imports nothing but std.
 pub fn layoutFor(config: anytype) Layout {
-    return if (config.isQwen4()) .long else .legacy;
+    return if (config.longCtxGated()) .long else .legacy;
 }
 
 /// Buckets the layout uses; cells past it are never written and never active.
@@ -714,19 +713,19 @@ pub fn persistEnabled() bool {
 
 pub fn persistDiagArmedFrom(raws: []const ?[*:0]const u8) bool {
     for (raws) |raw| {
-        if (transformer_mod.diagEnvValueOn(raw)) return true;
+        if (env.onValue(raw)) return true;
     }
     return false;
 }
 
 fn qwen4ProfileArmed() bool {
-    return env.anyOnWithPrefix("QWEN4_PROFILE_");
+    return env.diagAny("qwen4-profile-");
 }
 
 pub fn persistDiagArmed() bool {
     return qwen4ProfileArmed() or @import("mtp_depth_bounds.zig").active.pinned() != null or
         persistDiagArmedFrom(&.{
-            env.get(.MLX_SERVE_MTP_TRACE),
+            env.get(.MTP_TRACE),
         });
 }
 
@@ -1422,13 +1421,13 @@ test "round_cost: the long layout warm-starts from a legacy file — no user boo
 
 test "layoutFor is THE round-cost layout resolver" {
     const Stub = struct {
-        qwen4: bool,
-        fn isQwen4(self: *const @This()) bool {
-            return self.qwen4;
+        long_ctx: bool,
+        fn longCtxGated(self: *const @This()) bool {
+            return self.long_ctx;
         }
     };
-    const long = Stub{ .qwen4 = true };
-    const legacy = Stub{ .qwen4 = false };
+    const long = Stub{ .long_ctx = true };
+    const legacy = Stub{ .long_ctx = false };
     try testing.expectEqual(Layout.long, layoutFor(&long));
     try testing.expectEqual(Layout.legacy, layoutFor(&legacy));
     try testing.expect(storeVersion(layoutFor(&long)) != storeVersion(layoutFor(&legacy)));

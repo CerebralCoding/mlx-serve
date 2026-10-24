@@ -12,7 +12,7 @@ const xk = @import("kernels.zig");
 const sdk = @import("sdk");
 const sdk_ext = @import("../../../weights/streamed/sdk_ext.zig");
 const kr = sdk_ext.kernels.Routes(xk);
-const tr = @import("../../../../plugins/deepseek_v41/stream/kernel_routes.zig");
+const tr = @import("kernel_routes.zig");
 const xq = @import("quant.zig");
 
 const Allocator = std.mem.Allocator;

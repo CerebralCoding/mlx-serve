@@ -13,8 +13,8 @@ const ModelConfig = model_mod.ModelConfig;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const ChatConfig = chat_mod.ChatConfig;
 
-const buildGgufStubCpuState = @import("../../engines/ds4/adapter.zig").buildGgufStubCpuState;
 const GgufRoute = @import("../gpu_thread/thread.zig").GgufRoute;
+const served = @import("../engines/served.zig");
 
 /// Plan 05 Phase D: pre-loaded CPU state bundle. Built by the conn thread
 /// (CPU only — file I/O + parse, no mlx) ahead of posting a LoadRequest.
@@ -103,10 +103,8 @@ pub fn freeCpuState(allocator: std.mem.Allocator, s: *CpuState) void {
     allocator.destroy(s.chat_config);
 }
 
-/// GGUF cold-load preload: resolve the actual .gguf file, pick the embedded
-/// engine from its header metadata (the issue #15 rule in gguf_meta.zig;
-/// unreadable metadata defaults to llama with a log line, mirroring
-/// main.zig's chooseGgufEngine), and build the stub CPU state.
+/// GGUF cold-load preload: resolve the actual .gguf file, pick its engine (`served.ggufEngine`) and build the stub
+/// CPU state.
 fn preloadGgufCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, ctx_size: u32, forced: ?gguf_meta.Engine) !CpuState {
     const gguf_path = model_discovery.resolveGgufFile(io, allocator, model_dir) catch |err| {
         model_discovery.logResolveGgufError(model_dir, err);
@@ -114,23 +112,81 @@ fn preloadGgufCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []co
     };
     errdefer allocator.free(gguf_path);
 
-    const engine: gguf_meta.Engine = forced orelse blk: {
-        var info = gguf_meta.readFromFile(io, allocator, gguf_path) catch |err| {
-            log.warn("[gguf] route: metadata read failed ({s}); defaulting to llama\n", .{@errorName(err)});
-            break :blk .llama;
-        };
-        defer info.deinit(allocator);
-        const e = gguf_meta.preferredEngine(info);
-        log.info("[gguf] engine: {s} (arch={s}, ds4-lora={}, shards={d})\n", .{
-            @tagName(e),
-            info.architecture orelse "?",
-            info.has_ds4_lora_rank,
-            info.split_count,
-        });
-        break :blk e;
-    };
-
+    const engine = served.ggufEngine(io, allocator, gguf_path, forced);
     var state = try buildGgufStubCpuState(allocator, engine, ctx_size);
     state.gguf = .{ .path = gguf_path, .engine = engine };
     return state;
+}
+
+/// Stub CPU state for a GGUF: the engine owns the real tokenizer and template (llama.cpp's is adopted at load), so
+/// only `model_type` (echoed in /v1/models) and the context matter. `ctx_size` is the one asked for (0 = the
+/// engine's own); the engine's answer replaces it at load.
+pub fn buildGgufStubCpuState(allocator: std.mem.Allocator, engine: gguf_meta.Engine, ctx_size: u32) !CpuState {
+    const config = try allocator.create(ModelConfig);
+    errdefer allocator.destroy(config);
+    config.* = switch (engine) {
+        .llama => ModelConfig{
+            .model_type = "gguf",
+            .weight_prefix = "model",
+            .head_dim = 128,
+            .max_position_embeddings = ctx_size,
+            .is_encoder_only = false,
+        },
+        .ds4 => ModelConfig{
+            .model_type = "deepseek_v4",
+            .weight_prefix = "model",
+            .num_hidden_layers = 61,
+            .hidden_size = 7168,
+            .head_dim = 128,
+            .num_attention_heads = 56,
+            .num_key_value_heads = 56,
+            .max_position_embeddings = ctx_size,
+            .is_encoder_only = false,
+        },
+    };
+
+    const tok = try allocator.create(Tokenizer);
+    errdefer allocator.destroy(tok);
+    var byte_map: [256]u21 = undefined;
+    for (0..256) |b| byte_map[b] = @intCast(b);
+    tok.* = .{
+        .vocab = std.StringHashMap(u32).init(allocator),
+        .id_to_token = std.AutoHashMap(u32, []const u8).init(allocator),
+        .merge_ranks = @TypeOf(tok.merge_ranks).init(allocator),
+        .allocator = allocator,
+        .special_tokens = std.StringHashMap(u32).init(allocator),
+        .tok_type = .byte_level_bpe,
+        .byte_to_unicode = byte_map,
+        .unicode_to_byte = std.AutoHashMap(u21, u8).init(allocator),
+        .bos_id = null,
+        .eos_id = null,
+        .parsed_json = null,
+    };
+    errdefer tok.deinit();
+
+    const cc = try allocator.create(ChatConfig);
+    errdefer allocator.destroy(cc);
+    cc.* = .{
+        .chat_template = try allocator.dupe(u8, ""),
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+
+    return .{ .config = config, .tok = tok, .chat_config = cc };
+}
+
+test "buildGgufStubCpuState: the stub names its engine's model_type and carries the context asked for" {
+    const a = std.testing.allocator;
+    var s = try buildGgufStubCpuState(a, .llama, 0);
+    defer freeCpuState(a, &s);
+    try std.testing.expectEqualStrings("gguf", s.config.model_type);
+    try std.testing.expectEqual(@as(u32, 0), s.config.max_position_embeddings);
+    try std.testing.expect(s.gguf == null); // the route is attached by preloadGgufCpuState
+    try std.testing.expectEqual(@as(usize, 0), s.chat_config.chat_template.len);
+    var d = try buildGgufStubCpuState(a, .ds4, 4096);
+    defer freeCpuState(a, &d);
+    try std.testing.expectEqualStrings("deepseek_v4", d.config.model_type);
+    try std.testing.expectEqual(@as(u32, 4096), d.config.max_position_embeddings);
 }

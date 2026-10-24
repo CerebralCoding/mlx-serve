@@ -5,7 +5,6 @@
 //! memory, and the down kernel accumulates every expert of a token in registers. The affine
 //! bias rides a per-group sum of x: `sum((s*q + b) * x) = s * dot(q, x) + b * sum(x)`.
 const std = @import("std");
-const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../util/log.zig");
@@ -14,34 +13,22 @@ const log = @import("../../util/log.zig");
 const ROWS: c_int = 1;
 const SGS: c_int = 2;
 
-pub const DOT16 = kernelSource("plugins/qwen4_exp/kernels/moe_affine4_dot16.metal");
+pub const DOT16 = kernelSource("kernels/moe/moe_affine4_dot16.metal");
 
 // grid (32, N/ROWS, TOPK + SE), threadgroup (32, SGS, 1): one token, slot e = its e-th expert;
 // slots past TOPK are N-row slices of the ungated shared expert (`sg_*`/`su_*`, SE = its rows / N).
 // GS >= 16 and 16 | GS, so a lane's 16 values share one scale and bias.
-pub const GATEUP_SOURCE = kernelSource("plugins/qwen4_exp/kernels/moe_affine4_gateup.metal");
+pub const GATEUP_SOURCE = kernelSource("kernels/moe/moe_affine4_gateup.metal");
 
 // grid (32, H/ROWS, 1), threadgroup (32, SGS, 1): every expert's down row, weighted by its
 // routing score, accumulated in the same registers. SHARED: the gated shared expert's output
 // (`sdown`, gate logit `glog`) is added in the epilogue. SI > 0: the ungated shared expert's
 // down row (`sd_*`, SI inputs after the routed activations) joins the sum at weight 1.
-pub const DOWNRED_SOURCE = kernelSource("plugins/qwen4_exp/kernels/moe_affine4_downred.metal");
+pub const DOWNRED_SOURCE = kernelSource("kernels/moe/moe_affine4_downred.metal");
 
 var gateup_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var downred_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var engaged = false;
-var env_enabled: ?bool = null;
-pub var override: ?bool = null;
-
-/// `MLX_SERVE_MOE_AFFINE4=0` keeps the per-slot gather kernels.
-fn enabled() bool {
-    if (override) |v| return v;
-    if (env_enabled) |v| return v;
-    const raw = env.get(.MLX_SERVE_MOE_AFFINE4);
-    env_enabled = raw == null or raw.?[0] != '0';
-    return env_enabled.?;
-}
-
 fn makeKernel(name: [*:0]const u8, ins: []const [*:0]const u8, source: [*:0]const u8) !mlx.mlx_fast_metal_kernel {
     const outs = [_][*:0]const u8{"y"};
     const in_vec = mlx.mlx_vector_string_new_data(ins.ptr, ins.len);
@@ -80,16 +67,6 @@ pub const Bank = struct { w: mlx.mlx_array, s: mlx.mlx_array, b: mlx.mlx_array }
 /// The kernels address experts from the buffer pointer, so the view only changes the billing.
 pub const Views = struct { gate: Bank, up: Bank, down: Bank };
 
-var views_enabled: ?bool = null;
-
-/// `MLX_SERVE_MOE_BANK_VIEWS=0` binds the whole banks.
-fn viewsOn() bool {
-    if (views_enabled) |v| return v;
-    const raw = env.get(.MLX_SERVE_MOE_BANK_VIEWS);
-    views_enabled = raw == null or raw.?[0] != '0';
-    return views_enabled.?;
-}
-
 fn oneExpert(a: mlx.mlx_array, owned: *std.ArrayList(mlx.mlx_array), allocator: std.mem.Allocator, s: mlx.mlx_stream) !mlx.mlx_array {
     const sh = mlx.getShape(a);
     if (sh.len != 3) return a;
@@ -103,7 +80,6 @@ fn oneExpert(a: mlx.mlx_array, owned: *std.ArrayList(mlx.mlx_array), allocator: 
 /// Views for quantized banks (null for dense ones); fp banks carry no biases and their views none.
 /// The caller keeps `owned` alive as long as the banks.
 pub fn bindViews(gate: Bank, up: Bank, down: Bank, owned: *std.ArrayList(mlx.mlx_array), allocator: std.mem.Allocator, s: mlx.mlx_stream) !?Views {
-    if (!viewsOn()) return null;
     inline for (.{ gate, up, down }) |bk| {
         if (bk.s.ctx == null) return null;
     }
@@ -127,7 +103,7 @@ pub const Ungated = struct { gate: Bank, up: Bank, down: Bank };
 /// `inds` [TOPK] u32, `scores` [TOPK] in x's dtype, `sigtab` the SwiGLU table. Null outside
 /// the kernels' set (caller keeps its path). `views` (of the same banks) are what the kernels bind.
 pub fn decode(s: mlx.mlx_stream, x: mlx.mlx_array, gate: Bank, up: Bank, down: Bank, views: ?Views, shared: ?Shared, ungated: ?Ungated, inds: mlx.mlx_array, scores: mlx.mlx_array, sigtab: mlx.mlx_array, group_size: u32) !?mlx.mlx_array {
-    if (!enabled() or !mlx.streamIsGpu(s)) return null;
+    if (!mlx.streamIsGpu(s)) return null;
     if (group_size < 16 or group_size % 16 != 0) return null;
     const dt = mlx.mlx_array_dtype(x);
     if (dt != .bfloat16 and dt != .float16) return null;
@@ -187,7 +163,7 @@ pub fn decode(s: mlx.mlx_stream, x: mlx.mlx_array, gate: Bank, up: Bank, down: B
     const y = try apply(downred_kernel.?, &.{ act, bound.down.w, bound.down.s, bound.down.b, inds, scores, sh.down, sh.logit, ug.down.w, ug.down.s, ug.down.b }, &.{hidden}, dt, .{ 32, @divExact(hidden, ROWS), 1 }, &.{ .{ "I", inter }, .{ "H", hidden }, .{ "GS", gs }, .{ "TOPK", topk }, .{ "SHARED", @intFromBool(shared != null) }, .{ "SI", si } }, s);
     if (!engaged) {
         engaged = true;
-        log.info("[moe] affine-4 decode kernels engaged: topk={d} inter={d} hidden={d} gs={d} ungated_shared={d} (MLX_SERVE_MOE_AFFINE4=0 restores the per-slot gather kernels)\n", .{ topk, inter, hidden, gs, si });
+        log.info("[moe] affine-4 decode kernels engaged: topk={d} inter={d} hidden={d} gs={d} ungated_shared={d}\n", .{ topk, inter, hidden, gs, si });
     }
     return y;
 }
@@ -243,8 +219,6 @@ test "moe affine-4 decode: no worse than the per-slot gather kernels against the
     const down_reduce_vars = @import("down_reduce.zig");
     var prng = std.Random.DefaultPrng.init(0xA4E0);
     const rnd = prng.random();
-    override = true;
-    defer override = null;
     gather_qmv_vars.gqmv_gateup_override = true;
     defer gather_qmv_vars.gqmv_gateup_override = null;
     down_reduce_vars.downred_override = true;
@@ -391,8 +365,6 @@ test "moe affine-4 decode: no worse than the per-slot gather kernels against the
 }
 
 test "moe affine-4 decode: an ungated shared expert folded into both kernels is no worse than the separate chain against the f32 truth (Flint, Kolibri-1, Hunyuan 3 geometries)" {
-    override = true;
-    defer override = null;
     try ungatedFoldCase(2048, 512, 1024, 6);
     try ungatedFoldCase(2560, 512, 512, 6);
     try ungatedFoldCase(4096, 1536, 1536, 8);

@@ -26,7 +26,7 @@ const Bank = struct {
     geo: Geometry,
     bytes: []u8,
 
-    const Geometry = if (build_options.mlx_stream) stream.dsv41_streamed.Geometry else void;
+    const Geometry = if (build_options.mlx_stream) stream.bank_source.Geometry else void;
 
     fn init(a: std.mem.Allocator, seed: u64, n_experts: u32) !Bank {
         const geo = try Geometry.init(trunk.H, trunk.MOE_INTER, n_experts, FIRST_MOE, MOE_LAYERS);
@@ -143,7 +143,7 @@ fn parity(n_experts: u32) !void {
     defer b.close();
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    try stream.dsv41_streamed.writeBank(a, io, tmp.dir, bank.geo, bank.bytes, "synthetic/mimo-tiny", "0000000000000000000000000000000000000000");
+    try stream.bank_source.writeBank(a, io, tmp.dir, bank.geo, bank.bytes, "synthetic/mimo-tiny", "0000000000000000000000000000000000000000");
     var buf: [512]u8 = undefined;
     const bank_dir = buf[0..try tmp.dir.realPath(io, &buf)];
     const m: *mimo.Loaded = @ptrCast(@alignCast(b.xfm.plugin.?.model));
@@ -226,7 +226,7 @@ test "mimo_v2 streamed experts at the release's 4096 / 2048: the hook's decode M
     };
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    try stream.dsv41_streamed.writeBank(a, io, tmp.dir, geo, bank.bytes, "synthetic/mimo-release", "0000000000000000000000000000000000000000");
+    try stream.bank_source.writeBank(a, io, tmp.dir, geo, bank.bytes, "synthetic/mimo-release", "0000000000000000000000000000000000000000");
     var buf: [512]u8 = undefined;
     const s = fixture.stream();
     var sw = try streamed.Streamed.open(testing.allocator, io, buf[0..try tmp.dir.realPath(io, &buf)], s, .{});

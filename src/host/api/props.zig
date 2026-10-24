@@ -9,7 +9,6 @@ const mtp_acceptance_mod = @import("../../engines/mlx/spec/mtp_acceptance.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const mlx_stream = if (@import("build_options").mlx_stream) @import("../../engines/mlx/modules/stream_glue.zig") else @import("../../engines/mlx/modules/stream_stub.zig");
 const scheduler_mod = @import("../../engines/mlx/scheduler.zig");
-const ds4_ffi = if (@import("build_options").ds4_engine) @import("../../engines/ds4/ffi.zig") else @import("../../engines/ds4/ffi_stub.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const metrics = @import("../status.zig");
 const ane_mod = @import("../../sdk/ane/offload.zig");
@@ -85,9 +84,8 @@ fn renderPropsBody(
 /// The model-level half of `Scheduler.batchVerdict`: does this loaded model
 /// batch decode at all? Per-slot arms (spec, grammar, logprobs) come later.
 pub fn batchVerdictFor(entry: *const LoadedModel) scheduler_mod.BatchVerdict {
-    // llama.cpp batches its own sequences (`runLlamaDecodeTick`).
-    if (entry.llama_ctx) |c| return if (c.seqs.len > 1) .ok else .embedded_engine;
-    if (entry.engineBacked()) return .embedded_engine;
+    // An engine beside MLX batches its own requests where it says so (llama.cpp's sequences).
+    if (entry.engine) |e| return if (e.caps().batches) .ok else .embedded_engine;
     const cfg = entry.config orelse return .arch;
     return if (scheduler_mod.configBatchesDecode(cfg)) .ok else .arch;
 }
@@ -135,7 +133,7 @@ const PropsSettings = struct {
     prefill_decode_share: f32 = 0,
 };
 
-const PropsEngine = enum { mlx, llama, ds4, ane };
+const PropsEngine = @import("../engines/served.zig").Kind;
 
 /// ds4 and llama.cpp bypass generate.zig: MLX decode levers, PLD and the MLX drafters never run there.
 fn embeddedEngineSettings(st: PropsSettings, engine: PropsEngine, engine_mtp: bool) PropsSettings {
@@ -155,11 +153,17 @@ fn embeddedEngineSettings(st: PropsSettings, engine: PropsEngine, engine_mtp: bo
 }
 
 fn propsSettingsFor(lm: *LoadedModel) PropsSettings {
-    const engine: PropsEngine = if (lm.ds4_engine != null) .ds4 else if (lm.llama_engine != null) .llama else if (lm.ane != null) .ane else .mlx;
-    const engine_mtp = if (lm.ds4_engine) |e| e.mtpDraftTokens() > 1 else if (lm.llama_ctx) |c| c.mtpDrafts() > 0 else false;
+    const engine: PropsEngine = if (lm.engine) |e| e.kind else .mlx;
+    // The Neural Engine drafts with a DFlash drafter, not an MTP head.
+    const engine_mtp = if (lm.engine) |e| e.kind != .ane and e.caps().drafts else false;
     var out = embeddedEngineSettings(mlxPropsSettings(lm), engine, engine_mtp);
-    if (lm.ane != null) out.kv_quant = "off";
+    if (engine == .ane) out.kv_quant = "off";
     return out;
+}
+
+fn engineIs(lm: *const LoadedModel, kind: PropsEngine) bool {
+    const e = lm.engine orelse return false;
+    return e.kind == kind;
 }
 
 pub fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
@@ -168,7 +172,7 @@ pub fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
     const native = if (lm.transformer) |x| x.mlx_stream_ext else null;
     return .{
         .engine = "mlx",
-        .kv_quant = if (lm.llama_engine != null) @tagName(http_server.llama_settings.kv_quant) else if (kv.isQuant()) (if (kv.bits == 4) "4" else "8") else "off",
+        .kv_quant = if (engineIs(lm, .llama)) @tagName(http_server.llama_settings.kv_quant) else if (kv.isQuant()) (if (kv.bits == 4) "4" else "8") else "off",
         .kv_attn_mode = http_server.serverState().server_config.kv_attn_mode,
         .decode_attn_quant = decode_attn_quant_mod.decodeAttnQuantEnabled() and (if (lm.transformer) |x| x.dense_attn_proj else false),
         .prefill_chunk = generate_mod.prefill_chunk_override,
@@ -260,11 +264,7 @@ pub fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel
 
     const safe_ctx = computeMaxSafeContext(config);
 
-    // Query memory usage. The MLX path uses mlx's allocator counters; the
-    // ds4 path bypasses MLX entirely (no allocator hook to query), so we
-    // fall back to the GGUF on-disk size + the ds4 context-memory estimate.
-    // Without this branch the Swift app's "GPU Memory" progress bar shows a
-    // 0/0 indeterminate state for the entire DSV4 session.
+    // Query memory usage: mlx's allocator counters, or a GGUF engine's own figure.
     var active_mem: usize = 0;
     var peak_mem: usize = 0;
     // MLX's reclaimable buffer pool. Always read from MLX — the embedded
@@ -272,23 +272,10 @@ pub fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel
     // rather than needing a per-engine branch.
     var cache_mem: usize = 0;
     _ = mlx.mlx_get_cache_memory(&cache_mem);
-    if (lm.ds4_engine != null) {
-        // Static estimate: GGUF mmap size (set on the entry at registry-stub
-        // time in `runDs4Serve`) plus ds4's reported KV/scratch for the
-        // current ctx. Falls back to ctx-only if bytes_on_disk wasn't
-        // populated (shouldn't happen in practice, defensive).
-        const gguf_bytes: u64 = lm.bytes_on_disk orelse 0;
-        const ctx_for_estimate: c_int = @intCast(if (ctx_len > 0) ctx_len else config.max_position_embeddings);
-        const ctx_mem = ds4_ffi.ds4_context_memory_estimate(.metal, ctx_for_estimate);
-        const total: u64 = gguf_bytes + ctx_mem.total_bytes;
-        active_mem = @intCast(total);
-        peak_mem = active_mem;
-    } else if (lm.llama_engine != null) {
-        // llama.cpp owns its own (Metal) allocations outside MLX's counters.
-        // Use the GGUF on-disk size as the headline figure so the app's GPU
-        // memory bar isn't stuck at 0/0; KV/scratch isn't separately exposed.
-        const gguf_bytes: u64 = lm.bytes_on_disk orelse 0;
-        active_mem = @intCast(gguf_bytes);
+    if (lm.servesGguf()) {
+        // A GGUF engine allocates outside MLX's counters: what it says it holds (ds4: the GGUF and its
+        // session's KV/scratch; llama.cpp: the GGUF, its KV unexposed), so the app's memory bar is not 0/0.
+        active_mem = @intCast(lm.engine.?.residentBytes());
         peak_mem = active_mem;
     } else {
         _ = mlx.mlx_get_active_memory(&active_mem);

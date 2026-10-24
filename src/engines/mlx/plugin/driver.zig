@@ -104,12 +104,22 @@ fn headMxfp8Setting(config: *const ModelConfig) ?bool {
     return config.lm_head_mxfp8_override orelse transformer_mod.cli().lm_head_mxfp8_cli;
 }
 
-/// `LoadCtx.settings_json`: the lossy load settings for this model (null = the model's default), which the plugin
-/// reads.
-fn loadSettings(buf: []u8, config: *const ModelConfig) []const u8 {
-    const Settings = struct { lm_head_mxfp8: ?bool, int8_prefill: ?bool };
+/// `LoadCtx.settings_json`: the load settings stated for this model (a plugin that serves them reads them): the lossy
+/// `lm_head_mxfp8`, the `mtp` head, the lossy `int8_prefill` and `stream_experts`. `buf` holds 96 bytes.
+pub fn loadSettings(buf: []u8, config: *const ModelConfig) []const u8 {
     var w: std.Io.Writer = .fixed(buf);
-    std.json.Stringify.value(Settings{ .lm_head_mxfp8 = headMxfp8Setting(config), .int8_prefill = config.int8_prefill_override }, .{}, &w) catch unreachable;
+    w.writeByte('{') catch unreachable;
+    if (headMxfp8Setting(config)) |on| w.print("\"lm_head_mxfp8\":{s}", .{if (on) "true" else "false"}) catch unreachable;
+    if (config.mtp_override) |on| w.print("{s}\"mtp\":{s}", .{ if (w.end > 1) "," else "", if (on) "true" else "false" }) catch unreachable;
+    if (config.int8_prefill_override) |on| w.print("{s}\"int8_prefill\":{s}", .{ if (w.end > 1) "," else "", if (on) "true" else "false" }) catch unreachable;
+    if (config.stream_experts_override) |st| {
+        if (w.end > 1) w.writeByte(',') catch unreachable;
+        switch (st) {
+            .on => w.writeAll("\"stream_experts\":true") catch unreachable,
+            .rows => |n| w.print("\"stream_experts\":{d}", .{n}) catch unreachable,
+        }
+    }
+    w.writeByte('}') catch unreachable;
     return w.buffered();
 }
 
@@ -173,7 +183,7 @@ fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
     var why: abi.Verdict = .{};
     // A placeholder only the tokenizer names (RADIO's `<image>`) comes from the engine config, which read it.
     if (b.parsed.caps.images and b.parsed.placeholder_ids.image == 0) b.parsed.placeholder_ids.image = config.image_token_id;
-    var settings_buf: [64]u8 = undefined;
+    var settings_buf: [96]u8 = undefined;
     const m = b.table.load(&.{
         .model_dir = abi.Str.of(model_dir),
         .dir = &dir,
@@ -654,4 +664,24 @@ fn perSlot(xfm: *Transformer, x: Array, n: usize) ![]Array {
         made += 1;
     }
     return rows;
+}
+
+test "driver: the load settings JSON carries the head and stream_experts settings a model states" {
+    var buf: [96]u8 = undefined;
+    var config: ModelConfig = .{ .lm_head_mxfp8_override = false };
+    try std.testing.expectEqualStrings("{\"lm_head_mxfp8\":false}", loadSettings(&buf, &config));
+    config.stream_experts_override = .on;
+    try std.testing.expectEqualStrings("{\"lm_head_mxfp8\":false,\"stream_experts\":true}", loadSettings(&buf, &config));
+    config.stream_experts_override = .{ .rows = 64 };
+    try std.testing.expectEqualStrings("{\"lm_head_mxfp8\":false,\"stream_experts\":64}", loadSettings(&buf, &config));
+}
+
+test "plugin driver: the load settings carry the model's lm_head_mxfp8 and mtp" {
+    var buf: [96]u8 = undefined;
+    var c: ModelConfig = .{};
+    try std.testing.expectEqualStrings("{}", loadSettings(&buf, &c));
+    c.mtp_override = false;
+    try std.testing.expectEqualStrings("{\"mtp\":false}", loadSettings(&buf, &c));
+    c.lm_head_mxfp8_override = false;
+    try std.testing.expectEqualStrings("{\"lm_head_mxfp8\":false,\"mtp\":false}", loadSettings(&buf, &c));
 }

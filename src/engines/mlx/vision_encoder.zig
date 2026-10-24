@@ -547,7 +547,7 @@ pub const VisionEncoder = struct {
     /// lfm2 have no video path.
     pub fn forwardVideoPatches(self: *VisionEncoder, patches: mlx.mlx_array, grid_t: u32, grid_h: u32, grid_w: u32) !mlx.mlx_array {
         if (self.qwen) |*qv| return qv.forwardVideo(patches, grid_t, grid_h, grid_w);
-        if (self.config.isEmbeddingGemma2()) return self.forwardFrames(patches, grid_t, grid_h, grid_w);
+        if (self.config.gv_budgeted) return self.forwardFrames(patches, grid_t, grid_h, grid_w);
         return error.NoVideoEncoder;
     }
 
@@ -841,7 +841,7 @@ pub const VisionEncoder = struct {
         //     max_patches = default_output_length * pooling_kernel^2. For Gemma-4: 280 * 9 = 2520.
         // Gemma 4 pads every image to its one token budget. EmbeddingGemma 2 sizes each image to a budget of its
         // own, up to 1120 tokens, which can exceed `default_output_length`: its grid is the sequence.
-        const max_patches: c_int = if (cfg.isEmbeddingGemma2()) num_patches else @intCast(cfg.vision_soft_tokens * kernel * kernel);
+        const max_patches: c_int = if (cfg.gv_budgeted) num_patches else @intCast(cfg.vision_soft_tokens * kernel * kernel);
         const num_padding: c_int = max_patches - num_patches;
         if (num_padding > 0) {
             const pad_shape = [_]c_int{ batch, num_padding, hidden };

@@ -29,5 +29,5 @@ set on the host by `MLX_SERVE_LAYA_MAX_QUESTIONS` / `_MAX_INPUT_TOKENS`; a refus
 ## The row from the root architecture table
 
 Laya typed-decision checkpoints (no root config.json: classified from `encoder/config.json` + `rl_agent_config.json`
-by `discovery.peekLayaCheckpoint`, app twin `DownloadManager.markerModelType`): ModernBERT encoder + 2 head layers +
+by this plugin's `claims`, app twin `DownloadManager.markerModelType`): ModernBERT encoder + 2 head layers +
 marker scorer + act head, fp16

@@ -21,6 +21,11 @@ pub fn toModelConfig(c: *const Config) !model.ModelConfig {
     }
     m.hidden_act = .silu;
     m.norm_has_offset = false;
+    m.legacy.thinking = .on;
+    if (c.isGlm5()) {
+        m.legacy.caps.batch_pads_kv = false;
+        m.legacy.caps.dflash_policy = true;
+    }
     m.scale_embeddings = false;
     m.has_pre_ff_norm = false;
     m.has_qk_norm = false;

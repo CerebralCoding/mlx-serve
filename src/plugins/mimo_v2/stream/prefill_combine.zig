@@ -21,7 +21,7 @@ const env = @import("mlx_host").env;
 const mlx = @import("sdk").mlx;
 /// MLX custom kernels through the plugin's launch cache (sdk_ext/metal_launch.zig).
 const mtl = @import("../../../sdk/weights/streamed/sdk_ext/metal_launch.zig");
-const ops = @import("../../deepseek_v41/stream/ops.zig");
+const ops = @import("../../../sdk/weights/streamed/ops.zig");
 const bank_mod = @import("bank.zig");
 const moe = @import("moe.zig");
 
@@ -60,7 +60,7 @@ fn paddedTable(addr: *[inplace_sources]u64, n: usize) []const u64 {
 pub const hidden: u32 = moe.hidden;
 pub const top_k: u32 = moe.top_k;
 /// The text's source slots (`deepseek_v41_experts.joinless_sources`); unused slots alias source 0.
-pub const sources: usize = @import("../../deepseek_v41/stream/experts.zig").joinless_sources;
+pub const sources: usize = @import("../../../sdk/weights/streamed/experts.zig").joinless_sources;
 /// Columns per thread (one 8-byte bf16 load per routed row), threads per threadgroup: 256 x 4 = 1,024 columns of one
 /// token per threadgroup, H / 1,024 = 4 threadgroups per token.
 pub const cols_per_thread: u32 = 4;
@@ -311,9 +311,9 @@ fn makeFixture(a: std.mem.Allocator, g: *ops.MlxOps, nt: u32, n_out: u32, seed: 
     }
     f.loc = try a.alloc(i32, 2 * nr);
     if (merge) {
-        var sc: @import("../../deepseek_v41/stream/experts.zig").JoinlessScratch(T) = .{};
+        var sc: @import("../../../sdk/weights/streamed/experts.zig").JoinlessScratch(T) = .{};
         defer sc.deinit(a);
-        _ = try @import("../../deepseek_v41/stream/experts.zig").mergeJoinless(ops.MlxOps, g, a, &f.outs, pos, f.loc, &sc);
+        _ = try @import("../../../sdk/weights/streamed/experts.zig").mergeJoinless(ops.MlxOps, g, a, &f.outs, pos, f.loc, &sc);
         try g.evalAll(f.outs.items);
         if (keep_host) {
             // The merged source's words: the merged outputs' words in join order (the concatenate's copy).
@@ -323,7 +323,7 @@ fn makeFixture(a: std.mem.Allocator, g: *ops.MlxOps, nt: u32, n_out: u32, seed: 
             var off: [256]u32 = undefined;
             const sz = sizes[0..n_out];
             @memcpy(rows[0..n_out], sz);
-            const n_src = @import("../../deepseek_v41/stream/experts.zig").planJoinless(rows[0..n_out], order[0..n_out], src[0..n_out], off[0..n_out]);
+            const n_src = @import("../../../sdk/weights/streamed/experts.zig").planJoinless(rows[0..n_out], order[0..n_out], src[0..n_out], off[0..n_out]);
             if (n_src < n_out) {
                 var merged: std.ArrayList(u16) = .empty;
                 errdefer merged.deinit(a);

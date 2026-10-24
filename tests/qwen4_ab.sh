@@ -6,7 +6,7 @@
 #   tests/qwen4_ab.sh batched <tag> [server flags...]   serial x3 per prompt, then 2-/4-stream prose + 2-stream 8.5k
 #
 # Env: QWEN4_MODEL (pack), MLX_SERVE_BIN (a control binary must sit in zig-out/bin/ for its rpath), QWEN4_AB_OUT
-# (~/claude-tmp/qwen4-ab), QWEN4_AB_PORT. Engine env (MLX_SERVE_MTP_TRACE, kill switches) passes to the server.
+# (~/claude-tmp/qwen4-ab), QWEN4_AB_PORT. Engine env (MLX_SERVE_DIAG=mtp-trace, ...) passes to the server.
 
 setopt nonomatch
 mode=$1; tag=$2; shift 2

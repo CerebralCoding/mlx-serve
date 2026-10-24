@@ -1,11 +1,12 @@
-//! The Laguna-XS decode µbench (env-gated): the dense bf16 attention GEMVs at the real shapes.
+//! The Laguna-XS decode µbench (diag `laguna-ubench`): the dense bf16 attention GEMVs at the real shapes.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const testing = std.testing;
 const transposeBf16Weight = @import("../../engines/mlx/load/weights.zig").transposeBf16Weight;
 
-test "Laguna-XS decode µbench: bf16 attention projections (MLX_SERVE_LAGUNA_UBENCH=1)" {
+test "Laguna-XS decode µbench: bf16 attention projections (diag laguna-ubench)" {
     // Laguna XS 2.1 NVFP4 keeps attention, lm_head and the layer-0 MLP in BF16
     // and quantizes only the expert projections, so ~78% of the per-token DRAM
     // budget is DENSE bf16 GEMV — not the MoE. This measures the achievable
@@ -18,7 +19,7 @@ test "Laguna-XS decode µbench: bf16 attention projections (MLX_SERVE_LAGUNA_UBE
     // layers' weights exactly ONCE from DRAM, so the bench must too — otherwise
     // it manufactures a bandwidth floor far below the real one and makes the
     // live path look pathological by comparison.
-    if (std.c.getenv("MLX_SERVE_LAGUNA_UBENCH") == null) return error.SkipZigTest;
+    if (!env.on(.LAGUNA_UBENCH)) return error.SkipZigTest;
     const io_util = @import("../../sdk/util/io_util.zig");
     const tio = testing.io;
     const s = mlx.gpuStream();

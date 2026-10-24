@@ -4,6 +4,7 @@ const builtin = @import("builtin");
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../sdk/util/log.zig");
 const plugin_config = @import("plugin/config.zig");
+const abi = @import("../../abi/plugin.zig");
 const mlx_gguf = @import("../../sdk/quant/gguf/claim.zig");
 const exl3 = @import("../../sdk/quant/exl3/format.zig");
 const sushi_pack = @import("load/sushi_adapt.zig");
@@ -481,10 +482,6 @@ pub const ModelConfig = struct {
     dsv41_engram_compressed_vocab: u32 = 0,
     dsv41_dspark_experts: u32 = 0,
     dsv41_dspark_top_k: u32 = 0,
-    /// The pack's routed experts are an EXL3 bank (`experts.bin`, the OpensourceWTF
-    /// streaming repack): mlx-stream serves it (`arch/mlx_stream.zig`) and loads its
-    /// weights. Set by `parseConfig`.
-    dsv41_stream: bool = false,
     /// A MiMo pack prepared for mlx-stream (its config declares `expert_streaming`): mlx-stream serves it
     /// (`arch/mlx_stream.zig`) and loads its weights. Set by `parseConfig`.
     mimo_stream: bool = false,
@@ -548,12 +545,17 @@ pub const ModelConfig = struct {
     lm_head_mxfp8_override: ?bool = null,
     /// The model's `ane` setting: serve it on the Neural Engine; null follows `--ane`.
     ane_override: ?bool = null,
+    /// The model's `stream_experts` setting: its routed experts read from the pack into slot rows; null = resident.
+    stream_experts_override: ?@import("../../sdk/weights/streamed.zig").Setting = null,
     /// Dense context K/V a loaded DFlash drafter keeps per trunk token, per request. Stamped at load.
     drafter_ctx_bytes_per_token: u64 = 0,
     /// `drafter` setting: null or "auto" = the in-dir probe, "off", or a path. Owned.
     drafter_override: ?[]const u8 = null,
     /// The plugin serving this pack and its parse (`engines/mlx/plugin/config.zig`); null = the legacy path.
     plugin: ?*plugin_config.Binding = null,
+    /// The facts the legacy parse declares for its family; a served config reads its plugin's (`caps`,
+    /// `defaultEnableThinking`).
+    legacy: struct { caps: abi.Caps = .{}, thinking: abi.ThinkingDefault = .unset } = .{},
     /// Every quantized projection fits the row-exact kernels (`Transformer.init`).
     row_exact_covered: bool = false,
     /// A DFlash drafter is bound (`DflashModel.bind`): its block tree needs exact verify rows.
@@ -605,6 +607,9 @@ pub const ModelConfig = struct {
     gv_image_tokens: u32 = 280,
     gv_video_tokens: u32 = 70,
     gv_video_frames: u32 = 32,
+    /// Those processors serve this pack: each image sized to its own budget (the tower's grid is its sequence,
+    /// unpadded), each video frame an image wrapped as one; the encoder embeds `messages`.
+    gv_budgeted: bool = false,
     vision_hidden_size: u32 = 768,
     vision_num_layers: u32 = 16,
     vision_num_heads: u32 = 12,
@@ -1103,7 +1108,7 @@ pub const ModelConfig = struct {
     /// (`SSMCacheEntry.qsa_score_bank`). Never in an entry. Zero without an indexer.
     pub fn qsaScoreBankBytesPerToken(self: *const ModelConfig) u64 {
         if (self.indexer_budget == 0 or self.indexer_head_dim == 0) return 0;
-        if (@import("transformer.zig").qsaScoreFusedActiveFor(1, @intCast(self.indexer_n_heads), @intCast(self.indexer_head_dim))) return 0;
+        if (@import("../../sdk/blocks/attention/sparse_block/score.zig").qsaScoreFusedActiveFor(1, @intCast(self.indexer_n_heads), @intCast(self.indexer_head_dim))) return 0;
         const n = @as(u64, self.attnCacheLayerCount());
         const hd = @as(u64, self.indexer_head_dim);
         const ratio = @max(@as(u64, self.indexer_compress_ratio), 1);
@@ -1143,9 +1148,6 @@ pub const ModelConfig = struct {
     pub fn mtpDepth(self: *const ModelConfig, configured: u32) u32 {
         if (self.plugin) |b| if (configured == 0 and b.parsed.spec.mtp_default_depth > 0) return b.parsed.spec.mtp_default_depth;
         if (configured == 0 and self.hadamard_block > 0) return 2;
-        // glm5_next: the head's acceptance decays past three drafts while every verify row
-        // costs a MoE expert read; the adaptive default settled at one draft and lost.
-        if (configured == 0 and self.isGlm5()) return 3;
         return configured;
     }
 
@@ -1157,7 +1159,7 @@ pub const ModelConfig = struct {
         if (std.mem.eql(u8, self.model_type, "nemotron_h")) return "nemotron-h-nope-v1";
         if (self.rope_llama3 != null) return "llama3-rope-v1";
         // A pool's completing indexer row stores the pool's key in its gate half; v2: the KDA q/k norm epsilon.
-        if (self.isGlm5()) return "glm5-pooled-keys-v2";
+        if (self.dsa_kv_lora_rank > 0) return "glm5-pooled-keys-v2";
         // A restored bf16 state would keep running bf16: every GDN kernel takes its state's dtype.
         if (self.ssm_state_f32) return "gdn-f32-state-v1";
         return null;
@@ -1179,15 +1181,8 @@ pub const ModelConfig = struct {
     }
 
     pub fn rowExactArch(self: *const ModelConfig) bool {
-        if (self.plugin) |b| if (b.parsed.caps.exact_drafted) return true;
+        if (self.caps().exact_drafted) return true;
         return std.mem.startsWith(u8, self.model_type, "qwen3_5") and !self.isMoe() and self.hadamard_block == 0;
-    }
-
-    /// The MTP head's hidden input is the trunk's final-normed hidden, not the
-    /// residual (Nemotron-H: more drafts kept at depth 1 and 2).
-    pub fn mtpReadsFinalNorm(self: *const ModelConfig) bool {
-        if (self.plugin) |b| if (b.parsed.spec.head_reads_final_norm) return true;
-        return self.isMimo();
     }
 
     /// Vocab rows a spec drafter proposes from (0 = all): Qwen3.8's tokenizer
@@ -1211,19 +1206,18 @@ pub const ModelConfig = struct {
         return std.mem.eql(u8, self.model_type, "mimo_v2");
     }
 
-    pub fn isGlmMoeDsa(self: *const ModelConfig) bool {
-        return std.mem.eql(u8, self.model_type, "glm_moe_dsa");
-    }
-
-    /// The pack is mlx-stream's (`arch/mlx_stream.zig`): DeepSeek-V4.1's EXL3 repack, a MiMo stream pack or a GLM-5.3
-    /// pack.
+    /// The pack is mlx-stream's (`arch/mlx_stream.zig`): a MiMo stream pack or a GLM-5.3 pack.
     pub fn mlxStream(self: *const ModelConfig) bool {
-        return self.dsv41_stream or self.mimo_stream or self.glm_stream or self.glm5_stream;
+        return self.mimo_stream or self.glm_stream or self.glm5_stream;
     }
 
     pub fn isMoe(self: *const ModelConfig) bool {
-        if (self.plugin) |b| if (b.parsed.caps.moe) return true;
-        return self.num_experts > 0;
+        return self.caps().moe or self.num_experts > 0;
+    }
+
+    /// The model's caps: its plugin's when served, else what the legacy parse declares.
+    pub fn caps(self: *const ModelConfig) abi.Caps {
+        return if (self.plugin) |b| b.parsed.caps else self.legacy.caps;
     }
 
     /// True when the full-attention layers are Multi-head Latent Attention
@@ -1280,16 +1274,6 @@ pub const ModelConfig = struct {
         return self.is_encoder_only or self.pooling_mode != null;
     }
 
-    pub fn isInkling(self: *const ModelConfig) bool {
-        return std.mem.eql(u8, self.model_type, "inkling_mm_model");
-    }
-
-    /// Google EmbeddingGemma 2 (`embedding_gemma2`): a bidirectional Gemma 4 text trunk with
-    /// projection-only per-layer inputs and an `embedding_projection` head.
-    pub fn isEmbeddingGemma2(self: *const ModelConfig) bool {
-        return std.mem.eql(u8, self.model_type, "embedding_gemma2");
-    }
-
     /// Qwen3.8-Flash-Next (`qwen4_exp`): the qwen3_5 GDN + MoE trunk wrapped
     /// in hyper-connection residual streams, with the n-gram PLE and QSA.
     pub fn isQwen4(self: *const ModelConfig) bool {
@@ -1300,12 +1284,12 @@ pub const ModelConfig = struct {
     /// reservation, pad-waste cap, checkpoint thinning, admission terms, chunk bar) was
     /// measured on qwen4_exp only, so they are opt-in by arch. Never hand-roll it at a site.
     pub fn longCtxGated(self: *const ModelConfig) bool {
-        if (self.plugin) |b| if (b.parsed.caps.long_ctx) return true;
-        return self.isQwen4();
+        return self.caps().long_ctx;
     }
 
+    /// The keys a batched tick reads per slot: past the gather floor, QSA's indexer budget and its open block.
     pub fn batchedEffectiveKvLen(self: *const ModelConfig, kv: u32, gather_on: bool, gather_min_kv: u32) u32 {
-        if (!self.isQwen4() or !gather_on) return kv;
+        if (!gather_on) return kv;
         if (kv <= gather_min_kv) return kv;
         const cap = self.indexer_budget + self.indexer_compress_ratio;
         if (cap == 0) return kv;
@@ -1318,12 +1302,13 @@ pub const ModelConfig = struct {
     }
 
     /// True when per-request SSM/conv cache entries must exist: hybrid
-    /// recurrence (LFM2/Nemotron/GDN) or Inkling's four per-layer short
-    /// convolutions. Shared by Transformer.init and the scheduler's per-slot
+    /// recurrence (LFM2/Nemotron/GDN) or a served model's recurrent entries
+    /// (Inkling's four per-layer short convolutions). Shared by Transformer.init and the scheduler's per-slot
     /// allocation — the two predicates MUST agree or slots crash on a null
     /// `ctx.ssm_entries` (the Qwen3.5-MoE class).
     pub fn needsSsmEntries(self: *const ModelConfig) bool {
-        return self.has_hybrid_layers or self.full_attention_interval > 0 or self.isInkling();
+        if (self.plugin) |b| if (b.parsed.cache.ssm_state.entries > 0) return true;
+        return self.has_hybrid_layers or self.full_attention_interval > 0;
     }
 
     /// Pure-config half of "can this arch ride the batched GatedDeltaNet
@@ -1344,18 +1329,13 @@ pub const ModelConfig = struct {
     pub fn supportsBatchedGdnDecode(self: *const ModelConfig) bool {
         // A served model says so itself; its recurrent state rides the row-axis tick.
         if (self.plugin) |b| return b.parsed.caps.batches_decode and b.parsed.cache.ssm_state.entries > 0;
-        // MiMo: attention + row-generic MoE with no per-slot recurrent state to merge.
-        if (self.isMimo()) return true;
-        // GLM-5-Next: a batched tick's tokens ride as rows of one window; each slot's KDA state and
-        // DSA cache are advanced by its own call (`Transformer.forwardGlmBatchedDecode`).
-        if (self.isGlm5()) return true;
         if (self.full_attention_interval == 0) return false; // not a GDN trunk
         if (self.has_hybrid_layers) return false; // lfm2 / nemotron_h
         if (self.is_encoder_only) return false;
         // Routed experts are row-generic; a MoE trunk batches when its per-slot
         // state is what the path merges (GDN pair, qwen4's PLE window + QSA keys).
-        if (self.isMoe() and !self.isQwen4() and !std.mem.eql(u8, self.model_type, "qwen3_5_moe")) return false;
-        if (self.isInkling() or self.isMla() or self.isGemma4Layers()) return false;
+        if (self.isMoe() and !std.mem.eql(u8, self.model_type, "qwen3_5_moe")) return false;
+        if (self.isMla() or self.isGemma4Layers()) return false;
         if (self.kda_vector_gate) return false; // bailing KDA: its own gate shape
         if (std.mem.eql(u8, self.model_type, "deepseek_v4")) return false;
         return true;
@@ -1435,7 +1415,7 @@ pub const ModelConfig = struct {
     pub fn attnScale(self: *const ModelConfig) f32 {
         if (self.qk_scale_factor > 0)
             return self.qk_scale_factor / @sqrt(@as(f32, @floatFromInt(self.head_dim)));
-        if (std.mem.eql(u8, self.model_type, "gemma4") or self.isEmbeddingGemma2()) return 1.0;
+        if (std.mem.eql(u8, self.model_type, "gemma4")) return 1.0;
         return 1.0 / @sqrt(@as(f32, @floatFromInt(self.query_pre_attn_scalar)));
     }
 
@@ -1492,56 +1472,19 @@ pub const ModelConfig = struct {
     ///
     /// First the checkpoint's OWN declaration
     /// (`generation_config.json` -> `default_chat_template_kwargs.enable_thinking`),
-    /// then the per-arch allowlist below, which stays opt-in and only where the
-    /// vendor documents thinking-on AND the shipped template agrees — never
-    /// inferred from "the template mentions enable_thinking".
+    /// then the family's default (its plugin's `ChatFacts.thinking_default`), which
+    /// stays opt-in and only where the vendor documents thinking-on AND the shipped
+    /// template agrees — never inferred from "the template mentions enable_thinking".
     pub fn defaultEnableThinking(self: *const ModelConfig, has_tools: bool) bool {
-        // The checkpoint's own declared default outranks the arch allowlist:
+        // The checkpoint's own declared default outranks the family's:
         // it is the model author speaking, not our guess about the family.
         if (self.gen_enable_thinking) |v| return v;
-        if (self.plugin) |b| switch (b.parsed.chat.thinking_default) {
-            .unset => {},
-            .off => return false,
-            .on => return true,
-            .on_with_tools => return has_tools,
+        const plugin: abi.ThinkingDefault = if (self.plugin) |b| b.parsed.chat.thinking_default else .unset;
+        return switch (if (plugin != .unset) plugin else self.legacy.thinking) {
+            .unset, .off => false,
+            .on => true,
+            .on_with_tools => has_tools,
         };
-        // muse_glimmer: tool turns keep thinking (a tool call is a `to=<fn>`
-        // header, so the recipient must stay free and the reasoning is
-        // delivered rather than paid-and-dropped). A plain chat request
-        // defaults to the prompt-committed to=user channel instead
-        // (chat.noThinkTailSuffix) — no reasoning pass runs at all.
-        // gpt_oss: UNCONDITIONALLY on. Harmony has no thinking-off mode — the
-        // template's `Reasoning: low|medium|high` sets depth, not presence, and
-        // the model opens `<|channel|>analysis<|message|>` on every turn no
-        // matter what we ask. Defaulting a silent request to off did not stop
-        // the reasoning pass, it just routed the analysis channel down the
-        // flush-text streaming branch, which leaked `<|channel|>analysis` and
-        // the reasoning itself into visible content (live 2026-08-12).
-        // Thinking-off here would have to be enforced in the PROMPT, and
-        // harmony offers no way to do it.
-        if (std.mem.eql(u8, self.model_type, "gpt_oss")) return true;
-        if (has_tools and std.mem.eql(u8, self.model_type, "muse_glimmer")) return true;
-        // bailing_hybrid (Ling 3.0): thinking-on with or without tools. The
-        // checkpoint's own template normalizes an undefined `enable_thinking`
-        // to `thinking_option = 'on'` unconditionally, and unlike muse there
-        // is no prompt-committed no-think channel to fall back to — so a
-        // tool-less silent request gated OFF just makes a reasoner answer
-        // without reasoning ("17 - 9 = 8" where the thinking arm works the
-        // word problem and answers "9 sheep are left").
-        if (std.mem.eql(u8, self.model_type, "bailing_hybrid")) return true;
-        // mimo_v2: the template thinks unless told `enable_thinking` false.
-        if (self.isMimo()) return true;
-        // k2_horizon: the template opens a think marker on every assistant
-        // turn; thinking-off is the prompt-committed closer (chat.contentChannelTail).
-        if (std.mem.eql(u8, self.model_type, "k2_horizon")) return true;
-        // glm5_next: the template opens `<think>` on every assistant turn too.
-        if (self.isGlm5()) return true;
-        // deepseek_v41: DeepSeek's template defaults `thinking_mode` to thinking.
-        if (self.isDsv41()) return true;
-        // glm_moe_dsa: the template opens `<think>` on every assistant turn, as glm5_next.
-        if (self.isGlmMoeDsa()) return true;
-
-        return false;
     }
 
     /// Fill still-null sampling recommendations with the FAMILY's documented
@@ -1745,12 +1688,7 @@ fn parseConfigWith(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
         return plugin_config.adapted(b);
     };
     errdefer config.deinit(allocator);
-    if (config.isDsv41()) {
-        config.pack_dir = try allocator.dupe(u8, model_dir);
-        const bank = try std.fmt.allocPrint(allocator, "{s}/experts.bin", .{model_dir});
-        defer allocator.free(bank);
-        config.dsv41_stream = if (std.Io.Dir.accessAbsolute(io, bank, .{})) |_| true else |_| false;
-    }
+    if (config.isDsv41()) config.pack_dir = try allocator.dupe(u8, model_dir);
     if (config.isMimo() and declaresExpertStreaming(allocator, content)) {
         config.pack_dir = try allocator.dupe(u8, model_dir);
         config.mimo_stream = true;
@@ -1759,7 +1697,7 @@ fn parseConfigWith(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
         config.pack_dir = try allocator.dupe(u8, model_dir);
         config.glm5_stream = true;
     }
-    if (config.isGlmMoeDsa()) {
+    if (std.mem.eql(u8, config.model_type, "glm_moe_dsa")) {
         // No in-tree arch serves the 744B: only an mlx-stream pack (the trunk beside an experts.bin bank) loads.
         const bank = try std.fmt.allocPrint(allocator, "{s}/experts.bin", .{model_dir});
         defer allocator.free(bank);
@@ -1892,7 +1830,7 @@ fn parseConfigWith(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
         } else |_| {}
     }
 
-    if (config.isEmbeddingGemma2()) {
+    if (config.gv_budgeted) {
         const processor_path = try std.fmt.allocPrint(allocator, "{s}/processor_config.json", .{model_dir});
         defer allocator.free(processor_path);
         if (std.Io.Dir.openFileAbsolute(io, processor_path, .{})) |processor_file| {
@@ -2951,6 +2889,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         config.tie_word_embeddings = true;
         config.is_encoder_only = true;
         config.use_bidirectional_attention = true;
+        config.gv_budgeted = true;
         // The model card's window, not the trunk's 262144-position rope table.
         config.max_position_embeddings = if (config.max_position_embeddings == 0) EMBEDDING_GEMMA2_WINDOW else @min(config.max_position_embeddings, EMBEDDING_GEMMA2_WINDOW);
         try parseEmbeddingGemma2Geometry(cfg_obj, &config);
@@ -2973,6 +2912,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // 0), the rest slide at 2048. "muse_glimmer_text" is the flat
         // text-only sibling (bare "model" prefix, no text_config).
         config.model_type = "muse_glimmer";
+        config.legacy.thinking = .on_with_tools;
         config.weight_prefix = if (jsonField(root, "text_config") != null) "model.language_model" else "model";
         config.hidden_act = .silu;
         config.norm_has_offset = true; // sandwich norms are Gemma2-centered (1+w)…
@@ -3112,6 +3052,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         std.mem.eql(u8, model_type, "qwen4_exp_text"))
     {
         config.model_type = "qwen4_exp";
+        config.legacy.caps.long_ctx = true;
         config.weight_prefix = "language_model.model";
         config.norm_has_offset = false;
         if (root.get("qwen4_norm_convention")) |v| {
@@ -3225,6 +3166,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // the existing softmax-all → top-k → renorm chain, so moe_route_norm
         // stays true and moe_sigmoid_router stays false.
         config.model_type = "gpt_oss";
+        config.legacy.thinking = .on;
         config.weight_prefix = "model";
         config.norm_has_offset = false;
         config.scale_embeddings = false;
@@ -3289,6 +3231,9 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // pooled indexer picks the tokens each query reads. Sigmoid noaux_tc MoE with one
         // ungated shared expert and a clamped SwiGLU; dense MLP on the leading layers.
         config.model_type = "glm5_next";
+        config.legacy.thinking = .on;
+        config.legacy.caps.batch_pads_kv = false;
+        config.legacy.caps.dflash_policy = true;
         config.weight_prefix = if (jsonField(root, "text_config") != null) "language_model.model" else "model";
         config.norm_has_offset = false;
         config.scale_embeddings = false;
@@ -3437,6 +3382,8 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // A Sushi pack's `quant_method: fp8` describes its trunk; its experts are EXL3.
         if (jsonField(root, "expert_quant") == null) try refuseUnconvertedMimo(cfg_obj);
         config.model_type = "mimo_v2";
+        config.legacy.thinking = .on;
+        config.legacy.caps.verify_truncates = true;
         config.weight_prefix = "model";
         config.norm_has_offset = false;
         config.scale_embeddings = false;
@@ -3576,6 +3523,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // fla/ops/kda/fused_recurrent.py for the gate. Mirror:
         // rapid-mlx/Ling-3.0-tiny-MLX-4bit.
         config.model_type = "bailing_hybrid";
+        config.legacy.thinking = .on;
         config.weight_prefix = "model";
         config.norm_has_offset = false;
         config.scale_embeddings = false;
@@ -4048,6 +3996,8 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // these fields and adds the dsv41_* block below.
         const is_v41 = std.mem.eql(u8, model_type, "deepseek_v41");
         config.model_type = if (is_v41) "deepseek_v41" else "deepseek_v4";
+        config.legacy.caps.prefix_cache = false;
+        if (is_v41) config.legacy.thinking = .on;
         config.weight_prefix = ""; // release ships bare names (embed.weight, layers.N....)
         config.norm_has_offset = false;
         config.scale_embeddings = false;
@@ -4204,6 +4154,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // host reads the shell fields the common block parsed: vocab, hidden, layers,
         // eos ids, context, untied head.
         config.model_type = "glm_moe_dsa";
+        config.legacy.thinking = .on;
         config.has_sliding_window = false;
         if (jsonField(cfg_obj, "n_routed_experts")) |v| {
             if (v == .integer) config.num_experts = try jsonU32(v);
@@ -4574,6 +4525,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             // sizes (`mova_num_experts` > 0) are a different attention and
             // are not served.
             config.model_type = "k2_horizon";
+            config.legacy.thinking = .on;
             if (jsonField(cfg_obj, "layernorm_num_groups")) |v| {
                 if (v == .integer and v.integer > 1) config.norm_groups = try jsonU32(v);
             }
@@ -5235,7 +5187,7 @@ test "Qwen4 norm convention and embedded table layout are independent" {
     var weights = Weights.init(allocator);
     defer weights.deinit();
     try loadSafetensorsFile(allocator, &weights, path, s, .{ .skip = qwen4_exp.embeddedTensorName, .defer_qwen4_norms = true });
-    var embedded_delta_config = ModelConfig{ .model_type = "qwen4_exp", .qwen4_norm_convention = .delta, .embedded_ple_payload_bytes = 120 };
+    var embedded_delta_config = ModelConfig{ .model_type = "qwen4_exp", .legacy = .{ .caps = .{ .long_ctx = true } }, .qwen4_norm_convention = .delta, .embedded_ple_payload_bytes = 120 };
     try resolveAndFoldQwen4Norms(&embedded_delta_config, &weights, s, "fixture");
     try testing.expect(weights.get(shard) == null);
     try testing.expect(weights.get(scale) == null);
@@ -5249,21 +5201,21 @@ test "Qwen4 norm convention and embedded table layout are independent" {
     var converted = Weights.init(allocator);
     defer converted.deinit();
     try loadSafetensorsFile(allocator, &converted, path, s, .{ .defer_qwen4_norms = true });
-    var external_folded_config = ModelConfig{ .model_type = "qwen4_exp" };
+    var external_folded_config = ModelConfig{ .model_type = "qwen4_exp", .legacy = .{ .caps = .{ .long_ctx = true } } };
     try resolveAndFoldQwen4Norms(&external_folded_config, &converted, s, "fixture");
     try testing.expect(converted.get(shard) != null);
     try testing.expect(converted.get(scale) != null);
     var external_delta = Weights.init(allocator);
     defer external_delta.deinit();
     try loadSafetensorsFile(allocator, &external_delta, path, s, .{ .defer_qwen4_norms = true });
-    var external_delta_config = ModelConfig{ .model_type = "qwen4_exp", .qwen4_norm_convention = .delta };
+    var external_delta_config = ModelConfig{ .model_type = "qwen4_exp", .legacy = .{ .caps = .{ .long_ctx = true } }, .qwen4_norm_convention = .delta };
     try resolveAndFoldQwen4Norms(&external_delta_config, &external_delta, s, "fixture");
     try testing.expect(external_delta.get(shard) != null);
     try testing.expect(external_delta.get(scale) != null);
     var embedded_folded = Weights.init(allocator);
     defer embedded_folded.deinit();
     try loadSafetensorsFile(allocator, &embedded_folded, path, s, .{ .skip = qwen4_exp.embeddedTensorName, .defer_qwen4_norms = true });
-    var embedded_folded_config = ModelConfig{ .model_type = "qwen4_exp", .qwen4_norm_convention = .folded, .embedded_ple_payload_bytes = 120 };
+    var embedded_folded_config = ModelConfig{ .model_type = "qwen4_exp", .legacy = .{ .caps = .{ .long_ctx = true } }, .qwen4_norm_convention = .folded, .embedded_ple_payload_bytes = 120 };
     try resolveAndFoldQwen4Norms(&embedded_folded_config, &embedded_folded, s, "fixture");
     try testing.expect(embedded_folded.get(shard) == null);
     try testing.expect(embedded_folded.get(scale) == null);
@@ -5322,7 +5274,7 @@ test "Qwen4 loaded indexer norms infer only unanimous finite full-attention anch
             const values = [_]f32{ case.value, case.value, case.value, case.value };
             try addQwen4NormTestArray(&weights, name, &values, &shape, case.dtype, s);
         }
-        const config = ModelConfig{ .model_type = "qwen4_exp", .num_hidden_layers = 2, .full_attention_interval = 1, .indexer_head_dim = 4 };
+        const config = ModelConfig{ .model_type = "qwen4_exp", .legacy = .{ .caps = .{ .long_ctx = true } }, .num_hidden_layers = 2, .full_attention_interval = 1, .indexer_head_dim = 4 };
         try testing.expectEqual(case.expected, try inferLoadedQwen4Norms(&config, &weights, s));
     }
 
@@ -5331,7 +5283,7 @@ test "Qwen4 loaded indexer norms infer only unanimous finite full-attention anch
     const values = [_]f32{ 0.05, 0.05, 0.05, 0.05 };
     try addQwen4NormTestArray(&weights, names[2], &values, &shape, .float32, s);
     try addQwen4NormTestArray(&weights, names[3], &values, &shape, .float32, s);
-    const hybrid = ModelConfig{ .model_type = "qwen4_exp", .num_hidden_layers = 2, .full_attention_interval = 2, .indexer_head_dim = 4 };
+    const hybrid = ModelConfig{ .model_type = "qwen4_exp", .legacy = .{ .caps = .{ .long_ctx = true } }, .num_hidden_layers = 2, .full_attention_interval = 2, .indexer_head_dim = 4 };
     try testing.expectEqual(Qwen4NormConvention.delta, try inferLoadedQwen4Norms(&hybrid, &weights, s));
 }
 
@@ -5344,7 +5296,7 @@ test "Qwen4 loaded indexer norms refuse missing malformed mixed and nonfinite an
         "language_model.model.layers.1.self_attn.indexer.q_layernorm.weight",
         "language_model.model.layers.1.self_attn.indexer.k_layernorm.weight",
     };
-    const config = ModelConfig{ .model_type = "qwen4_exp", .num_hidden_layers = 2, .full_attention_interval = 1, .indexer_head_dim = 4 };
+    const config = ModelConfig{ .model_type = "qwen4_exp", .legacy = .{ .caps = .{ .long_ctx = true } }, .num_hidden_layers = 2, .full_attention_interval = 1, .indexer_head_dim = 4 };
     for ([_]struct { bad: usize, value: f32 = 0.05, dtype: mlx.mlx_dtype = .float32, shape: []const c_int = &.{4}, omit: bool = false, expected: anyerror }{
         .{ .bad = 0, .omit = true, .expected = error.MissingQwen4NormAnchor },
         .{ .bad = 3, .omit = true, .expected = error.MissingQwen4NormAnchor },
@@ -5383,7 +5335,7 @@ test "Qwen4 delta folds f16 before bf16 narrowing and resolves the shared MTP ma
     const mtp = "language_model.model.mtp.pre_fc_norm_hidden.weight";
     try addQwen4NormTestArray(&weights, trunk, &values, &shape, .float16, s);
     try addQwen4NormTestArray(&weights, mtp, &values, &shape, .float16, s);
-    var config = ModelConfig{ .model_type = "qwen4_exp", .qwen4_norm_convention = .delta, .embedded_ple_payload_bytes = 120 };
+    var config = ModelConfig{ .model_type = "qwen4_exp", .legacy = .{ .caps = .{ .long_ctx = true } }, .qwen4_norm_convention = .delta, .embedded_ple_payload_bytes = 120 };
     try resolveAndFoldQwen4Norms(&config, &weights, s, "fixture");
     try testing.expectEqual(Qwen4NormConvention.delta, config.qwen4_norm_convention.?);
     for ([_][]const u8{ trunk, mtp }) |name| {
@@ -5408,7 +5360,7 @@ test "Qwen4 folded f16 keeps generic narrowing after convention resolution" {
         var weights = Weights.init(testing.allocator);
         defer weights.deinit();
         try addQwen4NormTestArray(&weights, name, &values, &shape, .float16, s);
-        var config = ModelConfig{ .model_type = "qwen4_exp", .qwen4_norm_convention = marker };
+        var config = ModelConfig{ .model_type = "qwen4_exp", .legacy = .{ .caps = .{ .long_ctx = true } }, .qwen4_norm_convention = marker };
         try resolveAndFoldQwen4Norms(&config, &weights, s, "fixture");
         try testing.expectEqual(Qwen4NormConvention.folded, config.qwen4_norm_convention.?);
         try testing.expectEqual(if (narrow1dEnabled()) mlx.mlx_dtype.bfloat16 else mlx.mlx_dtype.float16, mlx.mlx_array_dtype(weights.get(name).?));
@@ -5818,53 +5770,29 @@ test "applyFamilySamplingDefaults never overrides explicit generation_config val
     try testing.expectEqual(@as(?f32, 0.8), partial.gen_top_p);
 }
 
-test "defaultEnableThinking: opt-in per arch, and every existing arch stays off" {
-    // No prior arch opts in — including the families whose templates merely
-    // MENTION enable_thinking, which is not evidence of a thinking-on default.
-    for ([_][]const u8{ "qwen3", "qwen3_5_moe", "gemma4", "gemma3_text", "laguna", "deepseek_v4", "inkling_mm_model", "llama", "hy_v3", "lfm2" }) |t| {
-        const c = ModelConfig{ .model_type = t };
-        try testing.expect(!c.defaultEnableThinking(false));
-        try testing.expect(!c.defaultEnableThinking(true));
+test "defaultEnableThinking: the family default, its plugin's over the legacy parse's" {
+    // Unset and off never think; muse_glimmer thinks only with tools; the reasoners (gpt_oss, Ling, MiMo, K2,
+    // GLM-5.3, DeepSeek-V4.1) always.
+    try testing.expect(!(ModelConfig{}).defaultEnableThinking(true));
+    const muse: ModelConfig = .{ .legacy = .{ .thinking = .on_with_tools } };
+    try testing.expect(!muse.defaultEnableThinking(false) and muse.defaultEnableThinking(true));
+    const k2_off: ModelConfig = .{ .legacy = .{ .thinking = .on }, .gen_enable_thinking = false };
+    try testing.expect(!k2_off.defaultEnableThinking(true));
+    for ([_][]const u8{ mimo_v2_pack_json, glm5_next_pack_json, dsv41_release_config, glm_moe_dsa_config }) |json| {
+        var c = try parseConfigFromJson(testing.allocator, json);
+        defer c.deinit(testing.allocator);
+        try testing.expect(c.defaultEnableThinking(false) and c.defaultEnableThinking(true));
     }
-    // muse_glimmer opts in only WITH tools: recipient selection is where its
-    // reasoning earns its keep. A plain chat request defaults to the
-    // prompt-committed to=user channel (chat.noThinkTailSuffix) — a real
-    // skip, so there is nothing to deliver or drop.
-    const muse = ModelConfig{ .model_type = "muse_glimmer" };
-    try testing.expect(!muse.defaultEnableThinking(false));
-    try testing.expect(muse.defaultEnableThinking(true));
-    // bailing_hybrid opts IN on BOTH arms: Ling 3.0 ships as a reasoner and
-    // its template normalizes an undefined enable_thinking to 'on' with no
-    // reference to tools. Gating it on has_tools (as muse is) contradicted the
-    // checkpoint and left a tool-less silent request answering without
-    // reasoning — muse can do that because its prompt commits a to=user
-    // channel, and this arch has no such fallback.
-    const ling = ModelConfig{ .model_type = "bailing_hybrid" };
-    try testing.expect(ling.defaultEnableThinking(false));
-    try testing.expect(ling.defaultEnableThinking(true));
-    // k2_horizon: the template opens a think marker on every assistant turn
-    // and the pack declares no default; a declared off still wins.
-    const k2 = ModelConfig{ .model_type = "k2_horizon" };
-    try testing.expect(k2.defaultEnableThinking(false));
-    try testing.expect(k2.defaultEnableThinking(true));
-    const k2_off = ModelConfig{ .model_type = "k2_horizon", .gen_enable_thinking = false };
-    try testing.expect(!k2_off.defaultEnableThinking(false));
-    // gpt_oss opts in with AND without tools. Unlike muse there is no
-    // thinking-off prompt to commit: harmony's `Reasoning: low|medium|high`
-    // sets depth, not presence, so the model opens an analysis channel on
-    // every turn. Defaulting a silent request off did not skip the reasoning
-    // pass — it sent the analysis channel down the flush-text streaming
-    // branch, leaking `<|channel|>analysis` and the reasoning into content.
-    const goss = ModelConfig{ .model_type = "gpt_oss" };
-    try testing.expect(goss.defaultEnableThinking(false));
-    try testing.expect(goss.defaultEnableThinking(true));
-    // deepseek_v41: DeepSeek's own template defaults `thinking_mode` to thinking.
-    const v41 = ModelConfig{ .model_type = "deepseek_v41" };
-    try testing.expect(v41.defaultEnableThinking(false));
-    try testing.expect(v41.defaultEnableThinking(true));
+    const t: abi.ModelTable = .{ .name = .of("t"), .claims = undefined, .parse = undefined, .free_parsed = undefined, .bill = undefined, .load = undefined, .unload = undefined, .forward = undefined, .cache = undefined, .weights = undefined };
+    var b: plugin_config.Binding = .{ .table = &t, .parsed = .{ .chat = .{ .thinking_default = .off } } };
+    var served: ModelConfig = .{ .legacy = .{ .thinking = .on } };
+    served.plugin = &b;
+    try testing.expect(!served.defaultEnableThinking(true));
+    b.parsed.chat.thinking_default = .unset;
+    try testing.expect(served.defaultEnableThinking(true));
 }
 
-test "defaultEnableThinking: the checkpoint's own generation_config default outranks the arch allowlist" {
+test "defaultEnableThinking: the checkpoint's own generation_config default outranks the family's" {
     // A thinking model whose arch is not on the allowlist still thinks when
     // its own generation_config declares it — this is the case a silent
     // request used to lose (3 tokens and no reasoning where the same weights
@@ -5874,7 +5802,7 @@ test "defaultEnableThinking: the checkpoint's own generation_config default outr
     try testing.expect(on.defaultEnableThinking(false));
     try testing.expect(on.defaultEnableThinking(true));
     // And a checkpoint that declares thinking OFF turns an opted-in arch off.
-    var off = ModelConfig{ .model_type = "bailing_hybrid" };
+    var off = ModelConfig{ .model_type = "bailing_hybrid", .legacy = .{ .thinking = .on } };
     off.gen_enable_thinking = false;
     try testing.expect(!off.defaultEnableThinking(false));
     try testing.expect(!off.defaultEnableThinking(true));
@@ -7411,7 +7339,7 @@ test "parseConfig: a MiMo pack that declares expert_streaming is mlx-stream's; a
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = marked });
     var pack = try parseConfig(io, testing.allocator, dir);
     defer pack.deinit(testing.allocator);
-    try testing.expect(pack.isMimo() and pack.mimo_stream and pack.mlxStream() and !pack.dsv41_stream);
+    try testing.expect(pack.isMimo() and pack.mimo_stream and pack.mlxStream());
     try testing.expectEqualStrings(dir, pack.pack_dir.?);
     var w = try loadModelWeights(io, testing.allocator, dir, &pack, false);
     defer w.deinit();
@@ -7437,25 +7365,6 @@ test "parseConfig: a glm5_next pack that declares expert_streaming is mlx-stream
     try testing.expect(pack.isGlm5() and pack.glm5_stream and pack.mlxStream() and !pack.mimo_stream and !pack.glm_stream);
     try testing.expectEqualStrings(dir, pack.pack_dir.?);
     var w = try loadModelWeights(io, testing.allocator, dir, &pack, false);
-    defer w.deinit();
-    try testing.expectEqual(@as(u32, 0), w.count());
-}
-
-test "parseConfig: a deepseek_v41 pack with an EXL3 bank is mlx-stream's, and the host loads none of its weights" {
-    const io = testing.io;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = dsv41_release_config });
-    var buf: [512]u8 = undefined;
-    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
-    var plain = try parseConfig(io, testing.allocator, dir);
-    defer plain.deinit(testing.allocator);
-    try testing.expect(!plain.dsv41_stream);
-    try tmp.dir.writeFile(io, .{ .sub_path = "experts.bin", .data = "" });
-    var repack = try parseConfig(io, testing.allocator, dir);
-    defer repack.deinit(testing.allocator);
-    try testing.expect(repack.dsv41_stream);
-    var w = try loadModelWeights(io, testing.allocator, dir, &repack, false);
     defer w.deinit();
     try testing.expectEqual(@as(u32, 0), w.count());
 }
@@ -7492,7 +7401,7 @@ test "parseConfig: a glm_moe_dsa pack with an experts.bin bank is mlx-stream's; 
     try tmp.dir.writeFile(io, .{ .sub_path = "experts.bin", .data = "" });
     var pack = try parseConfig(io, testing.allocator, dir);
     defer pack.deinit(testing.allocator);
-    try testing.expect(pack.glm_stream and pack.mlxStream() and !pack.dsv41_stream and !pack.mimo_stream);
+    try testing.expect(pack.glm_stream and pack.mlxStream() and !pack.mimo_stream);
     try testing.expectEqualStrings(dir, pack.pack_dir.?);
     var w = try loadModelWeights(io, testing.allocator, dir, &pack, false);
     defer w.deinit();
@@ -7771,7 +7680,7 @@ const embedding_gemma2_config_json =
 
 test "ModelConfig: embedding_gemma2 is a bidirectional Gemma 4 trunk with projection-only per-layer inputs" {
     const config = try parseConfigFromJson(testing.allocator, embedding_gemma2_config_json);
-    try testing.expect(config.isEmbeddingGemma2());
+    try testing.expect(config.gv_budgeted);
     try testing.expectEqualStrings("language_model", config.weight_prefix);
     // An encoder: /v1/embeddings accepts it, chat 400s it, and the input is wrapped <bos>…<eos>.
     try testing.expect(config.is_encoder_only);
@@ -7788,7 +7697,6 @@ test "ModelConfig: embedding_gemma2 is a bidirectional Gemma 4 trunk with projec
     try testing.expect(!config.norm_has_offset);
     try testing.expect(config.has_qk_norm and config.has_v_norm and config.has_pre_ff_norm);
     try testing.expect(config.scale_embeddings);
-    try testing.expectEqual(@as(f32, 1.0), config.attnScale());
     try testing.expectEqual(@as(u32, 512), config.hidden_size_per_layer_input);
     try testing.expectEqual(@as(f32, 1_000_000.0), config.rope_theta);
     try testing.expectEqual(@as(f32, 10_000.0), config.rope_local_base_freq);
@@ -9514,7 +9422,7 @@ test "parseConfigFromJson: qwen4_exp (Qwen3.8-Flash-Next) reads the hyper-connec
     try testing.expectEqual(@as(u64, 12 * 128 * 2 / 4), c.qsaHistoryBytesPerToken());
     try testing.expectEqual(@as(u64, 12 * @as(u64, @intCast(@import("transformer.zig").QSA_RING_ROWS)) * 128 * 2), c.qsaRingBytes());
     try testing.expect(c.attn_output_gate and c.kda_sigmoid_out_gate and !c.has_final_norm and !c.norm_has_offset);
-    try testing.expect(c.isMoe() and c.supportsBatchedGdnDecode()); // per-slot state on the SSMCacheEntry: batches
+    try testing.expect(c.isMoe() and c.longCtxGated());
     try testing.expectEqual(@as(f32, 0.25), c.partial_rotary_factor);
     try testing.expectEqual(@as(f32, 10000000.0), c.rope_theta);
     try testing.expect(!c.qwen_vision and !c.has_vision);
@@ -9885,7 +9793,7 @@ test "parseConfigFromJson: --config-overrides replaces scalars and arrays, creat
 
 test "ModelConfig.longCtxGated: the long-context blast radius is ONE predicate, qwen4_exp only" {
     const t = std.testing;
-    var qwen4 = ModelConfig{ .model_type = "qwen4_exp" };
+    var qwen4 = ModelConfig{ .model_type = "qwen4_exp", .legacy = .{ .caps = .{ .long_ctx = true } } };
     try t.expect(qwen4.longCtxGated());
     try t.expect(qwen4.ssdFirstCapable());
 

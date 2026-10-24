@@ -32,6 +32,6 @@ pub fn recordLoadError(sch: *Scheduler, err_name: []const u8) void {
 /// `.gguf` file (owned by the conn thread, freed after the load completes —
 /// the engines dupe/copy what they keep) and which embedded engine serves it.
 pub const GgufRoute = struct {
-    path: []u8,
+    path: []const u8,
     engine: gguf_meta.Engine,
 };

@@ -44,7 +44,7 @@ const verifyQmmTile = @import("verify_qmm_nax.zig").verifyQmmTile;
 // availability probes) → us (plan: todo-m5-nax.md). The kernel object is
 // NEVER built — not just never dispatched — where the probe is false:
 // matmul2d<.., execution_simdgroup> pipeline creation can fail on non-G17
-// hardware. MLX_SERVE_FORCE_GPU_FAMILY_FALLBACK=1 pretends the units are
+// hardware. diag force-gpu-family-fallback pretends the units are
 // absent (QA rehearsal of the exact M1-M4 path on an M5). The takeover width
 // is 8 (7 at 8-bit); their dispatcher keeps plain SIMD through M=6, but our
 // SIMD lanes differ — measure, don't inherit.
@@ -438,7 +438,7 @@ pub fn mixedNaxShapeEnabled(bits: u32, group_size: u32, n: c_int, m: c_int) bool
 /// (`MIXED_PLAIN=1`, which adopts the 1024-wide K/V projections too) measured
 /// only 1.01-1.05x on the same pack. Excluding them is worth ~10 points.
 ///
-/// MEASURED, Flash Next oQ4e on an M5 Ultra (`MLX_SERVE_VQMM_FN_UBENCH`, two
+/// MEASURED, Flash Next oQ4e on an M5 Ultra (diag `vqmm-fn-ubench`, two
 /// runs): 5-bit g128 z/out and 5/6-bit g64 o (N 2560/6144) at 0.79-0.86x stock
 /// at M=7, 0.95-0.98x at M 3-5. Shared-expert shapes (N/K 640) lose and stay below the floor.
 pub fn mixedPlainShapeEnabled(bits: u32, group_size: u32, n: c_int) bool {

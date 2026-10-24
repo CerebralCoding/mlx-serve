@@ -11,6 +11,7 @@
 const std = @import("std");
 const env = @import("../../env.zig");
 const ffi = @import("ffi.zig");
+const load = @import("load.zig");
 const log = @import("../../sdk/util/log.zig");
 
 /// The llama shim's log sink: llama.cpp's warnings and errors stay visible, the rest
@@ -36,9 +37,6 @@ pub const OpenOptions = struct {
     /// Without `mtp_path`, load the trunk's own NextN heads when it ships them.
     load_mtp: bool = false,
 };
-
-/// Sequences one context holds at most.
-pub const MAX_SEQS = 64;
 
 pub const ContextOptions = struct {
     /// Context per sequence; 0 = the model's trained context.
@@ -227,7 +225,7 @@ pub const LlamaEngine = struct {
     }
 
     pub fn createContext(self: *LlamaEngine, opts: ContextOptions) Error!*LlamaContext {
-        const n_seq: u32 = std.math.clamp(opts.n_seq, 1, MAX_SEQS);
+        const n_seq: u32 = std.math.clamp(opts.n_seq, 1, load.max_seqs);
         const params: ffi.CtxParams = .{
             .n_ctx = opts.ctx_size,
             .n_seq = @intCast(n_seq),
@@ -259,37 +257,6 @@ pub const LlamaEngine = struct {
         for (seqs, 0..) |*s, i| s.* = .{ .ctx = ctx, .id = @intCast(i) };
         ctx.* = .{ .allocator = self.allocator, .engine = self, .handle = raw, .seqs = seqs };
         return ctx;
-    }
-};
-
-/// KV quant for the llama.cpp engine. Mapped from the CLI flag onto ggml types;
-/// F16 is the dense default, Q8_0 halves KV bytes, Q4_0 quarters them.
-pub const LlamaKvQuant = enum(u8) {
-    off, // F16 (default)
-    q8, // Q8_0 (~2x compression, near-lossless on most archs)
-    q4, // Q4_0 (~4x compression, some quality impact)
-
-    pub fn fromString(s: []const u8) ?LlamaKvQuant {
-        if (std.mem.eql(u8, s, "off") or std.mem.eql(u8, s, "f16") or std.mem.eql(u8, s, "F16")) return .off;
-        if (std.mem.eql(u8, s, "8") or std.mem.eql(u8, s, "q8") or std.mem.eql(u8, s, "Q8_0") or std.mem.eql(u8, s, "q8_0")) return .q8;
-        if (std.mem.eql(u8, s, "4") or std.mem.eql(u8, s, "q4") or std.mem.eql(u8, s, "Q4_0") or std.mem.eql(u8, s, "q4_0")) return .q4;
-        return null;
-    }
-
-    pub fn ggmlType(self: LlamaKvQuant) i32 {
-        return switch (self) {
-            .off => 0, // shim treats 0 as "use libllama default"
-            .q8 => ffi.GgmlType.Q8_0,
-            .q4 => ffi.GgmlType.Q4_0,
-        };
-    }
-
-    pub fn label(self: LlamaKvQuant) []const u8 {
-        return switch (self) {
-            .off => "F16",
-            .q8 => "Q8_0",
-            .q4 => "Q4_0",
-        };
     }
 };
 
@@ -327,7 +294,7 @@ pub const LlamaContext = struct {
     /// `seqs[i]` (distinct sequences). Each then samples from its own row.
     pub fn step(self: *LlamaContext, seqs: []const *LlamaSeq, tokens: []const i32) Error!void {
         std.debug.assert(seqs.len == tokens.len);
-        var ids_buf: [MAX_SEQS]i32 = undefined;
+        var ids_buf: [load.max_seqs]i32 = undefined;
         const ids = ids_buf[0..seqs.len];
         for (seqs, ids) |s, *id| id.* = s.id;
         var err_buf: [256]u8 = undefined;
@@ -434,6 +401,12 @@ pub const LlamaSeq = struct {
     pub fn sample(self: *LlamaSeq, s: Sampling, rng: *u64) i32 {
         const temp: f32 = if (s.temperature < 0.01) 0 else s.temperature;
         return ffi.mlx_llama_seq_sample(self.ctx.handle, self.id, temp, s.top_k, s.top_p, s.min_p, rng);
+    }
+
+    /// The row the last decode left for this sequence, writable: `sample` draws from it. Null when there is none.
+    pub fn logits(self: *LlamaSeq) ?[]f32 {
+        const p = ffi.mlx_llama_seq_logits(self.ctx.handle, self.id) orelse return null;
+        return p[0..@intCast(self.ctx.engine.nVocab())];
     }
 
     pub fn argmax(self: *LlamaSeq) i32 {

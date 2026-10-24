@@ -19,7 +19,7 @@ const vqmmTileFrom = @import("verify_qmm.zig").vqmmTileFrom;
 var vqmm_nax_avail_cache: ?bool = null;
 
 /// M5-class NAX units present: "applegpu_g17" GPU + macOS >= 26.2.
-/// MLX_SERVE_FORCE_GPU_FAMILY_FALLBACK=1 pretends the units are absent so
+/// diag force-gpu-family-fallback pretends the units are absent so
 /// an M5 can rehearse the exact M1-M4 plain-SIMD path (QA switch, mirrored
 /// from MTPLX). Cached for the process lifetime (inference-thread caller
 /// discipline, same as the kernel caches).

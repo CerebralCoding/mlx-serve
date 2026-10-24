@@ -7,7 +7,7 @@
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const kc = @import("../../sdk/testing/kernel_contract/root.zig");
-const hostq = @import("../../sdk/testing/kernel_contract/hostq.zig");
+const host = @import("../../sdk/testing/kernel_contract/host.zig");
 const fa = @import("../../sdk/blocks/mlp/fused_activations.zig");
 const moe_affine4 = @import("../../sdk/blocks/moe/moe_affine4.zig");
 
@@ -41,7 +41,7 @@ pub const Affine4 = struct {
     both: bool = false,
     sp: spec.Spec = undefined,
     /// gate, up, down; then the ungated shared expert's gate, up, down.
-    banks: [6]hostq.Affine = @splat(.{ .bits = 4, .gs = GS, .n = 0, .k = 0 }),
+    banks: [6]host.Affine = @splat(.{ .bits = 4, .gs = GS, .n = 0, .k = 0 }),
     shape: Shape = undefined,
     x: []f64 = &.{},
     act: []f64 = &.{},
@@ -137,7 +137,7 @@ pub const Affine4 = struct {
         const a = self.rig.a;
         self.shape = shape;
         self.freeVecs();
-        if (self.table.len == 0) self.table = try hostq.values(a, try fa.swigluSigTable(self.rig.stream(), DT, std.heap.c_allocator));
+        if (self.table.len == 0) self.table = try host.read(a, try fa.swigluSigTable(self.rig.stream(), DT, std.heap.c_allocator), self.rig.stream());
         var prng = std.Random.DefaultPrng.init(seed);
         const rng = prng.random();
         const topk = shape.rows;
@@ -161,17 +161,17 @@ pub const Affine4 = struct {
             // Positive under the non-finite fill: an infinite weight then gives one signed infinity however its
             // group's x is split over the lanes (mixed-sign partial sums would make it NaN on some splits only).
             const lo: f64 = if (fill == .nonfinite) 0.25 else -2;
-            hostq.uniform(rng, self.x, lo, 2, DT);
-            hostq.uniform(rng, self.act, lo, 2, DT);
+            host.uniformInto(rng, self.x, lo, 2, DT);
+            host.uniformInto(rng, self.act, lo, 2, DT);
         }
         self.inds = try a.alloc(f64, topk);
         for (self.inds, 0..) |*v, j| v.* = @floatFromInt(j);
         rng.shuffle(f64, self.inds);
         self.scores = try a.alloc(f64, topk);
-        for (self.scores) |*v| v.* = if (stress) 1 else hostq.round(DT, 0.05 + 0.25 * rng.float(f64));
+        for (self.scores) |*v| v.* = if (stress) 1 else host.rt(DT, 0.05 + 0.25 * rng.float(f64));
         self.sdown = try a.alloc(f64, h);
-        for (self.sdown) |*v| v.* = if (stress) 0 else hostq.round(DT, -1 + 2 * rng.float(f64));
-        self.glog = hostq.round(DT, -3 + 6 * rng.float(f64));
+        for (self.sdown) |*v| v.* = if (stress) 0 else host.rt(DT, -1 + 2 * rng.float(f64));
+        self.glog = host.rt(DT, -3 + 6 * rng.float(f64));
         if (fill == .nonfinite) {
             // NaN in a scale, +Inf and -Inf in a bias, each in its own slot's own output row's first group:
             // one output each goes non-finite (gate+up: that slot's row; down: that row of the sum).
@@ -192,7 +192,7 @@ pub const Affine4 = struct {
         return true;
     }
 
-    fn bank3(rig: *metal.Rig, b: *const hostq.Affine, lead: ?usize, n: usize, k: usize) ![3]mlx.mlx_array {
+    fn bank3(rig: *metal.Rig, b: *const host.Affine, lead: ?usize, n: usize, k: usize) ![3]mlx.mlx_array {
         const ci: c_int = @intCast(n);
         var w: [3]mlx.mlx_array = undefined;
         if (lead) |e| {
@@ -250,7 +250,7 @@ pub const Affine4 = struct {
     }
 
     /// Row `r` of `b` against `x` on the kernels' formula: per group `s * sum(q x) + b * sum(x)`, and its magnitude.
-    fn rowDot(b: *const hostq.Affine, r: usize, x: []const f64) [2]f64 {
+    fn rowDot(b: *const host.Affine, r: usize, x: []const f64) [2]f64 {
         var v: f64 = 0;
         var m: f64 = 0;
         for (0..b.k / GS) |gi| {
@@ -308,8 +308,8 @@ pub const Affine4 = struct {
             const sn = self.slots() * n;
             for (want, allow, 0..) |*y, *l, at| {
                 if (!exact) {
-                    const gt = hostq.round(DT, dv[at]);
-                    y.* = hostq.round(DT, gt * self.table[spec.toBf16(@floatCast(gt))]) * hostq.round(DT, dv[sn + at]);
+                    const gt = host.rt(DT, dv[at]);
+                    y.* = host.rt(DT, gt * self.table[spec.toBf16(@floatCast(gt))]) * host.rt(DT, dv[sn + at]);
                     l.* = 0;
                     continue;
                 }
@@ -350,7 +350,7 @@ pub const Affine4 = struct {
             const sig = 1 / (1 + @exp(-self.glog));
             const sd = self.sdown[j];
             if (!exact) {
-                y.* = hostq.round(DT, v) + hostq.round(DT, hostq.round(DT, sig) * sd);
+                y.* = host.rt(DT, v) + host.rt(DT, host.rt(DT, sig) * sd);
                 l.* = 0;
                 continue;
             }
@@ -411,7 +411,7 @@ pub const Affine4 = struct {
         self.epilogue(self.dv, self.dm, at == .shapes, buf[0..n], buf[n .. 2 * n]);
         const out = self.rig.outputBytes();
         for (buf[2 * n ..], 0..) |*g, i| g.* = spec.read(.bf16, out, i);
-        return hostq.within(&self.msg, at, buf[2 * n ..], buf[0..n], buf[n .. 2 * n]);
+        return host.within(&self.msg, at, buf[2 * n ..], buf[0..n], buf[n .. 2 * n]);
     }
 
     /// Both dispatches through the declared launches, then `moe_affine4.decode` on the same inputs: the bytes of
@@ -433,8 +433,6 @@ pub const Affine4 = struct {
         const B = moe_affine4.Bank;
         const shared: ?moe_affine4.Shared = if (self.shared == .gated) .{ .down = dn[6], .logit = dn[7] } else null;
         const ungated: ?moe_affine4.Ungated = if (self.shared == .ungated) .{ .gate = B{ .w = gu[9], .s = gu[10], .b = gu[11] }, .up = B{ .w = gu[12], .s = gu[13], .b = gu[14] }, .down = B{ .w = dn[8], .s = dn[9], .b = dn[10] } } else null;
-        moe_affine4.override = true;
-        defer moe_affine4.override = null;
         const y = (try moe_affine4.decode(self.rig.stream(), gu[0], B{ .w = gu[1], .s = gu[2], .b = gu[3] }, B{ .w = gu[4], .s = gu[5], .b = gu[6] }, B{ .w = dn[1], .s = dn[2], .b = dn[3] }, null, shared, ungated, gu[7], dn[5], gu[8], GS)) orelse return error.Declined;
         defer _ = mlx.mlx_array_free(y);
         return .{ ours, try self.rig.bytesOf(&.{y}) };
@@ -445,10 +443,10 @@ fn gamma32(d: usize) f64 {
     return spec.gamma(@floatFromInt(d), 0x1p-24);
 }
 
-/// Mirrored integer rows (`hostq.mirroredWide`) with the second half reversed: lane-strided partial sums leave fp16's
+/// Mirrored integer rows (`host.mirroredWide`) with the second half reversed: lane-strided partial sums leave fp16's
 /// grid while the whole row stays a small integer.
 fn stressX(rng: std.Random, v: []f64, k: usize) void {
-    hostq.mirroredWide(rng, v, k);
+    host.mirroredWide(rng, v, k);
     const h = k / 2;
     for (0..v.len / k) |r| std.mem.reverse(f64, v[r * k + h ..][0 .. k - h]);
 }

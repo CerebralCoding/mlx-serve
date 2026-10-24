@@ -7,7 +7,7 @@
 #
 #   CHAT_MODEL=<dir> FLUX_MODEL=<dir> [HY3D_MODEL=<dir>] ./tests/test_gen_chat_interleave.sh [port]
 #
-# Boots MLX_SERVE_GEN_YIELD=1 (off by default on CUDA, genYieldEnabled). Hermetic twins: Progress.boundary, offload.
+# Metal only (off on CUDA, genYieldEnabled). Hermetic twins: Progress.boundary, offload.
 
 set -uo pipefail
 source "$(dirname "$0")/lib/server.sh"
@@ -21,11 +21,11 @@ FLUX="${FLUX_MODEL:-$M/Runpod/FLUX.2-klein-4B-mflux-4bit}"
 HY3D="${HY3D_MODEL:-$M/ddalcu/Hunyuan3D-2.1-MLX-Serve-8bit}"
 [ -f "$CHAT/config.json" ] || { echo "SKIP: no chat model (set CHAT_MODEL)"; exit 0; }
 [ -d "$FLUX" ] || { echo "SKIP: no FLUX model (set FLUX_MODEL)"; exit 0; }
+[ "$(uname)" = Darwin ] || { echo "SKIP: chat does not interleave with media jobs on CUDA"; exit 0; }
 
 TMP=$(mktemp -d)
 LOG="$TMP/server.log"
-# Interleaving is opt-in on CUDA (off by default there); this script tests the feature itself.
-MLX_SERVE_GEN_YIELD=1 "$BIN" --serve --port "$PORT" --log-level debug >"$LOG" 2>&1 &
+"$BIN" --serve --port "$PORT" --log-level debug >"$LOG" 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null; wait $SRV 2>/dev/null' EXIT
 srv_wait_health "http://127.0.0.1:$PORT" 60 1 "$SRV" || kill -0 "$SRV" 2>/dev/null || { echo "FAIL: server did not start"; tail -5 "$LOG"; exit 1; }

@@ -1,5 +1,5 @@
 //! One ds4 decode round: the next token drawn from the session's logits, and ds4's speculative arm that commits it
-//! with the drafts it verifies after it. The scheduler arm and the engine adapter both decode through here.
+//! with the drafts it verifies after it.
 
 const std = @import("std");
 

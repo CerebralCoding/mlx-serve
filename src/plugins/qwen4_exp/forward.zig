@@ -13,8 +13,8 @@ const standin = @import("../../sdk/diag/standin.zig");
 const verify_projection = @import("../../sdk/blocks/linear/verify_projection.zig");
 const MAX_BATCH_ROWS = @import("../../engines/mlx/batched/layered.zig").MAX_BATCH_ROWS;
 const layerCap = @import("../../engines/mlx/diag/profile.zig").layerCap;
-const diagEnvOn = @import("../../engines/mlx/env_transformer.zig").diagEnvOn;
-const envFlagCached = @import("../../engines/mlx/env_transformer.zig").envFlagCached;
+const env = @import("../../env.zig");
+const profileFwdOn = @import("prof.zig").profileFwdOn;
 const PREFILL_EVAL_CADENCE_DEFAULT = @import("../../engines/mlx/eval_cadence.zig").PREFILL_EVAL_CADENCE_DEFAULT;
 const evalCadencePoint = @import("../../engines/mlx/eval_cadence.zig").evalCadencePoint;
 const ladderStepMulti = @import("../../engines/mlx/eval_cadence.zig").ladderStepMulti;
@@ -67,7 +67,7 @@ pub fn qwen4VerifyRowsEligible(self: *Trunk, token_rows: []const mlx.mlx_array, 
     {
         return false;
     }
-    if (Trunk.qwen4_trace != null or diagEnvOn("QWEN4_PROFILE_FWD")) return false;
+    if (Trunk.qwen4_trace != null or profileFwdOn()) return false;
     const si = qwen4Standin();
     if (si.gdn or si.attn or si.mlp or si.gdn_recur or si.gdn_proj or si.attn_qsa or si.attn_sdpa or si.hc or si.moe_shared or si.moe_router or si.moe_gateup or si.moe_down) return false;
     for (self.moe_layers) |lw| switch (lw.mlp) {
@@ -126,7 +126,7 @@ pub fn forwardQwen4VerifyRows(
         var h = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_tile(&h, emb, &.{ 1, 1, hc }, 3, self.s));
         errdefer _ = mlx.mlx_array_free(h);
-        if (self.qwen4_stream_f32 or envFlagCached(&qwen4_stream_f32_env, "QWEN4_STREAM_F32")) {
+        if (self.qwen4_stream_f32 or env.onCached(&qwen4_stream_f32_env, .QWEN4_STREAM_F32)) {
             var h32 = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_astype(&h32, h, .float32, self.s));
             _ = mlx.mlx_array_free(h);
@@ -377,7 +377,7 @@ pub fn forwardQwen4With(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array
     const seq_len: c_int = x_shape[1];
     const is_prefill = seq_len > 1;
 
-    if (self.qwen4_stream_f32 or envFlagCached(&qwen4_stream_f32_env, "QWEN4_STREAM_F32")) {
+    if (self.qwen4_stream_f32 or env.onCached(&qwen4_stream_f32_env, .QWEN4_STREAM_F32)) {
         var h32 = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_astype(&h32, h, .float32, self.s));
         _ = mlx.mlx_array_free(h);
@@ -1886,7 +1886,7 @@ const Qwen4LadderRig = struct {
         const x = self.fx.xfm();
         const st = x.qwen4.?;
         const emb_dim: c_int = @intCast(st.table.dim * st.hash.n_heads);
-        x.config = .{ .model_type = "qwen4_exp", .hidden_size = HIDDEN, .hc_count = HC, .num_hidden_layers = LAYERS, .vocab_size = VOCAB };
+        x.config = .{ .model_type = "qwen4_exp", .legacy = .{ .caps = .{ .long_ctx = true } }, .hidden_size = HIDDEN, .hc_count = HC, .num_hidden_layers = LAYERS, .vocab_size = VOCAB };
         var prng = std.Random.DefaultPrng.init(59);
         const r = prng.random();
         x.emb_w = try self.weight(r, &.{ VOCAB, HIDDEN });

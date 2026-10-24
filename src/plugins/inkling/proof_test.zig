@@ -98,7 +98,7 @@ fn caseOn(comptime quantized: bool, comptime seed: u64, comptime legacy_config: 
     try writePack(&p, quantized);
     var b = try openCase(&p, configJson(quantized), legacy_config, seed);
     defer b.close();
-    if (b.lg) |lg| try std.testing.expect(lg.config.isInkling() and lg.xfm.moe_layers != null);
+    if (b.lg) |lg| try std.testing.expect(std.mem.eql(u8, lg.config.model_type, "inkling_mm_model") and lg.xfm.moe_layers != null);
     try b.expectSteps(&both.long_steps);
     try b.expectGreedy();
     try b.expectDone();
@@ -149,7 +149,7 @@ test "inkling plugin: the released Inkling-Small-mlx-2bit config at the proof ge
     try writePack(&p, true);
     var b = try openCase(&p, json, true, 0x1aa2);
     defer b.close();
-    if (b.lg) |lg| try std.testing.expect(lg.config.isInkling());
+    if (b.lg) |lg| try std.testing.expect(std.mem.eql(u8, lg.config.model_type, "inkling_mm_model"));
     try b.expectSteps(&both.long_steps);
     try b.expectGreedy();
     try b.expectDone();

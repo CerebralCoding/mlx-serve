@@ -10,7 +10,7 @@
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const kc = @import("../../sdk/testing/kernel_contract/root.zig");
-const hostq = @import("../../sdk/testing/kernel_contract/hostq.zig");
+const host = @import("../../sdk/testing/kernel_contract/host.zig");
 const sparse = @import("qsa/sparse_attn.zig");
 const gather = @import("qsa/gather.zig");
 const DenseKVView = @import("../../sdk/blocks/attention/kv_view.zig").DenseKVView;
@@ -164,7 +164,7 @@ const Split = struct {
         const n = HK * self.cap() * BD;
         c.vals = try a.alloc(f64, n);
         if (self.kv == .dense) {
-            for (c.vals) |*x| x.* = hostq.round(.bfloat16, rng.floatNorm(f64));
+            for (c.vals) |*x| x.* = host.rt(.bfloat16, rng.floatNorm(f64));
             return;
         }
         const top: f64 = @floatFromInt((@as(u32, 1) << @intCast(bitsOf(self.kv))) - 1);
@@ -173,8 +173,8 @@ const Split = struct {
         c.biases = try a.alloc(f64, n / GS);
         for (c.codes) |*x| x.* = @intCast(rng.uintAtMost(u32, @intFromFloat(top)));
         for (c.scales, c.biases) |*sc, *b| {
-            sc.* = hostq.round(.bfloat16, (4 / top) * (0.5 + rng.float(f64)));
-            b.* = hostq.round(.bfloat16, -2 + rng.float(f64));
+            sc.* = host.rt(.bfloat16, (4 / top) * (0.5 + rng.float(f64)));
+            b.* = host.rt(.bfloat16, -2 + rng.float(f64));
         }
     }
 
@@ -183,7 +183,7 @@ const Split = struct {
         if (c.codes.len == 0) return;
         for (c.vals, c.codes, 0..) |*x, q, i| {
             const f: f32 = @floatCast(@as(f64, @floatFromInt(q)) * c.scales[i / GS] + c.biases[i / GS]);
-            x.* = hostq.round(.bfloat16, f);
+            x.* = host.rt(.bfloat16, f);
         }
     }
 
@@ -214,7 +214,7 @@ const Split = struct {
         var prng = std.Random.DefaultPrng.init(seed);
         const rng = prng.random();
         self.q = try a.alloc(f64, HQ * shape.rows * BD);
-        for (self.q) |*x| x.* = hostq.round(.bfloat16, rng.floatNorm(f64));
+        for (self.q) |*x| x.* = host.rt(.bfloat16, rng.floatNorm(f64));
         try self.fillCache(a, rng, &self.k);
         try self.fillCache(a, rng, &self.v);
         self.blocks = try a.alloc(f64, shape.rows * shape.k);
@@ -336,7 +336,7 @@ const Split = struct {
             }
             const bits = bitsOf(self.kv);
             const wpr: c_int = @intCast(BD * bits / 32);
-            const words = try hostq.packAffine(self.arena.allocator(), c.codes, HK * self.cap(), BD, bits);
+            const words = try host.packAffine(self.arena.allocator(), c.codes, HK * self.cap(), BD, bits);
             full[n] = try rig.input(.uint32, &.{ 1, HK, capc, wpr }, words);
             full[n + 1] = try rig.input(.bfloat16, &.{ 1, HK, capc, BD / GS }, c.scales);
             full[n + 2] = try rig.input(.bfloat16, &.{ 1, HK, capc, BD / GS }, c.biases);
@@ -396,10 +396,10 @@ const Split = struct {
             for (p, t) |*w, x| w.* = std.math.exp2(x - m);
             for (o, 0..) |*y, d| {
                 for (terms, p, rows) |*x, w, kr| x.* = w * self.vrow(h, kr)[d];
-                y.* = if (acc) |ac| spec.sumIn(ac, order, terms) else hostq.sum(terms);
+                y.* = if (acc) |ac| spec.sumIn(ac, order, terms) else host.sum(terms);
             }
             out[n_acc + 2 * row] = m;
-            out[n_acc + 2 * row + 1] = if (acc) |ac| spec.sumIn(ac, order, p) else hostq.sum(p);
+            out[n_acc + 2 * row + 1] = if (acc) |ac| spec.sumIn(ac, order, p) else host.sum(p);
         };
     }
 
@@ -496,7 +496,7 @@ const Split = struct {
             var why: [200]u8 = undefined;
             // An empty split's -Inf max is its flag, not a planted value.
             if (r[0] >= r[1]) planted -= 1;
-            if (hostq.within(&why, if (at == .nonfinite) .repeat else at, &got, &want, &allow)) |w| {
+            if (host.within(&why, if (at == .nonfinite) .repeat else at, &got, &want, &allow)) |w| {
                 return std.fmt.bufPrint(&self.msg, "token {d} head {d} split {d}: {s}", .{ s, h, j, w }) catch &self.msg;
             }
         };
@@ -763,10 +763,10 @@ const Merge = struct {
         for (0..nr) |h| for (0..ns) |s| {
             const r = h * ns + s;
             const empty = s + 1 == ns and ns > 1;
-            const l: f64 = if (fill == .stress) 1 else hostq.round(.float32, 1 + 63 * rng.float(f64));
-            self.ml[2 * r] = if (empty) -std.math.inf(f64) else if (fill == .stress) 0 else hostq.round(.float32, -4 + 28 * rng.float(f64));
+            const l: f64 = if (fill == .stress) 1 else host.rt(.float32, 1 + 63 * rng.float(f64));
+            self.ml[2 * r] = if (empty) -std.math.inf(f64) else if (fill == .stress) 0 else host.rt(.float32, -4 + 28 * rng.float(f64));
             self.ml[2 * r + 1] = if (empty) 0 else l;
-            for (self.acc[r * BD ..][0..BD]) |*x| x.* = if (empty) 0 else hostq.round(.float32, l * (2 * rng.float(f64) - 1));
+            for (self.acc[r * BD ..][0..BD]) |*x| x.* = if (empty) 0 else host.rt(.float32, l * (2 * rng.float(f64) - 1));
         };
         if (fill == .stress) {
             // Down each column's splits: B_i + r_i, then -B_(i+1); the column telescopes to the small sum of the r,
@@ -832,7 +832,7 @@ const Merge = struct {
                     x.* = wj * self.acc[(h * ns + s) * BD + d];
                     mag += @abs(x.*);
                 }
-                const y = (if (acc) |ac| spec.sumIn(ac, order, t) else hostq.sum(t)) / z;
+                const y = (if (acc) |ac| spec.sumIn(ac, order, t) else host.sum(t)) / z;
                 want[h * BD + d] = y;
                 // exp2 on each weight, the column's and Z's sequential sums, the division and the bf16 output.
                 const rel = 2 * EXP2_ERR + spec.gamma(@floatFromInt(2 * ns + 4), U);
@@ -860,7 +860,7 @@ const Merge = struct {
         try self.outputs(null, .sequential, buf[0..n], buf[n .. 2 * n]);
         const out = self.rig.outputBytes();
         for (buf[2 * n ..], 0..) |*g, i| g.* = spec.read(.bf16, out, i);
-        return hostq.within(&self.msg, at, buf[2 * n ..], buf[0..n], buf[n .. 2 * n]);
+        return host.within(&self.msg, at, buf[2 * n ..], buf[0..n], buf[n .. 2 * n]);
     }
 };
 

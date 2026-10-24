@@ -3,8 +3,8 @@
 //! verify's M = 4) resolves to a resident slot of its layer; no load is planned or read, no pre-read and no
 //! speculation is posted, the resident set is unchanged; the prompt pass is the stock route. CPU only.
 const std = @import("std");
-const ops = @import("../../deepseek_v41/stream/ops.zig");
-const shared = @import("../../deepseek_v41/stream/experts.zig");
+const ops = @import("../../../sdk/weights/streamed/ops.zig");
+const shared = @import("../../../sdk/weights/streamed/experts.zig");
 const stream_mod = @import("stream.zig");
 const source_mod = @import("source.zig");
 const diag = @import("diag.zig");

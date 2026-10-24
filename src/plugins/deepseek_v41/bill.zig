@@ -7,12 +7,42 @@ const cfg_mod = @import("config.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const dsv41_mod = @import("deepseek_v41.zig");
 const toModelConfig = @import("../deepseek_v4/model_config.zig").toModelConfig;
+const mlx = @import("../../mlx/ffi.zig");
+const system = @import("../../sdk/util/system.zig");
 
 const PREFILL_RUNTIME_FLOOR_BYTES = @import("../../engines/mlx/admission/bills.zig").PREFILL_RUNTIME_FLOOR_BYTES;
 const prefillNeededAtChunk = @import("../../engines/mlx/admission/prefill_chunk.zig").prefillNeededAtChunk;
 
 pub fn dsv41PrefillMemoryNeeded(config: *const model_mod.ModelConfig, seq: u64, chunk: u64) u64 {
     return dsv41_mod.prefillBytes(config, seq, chunk, PREFILL_RUNTIME_FLOOR_BYTES);
+}
+
+// ── a streamed bank (`experts.bin`) ──
+
+/// The prompt positions a streamed bank's slot rows are billed for when the model sets no `ctx_size`.
+pub const stream_context: u64 = 16384;
+/// The contexts a streamed bank tries when the model sets no `ctx_size`, largest first.
+pub const stream_context_rungs = [_]u64{ 262144, 131072, 65536, 32768 };
+/// The fewest prompt slot rows an auto context keeps.
+pub const stream_min_rows: u32 = 16;
+/// The rows of one streamed prompt call: each layer's routed experts are read once a call.
+pub const stream_call_rows: usize = 16384;
+/// Positions a request generates past its prompt (the decode phase's state).
+pub const stream_generation: u64 = 8192;
+/// What the box keeps unplanned: the host's default wired-limit margin (`--wired-margin-gib`), the stop under the
+/// ceiling, and the host side of the process (its heap and the stream's read buffers).
+pub const stream_margin_bytes: u64 = (8 << 30) + 2_000_000_000 + (1 << 30);
+
+/// The bytes a streamed bank's slot rows may take in each phase: the GPU working set less `stream_margin_bytes`, the
+/// memory in use now (the residents loaded, every other process) and the phase's working set at `context` positions
+/// (a prompt: one `stream_call_rows` call's; decode: the state at `context + stream_generation`).
+pub fn streamBudget(config: *const model_mod.ModelConfig, context: u64) struct { prompt: u64, decode: u64 } {
+    const in_use = system.getTotalMemBytes() -| system.getAvailableMemBytes();
+    const box = @as(u64, mlx.maxRecommendedWorkingSet()) -| stream_margin_bytes -| in_use;
+    return .{
+        .prompt = box -| dsv41PrefillMemoryNeeded(config, context, stream_call_rows),
+        .decode = box -| dsv41PrefillMemoryNeeded(config, context + stream_generation, 1),
+    };
 }
 
 /// The table's `bill`: only the KV sources' compressed latents and index keys grow per token (bf16); the windows

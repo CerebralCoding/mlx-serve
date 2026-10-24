@@ -8,6 +8,8 @@ const ForwardCtx = @import("../../../engines/mlx/forward_ctx.zig").ForwardCtx;
 const KVCache = @import("../../../engines/mlx/kv/cache.zig").KVCache;
 const Trunk = @import("../trunk.zig").Trunk;
 const FUSED256_MIN_Q_LEN = @import("../../../sdk/blocks/attention/attn256.zig").FUSED256_MIN_Q_LEN;
+const OneShotBits = @import("../../../sdk/blocks/attention/sparse_block/one_shot.zig").OneShotBits;
+const qsaWidthBucket = @import("../../../sdk/blocks/attention/sparse_block/one_shot.zig").widthBucket;
 
 // ── QSA arm meters ──
 //
@@ -20,34 +22,8 @@ const FUSED256_MIN_Q_LEN = @import("../../../sdk/blocks/attention/attn256.zig").
 // per (arm, width bucket) for engagement, one-shot bits per reason for
 // declines, and a per-request tally.
 
-/// One-shot gate keyed by a small bit index. `take` returns true the FIRST
-/// time each bit is asked for.
-pub const OneShotBits = struct {
-    seen: u32 = 0,
-
-    pub fn take(self: *OneShotBits, bit: u5) bool {
-        const m: u32 = @as(u32, 1) << bit;
-        if (self.seen & m != 0) return false;
-        self.seen |= m;
-        return true;
-    }
-    pub fn reset(self: *OneShotBits) void {
-        self.seen = 0;
-    }
-};
-
 /// Which arm served one qwen4_exp full-attention call.
 pub const QsaArm = enum(u2) { mask = 0, decode_gather = 1, verify_gather = 2, prefill_gather = 3 };
-
-/// Query-width bucket: decode (1), verify (2 .. FUSED256_MIN_Q_LEN-1),
-/// prefill (>= FUSED256_MIN_Q_LEN). The meters are one-shot PER BUCKET so a
-/// decode-width engagement at 16k cannot vouch for a verify-width call at
-/// 62k — which is exactly the confusion a single global bool created.
-pub fn qsaWidthBucket(seq_len: c_int) u2 {
-    if (seq_len <= 1) return 0;
-    if (seq_len < FUSED256_MIN_Q_LEN) return 1;
-    return 2;
-}
 
 /// Why a gather arm handed the call back to the dense mask.
 pub const QsaDeclineReason = enum(u5) {

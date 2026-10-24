@@ -23,8 +23,8 @@ const log = sdk.log;
 const expert = @import("../../../sdk/weights/streamed/sdk_ext.zig").expert;
 const mimo_profile = @import("../../mimo_v2/stream/profile.zig");
 const ptl = @import("../../mimo_v2/stream/prefill_timeline.zig");
-const dt = @import("../../deepseek_v41/stream/decode_timers.zig");
-const timeline = @import("../../deepseek_v41/stream/verify_timeline.zig");
+const dt = @import("../../../sdk/weights/streamed/profile/decode_timers.zig");
+const timeline = @import("../../../sdk/weights/streamed/profile/verify_timeline.zig");
 const experts = @import("experts.zig");
 
 pub const enabled = mimo_profile.enabled;

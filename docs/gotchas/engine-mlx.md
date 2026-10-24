@@ -320,7 +320,7 @@ real (exactly 2.00x on the KV term) but the blended speedup falls with context (
 by different factors do not compound; `gatherQmv` now lost to stock `gather_qmm` on both Laguna sizes, so no arch opts
 in by default; the PLD yield-gate warmup dropped 32 → 8 (recovers the losses, keeps the +77% echo win; enabling
 speculation costs ~1% even when the prompt gate declines). Method: per-cell medians over repeated runs (single runs
-lied three times); check a flagged cell's reachability from the change before re-running; `MLX_SERVE_DECODE_PROFILE`
+lied three times); check a flagged cell's reachability from the change before re-running; diag `decode-profile`
 destroys pipelining and is not a sizing tool; a ladder guard must use the ladder's own geometry.
 
 ### Fusing decode dispatches: only the critical path pays
@@ -486,7 +486,7 @@ inheritance.
 Defect: agent CLIs omit temperature (generation_config 0.6), so every agent request ran serial and only `--temp 0` got
 DSpark. Fix: the one-hot-proposal arm of the MTP accept graph (accept with `min(1, p)`, residual correction from the
 original verify logits) on a split begin/finish seam that the greedy path also rides; `dsparkArmFor` picks the arm.
-2.0-2.3x on code and echo, parity on prose. Default on (`MLX_SERVE_DSV4_DSPARK_STOCH=0`).
+2.0-2.3x on code and echo, parity on prose.
 
 ## Media DiTs and loop tiers
 
@@ -711,7 +711,7 @@ and eval, or the hint is silently ignored; ~121 resident handles forced layers i
 symbol indices come only from `procedureInfoForProcedureIndex:` (the other selectors return 0 for every procedure),
 and identity indices made 200 of 210 evals fail into the GPU fallback, reading as "banks cost 23%". Fix: banks with
 per-procedure indices (a multi-procedure bank is refused when the API is unreachable), a bank size cap
-(`MLX_SERVE_ANE_BANK_MAX_BYTES`, the ~4 GiB device window and the build's host peak) with a halving ladder,
+(the ~4 GiB device window and the build's host peak) with a halving ladder,
 per-instance output planes, the total share split across units. Every arm of `tests/test_ane_prefill.sh` asserts zero
 eval failures; an ignored hint looks like success, so `/props` carries per-unit evals and the IOReport cross-check
 stands.
@@ -837,7 +837,7 @@ in-checkpoint head bound regardless): `entry.mtp` reads `params.mtp_enabled`.
 Defect: the Flash Next controller priced verify positions at the M4 default on an M5 Max, three to five times too
 cheap: the first prose request ran 20-24% below serial. Cause: the `.qwen4` arm hardcoded `.generic`; a verify row on
 this arch reads its own experts, so the marginal never flattens. Fix: a measured G17 surface behind a full
-fingerprint, cap kept at 6 (`MLX_SERVE_MTP_QWEN4_PROFILE=0` revokes it alone). Trap: a cost-profile A/B with the
+fingerprint, cap kept at 6. Trap: a cost-profile A/B with the
 persisted round-cost table live measures the table: run persistence off on both arms.
 
 ### The grouped-expert NAX tile loses at verify widths
@@ -935,8 +935,7 @@ null sheet to `mlx_logical_and` and aborted on the first token past kv 2052; the
 decode (3 GB at 786k). Fix: one split-K dispatch with in-kernel unpack (`QsaCfgCache` keyed without runtime shapes);
 `msv_qsa_select`, an exact radix select on every arm; the skip gated by `nb > block_topk` (test kv 2049..2052); the
 newest checkpoint takes a slice view of the slot's buffer at commit, and the f32 score bank is billed; the score-sheet
-budget is billed to admission. The select ran one threadgroup per row, which decode starves: split 16-way at decode
-(`MLX_SERVE_QSA_SELECT_SPLIT=0`).
+budget is billed to admission. The select ran one threadgroup per row, which decode starves: split 16-way at decode.
 
 ### The pad-waste cap priced every hybrid slot at kv_len 0
 Defect: on linear-layer-0 trunks `cache.step` is 0 forever, so the waste ratio was 1.0 and a 1k slot beside a 60k one
@@ -1276,7 +1275,7 @@ codesign uses. Check: `codesign -dv` on a re-signed copy prints that identifier 
 ### Bonsai 2 2B/4B/9B answered in gibberish: a decode kernel sized for one pack's block
 Defect: Bonsai 2B, 4B and 9B produced word salad from the first token; the 27B was fine. Cause: each pack picks its
 own Hadamard block (512/4096/1024) and the fused one-token GDN kernel was written for 1024. Found by matching prism's
-loader layer by layer under `MLX_SERVE_LAYER_CAP`. Fix: the kernel takes the block as a template. Guard:
+loader layer by layer under diag `layer-cap`. Fix: the kernel takes the block as a template. Guard:
 `gdn_decode.step and recur` at every block.
 
 ### GLM's KDA layers came out 1.8% short: an epsilon on the mean

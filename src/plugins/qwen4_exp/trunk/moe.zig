@@ -274,7 +274,7 @@ pub fn moeExpertsRouted(self: *Trunk, x: mlx.mlx_array, layer: u32, logits: mlx.
 
 pub fn moeMLP2WithRouter(self: *Trunk, router_x: mlx.mlx_array, expert_x_in: mlx.mlx_array, mw: *const MoeMlpWeights, router_override: ?mlx.mlx_array, skip_shared: bool) !mlx.mlx_array {
     const cfg = &self.config;
-    // DIAGNOSTIC (MLX_SERVE_DISPATCH_PROBE=N): inject N extra small
+    // DIAGNOSTIC (diag dispatch-probe=N): inject N extra small
     // elementwise kernels per MoE layer and read the slope. Multiplying by
     // an exact 1.0 is output-identical for every finite value, and the
     // result FEEDS the expert path so MLX cannot elide it — the two
@@ -299,7 +299,7 @@ pub fn moeMLP2WithRouter(self: *Trunk, router_x: mlx.mlx_array, expert_x_in: mlx
         }
         break :blk cur;
     };
-    // Decode MoE-internals profiler (MLX_SERVE_DECODE_PROFILE=1, S==1 only).
+    // Decode MoE-internals profiler (diag decode-profile, S==1 only).
     const moe_prof = decodeProfileEnabled() and mlx.getShape(expert_x)[1] == 1;
     var mclk: ProfClock = if (moe_prof) ProfClock.init() else undefined;
     // Per-expert-weight params: mixed-precision MoE checkpoints vary bits

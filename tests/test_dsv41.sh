@@ -1,9 +1,9 @@
 #!/bin/bash
-# test_dsv41.sh — DeepSeek-V4.1-Flash live end to end on any pack (MLX packs in-tree, the EXL3 repack on mlx-stream):
+# test_dsv41.sh — DeepSeek-V4.1-Flash live end to end on any pack (MLX packs, the EXL3 repack with streamed experts):
 # template A/B vs the release encoder (when encoding/ is staged), greedy raw answer, both thinking arms, stream ==
 # non-stream, spaced-DSML tool call + round trip, single-flight (a concurrent request queues, byte-equal to solo, no
 # leak), prefix resume (a repeat resumes one token short and keeps the bytes; a fresh prompt starts over),
-# `[mlx-stream] loaded` on the repack. DSV41_TEST_DSPARK=1: rounds engaged, a --no-mtp boot keeps the greedy bytes,
+# the repack's experts streamed from its bank. DSV41_TEST_DSPARK=1: rounds engaged, a --no-mtp boot keeps the greedy bytes,
 # a sampled seeded request engages the lane and repeats byte-equal from cold. [9] with a tower: house.jpeg on the
 # release's 35x53 grid as 230 span tokens, the street signs read, a /v1/messages image block, a warm repeat.
 #
@@ -80,11 +80,8 @@ post() { # path, body
 text_of() { python3 -c "import json,sys; print(json.load(sys.stdin)['choices'][0]['text'])"; }
 
 speculation_contract() { # enabled: default boot (1) or --no-mtp boot (0)
-    local native=()
-    [ -f "$MODEL/experts.bin" ] && native=(--native)
     python3 "$(dirname "$0")/test_dsv41_speculation.py" \
-        --url "http://127.0.0.1:$PORT" --log "$LOG" --expect-enabled "$1" \
-        --model mlx-serve ${native[@]+"${native[@]}"}
+        --url "http://127.0.0.1:$PORT" --log "$LOG" --expect-enabled "$1" --model mlx-serve
 }
 
 boot
@@ -174,9 +171,9 @@ else
     echo "FAIL: resumed or fresh greedy bytes differ"
     for r in "$R1" "$R2" "$R3"; do echo "  $(echo "$r" | head -c 200)"; done; fail=$((fail+1))
 fi
-# The EXL3 repack runs on mlx-stream.
+# The EXL3 repack's routed experts stream from its bank.
 if [ -f "$MODEL/experts.bin" ]; then
-    check "mlx-stream serves the repack" "$(grep '\[mlx-stream\] loaded' "$LOG" || true)" 'tensors from'
+    check "the repack streams its experts" "$(grep 'deepseek_v41: streamed experts' "$LOG" || true)" 'slot rows per layer'
 fi
 
 # [9] Images, on a pack that ships the tower. The grid and token accounting come from the log (a run of
@@ -255,10 +252,7 @@ if [ "${DSV41_TEST_DSPARK:-0}" = "1" ]; then
     boot --no-mtp
     speculation_contract 0
     SERIAL=$(post /v1/completions "$SF_BODY" | text_of)
-    if [ -f "$MODEL/experts.bin" ]; then
-        # mlx-stream's lane accepts drafts by typical acceptance: greedy text may differ from serial.
-        if [ -n "$SERIAL" ]; then echo "PASS: serial boot answers"; pass=$((pass+1)); else echo "FAIL: serial boot answered nothing"; fail=$((fail+1)); fi
-    elif [ "$SERIAL" = "$SOLO" ]; then
+    if [ "$SERIAL" = "$SOLO" ]; then
         echo "PASS: dspark greedy == serial"; pass=$((pass+1))
     else
         echo "FAIL: dspark greedy != serial"; echo "  dspark: $(echo "$SOLO" | head -c 300)"; echo "  serial: $(echo "$SERIAL" | head -c 300)"; fail=$((fail+1))

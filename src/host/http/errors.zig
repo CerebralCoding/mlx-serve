@@ -16,6 +16,7 @@ const jsonEscape = @import("../api/format.zig").jsonEscape;
 const sendAnthropicError = @import("../api/anthropic.zig").sendAnthropicError;
 const sendAnthropicEvent = @import("../api/anthropic.zig").sendAnthropicEvent;
 const sendResponsesEvent = @import("../api/responses/events.zig").sendResponsesEvent;
+const engine_requests = @import("../engines/requests.zig");
 
 /// A slot that errored reports why: the MLX error latch's `error.OutOfMemory` is a memory
 /// failure the operator can act on. One helper for the three slot-drain sites.
@@ -115,13 +116,13 @@ pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
             .anthropic_type = "invalid_request_error",
             .message = PROMPT_LOGPROBS_UNAVAILABLE_MSG,
         },
-        // A Neural Engine model samples the raw logits: refused, not silently ignored.
-        error.NeuralEngineUnsupported => .{
+        // What the model's engine does not declare: refused by name, not silently ignored.
+        error.EngineUnsupported => .{
             .status_line = "400 Bad Request",
             .code = 400,
             .openai_type = "invalid_request_error",
             .anthropic_type = "invalid_request_error",
-            .message = "This model runs on the Neural Engine, which serves plain sampling only: structured output (response_format, grammars), logprobs, repetition or presence penalties and forced tool calls are not available. Use a GPU model for those.",
+            .message = engine_requests.refusalMessage(buf),
         },
         error.GenerationFailed => .{
             .status_line = "500 Internal Server Error",
@@ -500,10 +501,12 @@ test "a streaming fault answers with the SAME mapped error a non-streaming one d
         try t.expectEqualStrings("invalid_request_error", w.openai_type);
     }
     {
-        // What a Neural Engine model cannot honor is the request's shape, not a fault.
-        const w = mapGenerationError(error.NeuralEngineUnsupported, &buf);
+        // What a model's engine cannot honor is the request's shape, not a fault, and the message names it.
+        engine_requests.refused = .{ .kind = .ane, .cap = "logprobs" };
+        const w = mapGenerationError(error.EngineUnsupported, &buf);
         try t.expectEqual(@as(u32, 400), w.code);
         try t.expectEqualStrings("invalid_request_error", w.anthropic_type);
+        try t.expect(std.mem.indexOf(u8, w.message, "Neural Engine") != null);
     }
     {
         // Anything else keeps its name in the message, at a mapped status.

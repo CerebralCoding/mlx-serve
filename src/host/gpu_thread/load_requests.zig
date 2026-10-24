@@ -3,14 +3,12 @@
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const model_registry_mod = @import("../registry/registry.zig");
-const arch_ane = @import("../../engines/ane/lm.zig");
 const log = @import("../../sdk/util/log.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
 const LoadedModel = model_registry_mod.LoadedModel;
 
-const aneWanted = @import("../../engines/ane/adapter.zig").aneWanted;
-const aneAdmit = @import("../../engines/ane/adapter.zig").aneAdmit;
-const aneBuild = @import("../../engines/ane/adapter.zig").aneBuild;
+const aneWanted = @import("../engines/served.zig").aneWanted;
+const engines_load = @import("../engines/load.zig");
 const moveHotCacheViewOff = @import("../../engines/mlx/cache/budget.zig").moveHotCacheViewOff;
 const publishHotCacheResidency = @import("../../engines/mlx/cache/budget.zig").publishHotCacheResidency;
 const doLoadOnInferenceThread = @import("../../engines/mlx/load.zig").doLoadOnInferenceThread;
@@ -90,11 +88,11 @@ pub fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
     req.evict_entries = &.{};
 
     // A Neural Engine build runs on its own thread while the GPU keeps serving.
-    if (!req.ane_declined and aneWanted(req.config, req.ane)) {
+    if (req.gguf == null and !req.ane_declined and aneWanted(req.config, req.ane)) {
         req.entry.load_progress.start(io_util.nowMsMonotonic(sch.io));
-        if (aneAdmit(sch, req)) |arch| {
+        if (engines_load.aneAdmit(sch, req)) {
             _ = sch.ane_builds.fetchAdd(1, .acq_rel);
-            const t = std.Thread.spawn(.{}, aneBuildThread, .{ sch, req, arch }) catch return aneBuildThread(sch, req, arch);
+            const t = std.Thread.spawn(.{}, aneBuildThread, .{ sch, req }) catch return aneBuildThread(sch, req);
             t.detach();
             return;
         }
@@ -118,9 +116,9 @@ pub fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
 
 /// A cold Neural Engine load's build, minutes on a first load: done, or back on the load queue
 /// for the GPU when the build declines. Never calls MLX.
-fn aneBuildThread(sch: *Scheduler, req: *LoadRequest, arch: arch_ane.Arch) void {
+fn aneBuildThread(sch: *Scheduler, req: *LoadRequest) void {
     defer _ = sch.ane_builds.fetchSub(1, .acq_rel);
-    const built = aneBuild(sch, req, arch) catch |err| return failLoadRequest(sch, req, err);
+    const built = engines_load.aneOpen(sch, req) catch |err| return failLoadRequest(sch, req, err);
     if (built) return readyLoadRequest(sch, req);
     req.ane_declined = true;
     sch.queue_mu.lockUncancelable(sch.io);

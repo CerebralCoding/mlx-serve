@@ -135,7 +135,7 @@ fn ollamaTagEntryOf(io: std.Io, e: *LoadedModel) ollama_mod.TagEntry {
     const family: []const u8 = if (ready and e.config != null) e.config.?.model_type else (if (e.arch_hint.len > 0) e.arch_hint else "unknown");
     // arch_hint "gguf" covers unloaded discovery stubs whose PATH is a
     // directory of .gguf files (issue #59) — no engine yet, no .gguf suffix.
-    const is_gguf = e.ds4_engine != null or e.llama_engine != null or
+    const is_gguf = e.servesGguf() or
         std.mem.endsWith(u8, e.path, ".gguf") or std.mem.eql(u8, e.arch_hint, "gguf");
     var modified_ms: i64 = 0;
     // config.json mtime; .gguf entries fall back to 0 (epoch) rather than

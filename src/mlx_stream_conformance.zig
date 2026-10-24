@@ -77,11 +77,7 @@ test "mlx-stream conformance: every arch the glue dispatches declines what is no
     });
     try std.testing.expect(glm.spec == .draft_lane and glm.caps.owns_decode_state);
     // The archs share the process's one reader: a load of one refuses another's claim by name.
-    const v41 = comptime sdk.Arch.of(@import("plugins/deepseek_v41/stream/plugin.zig"));
     const mimo = comptime sdk.Arch.of(plugin_mimo.provides.arch.?);
-    try v41.claim_process.?();
-    try std.testing.expectError(error.ExpertReaderInUse, glm.claim_process.?());
-    v41.release_process.?();
     try mimo.claim_process.?();
     try std.testing.expectError(error.ExpertReaderInUse, glm.claim_process.?());
     mimo.release_process.?();
@@ -97,7 +93,7 @@ test "mlx-stream conformance: MiMo is a second macOS-only arch from the same pac
 }
 
 test "mlx-stream conformance: each arch claims only its own pack" {
-    const dsv = comptime sdk.Arch.of(plugin.provides.arch.?);
+    const glm = comptime sdk.Arch.of(plugin.provides.arch.?);
     const mimo = comptime sdk.Arch.of(plugin_mimo.provides.arch.?);
     const mimo_pack = @embedFile("sdk/weights/streamed/fixtures/mimo_v2_flash_q4_config.json");
     const dsv_pack = @embedFile("sdk/weights/streamed/fixtures/dsv41_dspark_mini_config.json");
@@ -110,18 +106,18 @@ test "mlx-stream conformance: each arch claims only its own pack" {
         .{ .config = "{\"model_type\":\"mimo_v2\"}", .want = null },
         .{ .config = "{\"model_type\":\"glm_moe_dsa\"}", .want = null },
     });
-    // DeepSeek-V4.1 declines the MiMo pack.
-    try sdk.testing.expectClaims(dsv.claims, &.{ .{ .config = mimo_pack, .want = null }, .{ .config = dsv_pack, .want = .native } });
+    // GLM-5.3 declines the MiMo and DeepSeek-V4.1 packs.
+    try sdk.testing.expectClaims(glm.claims, &.{ .{ .config = mimo_pack, .want = null }, .{ .config = dsv_pack, .want = null }, .{ .config = "{\"model_type\":\"glm_moe_dsa\"}", .want = .native } });
 }
 
 test "mlx-stream conformance: both arches share one expert reader claim" {
-    const dsv = comptime sdk.Arch.of(plugin.provides.arch.?);
+    const glm = comptime sdk.Arch.of(plugin.provides.arch.?);
     const mimo = comptime sdk.Arch.of(plugin_mimo.provides.arch.?);
-    try dsv.claim_process.?();
+    try glm.claim_process.?();
     try std.testing.expectError(error.ExpertReaderInUse, mimo.claim_process.?());
-    dsv.release_process.?();
+    glm.release_process.?();
     try mimo.claim_process.?();
-    try std.testing.expectError(error.ExpertReaderInUse, dsv.claim_process.?());
+    try std.testing.expectError(error.ExpertReaderInUse, glm.claim_process.?());
     mimo.release_process.?();
 }
 

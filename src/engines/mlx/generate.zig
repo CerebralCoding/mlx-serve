@@ -174,7 +174,6 @@ pub const all_source = @embedFile("generate.zig") ++
     @embedFile("spec/mtp/adaptive.zig") ++
     @embedFile("spec/mtp/planner.zig") ++
     @embedFile("generate/step.zig") ++
-    @embedFile("../../plugins/qwen4_exp/ple_generate.zig") ++
     @embedFile("sampling/spec_sampling.zig") ++
     @embedFile("sampling/lazy.zig") ++
     @embedFile("generate/oneshot.zig") ++
@@ -222,7 +221,6 @@ test {
     _ = @import("spec/mtp/adaptive.zig");
     _ = @import("spec/mtp/planner.zig");
     _ = @import("generate/step.zig");
-    _ = @import("../../plugins/qwen4_exp/ple_generate.zig");
     _ = @import("sampling/spec_sampling.zig");
     _ = @import("sampling/lazy.zig");
     _ = @import("generate/oneshot.zig");

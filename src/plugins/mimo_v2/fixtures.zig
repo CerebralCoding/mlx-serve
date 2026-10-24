@@ -149,8 +149,6 @@ test "mimo_v2 fixture: one-shot and chunked prefill + decode vs modeling_mimo_v2
 
     // [b] a chunked prefill split across the window, then single-token decode steps.
     try xfm.resetCache();
-    const ref_step = try qwen4ReadF32(allocator, fx.get("logits_step").?, s);
-    defer allocator.free(ref_step);
     const t_pre: c_int = T - 6;
     const chunks = [_][2]c_int{ .{ 0, 13 }, .{ 13, t_pre } };
     for (chunks) |c| {

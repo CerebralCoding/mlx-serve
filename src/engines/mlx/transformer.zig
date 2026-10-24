@@ -117,11 +117,6 @@ pub const qsaBatchedGatherOn = @import("../../plugins/qwen4_exp/qsa/gather.zig")
 pub const qsaBatchedGatherFloor = @import("../../plugins/qwen4_exp/qsa/gather.zig").qsaBatchedGatherFloor;
 pub const qsaHistoryShareEnabled = @import("../../plugins/qwen4_exp/qsa/gather.zig").qsaHistoryShareEnabled;
 pub const gatherQsa256 = @import("../../plugins/qwen4_exp/qsa/gather.zig").gatherQsa256;
-// plugins/qwen4_exp/qsa/select.zig
-pub const qsaSelectTgFor = @import("../../plugins/qwen4_exp/qsa/select.zig").qsaSelectTgFor;
-pub const qsaSelectTopBlocks = @import("../../plugins/qwen4_exp/qsa/select.zig").qsaSelectTopBlocks;
-pub const QSA_SELECT_SPLIT_G = @import("../../plugins/qwen4_exp/qsa/select.zig").QSA_SELECT_SPLIT_G;
-pub const qsaSelectDigitBits = @import("../../plugins/qwen4_exp/qsa/select.zig").qsaSelectDigitBits;
 // plugins/qwen4_exp/mtp.zig
 pub const Qwen4Mtp = @import("../../plugins/qwen4_exp/mtp.zig").Qwen4Mtp;
 // sdk/blocks/linear/verify_projection.zig
@@ -131,10 +126,6 @@ pub const verifySharedFor = @import("../../sdk/blocks/linear/verify_projection.z
 pub const dualDieArch = @import("../../sdk/blocks/linear/verify_projection.zig").dualDieArch;
 pub const verifySharedCapable = @import("../../sdk/blocks/linear/verify_projection.zig").verifySharedCapable;
 pub const verifySharedHardware = @import("../../sdk/blocks/linear/verify_projection.zig").verifySharedHardware;
-// plugins/qwen4_exp/qsa/score.zig
-pub const qsaScoreFusedActiveFor = @import("../../plugins/qwen4_exp/qsa/score.zig").qsaScoreFusedActiveFor;
-// plugins/qwen4_exp/qsa/sparse_attn.zig
-pub const qsaMaskArm = @import("../../plugins/qwen4_exp/qsa/sparse_attn.zig").qsaMaskArm;
 // plugins/qwen4_exp/qsa/arms.zig
 pub const QsaArmCounts = @import("../../plugins/qwen4_exp/qsa/arms.zig").QsaArmCounts;
 // mlx/array.zig
@@ -143,8 +134,6 @@ pub const materializedOwnedCopy = @import("../../mlx/array.zig").materializedOwn
 pub const qsaDecodeGatherAttn = @import("../../plugins/qwen4_exp/qsa/decode_gather.zig").qsaDecodeGatherAttn;
 // plugins/qwen4_exp/qsa/verify_gather.zig
 pub const qsaVerifyGatherAttn = @import("../../plugins/qwen4_exp/qsa/verify_gather.zig").qsaVerifyGatherAttn;
-// plugins/qwen4_exp/qsa/mask.zig
-pub const qsaMaskFromBlocks = @import("../../plugins/qwen4_exp/qsa/mask.zig").qsaMaskFromBlocks;
 // engines/mlx/kv/cache.zig
 pub const KVCacheEntry = @import("kv/cache.zig").KVCacheEntry;
 pub const newEmptyKVEntry = @import("kv/cache.zig").newEmptyKVEntry;
@@ -269,8 +258,6 @@ const DtypeCastCache = @import("../../mlx/dtype.zig").DtypeCastCache;
 // sdk/diag/standin.zig
 pub const Standin = @import("../../sdk/diag/standin.zig").Standin;
 pub const qwen4Standin = @import("../../sdk/diag/standin.zig").qwen4Standin;
-// engines/mlx/env_transformer.zig
-pub const diagEnvValueOn = @import("env_transformer.zig").diagEnvValueOn;
 // sdk/blocks/linear/fused_rows.zig
 // sdk/blocks/attention/decode_attn_quant.zig
 const AttnDqCopy = @import("../../sdk/blocks/attention/decode_attn_quant.zig").AttnDqCopy;
@@ -330,8 +317,6 @@ pub var qsa_decode_gather_override: ?bool = null;
 pub var qsa_batched_gather_override: ?bool = null;
 
 pub var qsa_history_share_override: ?bool = null;
-
-pub var qsa_score_fused_override: ?bool = null;
 
 pub var qsa_attn_kernel_override: ?bool = null;
 
@@ -1009,7 +994,6 @@ test {
     _ = @import("../../sdk/blocks/attention/attn256.zig");
     _ = @import("../../sdk/blocks/norms/residual_norm.zig");
     _ = @import("../../plugins/qwen4_exp/qsa/gather.zig");
-    _ = @import("../../plugins/qwen4_exp/qsa/select.zig");
     _ = @import("../../plugins/qwen4_exp/mtp.zig");
     _ = @import("../../sdk/blocks/linear/verify_projection.zig");
     _ = @import("../../plugins/qwen4_exp/qsa/score.zig");
@@ -1019,7 +1003,7 @@ test {
     _ = @import("../../mlx/array.zig");
     _ = @import("../../plugins/qwen4_exp/qsa/decode_gather.zig");
     _ = @import("../../plugins/qwen4_exp/qsa/verify_gather.zig");
-    _ = @import("../../plugins/qwen4_exp/qsa/mask.zig");
+    _ = @import("../../plugins/qwen4_exp/qsa/head_place.zig");
     _ = @import("kv/cache.zig");
     _ = @import("../../sdk/blocks/attention/kv_view.zig");
     _ = @import("kv/sliding.zig");
@@ -1095,7 +1079,6 @@ test {
     _ = @import("../../mlx/dtype.zig");
     _ = @import("../../sdk/diag/standin.zig");
     _ = @import("../../plugins/qwen4_exp/prof.zig");
-    _ = @import("env_transformer.zig");
     _ = @import("../../sdk/blocks/linear/fused_rows.zig");
     _ = @import("../../sdk/blocks/attention/decode_attn_quant.zig");
     _ = @import("../../sdk/blocks/rope/qk_norm_rope.zig");

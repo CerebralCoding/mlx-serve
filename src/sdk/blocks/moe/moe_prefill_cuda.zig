@@ -6,7 +6,6 @@
 //! is bit-identical to the chain's (the weights are exact in bf16). Where MLX would not run `qmm_sm80`
 //! the kernels decline.
 const std = @import("std");
-const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../util/log.zig");
@@ -48,17 +47,6 @@ var engaged = false;
 /// Gathers served (the tests assert the path engaged).
 pub var served: u64 = 0;
 
-var env_enabled: ?bool = null;
-pub var override: ?bool = null;
-/// `MLX_SERVE_MOE_PREFILL_CUDA=0` keeps MLX's `gather_qmm`.
-pub fn enabled() bool {
-    if (override) |v| return v;
-    if (env_enabled) |v| return v;
-    const raw = env.get(.MLX_SERVE_MOE_PREFILL_CUDA);
-    env_enabled = raw == null or raw.?[0] != '0';
-    return env_enabled.?;
-}
-
 fn kernelFor(fmt: Format) !mlx.mlx_fast_cuda_kernel {
     const slot = &kernels[if (fmt == .mxfp8) 0 else 1];
     if (slot.*) |k| return k;
@@ -79,7 +67,7 @@ fn kernelFor(fmt: Format) !mlx.mlx_fast_cuda_kernel {
 /// w [E, N, K*bits/32] uint32 and s [E, N, K/group] uint8, inds [R] uint32 sorted. Returns
 /// [R, 1, N] (x's rank), or null outside the kernel's envelope.
 pub fn sortedGather(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, inds: mlx.mlx_array, fmt: Format) !?mlx.mlx_array {
-    if (!enabled() or !mlx.cudaAvailable()) return null;
+    if (!mlx.cudaAvailable()) return null;
     if (mlx.mlx_array_dtype(x) != .bfloat16 or mlx.mlx_array_dtype(inds) != .uint32) return null;
     if (mlx.mlx_array_dtype(w) != .uint32 or mlx.mlx_array_dtype(sc) != .uint8) return null;
     const bits: c_int = if (fmt == .mxfp8) 8 else 4;
@@ -124,7 +112,7 @@ pub fn sortedGather(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc: m
     if (xs.len == 3) try mlx.check(mlx.mlx_reshape(&out, y, &[_]c_int{ R, 1, N }, 3, s)) else try mlx.check(mlx.mlx_reshape(&out, y, &[_]c_int{ R, N }, 2, s));
     if (!engaged) {
         engaged = true;
-        log.info("[moe] CUDA prefill expert GEMM engaged: {s} K={d} N={d} experts={d} (MLX_SERVE_MOE_PREFILL_CUDA=0 restores gather_qmm)\n", .{ @tagName(fmt), K, N, E });
+        log.info("[moe] CUDA prefill expert GEMM engaged: {s} K={d} N={d} experts={d}\n", .{ @tagName(fmt), K, N, E });
     }
     served += 1;
     return out;
@@ -140,7 +128,7 @@ pub var gu_served: u64 = 0;
 /// [E, I, K*bits/32] uint32 with uint8 scales, `gscale` [E] or null. Returns act [R, I], or null
 /// outside the kernel's envelope.
 pub fn gateUp(s: mlx.mlx_stream, x: mlx.mlx_array, rows: mlx.mlx_array, inds: mlx.mlx_array, gw: mlx.mlx_array, gsc: mlx.mlx_array, uw: mlx.mlx_array, usc: mlx.mlx_array, gscale: ?mlx.mlx_array, fmt: Format) !?mlx.mlx_array {
-    if (!enabled() or !mlx.cudaAvailable()) return null;
+    if (!mlx.cudaAvailable()) return null;
     if (mlx.mlx_array_dtype(x) != .bfloat16 or mlx.mlx_array_dtype(inds) != .uint32 or mlx.mlx_array_dtype(rows) != .uint32) return null;
     if (gscale) |g| if (mlx.mlx_array_dtype(g) != .bfloat16) return null;
     inline for (.{ gw, uw }) |b| if (mlx.mlx_array_dtype(b) != .uint32) return null;
@@ -194,7 +182,7 @@ pub fn gateUp(s: mlx.mlx_stream, x: mlx.mlx_array, rows: mlx.mlx_array, inds: ml
     try mlx.check(mlx.mlx_vector_array_get(&act, o, 0));
     if (!gu_engaged) {
         gu_engaged = true;
-        log.info("[moe] CUDA prefill gate+up+SwiGLU engaged: {s} K={d} I={d} experts={d} (MLX_SERVE_MOE_PREFILL_CUDA=0 restores the chain)\n", .{ @tagName(fmt), K, I, E });
+        log.info("[moe] CUDA prefill gate+up+SwiGLU engaged: {s} K={d} I={d} experts={d}\n", .{ @tagName(fmt), K, I, E });
     }
     gu_served += 1;
     return act;
@@ -211,7 +199,7 @@ var reduce_engaged = false;
 /// weighted and summed over the top-k, [B, S, H]. down [B*S*K, H] and scores [B, S, K] bf16,
 /// inverse [B*S*K] uint32. Null outside the kernel's envelope.
 pub fn weightedSum(s: mlx.mlx_stream, down: mlx.mlx_array, inverse: mlx.mlx_array, scores: mlx.mlx_array) !?mlx.mlx_array {
-    if (!enabled() or !mlx.cudaAvailable()) return null;
+    if (!mlx.cudaAvailable()) return null;
     if (mlx.mlx_array_dtype(down) != .bfloat16 or mlx.mlx_array_dtype(scores) != .bfloat16 or mlx.mlx_array_dtype(inverse) != .uint32) return null;
     const ds = mlx.getShape(down);
     const ss = mlx.getShape(scores);
@@ -250,7 +238,7 @@ pub fn weightedSum(s: mlx.mlx_stream, down: mlx.mlx_array, inverse: mlx.mlx_arra
     try mlx.check(mlx.mlx_vector_array_get(&y, o, 0));
     if (!reduce_engaged) {
         reduce_engaged = true;
-        log.info("[moe] CUDA prefill weighted sum engaged: top-{d} H={d} (MLX_SERVE_MOE_PREFILL_CUDA=0 restores the take + multiply + sum)\n", .{ K, H });
+        log.info("[moe] CUDA prefill weighted sum engaged: top-{d} H={d}\n", .{ K, H });
     }
     return y;
 }

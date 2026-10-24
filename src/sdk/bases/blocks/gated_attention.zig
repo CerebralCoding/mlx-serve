@@ -48,7 +48,7 @@ pub const Proj = struct {
 
     /// `forward`, the projection on the row-exact `lane` (the side copy keeps its own kernel, as the engine's).
     pub fn onLane(p: *const Proj, lane: row_exact.Lane, g: *Graph, x: Array, decode: bool) !Array {
-        if (decode and p.dq.w.ctx != null and (p.lin.s.ctx == null or dq.attnDqRequantEnabled()) and dq.decodeAttnQuantEnabled())
+        if (decode and p.dq.w.ctx != null and dq.decodeAttnQuantEnabled())
             return p.dq.forward(g, x);
         return row_exact.linear(lane, g, &p.lin, x);
     }

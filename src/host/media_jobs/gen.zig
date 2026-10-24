@@ -37,7 +37,6 @@ const Conn = server_mod.Conn;
 
 const modality_mod = @import("../registry/modality.zig");
 pub const Modality = modality_mod.Modality;
-pub const media_model_types = modality_mod.media_model_types;
 pub const modalityFromType = modality_mod.fromType;
 
 /// Endpoint-level media route. `.speech`, `.music` and `.sound` share the `.audio`
@@ -72,9 +71,8 @@ pub fn servesAudioRoute(io: std.Io, model_dir: []const u8, model_type: []const u
     return @field(plugin_engine.caps(io, d, t).routes, @tagName(route));
 }
 
-/// Peek `model_dir/config.json` for its `model_type` string (owned dupe, caller
-/// frees) or null on any read/parse error. Cheap — used to route to a media
-/// modality and to pick a legacy backend.
+/// The pack's `model_type` (owned dupe, caller frees), or null on any read/parse error: the media plugin's that claims
+/// the folder, else config.json's. Cheap — used to route to a media modality and to pick a legacy backend.
 pub fn peekModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) ?[]u8 {
     // Guard the openFileAbsolute assert (ReleaseFast UB on relative/empty paths).
     if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return null;
@@ -83,48 +81,7 @@ pub fn peekModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
         defer d.close(io);
         if (plugin_served.claimTypeIn(io, d, allocator)) |mt| return mt;
     } else |_| {}
-    if (isClefPack(io, model_dir)) return allocator.dupe(u8, "clef") catch null;
-    // A Kev pack's root config.json is its qwen3_5 base: the marker is checked first (discovery agrees).
-    if (isKevPack(io, model_dir)) return allocator.dupe(u8, "kev") catch null;
-    // A D1 pack's root config.json is LFM2-VL: its auto_map decides, before the model_type reads as chat.
-    if (isD1Pack(io, allocator, model_dir)) return allocator.dupe(u8, "d1") catch null;
-    if (readConfigModelType(io, allocator, model_dir)) |mt| return mt;
-    // Laya decision checkpoints carry no root config.json.
-    if (isLayaRepo(io, model_dir)) return allocator.dupe(u8, "laya") catch null;
-    // Stable Audio 3 as Stability publishes it: stable-audio-tools' model_config.json.
-    if (isStableAudio3Repo(io, allocator, model_dir)) return allocator.dupe(u8, "stable_audio3") catch null;
-    return null;
-}
-
-fn isClefPack(io: std.Io, model_dir: []const u8) bool {
-    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
-    defer dir.close(io);
-    return discovery.peekClefPack(io, dir);
-}
-
-/// Thin path→Dir wrapper over `model_discovery.peekStableAudio3Config`.
-fn isStableAudio3Repo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
-    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
-    defer dir.close(io);
-    return discovery.peekStableAudio3Config(io, allocator, dir);
-}
-
-fn isKevPack(io: std.Io, model_dir: []const u8) bool {
-    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
-    defer dir.close(io);
-    return discovery.peekKevPack(io, dir);
-}
-
-fn isD1Pack(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
-    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
-    defer dir.close(io);
-    return discovery.peekD1Pack(io, allocator, dir);
-}
-
-fn isLayaRepo(io: std.Io, model_dir: []const u8) bool {
-    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
-    defer dir.close(io);
-    return discovery.peekLayaCheckpoint(io, dir);
+    return readConfigModelType(io, allocator, model_dir);
 }
 
 /// Read `model_dir/config.json`'s `model_type` (owned dupe) or null on any
@@ -146,32 +103,13 @@ fn readConfigModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []co
     return allocator.dupe(u8, mt.string) catch null;
 }
 
-/// Classify a model dir into a media modality (reads its `model_type`), or null
-/// for a regular LM/embedding arch. The video (LTX "AudioVideo") branch
-/// additionally requires `connector.safetensors` so a generic "AudioVideo"
-/// config without the LTX bundle isn't misrouted.
-/// A file that must be present for `model_type` to be accepted as that media
-/// backend, or null when the `model_type` alone is sufficient.
-///
-/// This is keyed on the TYPE, not the modality. It used to be
-/// `if (modality == .video) require connector.safetensors` — a marker that
-/// belongs to LTX only. The moment a second video backend existed, that guard
-/// rejected it, `detectModality` returned null, and the loader fell through to
-/// the MLX TEXT path: it globbed all four of MiniMax-H3's safetensors into one
-/// weight map and died on `model.norm.weight`. A per-MODALITY guard cannot
-/// survive a modality growing a second backend.
-pub fn requiredMarkerFor(model_type: []const u8) ?[]const u8 {
-    // The table lives in model_discovery (fs-only, so discovery and
-    // register-by-path apply the SAME completeness rule) — this module can
-    // import that one, just not the other way around.
-    return discovery.requiredMediaMarker(model_type);
-}
-
+/// Classify a model dir into a media modality (its media plugin's), or null for a regular LM/embedding arch or an
+/// incomplete media pack (its plugin's required file missing).
 pub fn detectModality(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) ?Modality {
     const mt = peekModelType(io, allocator, model_dir) orelse return null;
     defer allocator.free(mt);
     const modality = modalityFromType(mt) orelse return null;
-    if (requiredMarkerFor(mt)) |marker| {
+    if (discovery.requiredMediaMarker(mt)) |marker| {
         const p = std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ model_dir, marker }, 0) catch return null;
         defer allocator.free(p);
         if (!fileExists(io, p)) {
@@ -192,7 +130,7 @@ pub fn incompleteMediaDir(io: std.Io, allocator: std.mem.Allocator, model_dir: [
     const mt = peekModelType(io, allocator, model_dir) orelse return false;
     defer allocator.free(mt);
     if (modalityFromType(mt) == null) return false;
-    const marker = requiredMarkerFor(mt) orelse return false;
+    const marker = discovery.requiredMediaMarker(mt) orelse return false;
     const p = std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ model_dir, marker }, 0) catch return false;
     defer allocator.free(p);
     return !fileExists(io, p);
@@ -200,7 +138,7 @@ pub fn incompleteMediaDir(io: std.Io, allocator: std.mem.Allocator, model_dir: [
 
 // ════════════════════════════════════════════════════════════════════════
 // Engine wrappers — own the backend sub-models. Allocated on the heap so the
-// `?*Engine` slot on `LoadedModel` is a stable pointer (mirrors `ds4_engine`).
+// `?*Engine` slot on `LoadedModel` is a stable pointer (mirrors `engine`).
 // load() + every generate() run on the inference thread.
 // ════════════════════════════════════════════════════════════════════════
 
@@ -641,7 +579,7 @@ pub fn videoStreamCtx(conn: *Conn, allocator: std.mem.Allocator, body: []const u
 // Stub CPU state for a media model. The gen path bypasses the transformer, so
 // `config`/`tokenizer`/`chat_config` on the LoadedModel are minimal stubs that
 // only keep server-side reads of `lm.config.?` / `lm.chat_config.?` from
-// crashing. Mirrors `runDs4Serve`'s stub construction. Used by BOTH the
+// crashing. Mirrors the GGUF stub (`cpu_state.buildGgufStubCpuState`). Used by BOTH the
 // startup gen-primary path and the cold-load (`/v1/load-model`) path.
 // ════════════════════════════════════════════════════════════════════════
 
@@ -721,59 +659,6 @@ pub fn estimateResidentBytes(io: std.Io, model_dir: []const u8) u64 {
     return sumSafetensorsIn(io, dir);
 }
 
-/// Weights a media backend keeps resident: the pack's files, with a DiT that
-/// `--w8a8` converts re-billed at its int8 copy (4-bit packs grow, bf16 halves).
-fn residentWeightBytes(io: std.Io, dir: std.Io.Dir, model_type: []const u8) u64 {
-    const sum = sumSafetensorsIn(io, dir);
-    if (!(convertsW8a8(model_type) orelse false) or aneKeepsPacked(model_type)) return sum;
-    return sum -| ditBytes(io, dir, false) + ditBytes(io, dir, true);
-}
-
-/// Whether a media type's DiT loaders convert under `--w8a8` (null: nobody classified it). The bill
-/// reads this, so a type that converts and is missing here would be under-billed into an uncatchable
-/// Metal OOM; the test below refuses an unclassified entry of `media_model_types`.
-fn convertsW8a8(model_type: []const u8) ?bool {
-    const converts = [_][]const u8{ "acestep", "AudioVideo", "minimax_h3", "minimax_music3" };
-    const packed_only = [_][]const u8{ "qwen3_tts", "kokoro", "laya", "kev", "clef", "d1", "stable_audio3", "yue2", "nemotron_diarization" };
-    for (converts) |p| if (std.mem.startsWith(u8, model_type, p)) return true;
-    for (packed_only) |p| if (std.mem.startsWith(u8, model_type, p)) return false;
-    return null;
-}
-
-/// The engines whose ANE seam reads the packed DiT weights, so `--ane-*` keeps them packed (the loaders
-/// skip the conversion) and the bill must not assume the int8 copy.
-fn aneKeepsPacked(model_type: []const u8) bool {
-    if (std.mem.eql(u8, model_type, "acestep")) return ane.aneState().media_offload.audio;
-    if (std.mem.eql(u8, model_type, "minimax_h3")) return ane.aneState().media_offload.video;
-    return false;
-}
-
-/// A top-level shard that holds a DiT: `transformer*` (Krea, H3, LTX, Music3), ACE-Step's `model` or
-/// Hunyuan3D's `dit`.
-fn isDitShardName(name: []const u8) bool {
-    return std.mem.startsWith(u8, name, "transformer") or std.mem.eql(u8, name, "model.safetensors") or std.mem.eql(u8, name, "dit.safetensors");
-}
-
-/// A pack's DiT shards (`transformer/*.safetensors`, else the top-level ones `isDitShardName` names):
-/// their file bytes, or resident under `--w8a8`.
-fn ditBytes(io: std.Io, dir: std.Io.Dir, resident: bool) u64 {
-    var sub: ?std.Io.Dir = dir.openDir(io, "transformer", .{ .iterate = true }) catch null;
-    defer if (sub) |*d| d.close(io);
-    const d = sub orelse dir;
-    var total: u64 = 0;
-    var it = d.iterate();
-    while (it.next(io) catch null) |e| {
-        if (e.kind != .file and e.kind != .sym_link) continue;
-        if (!std.mem.endsWith(u8, e.name, ".safetensors")) continue;
-        if (sub == null and !isDitShardName(e.name)) continue;
-        const st = d.statFile(io, e.name, .{}) catch continue;
-        if (st.kind != .file) continue;
-        const size: u64 = @intCast(st.size);
-        total += if (resident) w8a8.residentBytes(io, d, e.name) orelse size else size;
-    }
-    return total;
-}
-
 fn sumSafetensorsIn(io: std.Io, dir: std.Io.Dir) u64 {
     // Symlinked weights count (statFile follows) — an HF hub-cache snapshot
     // is ALL symlinks into ../../blobs; skipping them billed a pack at 0.
@@ -808,13 +693,11 @@ pub fn releaseMediaResidency() u64 {
     return minimax_h3.releaseAllResidents();
 }
 
-/// Per-backend generation-peak estimate for the media load preflight. A
-/// backend with a STAGED residency plan declares it here; every other type
-/// keeps the sum-of-safetensors default — over-billing fails safe (a refused
-/// load names its numbers), under-billing kills the process mid-request.
+/// The generation peak a media load preflight bills: the media plugin's load bill, else the pack's safetensors —
+/// over-billing fails safe (a refused load names its numbers), under-billing kills the process mid-request.
 pub fn estimatePeakResidentBytesIn(io: std.Io, dir: std.Io.Dir, model_type: []const u8) u64 {
     if (plugin_served.byName(model_type)) |t| return plugin_engine.billLoad(io, dir, t);
-    return residentWeightBytes(io, dir, model_type);
+    return sumSafetensorsIn(io, dir);
 }
 
 /// Sum of the `.safetensors` under an absolute path, or 0 if it is not
@@ -1879,17 +1762,6 @@ test "residency bill: ACE-Step, Music3, Hunyuan3D and LTX DiT shards are billed 
     try std.testing.expectEqual(f1 - 18432 + 33280 + ltx_bill.externalTextEncoderBytes(), estimatePeakResidentBytesIn(io, tmp.dir, "AudioVideo"));
 }
 
-test "every media model type says whether --w8a8 converts it, so the bill cannot miss an engine" {
-    // A plugin's own load bill reads the machine's `--w8a8` itself.
-    for (media_model_types) |mt| if (plugin_served.byName(mt) == null and convertsW8a8(mt) == null) {
-        std.debug.print("media type '{s}' is not classified in convertsW8a8\n", .{mt});
-        return error.UnclassifiedMediaType;
-    };
-    try std.testing.expect(convertsW8a8("acestep").? and convertsW8a8("AudioVideo").?);
-    try std.testing.expect(!convertsW8a8("kokoro").? and !convertsW8a8("stable_audio3").?);
-    try std.testing.expect(convertsW8a8("a_future_engine") == null);
-}
-
 test "media markers are per-TYPE, not per-modality" {
     // REGRESSION. `detectModality` guarded the whole `.video` modality on
     // LTX's `connector.safetensors`. MiniMax-H3 has no such file, so detection
@@ -1899,25 +1771,25 @@ test "media markers are per-TYPE, not per-modality" {
     //
     // The invariant: a marker belongs to a BACKEND. Requiring one backend's
     // file from every model in its modality breaks the next backend added.
-    try std.testing.expectEqualStrings("connector.safetensors", requiredMarkerFor("AudioVideo").?);
-    try std.testing.expectEqualStrings("transformer.safetensors", requiredMarkerFor("minimax_h3").?);
+    try std.testing.expectEqualStrings("connector.safetensors", discovery.requiredMediaMarker("AudioVideo").?);
+    try std.testing.expectEqualStrings("transformer.safetensors", discovery.requiredMediaMarker("minimax_h3").?);
     // Music3: the converter writes the vocoder LAST, so its presence is the
     // completeness marker for the whole five-file pack.
-    try std.testing.expectEqualStrings("vocoder.safetensors", requiredMarkerFor("minimax_music3").?);
+    try std.testing.expectEqualStrings("vocoder.safetensors", discovery.requiredMediaMarker("minimax_music3").?);
     // H3 must NOT be gated on LTX's file.
-    try std.testing.expect(!std.mem.eql(u8, requiredMarkerFor("minimax_h3").?, "connector.safetensors"));
+    try std.testing.expect(!std.mem.eql(u8, discovery.requiredMediaMarker("minimax_h3").?, "connector.safetensors"));
 
     // Every media type either declares its own marker or needs none; none may
     // inherit another backend's.
-    for (media_model_types) |mt| {
-        if (requiredMarkerFor(mt)) |m| {
+    for (plugin_served.types) |mt| {
+        if (discovery.requiredMediaMarker(mt)) |m| {
             try std.testing.expect(m.len > 0);
             if (!std.mem.eql(u8, mt, "AudioVideo"))
                 try std.testing.expect(!std.mem.eql(u8, m, "connector.safetensors"));
         }
     }
     // A non-media type never carries one.
-    try std.testing.expect(requiredMarkerFor("gemma4") == null);
+    try std.testing.expect(discovery.requiredMediaMarker("gemma4") == null);
 }
 
 test "incompleteMediaDir: marker-missing media dir is refused, complete and non-media are not" {

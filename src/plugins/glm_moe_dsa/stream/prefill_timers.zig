@@ -3,7 +3,7 @@
 //! at its end. In every other build `enabled` is false and each call below compiles to nothing.
 
 const bo = @import("../../../sdk/weights/streamed/build_flags.zig");
-const ops = @import("../../deepseek_v41/stream/ops.zig");
+const ops = @import("../../../sdk/weights/streamed/ops.zig");
 const sdk_ext = @import("../../../sdk/weights/streamed/sdk_ext.zig");
 const log = @import("sdk").log;
 

@@ -5,7 +5,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const mlx = @import("sdk").mlx;
 const moe = @import("moe.zig");
-const streamed = @import("../../deepseek_v41/stream/streamed.zig");
+const streamed = @import("../../../sdk/weights/streamed/bank_source.zig");
 
 comptime {
     if (!builtin.is_test) @compileError("mimo_v2 dupes.zig is a parity harness; served code never imports it");

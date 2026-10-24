@@ -24,6 +24,7 @@ const lane_qmm = @import("../../sdk/blocks/qmm/lane_qmm.zig");
 const log = @import("../../sdk/util/log.zig");
 const prism_seam = @import("../prism_hadamard_qwen35/seam.zig");
 const weights_mod = @import("../../sdk/weights/load.zig");
+const streamed = @import("../../sdk/weights/streamed.zig");
 const ld = @import("../qwen3/load.zig");
 const qwen3 = @import("../qwen3/plugin.zig");
 pub const config = @import("config.zig");
@@ -126,10 +127,13 @@ pub const Loaded = struct {
     /// The scaled rope's spectrum and YaRN's `[head_dim]` factor (null = none), owned.
     rope_freqs: Array = .{ .ctx = null },
     rope_mscale: Array = .{ .ctx = null },
+    /// The routed experts streamed from the pack as downloaded (the `stream_experts` setting).
+    experts: ?streamed.Streamed = null,
 
     fn release(m: *Loaded) void {
         lane_qmm.release(@intFromPtr(m));
         if (m.head) |*h| h.deinit();
+        if (m.experts) |*x| x.close();
         switch (m.body) {
             .none => {},
             inline .dense, .moe, .prism => |*d| {
@@ -218,6 +222,7 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
     if (gpu) m.geo.gate_fn = gdn.compileGate(m.geo.state, s);
     const shared = bases.Shared.init(c.rms_norm_eps, c.rms_norm_eps);
     if (c.moe()) {
+        if (streamed.Setting.parse(ctx.settings_json.slice())) |st| m.experts = try streamed.Streamed.openPack(gpa, ctx.model_dir.slice(), s, st.slotRows(c.num_experts));
         m.body = .{ .moe = .{ .base = .{ .weights = undefined, .shared = shared, .a = gpa, .s = s, .placeholders = ctx.parsed.placeholder_ids }, .layers = try gpa.alloc(Moe.Layer, c.num_hidden_layers) } };
         m.routes = try gpa.alloc(compiled.Closure, c.num_hidden_layers);
         @memset(m.routes, .{ .ctx = null });
@@ -497,20 +502,33 @@ fn moeMlp(m: *Loaded, r: *ld.Reader, c: *const config.Config, i: usize, s: mlx.m
     const hidden = c.hidden_size;
     var nb: [256]u8 = undefined;
     const router = try r.proj(try r.name(&nb, "layers.{d}.mlp.gate", .{i}), hidden);
+    try m.owned.linear(router);
     const gate = try r.bank(try r.name(&nb, "layers.{d}.mlp.switch_mlp.gate_proj", .{i}), hidden);
     const up = try r.bank(try r.name(&nb, "layers.{d}.mlp.switch_mlp.up_proj", .{i}), hidden);
     const down = try r.bank(try r.name(&nb, "layers.{d}.mlp.switch_mlp.down_proj", .{i}), c.moe_intermediate_size);
-    for ([_]Linear{ router, gate, up, down }) |l| try m.owned.linear(l);
     var w: b.moe.Moe.Weights = .{
         .router = router,
         .route = .softmax,
         .gate = qwen3.bankOf(gate, c.quant),
         .up = qwen3.bankOf(up, c.quant),
         .down = qwen3.bankOf(down, c.quant),
-        .bank_views = try qwen3.bankViews(&m.owned, gate, up, down, s),
         .top_k = @intCast(c.num_experts_per_tok),
         .experts = @intCast(c.num_experts),
     };
+    if (m.experts) |*x| {
+        // The banks give the quant params only: their tensors are never read.
+        for ([_]Linear{ gate, up, down }) |l| for ([_]Array{ l.w, l.s, l.b }) |a| if (a.ctx != null) {
+            _ = mlx.mlx_array_free(a);
+        };
+        inline for (.{ &w.gate, &w.up, &w.down }) |bk| {
+            if (bk.qp.mode != .affine) return error.StreamedPackNotAffine;
+            bk.* = .{ .w = .{ .ctx = null }, .qp = bk.qp };
+        }
+        w.streamed = .{ .routed = x.routedSource(), .layer = x.layerOf(try r.name(&nb, "layers.{d}.mlp", .{i})) orelse return error.StreamedLayerMissing };
+    } else {
+        for ([_]Linear{ gate, up, down }) |l| try m.owned.linear(l);
+        w.bank_views = try qwen3.bankViews(&m.owned, gate, up, down, s);
+    }
     if (r.has(try r.name(&nb, "layers.{d}.mlp.shared_expert_gate.weight", .{i}))) {
         const sg = try r.proj(try r.name(&nb, "layers.{d}.mlp.shared_expert.gate_proj", .{i}), hidden);
         const su = try r.proj(try r.name(&nb, "layers.{d}.mlp.shared_expert.up_proj", .{i}), hidden);

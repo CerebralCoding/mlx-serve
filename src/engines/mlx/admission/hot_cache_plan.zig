@@ -570,6 +570,7 @@ test "disabled prefix cache: sizing releases the cache reserve on every arch" {
     var gated = longCtxTestConfig();
     var other = longCtxTestConfig();
     other.model_type = "qwen3_5_moe";
+    other.legacy.caps.long_ctx = std.mem.eql(u8, other.model_type, "qwen4_exp");
     const configs = [_]*model_mod.ModelConfig{ &gated, &other };
     for ([_]u64{ 0, 2 << 30, 60 << 30 }) |ask| {
         http_server.prefix_cache_mem_bytes = ask;

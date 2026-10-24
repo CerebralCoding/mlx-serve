@@ -275,7 +275,9 @@ pub fn assertSource(comptime S: type) void {
 /// - `Bank`: fields `layers: []Layer` (the arch's routed layers), `n_experts`, `sidecar: UncachedFd`; methods
 ///   `recordOffset(*const Bank, layer, expert) u64` and `spans(*const Bank, layer, expert)` (`.gu_offset`, `.down_offset`);
 /// - `BankArrays` and `bankArraysOf([n_components]mlx_array) BankArrays`: the slot arrays as the bank's quant binds them;
-/// - `routed_top_k`: the arch's routed experts per token (the lookahead selector's per-row threshold rank).
+/// - `routed_top_k`: the arch's routed experts per token (the lookahead selector's per-row threshold rank);
+/// - optional `scatter = true` (an MLX pack, whose record parts live apart): `Bank.parts(*const Bank, layer, expert)`
+///   gives each component's file and offset (`Records.Part`), and `recordOffset` / `spans` only order the reads.
 /// The stream allocates the slot rows, plans routes, reads, gates and releases; the arch keeps the MoE math.
 pub fn assertBank(comptime B: type) void {
     comptime {
@@ -292,6 +294,7 @@ pub fn assertBank(comptime B: type) void {
         if (@FieldType(B.Bank, "sidecar") != io.UncachedFd) @compileError(where ++ "Bank.sidecar is not an UncachedFd");
         for ([_][]const u8{ "recordOffset", "spans" }) |m|
             if (!@hasDecl(B.Bank, m)) @compileError(where ++ "Bank has no " ++ m);
+        if (@hasDecl(B, "scatter") and B.scatter and !@hasDecl(B.Bank, "parts")) @compileError(where ++ "a scatter Bank has no parts");
     }
 }
 

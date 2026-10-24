@@ -637,7 +637,7 @@ pub fn handleChatCompletions(
     // that into a prefill would change what every one of them gets back.
     // Asked for by name, so a model that cannot serve it is refused by name.
     const continue_final = continueFinalMessageRequested(root, messages.items);
-    if (continue_final) if (continuationRejectReason(lm.ds4_engine != null)) |reason| {
+    if (continue_final) if (continuationRejectReason(lm.engineOwnsTemplate())) |reason| {
         log.warn("  -> 400 (continuation unsupported by the embedded engine)\n", .{});
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
         return;

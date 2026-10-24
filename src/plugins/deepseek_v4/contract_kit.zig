@@ -34,22 +34,6 @@ pub const Sum = struct {
     }
 };
 
-pub fn elemOf(dt: mlx.mlx_dtype) spec.Elem {
-    return switch (dt) {
-        .float32 => .f32,
-        .float16 => .f16,
-        else => .bf16,
-    };
-}
-
-/// `v` rounded to `dt` (integers pass through).
-pub fn rt(dt: mlx.mlx_dtype, v: f64) f64 {
-    return switch (dt) {
-        .float32, .float16, .bfloat16 => spec.roundTo(elemOf(dt), v),
-        else => v,
-    };
-}
-
 pub fn Case(comptime D: type) type {
     return struct {
         const Self = @This();
@@ -111,7 +95,7 @@ pub fn Case(comptime D: type) type {
             try D.fill(self, fill, prng.random());
             self.rig.reset();
             for (self.ins[0..self.n_in], 0..) |x, i| {
-                for (x.v) |*v| v.* = rt(x.dt, v.*);
+                for (x.v) |*v| v.* = kc.host.rt(x.dt, v.*);
                 self.args[i] = try self.rig.input(x.dt, x.dims[0..x.nd], x.v);
             }
             return true;
@@ -183,11 +167,6 @@ pub fn add(set: *kc.Set, comptime D: type, launch: *const metal.Launch, p: D.Par
 /// Uniform values in [lo, hi).
 pub fn uniform(rng: std.Random, out: []f64, lo: f64, hi: f64) void {
     for (out) |*v| v.* = lo + (hi - lo) * rng.float(f64);
-}
-
-/// Integers in [lo, hi].
-pub fn ints(rng: std.Random, out: []f64, lo: i32, hi: i32) void {
-    for (out) |*v| v.* = @floatFromInt(rng.intRangeAtMost(i32, lo, hi));
 }
 
 /// Places NaN, +Inf and -Inf in `v` (a [rows, k] row-major input): row 0 a NaN, row 1 +Inf, row 2 -Inf, row 3 both

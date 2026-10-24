@@ -27,6 +27,7 @@ const getTimeoutNs = @import("../http/server.zig").getTimeoutNs;
 const decodeTokens = @import("tokenize.zig").decodeTokens;
 const promptOpensThink = @import("../chat/reasoning/request.zig").promptOpensThink;
 const promptOpensMuseHeader = @import("../chat/reasoning/request.zig").promptOpensMuseHeader;
+const reasoningDialect = @import("../chat/reasoning/request.zig").reasoningDialect;
 const toolCallFinishReason = @import("../chat/tools/pipeline.zig").toolCallFinishReason;
 const streamToolCallDelta = @import("../chat/tools/pipeline.zig").streamToolCallDelta;
 const shouldParseToolCalls = @import("../chat/tools/pipeline.zig").shouldParseToolCalls;
@@ -504,7 +505,7 @@ pub fn handleStreamingGeneration(
     // answer into reasoning_content and left `content` empty (live 2026-08-13).
     // A model that opens the block itself is picked up by `saw_think_open`.
     var channel_armed = false; // the `<|channel>` marker that may open a Gemma 4 thought
-    const gated_stream = has_tools or (sampling.constraint == null and std.mem.eql(u8, config.model_type, "gpt_oss"));
+    const gated_stream = has_tools or (sampling.constraint == null and reasoningDialect(config) == .harmony);
     // Constrained requests route through the protocol, not the response-side
     // close scan. The stream seeds the think arm while the payload has not
     // begun (a generated opener must strip, not leak), and flips straight to

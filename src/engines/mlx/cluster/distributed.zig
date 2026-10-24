@@ -1601,7 +1601,7 @@ test "the pair holds its own folder, not another one with the same name" {
     try std.testing.expect(holds(a_spelled));
     try std.testing.expect(!holds(b));
     // The other folder loads, and is billed, whole.
-    var c: model_mod.ModelConfig = .{ .model_type = "qwen4_exp", .num_hidden_layers = 8 };
+    var c: model_mod.ModelConfig = .{ .model_type = "qwen4_exp", .legacy = .{ .caps = .{ .long_ctx = true } }, .num_hidden_layers = 8 };
     worker_free_mib.store(40, .release);
     defer worker_free_mib.store(0, .release);
     try std.testing.expectEqual(@as(u64, 800), hostShare(b, &c, 800));

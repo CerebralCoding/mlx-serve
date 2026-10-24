@@ -11,10 +11,6 @@ pub const Message = @import("types.zig").Message;
 pub const ChatConfig = @import("types.zig").ChatConfig;
 pub const loadChatConfig = @import("template_load.zig").loadChatConfig;
 pub const formatChat = @import("template_load.zig").formatChat;
-pub const encodeChatViaDs4 = @import("../../engines/ds4/chat.zig").encodeChatViaDs4;
-pub const decodeViaDs4 = @import("../../engines/ds4/chat.zig").decodeViaDs4;
-pub const encodeChatViaLlama = @import("../../engines/llama/chat.zig").encodeChatViaLlama;
-pub const decodeViaLlama = @import("../../engines/llama/chat.zig").decodeViaLlama;
 pub const renderChatTemplate = @import("render.zig").renderChatTemplate;
 pub const serializeMessagesJson = @import("serialize.zig").serializeMessagesJson;
 pub const serializeMessagesJsonFor = @import("serialize.zig").serializeMessagesJsonFor;
@@ -76,8 +72,6 @@ pub const toolsDeclare = @import("tools/tool_choice.zig").toolsDeclare;
 pub const forcedToolOpener = @import("tools/tool_choice.zig").forcedToolOpener;
 
 test {
-    _ = @import("../../engines/ds4/chat.zig");
-    _ = @import("../../engines/llama/chat.zig");
     _ = @import("continuation.zig");
     _ = @import("effort.zig");
     _ = @import("fallback.zig");

@@ -168,10 +168,16 @@ test "deepseek_v41 config: the release pack parses with its sources, Engram, DSp
     try testing.expectEqual(@as(u32, 3), p.spec.native_stages);
 }
 
-test "deepseek_v41 config: an experts.bin bank is refused by name (lib/mlx-stream serves it)" {
+test "deepseek_v41 config: an experts.bin bank streams, its prompt passed whole" {
     var p: abi.Parsed = .{};
     const v = parseFiles(&.{ .{ .name = "config.json", .bytes = iq3 }, .{ .name = "experts.bin", .bytes = "" } }, true, &p);
-    try testing.expect(!v.isOk() and std.mem.indexOf(u8, v.why.slice(), "mlx-stream") != null);
+    try testing.expect(v.isOk());
+    defer freeParsed(&p);
+    try testing.expect(of(&p).dsv41_streamed and p.caps.whole_prompt_prefill and p.caps.streamed_weights);
+    var q: abi.Parsed = .{};
+    try testing.expect(parseFiles(&.{.{ .name = "config.json", .bytes = iq3 }}, true, &q).isOk());
+    defer freeParsed(&q);
+    try testing.expect(!of(&q).dsv41_streamed and !q.caps.whole_prompt_prefill);
 }
 
 test "deepseek_v41 config: a layer that would read another ratio's cache is refused by name" {

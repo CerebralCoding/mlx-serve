@@ -165,7 +165,7 @@ holds the arch contract's types. MLX-format V4.1 packs stay in-tree (`src/plugin
 - **Refuse by name.** An unsupported config, layout or platform is a named error plus a `log.err` line. It never
   falls back to another arch.
 - **No new CLI flags or env levers for one plugin.** Use what the host already has: the GPU ceiling
-  (`MLX_SERVE_GPU_CEILING_MB` for diagnostics), the OS reserve, `--wired-margin-gib`, the per-model `ctx_size`. A diagnostic env follows the host's convention (absent or `0` = off, as `diagEnvOn`).
+  (`MLX_SERVE_GPU_CEILING_MB` for diagnostics), the OS reserve, `--wired-margin-gib`, the per-model `ctx_size`. A diagnostic is a `MLX_SERVE_DIAG` token (absent or `0` = off).
 - **Bill what you allocate.** Memory the plugin allocates is billed by the plugin (`loadBytes`, `promptBytes`), and
   each term is an upper bound it has measured.
 - **No duplicated host code.** If the plugin needs something the host has, the host exposes it through `mlx_host`.

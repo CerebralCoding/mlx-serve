@@ -2,7 +2,6 @@
 //! Owns AttnDqCopy, attnDqUseNvfp4, attn_dq_engaged, attn_dq_nvfp4_engaged, and 11 more.
 
 const std = @import("std");
-const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const QuantMode = @import("../../quant/params.zig").QuantMode;
 const Weights = @import("../../weights/resident.zig").Weights;
@@ -76,13 +75,6 @@ pub fn decodeAttnQuantExplicit() bool {
     return cli().decode_attn_quant_flag orelse false;
 }
 
-/// LOSSY opt-in (`MLX_SERVE_DECODE_ATTN_QUANT_REQUANT=1`): 8-bit affine
-/// attention weights get nvfp4 decode copies too, halving their per-token read.
-var attn_dq_requant_cached: ?bool = null;
-pub fn attnDqRequantEnabled() bool {
-    return env.onCached(&attn_dq_requant_cached, .MLX_SERVE_DECODE_ATTN_QUANT_REQUANT);
-}
-
 pub fn decodeAttnQuantEnabled() bool {
     if (decode_attn_quant_override) |v| return v;
     return cli().decode_attn_quant_flag orelse DECODE_ATTN_QUANT_DEFAULT;
@@ -122,17 +114,6 @@ pub fn decodeAttnQuantEligible(w_shape: []const c_int, dtype: mlx.mlx_dtype, has
 /// same as any checkpoint-quantized linear). `nvfp4` picks real nvfp4-g16
 /// (half the int8 bytes, e4m3 scales, no biases) over the default INT8-g32
 /// affine. Materialized eagerly so the build never rides a token's graph.
-/// An 8-bit affine weight [out, in] back in the dense layout `buildAttnDqCopy`
-/// takes (bf16 [in, out]).
-pub fn denseFromAffine8(s: mlx.mlx_stream, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, group_size: u32) !mlx.mlx_array {
-    var deq = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(deq);
-    try mlx.check(mlx.mlx_dequantize(&deq, w, sc, bi, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(8), "affine", .{ .ctx = null }, .{ .value = .bfloat16, .has_value = true }, s));
-    var t = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(t);
-    try mlx.check(mlx.mlx_transpose_axes(&t, deq, &[_]c_int{ 1, 0 }, 2, s));
-    return t;
-}
 
 pub fn buildAttnDqCopy(s: mlx.mlx_stream, w: mlx.mlx_array, nvfp4: bool) !?AttnDqCopy {
     var wt = mlx.mlx_array_new();
@@ -247,39 +228,6 @@ test "decode-attn-quant: int8 side copy tracks the dense projection (and is hone
         // would mean the hook silently dispatched the dense weight.
         try std.testing.expect(max_diff > 0.0);
     }
-}
-
-test "decode-attn-quant: an 8-bit affine weight's nvfp4 copy tracks its own projection" {
-    const s = mlx.gpuStream();
-    var prng = std.Random.DefaultPrng.init(0xA8);
-    // Packed weights are [out, in] = [192, 256], read transposed.
-    const w = try attn256RandBf16(prng.random(), &[_]c_int{ 192, 256 }, s);
-    defer _ = mlx.mlx_array_free(w);
-    const x = try attn256RandBf16(prng.random(), &[_]c_int{ 1, 1, 256 }, s);
-    defer _ = mlx.mlx_array_free(x);
-    var parts = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(parts);
-    try mlx.check(mlx.mlx_quantize(&parts, w, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(8), "affine", .{ .ctx = null }, s));
-    var q8: [3]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new() };
-    defer for (q8) |a| {
-        _ = mlx.mlx_array_free(a);
-    };
-    for (&q8, 0..) |*a, i| try mlx.check(mlx.mlx_vector_array_get(a, parts, i));
-    const ref = try qmatmulBits(x, q8[0], q8[1], q8[2], 8, 64, .affine, s);
-    defer _ = mlx.mlx_array_free(ref);
-
-    const dense = try denseFromAffine8(s, q8[0], q8[1], q8[2], 64);
-    defer _ = mlx.mlx_array_free(dense);
-    const copy = (try buildAttnDqCopy(s, dense, true)) orelse return error.SideCopyDeclined;
-    defer {
-        _ = mlx.mlx_array_free(copy.w);
-        _ = mlx.mlx_array_free(copy.s);
-    }
-    const quant = try qmatmulBits(x, copy.w, copy.s, copy.b, copy.bits, copy.group_size, copy.mode, s);
-    defer _ = mlx.mlx_array_free(quant);
-    // Same lossy band as the dense nvfp4 copy; a transposed copy is off by the output's magnitude.
-    const max_diff = try attn256MaxDiff(ref, quant, s);
-    try std.testing.expect(max_diff < 0.6 and max_diff > 0.0);
 }
 
 test "decode-attn-quant: nvfp4 tail boundary is the last 20% of layers" {

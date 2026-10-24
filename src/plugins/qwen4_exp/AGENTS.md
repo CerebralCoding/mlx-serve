@@ -25,8 +25,11 @@ an in-checkpoint MTP layer, a Qwen3-VL tower. Packs, oracle: `docs/reference.md`
   `plugin.engineCtx`, a `SharedThreadLocal`).
 - Unserved hooks: `cache.aux` (QSA history + PLE prev in checkpoints/SSD ride the engine's SSM entries),
   `capture_stream_all` (no caller on this arch).
-- Kernel contract: every Metal kernel registered (`contract*.zig`); the multi-launch ones (qsa_decode, qsa_select's
-  split pair, qsa_attn) chained against their wrappers. Unregistered: qsa_decode's CUDA pair (no CUDA rig).
+- QSA's generic half is the SDK's block-sparse attention (`sdk/blocks/attention/sparse_block/`: `Blocks`/`Params`,
+  score sheet, exact select, masks, decode kernel, float64 reference, its own contract); the indexer (YaRN/M-RoPE,
+  pooled keys, hc reads), the key history and checkpoints, the gather and verify arms stay here.
+- Kernel contract: every Metal kernel registered (`contract*.zig` here and in `sparse_block/`); the multi-launch ones
+  (qsa_decode, qsa_select's split pair, qsa_attn) chained against their wrappers. Unregistered: qsa_decode's CUDA pair.
 
 ## Rules (from the root AGENTS.md)
 
@@ -40,20 +43,20 @@ an in-checkpoint MTP layer, a Qwen3-VL tower. Packs, oracle: `docs/reference.md`
   the score sheet stays ONE NAX kernel at every width (`msv_qsa_score`): decode, verify, prefill pick the same blocks.
 - QSA's visible tail is PER QUERY; scores in f32; `torch.topk` keeps the LOWER index on ties; n-gram eos is the TEXT
   config's (`ngram_eos`). One YaRN mscale on every indexer arm; pooled keys rope with attention's M-RoPE table.
-- Past the budget a solo dense-KV decode row skips mask, gather and SDPA (`qsa_decode.attend`): reduce BEFORE the
+- Past the budget a solo dense-KV decode row skips mask, gather and SDPA (`sparse_block/decode.zig` `attend`): reduce BEFORE the
   select (a shuffle in divergent code returns garbage).
 - A host read inside the layer loop is a GPU barrier: PLE defers (`ple_defer` + `flushDeferredPle`) and claims its
   spec slot at build time; the GPU arm settles its n-gram history at the NEXT forward.
 - PLE read path is calibrated on the inference thread before and after warming, median of 5 (`calibrateArm`); a cold
   32 GB mmap is a serial SSD fault (`PrefetchPool`, `startWarm`); `--ple-gpu` gates the no-copy wrap BEFORE wrapping.
-- Residual stream is bf16; the f32 fixture is the MATH oracle (`QWEN4_STREAM_F32=1`); `qwen4 fixture bf16` pins
+- Residual stream is bf16; the f32 fixture is the MATH oracle (`MLX_SERVE_DIAG=qwen4-stream-f32`); `qwen4 fixture bf16` pins
   streams at 0.999. GDN state + gate in f32 (`MLX_SERVE_GDN_STATE_F32=0` = bf16), its own SSD namespace.
 - Tiny MoE oracles tie everywhere: fixtures dump the reference's own margins; `Qwen4Ties` acquits by those.
 - MTP head state is a `Qwen4MtpState` swapped onto the module (`qwen4MtpActivate` before EVERY head touch); the head
   projects only the consumed row; its rounds stay solo (`mtpRoundsStaySolo`).
 - A fast path keyed on one pack's quant layout is silent on another's: new pack layout => `tests/qwen4_engagement.sh`.
 - Decode is kernel-time and dispatch bound: a kernel that replaces ONE dispatch loses to MLX's qmv; rows per simdgroup
-  is an occupancy decision (sweep in situ). Meters: `fwd-ubench`, `MLX_SERVE_STEP_TRACE=1`.
+  is an occupancy decision (sweep in situ). Meters: `tests/fwd_ubench.sh`, `MLX_SERVE_DIAG=step-trace`.
 
 - MTP specifics: the head projects only the consumed row (`Qwen4MtpProject`) and rides the slot's M-RoPE table on image turns; the grouped-expert NAX tile is a LOSS; solo greedy rounds pad the head history and pre-draft lazily, lagging one round at auto depth BY DESIGN.
 

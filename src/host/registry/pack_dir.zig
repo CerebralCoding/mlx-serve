@@ -8,6 +8,20 @@ const Str = common.Str;
 const Verdict = common.Verdict;
 const PackDir = common.PackDir;
 
+/// A pack with no files: a plugin's claim on a bare `model_type`.
+pub const none: PackDir = .{ .ctx = null, .exists = None.exists, .read = None.read, .safetensors_header = None.read, .list = None.read, .file_bytes = None.bytes };
+const None = struct {
+    fn exists(_: ?*anyopaque, _: Str) callconv(.c) bool {
+        return false;
+    }
+    fn read(_: ?*anyopaque, _: Str, _: [*]u8, _: usize, _: *usize) callconv(.c) Verdict {
+        return Verdict.refuse(.failed, "no files");
+    }
+    fn bytes(_: ?*anyopaque, _: Str) callconv(.c) u64 {
+        return 0;
+    }
+};
+
 pub const FsPackDir = struct {
     io: std.Io,
     root: std.Io.Dir,

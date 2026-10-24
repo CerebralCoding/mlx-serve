@@ -26,6 +26,7 @@ const BudgetRevise = @import("../cache/budget.zig").BudgetRevise;
 const scheduler_mod = @import("../scheduler.zig");
 
 pub const LlamaSettings = @import("../../llama/load.zig").Settings;
+const GgufRoute = @import("../../../host/gpu_thread/thread.zig").GgufRoute;
 
 /// Phase A1: model-load plan executed on the scheduler's inference thread.
 ///
@@ -137,15 +138,10 @@ pub const LoadParams = struct {
     /// Embedded llama.cpp engine settings (`--llama-*`), applied when a GGUF
     /// model's context is created at load.
     llama: LlamaSettings = .{},
-    /// When non-empty, the load routes through the embedded ds4 engine
-    /// instead of the MLX safetensors path. `model_dir` is expected to point
-    /// at a `.gguf` file (or a directory containing one); the inference
-    /// thread opens a `Ds4Engine` and installs it on the entry's
-    /// `ds4_engine` field. `config`/`tok`/`chat_config` are stubs (the
-    /// embedded engine owns the real tokenizer + chat template); they're
-    /// still moved onto the entry so server-side reads of `lm.config.?`
-    /// (e.g. `eosTokenSlice`, `getEffectiveContextLength`) keep working.
-    ds4_path: []const u8 = "",
+    /// A GGUF and the engine that serves it (`host/engines/load.zig`) instead of the MLX safetensors path.
+    /// `config`/`tok`/`chat_config` are stubs (the engine owns the real tokenizer + chat template); they still move
+    /// onto the entry so server-side reads of `lm.config.?` keep working.
+    gguf: ?GgufRoute = null,
     /// SSD weight-streaming for the ds4 engine (issue #39): stream experts from
     /// disk instead of requiring the full model resident in RAM.
     ds4_ssd_streaming: bool = false,
@@ -159,11 +155,6 @@ pub const LoadParams = struct {
     /// stages but keeps target-only decode. Requires `ds4_mtp` (the sidecar
     /// is the support model).
     ds4_dspark: bool = false,
-    /// Like `ds4_path` but for the generic llama.cpp engine (any GGUF except
-    /// DeepSeek-V4-Flash). The inference thread opens a `LlamaEngine` and
-    /// installs it on the entry's `llama_engine` field. Mutually exclusive with
-    /// `ds4_path` and the MLX safetensors path.
-    llama_path: []const u8 = "",
     /// Headless boot: skip the startup load entirely and run the inference
     /// loop idle. The registry holds discovery stubs (or nothing); the first
     /// model — chat or media — loads on demand via `/v1/load-model`. `entry`/

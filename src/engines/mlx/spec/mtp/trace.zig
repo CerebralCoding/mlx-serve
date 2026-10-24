@@ -8,7 +8,7 @@ const testing = std.testing;
 const Generator = @import("../../generate/generator.zig").Generator;
 
 
-/// Per-phase wall-time accumulator behind MLX_SERVE_MTP_TRACE=1. Pure
+/// Per-phase wall-time accumulator behind diag mtp-trace. Pure
 /// bookkeeping; `nextMtp` stamps phases with a Stopwatch and emits one
 /// summary line every LOG_EVERY rounds. Zero cost when the env is absent
 /// (every stamp is guarded on the cached env check).
@@ -107,7 +107,7 @@ pub const SubLap = struct {
     }
 };
 
-/// Per-phase wall-time accumulator behind MLX_SERVE_DFLASH_TRACE=1.
+/// Per-phase wall-time accumulator behind diag dflash-trace.
 /// `nextDflash` stamps phases with a Stopwatch and emits one summary line
 /// every LOG_EVERY rounds. Zero cost when the env is absent.
 pub const DflashTrace = struct {
@@ -152,7 +152,7 @@ pub const DflashTrace = struct {
 var dflash_trace_cache: ?bool = null;
 pub fn dflashTraceEnabled() bool {
     if (dflash_trace_cache) |v| return v;
-    const on = env.one(.MLX_SERVE_DFLASH_TRACE);
+    const on = env.one(.DFLASH_TRACE);
     dflash_trace_cache = on;
     return on;
 }
@@ -198,7 +198,7 @@ pub fn mtpTraceSub(self: *Generator, sub: MtpTrace.Sub, dur_ns: u64) void {
 var mtp_trace_cache: ?bool = null;
 pub fn mtpTraceEnabled() bool {
     if (mtp_trace_cache) |v| return v;
-    const on = env.one(.MLX_SERVE_MTP_TRACE);
+    const on = env.one(.MTP_TRACE);
     mtp_trace_cache = on;
     return on;
 }

@@ -5,8 +5,8 @@
 //! must be identical; the engine must be armed once per gated decode call with that call's last gate value (the
 //! stream's newest), never in the prompt phase, and must park once the pool's reads have handed the word every value.
 const std = @import("std");
-const ops = @import("../../deepseek_v41/stream/ops.zig");
-const shared = @import("../../deepseek_v41/stream/experts.zig");
+const ops = @import("../../../sdk/weights/streamed/ops.zig");
+const shared = @import("../../../sdk/weights/streamed/experts.zig");
 const stream_mod = @import("stream.zig");
 const gpu_warm = @import("gpu_warm.zig");
 const vl = @import("verify_lane_test.zig");

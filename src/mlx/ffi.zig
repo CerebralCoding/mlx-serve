@@ -364,7 +364,7 @@ pub extern "c" fn mlx_distributed_recv_like(res: *mlx_array, x: mlx_array, src: 
 pub extern "c" fn mlx_vector_array_new() mlx_vector_array;
 pub extern "c" fn mlx_vector_array_new_data(data: [*]const mlx_array, size: usize) mlx_vector_array;
 pub extern "c" fn mlx_vector_array_free(vec: mlx_vector_array) c_int;
-// Graph printing, for the decode-graph dump diagnostic (MLX_SERVE_DECODE_GRAPH_DUMP).
+// Graph printing, for the decode-graph dump diagnostic (diag decode-graph-dump).
 pub const mlx_node_namer = extern struct { ctx: ?*anyopaque = null };
 pub extern "c" fn mlx_node_namer_new() mlx_node_namer;
 pub extern "c" fn mlx_node_namer_free(namer: mlx_node_namer) c_int;
@@ -1366,49 +1366,47 @@ pub fn dropLatchedErrorUnless(had_error: bool) void {
     }
 }
 
-/// Release-build fault injection: `MLX_SERVE_MLX_FAULT_CHUNK=<n>` latches a synthetic Metal
+/// Release-build fault injection: diag `mlx-fault-chunk=<n>` latches a synthetic Metal
 /// OOM at the n-th `checkError` of the process, then disarms (`tests/test_mlx_error_recovery.sh`).
-const FAULT_CHUNK_MSG = "[METAL] Command buffer execution failed: Insufficient Memory (injected by MLX_SERVE_MLX_FAULT_CHUNK). at transforms.cpp:15";
-const FAULT_STEP_MSG = "[METAL] Command buffer execution failed: Insufficient Memory (injected by MLX_SERVE_MLX_FAULT_STEP). at transforms.cpp:15";
-/// `MLX_SERVE_MLX_FAULT_KIND=cuda_lost` injects a sticky CUDA error instead of the OOM.
-const FAULT_CUDA_LOST_MSG = "cudaGraphLaunch(graph_exec, stream_) failed: an illegal memory access was encountered (injected by MLX_SERVE_MLX_FAULT_KIND). at array.cpp:352";
+const FAULT_CHUNK_MSG = "[METAL] Command buffer execution failed: Insufficient Memory (injected by mlx-fault-chunk). at transforms.cpp:15";
+const FAULT_STEP_MSG = "[METAL] Command buffer execution failed: Insufficient Memory (injected by mlx-fault-step). at transforms.cpp:15";
+/// `mlx-fault-kind=cuda_lost` injects a sticky CUDA error instead of the OOM.
+const FAULT_CUDA_LOST_MSG = "cudaGraphLaunch(graph_exec, stream_) failed: an illegal memory access was encountered (injected by mlx-fault-kind). at array.cpp:352";
 
 /// One armed, self-disarming injector; prefill and decode checkpoints count separately.
-const FaultSite = struct {
-    env: [:0]const u8,
-    msg: [:0]const u8,
-    at: ?u64 = null,
-    seen: u64 = 0,
+fn FaultSite(comptime name: @EnumLiteral()) type {
+    return struct {
+        msg: [:0]const u8,
+        at: ?u64 = null,
+        seen: u64 = 0,
 
-    fn target(self: *FaultSite) u64 {
-        if (self.at) |v| return v;
-        var v: u64 = 0;
-        if (env.byName(self.env.ptr)) |pz| {
-            v = std.fmt.parseInt(u64, std.mem.span(pz), 10) catch 0;
+        fn target(self: *@This()) u64 {
+            if (self.at) |v| return v;
+            const v = env.int(name, u64, 0);
+            self.at = v;
+            if (v > 0) log.warn("[mlx] FAULT INJECTION armed: {s}=#{d}\n", .{ @tagName(name), v });
+            return v;
         }
-        self.at = v;
-        if (v > 0) log.warn("[mlx] FAULT INJECTION armed: {s}=#{d}\n", .{ self.env, v });
-        return v;
-    }
 
-    fn maybeFire(self: *FaultSite) void {
-        const t = self.target();
-        if (t == 0) return;
-        self.seen += 1;
-        if (self.seen != t) return;
-        self.at = 0;
-        const kind: []const u8 = if (env.get(.MLX_SERVE_MLX_FAULT_KIND)) |p| std.mem.span(p) else "";
-        latchErrorForTest(if (std.mem.eql(u8, kind, "cuda_lost")) FAULT_CUDA_LOST_MSG else self.msg);
-    }
+        fn maybeFire(self: *@This()) void {
+            const t = self.target();
+            if (t == 0) return;
+            self.seen += 1;
+            if (self.seen != t) return;
+            self.at = 0;
+            const kind: []const u8 = if (env.get(.MLX_FAULT_KIND)) |p| std.mem.span(p) else "";
+            latchErrorForTest(if (std.mem.eql(u8, kind, "cuda_lost")) FAULT_CUDA_LOST_MSG else self.msg);
+        }
 
-    fn reset(self: *FaultSite) void {
-        self.at = null;
-        self.seen = 0;
-    }
-};
+        fn reset(self: *@This()) void {
+            self.at = null;
+            self.seen = 0;
+        }
+    };
+}
 
-var fault_chunk = FaultSite{ .env = "MLX_SERVE_MLX_FAULT_CHUNK", .msg = FAULT_CHUNK_MSG };
-var fault_step = FaultSite{ .env = "MLX_SERVE_MLX_FAULT_STEP", .msg = FAULT_STEP_MSG };
+var fault_chunk = FaultSite(.MLX_FAULT_CHUNK){ .msg = FAULT_CHUNK_MSG };
+var fault_step = FaultSite(.MLX_FAULT_STEP){ .msg = FAULT_STEP_MSG };
 
 /// Consume a latched failure: `error.OutOfMemory` for the memory class, else `error.MlxFailure`.
 fn consumeLatch() !void {

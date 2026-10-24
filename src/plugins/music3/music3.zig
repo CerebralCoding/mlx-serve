@@ -3006,7 +3006,7 @@ test "music3 wav dump harness (env-gated, fixed seed)" {
 
 test "music3 frame cost probe (env-gated, informational)" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
-    _ = std.c.getenv("MUSIC3_COST_PROBE") orelse return error.SkipZigTest;
+    if (!env.on(.MUSIC3_COST_PROBE)) return error.SkipZigTest;
     log.enableStderr(); // the ms/frame line IS this harness's output
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();

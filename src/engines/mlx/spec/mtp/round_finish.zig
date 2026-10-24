@@ -545,7 +545,7 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
 
     var re_new_hidden = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(re_new_hidden);
-    if (gdn_captured or xfm.config.isMimo()) {
+    if (gdn_captured or xfm.config.caps().verify_truncates) {
         const accepted_len: usize = 1 + @as(usize, accepted);
         // `truncate` overwrites cache.step with its length arg. On a GDN
         // trunk cache.step is a stale counter the model never reads

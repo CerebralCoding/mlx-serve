@@ -10,6 +10,7 @@ const host = @import("host.zig");
 const fwd = @import("table_forward.zig");
 const head = @import("head.zig");
 const fixture = @import("fixture.zig");
+const sushi_pack = @import("../../sdk/quant/exl3/sushi_pack.zig");
 pub const config = @import("config.zig");
 
 pub const plugin = sdk.Plugin{
@@ -29,7 +30,7 @@ pub const table = abi.ModelTable{
     .unload = &host.unload,
     .forward = &forward,
     .cache = &.{ .layout = &layout },
-    .weights = &.{},
+    .weights = &.{ .resident_bytes = &residentBytes },
     .spec = &.{ .trunk_weight = &host.trunkWeight, .head = &head.hooks },
 };
 
@@ -61,6 +62,72 @@ fn bill(p: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) 
 
 fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     return host.load(plugin.name, ctx, out);
+}
+
+/// A Sushi pack is held as its adapter leaves it (`SushiBill`); every other pack as stored.
+fn residentBytes(p: *const abi.Parsed, model_dir: abi.Str, _: abi.Str, shards: u64, out: *u64) callconv(.c) Verdict {
+    const c = config.of(p);
+    out.* = shards;
+    if (c.expert_quant_json.len == 0) return .ok;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    out.* = sushi_pack.residentBytes(io, std.heap.page_allocator, model_dir.slice(), SushiBill{ .layers = c.num_hidden_layers, .kv_lora_rank = c.dsa_kv_lora_rank }) catch |e|
+        return Verdict.named(.failed, @errorName(e));
+    return .ok;
+}
+
+/// A Sushi GLM tensor as the load holds it: the vision tower and the EXL3 MTP layer past the trunk not at all, the
+/// KDA q/k/v projections twice (also joined into one matrix), the router, hyper-connection, indexer and KDA tables
+/// beside an owned f32 copy, and `kv_b_proj` beside its two dense bf16 halves.
+const SushiBill = struct {
+    layers: u32,
+    kv_lora_rank: u32,
+
+    pub fn bill(f: SushiBill, t: sushi_pack.Stored) !u64 {
+        if (std.mem.startsWith(u8, t.key, "model.visual.") or sushi_pack.pastTrunk(t.key, f.layers)) return 0;
+        var total = t.bytes;
+        if (isKdaProjection(t.key)) total += t.bytes;
+        if (isF32Copied(t.key)) total += t.elements() * 4;
+        if (std.mem.endsWith(u8, t.key, ".kv_b_proj.weight")) {
+            if (t.shape.len != 2) return error.InvalidSafetensorsHeader;
+            total += @as(u64, @intCast(t.shape[0].integer)) * f.kv_lora_rank * 2;
+        }
+        return total;
+    }
+
+    fn isF32Copied(key: []const u8) bool {
+        for ([_][]const u8{ ".mlp.gate.weight", ".mlp.gate.e_score_correction_bias", ".hc_attn_", ".hc_ffn_", ".indexer.index_kpool_compress_", ".self_attn.A_log", ".self_attn.dt_bias" }) |p|
+            if (std.mem.indexOf(u8, key, p) != null) return true;
+        return false;
+    }
+
+    fn isKdaProjection(key: []const u8) bool {
+        const at = std.mem.indexOf(u8, key, ".self_attn.") orelse return false;
+        const rest = key[at + ".self_attn.".len ..];
+        for ([_][]const u8{ "q_proj.", "k_proj.", "v_proj." }) |p| if (std.mem.startsWith(u8, rest, p)) return true;
+        return false;
+    }
+};
+
+test "glm5_next resident bill: a Sushi pack holds the joined KDA projections and the dense kv_b halves" {
+    const header =
+        \\{"model.language_model.layers.0.self_attn.q_proj.weight":{"dtype":"U32","shape":[1,1],"data_offsets":[0,100]},
+        \\"model.language_model.layers.3.self_attn.kv_b_proj.weight":{"dtype":"U32","shape":[10,1],"data_offsets":[100,160]},
+        \\"model.visual.patch_embed.proj.weight":{"dtype":"BF16","shape":[1,1],"data_offsets":[160,260]},
+        \\"model.language_model.layers.45.enorm.weight":{"dtype":"BF16","shape":[1,1],"data_offsets":[260,360]}}
+    ;
+    // q 100 twice, kv_b 60 plus its dense 10 x 8 x 2 bf16 bytes.
+    try std.testing.expectEqual(@as(u64, 200 + 60 + 160), try sushi_pack.headerResidentBytes(std.testing.allocator, header, "a.safetensors", null, SushiBill{ .layers = 45, .kv_lora_rank = 8 }));
+}
+
+test "glm5_next resident bill: a Sushi pack adds the f32 copies of the router and the hyper-connection tables" {
+    const header =
+        \\{"model.language_model.layers.3.mlp.gate.weight":{"dtype":"BF16","shape":[4,8],"data_offsets":[0,64]},
+        \\"model.language_model.layers.3.hc_attn_fn":{"dtype":"BF16","shape":[16,4],"data_offsets":[64,192]},
+        \\"model.language_model.layers.3.self_attn.indexer.index_kpool_compress_gate":{"dtype":"BF16","shape":[2,8],"data_offsets":[192,224]},
+        \\"model.language_model.layers.3.input_layernorm.weight":{"dtype":"BF16","shape":[8],"data_offsets":[224,240]}}
+    ;
+    // 240 stored bytes, plus 4 bytes per element of the 32 + 64 + 16 widened ones.
+    try std.testing.expectEqual(@as(u64, 240 + 4 * (32 + 64 + 16)), try sushi_pack.headerResidentBytes(std.testing.allocator, header, "a.safetensors", null, SushiBill{ .layers = 45, .kv_lora_rank = 0 }));
 }
 
 pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) Verdict {

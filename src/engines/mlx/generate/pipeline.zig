@@ -235,10 +235,10 @@ pub fn rollbackSsmFromCapture(self: *Generator, entries: []transformer_mod.SSMCa
 }
 
 /// Keep the recurrent state this pipelined step starts from, dropping the oldest. Solo slots
-/// only: a live batched group's states are copies, and qwen4_exp's aux buffers are written in place.
+/// only: a live batched group's states are copies, and a model that writes its state in place keeps none.
 pub fn pushSsmLag(self: *Generator) void {
     const entries = self.ctx.ssm_entries orelse return;
-    if (self.xfm.config.isQwen4()) return;
+    if (self.xfm.config.plugin) |b| if (b.parsed.cache.ssm_state.snapshot_policy == .in_place) return;
     for (entries) |*e| if (e.group) |g| if (g.live) return;
     var oldest = self.ssm_lag[0];
     self.ssm_lag[0] = self.ssm_lag[1];

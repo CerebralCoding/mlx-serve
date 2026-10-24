@@ -5,6 +5,7 @@ const std = @import("std");
 const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
+const sparse_score = @import("../../../sdk/blocks/attention/sparse_block/score.zig");
 const generate_mod = @import("../generate.zig");
 const model_mod = @import("../model.zig");
 const dsv4_mod = @import("../../../plugins/deepseek_v4/deepseek_v4.zig");
@@ -248,6 +249,9 @@ pub fn prefillNeededAtChunk(
     const ffn: u64 = prefillFfnWidth(config);
     if (is_dsv4) return dsv4PrefillMemoryNeeded(seq, layers, kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq));
     if (config.mlxStream()) return 0; // billed at construction (`mlx_stream.loadBytes`)
+    // A streamed bank's slot rows are filled at the load beside the prompt working set it reserves (DeepSeek-V4.1's
+    // `bill.streamBudget`); a longer prompt is the plugin's refusal by name.
+    if (config.plugin) |b| if (b.parsed.caps.streamed_weights) return 0;
     if (config.isDsv41()) return dsv41PrefillMemoryNeeded(config, seq, chunk);
     const drafter: u64 = (seq +| @min(@as(u64, max_tokens), transformer_mod.KVCache.RESERVE_GEN_HEADROOM)) *| config.drafter_ctx_bytes_per_token;
     if (config.isGlm5()) return glm5PrefillMemoryNeeded(config, seq, max_tokens, kv_bits, chunk, warm) +| drafter;
@@ -587,8 +591,8 @@ test "an auto boot sizes the SAME context whatever the cache ask (live check #6)
 test "the clamp bills the context that will be SERVED, not the placeholder" {
     // With a placeholder context the clamp hands back nearly the whole ask.
     const t = std.testing;
-    transformer_mod.qsa_score_fused_override = false;
-    defer transformer_mod.qsa_score_fused_override = null;
+    sparse_score.qsa_score_fused_override = false;
+    defer sparse_score.qsa_score_fused_override = null;
     var cfg = qwen4RequestTestConfig();
     cfg.mtp_override = false; // the trunk's bill; the head term has its own test
     const kv_bits: u64 = 8;
@@ -697,6 +701,7 @@ test "SSD-first is gated on a DISK TIER: with --prefix-cache-disk off, qwen4_exp
     try t.expect(prefix_cache_mod.ssdFirstActive(&cfg, true, true));
     var dense = model_mod.ModelConfig{};
     dense.model_type = "qwen3";
+    dense.legacy.caps.long_ctx = std.mem.eql(u8, dense.model_type, "qwen4_exp");
     try t.expect(!prefix_cache_mod.ssdFirstActive(&dense, true, true));
     try t.expect(prefix_cache_mod.ssdFirstActive(&dense, true, false));
     prefix_cache_mod.ssd_first_override = false;
@@ -787,8 +792,8 @@ test "the load-time session bill is billed at the boot's --kv-quant, not bf16" {
     const MiB: u64 = 1 << 20;
     transformer_mod.qsa_history_share_override = true;
     defer transformer_mod.qsa_history_share_override = null;
-    transformer_mod.qsa_score_fused_override = false;
-    defer transformer_mod.qsa_score_fused_override = null;
+    sparse_score.qsa_score_fused_override = false;
+    defer sparse_score.qsa_score_fused_override = null;
     try t.expectEqual(@as(u64, 2_304), statePerTokenBilled(&cfg));
     try t.expectEqual(@as(u64, 13_056), kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8));
     try t.expectEqual(@as(u64, 24_576), kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 16));
@@ -921,6 +926,7 @@ test "clampReserveWidth: the load-time reserve is a promise to the FIRST request
 
     var other = qwen4RequestTestConfig();
     other.model_type = "qwen3_5";
+    other.legacy.caps.long_ctx = std.mem.eql(u8, other.model_type, "qwen4_exp");
     const neutral = planHotCache(&other, kv_bits, weights + 28_909 * MiB, weights, ctx_tokens, 0, 10 * GiB, 0);
     try t.expectEqual(neutral.chunk, neutral.reserve_chunk);
 }
@@ -933,8 +939,8 @@ test "the per-token widths the request chooser is built on" {
     try t.expectEqual(@as(u64, 13_056), kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8));
     transformer_mod.qsa_history_share_override = true;
     defer transformer_mod.qsa_history_share_override = null;
-    transformer_mod.qsa_score_fused_override = false;
-    defer transformer_mod.qsa_score_fused_override = null;
+    sparse_score.qsa_score_fused_override = false;
+    defer sparse_score.qsa_score_fused_override = null;
     try t.expectEqual(@as(u64, 768), cfg.qsaHistoryBytesPerToken());
     try t.expectEqual(@as(u64, 1_536), cfg.qsaScoreBankBytesPerToken());
     try t.expectEqual(@as(u64, 2_304), statePerTokenBilled(&cfg));
@@ -946,8 +952,8 @@ test "a 512k QSA session drops the raw-key overbill and bills the ring once" {
     const t = std.testing;
     transformer_mod.qsa_history_share_override = true;
     defer transformer_mod.qsa_history_share_override = null;
-    transformer_mod.qsa_score_fused_override = false;
-    defer transformer_mod.qsa_score_fused_override = null;
+    sparse_score.qsa_score_fused_override = false;
+    defer sparse_score.qsa_score_fused_override = null;
     const cfg = qwen4ExpOomConfig();
     const seq: u64 = 512 * 1024;
     const short = prefillRequestTerms(&cfg, 1024, 2048, 8, 4096, .{});
@@ -965,8 +971,8 @@ test "a 512k QSA session drops the raw-key overbill and bills the ring once" {
 test "chooseRequestPrefillChunk: the machine's chunk cap bounds the per-request width" {
     // Flash Next on CUDA chose 8192 past the 2048 cap and MLX's expert gather failed at that width.
     const t = std.testing;
-    transformer_mod.qsa_score_fused_override = false;
-    defer transformer_mod.qsa_score_fused_override = null;
+    sparse_score.qsa_score_fused_override = false;
+    defer sparse_score.qsa_score_fused_override = null;
     const saved = generate_mod.machine_prefill_chunk_cap;
     defer generate_mod.machine_prefill_chunk_cap = saved;
     generate_mod.machine_prefill_chunk_cap = autoPrefillChunkCap(true);
@@ -980,8 +986,8 @@ test "chooseRequestPrefillChunk: an ordinary prompt buys the wide chunk a 1M ses
     // `--ctx-size 1048576` with no chunk or cache flags must still prefill ordinary prompts at
     // the wide chunk; load-time sizing reserved for the whole session (rung 1024 for the boot).
     const t = std.testing;
-    transformer_mod.qsa_score_fused_override = false;
-    defer transformer_mod.qsa_score_fused_override = null;
+    sparse_score.qsa_score_fused_override = false;
+    defer sparse_score.qsa_score_fused_override = null;
     const cfg = qwen4RequestTestConfig();
     const kv_bits: u64 = 8;
     const MiB: u64 = 1 << 20;
@@ -1132,6 +1138,7 @@ test "chooseRequestPrefillChunk: the explicit flag and the gate both outrank it"
     // Another arch keeps the load-time pin exactly.
     var other = qwen4RequestTestConfig();
     other.model_type = "qwen3_5";
+    other.legacy.caps.long_ctx = std.mem.eql(u8, other.model_type, "qwen4_exp");
     try t.expect(!other.perRequestPrefillChunk());
     try t.expectEqual(pin, chooseRequestPrefillChunk(&other, 300_000, 2048, kv_bits, roomy, pin, 0, .{}));
     try t.expect(cfg.perRequestPrefillChunk());
@@ -1210,6 +1217,7 @@ test "the post-eviction re-ask never exceeds what live memory affords, and never
     // A non-qwen4 arch is untouched end to end.
     var other = qwen4RequestTestConfig();
     other.model_type = "qwen3_5";
+    other.legacy.caps.long_ctx = std.mem.eql(u8, other.model_type, "qwen4_exp");
     const other_pre = chooseRequestPrefillChunk(&other, seq, 2048, kv_bits, 0, pin, 0, .{});
     const other_post = chooseRequestPrefillChunk(&other, seq, 2048, kv_bits, roomy, pin, 0, .{});
     try t.expectEqual(pin, other_pre);
@@ -1442,6 +1450,7 @@ test "the tail-merge gate reads the ARCH, not the installed hook (serve installs
 
     var other = qwen4RequestTestConfig();
     other.model_type = "qwen3_5";
+    other.legacy.caps.long_ctx = std.mem.eql(u8, other.model_type, "qwen4_exp");
     const adaptive = scheduler_mod.adaptiveChunkWidthFor(&other);
     try t.expect(!adaptive);
     try t.expect(hook_installed != adaptive);
@@ -1476,6 +1485,7 @@ test "the tail-merge bound scales ONLY where the per-chunk adaptive width is liv
 
     var other = qwen4RequestTestConfig();
     other.model_type = "qwen3_5";
+    other.legacy.caps.long_ctx = std.mem.eql(u8, other.model_type, "qwen4_exp");
     try t.expect(!other.perRequestPrefillChunk());
     try t.expect(!adaptivePrefillChunkEnabled(&other));
     const off = adaptivePrefillChunkEnabled(&other);
@@ -1635,6 +1645,7 @@ test "adaptivePrefillChunkEnabled: the arch, both kill switches, and any pinned 
     const cfg = qwen4RequestTestConfig();
     var other = qwen4RequestTestConfig();
     other.model_type = "qwen3_5_moe";
+    other.legacy.caps.long_ctx = std.mem.eql(u8, other.model_type, "qwen4_exp");
 
     try t.expect(adaptivePrefillChunkEnabled(&cfg));
     // Another arch never adapts; one switch disables both.
@@ -1665,8 +1676,8 @@ test "a WARM turn is not billed for the prefix it is about to SHARE (786,707 @ 1
     // by name; the restore hands over the entry's buffers without a second copy, so those
     // ~14.5 GB were already inside `mlx_get_active_memory` and `needed` billed them again.
     const cfg = qwen4ExpOomConfig();
-    transformer_mod.qsa_score_fused_override = false;
-    defer transformer_mod.qsa_score_fused_override = null;
+    sparse_score.qsa_score_fused_override = false;
+    defer sparse_score.qsa_score_fused_override = null;
     const seq: u64 = 786_707;
     const chunk: u64 = 512; // the width the ladder came down to that evening
     const kv_bits: u64 = 8;
@@ -1731,6 +1742,7 @@ test "prefillChunkCap: the chunk sizer's two long-context changes are qwen4_exp-
     for ([_][]const u8{ "qwen3_5", "qwen3_5_moe", "lfm2", "nemotron_h", "bailing_hybrid", "llama", "mistral" }) |mt| {
         var cfg = longCtxTestConfig();
         cfg.model_type = mt;
+        cfg.legacy.caps.long_ctx = std.mem.eql(u8, cfg.model_type, "qwen4_exp");
         const baseline: u64 = (ceiling - (weights + ask)) / PREFILL_RESERVE_BUDGET_SHARE;
         try t.expectEqual(baseline, prefillChunkCap(&cfg, ceiling, weights, ctx_kv, ask));
         try t.expectEqual(baseline, prefillChunkCap(&cfg, ceiling, weights, 48 * GiB, ask));
@@ -1740,6 +1752,7 @@ test "prefillChunkCap: the chunk sizer's two long-context changes are qwen4_exp-
     // qwen4_exp: the ask is ignored, and the ctx bar binds.
     var q4 = longCtxTestConfig();
     q4.model_type = "qwen4_exp";
+    q4.legacy.caps.long_ctx = true;
     const serving: u64 = ceiling - weights;
     const share_bar: u64 = serving / PREFILL_RESERVE_BUDGET_SHARE;
     const want: u64 = @min(share_bar, (serving - ctx_kv) -| HOT_CACHE_FLOOR_BYTES);
@@ -1755,8 +1768,8 @@ test "the live 364k session's admission numbers reproduce, to the megabyte" {
     // The anchor: fed the deployed config and the incident's prompt lengths, the estimator prints
     // the incident's own numbers (Turn A admitted at 16,233 MB; Turn B refused at 13,664 MB).
     const t = std.testing;
-    transformer_mod.qsa_score_fused_override = false;
-    defer transformer_mod.qsa_score_fused_override = null;
+    sparse_score.qsa_score_fused_override = false;
+    defer sparse_score.qsa_score_fused_override = null;
     const cfg = qwen4ExpLive364kConfig();
     const mb: u64 = 1024 * 1024;
     const kv_bits: u64 = 8;

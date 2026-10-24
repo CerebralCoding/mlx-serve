@@ -1677,7 +1677,7 @@ const Iq = struct {
             if (self.rotate) {
                 for (row, self.signs) |*v, s| v.* *= s;
                 var b: usize = 0;
-                while (b < k) : (b += 1024) kc.hostq.fwht(row[b..][0..1024]);
+                while (b < k) : (b += 1024) host.fwht(row[b..][0..1024]);
                 for (row) |*v| v.* = spec.roundTo(.f16, v.* / 32);
             }
             for (0..kg) |g| {

@@ -1,9 +1,9 @@
-//! mlx-stream: the native streaming stack as one plugin: the DeepSeek-V4.1 arch, the EXL3 quant it binds (the routed
-//! experts' kernels over the package's pinned registry) and the EXL3 expert source that streams them; MiMo-V2.6-Flash
-//! and GLM-5.3 over the same expert reader. Built only where the macOS-only sources are. Absorbed from davidtai's
-//! mlx-stream: the archs live in `plugins/<model>/stream/`, the EXL3 lanes in `sdk/quant/exl3/stream/`, the expert
-//! streamer in `sdk/weights/streamed/`. The module imports its own `sdk` (`sdk/weights/streamed/sdk/`) and the host's
-//! `mlx_host`.
+//! mlx-stream: the native streaming stack as one plugin: GLM-5.3's arch, the EXL3 quant (the routed experts' kernels
+//! over the package's pinned registry) and the EXL3 expert source that streams them; MiMo-V2.6-Flash and GLM-5.3-Flash
+//! over the same expert reader, and the bank sources a resident trunk streams its experts from. Built only where the
+//! macOS-only sources are. Absorbed from davidtai's mlx-stream: the archs live in `plugins/<model>/stream/`, the EXL3
+//! lanes in `sdk/quant/exl3/stream/`, the expert streamer in `sdk/weights/streamed/`. The module imports its own `sdk`
+//! (`sdk/weights/streamed/sdk/`) and the host's `mlx_host`.
 
 pub const plugin = sdk.Plugin{
     .name = "mlx-stream",
@@ -13,7 +13,7 @@ pub const plugin = sdk.Plugin{
     .macos_only = true,
     // The host registers the arch; the EXL3 quant and the EXL3 expert source are its internals, bound at comptime
     // (sdk_ext.zig).
-    .provides = .{ .arch = @import("plugins/deepseek_v41/stream/plugin.zig") },
+    .provides = .{ .arch = @import("plugins/glm_moe_dsa/stream/plugin.zig") },
 };
 
 /// MiMo-V2.6-Flash's prepared MXFP4 streaming pack: the package's second arch, over the same expert reader.
@@ -53,22 +53,18 @@ pub const glm5_next = struct {
     pub const generation_headroom: u64 = 0;
 };
 
-/// What the host's glue (`engines/mlx/modules/stream_glue.zig`) calls: the arch's entry points and their contract types.
-pub const arch = @import("plugins/deepseek_v41/stream/plugin.zig");
-/// Every arch the package serves through the SDK's table (`sdk.Arch.of`), in claim order: DeepSeek-V4.1 and GLM-5.3
-/// (the conformance suite's list; the host's glue binds each arch by its own entry: the root's, `mimo` and `glm`).
-pub const archs = .{ @import("plugins/deepseek_v41/stream/plugin.zig"), @import("plugins/glm_moe_dsa/stream/plugin.zig") };
+/// Every arch the package serves through the SDK's table (`sdk.Arch.of`), in claim order (the conformance suite's list;
+/// the host's glue binds each arch by its own entry: `mimo`, `glm` and `glm5_next`).
+pub const archs = .{@import("plugins/glm_moe_dsa/stream/plugin.zig")};
 pub const sdk = @import("sdk");
-/// DeepSeek-V4.1's routed experts streamed for the resident trunk (`sdk/weights/streamed.zig` `Streamed`).
-pub const dsv41_streamed = @import("plugins/deepseek_v41/stream/streamed.zig");
+/// The expert bank source a resident trunk streams its routed experts from (`sdk/weights/streamed.zig` `Streamed`).
+pub const bank_source = @import("sdk/weights/streamed/bank_source.zig");
+/// A standard MLX pack's routed experts streamed for the resident trunk as downloaded (`Streamed.openPack`).
+pub const mlx_pack = @import("sdk/weights/streamed/mlx_pack.zig");
+/// An EXL3 expert bank streamed for a resident trunk (`sdk/weights/streamed.zig` `Exl3`).
+pub const exl3_source = @import("sdk/weights/streamed/exl3_source.zig");
 /// The streamed halves of the dupes parity harnesses (test builds only): each arch's trunk over a pack, for the main
 /// test module's `plugins/<model>/stream/dupes_test.zig` to compare against the resident arch.
 pub const dupes = if (@import("builtin").is_test) struct {
-    pub const deepseek_v41 = @import("plugins/deepseek_v41/stream/dupes.zig");
     pub const mimo_v2 = @import("plugins/mimo_v2/stream/dupes.zig");
 } else struct {};
-/// The context a construction bills when the model sets none (`ctx_size`): the standard request.
-pub const default_context: u64 = @import("plugins/deepseek_v41/stream/bill.zig").fill_prompt_tokens;
-/// Positions a request may generate past its prompt (the KV lanes' bound) for an arch without its own `maxOutput`
-/// (DeepSeek-V4.1's).
-pub const generation_headroom: u64 = @import("plugins/deepseek_v41/stream/module.zig").generation_headroom;

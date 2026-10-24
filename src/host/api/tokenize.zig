@@ -16,10 +16,8 @@ const sendResponse = @import("../http/respond.zig").sendResponse;
 const sendErrorResponse = @import("../http/errors.zig").sendErrorResponse;
 const jsonEscape = @import("format.zig").jsonEscape;
 
-/// Decode a slice of token IDs to bytes, routing through the ds4 engine when
-/// the loaded model is GGUF-backed (no MLX tokenizer in that case). Used by
-/// the request handlers' streaming + final-decode paths so a single call
-/// site supports both backends.
+/// Decode a slice of token IDs to bytes through the model's own vocabulary: a GGUF engine's, else the loaded
+/// tokenizer. Used by the request handlers' streaming + final-decode paths.
 pub fn decodeTokens(
     allocator: std.mem.Allocator,
     lm: *LoadedModel,
@@ -27,12 +25,7 @@ pub fn decodeTokens(
     ids: []const u32,
     strip_leading_space: bool,
 ) ![]u8 {
-    if (lm.ds4_engine) |engine| {
-        return chat_mod.decodeViaDs4(allocator, engine, ids);
-    }
-    if (lm.llama_engine) |engine| {
-        return chat_mod.decodeViaLlama(allocator, engine, ids);
-    }
+    if (lm.engine) |e| if (e.caps().owns_tokenizer) return e.decode(allocator, ids);
     return tok.decode(allocator, ids, strip_leading_space);
 }
 
@@ -40,16 +33,8 @@ pub fn decodeTokens(
 /// vocab, else the loaded BPE tokenizer (an engine model's `tok` is an empty stub).
 /// `add_special` reaches llama.cpp only.
 pub fn encodeText(allocator: std.mem.Allocator, lm: *const LoadedModel, tok: *const Tokenizer, text: []const u8, add_special: bool) ![]u32 {
-    const i32_ids = if (lm.ds4_engine) |engine|
-        try engine.tokenizeText(allocator, text)
-    else if (lm.llama_engine) |engine|
-        try engine.tokenizeText(allocator, text, add_special)
-    else
-        return tok.encode(allocator, text);
-    defer allocator.free(i32_ids);
-    const out = try allocator.alloc(u32, i32_ids.len);
-    for (i32_ids, out) |t, *o| o.* = @intCast(t);
-    return out;
+    if (lm.engine) |e| if (e.caps().owns_tokenizer) return e.tokenize(allocator, text, add_special);
+    return tok.encode(allocator, text);
 }
 
 pub fn handleTokenize(

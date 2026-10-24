@@ -1847,7 +1847,7 @@ pub fn buildTimestepPlan(
 // Phase-0 cost attribution WITHOUT inserting syncs: an arm removes one
 // component from the step graph while keeping every shape, so the step-time
 // delta against the `.none` baseline prices that component at the loop's own
-// eval cadence. The per-phase-eval profiler lesson (MLX_SERVE_DECODE_PROFILE)
+// eval cadence. The per-phase-eval profiler lesson (diag decode-profile)
 // is exactly what this avoids — inserted evals destroy pipelining and inflate
 // what they measure.
 

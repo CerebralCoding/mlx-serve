@@ -16,8 +16,9 @@ const materializedOwnedCopy = @import("../../../mlx/array.zig").materializedOwne
 const attn256MaxDiff = @import("../../../sdk/blocks/attention/attn256.zig").attn256MaxDiff;
 const attn256RandBf16 = @import("../../../sdk/blocks/attention/attn256.zig").attn256RandBf16;
 const testRandUniformBf16 = @import("../../../sdk/testing/parity.zig").testRandUniformBf16;
-const qsaProbeAllFinite = @import("gather.zig").qsaProbeAllFinite;
+const qsaProbeAllFinite = @import("../../../sdk/blocks/attention/sparse_block/probe.zig").qsaProbeAllFinite;
 const ssmFreeQsaState = @import("history.zig").ssmFreeQsaState;
+const tieBias = @import("../../../sdk/blocks/attention/sparse_block/select.zig").tieBias;
 
 /// The QSA pooled-block RoPE tables, shared by every full-attention layer and across
 /// forwards while the key holds. The key is the block position (`base`, `step`, `n`, dtype)
@@ -94,13 +95,7 @@ pub const QsaBlockConsts = struct {
         try mlx.check(mlx.mlx_arange(&blk_end, @floatFromInt(ratio - 1), @floatFromInt(nb * ratio), @floatFromInt(ratio), .int32, s));
         self.blk_end2 = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_reshape(&self.blk_end2, blk_end, &[_]c_int{ 1, nb }, 2, s));
-        var blk_idx_f = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(blk_idx_f);
-        try mlx.check(mlx.mlx_arange(&blk_idx_f, 0, @floatFromInt(nb), 1.0, .float32, s));
-        const tie_eps = mlx.mlx_array_new_float(1e-7);
-        defer _ = mlx.mlx_array_free(tie_eps);
-        self.tie_bias = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_multiply(&self.tie_bias, blk_idx_f, tie_eps, s));
+        self.tie_bias = try tieBias(s, nb);
         self.nb = nb;
         self.ratio = ratio;
         self.builds += 1;

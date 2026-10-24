@@ -10,8 +10,6 @@ const model_mod = @import("model.zig");
 const prefix_cache_mod = @import("cache/prefix_cache.zig");
 const metrics_mod = @import("../../host/metrics/metrics.zig");
 const model_registry_mod = @import("../../host/registry/registry.zig");
-const arch_ds4 = if (@import("build_options").ds4_engine) @import("../ds4/bridge.zig") else @import("../ds4/stub.zig");
-const arch_llama = if (@import("build_options").llama_engine) @import("../llama/bridge.zig") else @import("../llama/stub.zig");
 const KVCache = transformer_mod.KVCache;
 const SSMCacheEntry = transformer_mod.SSMCacheEntry;
 const ForwardCtx = transformer_mod.ForwardCtx;
@@ -91,31 +89,9 @@ pub const Slot = struct {
     /// Generator (constructed on inference thread post-prefill).
     legacy_gen: ?Generator,
 
-    /// ds4 session for this slot, BORROWED from `model.ds4_session` (one
-    /// persistent session per model, claimed via `session_claims`) — never
-    /// freed here. Mutually exclusive with `legacy_gen` (the MLX path).
-    ds4_session: ?*arch_ds4.Ds4Session = null,
-    /// Per-request RNG state for ds4 sampling. ds4's sampler takes the seed
-    /// by pointer so we keep it on the slot.
-    ds4_rng: u64 = 0,
-
-    /// llama.cpp sequence this slot decodes on, BORROWED from
-    /// `model.llama_ctx` (reused across requests for prompt-prefix KV reuse)
-    /// and marked `busy` while held. Mutually exclusive with `legacy_gen` and
-    /// `ds4_session`.
-    llama_seq: ?*arch_llama.LlamaSeq = null,
-    /// The sampled token not yet fed to `llama_seq`: every decode samples its
-    /// rows at once, since the next decode on the context discards them.
-    llama_next: i32 = -1,
-    /// MTP rounds, draft tokens offered and accepted, for `[spec-stats]`.
-    llama_mtp_rounds: u32 = 0,
-    llama_mtp_drafted: u32 = 0,
-    llama_mtp_accepted: u32 = 0,
-    /// True when this slot holds one of `model.session_claims` from `submit`
-    /// (one per ds4 session or llama sequence); released in `complete()`.
+    /// True when this slot holds one of `model.session_claims` from `submit` (an engine session beside MLX);
+    /// released in `complete()`.
     holds_session: bool = false,
-    /// Per-request RNG state for llama.cpp sampling (passed by pointer, like ds4).
-    llama_rng: u64 = 0,
 
     // ── Submission data. Owned by the slot, freed in deinit. ──
     prompt_ids: []u32,
@@ -253,9 +229,8 @@ pub const Slot = struct {
         const slot = try allocator.create(Slot);
         errdefer allocator.destroy(slot);
 
-        // Embedded-GGUF model (ds4 or llama.cpp): skip all MLX per-slot
-        // allocations — the engine owns its own KV cache, vision is not
-        // supported, and the forward path bypasses `ForwardCtx`. Build
+        // A model on an engine beside MLX (ds4, llama.cpp, the Neural Engine): skip all MLX per-slot
+        // allocations — the engine owns its own KV cache and forward. Build
         // sentinel-empty fields so `Slot.deinit` is well-defined on both paths.
         const is_embedded = params.model.engineBacked();
 
@@ -325,10 +300,6 @@ pub const Slot = struct {
             .mrope_delta = params.mrope_delta,
             .ctx = undefined, // set after slot is in stable storage so pointers are valid
             .legacy_gen = null,
-            .ds4_session = null,
-            .ds4_rng = @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds()),
-            .llama_seq = null,
-            .llama_rng = @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds()),
             .prompt_ids = prompt_owned,
             .full_prompt = full_prompt_owned,
             .sampling = params.sampling,
@@ -414,11 +385,6 @@ pub const Slot = struct {
     /// finished/errored it AND the connection thread has consumed the final
     /// `done`/`err` from `waitNext`).
     pub fn deinit(self: *Slot) void {
-        // ds4_session / llama_seq are borrowed from the model (persistent
-        // across requests) — never freed here. The claim on them is released
-        // in Scheduler.complete; they die with the model.
-        self.ds4_session = null;
-        self.llama_seq = null;
         if (self.model.transformer) |xfm| if (xfm.qwen4Trunk()) |t| t.markQsaPooledRopeStale();
         if (self.legacy_gen) |*gen| {
             gen.deinit(self.allocator);

@@ -315,27 +315,26 @@ test "plugin config: the cache layout sets the sliding window, the global layers
 test "plugin config: a served model's facts layer on the legacy config; an unset fact keeps the legacy arm" {
     const t: abi.ModelTable = .{ .name = .of("t"), .claims = undefined, .parse = undefined, .free_parsed = undefined, .bill = undefined, .load = undefined, .unload = undefined, .forward = undefined, .cache = &.{}, .weights = undefined };
     var b: Binding = .{ .table = &t };
-    // Legacy configs (a dense qwen3_5, MiMo, GLM-5.3): their arms answer while the plugin states nothing.
-    var c: ModelConfig = .{ .model_type = "qwen3_5" };
+    // A legacy dense qwen3_5 config: its arm answers while the plugin states nothing.
+    var c: ModelConfig = .{ .model_type = "qwen3_5", .legacy = .{ .caps = .{ .long_ctx = true } } };
     c.plugin = &b;
-    try testing.expect(c.rowExactArch() and !c.mtpReadsFinalNorm() and !c.isMoe() and !c.longCtxGated());
-    c.model_type = "mimo_v2";
-    try testing.expect(c.mtpReadsFinalNorm() and !c.rowExactArch());
-    c.model_type = "glm5_next";
-    try testing.expectEqual(@as(u32, 3), c.mtpDepth(0));
+    try testing.expect(c.rowExactArch() and !c.isMoe() and !c.longCtxGated());
     // A generic legacy config: the facts answer.
     c.model_type = "llama";
-    try testing.expect(!c.rowExactArch() and !c.mtpReadsFinalNorm());
+    try testing.expect(!c.rowExactArch());
     try testing.expectEqual(@as(u32, 0), c.mtpDepth(0));
     b.parsed.caps = .{ .moe = true, .long_ctx = true, .exact_drafted = true };
-    b.parsed.spec = .{ .mtp_default_depth = 3, .head_reads_final_norm = true };
+    b.parsed.spec = .{ .mtp_default_depth = 3 };
     b.parsed.chat = .{ .thinking_default = .on_with_tools };
-    try testing.expect(c.isMoe() and c.longCtxGated() and c.rowExactArch() and c.mtpReadsFinalNorm());
+    try testing.expect(c.isMoe() and c.longCtxGated() and c.rowExactArch());
     try testing.expectEqual(@as(u32, 3), c.mtpDepth(0));
     try testing.expectEqual(@as(u32, 5), c.mtpDepth(5));
     try testing.expect(c.defaultEnableThinking(true) and !c.defaultEnableThinking(false));
     c.gen_enable_thinking = false;
     try testing.expect(!c.defaultEnableThinking(true));
+    // Unbound, the legacy parse's caps answer.
+    c.plugin = null;
+    try testing.expect(c.longCtxGated() and !c.isMoe());
 }
 
 test "plugin config: sampling defaults fill the knobs the pack left null; a wild signature takes the reference temperature" {

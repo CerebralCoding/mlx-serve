@@ -23,6 +23,10 @@ pub fn wireTables(wired: u64) u64 {
         (std.math.divCeil(u64, wired, 1 << 36) catch unreachable) * 16;
 }
 
+/// The wiring overhead per live buffer if all of it were per buffer (measured on DeepSeek-V4.1): the largest
+/// construction reading, 125,852,608 B (run 3bk control1), over the 4,493 buffers live there, rounded up to a KiB.
+pub const wire_buffer_bytes: u64 = 28_672;
+
 /// The sum of every field of `t` (a bill's phase terms: a struct of u64 fields).
 pub fn sumFields(t: anytype) u64 {
     var n: u64 = 0;

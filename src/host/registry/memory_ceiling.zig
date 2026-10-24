@@ -4,7 +4,7 @@ const std = @import("std");
 const env = @import("../../env.zig");
 const builtin = @import("builtin");
 const mlx = @import("../../mlx/ffi.zig");
-const transformer_mod = @import("../../engines/mlx/transformer.zig");
+const sparse_score = @import("../../sdk/blocks/attention/sparse_block/score.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const log = @import("../../sdk/util/log.zig");
 const metrics = @import("../status.zig");
@@ -184,8 +184,8 @@ test "an explicitly raised iogpu.wired_limit_mb is a FLOOR under the ceiling" {
     // Bar: a raised sysctl lifts the free-RAM term and nothing else; every other arch and the
     // default sysctl keep the old expression byte for byte.
     const t = std.testing;
-    transformer_mod.qsa_score_fused_override = false;
-    defer transformer_mod.qsa_score_fused_override = null;
+    sparse_score.qsa_score_fused_override = false;
+    defer sparse_score.qsa_score_fused_override = null;
     const mb: u64 = 1024 * 1024;
     const total_ram: u64 = 131_072 * mb;
     const working_set: u64 = 120_000 * mb;
@@ -214,6 +214,7 @@ test "an explicitly raised iogpu.wired_limit_mb is a FLOOR under the ceiling" {
     for ([_][]const u8{ "qwen3_5_moe", "gemma3", "llama", "deepseek_v4", "bailing_hybrid" }) |mt| {
         var other = cfg;
         other.model_type = mt;
+        other.legacy.caps.long_ctx = std.mem.eql(u8, other.model_type, "qwen4_exp");
         try t.expect(!other.longCtxGated());
         try t.expectEqual(@as(u64, 0), wiredCeilingFloorForRam(&other, total_ram));
     }

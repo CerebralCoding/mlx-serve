@@ -149,7 +149,7 @@ pub fn mediaRunTokens(items: []const MediaItem, config: *const model_mod.ModelCo
 fn appendMediaRun(allocator: std.mem.Allocator, ids: *std.ArrayList(u32), item: MediaItem, n: usize, images_before: usize, config: *const model_mod.ModelConfig) !void {
     if (item == .image and config.minicpm_vision) return appendMiniCpmImageRun(allocator, ids, item.image, images_before, config);
     // EmbeddingGemma 2 wraps every video FRAME like an image of its own.
-    if (item == .video and config.isEmbeddingGemma2()) {
+    if (item == .video and config.gv_budgeted) {
         const frames: usize = item.video.grid_t;
         if (frames == 0) return;
         for (0..frames) |_| {

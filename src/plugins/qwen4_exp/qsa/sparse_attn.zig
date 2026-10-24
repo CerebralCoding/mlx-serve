@@ -5,11 +5,12 @@ const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const kv_quant = @import("../../../engines/mlx/cache/kv_quant.zig");
 const log = @import("../../../sdk/util/log.zig");
-const qsa_decode = @import("../qsa_decode.zig");
+const qsa_decode = @import("../../../sdk/blocks/attention/sparse_block/decode.zig");
+const qsa_decode_cuda = @import("../../../sdk/blocks/attention/sparse_block/decode_cuda.zig");
 const arms_mod = @import("arms.zig");
 const transformer = @import("../../../engines/mlx/transformer.zig");
 const ProfClock = @import("../../../engines/mlx/diag/profile.zig").ProfClock;
-const diagEnvOn = @import("../../../engines/mlx/env_transformer.zig").diagEnvOn;
+const env = @import("../../../env.zig");
 const KVCache = @import("../../../engines/mlx/kv/cache.zig").KVCache;
 const scalarOf = @import("../../../engines/mlx/load/weights.zig").scalarOf;
 const QsaCfgCache = @import("../../../mlx/kernel_cache.zig").QsaCfgCache;
@@ -27,9 +28,9 @@ const ShapeKey = @import("../../../sdk/blocks/moe/router_kernel.zig").ShapeKey;
 const qwen4Standin = @import("../../../sdk/diag/standin.zig").qwen4Standin;
 const standinRef = @import("../../../sdk/diag/standin.zig").standinRef;
 const testRandWeightBf16 = @import("../../../sdk/testing/parity.zig").testRandWeightBf16;
-const OneShotBits = @import("arms.zig").OneShotBits;
+const OneShotBits = @import("../../../sdk/blocks/attention/sparse_block/one_shot.zig").OneShotBits;
 const QsaArmCounts = @import("arms.zig").QsaArmCounts;
-const qsaWidthBucket = @import("arms.zig").qsaWidthBucket;
+const qsaWidthBucket = @import("../../../sdk/blocks/attention/sparse_block/one_shot.zig").widthBucket;
 const qsaDecodeGatherAttn = @import("decode_gather.zig").qsaDecodeGatherAttn;
 const ATTN_QSA256_KERNEL_HEADER = @import("gather.zig").ATTN_QSA256_KERNEL_HEADER;
 const gatherQsa256 = @import("gather.zig").gatherQsa256;
@@ -39,10 +40,11 @@ const qsaGatherEnabled = @import("gather.zig").qsaGatherEnabled;
 const qsaGatherMinKv = @import("gather.zig").qsaGatherMinKv;
 const qsaHistoryShareEnabled = @import("gather.zig").qsaHistoryShareEnabled;
 const qsaPrefillGatherMinKv = @import("gather.zig").qsaPrefillGatherMinKv;
-const qsaMaskFromBlocks = @import("mask.zig").qsaMaskFromBlocks;
-const qsaScoreSheetBudget = @import("score.zig").qsaScoreSheetBudget;
-const qsaSelectKernelEnabled = @import("select.zig").qsaSelectKernelEnabled;
-const qsaSelectSplitEnabled = @import("select.zig").qsaSelectSplitEnabled;
+const qsaMaskFromBlocks = @import("../../../sdk/blocks/attention/sparse_block/mask.zig").qsaMaskFromBlocks;
+const qsaMaskArm = @import("../../../sdk/blocks/attention/sparse_block/mask.zig").qsaMaskArm;
+const qsaScoreSheetBudget = @import("../../../sdk/blocks/attention/sparse_block/score.zig").qsaScoreSheetBudget;
+const qsaSelectKernelEnabled = @import("../../../sdk/blocks/attention/sparse_block/select.zig").qsaSelectKernelEnabled;
+const qsaSelectSplitEnabled = @import("../../../sdk/blocks/attention/sparse_block/select.zig").qsaSelectSplitEnabled;
 const QSA_VERIFY_GATHER_MIN_KV_DENSE = @import("verify_gather.zig").QSA_VERIFY_GATHER_MIN_KV_DENSE;
 const qsaVerifyBlocksHost = @import("verify_gather.zig").qsaVerifyBlocksHost;
 const qsaVerifyGatherAttn = @import("verify_gather.zig").qsaVerifyGatherAttn;
@@ -627,9 +629,9 @@ pub fn qsaSlotAttn(
     }
     if (qsa_ok and seq_len == 1 and !kv_view.has_quant_triple) {
         const dec = (try qsa_decode.attend(s, q_rope, kv_view.k, kv_view.v, blocks, ratio, attn_scale)) orelse
-            try @import("../qsa_decode_cuda.zig").attend(s, q_rope, kv_view.k, kv_view.v, blocks, ratio, attn_scale);
+            try qsa_decode_cuda.attend(s, q_rope, kv_view.k, kv_view.v, blocks, ratio, attn_scale);
         if (dec) |g| {
-            if (arms_mod.qsa_dec_engaged_bits.take(0)) log.info("[qsa-dec] engaged (kv={d}) (MLX_SERVE_QSA_DEC_KERNEL=0 restores the gather / mask arms)\n", .{mlx.getShape(kv_view.k)[2]});
+            if (arms_mod.qsa_dec_engaged_bits.take(0)) log.info("[qsa-dec] engaged (kv={d})\n", .{mlx.getShape(kv_view.k)[2]});
             return qsaSlotGathered(arms, seq_len, g, 2);
         }
     }
@@ -640,8 +642,8 @@ pub fn qsaSlotAttn(
     }
     if (qsa_ok and verify_w and !kv_view.has_quant_triple) {
         // CUDA: each verify row attends its own picks and tail; the mask arm read the whole cache.
-        if (try @import("../qsa_decode_cuda.zig").attend(s, q_rope, kv_view.k, kv_view.v, blocks, ratio, attn_scale)) |g| {
-            if (arms_mod.qsa_dec_engaged_bits.take(1)) log.info("[qsa-dec] verify rows engaged (S={d} kv={d}) (MLX_SERVE_QSA_DEC_KERNEL=0 restores the gather / mask arms)\n", .{ seq_len, mlx.getShape(kv_view.k)[2] });
+        if (try qsa_decode_cuda.attend(s, q_rope, kv_view.k, kv_view.v, blocks, ratio, attn_scale)) |g| {
+            if (arms_mod.qsa_dec_engaged_bits.take(1)) log.info("[qsa-dec] verify rows engaged (S={d} kv={d})\n", .{ seq_len, mlx.getShape(kv_view.k)[2] });
             return qsaSlotGathered(arms, seq_len, g, 4);
         }
     }
@@ -670,7 +672,7 @@ fn qsaSlotGathered(arms: *QsaArmCounts, seq_len: c_int, out: mlx.mlx_array, cost
 
 /// `gatherQsa256` with the `QWEN4_PROFILE_QSA` timer around it.
 fn qsaPrefillGatherProfiled(s: mlx.mlx_stream, q_rope: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, attn_scale: f32, blocks: mlx.mlx_array, ratio: c_int) !?mlx.mlx_array {
-    const prof = diagEnvOn("QWEN4_PROFILE_QSA");
+    const prof = env.on(.QWEN4_PROFILE_QSA);
     var clk: ProfClock = undefined;
     if (prof) {
         try mlx.check(mlx.mlx_array_eval(q_rope));
@@ -682,27 +684,6 @@ fn qsaPrefillGatherProfiled(s: mlx.mlx_stream, q_rope: mlx.mlx_array, k: mlx.mlx
         log.info("[qsa-prof] gather S={d} kv={d}: {d:.2} ms\n", .{ mlx.getShape(q_rope)[2], mlx.getShape(k)[2], @as(f64, @floatFromInt(clk.lap())) / 1e6 });
     };
     return gathered;
-}
-
-/// The dense-mask arm: the fused masked kernel, the split vector sdpa, then stock sdpa.
-pub fn qsaMaskArm(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, mask: mlx.mlx_array) !mlx.mlx_array {
-    if (try fusedSdpa256Masked(s, q, k, v, scale, mask)) |o| return o;
-    if (try splitMaskedSdpa256(s, q, k, v, scale, mask)) |o| return o;
-    // MLX's CUDA SDPA turns a bool mask into 0 / -inf after broadcasting it over the heads, three
-    // [B, H, S, kv] arrays; the same values over one head reach cuDNN as a broadcast view.
-    var additive = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(additive);
-    if (mlx.cudaAvailable() and mlx.mlx_array_dtype(mask) == .bool_) {
-        const zero = try scalarOf(0, mlx.mlx_array_dtype(q), s);
-        defer _ = mlx.mlx_array_free(zero);
-        const neg_inf = try scalarOf(-std.math.inf(f32), mlx.mlx_array_dtype(q), s);
-        defer _ = mlx.mlx_array_free(neg_inf);
-        try mlx.check(mlx.mlx_where(&additive, mask, zero, neg_inf, s));
-    } else try mlx.check(mlx.mlx_array_set(&additive, mask));
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out, q, k, v, scale, "array", additive, .{ .ctx = null }, false, s));
-    return out;
 }
 
 // ── tests ──
