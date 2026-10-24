@@ -969,9 +969,9 @@ pub const Transformer = struct {
     pub const dequantizedEmbedding = @import("../../sdk/blocks/embedding.zig").dequantizedEmbedding;
     pub const dequantTake = @import("../../sdk/blocks/embedding.zig").dequantTake;
     // sdk/vision/splice.zig
-    pub const spliceVisionEmbeddings = @import("../../sdk/vision/splice.zig").spliceVisionEmbeddings;
+    pub const spliceVisionEmbeddings = @import("methods/vision_splice.zig").spliceVisionEmbeddings;
     pub const spliceVisionRows = @import("../../sdk/vision/splice.zig").spliceVisionRows;
-    pub const applyVisionEmbeddingsWith = @import("../../sdk/vision/splice.zig").applyVisionEmbeddingsWith;
+    pub const applyVisionEmbeddingsWith = @import("methods/vision_splice.zig").applyVisionEmbeddingsWith;
     // sdk/blocks/mlp/activations.zig
     pub const gelu = @import("../../sdk/blocks/mlp/activations.zig").gelu;
     pub const geluUncompiled = @import("../../sdk/blocks/mlp/activations.zig").geluUncompiled;
