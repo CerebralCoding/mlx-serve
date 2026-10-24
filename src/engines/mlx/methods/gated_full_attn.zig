@@ -1,40 +1,40 @@
-//! sdk/blocks/attention/gated_full, split out of engines/mlx/transformer.zig (P1, moves only).
+//! engines/mlx/methods/gated_full_attn, the legacy `Transformer`'s methods split out of engines/mlx/transformer.zig.
 //! Owns gatedFullAttnWith, gatedFullAttnProjected, gatedAttnTail.
 
 const mlx = @import("../../../mlx/ffi.zig");
-const rowqmv = @import("../qmm/rowqmv.zig");
-const lane_attn = @import("lane_attn.zig");
-const row_attn = @import("row_attn.zig");
+const rowqmv = @import("../../../sdk/blocks/qmm/rowqmv.zig");
+const lane_attn = @import("../../../sdk/blocks/attention/lane_attn.zig");
+const row_attn = @import("../../../sdk/blocks/attention/row_attn.zig");
 const log = @import("../../../host/log.zig");
-const decode_fused = @import("../gdn/decode_fused.zig");
-const residual_norm = @import("../norms/residual_norm.zig");
-const MAX_BATCH_ROWS = @import("../../../engines/mlx/batched/layered.zig").MAX_BATCH_ROWS;
-const ForwardCtx = @import("../../../engines/mlx/forward_ctx.zig").ForwardCtx;
-const KVCache = @import("../../../engines/mlx/kv/cache.zig").KVCache;
-const FullAttnWeights = @import("../../../engines/mlx/layer_weights.zig").FullAttnWeights;
-const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
-const AttnVerifyInputs = @import("../../../engines/mlx/verify/joined_rows.zig").AttnVerifyInputs;
+const decode_fused = @import("../../../sdk/blocks/gdn/decode_fused.zig");
+const residual_norm = @import("../../../sdk/blocks/norms/residual_norm.zig");
+const MAX_BATCH_ROWS = @import("../../../sdk/bases/run.zig").MAX_BATCH_ROWS;
+const ForwardCtx = @import("../forward_ctx.zig").ForwardCtx;
+const KVCache = @import("../kv/cache.zig").KVCache;
+const FullAttnWeights = @import("../layer_weights.zig").FullAttnWeights;
+const Transformer = @import("../transformer.zig").Transformer;
+const AttnVerifyInputs = @import("../verify/joined_rows.zig").AttnVerifyInputs;
 const naxAvailable = @import("../../../mlx/device.zig").naxAvailable;
 const constTableAs = @import("../../../mlx/dtype.zig").constTableAs;
 const Qwen4AttnProf = @import("../../../plugins/qwen4_exp/prof.zig").Qwen4AttnProf;
 const noteQsaArmForSlots = @import("../../../plugins/qwen4_exp/qsa/arms.zig").noteQsaArmForSlots;
 const qsaSlotAttn = @import("../../../plugins/qwen4_exp/qsa/sparse_attn.zig").qsaSlotAttn;
-const standinRef = @import("../../diag/standin.zig").standinRef;
-const fusedQkNormRope = @import("../rope/qk_norm_rope.zig").fusedQkNormRope;
-const fusedQkNormRope256 = @import("../rope/qk_norm_rope.zig").fusedQkNormRope256;
-const qkNormRopeFusedEnabled = @import("../rope/qk_norm_rope.zig").qkNormRopeFusedEnabled;
-const fusedSdpa256Prefill = @import("attn256.zig").fusedSdpa256Prefill;
-const batchedAttnPerSlot = @import("batched.zig").batchedAttnPerSlot;
-const stridedSigmoidGateMul = @import("gates.zig").stridedSigmoidGateMul;
-const kvAttnFusedEligible = @import("kv_quant_attn.zig").kvAttnFusedEligible;
-const kvAttnVerifyEligible = @import("kv_quant_attn.zig").kvAttnVerifyEligible;
-const logKvAttnFusedEngaged = @import("kv_quant_attn.zig").logKvAttnFusedEngaged;
-const qkvAttnDecodeKernel = @import("kv_quant_attn.zig").qkvAttnDecodeKernel;
-const qkvAttnVerifyKernel = @import("kv_quant_attn.zig").qkvAttnVerifyKernel;
-const DenseKVView = @import("kv_view.zig").DenseKVView;
-const rowByRowSdpa = @import("sdpa.zig").rowByRowSdpa;
-const sdpaForceFused = @import("sdpa.zig").sdpaForceFused;
-const splitCausalSdpa = @import("sdpa.zig").splitCausalSdpa;
+const standinRef = @import("../../../sdk/diag/standin.zig").standinRef;
+const fusedQkNormRope = @import("../../../sdk/blocks/rope/qk_norm_rope.zig").fusedQkNormRope;
+const fusedQkNormRope256 = @import("../../../sdk/blocks/rope/qk_norm_rope.zig").fusedQkNormRope256;
+const qkNormRopeFusedEnabled = @import("../../../sdk/blocks/rope/qk_norm_rope.zig").qkNormRopeFusedEnabled;
+const fusedSdpa256Prefill = @import("../../../sdk/blocks/attention/attn256.zig").fusedSdpa256Prefill;
+const batchedAttnPerSlot = @import("../../../sdk/blocks/attention/batched.zig").batchedAttnPerSlot;
+const stridedSigmoidGateMul = @import("../../../sdk/blocks/attention/gates.zig").stridedSigmoidGateMul;
+const kvAttnFusedEligible = @import("../../../sdk/blocks/attention/kv_quant_attn.zig").kvAttnFusedEligible;
+const kvAttnVerifyEligible = @import("../../../sdk/blocks/attention/kv_quant_attn.zig").kvAttnVerifyEligible;
+const logKvAttnFusedEngaged = @import("../../../sdk/blocks/attention/kv_quant_attn.zig").logKvAttnFusedEngaged;
+const qkvAttnDecodeKernel = @import("../../../sdk/blocks/attention/kv_quant_attn.zig").qkvAttnDecodeKernel;
+const qkvAttnVerifyKernel = @import("../../../sdk/blocks/attention/kv_quant_attn.zig").qkvAttnVerifyKernel;
+const DenseKVView = @import("../../../sdk/blocks/attention/kv_view.zig").DenseKVView;
+const rowByRowSdpa = @import("../../../sdk/blocks/attention/sdpa.zig").rowByRowSdpa;
+const sdpaForceFused = @import("../../../sdk/blocks/attention/sdpa.zig").sdpaForceFused;
+const splitCausalSdpa = @import("../../../sdk/blocks/attention/sdpa.zig").splitCausalSdpa;
 
 pub fn gatedFullAttnWith(
     self: *Transformer,

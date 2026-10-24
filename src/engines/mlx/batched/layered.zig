@@ -23,8 +23,7 @@ var gdn_batched_verify_rows_logged: c_int = 0; // widest row total logged so far
 pub var row_axis_verify_logged: bool = false;
 pub var verify_fail_after_flush: ?usize = null;
 
-/// Slots one batched forward carries (twin of `scheduler.MAX_BATCH_GROUP`).
-pub const MAX_BATCH_ROWS = 32;
+pub const MAX_BATCH_ROWS = @import("../../../sdk/bases/run.zig").MAX_BATCH_ROWS;
 pub var std_batched_logged: bool = false; // one-shot log guard
 
 /// Batched decode for a GatedDeltaNet trunk (qwen3_5 family), the hybrid

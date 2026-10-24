@@ -4,13 +4,11 @@
 const std = @import("std");
 const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
-const QuantMode = @import("../../../engines/mlx/model.zig").QuantMode;
-const transformer = @import("../../../engines/mlx/transformer.zig");
-const testing = @import("../../../engines/mlx/kv/cache.zig").testing;
-const lastDim = @import("../../../engines/mlx/load/weights.zig").lastDim;
+const QuantMode = @import("../../quant/params.zig").QuantMode;
+const testing = std.testing;
+const lastDim = @import("../../../mlx/array.zig").lastDim;
 const naxAvailable = @import("../../../mlx/device.zig").naxAvailable;
 const testRandWeightBf16 = @import("../../testing/parity.zig").testRandWeightBf16;
-const qmatmulBits = @import("qmatmul.zig").qmatmulBits;
 const dualDieArch = @import("verify_projection.zig").dualDieArch;
 const verifyArch = @import("verify_projection.zig").verifyArch;
 
@@ -59,7 +57,7 @@ fn prefillDqGemmRowFloorNow(bits: u32, n: usize, k: usize) usize {
 /// Off on CUDA: there it measured slower than stock qmm (3845 vs 4400 tok/s, Llama 3.2 3B, RTX 5060 Ti) and its
 /// bf16 weight transients stacked ~5 GB into the prefill peak.
 pub fn prefillDqGemmEnabled() bool {
-    return transformer.prefill_dq_gemm_override orelse !mlx.cudaAvailable();
+    return prefill_dq_gemm_override orelse !mlx.cudaAvailable();
 }
 
 /// Test seam: engagement is counted, never inferred from output equality.
@@ -94,7 +92,12 @@ pub fn prefillDqGemm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: 
     return out;
 }
 
+/// Test seam: forces the route on/off without the environment.
+pub var prefill_dq_gemm_override: ?bool = null;
+
 // ── tests ──
+
+const qmatmulBits = @import("qmatmul.zig").qmatmulBits;
 
 test "prefillDqGemmRowFloor: on the Ultra the floor follows min(N, K) from 4096, the rest keep theirs" {
     // M5 Ultra crossovers, stock NAX qmm vs dequant+GEMM: K 640 and 2560 win from 2048
@@ -117,17 +120,17 @@ test "prefillDqGemmRowFloor: on the Ultra the floor follows min(N, K) from 4096,
 }
 
 test "prefillDqGemm defaults on where it was measured a win, off on CUDA" {
-    const saved = transformer.prefill_dq_gemm_override;
-    defer transformer.prefill_dq_gemm_override = saved;
-    transformer.prefill_dq_gemm_override = null;
+    const saved = prefill_dq_gemm_override;
+    defer prefill_dq_gemm_override = saved;
+    prefill_dq_gemm_override = null;
     try std.testing.expectEqual(!mlx.cudaAvailable(), prefillDqGemmEnabled());
 }
 
 test "prefillDqGemm: 2-bit weights take the dequant route from 384 rows, other widths from 2048" {
     // Measured on the M4 Max: 2-bit qmm loses to dequant+GEMM from 384 rows
     // (+5%, +10% at 1024); the 2048 floor stays for the widths it was tuned on.
-    transformer.prefill_dq_gemm_override = true; // the row floors, whatever the platform default
-    defer transformer.prefill_dq_gemm_override = null;
+    prefill_dq_gemm_override = true; // the row floors, whatever the platform default
+    defer prefill_dq_gemm_override = null;
     const s = mlx.gpuStream();
     const K: c_int = 256;
     const N: c_int = 128;

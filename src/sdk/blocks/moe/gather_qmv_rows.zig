@@ -6,10 +6,9 @@ const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
-const QuantMode = @import("../../../engines/mlx/model.zig").QuantMode;
+const QuantMode = @import("../../quant/params.zig").QuantMode;
 const standin = @import("../../diag/standin.zig");
-const transformer = @import("../../../engines/mlx/transformer.zig");
-const testing = @import("../../../engines/mlx/kv/cache.zig").testing;
+const testing = std.testing;
 const qwen4Standin = @import("../../diag/standin.zig").qwen4Standin;
 const testRandUniformBf16 = @import("../../testing/parity.zig").testRandUniformBf16;
 const attn256MaxDiff = @import("../attention/attn256.zig").attn256MaxDiff;
@@ -77,12 +76,15 @@ const MoeStatsState = struct {
     moe_sorted_layers: u32 = 0,
 };
 const moeStats_shared = @import("../../util/shared.zig").Shared(MoeStatsState, "moe_rows_stats", .{});
+const device = @import("../../../mlx/device.zig");
+const gather_qmv_vars = @import("gather_qmv.zig");
+const down_reduce_vars = @import("down_reduce.zig");
 pub inline fn moeStats() *MoeStatsState {
     return moeStats_shared.get();
 }
 
 pub fn moeRowsFusedEnabled() bool {
-    return transformer.moe_rows_fused_override orelse true;
+    return moe_rows_fused_override orelse true;
 }
 
 pub var moe_verify_rows_override: ?bool = null; // test seam
@@ -227,6 +229,8 @@ pub fn gatherQmvGateUpRows(
     return y;
 }
 
+pub var moe_rows_fused_override: ?bool = null;
+
 // ── tests ──
 
 pub fn moeRowsAffineBank(s: mlx.mlx_stream, rnd: std.Random, E: c_int, N: c_int, K: c_int, bits: u32, gs: u32) !struct { w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array } {
@@ -260,8 +264,8 @@ pub fn moeRowsSliceRow(s: mlx.mlx_stream, x: mlx.mlx_array, i: c_int) !mlx.mlx_a
 }
 
 test "moe decode dispatch: rows vs sorted vs gatherQmv" {
-    transformer.moe_rows_fused_override = true;
-    defer transformer.moe_rows_fused_override = null;
+    moe_rows_fused_override = true;
+    defer moe_rows_fused_override = null;
     standin.qwen4_standin_override = .{};
     defer standin.qwen4_standin_override = null;
     const K: c_int = 10;
@@ -281,8 +285,8 @@ test "moe decode dispatch: rows vs sorted vs gatherQmv" {
 }
 
 test "moe dispatch: a clamped SwiGLU declines the rows arm, at batched decode and at verify widths" {
-    transformer.moe_rows_fused_override = true;
-    defer transformer.moe_rows_fused_override = null;
+    moe_rows_fused_override = true;
+    defer moe_rows_fused_override = null;
     standin.qwen4_standin_override = .{};
     defer standin.qwen4_standin_override = null;
     // The rows kernels apply no clamp (GLM-5.3's limit 10): the composed chain runs instead.
@@ -315,10 +319,10 @@ test "moe decode dispatch: single-slot verify widths take the rows arm when enab
 
 test "gatherQmvGateUpRows accepts N=8 K=10" {
     const s = mlx.gpuStream();
-    transformer.moe_rows_fused_override = true;
-    defer transformer.moe_rows_fused_override = null;
-    transformer.gqmv_gateup_override = true;
-    defer transformer.gqmv_gateup_override = null;
+    moe_rows_fused_override = true;
+    defer moe_rows_fused_override = null;
+    gather_qmv_vars.gqmv_gateup_override = true;
+    defer gather_qmv_vars.gqmv_gateup_override = null;
     const nrows: c_int = 8;
     const topk: c_int = 10;
     const hid: c_int = 2560;
@@ -362,12 +366,12 @@ test "moe rows fused: N=1 is byte-identical to the single-row kernel" {
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x51F0);
     const rnd = prng.random();
-    transformer.moe_rows_fused_override = true;
-    defer transformer.moe_rows_fused_override = null;
-    transformer.gqmv_gateup_override = true;
-    defer transformer.gqmv_gateup_override = null;
-    transformer.downred_override = true;
-    defer transformer.downred_override = null;
+    moe_rows_fused_override = true;
+    defer moe_rows_fused_override = null;
+    gather_qmv_vars.gqmv_gateup_override = true;
+    defer gather_qmv_vars.gqmv_gateup_override = null;
+    down_reduce_vars.downred_override = true;
+    defer down_reduce_vars.downred_override = null;
     const E: c_int = 32;
     const hid: c_int = 2560;
     const inter: c_int = 640;
@@ -425,12 +429,12 @@ test "moe rows fused: N=8 K=10 gate/up and down/reduce match N solo calls" {
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0xC0DE);
     const rnd = prng.random();
-    transformer.moe_rows_fused_override = true;
-    defer transformer.moe_rows_fused_override = null;
-    transformer.gqmv_gateup_override = true;
-    defer transformer.gqmv_gateup_override = null;
-    transformer.downred_override = true;
-    defer transformer.downred_override = null;
+    moe_rows_fused_override = true;
+    defer moe_rows_fused_override = null;
+    gather_qmv_vars.gqmv_gateup_override = true;
+    defer gather_qmv_vars.gqmv_gateup_override = null;
+    down_reduce_vars.downred_override = true;
+    defer down_reduce_vars.downred_override = null;
     const E: c_int = 512;
     const hid: c_int = 2560;
     const inter: c_int = 640;
@@ -446,12 +450,12 @@ test "moe rows fused: N=8 K=10 gate/up and down/reduce match N solo calls" {
 test "moe rows fused: a second down width at the same rows, top-k and N runs its own width" {
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0xC0DF);
-    transformer.moe_rows_fused_override = true;
-    defer transformer.moe_rows_fused_override = null;
-    transformer.gqmv_gateup_override = true;
-    defer transformer.gqmv_gateup_override = null;
-    transformer.downred_override = true;
-    defer transformer.downred_override = null;
+    moe_rows_fused_override = true;
+    defer moe_rows_fused_override = null;
+    gather_qmv_vars.gqmv_gateup_override = true;
+    defer gather_qmv_vars.gqmv_gateup_override = null;
+    down_reduce_vars.downred_override = true;
+    defer down_reduce_vars.downred_override = null;
     for ([_]c_int{ 640, 320 }) |inter| try moeRowsFusedCase(s, prng.random(), 512, 2560, inter, 10, 8, 4, 64, 8, 32);
 }
 
@@ -509,12 +513,12 @@ test "moe rows fused nvfp4: verify rows with per-expert gate scales match fp32 t
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x4E5F);
     const rnd = prng.random();
-    transformer.moe_rows_fused_override = true;
-    defer transformer.moe_rows_fused_override = null;
-    transformer.gqmv_gateup_override = true;
-    defer transformer.gqmv_gateup_override = null;
-    transformer.downred_override = true;
-    defer transformer.downred_override = null;
+    moe_rows_fused_override = true;
+    defer moe_rows_fused_override = null;
+    gather_qmv_vars.gqmv_gateup_override = true;
+    defer gather_qmv_vars.gqmv_gateup_override = null;
+    down_reduce_vars.downred_override = true;
+    defer down_reduce_vars.downred_override = null;
     const E: c_int = 16;
     const H: c_int = 2560;
     const I: c_int = 640;
@@ -650,15 +654,15 @@ test "moe rows fused: rows match solo calls at 8 and at 16 lanes per down row" {
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x1A4E);
     const rnd = prng.random();
-    transformer.moe_rows_fused_override = true;
-    defer transformer.moe_rows_fused_override = null;
-    transformer.gqmv_gateup_override = true;
-    defer transformer.gqmv_gateup_override = null;
-    transformer.downred_override = true;
-    defer transformer.downred_override = null;
-    defer transformer.device_gen_override = null;
+    moe_rows_fused_override = true;
+    defer moe_rows_fused_override = null;
+    gather_qmv_vars.gqmv_gateup_override = true;
+    defer gather_qmv_vars.gqmv_gateup_override = null;
+    down_reduce_vars.downred_override = true;
+    defer down_reduce_vars.downred_override = null;
+    defer device.device_gen_override = null;
     for ([_]u32{ 16, 17 }) |gen| {
-        transformer.device_gen_override = .{ .gen = gen, .phone = false };
+        device.device_gen_override = .{ .gen = gen, .phone = false };
         try moeRowsFusedCase(s, rnd, 512, 2560, 640, 10, 8, 4, 64, 4, 64);
     }
 }

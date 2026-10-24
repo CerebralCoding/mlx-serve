@@ -6,7 +6,6 @@ const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
-const transformer = @import("../../../engines/mlx/transformer.zig");
 const verify_qmm = @import("verify_qmm.zig");
 const computeNaxAvailable = @import("../../../mlx/device.zig").computeNaxAvailable;
 const gpuArchitecture = @import("../../../mlx/device.zig").gpuArchitecture;
@@ -25,7 +24,7 @@ var vqmm_nax_avail_cache: ?bool = null;
 /// from MTPLX). Cached for the process lifetime (inference-thread caller
 /// discipline, same as the kernel caches).
 pub fn verifyQmmNaxAvailable() bool {
-    if (transformer.vqmm_nax_probe_override) |v| return v;
+    if (vqmm_nax_probe_override) |v| return v;
     if (vqmm_nax_avail_cache) |v| return v;
     const ok = computeNaxAvailable();
     vqmm_nax_avail_cache = ok;
@@ -36,7 +35,7 @@ var vqmm_tile_cache: ?VqmmTile = null;
 
 /// The matmul2d tile this process dispatches.
 pub fn verifyQmmTile() VqmmTile {
-    if (transformer.vqmm_nax_probe_override) |v| return if (v) .nax else .off;
+    if (vqmm_nax_probe_override) |v| return if (v) .nax else .off;
     if (vqmm_tile_cache) |v| return v;
     var arch_buf: [128]u8 = undefined;
     const arch = gpuArchitecture(&arch_buf) orelse "";
@@ -236,6 +235,12 @@ pub fn runVerifyQmmNax(
     try mlx.check(mlx.mlx_reshape(&y, ym, out_shape_buf[0..ndim].ptr, @intCast(ndim), s));
     return y;
 }
+
+/// Test seam: force the NAX availability probe (null = real probe). Only
+/// ever force FALSE on non-G17 machines — forcing true would let dispatch
+/// build a kernel whose matmul2d pipeline cannot be created off M5-class
+/// hardware.
+pub var vqmm_nax_probe_override: ?bool = null;
 
 // ── tests ──
 

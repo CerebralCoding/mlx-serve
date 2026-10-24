@@ -56,7 +56,7 @@ src/engines/mlx/admission/context.zig	pinPrefillChunk(config)	the prefill width 
 # Batching, KV and prefix cache.
 src/engines/mlx/batching/verdict.zig	t.ownsModuleDecodeState()	exclusive decode asks the transformer, never one hardcoded arch
 src/engines/mlx/batching/verdict.zig	!return t.dsv4 != null;	exclusive decode asks the transformer, never one hardcoded arch
-src/engines/mlx/cache/kv_quant.zig	!mlx_repeat_axis	quantized attention reshapes Q for GQA, never repeats the K/V triples
+src/sdk/blocks/attention/kv_quant.zig	!mlx_repeat_axis	quantized attention reshapes Q for GQA, never repeats the K/V triples
 src/engines/mlx/cache/prefix_cache.zig	[hot-cache] hybrid miss	the no-match lookup arm reports why (missKind), never returns silently
 # Commit ownership (were source-scan tests in commit.zig).
 src/engines/mlx/commit.zig	dflashContextCoversPrefix(dc.absLen(), total_len)	a DFlash payload is committed only when it spans the trunk prefix
@@ -126,7 +126,7 @@ src/plugins/ltx/video.zig	!some(4)	LTX quant reads solve (bits, gs) from geometr
 src/plugins/ltx/video.zig	!some(8)	LTX quant reads solve (bits, gs) from geometry, never a hardcoded width
 src/plugins/qwen4_exp/*.zig	!MTP_EV_SEED_DEPTH	the qwen4 EV seed width is mtp.MAX_DEPTH itself
 src/plugins/qwen4_exp/mtp.zig	ev_seed_accept: ?[mtp_mod.MAX_DEPTH]f32	the qwen4 EV seed width is mtp.MAX_DEPTH itself
-src/sdk/blocks/attention/gated_full.zig	&ctx.qsa_arms, seq_len	the QSA arm tally lives on the request's ForwardCtx
+src/engines/mlx/methods/gated_full_attn.zig	&ctx.qsa_arms, seq_len	the QSA arm tally lives on the request's ForwardCtx
 src/plugins/qwen4_exp/qsa/*.zig	!self.qsa_arms	the QSA arm tally never lives on the shared Transformer
 src/plugins/qwen4_exp/plugin.zig	r.arms.add(ctx.qsa_arms)	the QSA arm log reads the request's own ctx
 src/plugins/qwen4_exp/qsa/*.zig	const want_blocks = qsaWantsBlocks(	the QSA selection arm takes the block branch at verify widths
@@ -134,7 +134,7 @@ src/plugins/qwen4_exp/qsa/*.zig	qsaVerifyGatherAttn(	the QSA dispatch reaches th
 src/plugins/qwen4_exp/qsa/*.zig	seq_len >= FUSED256_MIN_Q_LEN	the QSA prefill gather is guarded by the hd-256 width floor
 src/plugins/qwen4_exp/qsa/indexer.zig	yarnScaleRotated	the QSA indexer's scalar rope arm applies the YaRN mscale
 src/plugins/qwen4_exp/qsa/indexer.zig	!deliberately NOT applied	the QSA indexer never skips the YaRN mscale
-src/sdk/blocks/rope/*.zig	constTableAs(self.yarn_mscale.?,	the YaRN mscale table reaches a multiply only through constTableAs
+src/engines/mlx/methods/yarn.zig	constTableAs(self.yarn_mscale.?,	the YaRN mscale table reaches a multiply only through constTableAs
 src/engines/mlx/forward/*.zig	applyVisionEmbeddingsWith	every generative forward arm splices vision rows
 src/plugins/glm5_next/forward.zig	applyVisionEmbeddingsWith	every generative forward arm splices vision rows
 src/plugins/qwen4_exp/forward.zig	applyVisionEmbeddingsWith	every generative forward arm splices vision rows

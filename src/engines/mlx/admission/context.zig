@@ -5,9 +5,10 @@ const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const generate_mod = @import("../generate.zig");
 const model_mod = @import("../model.zig");
-const mlx_stream = if (@import("build_options").mlx_stream) @import("../../../sdk/weights/streamed/glue.zig") else @import("../../../sdk/weights/streamed/stub.zig");
+const mlx_stream = if (@import("build_options").mlx_stream) @import("../modules/stream_glue.zig") else @import("../modules/stream_stub.zig");
 const model_registry_mod = @import("../../../host/registry/registry.zig");
 const metrics = @import("../../../host/status.zig");
+const system_vars = @import("../../../sdk/util/system.zig");
 const instr = @import("../../../host/metrics/metrics.zig");
 const ModelRegistry = model_registry_mod.ModelRegistry;
 const testing = std.testing;
@@ -266,9 +267,9 @@ test "autoContextFor: the safety margin applies to MEMORY, never to the model's 
     defer http_server.serverState().server_config.max_context_size = original;
     http_server.serverState().server_config.max_context_size = 0;
     // The OS reserve alone eats a 7 GB CI runner's free RAM; it is not what is on trial.
-    const orig_reserve = metrics.os_reserve_override;
-    defer metrics.os_reserve_override = orig_reserve;
-    metrics.os_reserve_override = 0;
+    const orig_reserve = system_vars.os_reserve_override;
+    defer system_vars.os_reserve_override = orig_reserve;
+    system_vars.os_reserve_override = 0;
 
     // A tiny model whose `max_position_embeddings` is far below anything memory
     // could constrain: it must get its FULL declared context, un-margined.

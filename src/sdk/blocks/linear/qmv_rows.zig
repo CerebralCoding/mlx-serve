@@ -5,10 +5,8 @@ const std = @import("std");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
-const ModelConfig = @import("../../../engines/mlx/model.zig").ModelConfig;
-const Weights = @import("../../../engines/mlx/model.zig").Weights;
-const transformer = @import("../../../engines/mlx/transformer.zig");
-const testing = @import("../../../engines/mlx/kv/cache.zig").testing;
+const Weights = @import("../../weights/resident.zig").Weights;
+const testing = std.testing;
 const KernelCfgCache = @import("../../../mlx/kernel_cache.zig").KernelCfgCache;
 const firstRowExactMiss = @import("../../quant/ternary.zig").firstRowExactMiss;
 const testRandWeightBf16 = @import("../../testing/parity.zig").testRandWeightBf16;
@@ -121,7 +119,7 @@ pub fn msvQmvRows(
     defer _ = mlx.mlx_vector_array_free(outputs_vec);
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, config, s));
     if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
-    transformer.mtp_head_row_dispatches += 1;
+    mtp_head_row_dispatches += 1;
     if (!msv_qmv_rows_logged[bits]) {
         msv_qmv_rows_logged[bits] = true;
         log.info("[mtp] row-axis projection engaged: rows={d} K={d} N={d} bits={d} gs={d}\n", .{ nrows, K, Nout, bits, group_size });
@@ -140,7 +138,11 @@ pub fn msvQmvRows(
     return y;
 }
 
+pub var mtp_head_row_dispatches: usize = 0;
+
 // ── tests ──
+
+const ModelConfig = @import("../../../engines/mlx/model.zig").ModelConfig;
 
 test "firstRowExactMiss: 4, 6 and 8-bit trunk projections are inside the row kernels, 3-bit is not; vision and mtp never count" {
     const Q = struct {
@@ -159,10 +161,7 @@ test "firstRowExactMiss: 4, 6 and 8-bit trunk projections are inside the row ker
             }
         }
     };
-    var cfg = ModelConfig{};
-    cfg.quant_bits = 4;
-    cfg.quant_group_size = 64;
-    cfg.quant_mode = .affine;
+    const cfg: @import("../../quant/params.zig").QuantParams = .{ .bits = 4, .group_size = 64, .mode = .affine };
     var w = Weights.init(std.testing.allocator);
     defer w.deinit();
     try Q.put(&w, "m.layers.0.q", 4);
@@ -170,9 +169,9 @@ test "firstRowExactMiss: 4, 6 and 8-bit trunk projections are inside the row ker
     try Q.put(&w, "m.layers.2.q", 8);
     try Q.put(&w, "vision_tower.fc", 3);
     try Q.put(&w, "mtp.layers.0.fc", 3);
-    try std.testing.expectEqual(@as(?[]const u8, null), firstRowExactMiss(&cfg, &w, .{ .ctx = null }));
+    try std.testing.expectEqual(@as(?[]const u8, null), firstRowExactMiss(cfg, &w, .{ .ctx = null }));
     try Q.put(&w, "m.layers.3.q", 3);
-    try std.testing.expectEqualStrings("m.layers.3.q.scales", firstRowExactMiss(&cfg, &w, .{ .ctx = null }).?);
+    try std.testing.expectEqualStrings("m.layers.3.q.scales", firstRowExactMiss(cfg, &w, .{ .ctx = null }).?);
 }
 
 test "msv_qmv_rows is mlx_equal per row to stock M=1 qmv at every head shape, width and group" {

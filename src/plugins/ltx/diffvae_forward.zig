@@ -21,7 +21,7 @@ const ltx = @import("video.zig");
 const geom = @import("diffvae.zig");
 const na = @import("diffvae_kernel.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
-const status = @import("../../host/status.zig");
+const status = @import("../../sdk/util/system.zig");
 const env = @import("../../env.zig");
 
 const S = mlx.mlx_stream;

@@ -9,7 +9,7 @@ const mlx = @import("../../mlx/ffi.zig");
 const kc = @import("../../sdk/testing/kernel_contract/root.zig");
 const hostq = @import("../../sdk/testing/kernel_contract/hostq.zig");
 const fa = @import("../../sdk/blocks/mlp/fused_activations.zig");
-const moe_affine4 = @import("moe_affine4.zig");
+const moe_affine4 = @import("../../sdk/blocks/moe/moe_affine4.zig");
 
 const spec = kc.spec;
 const metal = kc.metal;

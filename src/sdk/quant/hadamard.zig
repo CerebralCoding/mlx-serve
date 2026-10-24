@@ -1,38 +1,12 @@
 //! sdk/quant/hadamard, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns unrotateEmbedding, aliasFusedRotations, registerRhtSigns.
+//! Owns registerRhtSigns.
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const rht = @import("hadamard/rht.zig");
 const log = @import("../../host/log.zig");
-const Weights = @import("../../engines/mlx/model.zig").Weights;
-const MoeLayerWeights = @import("../../engines/mlx/forward/layered.zig").MoeLayerWeights;
-const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
+const Weights = @import("../weights/resident.zig").Weights;
 const biasNegScalePeak = @import("ternary.zig").biasNegScalePeak;
-
-/// Hadamard packs: gathered embedding rows back to the residual basis.
-/// Takes ownership of `rows`.
-pub fn unrotateEmbedding(self: *const Transformer, rows: mlx.mlx_array) !mlx.mlx_array {
-    const reg = self.rht orelse return rows;
-    const signs = reg.get(self.emb_w) orelse return rows;
-    defer _ = mlx.mlx_array_free(rows);
-    return rht.transform(rows, signs, reg.block, true, self.s);
-}
-
-/// Hadamard packs: a row-joined group reads ONE rotation of its input, so it
-/// is served only when its parts share a sign vector; else the parts' views are.
-pub fn aliasFusedRotations(reg: *rht.Registry, layers: []MoeLayerWeights) !void {
-    for (layers) |*lw| {
-        if (lw.attn == .linear) {
-            const la = &lw.attn.linear;
-            if (la.in.w.ctx != null and !try reg.alias(la.in.w, (&[_]mlx.mlx_array{ la.qkv_w, la.z_w, la.a_w, la.b_w })[0..la.in.count])) la.in.w = .{ .ctx = null };
-        }
-        if (lw.mlp == .dense) {
-            const dw = &lw.mlp.dense;
-            if (dw.gu.w.ctx != null and !try reg.alias(dw.gu.w, &.{ dw.gate_w, dw.up_w })) dw.gu.w = .{ .ctx = null };
-        }
-    }
-}
 
 /// Binds every `<base>.signs` to `<base>.weight`; ONE eval for every sign
 /// hash and bias probe (a sync per weight was ~800 syncs at load). A sign

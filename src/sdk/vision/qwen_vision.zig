@@ -12,9 +12,7 @@
 const std = @import("std");
 const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
-const ModelConfig = model_mod.ModelConfig;
-const Weights = model_mod.Weights;
+const Weights = @import("../weights/resident.zig").Weights;
 const log = @import("../../host/log.zig");
 
 /// Qwen3VLImageProcessor fallbacks (processing_qwen3_vl.py:96-98). Checkpoint
@@ -617,7 +615,24 @@ pub const QwenVision = struct {
     merger_fc2_w: mlx.mlx_array,
     merger_fc2_b: mlx.mlx_array,
 
-    pub fn init(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !QwenVision {
+    /// The tower's geometry as a config declares it (`qv_*`).
+    pub const Geometry = struct {
+        patch: u32,
+        temporal_patch: u32,
+        depth: u32,
+        hidden: u32,
+        heads: u32,
+        head_dim: u32,
+        merge: u32,
+        num_pos_emb: u32,
+        out_hidden: u32,
+
+        pub fn of(cfg: anytype) Geometry {
+            return .{ .patch = cfg.qv_patch, .temporal_patch = cfg.qv_temporal_patch, .depth = cfg.qv_depth, .hidden = cfg.qv_hidden, .heads = cfg.qv_heads, .head_dim = cfg.qv_head_dim, .merge = cfg.qv_merge, .num_pos_emb = cfg.qv_num_pos_emb, .out_hidden = cfg.qv_out_hidden };
+        }
+    };
+
+    pub fn init(allocator: std.mem.Allocator, config: Geometry, weights: *const Weights) !QwenVision {
         const s = mlx.mlx_default_gpu_stream_new();
         var buf: [256]u8 = undefined;
         var kbuf: [256]u8 = undefined;
@@ -646,8 +661,8 @@ pub const QwenVision = struct {
         std.debug.assert(cw_shape.len == 5);
         const out_c = cw_shape[0];
         const flat_in = cw_shape[1] * cw_shape[2] * cw_shape[3] * cw_shape[4];
-        const layout = patchProjLayout(cw_shape, config.qv_temporal_patch, config.qv_patch) orelse {
-            log.warn("QWEN VISION: unreadable patch_embed.proj.weight shape (tps={d}, ps={d})\n", .{ config.qv_temporal_patch, config.qv_patch });
+        const layout = patchProjLayout(cw_shape, config.temporal_patch, config.patch) orelse {
+            log.warn("QWEN VISION: unreadable patch_embed.proj.weight shape (tps={d}, ps={d})\n", .{ config.temporal_patch, config.patch });
             return error.MissingVisionWeights;
         };
         log.info("[vision] qwen patch_embed layout: {s}\n", .{@tagName(layout)});
@@ -669,7 +684,7 @@ pub const QwenVision = struct {
         const patch_b = try must(weights, &buf, fmtKey(&kbuf, prefix, "patch_embed.proj.bias"));
         const pos_embed = try must(weights, &buf, fmtKey(&kbuf, prefix, "pos_embed.weight"));
 
-        const depth = config.qv_depth;
+        const depth = config.depth;
         var blocks = try allocator.alloc(QBlock, depth);
         errdefer allocator.free(blocks);
         for (0..depth) |i| {
@@ -693,12 +708,12 @@ pub const QwenVision = struct {
             .s = s,
             .allocator = allocator,
             .depth = depth,
-            .hidden = config.qv_hidden,
-            .heads = config.qv_heads,
-            .head_dim = config.qv_head_dim,
-            .merge = config.qv_merge,
-            .num_grid_per_side = @intFromFloat(@sqrt(@as(f64, @floatFromInt(config.qv_num_pos_emb)))),
-            .out_hidden = config.qv_out_hidden,
+            .hidden = config.hidden,
+            .heads = config.heads,
+            .head_dim = config.head_dim,
+            .merge = config.merge,
+            .num_grid_per_side = @intFromFloat(@sqrt(@as(f64, @floatFromInt(config.num_pos_emb)))),
+            .out_hidden = config.out_hidden,
             .patch_w = patch_w,
             .patch_b = patch_b,
             .pos_embed = pos_embed,
@@ -1285,6 +1300,68 @@ pub fn resolveVisionPrefix(weights: *const Weights) ?[]const u8 {
     return null;
 }
 
+// ── Soft-token-budget processor (EmbeddingGemma 2) ──
+
+/// `Gemma4ImageProcessor`'s resize target: the largest size with the image's aspect ratio whose patch grid
+/// fits `max_tokens` pooled soft tokens and whose sides are multiples of `merge * patch`. A source thinner than
+/// one multiple takes one multiple on its short side. Null for a degenerate request.
+pub fn budgetSize(height: u32, width: u32, patch: u32, merge: u32, max_tokens: u32) ?Resized {
+    if (height == 0 or width == 0 or patch == 0 or merge == 0 or max_tokens == 0) return null;
+    const side: u64 = @as(u64, merge) * patch;
+    const max_patches: u64 = @as(u64, max_tokens) * merge * merge;
+    const target_px: f64 = @floatFromInt(max_patches * patch * patch);
+    const factor = @sqrt(target_px / (@as(f64, @floatFromInt(height)) * @as(f64, @floatFromInt(width))));
+    const side_f: f64 = @floatFromInt(side);
+    var h: u64 = @as(u64, @intFromFloat(@floor(factor * @as(f64, @floatFromInt(height)) / side_f))) * side;
+    var w: u64 = @as(u64, @intFromFloat(@floor(factor * @as(f64, @floatFromInt(width)) / side_f))) * side;
+    if (h == 0 and w == 0) return null;
+    const max_side: u64 = (max_patches / (@as(u64, merge) * merge)) * side;
+    if (h == 0) {
+        h = side;
+        w = @min(@as(u64, width / height) * side, max_side);
+    } else if (w == 0) {
+        w = side;
+        h = @min(@as(u64, height / width) * side, max_side);
+    }
+    if (@as(f64, @floatFromInt(h * w)) > target_px) return null;
+    return .{ .h = @intCast(h), .w = @intCast(w) };
+}
+
+/// The i-th kept frame when a client sends `n` frames and the processor keeps `max`: `np.linspace(0, n-1, max,
+/// dtype=int)`, i.e. an even spread that always keeps the first and last frame.
+pub fn sampledFrame(i: usize, n: usize, max: usize) usize {
+    if (n <= max) return i;
+    if (max < 2) return 0;
+    return i * (n - 1) / (max - 1);
+}
+
+/// A resized image as the tower reads it: float32 CHW in [0, 1], as bytes.
+pub const UnitImage = struct { pixels: []u8, h: u32, w: u32 };
+
+/// Bicubic antialiased resize (Pillow's, which torchvision's uint8 kernel reproduces to within one level) of
+/// interleaved RGB8 to `[3, th, tw]` float32 in [0, 1]. Caller frees `pixels`.
+pub fn resizeToUnitChw(allocator: std.mem.Allocator, rgb: []const u8, sh: u32, sw: u32, th: u32, tw: u32) !UnitImage {
+    const resized: ?[]u8 = if (th == sh and tw == sw) null else try resizeInterleavedPil(allocator, rgb, sh, sw, th, tw, 3, .bicubic);
+    defer if (resized) |r| allocator.free(r);
+    const src = resized orelse rgb;
+    const plane: usize = @as(usize, th) * tw;
+    if (src.len != plane * 3) return error.InvalidImageBuffer;
+    const bytes = try allocator.alloc(u8, plane * 3 * @sizeOf(f32));
+    const out = @as([*]f32, @ptrCast(@alignCast(bytes.ptr)))[0 .. plane * 3];
+    // The processor multiplies by the float32 of 1/255 rather than dividing.
+    const rescale: f32 = 1.0 / 255.0;
+    for (0..plane) |i| inline for (0..3) |c| {
+        out[c * plane + i] = @as(f32, @floatFromInt(src[i * 3 + c])) * rescale;
+    };
+    return .{ .pixels = bytes, .h = th, .w = tw };
+}
+
+/// `Gemma4ImageProcessor` on one decoded image: resize to the budget's target size and rescale.
+pub fn budgetPixels(allocator: std.mem.Allocator, rgb: []const u8, h: u32, w: u32, patch: u32, merge: u32, max_tokens: u32) !UnitImage {
+    const size = budgetSize(h, w, patch, merge, max_tokens) orelse return error.InvalidImageDimensions;
+    return resizeToUnitChw(allocator, rgb, h, w, size.h, size.w);
+}
+
 test "qwen vision tower prefix and patch_embed layout are PROBED, not hardcoded" {
     const allocator = std.testing.allocator;
     const put = struct {
@@ -1698,11 +1775,12 @@ test "qwen vision parity vs reference embeddings (QWEN_VISION_TEST_MODEL)" {
     const alloc = std.testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
 
+    const model_mod = @import("../../engines/mlx/model.zig");
     const config = try model_mod.parseConfig(io, alloc, dir);
     try std.testing.expect(config.qwen_vision);
     var weights = try model_mod.loadWeightsWithVision(io, alloc, dir);
     defer weights.deinit();
-    var qv = try QwenVision.init(alloc, config, &weights);
+    var qv = try QwenVision.init(alloc, .of(&config), &weights);
     defer qv.deinit();
 
     // Reference pixel_values [N, C*tps*ps*ps] and post-merger embeddings.
@@ -1915,4 +1993,97 @@ test "qwen forwardVideo == per-group forward()+concat (self-consistency)" {
     const m_data = mlx.mlx_array_data_float32(m_f32) orelse return error.TestUnexpectedNullData;
     const total: usize = 12 * 4; // tokens × out_hidden
     try std.testing.expectEqualSlices(f32, m_data[0..total], v_data[0..total]);
+}
+
+const testing = std.testing;
+
+// Reference: `get_aspect_ratio_preserving_size` from transformers (patch 16, pooling kernel 3), rows of
+// { source h, source w, soft-token budget, target h, target w }.
+const SIZE_CASES = [_][5]u32{
+    .{ 5, 9, 70, 288, 528 },         .{ 16, 2000, 70, 48, 3360 },     .{ 2000, 16, 70, 3360, 48 },       .{ 48, 48, 70, 384, 384 },
+    .{ 47, 49, 70, 384, 384 },       .{ 1, 1, 70, 384, 384 },         .{ 300, 500, 70, 288, 480 },       .{ 200, 360, 70, 288, 528 },
+    .{ 1080, 1920, 70, 288, 528 },   .{ 3000, 4000, 70, 336, 432 },   .{ 50, 70, 70, 336, 432 },         .{ 16, 20000, 70, 48, 3360 },
+    .{ 20000, 16, 70, 3360, 48 },    .{ 2, 3, 70, 288, 480 },         .{ 5, 9, 140, 384, 720 },          .{ 16, 2000, 140, 48, 6336 },
+    .{ 47, 49, 140, 528, 576 },      .{ 300, 500, 140, 432, 720 },    .{ 200, 360, 140, 384, 720 },      .{ 3000, 4000, 140, 480, 624 },
+    .{ 5, 9, 280, 576, 1056 },       .{ 16, 2000, 280, 48, 8976 },    .{ 2000, 16, 280, 8976, 48 },      .{ 48, 48, 280, 768, 768 },
+    .{ 47, 49, 280, 768, 816 },      .{ 1, 1, 280, 768, 768 },        .{ 300, 500, 280, 576, 1008 },     .{ 200, 360, 280, 576, 1056 },
+    .{ 1080, 1920, 280, 576, 1056 }, .{ 3000, 4000, 280, 672, 912 },  .{ 16, 20000, 280, 48, 13440 },    .{ 20000, 16, 280, 13440, 48 },
+    .{ 2, 3, 280, 624, 960 },        .{ 5, 9, 560, 816, 1488 },       .{ 16, 2000, 560, 96, 12672 },     .{ 300, 500, 560, 864, 1440 },
+    .{ 3000, 4000, 560, 960, 1296 }, .{ 16, 20000, 560, 48, 26880 },  .{ 5, 9, 1120, 1152, 2112 },       .{ 16, 2000, 1120, 96, 17952 },
+    .{ 47, 49, 1120, 1536, 1632 },   .{ 300, 500, 1120, 1200, 2064 }, .{ 1080, 1920, 1120, 1200, 2112 }, .{ 16, 20000, 1120, 48, 53760 },
+};
+
+test "budgetSize: the largest aspect-preserving size that fits the soft-token budget, as the processor computes it" {
+    for (SIZE_CASES) |c| {
+        const got = budgetSize(c[0], c[1], 16, 3, c[2]) orelse {
+            std.debug.print("{d}x{d} @ {d}: refused\n", .{ c[0], c[1], c[2] });
+            return error.Refused;
+        };
+        testing.expect(got.h == c[3] and got.w == c[4]) catch |e| {
+            std.debug.print("{d}x{d} @ {d}: got {d}x{d}, want {d}x{d}\n", .{ c[0], c[1], c[2], got.h, got.w, c[3], c[4] });
+            return e;
+        };
+        // Whatever the shape, the grid pools evenly and fits the budget.
+        try testing.expect(got.h % 48 == 0 and got.w % 48 == 0);
+        try testing.expect((got.h / 16) * (got.w / 16) <= c[2] * 9);
+    }
+    try testing.expect(budgetSize(0, 10, 16, 3, 280) == null);
+    try testing.expect(budgetSize(10, 0, 16, 3, 280) == null);
+}
+
+test "sampledFrame: more frames than the processor keeps are cut to an even spread, first and last included" {
+    // np.linspace(0, n - 1, 32, dtype=int) for n = 33, 40, 100.
+    const want_33 = [_]usize{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 32 };
+    const want_40 = [_]usize{ 0, 1, 2, 3, 5, 6, 7, 8, 10, 11, 12, 13, 15, 16, 17, 18, 20, 21, 22, 23, 25, 26, 27, 28, 30, 31, 32, 33, 35, 36, 37, 39 };
+    const want_100 = [_]usize{ 0, 3, 6, 9, 12, 15, 19, 22, 25, 28, 31, 35, 38, 41, 44, 47, 51, 54, 57, 60, 63, 67, 70, 73, 76, 79, 83, 86, 89, 92, 95, 99 };
+    inline for (.{ .{ 33, want_33 }, .{ 40, want_40 }, .{ 100, want_100 } }) |c| {
+        for (c[1], 0..) |want, i| try testing.expectEqual(want, sampledFrame(i, c[0], 32));
+    }
+    // Within the cap every frame is kept, in order; a single kept frame is the first.
+    for (0..20) |i| try testing.expectEqual(i, sampledFrame(i, 20, 32));
+    try testing.expectEqual(@as(usize, 0), sampledFrame(0, 50, 1));
+}
+
+/// The closed-form source image of the fixture's resize cases.
+fn patternRgb(allocator: std.mem.Allocator, h: usize, w: usize) ![]u8 {
+    const out = try allocator.alloc(u8, h * w * 3);
+    for (0..h) |y| for (0..w) |x| for (0..3) |c| {
+        out[(y * w + x) * 3 + c] = @intCast((x * 7 + y * 13 + c * 61 + ((x * y) % 29) * 5) % 256);
+    };
+    return out;
+}
+
+test "resizeToUnitChw matches torchvision's bicubic antialias on the reference's own cases" {
+    const a = testing.allocator;
+    const Case = struct { src: [2]u32, dst: [2]u32, rgb: []const u8 };
+    const Expected = struct { media: struct { resize: []const Case } };
+    const parsed = try std.json.parseFromSlice(Expected, a, @embedFile("../../fixtures/embedding_gemma2_tiny_expected.json"), .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    for (parsed.value.media.resize, 0..) |c, case| {
+        const src = try patternRgb(a, c.src[0], c.src[1]);
+        defer a.free(src);
+        const img = try resizeToUnitChw(a, src, c.src[0], c.src[1], c.dst[0], c.dst[1]);
+        defer a.free(img.pixels);
+        try testing.expectEqual(c.dst[0], img.h);
+        try testing.expectEqual(c.dst[1], img.w);
+
+        const want = try a.alloc(u8, c.dst[0] * c.dst[1] * 3);
+        defer a.free(want);
+        try std.base64.standard.Decoder.decode(want, c.rgb);
+        const got: []const f32 = @as([*]const f32, @ptrCast(@alignCast(img.pixels.ptr)))[0..want.len];
+        const plane = @as(usize, c.dst[0]) * c.dst[1];
+        var off_by_one: usize = 0;
+        var worst: u32 = 0;
+        for (0..plane) |i| for (0..3) |ch| {
+            const level: i32 = @intFromFloat(@round(got[ch * plane + i] * 255.0));
+            const diff = @abs(level - @as(i32, want[i * 3 + ch]));
+            worst = @max(worst, diff);
+            off_by_one += @intFromBool(diff == 1);
+        };
+        // Torchvision's integer kernel and Pillow's differ in the last bit now and then, never more.
+        testing.expect(worst <= 1 and off_by_one * 20 <= plane * 3) catch |e| {
+            std.debug.print("case {d}: worst {d} levels, {d} of {d} values off by one\n", .{ case, worst, off_by_one, plane * 3 });
+            return e;
+        };
+    }
 }

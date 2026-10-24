@@ -2,10 +2,9 @@
 //! Owns forwardMlxStream, initMlxStream.
 
 const std = @import("std");
-const mlx_stream_mod = if (@import("build_options").mlx_stream) @import("../../../sdk/weights/streamed/glue.zig") else @import("../../../sdk/weights/streamed/stub.zig");
+const mlx_stream_mod = if (@import("build_options").mlx_stream) @import("stream_glue.zig") else @import("stream_stub.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const ModelConfig = @import("../model.zig").ModelConfig;
-const hostIds = @import("../../../mlx/array.zig").hostIds;
 const ForwardCtx = @import("../forward_ctx.zig").ForwardCtx;
 const Transformer = @import("../transformer.zig").Transformer;
 const moduleShell = @import("shell.zig").moduleShell;
@@ -26,4 +25,17 @@ pub fn initMlxStream(io: std.Io, allocator: std.mem.Allocator, config: ModelConf
     var t = try moduleShell(allocator, config, s);
     t.mlx_stream_ext = m;
     return t;
+}
+
+/// A module arch's token ids on the host.
+fn hostIds(self: *Transformer, token_ids: mlx.mlx_array) ![]u32 {
+    var ids32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ids32);
+    try mlx.check(mlx.mlx_astype(&ids32, token_ids, .int32, self.s));
+    try mlx.check(mlx.mlx_array_eval(ids32));
+    const n = mlx.mlx_array_size(ids32);
+    const data = mlx.mlx_array_data_int32(ids32) orelse return error.NoData;
+    const ids = try self.allocator.alloc(u32, n);
+    for (ids, data[0..n]) |*o, id| o.* = @intCast(id);
+    return ids;
 }

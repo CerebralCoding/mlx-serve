@@ -734,7 +734,7 @@ const Fp8 = struct {
     }
 
     fn wrapper(self: *Fp8) ![]const u8 {
-        const xfm = @import("../../../engines/mlx/transformer.zig");
+        const xfm = @import("../../../mlx/device.zig");
         xfm.device_gen_override = .{ .gen = 17, .phone = false };
         defer xfm.device_gen_override = null;
         const got = (try mxfp8_qmv.linear(self.args[0], self.args[1], self.args[2], self.rig.stream())) orelse return error.Declined;

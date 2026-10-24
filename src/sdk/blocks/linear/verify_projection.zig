@@ -4,23 +4,17 @@
 const std = @import("std");
 const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
-const mtp_mod = @import("../../spec/mtp/mtp.zig");
 const mlx = @import("../../../mlx/ffi.zig");
-const model_mod = @import("../../../engines/mlx/model.zig");
 const log = @import("../../../host/log.zig");
-const transformer = @import("../../../engines/mlx/transformer.zig");
 const verify_qmm = @import("verify_qmm.zig");
-const MAX_BATCH_ROWS = @import("../../../engines/mlx/batched/layered.zig").MAX_BATCH_ROWS;
-const testing = @import("../../../engines/mlx/kv/cache.zig").testing;
-const lastDim = @import("../../../engines/mlx/load/weights.zig").lastDim;
-const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
+const MAX_BATCH_ROWS = @import("../../bases/run.zig").MAX_BATCH_ROWS;
+const testing = std.testing;
+const lastDim = @import("../../../mlx/array.zig").lastDim;
 const concatAxis0 = @import("../../../mlx/array.zig").concatAxis0;
 const gpuArchitecture = @import("../../../mlx/device.zig").gpuArchitecture;
 const QsaCfgCache = @import("../../../mlx/kernel_cache.zig").QsaCfgCache;
-const qsaArraysAllEqual = @import("../../../plugins/qwen4_exp/qsa/select.zig").qsaArraysAllEqual;
 const affineParamsFromGeometry = @import("../../quant/params.zig").affineParamsFromGeometry;
 const attn256RandBf16 = @import("../attention/attn256.zig").attn256RandBf16;
-const qmatmulBits = @import("qmatmul.zig").qmatmulBits;
 const qmvBatchLimit = @import("qmatmul.zig").qmvBatchLimit;
 const msvQmvRows = @import("qmv_rows.zig").msvQmvRows;
 const cachedScalarInt = @import("verify_qmm.zig").cachedScalarInt;
@@ -69,46 +63,6 @@ pub fn mtpHeadRowsFit(widths: []const c_int, hc: u32) bool {
     if (@as(u64, hc) * widths.len > 16) return false;
     for (widths) |width| if (width != 1) return false;
     return true;
-}
-
-pub fn verifyFeatureEnabled(self: *const Transformer, comptime feature: SingleVerifyFeature, grouped: bool, batch: c_int, width: c_int) bool {
-    if (self.qwen4 == null) return false;
-    if (grouped) return true;
-    if (@import("builtin").is_test and !single_verify_test_features[@backingInt(feature)]) return false;
-    // Capture marks speculative verification. A short prefill tail has the
-    // same shape but must keep the ordinary forward path and shared expert.
-    return self.spec_capture_ssm and batch == 1 and width >= 2 and width <= 6;
-}
-
-pub fn mtpProjectionRows(self: *Transformer, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, lm_head: bool) !mlx.mlx_array {
-    const sh = mlx.getShape(x);
-    if (sh.len < 2 or sh.len > 8 or sh[0] < 1 or sh[0] > MAX_BATCH_ROWS) return error.MtpProjectionShape;
-    const n: usize = @intCast(sh[0]);
-    var virtual_rows: c_int = 1;
-    for (sh[1 .. sh.len - 1]) |d| virtual_rows *= d;
-    if (virtual_rows == 1) {
-        const qp = self.quantParamsHinted(w, sc, lastDim(x));
-        if (qp.mode == .affine) {
-            if (try msvQmvRows(self.s, x, w, sc, bi, qp.bits, qp.group_size)) |y| return y;
-        }
-    }
-    var parts: [MAX_BATCH_ROWS]mlx.mlx_array = @splat(.{ .ctx = null });
-    defer for (parts[0..n]) |a| {
-        if (a.ctx != null) _ = mlx.mlx_array_free(a);
-    };
-    for (0..n) |row| {
-        var starts: [8]c_int = @splat(0);
-        var stops: [8]c_int = @splat(0);
-        const strides: [8]c_int = @splat(1);
-        @memcpy(stops[0..sh.len], sh);
-        starts[0] = @intCast(row);
-        stops[0] = @intCast(row + 1);
-        var xrow = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(xrow);
-        try mlx.check(mlx.mlx_slice(&xrow, x, &starts, @intCast(sh.len), &stops, @intCast(sh.len), &strides, @intCast(sh.len), self.s));
-        parts[row] = if (lm_head) try self.lmHeadProject(xrow) else try self.qmatmul(xrow, w, sc, bi);
-    }
-    return concatAxis0(self.s, parts[0..n]);
 }
 
 var verify_arch_buf: [128]u8 = undefined;
@@ -164,7 +118,7 @@ pub fn mtpCoarsePairs(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc:
     var result = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(result);
     try mlx.check(mlx.mlx_vector_array_get(&result, ov, 0));
-    transformer.mtp_coarse_pair_dispatches +%= 1;
+    mtp_coarse_pair_dispatches +%= 1;
     const Once = struct {
         var logged = false;
     };
@@ -315,7 +269,7 @@ fn verifyJoinedProjection(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array,
     if (total != xs[1] or total > (if (wide) @as(c_int, 12) else 24)) return null;
     if (total == 12 and n >= 2560 and qp.bits == 8 and qp.group_size == 64) {
         if (try verifyWideProjection(s, x, w, sc, bi, 6)) |value| {
-            transformer.mtp_verify_kernel_calls[0] +%= 1;
+            mtp_verify_kernel_calls[0] +%= 1;
             const Once = struct {
                 var logged = false;
             };
@@ -334,7 +288,17 @@ fn verifyJoinedProjection(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array,
     return result;
 }
 
+pub var mtp_coarse_pair_dispatches: u64 = 0;
+pub var mtp_verify_kernel_calls: [3]u64 = @splat(0);
+
 // ── tests ──
+
+const mtp_mod = @import("../../spec/mtp/mtp.zig");
+
+const qmatmulBits = @import("qmatmul.zig").qmatmulBits;
+
+const model_mod = @import("../../../engines/mlx/model.zig");
+const qsaArraysAllEqual = @import("../../testing/parity.zig").qsaArraysAllEqual;
 
 test "shared expert gate tail admits the joined verifier envelope only" {
     try testing.expect(sharedGateRowsEligible(&.{ 2, 2, 2, 2 }));

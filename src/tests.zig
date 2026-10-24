@@ -27,7 +27,7 @@ test {
     _ = @import("env.zig");
     _ = @import("sdk/util/win_io.zig");
     _ = @import("sdk/quant/gguf/claim.zig");
-    if (@import("build_options").mlx_stream) _ = @import("sdk/weights/streamed/glue.zig");
+    if (@import("build_options").mlx_stream) _ = @import("engines/mlx/modules/stream_glue.zig");
     _ = @import("sdk/weights/streamed/dupes_test.zig");
     _ = @import("plugins/deepseek_v41/stream/dupes_test.zig");
     _ = @import("version.zig");
@@ -53,7 +53,7 @@ test {
     _ = @import("engines/mlx/model.zig");
     _ = @import("engines/mlx/generate.zig");
     _ = @import("engines/mlx/transformer.zig");
-    _ = @import("sdk/vision/encoder.zig");
+    _ = @import("engines/mlx/vision_encoder.zig");
     _ = @import("sdk/vision/qwen_vision.zig");
     _ = @import("plugins/nemotron_h/radio_vision.zig");
     _ = @import("plugins/muse_glimmer/vision.zig");
@@ -72,7 +72,7 @@ test {
     _ = @import("sdk/blocks/qmm/qmv2.zig");
     _ = @import("sdk/blocks/qmm/qmv_cuda.zig");
     _ = @import("sdk/blocks/moe/moe_gather_ubench.zig");
-    _ = @import("plugins/qwen4_exp/moe_affine4.zig");
+    _ = @import("sdk/blocks/moe/moe_affine4.zig");
     _ = @import("sdk/blocks/hc/hc_decode2.zig");
     _ = @import("sdk/blocks/hc/hc_cuda.zig");
     _ = @import("sdk/blocks/moe/moe_cuda.zig");
@@ -88,6 +88,7 @@ test {
     _ = @import("sdk/blocks/moe/moe_fp4.zig");
     _ = @import("plugins/glm5_next/mtp.zig");
     _ = @import("sdk/quant/exl3/sushi_pack.zig");
+    _ = @import("engines/mlx/load/sushi_adapt.zig");
     _ = @import("sdk/quant/nvfp4/modelopt_pack.zig");
     _ = @import("sdk/quant/formats.zig");
     _ = @import("sdk/blocks/qmm/mxfp8_qmv.zig");
@@ -113,7 +114,7 @@ test {
     _ = @import("host/api/responses/model.zig");
     _ = @import("host/http/ws.zig");
     _ = @import("engines/mlx/spec/pld_index.zig");
-    _ = @import("engines/mlx/cache/kv_quant.zig");
+    _ = @import("sdk/blocks/attention/kv_quant.zig");
     _ = @import("host/registry/model_settings.zig");
     _ = @import("host/registry/load_progress.zig");
     _ = @import("plugins/gemma4/assistant_drafter.zig");
@@ -141,7 +142,7 @@ test {
     _ = @import("engines/mlx/cache/prefix_cache.zig");
     _ = @import("engines/mlx/cache/restore_dump.zig");
     _ = @import("host/metrics/metrics.zig");
-    _ = @import("host/status.zig");
+    _ = @import("sdk/util/system.zig");
     _ = @import("host/gpu_thread/sleep_inhibit.zig");
     _ = @import("engines/mlx/cache/ssd/disk_tier.zig");
     _ = @import("engines/mlx/cache/ssd/writer.zig");

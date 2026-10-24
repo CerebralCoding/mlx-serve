@@ -18,7 +18,7 @@ const token_mask = @import("../../engines/mlx/grammar/token_mask.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const dsv4_mod = @import("../../plugins/deepseek_v4/deepseek_v4.zig");
 const dsv41_mod = @import("../../plugins/deepseek_v41/deepseek_v41.zig");
-const mlx_stream = if (@import("build_options").mlx_stream) @import("../../sdk/weights/streamed/glue.zig") else @import("../../sdk/weights/streamed/stub.zig");
+const mlx_stream = if (@import("build_options").mlx_stream) @import("../../engines/mlx/modules/stream_glue.zig") else @import("../../engines/mlx/modules/stream_stub.zig");
 const qwen_vision = @import("../../sdk/vision/qwen_vision.zig");
 const muse_vision = @import("../../plugins/muse_glimmer/vision.zig");
 const lfm2_vision = @import("../../plugins/lfm2/vision.zig");
@@ -28,7 +28,7 @@ const radio_vision = @import("../../plugins/nemotron_h/radio_vision.zig");
 const minicpm_vision = @import("../../plugins/qwen3_5/minicpm_vision.zig");
 const minicpm_canvas = @import("../../plugins/qwen3_5/minicpm_canvas.zig");
 const mrope_mod = @import("../../sdk/vision/mrope.zig");
-const vision_mod = @import("../../sdk/vision/encoder.zig");
+const vision_mod = @import("../../engines/mlx/vision_encoder.zig");
 const log = @import("../log.zig");
 const responses_mod = @import("../api/responses/model.zig");
 const pld_index = @import("../../engines/mlx/spec/pld_index.zig");
@@ -989,5 +989,5 @@ test {
     _ = @import("../../plugins/nemotron_h/media.zig");
     _ = @import("../../plugins/qwen3_5/minicpm_media.zig");
     _ = @import("../../plugins/qwen4_exp/bill.zig");
-    _ = @import("../../sdk/vision/qwen_mrope.zig");
+    _ = @import("../media/qwen_mrope.zig");
 }

@@ -5,7 +5,6 @@
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const ops = @import("../../../mlx/ops.zig");
-const legacy = @import("../../../engines/mlx/kv/sliding.zig");
 const attn256 = @import("../../blocks/attention/attn256.zig");
 
 const Array = ops.Array;
@@ -24,8 +23,8 @@ pub const View = struct {
 /// The view of a layer of `window` (0 = not sliding) after `q_len` new rows land on `total_kv`.
 pub fn view(window: u32, head_dim: c_int, total_kv: c_int, q_len: c_int) View {
     const band = attn256.fused256Enabled() and head_dim == 256 and q_len >= attn256.FUSED256_MIN_Q_LEN;
-    const width: usize = if (band) 1 else legacy.SLIDING_TRIM_UNBOUNDED;
-    const span = legacy.slidingTailSpan(window, @intCast(q_len), width);
+    const width: usize = if (band) 1 else SLIDING_TRIM_UNBOUNDED;
+    const span = slidingTailSpan(window, @intCast(q_len), width);
     const kv_len: c_int = if (span > 0) @min(total_kv, @as(c_int, @intCast(span))) else total_kv;
     return .{ .span = span, .kv_len = kv_len, .band_in_kernel = band };
 }
@@ -82,4 +81,29 @@ pub fn decodeMask(parent: *Graph, kv_len: c_int, window: c_int) !Array {
     const too_old = try g.less(pos, try g.adopt(mlx.mlx_array_new_int(kv_len - window)));
     const mask = try g.where(too_old, try negInf(g), try g.scalar(0, .bfloat16));
     return parent.keep(try g.reshape(mask, &.{ 1, 1, 1, kv_len }));
+}
+
+/// "No width bound" for `slidingTailSpan`. A 32-wide cap used to keep prefill
+/// chunks out while the mask pairing was unproven; with `band_in_kernel` now
+/// gating the only consumer that reads ABSOLUTE positions and every other
+/// consumer deriving its query offset as `kv_len - q_len`, width needs no
+/// bound — and wide chunks are the only multi-token forward a serial arch
+/// (laguna, inkling) ever does.
+pub const SLIDING_TRIM_UNBOUNDED: usize = std.math.maxInt(usize);
+
+/// How many TAIL KV entries a forward of `q_len` queries needs from a SLIDING
+/// layer. The last query reaches back `window`; the first of the block reaches
+/// back `window + q_len - 1`, so the block's union is that many entries.
+/// Returns 0 — meaning "hand back the whole cache, no trim" — when the layer
+/// does not slide or the block is wider than `max_width`.
+///
+/// This is what makes a spec verify cost what a decode step costs on a sliding
+/// layer: at width 1 it has always returned `window`, but a block-wide verify
+/// used to fall through untrimmed and read the ENTIRE cache on every sliding
+/// layer, so a 3:1 local:global model paid full attention on 75% of its layers
+/// once past the window (measured: muse-glimmer verify 51 -> 140 ms from 0.6k
+/// to 17.6k ctx, turning DFlash from 2.28x into 0.74x).
+pub fn slidingTailSpan(window: u32, q_len: usize, max_width: usize) u32 {
+    if (window == 0 or q_len == 0 or q_len > max_width) return 0;
+    return window + @as(u32, @intCast(q_len)) - 1;
 }

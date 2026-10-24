@@ -8,7 +8,6 @@ const std = @import("std");
 const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
-const xfm = @import("../../../engines/mlx/transformer.zig");
 const down_reduce = @import("down_reduce.zig");
 const gather_qmv = @import("gather_qmv.zig");
 const gather_qmv_rows = @import("gather_qmv_rows.zig");
@@ -216,10 +215,10 @@ test "moe gather kernels: microbench (MOE_UBENCH=1)" {
     defer if (mlx.errorPending()) {
         _ = mlx.takeError(&trash);
     };
-    xfm.gqmv_gateup_override = true;
-    defer xfm.gqmv_gateup_override = null;
-    xfm.downred_override = true;
-    defer xfm.downred_override = null;
+    gather_qmv.gqmv_gateup_override = true;
+    defer gather_qmv.gqmv_gateup_override = null;
+    down_reduce.downred_override = true;
+    defer down_reduce.downred_override = null;
 
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x30E0B3);
@@ -481,12 +480,12 @@ test "moe verify rows kernels: microbench at S rows (MOE_UBENCH=1)" {
     defer if (mlx.errorPending()) {
         _ = mlx.takeError(&trash);
     };
-    xfm.gqmv_gateup_override = true;
-    defer xfm.gqmv_gateup_override = null;
-    xfm.downred_override = true;
-    defer xfm.downred_override = null;
-    xfm.moe_rows_fused_override = true;
-    defer xfm.moe_rows_fused_override = null;
+    gather_qmv.gqmv_gateup_override = true;
+    defer gather_qmv.gqmv_gateup_override = null;
+    down_reduce.downred_override = true;
+    defer down_reduce.downred_override = null;
+    gather_qmv_rows.moe_rows_fused_override = true;
+    defer gather_qmv_rows.moe_rows_fused_override = null;
 
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x30E0B4);

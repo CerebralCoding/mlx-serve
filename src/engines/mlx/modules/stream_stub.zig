@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const ModelConfig = @import("../../../engines/mlx/model.zig").ModelConfig;
+const ModelConfig = @import("../model.zig").ModelConfig;
 
 pub const built = false;
 

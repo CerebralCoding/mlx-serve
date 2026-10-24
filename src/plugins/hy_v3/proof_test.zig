@@ -12,6 +12,7 @@ const transformer = @import("../../engines/mlx/transformer.zig");
 const hy3 = @import("plugin.zig");
 const config = @import("config.zig");
 const plugin_config = @import("../../engines/mlx/plugin/config.zig");
+const decode_attn_quant = @import("../../sdk/blocks/attention/decode_attn_quant.zig");
 
 const testing = std.testing;
 
@@ -202,9 +203,9 @@ test "hy_v3 served: a 4-bit pack through the driver on the legacy config is bit-
 }
 
 test "hy_v3 served: a bf16 pack with decode-attn-quant on (its side copies) is bit-equal" {
-    const was = transformer.decode_attn_quant_override;
-    defer transformer.decode_attn_quant_override = was;
-    transformer.decode_attn_quant_override = true;
+    const was = decode_attn_quant.decode_attn_quant_override;
+    defer decode_attn_quant.decode_attn_quant_override = was;
+    decode_attn_quant.decode_attn_quant_override = true;
     try servedCase(false, 0x4a6);
 }
 

@@ -6,8 +6,7 @@ const env = @import("../env.zig");
 const builtin = @import("builtin");
 const mlx = @import("ffi.zig");
 const ane_offload = @import("../sdk/ane/offload.zig");
-const transformer = @import("../engines/mlx/transformer.zig");
-const testing = @import("../engines/mlx/kv/cache.zig").testing;
+const testing = std.testing;
 
 // ── NAX m16 verify tile (M5-class matrix units; see the section comment
 // above for provenance, gating, and the never-build-off-probe rule) ──
@@ -40,7 +39,7 @@ var device_gen_cache: ?DeviceGen = null;
 /// The device's GPU generation, parsed once. Kernel plans keyed on generation (`qmv2.planFor`, the
 /// down+reduce lane count) read this one cache.
 pub fn deviceGeneration() DeviceGen {
-    if (transformer.device_gen_override) |g| return g;
+    if (device_gen_override) |g| return g;
     if (device_gen_cache) |g| return g;
     var buf: [128]u8 = undefined;
     const parsed = naxArchGeneration(gpuArchitecture(&buf) orelse "");
@@ -158,6 +157,9 @@ pub fn naxAvailable() bool {
 pub fn totalMemBytes() u64 {
     return ane_offload.totalMemBytes();
 }
+
+/// Test seam: pin the GPU generation every generation-keyed plan reads (null = the device's).
+pub var device_gen_override: ?DeviceGen = null;
 
 // ── tests ──
 

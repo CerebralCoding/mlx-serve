@@ -8,7 +8,7 @@ var kernels: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
 var announced = false;
 
 // Include the final remainder that the chunker may merge into an 8192-token chunk.
-pub const max_seq: c_int = 8192 + @as(c_int, @intCast(@import("../../../engines/mlx/generate.zig").TAIL_MERGE_MAX)) - 1;
+pub const max_seq: c_int = 8192 + @as(c_int, @intCast(@import("../../bases/run.zig").TAIL_MERGE_MAX)) - 1;
 
 
 

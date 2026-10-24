@@ -1,12 +1,12 @@
-//! sdk/blocks/norms/rms, split out of engines/mlx/transformer.zig (P1, moves only).
+//! engines/mlx/methods/rms, the legacy `Transformer`'s methods split out of engines/mlx/transformer.zig.
 //! Owns rmsNormEps, rhtAddNormRotate, narrowAddNorm, rmsNorm, layerNorm.
 
 const mlx = @import("../../../mlx/ffi.zig");
-const rht = @import("../../quant/hadamard/rht.zig");
-const add_norm = @import("add_norm.zig");
-const residual_norm = @import("residual_norm.zig");
-const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
-const groupedRmsNorm = @import("grouped_rms.zig").groupedRmsNorm;
+const rht = @import("../../../sdk/quant/hadamard/rht.zig");
+const add_norm = @import("../../../sdk/blocks/norms/add_norm.zig");
+const residual_norm = @import("../../../sdk/blocks/norms/residual_norm.zig");
+const Transformer = @import("../transformer.zig").Transformer;
+const groupedRmsNorm = @import("../../../sdk/blocks/norms/grouped_rms.zig").groupedRmsNorm;
 
 /// rmsNorm with an explicit epsilon — muse_glimmer's post-attention /
 /// post-feedforward norms run at post_norm_eps (1e-8) while every other

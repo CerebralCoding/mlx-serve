@@ -4,13 +4,11 @@
 const std = @import("std");
 const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
-const Weights = @import("../../../engines/mlx/model.zig").Weights;
-const testing = @import("../../../engines/mlx/kv/cache.zig").testing;
-const FullAttnWeights = @import("../../../engines/mlx/layer_weights.zig").FullAttnWeights;
-const transposeBf16Weight = @import("../../../engines/mlx/load/weights.zig").transposeBf16Weight;
+const Weights = @import("../../weights/resident.zig").Weights;
+const testing = std.testing;
+const transposeBf16Weight = @import("../../../mlx/array.zig").transposeBf16Weight;
 const QuantParams = @import("../../quant/params.zig").QuantParams;
 const testReadF32 = @import("../../testing/parity.zig").testReadF32;
-const qmatmulBits = @import("qmatmul.zig").qmatmulBits;
 
 /// Quantized projections that read the same input, joined along their
 /// output rows so one matmul serves them all. `widths[i]` is part i's row
@@ -225,7 +223,16 @@ pub fn joinableCols(cols: []const c_int) bool {
     return true;
 }
 
+/// A projection triple (`scales`/`biases` null-ctx when dense). Borrowed handles.
+pub const QW = struct {
+    w: mlx.mlx_array = .{ .ctx = null },
+    s: mlx.mlx_array = .{ .ctx = null },
+    b: mlx.mlx_array = .{ .ctx = null },
+};
+
 // ── tests ──
+
+const qmatmulBits = @import("qmatmul.zig").qmatmulBits;
 
 test "fused row projections are bit-identical to the separate matmuls at decode widths" {
     // Bar: for M in 1..FUSED_ROWS_MAX_M the joined matmul's slices equal the

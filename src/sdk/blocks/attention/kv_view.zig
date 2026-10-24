@@ -2,7 +2,7 @@
 //! Owns DenseKVView, SlidingView.
 
 const mlx = @import("../../../mlx/ffi.zig");
-const kv_quant = @import("../../../engines/mlx/cache/kv_quant.zig");
+const kv_quant = @import("kv_quant.zig");
 
 /// Materialized dense `[B,H,T,D]` K/V pair handed to SDPA. Owns its arrays
 /// only when `owned == true` (i.e. when the cache stores quantized data and

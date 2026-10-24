@@ -1,22 +1,21 @@
-//! sdk/blocks/attention/proj, split out of engines/mlx/transformer.zig (P1, moves only).
+//! engines/mlx/methods/attn_proj, the legacy `Transformer`'s methods split out of engines/mlx/transformer.zig.
 //! Owns qkAngleFor, qkAngleRowsFor, attnDqFor, attnProj, attnProjBias.
 
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
-const decode_attn_quant = @import("decode_attn_quant.zig");
-const fused_rows = @import("../linear/fused_rows.zig");
-const FullAttnWeights = @import("../../../engines/mlx/layer_weights.zig").FullAttnWeights;
-const lastDim = @import("../../../engines/mlx/load/weights.zig").lastDim;
-const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
-const qmatmulBits = @import("../linear/qmatmul.zig").qmatmulBits;
-const ropeAngleRows = @import("../rope/qk_norm_rope.zig").ropeAngleRows;
-const AttnDqCopy = @import("decode_attn_quant.zig").AttnDqCopy;
-const attnDqRequantEnabled = @import("decode_attn_quant.zig").attnDqRequantEnabled;
-const attnDqUseNvfp4 = @import("decode_attn_quant.zig").attnDqUseNvfp4;
-const buildAttnDqCopy = @import("decode_attn_quant.zig").buildAttnDqCopy;
-const decodeAttnQuantEligible = @import("decode_attn_quant.zig").decodeAttnQuantEligible;
-const decodeAttnQuantEnabled = @import("decode_attn_quant.zig").decodeAttnQuantEnabled;
-const denseFromAffine8 = @import("decode_attn_quant.zig").denseFromAffine8;
+const decode_attn_quant = @import("../../../sdk/blocks/attention/decode_attn_quant.zig");
+const fused_rows = @import("../../../sdk/blocks/linear/fused_rows.zig");
+const lastDim = @import("../../../mlx/array.zig").lastDim;
+const Transformer = @import("../transformer.zig").Transformer;
+const qmatmulBits = @import("../../../sdk/blocks/linear/qmatmul.zig").qmatmulBits;
+const ropeAngleRows = @import("../../../sdk/blocks/rope/qk_norm_rope.zig").ropeAngleRows;
+const AttnDqCopy = @import("../../../sdk/blocks/attention/decode_attn_quant.zig").AttnDqCopy;
+const attnDqRequantEnabled = @import("../../../sdk/blocks/attention/decode_attn_quant.zig").attnDqRequantEnabled;
+const attnDqUseNvfp4 = @import("../../../sdk/blocks/attention/decode_attn_quant.zig").attnDqUseNvfp4;
+const buildAttnDqCopy = @import("../../../sdk/blocks/attention/decode_attn_quant.zig").buildAttnDqCopy;
+const decodeAttnQuantEligible = @import("../../../sdk/blocks/attention/decode_attn_quant.zig").decodeAttnQuantEligible;
+const decodeAttnQuantEnabled = @import("../../../sdk/blocks/attention/decode_attn_quant.zig").decodeAttnQuantEnabled;
+const denseFromAffine8 = @import("../../../sdk/blocks/attention/decode_attn_quant.zig").denseFromAffine8;
 
 // ── Laguna attention (per-layer heads, YaRN/default RoPE, softplus gate) ──
 // Full-attention layers: 48 Q-heads, YaRN RoPE (theta 5e5, partial 0.5),

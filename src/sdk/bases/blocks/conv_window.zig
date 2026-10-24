@@ -7,10 +7,10 @@ const mlx = @import("../../../mlx/ffi.zig");
 const ops = @import("../../../mlx/ops.zig");
 const block = @import("../block.zig");
 const kv = @import("../kv.zig");
-const checkpoint = @import("../../../engines/mlx/ssm/checkpoint.zig");
-const PREFILL_EVAL_MIN_SEQ = @import("../../../engines/mlx/eval_cadence.zig").PREFILL_EVAL_MIN_SEQ;
+const PREFILL_EVAL_MIN_SEQ = @import("../run.zig").PREFILL_EVAL_MIN_SEQ;
 const materializedOwnedCopy = @import("../../../mlx/array.zig").materializedOwnedCopy;
 const depthwise = @import("../../blocks/conv/depthwise.zig");
+const compactConvStateEnabled = @import("../../blocks/conv/depthwise.zig").compactConvStateEnabled;
 
 const Array = ops.Array;
 const Ctx = block.Ctx;
@@ -25,9 +25,9 @@ pub fn conv(c: *Ctx, x: Array, w: Array, bias: Array, cdim: c_int, kernel: c_int
     const len = ops.shape(input)[1];
     var tail = try g.sliceAxis(input, 1, len - (kernel - 1), len);
     // A chunk-wide parent would stay alive behind a slice of it until the layer's next forward.
-    if (checkpoint.compactConvStateEnabled() and len - (kernel - 1) >= PREFILL_EVAL_MIN_SEQ) {
+    if (compactConvStateEnabled() and len - (kernel - 1) >= PREFILL_EVAL_MIN_SEQ) {
         tail = try g.adopt(try materializedOwnedCopy(g.s, tail));
-        checkpoint.compact_conv_state_copy_count += 1;
+        depthwise.compact_conv_state_copy_count += 1;
     }
     try kv.setState(c, .conv, tail);
     if (c.capture_spec) try kv.setState(c, .conv_input, input);

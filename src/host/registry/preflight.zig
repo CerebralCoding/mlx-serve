@@ -7,14 +7,14 @@ const ple_gpu = @import("../../plugins/qwen4_exp/ple_gpu.zig");
 const gen_mod = @import("../media_jobs/gen.zig");
 const mtp_mod = @import("../../sdk/spec/mtp/mtp.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
-const sushi_pack = @import("../../sdk/quant/exl3/sushi_pack.zig");
+const sushi_pack = @import("../../engines/mlx/load/sushi_adapt.zig");
 const modelopt_pack = @import("../../sdk/quant/nvfp4/modelopt_pack.zig");
 const model_registry_mod = @import("registry.zig");
 const model_discovery = @import("discovery.zig");
 const mlx_gguf = @import("../../sdk/quant/gguf/claim.zig");
 const status = @import("../status.zig");
 const dsv41_mod = @import("../../plugins/deepseek_v41/deepseek_v41.zig");
-const mlx_stream = if (@import("build_options").mlx_stream) @import("../../sdk/weights/streamed/glue.zig") else @import("../../sdk/weights/streamed/stub.zig");
+const mlx_stream = if (@import("build_options").mlx_stream) @import("../../engines/mlx/modules/stream_glue.zig") else @import("../../engines/mlx/modules/stream_stub.zig");
 const testing = std.testing;
 
 /// A load whose own bill exceeds the memory cap is refused whatever else is resident.

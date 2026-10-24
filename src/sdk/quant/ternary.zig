@@ -1,20 +1,13 @@
 //! sdk/quant/ternary, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns ternaryWideVerify, biasNegScalePeak, firstRowExactMiss, ternaryKernelCandidate, firstNonTernaryBias.
+//! Owns biasNegScalePeak, firstRowExactMiss, ternaryKernelCandidate, firstNonTernaryBias.
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const qmv2 = @import("../blocks/qmm/qmv2.zig");
 const rowqmv = @import("../blocks/qmm/rowqmv.zig");
-const ModelConfig = @import("../../engines/mlx/model.zig").ModelConfig;
-const Weights = @import("../../engines/mlx/model.zig").Weights;
-const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
+const Weights = @import("../weights/resident.zig").Weights;
 const computeQuantParams = @import("params.zig").computeQuantParams;
-
-/// A 2-bit ternary trunk whose verify rows ride qmv2's MMA lane: an
-/// 8-row window costs about what 5 rows do, like the NAX lane.
-pub fn ternaryWideVerify(self: *const Transformer) bool {
-    return (self.rht != null or self.ternary_2bit) and qmv2.deviceMmaVerifiesWide();
-}
+const QuantParams = @import("params.zig").QuantParams;
 
 /// Binds every `<base>.signs` to `<base>.weight`. A sign vector without its
 /// weight fails the load by name.
@@ -44,7 +37,7 @@ pub fn biasNegScalePeak(weights: *const Weights, base: []const u8, s: mlx.mlx_st
 /// The first quantized trunk projection the row-exact kernels cannot take
 /// (not 4-bit affine in their geometry), or null when they cover the pack.
 /// Vision towers, the MTP head and a gather-only embedding never reach a verify row.
-pub fn firstRowExactMiss(config: *const ModelConfig, weights: *const Weights, gather_only: mlx.mlx_array) ?[]const u8 {
+pub fn firstRowExactMiss(model: QuantParams, weights: *const Weights, gather_only: mlx.mlx_array) ?[]const u8 {
     var it = weights.map.iterator();
     while (it.next()) |kv| {
         const key = kv.key_ptr.*;
@@ -56,15 +49,14 @@ pub fn firstRowExactMiss(config: *const ModelConfig, weights: *const Weights, ga
         const w = weights.map.get(std.fmt.bufPrint(&buf, "{s}.weight", .{base}) catch return key) orelse continue;
         if (gather_only.ctx != null and w.ctx == gather_only.ctx) continue;
         const bi = weights.map.get(std.fmt.bufPrint(&buf, "{s}.biases", .{base}) catch return key) orelse return key;
-        const qp = computeQuantParams(config, w, kv.value_ptr.*, null);
+        const qp = computeQuantParams(model, w, kv.value_ptr.*, null);
         if (qp.mode != .affine or !rowqmv.fits(w, kv.value_ptr.*, bi, qp.bits, qp.group_size)) return key;
     }
     return null;
 }
 
-pub fn ternaryKernelCandidate(config: *const ModelConfig) bool {
-    return config.hadamard_block == 0 and config.quant_mode == .affine and
-        config.quant_bits == 2 and config.quant_group_size == 128;
+pub fn ternaryKernelCandidate(hadamard_block: u32, model: QuantParams) bool {
+    return hadamard_block == 0 and model.mode == .affine and model.bits == 2 and model.group_size == 128;
 }
 
 /// The first `<base>.biases` key whose biases are not exactly -scales, or null
@@ -138,17 +130,8 @@ test "firstNonTernaryBias: every matmul bias must be -scale; a gather-only embed
 }
 
 test "ternaryKernelCandidate: affine 2-bit group-128 packs without rotations" {
-    var c = std.mem.zeroes(ModelConfig);
-    c.quant_mode = .affine;
-    c.quant_bits = 2;
-    c.quant_group_size = 128;
-    try std.testing.expect(ternaryKernelCandidate(&c));
-    c.hadamard_block = 1024;
-    try std.testing.expect(!ternaryKernelCandidate(&c));
-    c.hadamard_block = 0;
-    c.quant_group_size = 64;
-    try std.testing.expect(!ternaryKernelCandidate(&c));
-    c.quant_group_size = 128;
-    c.quant_bits = 4;
-    try std.testing.expect(!ternaryKernelCandidate(&c));
+    try std.testing.expect(ternaryKernelCandidate(0, .{ .bits = 2, .group_size = 128, .mode = .affine }));
+    try std.testing.expect(!ternaryKernelCandidate(1024, .{ .bits = 2, .group_size = 128, .mode = .affine }));
+    try std.testing.expect(!ternaryKernelCandidate(0, .{ .bits = 2, .group_size = 64, .mode = .affine }));
+    try std.testing.expect(!ternaryKernelCandidate(0, .{ .bits = 4, .group_size = 128, .mode = .affine }));
 }

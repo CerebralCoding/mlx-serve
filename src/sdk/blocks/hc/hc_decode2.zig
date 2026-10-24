@@ -273,6 +273,8 @@ pub fn read(
     return .{ .mixed = upmix[0], .inj = inj_out, .stream = stream };
 }
 
+// ── tests ──
+
 const testing = std.testing;
 
 fn randBf16(rnd: std.Random, shape: []const c_int, scale: f32, offset: f32, s: mlx.mlx_stream) !mlx.mlx_array {

@@ -20,6 +20,7 @@ const arrayBytes = @import("../ssm/entry.zig").arrayBytes;
 const SLIDING_TRIM_UNBOUNDED = @import("sliding.zig").SLIDING_TRIM_UNBOUNDED;
 const slidingTailSpan = @import("sliding.zig").slidingTailSpan;
 const slidingViewFor = @import("sliding.zig").slidingViewFor;
+const attn256_vars = @import("../../../sdk/blocks/attention/attn256.zig");
 
 // ── KV Cache (standard attention) ──
 
@@ -1135,8 +1136,8 @@ test "slidingViewFor declines the trim only where the fused kernel really bands"
     // and must take the trim — the predicate used to say `seq_len >= 2`, which
     // handed gemma nothing at exactly the widths spec decode runs at.
     cfg.head_dim = 256;
-    transformer.fused256_override = true;
-    defer transformer.fused256_override = null;
+    attn256_vars.fused256_override = true;
+    defer attn256_vars.fused256_override = null;
     {
         const decode = slidingViewFor(&cfg, 20000, 1);
         try testing.expect(!decode.band_in_kernel);

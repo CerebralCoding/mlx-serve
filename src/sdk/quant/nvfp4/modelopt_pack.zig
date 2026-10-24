@@ -2,14 +2,16 @@
 //! reinterpreted in place, NVFP4 routed experts stacked into banks with their csf-compressed
 //! scales decoded at load, per-expert `weight_scale_2` kept beside each bank.
 const std = @import("std");
-const distributed = @import("../../../engines/mlx/cluster/distributed.zig");
 const builtin = @import("builtin");
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 const crt = @import("../../util/crt.zig");
-const Weights = @import("../../../engines/mlx/model.zig").Weights;
+const Weights = @import("../../weights/resident.zig").Weights;
 const sushi_pack = @import("../exl3/sushi_pack.zig");
-const status = @import("../../../host/status.zig");
+const status = @import("../../util/system.zig");
+const LayerSpan = @import("../../weights/shard.zig").LayerSpan;
+const Shard = @import("../../weights/shard.zig").Shard;
+const headOnly = @import("../../weights/shard.zig").headOnly;
 
 /// True for a config whose `quantization_config.quant_method` is `modelopt`.
 pub fn declared(root: std.json.ObjectMap) bool {
@@ -57,7 +59,7 @@ pub fn mlxName(a: std.mem.Allocator, key: []const u8, mtp_layer: ?u32) ![]u8 {
 /// Renames every loaded tensor to the mlx-lm layout, reinterprets fp weight bytes as the u32
 /// words MLX packs, dequantizes the vision tower's linears to bf16 (its encoder runs dense),
 /// then adds the routed-expert banks read from `model_dir`.
-pub fn adapt(weights: *Weights, model_dir: []const u8, mtp_layer: ?u32, clamped: bool, span: ?distributed.LayerSpan, shard: ?distributed.Shard) !void {
+pub fn adapt(weights: *Weights, model_dir: []const u8, mtp_layer: ?u32, clamped: bool, span: ?LayerSpan, shard: ?Shard) !void {
     const a = weights.allocator;
     // The loads' own stream: a CPU-stream view of a GPU load moves its buffer to managed memory.
     const s = mlx.weightLoadStream();
@@ -405,7 +407,7 @@ fn fillRound(round: []Bank, src: *const Source) void {
 /// `pressure` is read before each round: once the OS is paging, the load stops by name rather
 /// than take the machine down with it.
 /// A bank's layer base under this rank's numbering.
-fn spanBase(a: std.mem.Allocator, base: []const u8, span: ?distributed.LayerSpan) ![]const u8 {
+fn spanBase(a: std.mem.Allocator, base: []const u8, span: ?LayerSpan) ![]const u8 {
     const sp = span orelse return base;
     var buf: [512]u8 = undefined;
     const key = try std.fmt.bufPrint(&buf, "{s}.", .{base});
@@ -414,7 +416,7 @@ fn spanBase(a: std.mem.Allocator, base: []const u8, span: ?distributed.LayerSpan
     return a.dupe(u8, r[0 .. r.len - 1]);
 }
 
-fn buildBanks(weights: *Weights, model_dir: []const u8, mtp_layer: ?u32, pressure: *const fn () u32, clamped: bool, span: ?distributed.LayerSpan, shard: ?distributed.Shard) !void {
+fn buildBanks(weights: *Weights, model_dir: []const u8, mtp_layer: ?u32, pressure: *const fn () u32, clamped: bool, span: ?LayerSpan, shard: ?Shard) !void {
     var src = try openSource(model_dir);
     defer src.deinit();
     const a = src.arena.allocator();
@@ -424,7 +426,7 @@ fn buildBanks(weights: *Weights, model_dir: []const u8, mtp_layer: ?u32, pressur
         if (!std.mem.endsWith(u8, k.*, ".gate_proj.weight")) continue;
         var nb: [512]u8 = undefined;
         if (span) |sp| if (sp.remap(k.*, &nb) == null) continue;
-        if (shard) |sh| if (sh.rank != 0 and distributed.headOnly(k.*)) continue;
+        if (shard) |sh| if (sh.rank != 0 and headOnly(k.*)) continue;
         const at = std.mem.indexOf(u8, k.*, ".mlp.experts.").?;
         const tail = k.*[at + ".mlp.experts.".len ..];
         const e = try std.fmt.parseInt(u32, tail[0..std.mem.indexOfScalar(u8, tail, '.').?], 10);
@@ -464,7 +466,7 @@ fn buildBanks(weights: *Weights, model_dir: []const u8, mtp_layer: ?u32, pressur
             defer pageFree(w_part);
             var sc_part: []align(std.heap.page_size_min) u8 = &.{};
             defer pageFree(sc_part);
-            if (shard) |sh| if (!distributed.headOnly(b.base)) {
+            if (shard) |sh| if (!headOnly(b.base)) {
                 w_part = try pageAlloc(b.w.len / sh.size);
                 sc_part = try pageAlloc(b.sc.len / sh.size);
                 if (b.proj < 2) {

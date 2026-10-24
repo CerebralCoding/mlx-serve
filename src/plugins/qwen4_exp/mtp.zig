@@ -50,7 +50,7 @@ const MoeDecodeDispatchArm = @import("../../sdk/blocks/moe/gather_qmv_rows.zig")
 const moeDecodeDispatchArm = @import("../../sdk/blocks/moe/gather_qmv_rows.zig").moeDecodeDispatchArm;
 const moeRowsAffineBank = @import("../../sdk/blocks/moe/gather_qmv_rows.zig").moeRowsAffineBank;
 const MoeMlpWeights = @import("../../sdk/blocks/moe/weights.zig").MoeMlpWeights;
-const endMropeChunk = @import("../../sdk/blocks/rope/mrope.zig").endMropeChunk;
+const endMropeChunk = @import("../../engines/mlx/methods/mrope.zig").endMropeChunk;
 const qwen4Standin = @import("../../sdk/diag/standin.zig").qwen4Standin;
 const mlxSettledActiveBytes = @import("../../sdk/testing/parity.zig").mlxSettledActiveBytes;
 const qwen4CompareRows = @import("../../sdk/testing/parity.zig").qwen4CompareRows;
@@ -74,6 +74,7 @@ const qsaScoreFusedActive = @import("qsa/score.zig").qsaScoreFusedActive;
 const qsaScoreFusedActiveFor = @import("qsa/score.zig").qsaScoreFusedActiveFor;
 const qsaArraysAllEqual = @import("qsa/select.zig").qsaArraysAllEqual;
 const HcWeights = @import("weights.zig").HcWeights;
+const gather_qmv_rows_vars = @import("../../sdk/blocks/moe/gather_qmv_rows.zig");
 
 pub var qsa_index_score_graphs: usize = 0;
 pub var qsa_index_select_graphs: usize = 0;
@@ -1532,12 +1533,12 @@ test "MTP head row widths pick the verify lane, the MoE arm and the QSA score ke
     try t.expectEqual(VqmmLane.splitk, vqmmLaneFor(4, 5120, 17408, false, 8));
     try t.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5120, 17408, false, 8));
 
-    transformer.moe_rows_fused_override = true;
-    defer transformer.moe_rows_fused_override = null;
+    gather_qmv_rows_vars.moe_rows_fused_override = true;
+    defer gather_qmv_rows_vars.moe_rows_fused_override = null;
     try t.expectEqual(MoeDecodeDispatchArm.gather_qmv, moeDecodeDispatchArm(1, 1, 10, false, false));
     try t.expectEqual(MoeDecodeDispatchArm.rows, moeDecodeDispatchArm(2, 1, 10, false, false));
     try t.expectEqual(MoeDecodeDispatchArm.rows, moeDecodeDispatchArm(4, 1, 10, false, false));
-    transformer.moe_rows_fused_override = false;
+    gather_qmv_rows_vars.moe_rows_fused_override = false;
     try t.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 1, 10, false, false));
     try t.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(2, 2, 10, false, false));
     try t.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(4, 2, 10, false, false));
@@ -2498,7 +2499,7 @@ test "single-stream verify optimizations preserve native outputs and captures (Q
     var slots: [2]*Qwen4TestSlot = undefined;
     var initialized: usize = 0;
     defer for (slots[0..initialized]) |slot| slot.deinit(a);
-    const prefill_routes = transformer.mtp_verify_kernel_calls[2];
+    const prefill_routes = verify_projection.mtp_verify_kernel_calls[2];
     for (&slots, 0..) |*target, arm| {
         verify_projection.single_verify_test_features = @splat(arm == 1);
         target.* = try Qwen4TestSlot.init(a, config.num_hidden_layers);
@@ -2515,7 +2516,7 @@ test "single-stream verify optimizations preserve native outputs and captures (Q
         }
         target.*.ctx.skip_lm_head = false;
     }
-    try testing.expectEqual(prefill_routes, transformer.mtp_verify_kernel_calls[2]);
+    try testing.expectEqual(prefill_routes, verify_projection.mtp_verify_kernel_calls[2]);
     var position = prefix_len;
     for ([_]usize{ 1, 2, 3, 4, 5, 6, 7 }) |width| {
         const input = mlx.mlx_array_new_data(@ptrCast(ids[position..][0..width].ptr), &.{ 1, @as(c_int, @intCast(width)) }, 2, .int32);
@@ -2523,11 +2524,11 @@ test "single-stream verify optimizations preserve native outputs and captures (Q
         verify_projection.single_verify_test_features = @splat(false);
         var reference = try singleVerifyTestRound(&xfm, slots[0], input);
         defer reference.deinit();
-        const before = [_]u64{ transformer.mtp_verify_kernel_calls[2], verify_projection.mtp_verify_indexed_input_calls, verify_projection.mtp_verify_expert_pairs_calls, verify_projection.mtp_verify_expert_reduce_calls };
+        const before = [_]u64{ verify_projection.mtp_verify_kernel_calls[2], verify_projection.mtp_verify_indexed_input_calls, verify_projection.mtp_verify_expert_pairs_calls, verify_projection.mtp_verify_expert_reduce_calls };
         verify_projection.single_verify_test_features = @splat(true);
         var candidate = try singleVerifyTestRound(&xfm, slots[1], input);
         defer candidate.deinit();
-        const after = [_]u64{ transformer.mtp_verify_kernel_calls[2], verify_projection.mtp_verify_indexed_input_calls, verify_projection.mtp_verify_expert_pairs_calls, verify_projection.mtp_verify_expert_reduce_calls };
+        const after = [_]u64{ verify_projection.mtp_verify_kernel_calls[2], verify_projection.mtp_verify_indexed_input_calls, verify_projection.mtp_verify_expert_pairs_calls, verify_projection.mtp_verify_expert_reduce_calls };
         inline for (.{ "logits", "last", "all" }) |field| try expectRowsByteEqual(a, xfm.s, @field(reference, field), @field(candidate, field), "single verify " ++ field);
         for (slots[0].entries, slots[1].entries) |*left, *right| {
             inline for (.{ "conv_state", "ssm_state", "aux_state", "qsa_pooled", "spec_conv_input", "spec_ple_input" }) |field| {

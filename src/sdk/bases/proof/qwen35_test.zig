@@ -215,7 +215,7 @@ fn gatedWeights(lg: *fixture.Legacy, fa: *const FullAttnWeights, layer: u32, ang
 fn bank(lg: *fixture.Legacy, w: Array, s: Array, bi: Array, in_dim: ?u32, scale: Array) moe.Bank {
     // A dense bank resolves to the model-wide scheme, as `quantParamsHinted` does.
     const cfg = &lg.config;
-    const qp = if (s.ctx == null) @import("../../quant/params.zig").QuantParams{ .bits = cfg.quant_bits, .group_size = cfg.quant_group_size, .mode = cfg.quant_mode } else computeQuantParams(cfg, w, s, in_dim);
+    const qp = if (s.ctx == null) @import("../../quant/params.zig").QuantParams{ .bits = cfg.quant_bits, .group_size = cfg.quant_group_size, .mode = cfg.quant_mode } else computeQuantParams(.of(cfg), w, s, in_dim);
     return .{ .w = w, .s = s, .b = bi, .qp = qp, .expert_scale = scale };
 }
 
@@ -233,7 +233,7 @@ pub fn moeWeights(lg: *fixture.Legacy, mw: *const MoeMlpWeights, route_fn: *@imp
         .bank_views = mw.bank_views,
         .top_k = @intCast(cfg.num_experts_per_tok),
         .experts = @intCast(cfg.num_experts),
-        .clamp = swigluClampLimit(cfg),
+        .clamp = swigluClampLimit(cfg.swiglu_limit, cfg.swiglu_clamp),
         .clamp_limit = if (cfg.swiglu_clamp) cfg.swiglu_limit else 0,
     };
     if (mw.shared_expert_gate_w) |seg| w.shared = .{

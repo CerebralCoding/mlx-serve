@@ -88,7 +88,7 @@ fn case(v: Variant, seed: u64) !void {
         .clamped => {
             cfg.swiglu_clamp = true;
             cfg.swiglu_limit = 1.0;
-            w.clamp = swigluClampLimit(cfg);
+            w.clamp = swigluClampLimit(cfg.swiglu_limit, cfg.swiglu_clamp);
             w.clamp_limit = 1.0;
         },
     }

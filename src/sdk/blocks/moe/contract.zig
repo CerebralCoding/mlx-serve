@@ -31,7 +31,6 @@ const gqr = @import("gather_qmv_rows.zig");
 const dr = @import("down_reduce.zig");
 const fa = @import("../mlp/fused_activations.zig");
 const activations = @import("../mlp/activations.zig");
-const transformer = @import("../../../engines/mlx/transformer.zig");
 const device_mod = @import("../../../mlx/device.zig");
 const moe_fp4 = @import("moe_fp4.zig");
 const rk = @import("router_kernel.zig");
@@ -39,8 +38,8 @@ const routing = @import("routing.zig");
 const vk = @import("verify_kernels.zig");
 const experts = @import("experts.zig");
 const vp = @import("../linear/verify_projection.zig");
-const moe_affine4 = @import("../../../plugins/qwen4_exp/moe_affine4.zig");
-const QuantMode = @import("../../../engines/mlx/model.zig").QuantMode;
+const moe_affine4 = @import("moe_affine4.zig");
+const QuantMode = @import("../../quant/params.zig").QuantMode;
 
 const spec = kc.spec;
 const metal = kc.metal;
@@ -2845,12 +2844,12 @@ fn registerFp4(set: *kc.Set) !void {
 test "kernel contract moe: each declared launch is the shipped wrapper's, byte for byte" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const a = std.testing.allocator;
-    transformer.gqmv_gateup_override = true;
-    defer transformer.gqmv_gateup_override = null;
-    transformer.moe_rows_fused_override = true;
-    defer transformer.moe_rows_fused_override = null;
-    transformer.downred_override = true;
-    defer transformer.downred_override = null;
+    gq.gqmv_gateup_override = true;
+    defer gq.gqmv_gateup_override = null;
+    gqr.moe_rows_fused_override = true;
+    defer gqr.moe_rows_fused_override = null;
+    dr.downred_override = true;
+    defer dr.downred_override = null;
     var set = kc.Set.init(a);
     defer set.deinit();
     try registerGathers(&set);

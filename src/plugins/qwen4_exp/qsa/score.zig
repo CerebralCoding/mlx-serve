@@ -30,6 +30,7 @@ const qsaSelectKernelEnabled = @import("select.zig").qsaSelectKernelEnabled;
 const qsaSelectTopBlocks = @import("select.zig").qsaSelectTopBlocks;
 const qsaTieBiasForTest = @import("select.zig").qsaTieBiasForTest;
 const qsaVisibleBoundsHost = @import("select.zig").qsaVisibleBoundsHost;
+const verify_qmm_nax_vars = @import("../../../sdk/blocks/linear/verify_qmm_nax.zig");
 
 pub const QsaScoreLayout = enum(u8) { base = 0, h4 = 1 };
 
@@ -150,7 +151,7 @@ pub fn qsaScoreNsh(nslab: u32, ngrp: u32, layout: QsaScoreLayout) u32 {
     return nsh;
 }
 
-pub const QSA_SCORE_KERNEL_HEADER = kernelSource("plugins/qwen4_exp/kernels/qsa_score_header.metal");
+pub const QSA_SCORE_KERNEL_HEADER = @import("../../../sdk/blocks/attention/kv_quant_attn.zig").QSA_SCORE_KERNEL_HEADER;
 
 // The lane -> (row, col) map (`fm`/`fn`) is the matmul2d cooperative-fragment layout,
 // hand-derived from the SDK; every A, B and C fragment must use it. K stays 8 ascending
@@ -789,8 +790,8 @@ test "qsa score kernel: block ids through qsaSelectTopBlocks are identical on bo
 test "qsa score kernel: never built without NAX" {
     transformer.qsa_score_fused_override = true;
     defer transformer.qsa_score_fused_override = null;
-    transformer.vqmm_nax_probe_override = false;
-    defer transformer.vqmm_nax_probe_override = null;
+    verify_qmm_nax_vars.vqmm_nax_probe_override = false;
+    defer verify_qmm_nax_vars.vqmm_nax_probe_override = null;
     const saved = qsa_score_kernel_cached;
     qsa_score_kernel_cached = null;
     defer qsa_score_kernel_cached = saved;
@@ -889,11 +890,11 @@ test "qsa score kernel: TF32 off declines" {
 
 test "qsa score fused: the bill follows the predicate" {
     const saved_fused = transformer.qsa_score_fused_override;
-    const saved_nax = transformer.vqmm_nax_probe_override;
+    const saved_nax = verify_qmm_nax_vars.vqmm_nax_probe_override;
     const saved_sheet = qsa_score_sheet_mb_override;
     defer {
         transformer.qsa_score_fused_override = saved_fused;
-        transformer.vqmm_nax_probe_override = saved_nax;
+        verify_qmm_nax_vars.vqmm_nax_probe_override = saved_nax;
         qsa_score_sheet_mb_override = saved_sheet;
     }
     qsa_score_sheet_mb_override = QSA_SCORE_SHEET_BUDGET_MB_DEFAULT;
@@ -903,7 +904,7 @@ test "qsa score fused: the bill follows the predicate" {
     const kv = nb * 4;
     const ratio: u64 = 4;
 
-    transformer.vqmm_nax_probe_override = false;
+    verify_qmm_nax_vars.vqmm_nax_probe_override = false;
     transformer.qsa_score_fused_override = true;
     const composed_rows = qsaScoreRowsPerChunk(n_idx, nb, fwd, 128);
     const composed_bill = qsaPrefillTransientBytes(n_idx, fwd, kv, ratio, 128);
@@ -924,7 +925,7 @@ test "qsa score fused: the bill follows the predicate" {
     try testing.expectEqual(composed_bank, cfg.qsaScoreBankBytesPerToken());
 
     transformer.qsa_score_fused_override = true;
-    transformer.vqmm_nax_probe_override = null;
+    verify_qmm_nax_vars.vqmm_nax_probe_override = null;
     qsaScoreFusedArm();
     if (qsaScoreFusedActive()) {
         const fused_rows = qsaScoreRowsPerChunk(n_idx, nb, fwd, 128);
@@ -958,11 +959,11 @@ test "qsa score fused: sizing policy" {
     try testing.expectEqual(@as(u32, 64), qsaScoreNsh(64, 1, .base));
     try testing.expectEqual(@as(u32, 32), qsaScoreNsh(1024, 8, .h4));
     const saved_fused = transformer.qsa_score_fused_override;
-    const saved_nax = transformer.vqmm_nax_probe_override;
+    const saved_nax = verify_qmm_nax_vars.vqmm_nax_probe_override;
     const saved_sheet = qsa_score_sheet_mb_override;
     defer {
         transformer.qsa_score_fused_override = saved_fused;
-        transformer.vqmm_nax_probe_override = saved_nax;
+        verify_qmm_nax_vars.vqmm_nax_probe_override = saved_nax;
         qsa_score_sheet_mb_override = saved_sheet;
     }
     qsa_score_sheet_mb_override = QSA_SCORE_SHEET_BUDGET_MB_DEFAULT;
@@ -1031,13 +1032,13 @@ test "qsa score fused: no bank is built under the fused arm" {
     defer _ = mlx.mlx_array_free(pooled);
     try xfm.qsaAppendPooled(&entry, pooled, 0);
     const saved_fused = transformer.qsa_score_fused_override;
-    const saved_nax = transformer.vqmm_nax_probe_override;
+    const saved_nax = verify_qmm_nax_vars.vqmm_nax_probe_override;
     defer {
         transformer.qsa_score_fused_override = saved_fused;
-        transformer.vqmm_nax_probe_override = saved_nax;
+        verify_qmm_nax_vars.vqmm_nax_probe_override = saved_nax;
     }
     transformer.qsa_score_fused_override = false;
-    transformer.vqmm_nax_probe_override = false;
+    verify_qmm_nax_vars.vqmm_nax_probe_override = false;
     _ = try xfm.qsaScoreOperand(&entry, 1, nb, hd, false);
     try testing.expect(entry.qsa_score_bank.ctx != null);
     if (entry.qsa_score_bank.ctx != null) _ = mlx.mlx_array_free(entry.qsa_score_bank);
@@ -1046,7 +1047,7 @@ test "qsa score fused: no bank is built under the fused arm" {
     entry.qsa_score_buf = .{ .ctx = null };
     entry.qsa_score_blocks = 0;
     transformer.qsa_score_fused_override = true;
-    transformer.vqmm_nax_probe_override = null;
+    verify_qmm_nax_vars.vqmm_nax_probe_override = null;
     qsaScoreFusedArm();
     if (qsaScoreFusedActive()) {
         _ = try xfm.qsaScoreOperand(&entry, 1, nb, hd, true);
@@ -1063,11 +1064,11 @@ test "qsa score fused: unsupported indexer geometry falls back to the composed c
     xfm.allocator = testing.allocator;
     xfm.qsa_score_bank_builds = 0;
     const saved_fused = transformer.qsa_score_fused_override;
-    const saved_nax = transformer.vqmm_nax_probe_override;
+    const saved_nax = verify_qmm_nax_vars.vqmm_nax_probe_override;
     const saved_sheet = qsa_score_sheet_mb_override;
     defer {
         transformer.qsa_score_fused_override = saved_fused;
-        transformer.vqmm_nax_probe_override = saved_nax;
+        verify_qmm_nax_vars.vqmm_nax_probe_override = saved_nax;
         qsa_score_sheet_mb_override = saved_sheet;
     }
     qsa_score_sheet_mb_override = QSA_SCORE_SHEET_BUDGET_MB_DEFAULT;

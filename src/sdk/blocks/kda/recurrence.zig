@@ -5,7 +5,7 @@
 const std = @import("std");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
-const status = @import("../../../host/status.zig");
+const status = @import("../../util/system.zig");
 
 /// Value rows one threadgroup carries: 8 lanes each, at most two heads.
 const MAX_ROWS: c_int = 128;

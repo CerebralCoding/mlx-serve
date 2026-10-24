@@ -100,14 +100,7 @@ pub const PersistentSsmGroup = struct {
     }
 };
 
-pub fn ssmConcatAxis0(s: mlx.mlx_stream, parts: []const mlx.mlx_array) !mlx.mlx_array {
-    const vec = mlx.mlx_vector_array_new_data(parts.ptr, parts.len);
-    defer _ = mlx.mlx_vector_array_free(vec);
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 0, s));
-    return out;
-}
+pub const ssmConcatAxis0 = @import("../../../mlx/array.zig").concatAxis0;
 
 fn ssmRowView(s: mlx.mlx_stream, arr: mlx.mlx_array, i: usize) !mlx.mlx_array {
     const shape = mlx.getShape(arr);

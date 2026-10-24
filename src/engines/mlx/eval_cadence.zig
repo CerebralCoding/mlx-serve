@@ -12,6 +12,7 @@ const prefillHeadDimFused = @import("../../sdk/blocks/attention/attn256.zig").pr
 const testing = @import("kv/cache.zig").testing;
 const SSMCacheEntry = @import("ssm/entry.zig").SSMCacheEntry;
 const Transformer = @import("transformer.zig").Transformer;
+const attn256_vars = @import("../../sdk/blocks/attention/attn256.zig");
 
 // ── Forward dispatch ──
 
@@ -20,7 +21,7 @@ pub const EVAL_EVERY_N_LAYERS: u32 = 48;
 /// linear layers hold a chunk-wide stream between cadence points.
 pub const PREFILL_EVAL_CADENCE_DEFAULT: u32 = 4;
 pub const MOE_EVAL_EVERY_N_LAYERS: u32 = PREFILL_EVAL_CADENCE_DEFAULT;
-pub const RECURRENCE_EVAL_INTERVAL: usize = 32;
+pub const RECURRENCE_EVAL_INTERVAL = @import("../../sdk/bases/run.zig").RECURRENCE_EVAL_INTERVAL;
 
 /// Per-layer prefill transient (bytes) above which the layer loop eval()s
 /// after EVERY layer instead of the coarse default cadence. Between eval
@@ -43,17 +44,7 @@ pub const RECURRENCE_EVAL_INTERVAL: usize = 32;
 /// that keeps a 32 GB Mac serving a 26B alive.
 pub const PREFILL_EVAL_TRANSIENT_BUDGET: u64 = 2 << 30;
 
-/// Forwards narrower than this skip the mid-loop eval cadence entirely.
-/// Spec-decode VERIFY forwards (PLD/drafter/MTP: seq 2..~9) ride the
-/// prefill layer loops because they're multi-token, but their lazy-graph
-/// transients are decode-scale (KB-MB) — the periodic eval() that bounds
-/// GB-scale prefill-chunk transients only costs them synchronous
-/// pipeline drains. Measured (qwen3.6-27B, 64 layers, cadence 4 = 16
-/// drains per MTP round): depth-1 rounds 48 ms where the AR forward is
-/// ~34 ms, and the drain tax grows superlinearly with draft depth.
-/// seq-1 decode never ran cadence evals, so exempting verify-width
-/// forwards bounds nothing that wasn't already unbounded at decode.
-pub const PREFILL_EVAL_MIN_SEQ: c_int = 32;
+pub const PREFILL_EVAL_MIN_SEQ = @import("../../sdk/bases/run.zig").PREFILL_EVAL_MIN_SEQ;
 
 /// Pure gate: does the mid-loop eval cadence apply to a forward of this
 /// width? (True = real prefill chunk; false = decode/spec-verify shape.)
@@ -164,8 +155,8 @@ pub fn prefillEvalCadenceFor(default_cadence: u32, cfg: *const ModelConfig, chun
 
 test "prefillEvalCadence: small transients keep the coarse cadence" {
     const t = std.testing;
-    transformer.fused256_override = false;
-    defer transformer.fused256_override = null;
+    attn256_vars.fused256_override = false;
+    defer attn256_vars.fused256_override = null;
     // 26B geometry, short prompt: 16 heads x 2048 chunk x 2048 kv x 2B = 128 MB
     // of unfused scores — well inside the budget, keep today's cadence.
     try t.expectEqual(@as(u32, 4), Transformer.prefillEvalCadence(4, 256, 256, 16, 8, 2048, 2048, false));
@@ -179,8 +170,8 @@ test "prefillEvalCadence: small transients keep the coarse cadence" {
 
 test "prefillEvalCadenceFor: MiMo bills no score tensor, so a long chunk keeps the coarse cadence" {
     const t = std.testing;
-    transformer.fused256_override = false;
-    defer transformer.fused256_override = null;
+    attn256_vars.fused256_override = false;
+    defer attn256_vars.fused256_override = null;
     const mimo: ModelConfig = .{ .model_type = "mimo_v2", .head_dim = 192, .num_attention_heads = 64, .num_key_value_heads = 8 };
     try t.expectEqual(@as(u32, 4), Transformer.prefillEvalCadenceFor(4, &mimo, 8192, 32768, false));
     // An unfused wide head still drops to per-layer evals.
@@ -193,16 +184,16 @@ test "prefillEvalCadence: fused hd-256 kernel drops the score term" {
     // With msv_attn_p256 active (the default) the score transient never
     // exists — hd 256 keeps the coarse cadence at any context, exactly like
     // hd 128. The dequant term must still fire under --kv-quant.
-    transformer.fused256_override = true;
-    defer transformer.fused256_override = null;
+    attn256_vars.fused256_override = true;
+    defer attn256_vars.fused256_override = null;
     try t.expectEqual(@as(u32, 4), Transformer.prefillEvalCadence(4, 256, 256, 16, 8, 8192, 102_448, false));
     try t.expectEqual(@as(u32, 1), Transformer.prefillEvalCadence(4, 256, 256, 16, 8, 8192, 400_000, true));
 }
 
 test "prefillEvalCadence: big unfused score tensor forces eval-per-layer" {
     const t = std.testing;
-    transformer.fused256_override = false;
-    defer transformer.fused256_override = null;
+    attn256_vars.fused256_override = false;
+    defer attn256_vars.fused256_override = null;
     // 16 heads x 8192 chunk x 16384 kv x 2B = 4 GiB > 2 GiB budget: bounds a
     // ~13 GB windowed transient to ~4 GB. (8192 chunk x 8192 kv sits exactly
     // ON the 2 GiB budget and deliberately keeps the coarse cadence.)

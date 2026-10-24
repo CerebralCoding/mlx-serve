@@ -1,34 +1,17 @@
 //! sdk/blocks/moe/experts, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns scaleExperts, gatherExpertMm.
+//! Owns gatherExpertMm.
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const mlx_gguf = @import("../../quant/gguf/claim.zig");
+const mlx_gguf = @import("../../quant/gguf/root.zig");
 const gather_qmm_nax = @import("gather_qmm_nax.zig");
-const QuantMode = @import("../../../engines/mlx/model.zig").QuantMode;
-const testing = @import("../../../engines/mlx/kv/cache.zig").testing;
-const splitPackedGateUp = @import("../../../engines/mlx/load/weights.zig").splitPackedGateUp;
-const transposeBf16Weight = @import("../../../engines/mlx/load/weights.zig").transposeBf16Weight;
-const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
+const QuantMode = @import("../../quant/params.zig").QuantMode;
+const testing = std.testing;
+const splitPackedGateUp = @import("../../../mlx/array.zig").splitPackedGateUp;
+const transposeBf16Weight = @import("../../../mlx/array.zig").transposeBf16Weight;
 const testRandWeightBf16 = @import("../../testing/parity.zig").testRandWeightBf16;
 const testReadF32 = @import("../../testing/parity.zig").testReadF32;
 const verifyQmmNaxAvailable = @import("../linear/verify_qmm_nax.zig").verifyQmmNaxAvailable;
-
-/// Scale a gather_qmm result by a per-expert scale, in place. `sel` MUST be the index vector the matmul used, in
-/// its order (`sorted_inds` on the sorted path).
-pub fn scaleExperts(self: *const Transformer, out: *mlx.mlx_array, scale: mlx.mlx_array, sel: mlx.mlx_array) !void {
-    if (scale.ctx == null) return;
-    var picked = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(picked);
-    try mlx.check(mlx.mlx_take_axis(&picked, scale, sel, 0, self.s));
-    var col = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(col);
-    try mlx.check(mlx.mlx_expand_dims(&col, picked, -1, self.s));
-    var scaled = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_multiply(&scaled, out.*, col, self.s));
-    _ = mlx.mlx_array_free(out.*);
-    out.* = scaled;
-}
 
 /// Gathered matmul for MoE expert dispatch — handles both quantized and dense bf16.
 /// Quantized (sc.ctx != null): mlx_gather_qmm with transpose_w=true, w stored [E,out,in].

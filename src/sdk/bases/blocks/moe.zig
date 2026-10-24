@@ -16,14 +16,13 @@ const linear = @import("linear.zig");
 const compiled = @import("compiled.zig");
 const QuantParams = @import("../../quant/params.zig").QuantParams;
 const quant_abi = @import("../../../abi/quant.zig");
-const model = @import("../../../engines/mlx/model.zig");
 const routing = @import("../../blocks/moe/routing.zig");
 const router_kernel = @import("../../blocks/moe/router_kernel.zig");
 const moe_decode = @import("../../blocks/moe/decode.zig");
 const moe_fp4 = @import("../../blocks/moe/moe_fp4.zig");
 const moe_cuda = @import("../../blocks/moe/moe_cuda.zig");
 const moe_prefill_cuda = @import("../../blocks/moe/moe_prefill_cuda.zig");
-const moe_affine4 = @import("../../../plugins/qwen4_exp/moe_affine4.zig");
+const moe_affine4 = @import("../../blocks/moe/moe_affine4.zig");
 const gather_qmv = @import("../../blocks/moe/gather_qmv.zig");
 const gather_qmv_rows = @import("../../blocks/moe/gather_qmv_rows.zig");
 const gather_qmm_nax = @import("../../blocks/moe/gather_qmm_nax.zig");
@@ -35,6 +34,7 @@ const fused_act = @import("../../blocks/mlp/fused_activations.zig");
 const clampedSwiGLU = @import("../../blocks/mlp/activations.zig").clampedSwiGLU;
 const sigmoidTable = @import("../../blocks/hc/hc_prefill.zig").sigmoidTable;
 const routed = @import("../../weights/routed.zig");
+const HiddenAct = @import("../../blocks/mlp/activations.zig").HiddenAct;
 
 const Array = ops.Array;
 const Graph = ops.Graph;
@@ -423,7 +423,7 @@ fn cudaDecode(w: *const Moe.Weights, g: *Graph, out: *Array, x: Array, r: Routed
 
 fn gatherQmvRows(w: *const Moe.Weights, g: *Graph, out: *Array, x: Array, r: Routed, D: c_int, K: c_int, batch: c_int, seq: c_int) !bool {
     const B = batch * seq;
-    if (!down_reduce.gatherQmvDownReduceRowsEligible(model.HiddenAct.silu, w.gate.qp, w.up.qp, w.down.qp, D)) return false;
+    if (!down_reduce.gatherQmvDownReduceRowsEligible(HiddenAct.silu, w.gate.qp, w.up.qp, w.down.qp, D)) return false;
     const ind = try g.astype(try g.reshape(r.inds, &.{ B, K }), .uint32);
     const x2 = try g.reshape(x, &.{ B, D });
     const gscale: ?Array = if (w.gate.expert_scale.ctx != null) w.gate.expert_scale else null;
@@ -647,7 +647,7 @@ fn streamedRouted(w: *const Moe.Weights, st: *const Streamed, g: *Graph, x: Arra
     }
     const one_bank_kernels = (B * S == 1 and (w.clamp orelse 1) == 0 and gq.mode == .affine and uq.mode == .affine and dq.mode == .affine) or
         (gather_qmv_rows.moeDecodeDispatchArm(B, S, K, false, (w.clamp orelse 1) != 0) == .rows and useGatherQmv(w) and
-            down_reduce.gatherQmvDownReduceRowsEligible(model.HiddenAct.silu, gq, uq, dq, D));
+            down_reduce.gatherQmvDownReduceRowsEligible(HiddenAct.silu, gq, uq, dq, D));
     if (one_bank_kernels) return error.StreamedArmUnsupported;
     if (B * S > 1 or B * S * K >= 64) return sortedSlots(w, g, x, r, &sl, B, S, D, K);
     if (useGatherQmv(w) and (gq.mode == .affine or gq.mode == .nvfp4)) return error.StreamedArmUnsupported;

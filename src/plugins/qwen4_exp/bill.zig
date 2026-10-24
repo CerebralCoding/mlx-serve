@@ -14,6 +14,7 @@ const toModelConfig = @import("model_config.zig").toModelConfig;
 const bills = @import("../../engines/mlx/admission/bills.zig");
 const prefillTransientReserve = bills.prefillTransientReserve;
 const resolvePrefillChunk = @import("../../engines/mlx/admission/prefill_chunk.zig").resolvePrefillChunk;
+const verify_qmm_nax = @import("../../sdk/blocks/linear/verify_qmm_nax.zig");
 
 /// Bytes per (query, key) the QSA prefill holds for ONE live layer past the
 /// indexer budget: the `[S, kv]` bool mask, its additive copy for the sdpa
@@ -109,18 +110,18 @@ test "qsaMaskBytes: a qwen4_exp twin bills the QSA mask and steps a rung the qwe
     transformer_mod.qsa_gather_override = true;
     defer transformer_mod.qsa_gather_override = null;
     const saved_fused = transformer_mod.qsa_score_fused_override;
-    const saved_nax = transformer_mod.vqmm_nax_probe_override;
+    const saved_nax = verify_qmm_nax.vqmm_nax_probe_override;
     defer {
         transformer_mod.qsa_score_fused_override = saved_fused;
-        transformer_mod.vqmm_nax_probe_override = saved_nax;
+        verify_qmm_nax.vqmm_nax_probe_override = saved_nax;
     }
-    transformer_mod.vqmm_nax_probe_override = false;
+    verify_qmm_nax.vqmm_nax_probe_override = false;
     transformer_mod.qsa_score_fused_override = true;
     const gathered_composed = qsaMaskBytes(&q4, 4096, 250_000);
     try t.expect(gathered_composed > 0);
     try t.expect(gathered_composed < 4 * 4096 * 250_000);
     try t.expectEqual(score_mod.qsaPrefillTransientBytes(4, 4096, 250_000, 4, 128), gathered_composed);
-    transformer_mod.vqmm_nax_probe_override = null;
+    verify_qmm_nax.vqmm_nax_probe_override = null;
     transformer_mod.qsa_score_fused_override = true;
     const gathered_fused = qsaMaskBytes(&q4, 4096, 250_000);
     try t.expectEqual(score_mod.qsaPrefillTransientBytes(4, 4096, 250_000, 4, 128), gathered_fused);
@@ -128,7 +129,7 @@ test "qsaMaskBytes: a qwen4_exp twin bills the QSA mask and steps a rung the qwe
         try t.expect(gathered_fused < gathered_composed);
     }
     transformer_mod.qsa_score_fused_override = false;
-    transformer_mod.vqmm_nax_probe_override = false;
+    verify_qmm_nax.vqmm_nax_probe_override = false;
     const gathered = qsaMaskBytes(&q4, 4096, 250_000);
     try t.expectEqual(gathered_composed, gathered);
     const twin_bill = prefillTransientReserve(&twin, 16, 8192);

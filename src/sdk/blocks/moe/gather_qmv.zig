@@ -6,11 +6,10 @@ const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
-const QuantMode = @import("../../../engines/mlx/model.zig").QuantMode;
+const QuantMode = @import("../../quant/params.zig").QuantMode;
 const moe_fp4 = @import("moe_fp4.zig");
 const fused_activations = @import("../mlp/fused_activations.zig");
-const transformer = @import("../../../engines/mlx/transformer.zig");
-const testing = @import("../../../engines/mlx/kv/cache.zig").testing;
+const testing = std.testing;
 const testRandWeightBf16 = @import("../../testing/parity.zig").testRandWeightBf16;
 const testReadF32 = @import("../../testing/parity.zig").testReadF32;
 const cachedScalarInt = @import("../linear/verify_qmm.zig").cachedScalarInt;
@@ -164,7 +163,7 @@ var gqmv_gateup_engaged: bool = false;
 
 
 pub fn gatherQmvGateUpEnabled() bool {
-    return transformer.gqmv_gateup_override orelse true;
+    return gqmv_gateup_override orelse true;
 }
 
 /// One kernel for `silu(gather(gate) @ x) * (gather(up) @ x)` at decode width.
@@ -447,6 +446,8 @@ pub fn gatherQmvAct(
     return y;
 }
 
+pub var gqmv_gateup_override: ?bool = null;
+
 // ── tests ──
 
 test "fused gate+up+SwiGLU expert kernel is bit-identical to the split gatherQmv path" {
@@ -458,8 +459,8 @@ test "fused gate+up+SwiGLU expert kernel is bit-identical to the split gatherQmv
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x6A7E0FF5);
     const rnd = prng.random();
-    transformer.gqmv_gateup_override = true;
-    defer transformer.gqmv_gateup_override = null;
+    gqmv_gateup_override = true;
+    defer gqmv_gateup_override = null;
     fused_activations.swiglu_fused_override = true;
     defer fused_activations.swiglu_fused_override = null;
 

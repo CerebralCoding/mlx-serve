@@ -24,13 +24,12 @@ const checkQsaCompressRatio = @import("../../../plugins/qwen4_exp/qsa/history.zi
 const ssmFreeQsaState = @import("../../../plugins/qwen4_exp/qsa/history.zig").ssmFreeQsaState;
 const qsaScoreFusedArm = @import("../../../plugins/qwen4_exp/qsa/score.zig").qsaScoreFusedArm;
 const HcWeights = @import("../../../plugins/qwen4_exp/weights.zig").HcWeights;
-const attnProjRouted = @import("../../../sdk/blocks/attention/decode_attn_quant.zig").attnProjRouted;
 const weightsHaveDenseAttnProj = @import("../../../sdk/blocks/attention/decode_attn_quant.zig").weightsHaveDenseAttnProj;
 const DenseMlpWeights = @import("../../../sdk/blocks/mlp/dense.zig").DenseMlpWeights;
 const computeLlama3Freqs = @import("../../../sdk/blocks/rope/rope.zig").computeLlama3Freqs;
 const computeYarnFreqs = @import("../../../sdk/blocks/rope/yarn.zig").computeYarnFreqs;
-const yarnSpec = @import("../../../sdk/blocks/rope/yarn.zig").yarnSpec;
-const aliasFusedRotations = @import("../../../sdk/quant/hadamard.zig").aliasFusedRotations;
+const yarnSpec = @import("../methods/yarn.zig").yarnSpec;
+const aliasFusedRotations = @import("../methods/hadamard.zig").aliasFusedRotations;
 const registerRhtSigns = @import("../../../sdk/quant/hadamard.zig").registerRhtSigns;
 const lmHeadMxfp8On = @import("../../../sdk/quant/mxfp8.zig").lmHeadMxfp8On;
 const quantizeHeadMxfp8 = @import("../../../sdk/quant/mxfp8.zig").quantizeHeadMxfp8;
@@ -646,7 +645,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
         if (moe_layers) |ml| try aliasFusedRotations(reg, ml);
     }
     var ternary_2bit = false;
-    if (ternaryKernelCandidate(&config)) {
+    if (ternaryKernelCandidate(config.hadamard_block, .of(&config))) {
         // An embedding that is not also the lm_head is only ever gathered.
         const gather_only = if (lm_head_b.ctx == emb_b_arr.ctx) mlx.mlx_array{ .ctx = null } else emb_b_arr;
         if (try firstNonTernaryBias(weights, gather_only, s)) |key| {
@@ -673,7 +672,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
     var cfg = config;
     if (cfg.rowExactArch()) {
         const gather_only = if (lm_head_w.ctx == emb_w.ctx) mlx.mlx_array{ .ctx = null } else emb_w;
-        if (firstRowExactMiss(&cfg, weights, gather_only)) |key| {
+        if (firstRowExactMiss(.of(&cfg), weights, gather_only)) |key| {
             log.info("[row-exact] {s} is outside the row kernels: verify rows are not byte-exact\n", .{key});
         } else cfg.row_exact_covered = true;
     }
@@ -744,4 +743,16 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
         .mtp_uniform_affine_trunk = mtp_uniform_affine_trunk,
         .mtp_oqe_affine_trunk = mtp_oqe_affine_trunk,
     };
+}
+
+/// `attnProj` is reached only from the MoE/qwen4 forward, and not by its MLA or Gemma 4 arms.
+fn attnProjRouted(config: *const ModelConfig, moe_forward: bool) bool {
+    return moe_forward and !config.isMla() and !config.isGemma4Layers();
+}
+
+test "attnProj is routed on a MoE forward that is neither MLA nor Gemma 4" {
+    try std.testing.expect(attnProjRouted(&.{ .model_type = "laguna" }, true));
+    try std.testing.expect(!attnProjRouted(&.{ .model_type = "llama" }, false));
+    try std.testing.expect(!attnProjRouted(&.{ .model_type = "gemma4" }, true));
+    try std.testing.expect(!attnProjRouted(&.{ .model_type = "bailing_hybrid", .mla_kv_lora_rank = 512 }, true));
 }

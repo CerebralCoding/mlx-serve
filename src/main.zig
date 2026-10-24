@@ -34,7 +34,7 @@ const scheduler_mod = @import("engines/mlx/scheduler.zig");
 const ane_lm = @import("engines/ane/lm.zig");
 const status = @import("host/status.zig");
 const model_settings_mod = @import("host/registry/model_settings.zig");
-const vision_mod = @import("sdk/vision/encoder.zig");
+const vision_mod = @import("engines/mlx/vision_encoder.zig");
 const ds4_arch = if (build_options.ds4_engine) @import("engines/ds4/bridge.zig") else @import("engines/ds4/stub.zig");
 const llama_arch = if (build_options.llama_engine) @import("engines/llama/bridge.zig") else @import("engines/llama/stub.zig");
 const gen_mod = @import("host/media_jobs/gen.zig");
@@ -943,9 +943,9 @@ pub fn main(init: std.process.Init) !void {
             // DSpark support GGUF sits beside a served .gguf model.
             ds4_dspark = true;
         } else if (std.mem.eql(u8, args[i], "--decode-attn-quant")) {
-            transformer_mod.cli().decode_attn_quant_flag = true;
+            @import("sdk/blocks/attention/decode_attn_quant.zig").cli().decode_attn_quant_flag = true;
         } else if (std.mem.eql(u8, args[i], "--no-decode-attn-quant")) {
-            transformer_mod.cli().decode_attn_quant_flag = false;
+            @import("sdk/blocks/attention/decode_attn_quant.zig").cli().decode_attn_quant_flag = false;
         } else if (std.mem.eql(u8, args[i], "--mtp-min-depth") or std.mem.eql(u8, args[i], "--mtp-max-depth") or std.mem.eql(u8, args[i], "--mtp-depth")) {
             const is_min = std.mem.eql(u8, args[i], "--mtp-min-depth");
             const deprecated = std.mem.eql(u8, args[i], "--mtp-depth");
@@ -1062,7 +1062,7 @@ pub fn main(init: std.process.Init) !void {
             server_mod.ssm_checkpoint_max = std.fmt.parseInt(u32, args[i], 10) catch 16;
         } else if (std.mem.eql(u8, args[i], "--os-reserve-gib") and i + 1 < args.len) {
             i += 1;
-            status.os_reserve_override = status.parseOsReserveGib(args[i]) catch {
+            @import("sdk/util/system.zig").os_reserve_override = status.parseOsReserveGib(args[i]) catch {
                 log.err("--os-reserve-gib: expected an integer 0..64, got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };

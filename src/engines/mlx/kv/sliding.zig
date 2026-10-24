@@ -9,30 +9,9 @@ const FUSED256_MIN_Q_LEN = @import("../../../sdk/blocks/attention/attn256.zig").
 const fused256Enabled = @import("../../../sdk/blocks/attention/attn256.zig").fused256Enabled;
 const SlidingView = @import("../../../sdk/blocks/attention/kv_view.zig").SlidingView;
 
-/// "No width bound" for `slidingTailSpan`. A 32-wide cap used to keep prefill
-/// chunks out while the mask pairing was unproven; with `band_in_kernel` now
-/// gating the only consumer that reads ABSOLUTE positions and every other
-/// consumer deriving its query offset as `kv_len - q_len`, width needs no
-/// bound — and wide chunks are the only multi-token forward a serial arch
-/// (laguna, inkling) ever does.
-pub const SLIDING_TRIM_UNBOUNDED: usize = std.math.maxInt(usize);
+pub const SLIDING_TRIM_UNBOUNDED = @import("../../../sdk/bases/blocks/sliding.zig").SLIDING_TRIM_UNBOUNDED;
 
-/// How many TAIL KV entries a forward of `q_len` queries needs from a SLIDING
-/// layer. The last query reaches back `window`; the first of the block reaches
-/// back `window + q_len - 1`, so the block's union is that many entries.
-/// Returns 0 — meaning "hand back the whole cache, no trim" — when the layer
-/// does not slide or the block is wider than `max_width`.
-///
-/// This is what makes a spec verify cost what a decode step costs on a sliding
-/// layer: at width 1 it has always returned `window`, but a block-wide verify
-/// used to fall through untrimmed and read the ENTIRE cache on every sliding
-/// layer, so a 3:1 local:global model paid full attention on 75% of its layers
-/// once past the window (measured: muse-glimmer verify 51 -> 140 ms from 0.6k
-/// to 17.6k ctx, turning DFlash from 2.28x into 0.74x).
-pub fn slidingTailSpan(window: u32, q_len: usize, max_width: usize) u32 {
-    if (window == 0 or q_len == 0 or q_len > max_width) return 0;
-    return window + @as(u32, @intCast(q_len)) - 1;
-}
+pub const slidingTailSpan = @import("../../../sdk/bases/blocks/sliding.zig").slidingTailSpan;
 
 var sliding_block_trim_logged: bool = false; // one-shot log guard
 

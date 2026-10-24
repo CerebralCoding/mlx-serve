@@ -6,16 +6,7 @@ const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
-const transformer = @import("../../../engines/mlx/transformer.zig");
-const testing = @import("../../../engines/mlx/kv/cache.zig").testing;
-const OQE_FULL_O_BITS = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").OQE_FULL_O_BITS;
-const OQE_FULL_QK_BITS = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").OQE_FULL_QK_BITS;
-const OQE_FULL_V_BITS = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").OQE_FULL_V_BITS;
-const OQE_LINEAR_AB_BITS = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").OQE_LINEAR_AB_BITS;
-const OQE_LINEAR_OUT_BITS = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").OQE_LINEAR_OUT_BITS;
-const OQE_LINEAR_Z_BITS = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").OQE_LINEAR_Z_BITS;
-const OQE_MLP_DOWN_BITS = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").OQE_MLP_DOWN_BITS;
-const oqeLayerBits = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").oqeLayerBits;
+const testing = std.testing;
 const gpuArchitecture = @import("../../../mlx/device.zig").gpuArchitecture;
 const macosProductVersion = @import("../../../mlx/device.zig").macosProductVersion;
 const macosVersionAtLeast = @import("../../../mlx/device.zig").macosVersionAtLeast;
@@ -31,6 +22,7 @@ const verifyQmmNaxAvailable = @import("verify_qmm_nax.zig").verifyQmmNaxAvailabl
 const verifyQmmNaxEnabled = @import("verify_qmm_nax.zig").verifyQmmNaxEnabled;
 const verifyQmmNaxEnabledForMFrom = @import("verify_qmm_nax.zig").verifyQmmNaxEnabledForMFrom;
 const verifyQmmTile = @import("verify_qmm_nax.zig").verifyQmmTile;
+const verify_qmm_nax_vars = @import("verify_qmm_nax.zig");
 
 // ── Verify-width split-K quantized matmul (spec-decode fast path) ──
 //
@@ -711,6 +703,15 @@ pub fn runVerifyQmmMsg(
 
 // ── tests ──
 
+const OQE_FULL_O_BITS = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").OQE_FULL_O_BITS;
+const OQE_FULL_QK_BITS = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").OQE_FULL_QK_BITS;
+const OQE_FULL_V_BITS = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").OQE_FULL_V_BITS;
+const OQE_LINEAR_AB_BITS = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").OQE_LINEAR_AB_BITS;
+const OQE_LINEAR_OUT_BITS = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").OQE_LINEAR_OUT_BITS;
+const OQE_LINEAR_Z_BITS = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").OQE_LINEAR_Z_BITS;
+const OQE_MLP_DOWN_BITS = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").OQE_MLP_DOWN_BITS;
+const oqeLayerBits = @import("../../../engines/mlx/spec/mtp_nax_profile.zig").oqeLayerBits;
+
 test "vqmm scalar cache never evicts a scalar the caller is still holding" {
     // The live crash, as a pure decision: every verifyQmm-family call site
     // takes K then N back to back and holds BOTH handles in one `inputs_arr`.
@@ -988,8 +989,8 @@ test "verifyQmm: the plain-SIMD tiles match stock qmm at 5/6/8-bit affine too" {
     defer vqmm_mixed_plain_test_force = null;
     // The NAX probe must not steal these rows on an M5 box: this test is about
     // the plain-SIMD lanes, and M 2..7 is below the NAX takeover anyway.
-    transformer.vqmm_nax_probe_override = false;
-    defer transformer.vqmm_nax_probe_override = null;
+    verify_qmm_nax_vars.vqmm_nax_probe_override = false;
+    defer verify_qmm_nax_vars.vqmm_nax_probe_override = null;
 
     const cases = [_]struct { k: c_int, n: c_int, gs: u32, label: []const u8 }{
         .{ .k = 5120, .n = 17408, .gs = 64, .label = "mlp" }, // MLP gate/up, split-K
@@ -1215,8 +1216,8 @@ test "verifyQmm: split-K + msg + NAX verify-width kernels match stock qmm (4-bit
         // must NOT reach the split-K family (the measured spill cliff past 7
         // live row vectors), and M=17 is past every lane.
         {
-            transformer.vqmm_nax_probe_override = false;
-            defer transformer.vqmm_nax_probe_override = null;
+            verify_qmm_nax_vars.vqmm_nax_probe_override = false;
+            defer verify_qmm_nax_vars.vqmm_nax_probe_override = null;
             for ([_]c_int{ 1, 8, 16, 17 }) |bad_m| {
                 const xn: usize = @intCast(bad_m * cs.k);
                 const xbuf = try allocator.alloc(f32, xn);

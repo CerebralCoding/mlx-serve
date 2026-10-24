@@ -53,7 +53,7 @@ pub const glm5_next = struct {
     pub const generation_headroom: u64 = 0;
 };
 
-/// What the host's glue (`sdk/weights/streamed/glue.zig`) calls: the arch's entry points and their contract types.
+/// What the host's glue (`engines/mlx/modules/stream_glue.zig`) calls: the arch's entry points and their contract types.
 pub const arch = @import("plugins/deepseek_v41/stream/plugin.zig");
 /// Every arch the package serves through the SDK's table (`sdk.Arch.of`), in claim order: DeepSeek-V4.1 and GLM-5.3
 /// (the conformance suite's list; the host's glue binds each arch by its own entry: the root's, `mimo` and `glm`).

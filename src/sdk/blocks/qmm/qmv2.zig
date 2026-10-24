@@ -160,7 +160,7 @@ pub fn deviceMmaVerifiesWide() bool {
 var gen_logged = false;
 
 fn deviceGen() struct { gen: u32, phone: bool } {
-    const xfm = @import("../../../engines/mlx/transformer.zig");
+    const xfm = @import("../../../mlx/device.zig");
     const g = xfm.deviceGeneration();
     if (!gen_logged and xfm.device_gen_override == null) {
         gen_logged = true;
@@ -547,7 +547,7 @@ test "qmv2.qmm: routing per generation; legacy is the old dispatch byte for byte
     const xv = try std.testing.allocator.alloc(f32, @intCast(MMA_MAX_ROWS * k));
     defer std.testing.allocator.free(xv);
     for (xv) |*e| e.* = rnd.floatNorm(f32);
-    defer @import("../../../engines/mlx/transformer.zig").device_gen_override = null;
+    defer @import("../../../mlx/device.zig").device_gen_override = null;
 
     const Case = struct { gen: u32, dt: mlx.mlx_dtype, m: c_int, bneg: bool, legacy_ok: bool, want: enum { none, qmv, r4g8, r4g2, mma } };
     const cases = [_]Case{
@@ -570,7 +570,7 @@ test "qmv2.qmm: routing per generation; legacy is the old dispatch byte for byte
         .{ .gen = 17, .dt = .bfloat16, .m = 1, .bneg = true, .legacy_ok = false, .want = .none },
     };
     for (cases) |c| {
-        @import("../../../engines/mlx/transformer.zig").device_gen_override = .{ .gen = c.gen, .phone = false };
+        @import("../../../mlx/device.zig").device_gen_override = .{ .gen = c.gen, .phone = false };
         var sc = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(sc);
         try mlx.check(mlx.mlx_astype(&sc, sc32, c.dt, s));

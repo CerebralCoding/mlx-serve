@@ -68,6 +68,14 @@ pub fn depthwiseConvCuda(x: mlx.mlx_array, w: mlx.mlx_array, cdim: c_int, kernel
     return y;
 }
 
+/// Test seams (inference thread only): the copy/eval counters let the retention and cadence tests see what the loop did.
+pub var compact_conv_state_override: ?bool = null;
+pub var compact_conv_state_copy_count: u64 = 0;
+
+pub fn compactConvStateEnabled() bool {
+    return compact_conv_state_override orelse true;
+}
+
 // ── tests ──
 
 test "depthwiseConvStep equals a grouped conv1d over one window" {

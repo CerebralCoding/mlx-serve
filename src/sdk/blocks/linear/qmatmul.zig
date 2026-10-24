@@ -1,5 +1,5 @@
 //! sdk/blocks/linear/qmatmul, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns qmatmul, lmHeadProject, quantParamsFor, quantParamsHinted, qmatmulAddBias, qmatmulMaybeBias, and 8 more.
+//! Owns and 8 more.
 
 const std = @import("std");
 const env = @import("../../../env.zig");
@@ -9,23 +9,19 @@ const qmv_cuda = @import("../qmm/qmv_cuda.zig");
 const rowqmv = @import("../qmm/rowqmv.zig");
 const lane_qmm = @import("../qmm/lane_qmm.zig");
 const simd_qmm = @import("../qmm/simd_qmm.zig");
-const mlx_gguf = @import("../../quant/gguf/claim.zig");
+const mlx_gguf = @import("../../quant/gguf/root.zig");
 const sushi_pack = @import("../../quant/exl3/sushi_pack.zig");
 const qmv_nax2 = @import("../qmm/qmv_nax2.zig");
 const qmm_int8 = @import("../qmm/qmm_int8.zig");
 const log = @import("../../../host/log.zig");
-const ModelConfig = @import("../../../engines/mlx/model.zig").ModelConfig;
-const QuantMode = @import("../../../engines/mlx/model.zig").QuantMode;
+const QuantMode = @import("../../quant/params.zig").QuantMode;
 const mxfp8_qmv = @import("../qmm/mxfp8_qmv.zig");
 const prefill_dq_gemm = @import("prefill_dq_gemm.zig");
 const qmv_rows = @import("qmv_rows.zig");
-const transformer = @import("../../../engines/mlx/transformer.zig");
-const testing = @import("../../../engines/mlx/kv/cache.zig").testing;
-const lastDim = @import("../../../engines/mlx/load/weights.zig").lastDim;
-const transposeBf16Weight = @import("../../../engines/mlx/load/weights.zig").transposeBf16Weight;
-const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
+const testing = std.testing;
+const lastDim = @import("../../../mlx/array.zig").lastDim;
+const transposeBf16Weight = @import("../../../mlx/array.zig").transposeBf16Weight;
 const naxAvailable = @import("../../../mlx/device.zig").naxAvailable;
-const qsaArraysAllEqual = @import("../../../plugins/qwen4_exp/qsa/select.zig").qsaArraysAllEqual;
 const BITS_CACHE_CAP = @import("../../quant/params.zig").BITS_CACHE_CAP;
 const BitsCache = @import("../../quant/params.zig").BitsCache;
 const QuantParams = @import("../../quant/params.zig").QuantParams;
@@ -41,139 +37,20 @@ const prefillDqGemm = @import("prefill_dq_gemm.zig").prefillDqGemm;
 const VqmmTile = @import("verify_qmm.zig").VqmmTile;
 const verifyQmm = @import("verify_qmm.zig").verifyQmm;
 const verifyQmmTile = @import("verify_qmm_nax.zig").verifyQmmTile;
+const device_vars = @import("../../../mlx/device.zig");
 
 // ── Core ops ──
 
-pub inline fn qmatmul(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array) !mlx.mlx_array {
-    if (mlx_gguf.kernels.infoOf(w, sc)) |info| return mlx_gguf.kernels.linear(info, x, w, self.s);
-    if (sushi_pack.isRowScaledFp8(w, sc)) return sushi_pack.fp8Linear(x, w, sc, self.s);
-    // Resolve (bits, group_size, mode) per weight. Most weights inherit the
-    // global config; per-weight overrides (mixed-precision checkpoints, e.g.
-    // affine 8-bit shared MLP inside an nvfp4 QAT model) are detected on
-    // first touch — x's inner dim pins (bits, group_size) exactly.
-    const qp = self.quantParamsHinted(w, sc, lastDim(x));
-    // The 2-bit kernels (qmv2.zig) serve Prism packs: Hadamard ones, and
-    // ternary ones without rotations. Every other 2-bit pack keeps stock qmm.
-    if (self.rht) |reg| {
-        const signs = reg.get(w);
-        // Prompt width with int8 on: the rotation rides the quantizer, so the
-        // rotated activation is never written (the narrow routes stop at 16 rows).
-        if (self.int8_cache) |ic| if (signs) |sg| if (try qmm_int8.qmmRotated(ic, x, sg, reg.block, w, sc, bi, qp.bits, qp.group_size, reg.bias_is_neg_scale, self.s)) |y| return y;
-        const xr = if (signs) |sg| try reg.applyIn(x, sg, self.s) else x;
-        defer if (signs != null) {
-            _ = mlx.mlx_array_free(xr);
-        };
-        // nax2 first: it declines below its measured crossover, and from
-        // 6 rows up it beats qmv2 on every 27B projection shape.
-        if (try qmv_nax2.qmm(xr, w, sc, bi, qp.bits, qp.group_size, self.s)) |y| return y;
-        if (try qmv2.qmm(xr, w, sc, bi, qp.bits, qp.group_size, signs != null and reg.bias_is_neg_scale, true, self.s)) |y| return y;
-        // OPT-IN and LOSSY (activations to int8); declines unless the
-        // model or process enables it, and below prompt width.
-        if (self.int8_cache) |ic| if (try qmm_int8.qmm(ic, xr, w, sc, bi, qp.bits, qp.group_size, signs != null and reg.bias_is_neg_scale, self.s)) |y| return y;
-        return qmatmulBits(xr, w, sc, bi, qp.bits, qp.group_size, qp.mode, self.s);
-    }
-    if (self.ternary_2bit) {
-        if (try qmv_nax2.qmm(x, w, sc, bi, qp.bits, qp.group_size, self.s)) |y| return y;
-        if (try qmv2.qmm(x, w, sc, bi, qp.bits, qp.group_size, true, false, self.s)) |y| return y;
-    }
-    if (self.config.rowExactDecode() and qp.mode == .affine) {
-        if (try rowExactQmm(&self.config, x, w, sc, bi, qp.bits, qp.group_size, self.s)) |y| return y;
-    }
-    return qmatmulBits(x, w, sc, bi, qp.bits, qp.group_size, qp.mode, self.s);
-}
-
-/// Final logits projection. For dense bf16 the lm_head weight is [vocab, hidden]
-/// and is NOT pre-transposed at load (when tied it aliases emb_w, which must stay
-/// [vocab, hidden] for the embedding lookup), so we project via a lazy transposed
-/// view. Quantized models fall through to the standard gather/qmm path unchanged.
-pub inline fn lmHeadProject(self: *const Transformer, x: mlx.mlx_array) !mlx.mlx_array {
-    if (self.lm_head_s.ctx == null) {
-        const wt = try transposeBf16Weight(self.lm_head_w, self.s); // [hidden, vocab] view
-        defer _ = mlx.mlx_array_free(wt);
-        var result = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_matmul(&result, x, wt, self.s));
-        return result;
-    }
-    return self.qmatmul(x, self.lm_head_w, self.lm_head_s, self.lm_head_b);
-}
-
-/// Resolve per-weight quant params without an activation hint — for callers
-/// like the embedding gather whose tensors follow the model-wide scheme.
-pub inline fn quantParamsFor(self: *const Transformer, w: mlx.mlx_array, sc: mlx.mlx_array) QuantParams {
-    return self.quantParamsHinted(w, sc, null);
-}
-
-/// Resolve per-weight (bits, group_size, mode) with a lazy cache keyed by
-/// the scales array pointer. First touch computes params from the scales
-/// dtype + shapes (~4 FFI calls); subsequent calls are a single pointer
-/// compare. `in_dim` is the weight's input dimension when the caller knows
-/// it (activation inner dim) — required to disambiguate (bits, group_size)
-/// for affine-override tensors inside a non-affine model.
-/// Thread-safety: generation is single-threaded.
-pub inline fn quantParamsHinted(self: *const Transformer, w: mlx.mlx_array, sc: mlx.mlx_array, in_dim: ?u32) QuantParams {
-    const key_raw = sc.ctx orelse return .{
-        .bits = self.config.quant_bits,
-        .group_size = self.config.quant_group_size,
-        .mode = self.config.quant_mode,
-    };
-    const cache = @constCast(&self.bits_cache);
-    const start = BitsCache.slot(key_raw);
-    var i: usize = 0;
-    while (i < 4) : (i += 1) {
-        const idx = (start + i) & (BITS_CACHE_CAP - 1);
-        const entry = cache.keys[idx];
-        if (entry == key_raw) {
-            return .{
-                .bits = cache.vals_bits[idx],
-                .group_size = @as(u32, cache.vals_gs_div8[idx]) * 8,
-                .mode = @fromBackingInt(@intCast(cache.vals_mode[idx])),
-            };
-        }
-        if (entry == null) {
-            const detected = computeQuantParams(&self.config, w, sc, in_dim);
-            _ = cache.put(key_raw, detected);
-            return detected;
-        }
-    }
-    // Probe window saturated — fall through to direct detect, no cache write.
-    return computeQuantParams(&self.config, w, sc, in_dim);
-}
-
-pub inline fn qmatmulAddBias(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bias: mlx.mlx_array) !mlx.mlx_array {
-    const mm = try self.qmatmul(x, w, sc, bi);
-    defer _ = mlx.mlx_array_free(mm);
-    var result = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_add(&result, mm, bias, self.s));
-    return result;
-}
-
-/// `qmatmul`, plus an additive projection bias when `bias` is non-empty.
-/// Lets the standard (Llama-family) attention path support archs that carry
-/// additive qkv biases (Qwen2's `q/k/v_proj.bias`) without branching per
-/// arch — empty `bias` (qwen3/llama/mistral) is a plain `qmatmul`.
-pub inline fn qmatmulMaybeBias(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bias: mlx.mlx_array) !mlx.mlx_array {
-    if (bias.ctx != null) return self.qmatmulAddBias(x, w, sc, bi, bias);
-    return self.qmatmul(x, w, sc, bi);
-}
-
 /// A row-exact 4/6/8-bit matmul: Nemotron-H's thin MoE trunk streams faster
 /// through `rowqmv`'s per-row matvecs, the dense Qwen3.8 through `simd_qmm`,
-/// whose multi-row MMA reads each weight once. Null outside both.
-fn rowExactQmm(cfg: *const ModelConfig, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, s: mlx.mlx_stream) !?mlx.mlx_array {
-    if (!std.mem.eql(u8, cfg.model_type, "nemotron_h")) {
+/// whose multi-row MMA reads each weight once (`rowqmv_only` = the Nemotron-H trunk). Null outside both.
+pub fn rowExactQmm(rowqmv_only: bool, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, s: mlx.mlx_stream) !?mlx.mlx_array {
+    if (!rowqmv_only) {
         // The pick follows the weight and the GPU, never the row count: serial and verify rows share a kernel.
         if (naxAvailable()) if (try lane_qmm.qmm(x, w, sc, bi, bits, group_size, s)) |y| return y;
         if (try simd_qmm.qmm(x, w, sc, bi, bits, group_size, s)) |y| return y;
     }
     return rowqmv.qmv(x, w, sc, bi, bits, group_size, s);
-}
-
-pub fn projectWithConfig(cfg: *const ModelConfig, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
-    const qp = quantParamsOrDense(cfg, w, sc, lastDim(x));
-    if (cfg.rowExactDecode() and qp.mode == .affine) {
-        if (try rowExactQmm(cfg, x, w, sc, bi, qp.bits, qp.group_size, s)) |y| return y;
-    }
-    return qmatmulBits(x, w, sc, bi, qp.bits, qp.group_size, qp.mode, s);
 }
 
 /// The verify lanes cover 2..7 rows everywhere and take 8+ only with a NAX or shader tile,
@@ -321,6 +198,11 @@ pub fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: ml
 
 // ── tests ──
 
+const ModelConfig = @import("../../../engines/mlx/model.zig").ModelConfig;
+const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
+
+const qsaArraysAllEqual = @import("../../testing/parity.zig").qsaArraysAllEqual;
+
 test "qmvBatchLimit mirrors MLX's qmv/qmm split on single- and dual-die gen-17 GPUs" {
     try testing.expectEqual(@as(c_int, 25), qmvBatchLimit(false, 2560, 640));
     try testing.expectEqual(@as(c_int, 18), qmvBatchLimit(true, 2560, 640));
@@ -362,8 +244,8 @@ test "qmatmul: a ternary 2-bit pack routes through qmv2; without the flag it sta
     defer _ = mlx.mlx_array_free(x);
     try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
 
-    transformer.device_gen_override = .{ .gen = 13, .phone = false };
-    defer transformer.device_gen_override = null;
+    device_vars.device_gen_override = .{ .gen = 13, .phone = false };
+    defer device_vars.device_gen_override = null;
     var xfm: Transformer = undefined;
     xfm.s = s;
     xfm.rht = null;
@@ -561,15 +443,15 @@ fn expectDqRoute(mode: QuantMode, bits: u32, gs: u32) !void {
     const on: usize = @intCast(M * N);
 
     // Stock qmm (route forced off).
-    transformer.prefill_dq_gemm_override = false;
+    prefill_dq_gemm.prefill_dq_gemm_override = false;
     const stock = try qmatmulBits(x, wq, wsc, wbi, bits, gs, mode, s);
     defer _ = mlx.mlx_array_free(stock);
     const stock_f = try evalToF32(al, stock, on, s);
     defer al.free(stock_f);
 
     // Routed (default on): engagement must be COUNTED.
-    transformer.prefill_dq_gemm_override = true;
-    defer transformer.prefill_dq_gemm_override = null;
+    prefill_dq_gemm.prefill_dq_gemm_override = true;
+    defer prefill_dq_gemm.prefill_dq_gemm_override = null;
     const before = prefill_dq_gemm.prefill_dq_gemm_engaged;
     const routed = try qmatmulBits(x, wq, wsc, wbi, bits, gs, mode, s);
     defer _ = mlx.mlx_array_free(routed);

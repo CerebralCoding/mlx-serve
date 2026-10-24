@@ -23,7 +23,7 @@ const model_mod = @import("../../engines/mlx/model.zig");
 const transformer_mod = @import("../../engines/mlx/transformer.zig");
 const tokenizer_mod = @import("../tokenizer/tokenizer.zig");
 const chat_mod = @import("../chat/chat.zig");
-const vision_mod = @import("../../sdk/vision/encoder.zig");
+const vision_mod = @import("../../engines/mlx/vision_encoder.zig");
 const drafter_mod = @import("../../plugins/gemma4/assistant_drafter.zig");
 const prefix_cache_mod = @import("../../engines/mlx/cache/prefix_cache.zig");
 const tokenize_cache_mod = @import("../tokenizer/cache.zig");
@@ -38,7 +38,7 @@ const arch_ane = @import("../../engines/ane/lm.zig");
 const gen_mod = @import("../media_jobs/gen.zig");
 const generate_mod = @import("../../engines/mlx/generate.zig");
 const log = @import("../log.zig");
-const mlx_stream = if (@import("build_options").mlx_stream) @import("../../sdk/weights/streamed/glue.zig") else @import("../../sdk/weights/streamed/stub.zig");
+const mlx_stream = if (@import("build_options").mlx_stream) @import("../../engines/mlx/modules/stream_glue.zig") else @import("../../engines/mlx/modules/stream_stub.zig");
 
 /// Bumped every time a model becomes `.ready`; readers compare against the value they last acted on.
 pub var load_generation = std.atomic.Value(u64).init(0);

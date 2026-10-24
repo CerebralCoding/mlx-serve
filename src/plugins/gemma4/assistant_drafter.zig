@@ -877,7 +877,7 @@ fn embedTableRow(
         try mlx.check(mlx.mlx_take_axis(&tb, emb_b, id_arr, 0, s));
     }
 
-    const emb_qp = params_mod.computeQuantParams(config, emb_w, emb_s, config.hidden_size);
+    const emb_qp = params_mod.computeQuantParams(.of(config), emb_w, emb_s, config.hidden_size);
     var dequant = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(dequant);
     try mlx.check(mlx.mlx_dequantize(

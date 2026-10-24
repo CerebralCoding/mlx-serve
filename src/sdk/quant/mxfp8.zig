@@ -3,9 +3,7 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
-const Weights = @import("../../engines/mlx/model.zig").Weights;
-const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
+const Weights = @import("../weights/resident.zig").Weights;
 
 /// LOSSY, so on by default only where it was measured: Flash Next (`qwen4`) on an integrated
 /// CUDA GPU (DGX Spark), for a quantized pack whose head ships dense. A bf16 pack keeps its reference head.
@@ -34,6 +32,9 @@ pub fn quantizeHeadMxfp8(weights: *Weights, key: []const u8, w: mlx.mlx_array, s
 }
 
 // ── tests ──
+
+const model_mod = @import("../../engines/mlx/model.zig");
+const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
 
 // Bar: the default is on only where measured (Flash Next, quantized pack, integrated CUDA); a flag beats it, a model setting beats both.
 test "lm_head mxfp8: on by default for quantized Flash Next packs on integrated CUDA, settings and flags win" {

@@ -47,6 +47,8 @@ const prefillRequestTerms = @import("bills.zig").prefillRequestTerms;
 const prefillNeededAtChunk = @import("prefill_chunk.zig").prefillNeededAtChunk;
 const prefillAdmissionBill = @import("admit.zig").prefillAdmissionBill;
 const clampMaxTokens = @import("../../../host/api/sampling.zig").clampMaxTokens;
+const attn256 = @import("../../../sdk/blocks/attention/attn256.zig");
+const prefill_dq_gemm = @import("../../../sdk/blocks/linear/prefill_dq_gemm.zig");
 
 /// A stand-in for the deployed long-context pack: qwen3_5-shaped GDN+MoE trunk with a QSA
 /// indexer. Declares `qwen4_exp`: every long-context mechanism is gated on it.
@@ -569,8 +571,8 @@ test "prefillMemoryNeeded: a prompt shorter than the chunk bills the prompt-widt
 
 test "prefillMemoryNeeded: quantized KV is billed at its real width, not fp16" {
     const t = std.testing;
-    transformer_mod.fused256_override = false;
-    defer transformer_mod.fused256_override = null;
+    attn256.fused256_override = false;
+    defer attn256.fused256_override = null;
     // 26B-A4B shape at 100K ctx, chunk 512 (what the bounded chunk picks there).
     // fp16: kv 30x2x100000x8x256x2 = 24.576 GB; scores 16x512x100000x2 = 1.6384 GB;
     //       mlp 3x8x512x2816x2 = 69.2 MB; x1.25 margin.
@@ -591,8 +593,8 @@ test "prefillMemoryNeeded: quantized KV is billed at its real width, not fp16" {
 
 test "prefillMemoryNeeded: working set is chunk-bounded — the 255K MoE prompt is admittable" {
     const t = std.testing;
-    transformer_mod.fused256_override = false;
-    defer transformer_mod.fused256_override = null;
+    attn256.fused256_override = false;
+    defer attn256.fused256_override = null;
     // The PR-#69 failure case: Qwen3.6-35B-A3B shape (whose checkpoint OMITS
     // intermediate_size, so the struct default 15360 leaks into ffn) at 262144
     // tokens with 4-bit KV. kv 6.04 GB + scores 4.29 GB + dequant 0.54 GB +
@@ -608,8 +610,8 @@ test "prefillMemoryNeeded: working set is chunk-bounded — the 255K MoE prompt 
 
 test "prefillMemoryNeeded: unfused head dims bill the materialized score scratch" {
     const t = std.testing;
-    transformer_mod.fused256_override = false;
-    defer transformer_mod.fused256_override = null;
+    attn256.fused256_override = false;
+    defer attn256.fused256_override = null;
     // Same shape, head_dim 128 vs 256 (kv scaled by hdim too, so compare the
     // full bills computed by hand): hd=128 fp16 -> kv 12.288 GB + 0 scores +
     // mlp 69.2 MB, x1.25.
@@ -656,8 +658,8 @@ test "prefillMemoryNeeded: fused hd-256 kernel drops the score bill, keeps KV + 
     // Default (msv_attn_p256 active): the composed score scratch never exists,
     // so hd 256 bills exactly the hd-256 KV + mlp — the unfused bill minus the
     // 1.6384 GB x1.25 score term from the test above.
-    transformer_mod.fused256_override = true;
-    defer transformer_mod.fused256_override = null;
+    attn256.fused256_override = true;
+    defer attn256.fused256_override = null;
     try t.expectEqual(
         @as(u64, 32_854_507_520 + 671_088_640 - 2_048_000_000),
         prefillMemoryNeeded(100_000, 16, 8, 245760, 256, 256, 2816, 2112, 16, 512, 100_000, 0, 0, .{}),
@@ -741,8 +743,8 @@ test "prefillMemoryNeeded: every prefill peak the box measured, re-derived for t
     // Pre-fix this function billed 5 of these 8 shapes short, worst 0.58x.
     // The qwen3.5 rows are the measured peaks minus the exact conv_state pin the compaction removed ((linear_layers - 5) x chunk x qkv x 2); the packs are not on the box to re-measure.
     const t = std.testing;
-    transformer_mod.fused256_override = true;
-    defer transformer_mod.fused256_override = null;
+    attn256.fused256_override = true;
+    defer attn256.fused256_override = null;
 
     // qwen3_5 27B: hidden 5120, ffn 17408, 64 layers / 16 caching, hd 256,
     // 48 GatedDeltaNet layers x (2x16x128 + 48x128) elems x 2 B of stream.
@@ -769,8 +771,8 @@ test "prefillMemoryNeeded: every prefill peak the box measured, re-derived for t
 
 test "prefillMemoryNeeded: the new terms fire only where the measurement put them" {
     const t = std.testing;
-    transformer_mod.fused256_override = true;
-    defer transformer_mod.fused256_override = null;
+    attn256.fused256_override = true;
+    defer attn256.fused256_override = null;
     const q27 = .{ .seq = 9320, .h = 24, .kvh = 4, .kvpt = 65536, .hd = 256, .hidden = 5120, .ffn = 17408 };
     const stream: u64 = 48 * (2 * 16 * 128 + 48 * 128) * 2;
     const dq: u64 = 3 * 17408 * 5120 * 2;
@@ -910,8 +912,8 @@ test "prefillDequantWeightBytes: affine-quantized weights only, and it reads the
     try t.expectEqual(@as(u64, 0), prefillDequantWeightBytes(&nvfp4));
 
     // The estimator must not bill an allocation the kill switch removed.
-    transformer_mod.prefill_dq_gemm_override = false;
-    defer transformer_mod.prefill_dq_gemm_override = null;
+    prefill_dq_gemm.prefill_dq_gemm_override = false;
+    defer prefill_dq_gemm.prefill_dq_gemm_override = null;
     try t.expectEqual(@as(u64, 0), prefillDequantWeightBytes(&cfg));
 }
 
@@ -938,8 +940,8 @@ test "prefillMemoryNeeded: a sparse-attention arch bills its KEY BOUND, not the 
     try t.expect(after < available);
     // The score term is the ONLY one the key bound may touch: same call with a
     // fused head_dim has no score scratch, so the bound changes nothing.
-    transformer_mod.fused256_override = true;
-    defer transformer_mod.fused256_override = null;
+    attn256.fused256_override = true;
+    defer attn256.fused256_override = null;
     try t.expectEqual(
         prefillMemoryNeeded(5806, 64, 1, 44032, 256, 256, 4096, 2048, 8, 5632, 5806, 0, 0, .{}),
         prefillMemoryNeeded(5806, 64, 1, 44032, 256, 256, 4096, 2048, 8, 5632, 641, 0, 0, .{}),

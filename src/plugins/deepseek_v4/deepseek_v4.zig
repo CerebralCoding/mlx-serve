@@ -162,7 +162,7 @@ fn getQ(cfg: *const ModelConfig, w: *const model.Weights, buf: *NameBuf, in_dim:
     const wt = try getReq(w, buf, base ++ ".weight", args);
     const sc = try getReq(w, buf, base ++ ".scales", args);
     const bs = try getReq(w, buf, base ++ ".biases", args);
-    return .{ .w = wt, .s = sc, .b = bs, .qp = params_mod.computeQuantParams(cfg, wt, sc, in_dim) };
+    return .{ .w = wt, .s = sc, .b = bs, .qp = params_mod.computeQuantParams(.of(cfg), wt, sc, in_dim) };
 }
 
 fn getCompressor(w: *const model.Weights, buf: *NameBuf, comptime pfx: []const u8, args: anytype) !CompressorW {
@@ -8951,7 +8951,7 @@ test "dsv4: gs-128 expert pack resolves per-weight and qmm matches the dequant r
         defer _ = mlx.mlx_array_free(bs);
         try mlx.check(mlx.mlx_vector_array_get(&bs, qv, 2));
 
-        const qp = params_mod.computeQuantParams(&cfg, wq, sc, @intCast(K));
+        const qp = params_mod.computeQuantParams(.of(&cfg), wq, sc, @intCast(K));
         try testing.expectEqual(bits, qp.bits);
         try testing.expectEqual(@as(u32, 128), qp.group_size);
 
@@ -9092,10 +9092,10 @@ test "dsv4: comp_in decode requant rides --decode-attn-quant (DSV4_MINI)" {
     defer for (dense_logits[0..n_steps]) |l| allocator.free(l);
 
     defer {
-        transformer.decode_attn_quant_override = null;
+        decode_attn_quant.decode_attn_quant_override = null;
     }
     for ([_]bool{ false, true }) |quant_arm| {
-        transformer.decode_attn_quant_override = quant_arm;
+        decode_attn_quant.decode_attn_quant_override = quant_arm;
         const dw = try loadDsv4Weights(allocator, &cfg, &weights);
         const s = mlx.gpuStream();
         defer _ = mlx.mlx_stream_free(s);

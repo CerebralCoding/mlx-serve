@@ -34,7 +34,7 @@ const build_options = @import("build_options");
 // anyway; this only governs how an unexpected panic terminates.
 pub const panic = std.debug.simple_panic;
 // pub: Sushi's EXL3 module (src/sdk/quant/exl3/sushi) reaches mlx, log and io_util through its host root (`mlx_host`). iOS builds
-// no mlx-stream plugin (src/sdk/weights/streamed/stub.zig refuses its packs), so this root does not carry the plugin's names
+// no mlx-stream plugin (src/engines/mlx/modules/stream_stub.zig refuses its packs), so this root does not carry the plugin's names
 // of plugin_host.zig (exl3, dsa_nax), and plugin_host_check.zig does not check it; mtp_acceptance is the plugin
 // SDK's too (`sdk.acceptance`), kept as main.zig has it, and nothing on iOS reads it.
 pub const mlx = @import("mlx/ffi.zig");

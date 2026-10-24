@@ -165,7 +165,8 @@ test "EmbeddingGemma 2: forward and pooled embeddings match the transformers ref
     }
 }
 
-const vision_mod = @import("../../sdk/vision/encoder.zig");
+const vision_mod = @import("../../engines/mlx/vision_encoder.zig");
+const qwen_vision_budget = @import("../../sdk/vision/qwen_vision.zig");
 
 /// The soft-token budget the tiny fixture's image and clip were processed at (70 is the smallest a processor accepts).
 const eg2_fixture_budget: u32 = 70;
@@ -188,11 +189,11 @@ const Eg2Media = struct {
 };
 
 /// The fixture's image through the production preprocessing at `budget` soft tokens.
-fn eg2FixtureImage(allocator: std.mem.Allocator, b64: []const u8, h: u32, w: u32, budget: u32) !vision_mod.UnitImage {
+fn eg2FixtureImage(allocator: std.mem.Allocator, b64: []const u8, h: u32, w: u32, budget: u32) !qwen_vision_budget.UnitImage {
     const rgb = try allocator.alloc(u8, @as(usize, h) * w * 3);
     defer allocator.free(rgb);
     try std.base64.standard.Decoder.decode(rgb, b64);
-    return vision_mod.budgetPixels(allocator, rgb, h, w, 16, 3, budget);
+    return qwen_vision_budget.budgetPixels(allocator, rgb, h, w, 16, 3, budget);
 }
 
 fn eg2ImageRows(allocator: std.mem.Allocator, enc: *vision_mod.VisionEncoder, m: anytype, budget: u32, target: [2]u32) !mlx.mlx_array {

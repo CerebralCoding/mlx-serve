@@ -6,7 +6,7 @@ const log = @import("../../host/log.zig");
 const plugin_config = @import("plugin/config.zig");
 const mlx_gguf = @import("../../sdk/quant/gguf/claim.zig");
 const exl3 = @import("../../sdk/quant/exl3/format.zig");
-const sushi_pack = @import("../../sdk/quant/exl3/sushi_pack.zig");
+const sushi_pack = @import("load/sushi_adapt.zig");
 const modelopt_pack = @import("../../sdk/quant/nvfp4/modelopt_pack.zig");
 const model_discovery = @import("../../host/registry/discovery.zig");
 const tokenizer_mod = @import("../../host/tokenizer/tokenizer.zig");
@@ -17,13 +17,8 @@ const qwen4_ple = @import("../../plugins/qwen4_exp/ple_table.zig");
 const kv_quant_mod = @import("cache/kv_quant.zig");
 const mtp_acceptance_mod = @import("spec/mtp_acceptance.zig");
 
-pub const HiddenAct = enum { gelu_approx, gelu, silu, relu_sq };
+pub const HiddenAct = @import("../../sdk/blocks/mlp/activations.zig").HiddenAct;
 
-/// MLX quantization mode from config.json's `quantization.mode`. All
-/// non-affine modes store NO `.biases` tensors (per-group fp8-encoded uint8
-/// scales only) but share the packed-u32 weight layout, so supporting them is
-/// a matter of skipping the biases fetch and passing the right mode string to
-/// the mlx quantized ops. Tag names match the mlx-c mode strings exactly.
 /// Upper bound on a vision tower's per-layer type table (muse ships 50).
 pub const MAX_VISION_LAYERS = 64;
 
@@ -33,40 +28,7 @@ pub const MUSE_MAX_IMAGE_TOKENS = 4096;
 /// Default fraction of RADIO video tokens removed by EVS.
 pub const RADIO_VIDEO_PRUNING_RATE_DEFAULT: f64 = 0.7;
 
-pub const QuantMode = enum {
-    affine,
-    nvfp4,
-    mxfp4,
-    mxfp8,
-    /// Raw ggml blocks (src/sdk/quant/gguf). Never reaches an MLX quantized op:
-    /// the per-tensor type rides on the weight, see `mlx_gguf.kernels.Info`.
-    gguf,
-
-    pub fn fromString(name: []const u8) ?QuantMode {
-        return std.meta.stringToEnum(QuantMode, name);
-    }
-
-    /// Mode string for mlx_quantized_matmul / mlx_gather_qmm / mlx_dequantize.
-    pub fn cstr(self: QuantMode) [*:0]const u8 {
-        return switch (self) {
-            .affine => "affine",
-            .nvfp4 => "nvfp4",
-            .mxfp4 => "mxfp4",
-            .mxfp8 => "mxfp8",
-            .gguf => "gguf",
-        };
-    }
-
-    /// Affine is the only mode whose checkpoints carry per-group biases.
-    pub fn hasBiases(self: QuantMode) bool {
-        return self == .affine;
-    }
-
-    /// The e2m1 nibble modes (byte scales, no biases): MXFP4 g32, NVFP4 g16.
-    pub fn isFp4(self: QuantMode) bool {
-        return self == .mxfp4 or self == .nvfp4;
-    }
-};
+pub const QuantMode = @import("../../sdk/quant/params.zig").QuantMode;
 
 pub const LayerBlockType = enum { attention, gated_conv, mamba2, mlp, moe };
 
@@ -150,13 +112,7 @@ pub fn poolingFromDirName(dir_basename: []const u8, model_type: []const u8) ?Poo
 
 pub const Qwen4NormConvention = enum { delta, folded };
 
-/// Llama 3.x `rope_type: "llama3"` (HF `_compute_llama3_parameters`).
-pub const Llama3Rope = struct {
-    factor: f32,
-    low_freq_factor: f32 = 1.0,
-    high_freq_factor: f32 = 4.0,
-    original_max_position_embeddings: f32 = 8192.0,
-};
+pub const Llama3Rope = @import("../../sdk/blocks/rope/rope.zig").Llama3Rope;
 
 /// `thinker_config.audio_config` of a Qwen3-ASR pack (mlx-audio's `AudioEncoderConfig`).
 pub const QwenAudioConfig = struct {
@@ -4963,85 +4919,7 @@ fn jsonFloat(v: std.json.Value) !f32 {
     return f;
 }
 
-/// Holds all loaded weights as mlx arrays, keyed by name.
-pub const Weights = struct {
-    map: std.StringHashMap(mlx.mlx_array),
-    allocator: std.mem.Allocator,
-    /// Int8 copies of block linears that replace their packed arrays (`--w8a8`); only the media
-    /// DiTs that read through a name-keyed map fill it.
-    w8: @import("../../sdk/blocks/dit/w8a8.zig").Overlay = .{},
-
-    pub fn init(allocator: std.mem.Allocator) Weights {
-        return .{
-            .map = std.StringHashMap(mlx.mlx_array).init(allocator),
-            .allocator = allocator,
-        };
-    }
-
-    pub fn deinit(self: *Weights) void {
-        var it = self.map.iterator();
-        while (it.next()) |entry| {
-            _ = mlx.mlx_array_free(entry.value_ptr.*);
-            self.allocator.free(entry.key_ptr.*);
-        }
-        self.map.deinit();
-        self.w8.deinit(self.allocator);
-    }
-
-    pub fn get(self: *const Weights, name: []const u8) ?mlx.mlx_array {
-        return self.map.get(name);
-    }
-
-    /// Hand the map a new array under `name`, freeing the one it held (load-time
-    /// weight fusion parks its row views here so the originals go away).
-    pub fn replace(self: *Weights, name: []const u8, arr: mlx.mlx_array) void {
-        if (self.map.getPtr(name)) |p| {
-            _ = mlx.mlx_array_free(p.*);
-            p.* = arr;
-        }
-    }
-
-    /// Drop every entry named `prefix...` and free its array: a loader that built a block from them (its
-    /// structs hold their own refs) lets the originals go before the next block loads, which is when an
-    /// int8 copy and the packed weight it replaced would otherwise both be resident.
-    pub fn dropPrefix(self: *Weights, prefix: []const u8) void {
-        var found = true;
-        while (found) {
-            found = false;
-            var it = self.map.iterator();
-            while (it.next()) |e| if (std.mem.startsWith(u8, e.key_ptr.*, prefix)) {
-                self.remove(e.key_ptr.*);
-                found = true;
-                break;
-            };
-        }
-    }
-
-    /// `dropPrefix` for the `idx`-th block of a stack, named by `fmt` (`"blocks.{d}."`).
-    pub fn dropBlock(self: *Weights, comptime fmt: []const u8, idx: usize) void {
-        var buf: [128]u8 = undefined;
-        self.dropPrefix(std.fmt.bufPrint(&buf, fmt, .{idx}) catch return);
-    }
-
-    /// Hand the map `arr` under `name` (the key is copied), freeing an array it held there.
-    pub fn put(self: *Weights, name: []const u8, arr: mlx.mlx_array) !void {
-        if (self.map.contains(name)) return self.replace(name, arr);
-        const key = try self.allocator.dupe(u8, name);
-        errdefer self.allocator.free(key);
-        try self.map.put(key, arr);
-    }
-
-    /// Drop `name` and free its array (a loader that copied it elsewhere lets the original go).
-    pub fn remove(self: *Weights, name: []const u8) void {
-        const kv = self.map.fetchRemove(name) orelse return;
-        _ = mlx.mlx_array_free(kv.value);
-        self.allocator.free(kv.key);
-    }
-
-    pub fn count(self: *const Weights) u32 {
-        return @intCast(self.map.count());
-    }
-};
+pub const Weights = @import("../../sdk/weights/resident.zig").Weights;
 
 /// The generic nestings a text trunk ships under: flat, mlx-community's
 /// re-nest, and meta's VL original (Muse-Glimmer). `parseConfigFromJson`
@@ -5525,46 +5403,7 @@ pub fn reportF16Narrowing() void {
     narrowed_1d = 0;
 }
 
-/// Load ONE safetensors file into a Weights map, tensors as stored (lazy), on
-/// `mlx.weightLoadStream()` (Metal has no GPU `Load`). The iterator hands a +1
-/// reference in `value`; it transfers straight into the map.
-pub fn loadWeightsFile(allocator: std.mem.Allocator, model_dir: []const u8, file: []const u8) !Weights {
-    var w = Weights.init(allocator);
-    errdefer w.deinit();
-    const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ model_dir, file }, 0);
-    defer allocator.free(path);
-
-    var tensor_map = mlx.mlx_map_string_to_array_new();
-    defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
-    var meta_map = mlx.mlx_map_string_to_string_new();
-    defer _ = mlx.mlx_map_string_to_string_free(meta_map);
-    const s = mlx.weightLoadStream();
-    defer _ = mlx.mlx_stream_free(s);
-    try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, path, s));
-
-    const iter = mlx.mlx_map_string_to_array_iterator_new(tensor_map);
-    defer _ = mlx.mlx_map_string_to_array_iterator_free(iter);
-    while (true) {
-        var key: ?[*:0]const u8 = null;
-        var value = mlx.mlx_array_new();
-        const rc = mlx.mlx_map_string_to_array_iterator_next(&key, &value, iter);
-        if (rc != 0 or key == null) {
-            _ = mlx.mlx_array_free(value);
-            break;
-        }
-        const owned_key = allocator.dupe(u8, std.mem.span(key.?)) catch |e| {
-            _ = mlx.mlx_array_free(value);
-            return e;
-        };
-        w.map.put(owned_key, value) catch |e| {
-            allocator.free(owned_key);
-            _ = mlx.mlx_array_free(value);
-            return e;
-        };
-    }
-    log.info("[weights] loaded {d} tensors from {s}\n", .{ w.count(), file });
-    return w;
-}
+pub const loadWeightsFile = @import("../../sdk/weights/resident.zig").loadWeightsFile;
 
 pub fn loadSafetensorsFile(
     allocator: std.mem.Allocator,

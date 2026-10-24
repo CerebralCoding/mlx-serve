@@ -51,7 +51,7 @@ const diffusion_mod = @import("../../plugins/diffusion_gemma/runner.zig");
 const model_mod = @import("model.zig");
 const sushi_pack = @import("../../sdk/quant/exl3/sushi_pack.zig");
 const modelopt_pack = @import("../../sdk/quant/nvfp4/modelopt_pack.zig");
-const vision_mod = @import("../../sdk/vision/encoder.zig");
+const vision_mod = @import("vision_encoder.zig");
 const radio_vision = @import("../../plugins/nemotron_h/radio_vision.zig");
 const chat_mod = @import("../../host/chat/chat.zig");
 const prefix_cache_mod = @import("cache/prefix_cache.zig");
@@ -71,7 +71,7 @@ const log = @import("../../host/log.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
 const status = @import("../../host/status.zig");
 const dsv41_mod = @import("../../plugins/deepseek_v41/deepseek_v41.zig");
-const mlx_stream = if (@import("build_options").mlx_stream) @import("../../sdk/weights/streamed/glue.zig") else @import("../../sdk/weights/streamed/stub.zig");
+const mlx_stream = if (@import("build_options").mlx_stream) @import("modules/stream_glue.zig") else @import("modules/stream_stub.zig");
 const sleep_inhibit = @import("../../host/gpu_thread/sleep_inhibit.zig");
 
 const Transformer = transformer_mod.Transformer;

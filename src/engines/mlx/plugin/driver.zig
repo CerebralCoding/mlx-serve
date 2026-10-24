@@ -22,7 +22,7 @@ const moduleShell = @import("../modules/shell.zig").moduleShell;
 const KVCache = @import("../kv/cache.zig").KVCache;
 const bf16Scalar = @import("../load/weights.zig").bf16Scalar;
 const mrope = @import("../../../sdk/vision/mrope.zig");
-const mropeContext = @import("../../../sdk/blocks/rope/mrope.zig").mropeContext;
+const mropeContext = @import("../methods/mrope.zig").mropeContext;
 const SSMCacheEntry = @import("../ssm/entry.zig").SSMCacheEntry;
 const ForwardCtx = @import("../forward_ctx.zig").ForwardCtx;
 const MAX_BATCH_ROWS = @import("../batched/layered.zig").MAX_BATCH_ROWS;
@@ -184,7 +184,7 @@ pub fn loadWith(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_di
     // The engine's row-exact sampling reads coverage off the config, measured over the pack as the legacy load does.
     if (trunk and xfm.config.rowExactArch()) {
         const gather_only: Array = if (xfm.lm_head_w.ctx == xfm.emb_w.ctx) .{ .ctx = null } else xfm.emb_w;
-        xfm.config.row_exact_covered = firstRowExactMiss(&xfm.config, &res.weights, gather_only) == null;
+        xfm.config.row_exact_covered = firstRowExactMiss(.of(&xfm.config), &res.weights, gather_only) == null;
     }
     const bound = try a.create(Bound);
     bound.* = .{ .table = b.table, .model = m, .drafters = caps.dflash_capture and trunk, .trunk = trunk };
