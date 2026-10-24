@@ -1120,14 +1120,14 @@ pub const ModelRegistry = struct {
     }
 
     /// A stream pack whose plugin module reads the process's foreign-bytes value (`mlx_stream.setForeignBytes`):
-    /// DeepSeek-V4.1's and GLM-5.3's. The value is one number for the process, so it is correct for one such pack at a
+    /// GLM-5.3's. The value is one number for the process, so it is correct for one such pack at a
     /// time: a load of a second unloads the first (`foreignReaderVictimLocked`).
     pub fn readsForeignBytes(c: *const ModelConfig) bool {
-        return c.dsv41_stream or c.glm_stream;
+        return c.glm_stream;
     }
 
     /// What every ready model except a stream pack whose module reads the value holds: the plugin bills only its own
-    /// bytes, and its footprint reads are the whole process's. DeepSeek-V4.1's and GLM-5.3's modules read it, so their
+    /// bytes, and its footprint reads are the whole process's. GLM-5.3's module reads it, so its
     /// packs are left out; a MiMo or GLM-5.3-Flash stream pack's bytes are foreign to them. One reader pack at a time
     /// (`foreignReaderVictimLocked`): with two, each one's bound would leave out the other's residents. Caller holds
     /// `mutex`.
@@ -1872,7 +1872,7 @@ test "ModelRegistry: the streaming pack's foreign bytes are every other ready mo
     var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
     defer reg.deinit();
     var cfg = ModelConfig{};
-    cfg.dsv41_stream = true;
+    cfg.glm_stream = true;
     const stream = try makeReadyStub(reg, "deepseek", 180_000_000_000);
     stream.config = &cfg;
     defer stream.config = null; // borrowed: the registry frees the configs it owns
@@ -2544,7 +2544,7 @@ test "ModelRegistry: a second stream pack that reads the foreign bytes unloads a
     var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
     defer reg.deinit();
     var dsv41_cfg = ModelConfig{};
-    dsv41_cfg.dsv41_stream = true;
+    dsv41_cfg.glm_stream = true;
     const dsv41 = try makeReadyStub(reg, "deepseek", 180_000_000_000);
     dsv41.config = &dsv41_cfg;
     defer dsv41.config = null;

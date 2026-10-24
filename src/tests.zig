@@ -95,7 +95,7 @@ test {
     if (@import("build_options").mlx_stream) _ = @import("engines/mlx/modules/stream_glue.zig");
     _ = @import("sdk/weights/streamed/dupes_test.zig");
     _ = @import("sdk/weights/streamed/mlx_pack_test.zig");
-    _ = @import("plugins/deepseek_v41/stream/dupes_test.zig");
+    _ = @import("plugins/deepseek_v41/streamed_test.zig");
     _ = @import("version.zig");
     _ = @import("mlx/ops.zig");
     _ = @import("mlx/kernels.zig");

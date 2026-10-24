@@ -35,7 +35,7 @@ Two seams: the ENGINE interface (`abi/engine.zig`, host ↔ an engine, per reque
 | `plugins/<name>/` | One model family or media backend each: `plugin.zig` (the table), `config.zig` (MLX-free claim + parse + bill), its own blocks, `kernels/`, `fixtures/`, proofs, and its `AGENTS.md` (its rules and quirks: read it before touching the model). `_template*` = the barebones plugins, `_example*` = the kit's |
 | `mlx/` | `ffi.zig` (mlx-c), `ops.zig` (the op layer: a `Graph` owns what it makes), `scope.zig`, `kernels.zig` (the kernel loader), `state.zig` |
 | `kernels/<area>/` | Metal/CUDA kernels two or more plugins use (one model's own: `plugins/<name>/kernels/`); every file listed with its sha256 in `kernels/digests.txt` |
-| `mlx_stream.zig` | The absorbed mlx-stream plugin (DeepSeek-V4.1 EXL3 repack; MiMo + GLM stream packs): archs in `plugins/<model>/stream/`, EXL3 lanes in `sdk/quant/exl3/stream/`, the expert streamer in `sdk/weights/streamed/`; `zig build mlx-stream-test` |
+| `mlx_stream.zig` | The absorbed mlx-stream plugin (MiMo + GLM stream packs; the bank sources a resident trunk streams from): archs in `plugins/<model>/stream/`, EXL3 lanes in `sdk/quant/exl3/stream/`, the expert streamer in `sdk/weights/streamed/`; `zig build mlx-stream-test` |
 | `kit.zig`, `kit_header.zig`, `plugin_host.zig` | The plugin kit's module, its generated C header, and the host surface a plugin's own test build imports |
 | `testing/fake_engine.zig`, `tests.zig`, `preview_tests.zig`, `ios_lib.zig` | Test roots, the no-model engine, the iOS entry |
 | `html/index.html` | The console, BUILT from `app-web/` (never hand-edited) |

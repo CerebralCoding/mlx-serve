@@ -1,8 +1,9 @@
 //! DeepSeek-V4.1-Flash: the module-owned native arch (`deepseek_v41.zig`) and its vision tower behind the model table.
-//! Serial, single-flight; one conversation resumes (`resume`, keyed on its image rows). Streamed EXL3 packs stay on
-//! lib/mlx-stream until P4 merges the two implementations.
+//! Serial, single-flight; one conversation resumes (`resume`, keyed on its image rows). A streamed pack's routed
+//! experts come from its EXL3 bank (`sdk/weights/streamed.zig` `Exl3`).
 
 const std = @import("std");
+const build_options = @import("build_options");
 const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 const mlx = @import("../../mlx/ffi.zig");
@@ -18,6 +19,7 @@ const quant_abi = @import("../../abi/quant.zig");
 const intree = @import("../../engines/mlx/plugin/intree.zig");
 const distributed = @import("../../engines/mlx/cluster/distributed.zig");
 const Layout = @import("../../sdk/quant/native.zig").Layout;
+const streamed = @import("../../sdk/weights/streamed.zig");
 pub const config = @import("config.zig");
 
 pub const plugin = config.plugin;
@@ -77,7 +79,12 @@ pub const Model = struct {
     tower: ?vision.Dsv41Vision,
     caps: abi.Caps,
     s: mlx.mlx_stream,
+    /// A streamed pack's expert bank, and the prompt positions its slot rows were billed for.
+    bank: ?Bank = null,
+    bank_context: u64 = 0,
 };
+
+const Bank = if (build_options.mlx_stream) *streamed.Exl3.Source else void;
 
 /// The trunk's embedding table or LM head as loaded (borrowed), for the DSpark drafter.
 fn trunkWeight(mp: *anyopaque, which: abi.TrunkWeight, out: *quant_abi.Weight) callconv(.c) Verdict {
@@ -102,9 +109,11 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         return null;
     };
     return loadModel(ctx, s) catch |e| {
+        std.log.err("deepseek_v41: load failed: {t}", .{e});
         out.* = switch (e) {
             error.OutOfMemory => Verdict.refuse(.failed, "deepseek_v41: out of memory"),
             error.MissingWeight => Verdict.refuse(.failed, "deepseek_v41: a weight is missing"),
+            error.StreamedWeightsUnsupported => Verdict.refuse(.unsupported, "deepseek_v41: a streamed (experts.bin) pack needs the macOS build's expert streamer"),
             else => Verdict.refuse(.failed, "deepseek_v41: the pack does not load"),
         };
         return null;
@@ -146,14 +155,60 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     };
     m.s = s;
     m.caps = ctx.parsed.caps;
-    m.mdl = try dsv41.init(gpa, &m.cfg, &m.weights, s, .{ .dspark = dsv41.dsparkWanted(&m.cfg), .pair = m.cfg.dist_dsv41, .head_8bit = dsv41.head8Wanted() });
+    m.mdl = try dsv41.init(gpa, &m.cfg, &m.weights, s, .{ .dspark = dsv41.dsparkWanted(&m.cfg), .pair = m.cfg.dist_dsv41, .head_8bit = dsv41.head8Wanted(), .streamed_experts = c.dsv41_streamed });
     errdefer m.mdl.deinit();
+    m.bank = null;
+    if (c.dsv41_streamed) try openBank(m, io, ctx.model_dir.slice(), ctxSetting(ctx.settings_json.slice()));
+    errdefer closeBank(m);
     m.tower = if (c.dsv41_vision and taken == null) try vision.Dsv41Vision.init(gpa, m.cfg, &m.weights) else null;
     return m;
 }
 
+/// The pack's EXL3 bank at the slot rows the box holds beside the residents and a request of the model's `ctx_size`,
+/// else of the largest `bill.stream_context_rungs` rung that keeps `bill.stream_min_rows` rows, else of
+/// `bill.stream_context`.
+fn openBank(m: *Model, io: std.Io, dir: []const u8, ctx_size: ?u64) !void {
+    if (comptime !build_options.mlx_stream) return error.StreamedWeightsUnsupported;
+    const mdl = m.mdl;
+    const gates = try gpa.alloc(streamed.Exl3.Gate, mdl.n_layers);
+    defer gpa.free(gates);
+    for (gates, mdl.layers[0..mdl.n_layers]) |*g, *ly| g.* = .{ .w = ly.gate_w, .bias = ly.gate_bias };
+    _ = mlx.mlx_synchronize(m.s);
+    const c = &m.cfg;
+    const geo: streamed.Exl3.Geometry = .{ .hidden_size = c.hidden_size, .moe_intermediate_size = c.moe_intermediate_size, .n_experts_per_tok = c.num_experts_per_tok, .n_routed_experts = c.num_experts, .n_layers = @intCast(mdl.n_layers), .swiglu_limit = c.dsv4_swiglu_limit };
+    const context = ctx_size orelse for (bill_mod.stream_context_rungs) |rung| {
+        const at = bill_mod.streamBudget(c, rung);
+        const fit = streamed.Exl3.billOf(gpa, io, dir, geo, .{ .prompt = at.prompt, .decode = at.decode }) catch continue;
+        if (fit.rows.prompt >= bill_mod.stream_min_rows) break rung;
+    } else bill_mod.stream_context;
+    const budget = bill_mod.streamBudget(c, context);
+    const b = try streamed.Exl3.Source.open(gpa, io, dir, m.s, geo, gates, .{ .prompt = budget.prompt, .decode = budget.decode });
+    std.log.info("deepseek_v41: streamed experts, {d} prompt / {d} decode slot rows per layer for a {d}-token context ({d} B a row)", .{ b.bill.rows.prompt, b.bill.rows.decode, context, b.bill.row_bytes });
+    m.bank = b;
+    m.bank_context = context;
+    mdl.streamed = streamed.exl3Routed(b);
+}
+
+fn closeBank(m: *Model) void {
+    if (comptime !build_options.mlx_stream) return;
+    const b = m.bank orelse return;
+    m.mdl.streamed = null;
+    b.deinit();
+    m.bank = null;
+}
+
+/// The per-model `ctx_size` setting: the prompt positions a streamed bank bills.
+fn ctxSetting(settings_json: []const u8) ?u64 {
+    if (settings_json.len == 0) return null;
+    const S = struct { ctx_size: ?u64 = null };
+    const parsed = std.json.parseFromSlice(S, gpa, settings_json, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    return parsed.value.ctx_size;
+}
+
 fn unload(mp: *anyopaque) callconv(.c) void {
     const m: *Model = @ptrCast(@alignCast(mp));
+    closeBank(m);
     if (m.tower) |*t| t.deinit();
     m.mdl.deinit();
     m.weights.deinit();
@@ -171,6 +226,8 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     const pos: usize = if (f.positions.len > 0) f.positions.slice()[0] else 0;
     if (pos != 0 and (m.mdl.dec_state == null or m.mdl.dec_state.?.n != pos)) return Verdict.refuse(.failed, "deepseek_v41: the position does not follow the model's state");
     for (in.host) |t| if (t >= m.cfg.vocab_size) return Verdict.refuse(.failed, "deepseek_v41: token id past the vocabulary");
+    if (m.bank != null and in.host.len > 1 and f.logits != .all_rows and pos + in.host.len > m.bank_context)
+        return Verdict.refuse(.failed, "deepseek_v41: the prompt is longer than the streamed bank's billed context (ctx_size)");
     const rows: ?dsv41.VisionRows = if (f.media.ctx != null) .{ .rows = .{ .ctx = f.media.ctx }, .offset = f.media_offset } else null;
     const logits = run(m, in.host, pos, f.logits == .all_rows, rows, in.dev) catch return Verdict.refuse(.failed, "deepseek_v41: the forward failed");
     if (f.logits == .none) _ = mlx.mlx_array_free(logits) else out.logits = .{ .ctx = logits.ctx };
@@ -198,15 +255,29 @@ fn run(m: *Model, host_ids: []const u32, pos: usize, all: bool, rows: ?dsv41.Vis
         };
         defer _ = mlx.mlx_array_free(tok);
         break :blk try dsv41.extendResumableGpu(mdl, gpa, tok);
-    } else if (pos == 0)
-        try dsv41.prefill(mdl, gpa, ids, rows)
-    else
-        try dsv41.extendResumable(mdl, gpa, ids, rows);
+    } else try runPrompt(m, ids, pos, rows);
     defer _ = mlx.mlx_array_free(logits);
     var o = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(o);
     try mlx.check(mlx.mlx_reshape(&o, logits, &[_]c_int{ -1, @intCast(mdl.vocab) }, 2, m.s));
     return o;
+}
+
+/// A prompt from `pos` (0: a new request); a streamed bank's in calls of at most `bill.stream_call_rows`.
+fn runPrompt(m: *Model, ids: []const u32, pos: usize, rows: ?dsv41.VisionRows) !mlx.mlx_array {
+    const mdl = m.mdl;
+    if (pos == 0) try dsv41.reset(mdl, gpa);
+    const call = if (m.bank != null) bill_mod.stream_call_rows else ids.len;
+    var vr = rows;
+    var at: usize = 0;
+    while (true) {
+        const piece = ids[at..][0..@min(call, ids.len - at)];
+        const out = try dsv41.extendResumable(mdl, gpa, piece, vr);
+        at += piece.len;
+        if (at == ids.len) return out;
+        _ = mlx.mlx_array_free(out);
+        if (vr) |*v| v.offset += std.mem.count(u32, piece, &.{m.cfg.image_token_id});
+    }
 }
 
 /// `CacheHooks.resume_prompt`: restores the longest prefix of `prompt` the model kept (images keyed by their rows)

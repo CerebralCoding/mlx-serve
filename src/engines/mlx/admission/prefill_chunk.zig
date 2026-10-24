@@ -248,6 +248,9 @@ pub fn prefillNeededAtChunk(
     const ffn: u64 = prefillFfnWidth(config);
     if (is_dsv4) return dsv4PrefillMemoryNeeded(seq, layers, kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq));
     if (config.mlxStream()) return 0; // billed at construction (`mlx_stream.loadBytes`)
+    // A streamed bank's slot rows are filled at the load beside the prompt working set it reserves (DeepSeek-V4.1's
+    // `bill.streamBudget`); a longer prompt is the plugin's refusal by name.
+    if (config.plugin) |b| if (b.parsed.caps.streamed_weights) return 0;
     if (config.isDsv41()) return dsv41PrefillMemoryNeeded(config, seq, chunk);
     const drafter: u64 = (seq +| @min(@as(u64, max_tokens), transformer_mod.KVCache.RESERVE_GEN_HEADROOM)) *| config.drafter_ctx_bytes_per_token;
     if (config.isGlm5()) return glm5PrefillMemoryNeeded(config, seq, max_tokens, kv_bits, chunk, warm) +| drafter;

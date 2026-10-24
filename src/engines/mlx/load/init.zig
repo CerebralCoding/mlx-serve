@@ -64,14 +64,13 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
 
     // Bidirectional decoder archs (EmbeddingGemma) load through the standard arm and dispatch to
     // forwardGemma3EncoderWith. LFM2, Nemotron-H, DeepSeek-V4/V4.1's MLX packs and qwen4_exp run on their plugins only.
-    if (config.has_hybrid_layers or std.mem.eql(u8, config.model_type, "deepseek_v4") or (config.isDsv41() and !config.dsv41_stream) or config.isQwen4()) {
+    if (config.has_hybrid_layers or std.mem.eql(u8, config.model_type, "deepseek_v4") or config.isDsv41() or config.isQwen4()) {
         log.err("[load] {s}: its plugin does not serve this pack and the legacy forward is gone\n", .{config.model_type});
         return error.PluginDeclinedNoLegacy;
     }
     if (config.mimo_stream) return initMlxStream(io, allocator, config, s);
     if (config.glm_stream) return initMlxStream(io, allocator, config, s);
     if (config.glm5_stream) return initMlxStream(io, allocator, config, s);
-    if (config.dsv41_stream) return initMlxStream(io, allocator, config, s);
 
     const emb_base: []const u8 = "embed_tokens";
     const emb_w = getNamedWeight(weights, &name_buf, prefix, emb_base, "weight") orelse {
