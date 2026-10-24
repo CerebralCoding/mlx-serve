@@ -8,6 +8,7 @@ const mtp_mod = @import("../../../../sdk/spec/mtp/mtp.zig");
 const Transformer = transformer_mod.Transformer;
 const Generator = @import("../../generate/generator.zig").Generator;
 const MAX_ROUND_DRAFTS = @import("../mtp_head_ref.zig").MAX_ROUND_DRAFTS;
+const MtpHeadRef = @import("../mtp_head_ref.zig").MtpHeadRef;
 const MtpPreDraft = @import("chain.zig").MtpPreDraft;
 const SamplingParams = @import("../../sampling/params.zig").SamplingParams;
 const argmaxStepProposal = @import("../../sampling/spec_sampling.zig").argmaxStepProposal;
@@ -364,12 +365,12 @@ pub fn mtpGroupSampledDrafts(
 
 var mtp_lanes_logged: bool = false;
 
-/// Draft steps [from..to) for a group on one sidecar head: every lane is a row of ONE
-/// head forward per step, and one exact trunk-head readout proposes for all of them.
+/// Draft steps [from..to) for a group on one head (`MtpHeadRef.lanesWith`): every lane is a row
+/// of ONE head forward per step, and one exact trunk-head readout proposes for all of them.
 pub fn mtpChainBuildLanes(gens: []const *Generator, chains: []MtpPreDraft, from: u32, to: u32) !void {
     const xfm = gens[0].xfm;
     const s = xfm.s;
-    const head = gens[0].mtp.?.qwen;
+    const head = gens[0].mtp.?;
     const n = gens.len;
     if (!mtp_lanes_logged) {
         mtp_lanes_logged = true;
@@ -377,16 +378,16 @@ pub fn mtpChainBuildLanes(gens: []const *Generator, chains: []MtpPreDraft, from:
     }
     var i: u32 = from;
     while (i < to) : (i += 1) {
-        var lanes: [mtp_mod.MAX_LANES]mtp_mod.Lane = undefined;
+        var lanes: [mtp_mod.MAX_LANES]MtpHeadRef.Lane = undefined;
         for (gens, chains, 0..) |g, *c, k| {
             std.debug.assert(c.n_drafted == i);
-            const mc = &g.mtp_cache.?.qwen;
+            const mc = &g.mtp_cache.?;
             if (i == 0) if (g.mtp_hist_stash) |pending| {
                 var stash = pending;
                 g.mtp_hist_stash = null;
                 defer stash.deinit();
                 try mc.truncate(stash.off0, s);
-                try mtp_mod.appendKvOnly(head, xfm, mc, stash.ids, stash.hidden, @intCast(stash.off0), null);
+                try head.appendRows(xfm, mc, stash.ids, stash.hidden, @intCast(stash.off0));
             };
             lanes[k] = .{
                 .cache = mc,
@@ -395,7 +396,7 @@ pub fn mtpChainBuildLanes(gens: []const *Generator, chains: []MtpPreDraft, from:
                 .rope_offset = @intCast(c.off0 + i),
             };
         }
-        const post = try mtp_mod.forwardLanes(head, xfm, lanes[0..n]);
+        const post = try head.forwardLanes(xfm, lanes[0..n]);
         defer _ = mlx.mlx_array_free(post);
         const hidden_size = mlx.getShape(post)[2];
         var stacked_x = mlx.mlx_array_new();
@@ -433,23 +434,14 @@ pub fn mtpChainBuildBatchedActive(gens: []const *Generator, chains: []MtpPreDraf
     std.debug.assert(gens.len == chains.len);
     var any_mrope = false;
     var all_qwen4 = true;
-    var one_sidecar = true;
+    var one_head = true;
     for (gens) |g| {
         if (g.mtpMropeContext() != null) any_mrope = true;
-        switch (g.mtp.?) {
-            .qwen4 => one_sidecar = false,
-            .plugin => {
-                all_qwen4 = false;
-                one_sidecar = false;
-            },
-            .qwen => |h| {
-                all_qwen4 = false;
-                if (h != gens[0].mtp.?.qwen) one_sidecar = false;
-            },
-        }
+        if (g.mtp.? != .qwen4) all_qwen4 = false;
+        if (!gens[0].mtp.?.lanesWith(g.mtp.?)) one_head = false;
     }
     // The lanes step hands back no head logits: a row that needs them builds alone.
-    if (one_sidecar and !any_mrope and gens.len > 1 and mtpRowRerankMode(gens[0], &chains[0], from)) {
+    if (one_head and !any_mrope and gens.len > 1 and mtpRowRerankMode(gens[0], &chains[0], from)) {
         return mtpChainBuildLanes(gens, chains, from, to);
     }
     if (!all_qwen4 or any_mrope or gens.len == 1) {

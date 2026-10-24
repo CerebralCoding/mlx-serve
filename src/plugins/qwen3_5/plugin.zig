@@ -89,6 +89,8 @@ pub const head_hooks: abi.HeadHooks = .{
     .mark = &headRelease,
     .draft_select = &headSelect,
     .bill = &headBill,
+    .forward_lanes = &headForwardLanes,
+    .cost_fingerprint = &headFingerprint,
 };
 
 const gpa = ld.gpa;
@@ -609,6 +611,19 @@ fn headForward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     defer if (m.rht) |reg| reg.dropMemo();
     mtp.forward(h, f, out) catch |e| return ld.failed(e);
     return .ok;
+}
+
+fn headForwardLanes(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) Verdict {
+    const m: *Loaded = @ptrCast(@alignCast(mp));
+    const h = &(m.head orelse return Verdict.refuse(.failed, "qwen3_5: no MTP head loaded"));
+    defer if (m.rht) |reg| reg.dropMemo();
+    mtp.forwardLanes(h, f, out) catch |e| return ld.failed(e);
+    return .ok;
+}
+
+fn headFingerprint(mp: *anyopaque) callconv(.c) u32 {
+    const m: *Loaded = @ptrCast(@alignCast(mp));
+    return if (m.head) |*h| h.costFingerprint() else 0;
 }
 
 pub fn unload(mp: *anyopaque) callconv(.c) void {

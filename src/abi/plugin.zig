@@ -561,6 +561,13 @@ pub const HeadHooks = extern struct {
     shortlist: ?*const fn (m: *anyopaque, hidden: Array, k: u32, out: *Array) callconv(.c) Verdict = null,
     rerank: ?*const fn (m: *anyopaque, hidden: Array, shortlist: Array, out: *Array) callconv(.c) Verdict = null,
     bill: *const fn (p: *const Parsed) callconv(.c) u64,
+    /// One draft step for several requests as the rows of one head forward: row k of `ids` `[n, 1]` and of
+    /// `hidden_in` `[1, n, hidden]` runs at `positions[k]` over `caches[k]`; `out.hidden` = the normed rows
+    /// `[1, n, hidden]`. Null = the engine drafts each request alone.
+    forward_lanes: ?*const fn (m: *anyopaque, f: *const Forward, out: *ForwardOut) callconv(.c) Verdict = null,
+    /// The head's half of the engine's measured cost fingerprint: `bits << 16 | group` when the loaded head is the
+    /// measured dense layout (bf16 fc `[2H, H]` and norms, every projection affine at that one width); 0 = none.
+    cost_fingerprint: ?*const fn (m: *anyopaque) callconv(.c) u32 = null,
 };
 
 /// A drafter the model carries in its own forward (DSpark); stages and block are `SpecFacts`.

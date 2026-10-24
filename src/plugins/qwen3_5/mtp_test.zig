@@ -17,7 +17,12 @@ const MtpHeadRef = @import("../../engines/mlx/spec/mtp_head_ref.zig").MtpHeadRef
 const MtpCacheRef = @import("../../engines/mlx/spec/mtp_head_ref.zig").MtpCacheRef;
 const Generator = @import("../../engines/mlx/generate/generator.zig").Generator;
 const Tokenizer = @import("../../sdk/tokenizer/tokenizer.zig").Tokenizer;
-const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
+const transformer_mod = @import("../../engines/mlx/transformer.zig");
+const Transformer = transformer_mod.Transformer;
+const KVCache = transformer_mod.KVCache;
+const SSMCacheEntry = transformer_mod.SSMCacheEntry;
+const ForwardCtx = transformer_mod.ForwardCtx;
+const chain_build = @import("../../engines/mlx/spec/mtp/chain_build.zig");
 const served_test = @import("served_test.zig");
 const qwen3_5 = @import("plugin.zig");
 
@@ -212,4 +217,240 @@ pub fn expectHeadAt(table: *const @import("../../abi/plugin.zig").ModelTable, pk
     try p.oracle.stream(&tokens[1], &tokens[0]);
     try p.oracle.stream(accepted[1].items, accepted[0].items);
     try p.oracle.done();
+}
+
+/// A dense head in the measured layout: bf16 fc and norms, every projection 4-bit/gs64.
+fn writeQuantHead(path: []const u8) !void {
+    var hp = fixture.Pack.init(0x47b1);
+    defer hp.deinit();
+    try hp.weight("mtp.fc", H, 2 * H, false);
+    for ([_][]const u8{ "mtp.pre_fc_norm_embedding.weight", "mtp.pre_fc_norm_hidden.weight", "mtp.norm.weight", "mtp.layers.0.input_layernorm.weight", "mtp.layers.0.post_attention_layernorm.weight" }) |k|
+        try hp.norm(k, H);
+    try hp.norm("mtp.layers.0.self_attn.q_norm.weight", 256);
+    try hp.norm("mtp.layers.0.self_attn.k_norm.weight", 256);
+    try hp.weight("mtp.layers.0.self_attn.q_proj", 2 * 4 * 256, H, true);
+    try hp.weight("mtp.layers.0.self_attn.k_proj", 2 * 256, H, true);
+    try hp.weight("mtp.layers.0.self_attn.v_proj", 2 * 256, H, true);
+    try hp.weight("mtp.layers.0.self_attn.o_proj", H, 4 * 256, true);
+    try hp.weight("mtp.layers.0.mlp.gate_proj", 512, H, true);
+    try hp.weight("mtp.layers.0.mlp.up_proj", 512, H, true);
+    try hp.weight("mtp.layers.0.mlp.down_proj", H, 512, true);
+    const file = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/model-mtp.safetensors", .{path}, 0);
+    defer testing.allocator.free(file);
+    const meta = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(meta);
+    try mlx.check(mlx.mlx_save_safetensors(file.ptr, hp.map, meta));
+}
+
+const nax_profile = @import("../../engines/mlx/spec/mtp_nax_profile.zig");
+
+test "qwen3_5 MTP head: the measured-cost fingerprint, trunk projections and profile are the legacy sidecar arm's" {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var pk = fixture.Pack.init(0x47a4);
+    defer pk.deinit();
+    try pack.writePack(&pk, false, true, 8);
+    var p: served_test.Pair = undefined;
+    try p.openWith(&qwen3_5.table, &pk, pack.config(false, true, 8), &noCapture);
+    p.oracle = .{};
+    defer p.close();
+    try writeQuantHead(p.dir);
+    var legacy = try mtp_mod.loadMtp(io, a, fixture.stream(), p.dir);
+    defer legacy.deinit();
+    try legacy.bind(&p.lg.xfm);
+    const served = plugin_head.load(io, a, &p.xfm, p.dir) orelse return error.HeadNotLoaded;
+    defer plugin_head.destroy(served, a);
+
+    const c = &p.lg.xfm.config;
+    const want = legacy.m5NaxHeadFingerprint(.{ .hidden = c.hidden_size, .heads = c.num_attention_heads, .kv_heads = c.num_key_value_heads, .head_dim = c.head_dim, .intermediate = c.intermediate_size }) orelse return error.TestExpectedFingerprint;
+    try testing.expectEqual(mtp_mod.HeadFingerprint{ .bits = 4, .group_size = 64 }, want);
+    try testing.expectEqual(@as(?mtp_mod.HeadFingerprint, want), served.fingerprint);
+    try testing.expectEqual(legacy.m5NaxCostProfile(&p.lg.xfm), served.m5NaxCostProfile(&p.xfm));
+    try testing.expectEqual(legacy.draft_head != null, served.draft_head != null);
+    try testing.expectEqual(legacy.rerank_coarse != null, served.rerank_coarse != null);
+
+    // The served shell reads the trunk off the pack's tensors, the legacy one off its layers: the same projections.
+    const by_layers: nax_profile.TrunkSource = .{ .layers = p.lg.xfm.moe_layers };
+    const by_names: nax_profile.TrunkSource = .{ .weights = .{ .w = &p.lg.weights, .prefix = c.weight_prefix } };
+    for (0..c.num_hidden_layers) |i| {
+        const x = by_layers.at(c, i) orelse return error.TestExpectedLayer;
+        const y = by_names.at(c, i) orelse return error.TestExpectedLayer;
+        try testing.expectEqual(x.linear, y.linear);
+        const n: usize = if (x.linear) 5 else 4;
+        for (x.attn[0..n], y.attn[0..n]) |u, v| try expectProj(u, v);
+        for (x.mlp, y.mlp) |u, v| try expectProj(u, v);
+    }
+    inline for (.{ false, true }) |oqe| try testing.expectEqual(nax_profile.trunkMatches(c, by_layers, oqe), nax_profile.trunkMatches(c, by_names, oqe));
+    try testing.expectEqual(p.lg.xfm.mtp_uniform_affine_trunk, p.xfm.mtp_uniform_affine_trunk);
+    try testing.expectEqual(p.lg.xfm.mtp_oqe_affine_trunk, p.xfm.mtp_oqe_affine_trunk);
+}
+
+fn expectProj(want: anytype, got: anytype) !void {
+    for ([_]Array{ want.w, want.s, want.b }, [_]Array{ got.w, got.s, got.b }) |x, y| {
+        try testing.expectEqual(x.ctx == null, y.ctx == null);
+        if (x.ctx != null) try ops.expectBitEqual(y, x);
+    }
+}
+
+/// One request on `xfm` with its own trunk cache, drafting on `head`.
+const Slot = struct {
+    cache: KVCache,
+    off: usize = 0,
+    entries: []SSMCacheEntry,
+    gen: Generator = undefined,
+
+    fn init(a: std.mem.Allocator, xfm: *Transformer, tok: *Tokenizer, head: MtpHeadRef, prompt: []const u32) !*Slot {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const slot = try a.create(Slot);
+        errdefer a.destroy(slot);
+        slot.* = .{ .cache = try KVCache.init(a, xfm.config.num_hidden_layers), .entries = try fixture.newEntries(xfm.config.num_hidden_layers) };
+        errdefer {
+            fixture.freeEntries(slot.entries);
+            slot.cache.deinit();
+        }
+        const ctx: ForwardCtx = .{ .cache = &slot.cache, .moe_seq_offset = &slot.off, .ssm_entries = slot.entries, .capture_hidden = null, .vision_embeddings = null };
+        slot.gen = try Generator.initWithOptions(io, a, xfm, tok, prompt, 64, .{ .temperature = 0 }, &.{}, .{
+            .ctx = ctx,
+            .mtp = head,
+            .mtp_enabled = true,
+            .model_has_mtp = true,
+            .mtp_depth = 2,
+            .skip_lazy_preforward = true,
+        });
+        return slot;
+    }
+
+    fn deinit(slot: *Slot, a: std.mem.Allocator) void {
+        slot.gen.deinit(a);
+        fixture.freeEntries(slot.entries);
+        slot.cache.deinit();
+        a.destroy(slot);
+    }
+};
+
+/// Two requests' draft chains built as lanes of one head forward (`mtpChainBuildLanes`) on each arm: the same drafts
+/// and the same chained hidden rows, two rounds deep (the second merges each request's committed history first).
+fn expectLanes(comptime moe: bool, seed: u64) !void {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var pk = fixture.Pack.init(seed);
+    defer pk.deinit();
+    try pack.writePack(&pk, moe, true, 8);
+    var p: served_test.Pair = undefined;
+    try p.openWith(&qwen3_5.table, &pk, pack.config(moe, true, 8), &noCapture);
+    p.oracle = .{};
+    defer p.close();
+    if (moe) try writeMoeHead(p.dir) else try writeHead(p.dir, .{});
+    var legacy = try mtp_mod.loadMtp(io, a, fixture.stream(), p.dir);
+    defer legacy.deinit();
+    try legacy.bind(&p.lg.xfm);
+    const served = plugin_head.load(io, a, &p.xfm, p.dir) orelse return error.HeadNotLoaded;
+    defer plugin_head.destroy(served, a);
+    const heads = [_]MtpHeadRef{ .{ .qwen = &legacy }, .{ .plugin = served } };
+    for (heads) |h| try testing.expect(h.lanesWith(h));
+    try testing.expect(!heads[1].lanesWith(heads[0]));
+
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    depth_bounds.active = .{ .min = 2, .max = 2 };
+    defer depth_bounds.active = .{};
+    const prompts = [_][]const u32{ &.{ 3, 7, 1, 12, 30, 5, 9, 22, 4, 17, 2, 28 }, &.{ 40, 2, 9, 61, 7, 33, 5, 19, 8 } };
+    const xs = p.shells();
+    var slots: [2][2]*Slot = undefined;
+    for (heads, xs, 0..) |h, x, k| for (prompts, 0..) |pr, r| {
+        slots[k][r] = try Slot.init(a, x, &tok, h, pr);
+    };
+    defer for (slots) |arm| for (arm) |sl| sl.deinit(a);
+    var g = ops.Graph.init(a, fixture.stream());
+    defer g.deinit();
+    for (0..2) |_| {
+        var drafts: [2][2][2]Array = undefined;
+        var hidden: [2][2]Array = undefined;
+        for (0..2) |k| {
+            var gens: [2]*Generator = undefined;
+            var opens: [2]Generator.MtpRoundOpen = undefined;
+            var chains: [2]Generator.MtpPreDraft = undefined;
+            for (0..2) |r| {
+                gens[r] = &slots[k][r].gen;
+                gens[r].mtp_depth_current = 2;
+                gens[r].spec_cost_solo = false;
+                // A group row: the round opens for the group's build and never pre-drafts alone.
+                gens[r].mtp_batch_head = true;
+                opens[r] = switch (try gens[r].mtpRoundBegin(a)) {
+                    .open => |o| o,
+                    else => return error.TestExpectedOpenRound,
+                };
+                chains[r] = opens[r].chain;
+            }
+            try chain_build.mtpChainBuildLanes(&gens, &chains, 0, 2);
+            for (0..2) |r| {
+                for (0..2) |d| drafts[k][r][d] = try g.adopt(try Transformer.axisView(fixture.stream(), chains[r].draft_arrs[d], 0, 0));
+                hidden[k][r] = try g.adopt(try Transformer.axisView(fixture.stream(), chains[r].h_chain.?, 0, 0));
+                opens[r].chain = chains[r];
+                var st = try gens[r].mtpRoundContinue(a, opens[r]);
+                defer st.deinit(a);
+                try gens[r].mtpRoundVerify(&st);
+                if (try gens[r].mtpRoundFinish(a, &st)) |res| a.free(res.tokens);
+            }
+        }
+        for (0..2) |r| {
+            for (0..2) |d| try ops.expectBitEqual(drafts[1][r][d], drafts[0][r][d]);
+            try ops.expectBitEqual(hidden[1][r], hidden[0][r]);
+        }
+    }
+}
+
+test "qwen3_5 MTP head: a group drafts as lanes of one head forward, equal to the legacy sidecar's lanes" {
+    try expectLanes(false, 0x47a5);
+}
+
+test "qwen3_5 MTP head: a MoE trunk's head drafts lanes equal to the legacy arm's" {
+    try expectLanes(true, 0x47a6);
+}
+
+test "qwen3_5 MTP head: an image turn's steps rope as the legacy arm ropes them, inside and past the M-RoPE table" {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var pk = fixture.Pack.init(0x47a7);
+    defer pk.deinit();
+    try pack.writePack(&pk, false, true, 8);
+    var p: served_test.Pair = undefined;
+    try p.openWith(&qwen3_5.table, &pk, pack.config(false, true, 8), &noCapture);
+    p.oracle = .{};
+    defer p.close();
+    try writeHead(p.dir, .{});
+    var legacy = try mtp_mod.loadMtp(io, a, fixture.stream(), p.dir);
+    defer legacy.deinit();
+    try legacy.bind(&p.lg.xfm);
+    const served = plugin_head.load(io, a, &p.xfm, p.dir) orelse return error.HeadNotLoaded;
+    defer plugin_head.destroy(served, a);
+    const heads = [_]MtpHeadRef{ .{ .qwen = &legacy }, .{ .plugin = served } };
+    const xs = p.shells();
+    for (xs) |x| x.config.mrope_section = .{ 11, 11, 10 };
+
+    // Six prompt positions (an image's rows share t), then generated text at `absolute + delta`.
+    const table = [_]i32{ 0, 1, 2, 2, 2, 3 } ++ [_]i32{ 0, 1, 2, 3, 3, 4 } ++ [_]i32{ 0, 1, 2, 3, 4, 5 };
+    const mctx: mtp_mod.MropeContext = .{ .pos = &table, .total = 6, .delta = -2 };
+    var caches: [2]MtpCacheRef = undefined;
+    for (heads, &caches) |h, *c| c.* = try h.makeCache(a);
+    defer for (&caches) |*c| c.deinit();
+    var g = ops.Graph.init(a, fixture.stream());
+    defer g.deinit();
+    const width = p.cfg.hidden_size;
+    const dt = p.cfg.actDtype();
+    const hist = try hiddenRows(&g, 4, width, dt, 11);
+    const straddle = try hiddenRows(&g, 3, width, dt, 12);
+    const one = try hiddenRows(&g, 1, width, dt, 13);
+    const many = try hiddenRows(&g, 3, width, dt, 14);
+    var outs: [2][5]Array = undefined;
+    for (heads, xs, &caches, 0..) |h, x, *c, k| {
+        try h.appendHistory(x, c, &.{ 5, 9, 40, 7 }, hist, 0, mctx, a);
+        // Rows 4 and 5 sit inside the table, row 6 past it.
+        const merged = try h.forward(x, c, try idArr(&g, &.{ 11, 12, 13 }), straddle, 4, .logits, mctx, null);
+        const mixed = try h.forward(x, c, try idArr(&g, &.{60}), one, 7, .mixed, mctx, null);
+        const rows = try h.forward(x, c, try idArr(&g, &.{ 61, 2, 90 }), many, 8, .mixed, mctx, null);
+        outs[k] = .{ try g.adopt(merged.logits), try g.adopt(merged.hidden_next), try g.adopt(mixed.hidden_next), try g.adopt(rows.hidden_next), try g.adopt(try h.draftSelect(x, mixed.hidden_next, null)) };
+        try testing.expectEqual(@as(usize, 11), c.step());
+    }
+    for (outs[0], outs[1]) |want, got| try ops.expectBitEqual(got, want);
 }

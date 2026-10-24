@@ -33,9 +33,7 @@ const MoeLayerWeights = @import("../forward/layered.zig").MoeLayerWeights;
 const KVCache = @import("../kv/cache.zig").KVCache;
 const LayerWeights = @import("../layer_weights.zig").LayerWeights;
 const initMlxStream = @import("../modules/mlx_stream.zig").initMlxStream;
-const mtpNaxCalibratedModelFrom = @import("../spec/mtp_nax_profile.zig").mtpNaxCalibratedModelFrom;
-const mtpNaxOqeAffineTrunkFrom = @import("../spec/mtp_nax_profile.zig").mtpNaxOqeAffineTrunkFrom;
-const mtpNaxUniformAffineTrunkFrom = @import("../spec/mtp_nax_profile.zig").mtpNaxUniformAffineTrunkFrom;
+const mtp_nax_profile = @import("../spec/mtp_nax_profile.zig");
 const SSMCacheEntry = @import("../ssm/entry.zig").SSMCacheEntry;
 const Transformer = @import("../transformer.zig").Transformer;
 const initStandardLayers = @import("layers_dense.zig").initStandardLayers;
@@ -576,19 +574,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
         }
     }
 
-    const profile_head_shape = mlx.getShape(lm_head_w);
-    const profile_head_n: c_int = if (profile_head_shape.len == 2) profile_head_shape[0] else 0;
-    const uniform_profile_bits = config.quant_bits == 4 or config.quant_bits == 6 or config.quant_bits == 8;
-    const mtp_uniform_affine_trunk = mtpNaxCalibratedModelFrom(&config, profile_head_n) and
-        uniform_profile_bits and
-        config.quant_group_size == 64 and
-        config.quant_mode == .affine and
-        mtpNaxUniformAffineTrunkFrom(&config, moe_layers);
-    const mtp_oqe_affine_trunk = mtpNaxCalibratedModelFrom(&config, profile_head_n) and
-        config.quant_bits == 4 and
-        config.quant_group_size == 64 and
-        config.quant_mode == .affine and
-        mtpNaxOqeAffineTrunkFrom(&config, moe_layers);
+    const mtp_trunk = mtp_nax_profile.trunkFlags(&config, lm_head_w, .{ .layers = moe_layers });
     var cfg = config;
     if (cfg.rowExactArch()) {
         const gather_only = if (lm_head_w.ctx == emb_w.ctx) mlx.mlx_array{ .ctx = null } else emb_w;
@@ -653,8 +639,8 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
         .embedding_norm = embedding_norm_w,
         .prompt_cache = null,
         .bits_cache = bits_cache,
-        .mtp_uniform_affine_trunk = mtp_uniform_affine_trunk,
-        .mtp_oqe_affine_trunk = mtp_oqe_affine_trunk,
+        .mtp_uniform_affine_trunk = mtp_trunk.uniform,
+        .mtp_oqe_affine_trunk = mtp_trunk.oqe,
     };
 }
 
