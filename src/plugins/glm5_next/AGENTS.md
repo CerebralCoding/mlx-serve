@@ -52,3 +52,9 @@ Batched verify rows (`batched_rows`, rows > 1) are refused by name: the engine k
   draft head the legacy GLM head never built (drafts only, never output): needs a `SpecFacts` fact.
 - Kernel contracts for the 20 `kernels/*.metal` rows are not registered.
 - No `[dtype-trace]`, `MLX_SERVE_GLM_PROFILE` or layer-cap diagnostics on the table forward.
+
+## The row from the root architecture table
+
+GLM-5.3-Flash: KDA (f32 state) + DSA (absorbed NoPE MLA, indexer past position 2051) inside mHC, 288-expert MoE.
+Thinking ON. Batches decode (`forwardGlmBatchedDecode`); MTP = its `mtp.0` layer. Vision = `vision.zig`, rows spliced
+at `<|image|>` on 1-D positions.

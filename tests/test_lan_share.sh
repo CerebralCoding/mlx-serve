@@ -8,7 +8,7 @@
 # `[lan] proxy` line); load/unload of a remote id are 200 no-ops; A's gate via the LAN IP 403s metrics, GET /,
 # load-model while /health and the filtered /v1/models stay open and loopback is untouched; a direct non-loopback
 # `@peer` request hops once, a tunneled one never again; A never lists itself. SKIPs without the model or a
-# non-loopback IP. Hermetic twins: lan.zig (incl. the tunnel pump against a fake peer) and `lanShareDenial`.
+# non-loopback IP. Hermetic twins: host/lan/lan.zig (incl. the tunnel pump against a fake peer) and `lanShareDenial`.
 
 source "$(dirname "$0")/lib/server.sh"
 MODEL="${1:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit}"

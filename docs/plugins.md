@@ -1,26 +1,45 @@
 # Plugins
 
-How engine work from another repository ships inside mlx-serve: compiled into our build, from its repository, at a
-pinned commit, with as little glue on our side as possible. This replaces the proposal on
-`claude/mlx-serve-modular-arch-l2h588` (8781a6c). The goal is the same and the mechanism is much smaller: no SDK
-layer, no registry, no negotiation. Plugin and host already share one MLX and one compiler.
+Every model family and media backend is a plugin: a folder under `src/plugins/<name>/` compiled into the server, or a
+dylib built from the plugin kit and installed at runtime. Three vendored modules (GGUF, sushi's EXL3, mlx-stream)
+predate the plugin table and plug in at seams below it; their sections close this page.
 
-## What a plugin is
+## In-tree plugins
 
-- A Zig module in its own repository, pinned as a git submodule under `lib/<name>`. `-D<name>-dir=/abs/path` builds
-  against a checkout instead.
-- It imports `std`, `builtin` and one host module, `mlx_host`. It imports nothing else from the host and never
-  another plugin.
-- It owns only what differs from the host: a file format, a weight encoding and its kernels, or a model's forward.
-  HTTP, chat templates, tool calls, sampling, stops, the scheduler, memory admission and the app stay the host's.
-- The host calls it from one glue file (`src/arch/<name>.zig`) or from one call site at a seam. The plugin never
-  calls back into host internals.
-- Glue budget on our side: one submodule line, one `build.zig` function, the glue, one `NOTICE` paragraph.
+- **A folder per family.** `src/plugins/<name>/` holds `plugin.zig` (the table: `sdk.Plugin` with its `kind`
+  (`model`, `media` or `quant`) and the `model_type`s it claims), `config.zig` (the claim and parse, MLX-free: the
+  build refuses a `config.zig` whose import closure reaches `src/mlx/`, `src/engines/`, `src/host/` or `src/kernels/`)
+  and an `AGENTS.md` (what it owns, its rules, its known issues). The table's contract is `src/abi/plugin.zig`;
+  `Caps` declares what the engine may assume (batching, MoE, the exactness contracts in `docs/known-issues.md`).
+- **Registration is a scan.** `build/plugins.zig` scans `src/plugins/*/plugin.zig` at configure time and writes the
+  git-ignored `src/plugins/registry.zig`. A folder starting with `_` is a template (`_template`, `_template_media`,
+  `_template_quant`): compiled and tested, never registered. Copy one to start a family.
+- **Blocks come from the SDK.** `src/sdk/` holds the bases, blocks, quant formats, weight sources, spec heads and test
+  harnesses a plugin builds on; a plugin never imports another plugin (shared code moves into the SDK).
+- **Proof.** A plugin carries its own bar: a proof test against recorded goldens or a reference oracle, the released
+  configs it claims (`src/fixtures/model-configs/`), and a registered contract for each of its Metal kernels
+  (`contract.zig`, `src/sdk/testing/kernel_contract/REGISTERING.md`).
+- **Units.** `-Dunits=true` builds each plugin as its own object (`zig build units-check -Dunits=true` for host
+  globals; AGENTS.md "Building").
 
-## `mlx_host`: the one import, and the hub between plugins
+## Outside plugins (dylibs)
+
+- **The kit.** `zig build kit` stages `zig-out/kit/mlx-serve-plugin-kit-<version>/` and its tarball: `build/kit/`,
+  `src/kit.zig`'s import closure, mlx-c's headers, the MLX pin and the example plugins (`src/plugins/_example*`).
+  `zig build test` builds every example from the staged kit, so the kit and the server cannot drift.
+- **The CLI** (`src/host/plugins/cli.zig`): `mlx-serve plugin new <name> [--media|--quant]` copies the kit's example;
+  `plugin check` loads a built dylib and runs the conformance suite (`src/sdk/testing/conformance.zig`) on its
+  fixture; `plugin install` copies it into `~/.mlx-serve/plugins/` with a receipt of its hash (a quarantined
+  download needs `--yes`).
+- **Loading** (`src/host/plugins/loader.zig`): at startup, when `plugins.json` says `"enabled": true`. Each dylib must
+  match its receipt's hash, is negotiated (`src/abi/dylib.zig`: a plugin built against another MLX is refused) and
+  joins the claims. A refusal names the file and the reason, and the server serves on without it. A dylib is never
+  unloaded.
+
+## Vendored modules: `mlx_host`, the one import
 
 `mlx_host` is the host's root module (`src/main.zig`, `src/tests.zig`, `src/ios_lib.zig`); `build.zig` passes it to
-every plugin. A plugin reads only the declarations those roots re-export for it:
+the two vendored modules (`sushi_exl3`, `mlx_stream`). They read only the declarations those roots re-export:
 
 | Declaration | What | Used by |
 |---|---|---|
@@ -53,49 +72,6 @@ The deeper the seam, the less of our stack the model gets for free. Use the shal
 Not a seam: **opaque engines.** ds4 and llama.cpp keep their bridges (`src/engines/ds4/bridge.zig`, `src/engines/llama/bridge.zig`).
 
 A seam is added with its first consumer and generalized with its second.
-
-## Wiring a plugin
-
-1. **Pin it.** `git submodule add <url> lib/<name>`. Anything compiled into a release is pinned from a repository we
-   control (a fork, as with `ddalcu/sushi`). The author keeps developing upstream, and a bump is a PR that moves the
-   pin.
-2. **Build it.** Add one function to `build.zig`, shaped like `addGgufModule`, and call it once per graph (server,
-   tests, Linux, iOS):
-
-   ```zig
-   fn addNameModule(b: *std.Build, host: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
-       const m = b.createModule(.{
-           .root_source_file = nameRoot(b), // lib/<name>/src/root.zig, or -D<name>-dir
-           .target = target,
-           .optimize = optimize,
-           .link_libc = true,
-           .imports = &.{.{ .name = "mlx_host", .module = host }},
-       });
-       host.addImport("<name>", m);
-   }
-   ```
-
-   The plugin's C sources go into its module in the same function. Plain C (a pthread read pool) and Objective-C over
-   public Metal API are fine.
-3. **Glue it.** `src/arch/<name>.zig` is the only host file that imports the plugin, unless the seam is a single call
-   (EXL3's MoE call sits in `transformer.zig`). The glue translates host types (`ModelConfig`, `Transformer`,
-   `ForwardCtx`) into the plugin's plain arguments: slices, integers, `mlx_array`.
-4. **Platforms.** Pure Zig over `mlx_host.mlx` compiles on every graph. macOS-only code (Objective-C, Metal events)
-   gets a stub glue file chosen by a build option (`build_options.mlx_stream`, as `macos_engines` picks
-   `src/engines/ds4/stub.zig`). The stub refuses the model by name.
-5. **Tests.** The plugin's own suite runs in its own repository (see below). Its root also runs as a test artifact in
-   our `zig build test` (one `b.addTest` per plugin), so a host change that breaks it fails here. The glue's tests live
-   in the glue file.
-6. **NOTICE.** One paragraph naming the repository, its license and what it ports. The license must allow
-   redistribution in our MIT / Apache-2.0 release.
-
-## Developing a plugin on its own
-
-The plugin's `build.zig` builds against an mlx-serve checkout (`-Dmlx-serve=../mlx-serve`). A three-line
-`standalone/mlx_host.zig` re-exports the host's `src/mlx/ffi.zig` (plus `log.zig` and `io_util.zig` if it uses them).
-To serve, build mlx-serve with `-D<name>-dir=$PWD`. No slim host and no fork are needed. mlx-stream's `build.zig`
-drives the host's own build instead (`zig build test` runs the host's `mlx-stream-test` step, `zig build conformance`
-its `mlx-stream-conformance` step).
 
 ## Example: GGUF (format seam)
 
@@ -179,8 +155,8 @@ holds the arch contract's types. MLX-format V4.1 packs stay in-tree (`src/plugin
 
 ## Rules for plugin code
 
-- Our `AGENTS.md` rules apply to the glue in our tree. A plugin's internals follow its own repository's rules, and
-  its tests must pass in our `zig build test`.
+- Our `AGENTS.md` rules apply to every plugin, in-tree and vendored; an outside plugin's tests are its own, and
+  `plugin check` is the bar it must pass here.
 - **Refuse by name.** An unsupported config, layout or platform is a named error plus a `log.err` line. It never
   falls back to another arch.
 - **No new CLI flags or env levers for one plugin.** Use what the host already has: the GPU ceiling
@@ -192,18 +168,3 @@ holds the arch contract's types. MLX-format V4.1 packs stay in-tree (`src/plugin
 - **Weight layouts start from mlx-lm.** Read mlx-lm's model file and the MLX packs on Hugging Face first. A new layout
   needs a stated reason, and a pack other engines can read beats one only the plugin reads.
 - **No host types in a plugin's API, and no plugin types on host-wide structs** beyond one pointer.
-
-## Left out of the earlier proposal, on purpose
-
-- **Compile-time API and MLX negotiation.** The compiler already checks every call, and the submodule pin is the
-  version. There is one MLX per binary because there is one `mlx_host.mlx`.
-- **`claims(peek) ?Priority`, a registry and tie-breaks in `model-settings.json`.** One plugin serves each
-  `model_type` or file format, so the glue's dispatch arm is the registration.
-- **`source` and `engine` kinds, a slim host, conformance lanes.** None has a consumer. Each lands with its first
-  real one, the way the arch seam landed with mlx-stream.
-
-## Status
-
-- On main: the format seam (GGUF, in-tree); the weight-encoding seam (EXL3 from sushi, in-tree).
-- With DeepSeek-V4.1: the arch seam (mlx-stream, absorbed from `ddalcu/mlx-stream`, a fork of `davidtai/mlx-stream`),
-  its suite in `zig build test`.

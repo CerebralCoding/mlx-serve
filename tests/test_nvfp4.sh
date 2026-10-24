@@ -5,7 +5,7 @@
 #
 #   NVFP4_TEST_MODEL=<dir> PORT=8096 ./tests/test_nvfp4.sh   # default mlx-community/Qwen3-0.6B-nvfp4; SKIPs without
 #
-# Hermetic twins: `computeQuantParams` and the nvfp4 qmatmul/gather tests in transformer.zig.
+# Hermetic twins: `computeQuantParams` and the nvfp4 qmatmul/gather tests in engines/mlx/transformer.zig.
 
 set -euo pipefail
 

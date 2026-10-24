@@ -6,7 +6,7 @@
 #
 # Checks: listed rows with twinned context_length, disabled rows absent, chat proxied with `api_key_env` winning and
 # the bare model id, de-chunked SSE relay under our head, `/v1/messages` a named 400, GET /v1/providers, rows that
-# drop when a stub dies and return on reload, the `[providers]` log lines. Hermetic twins: providers.zig tests.
+# drop when a stub dies and return on reload, the `[providers]` log lines. Hermetic twins: host/api/providers.zig tests.
 
 set -u
 source "$(dirname "$0")/lib/server.sh"

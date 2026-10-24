@@ -43,3 +43,10 @@ attention, `attention_k_eq_v` (keys the legacy dropped or mis-served), hd 256, a
 - Config reads: a default only ONE family wants is pinned PER LAYER TYPE (muse `rope_local_base_freq`, guard
   `tests/test_muse_repetition.sh`).
 - The muse channel-header, `to=self` reasoning and prior-turn-reasoning rules stay in the root (host chat code).
+
+## The row from the root architecture table
+
+Muse-Glimmer-30B (dense VL, GQA 32/2 hd128): sandwich norms, qk-norm folded into `attnScale()`, sigmoid out-gate, NoPE
+every 4th layer, softcap 20. Harmony channels + ATEM tools; thinking ON with tools / OFF without
+(`defaultEnableThinking`). CASED Llama-3 pretokenizer (`.llama3`). Vision `vision.zig`; DFlash via `-assistant`
+sidecar.

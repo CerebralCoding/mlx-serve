@@ -36,3 +36,7 @@ a non-text2music `task`) are named refusals. The assembled prompt is capped at 5
 ## Fixtures
 - `conformanceFixture`: one layer per stage at 32 over the real vocabulary layout, 4-bit head, vocoder 16 → 4.
 - Reference oracles: `tests/dump_music3_fixtures.py` → `MUSIC3_*` env-gated tests in `music3.zig`.
+
+## Rules (moved from the root AGENTS.md)
+
+- **Music3 is NOT an ACE-Step variant** (timestep TOKEN, reversed SwiGLU, alpha-only Snake, hardcoded DiT RoPE). Probe laps (`MUSIC3_COST_PROBE`) before bandwidth arithmetic.

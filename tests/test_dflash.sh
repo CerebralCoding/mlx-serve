@@ -8,7 +8,7 @@
 #
 #   DFLASH_TEST_MODEL=<target dir> DFLASH_TEST_DRAFTER=<assistant dir> ./tests/test_dflash.sh   # DFLASH_TEST_PORT
 #
-# SKIPs without the env vars. Hermetic twins: dflash.zig config/mask/forward/cache tests + fixture parity
+# SKIPs without the env vars. Hermetic twins: engines/mlx/spec/dflash/dflash.zig config/mask/forward/cache tests + fixture parity
 # (DFLASH_FIXTURES, tests/dump_dflash_fixtures.py), nextDflash greedy equivalence, specInitWiring / specTickMode.
 
 set -euo pipefail

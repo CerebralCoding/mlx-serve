@@ -55,7 +55,6 @@ mlx-lm's layout (`tests/convert_mimo_v2.py`, mlx-community's mxfp4-q8 packs).
   hiddens and tokens, the round's drafts) rides the head cache's recurrent entries; KV layer 0 only counts the
   committed rows. The head cache is never persisted (`MtpCacheRef.kv` null): a prefix-cache hit rebuilds the heads
   from the uncached tail, as the legacy heads did.
-- The root arch row says "Serial"; the engine batches MiMo decode.
 
 ## Served
 

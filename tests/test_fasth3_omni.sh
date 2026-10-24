@@ -10,7 +10,7 @@
 #
 # Usage: [OMNI_MODEL=<pack dir>] ./tests/test_fasth3_omni.sh [port]   # SKIPs without the pack
 #
-# Hermetic twins: the `PDD` tests in minimax_h3.zig, `zig build test -Dtest-filter="h3 vsa:"` (H3_VSA_FIXTURE from
+# Hermetic twins: the `PDD` tests in plugins/minimax_h3/h3.zig, `zig build test -Dtest-filter="h3 vsa:"` (H3_VSA_FIXTURE from
 # tests/dump_h3_vsa_fixtures.py), `h3 vsa kernel` (GPU; H3_VSA_UBENCH=1), tests/test_convert_minimax_h3_omni.py.
 set -uo pipefail
 source "$(dirname "$0")/lib/server.sh"

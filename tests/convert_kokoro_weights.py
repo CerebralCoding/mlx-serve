@@ -35,7 +35,7 @@ WHY EACH TRANSFORM EXISTS
     quiet, wrong audio rather than an error.
 
 (b) NO LAYOUT TRANSPOSE. Conv weights stay in PyTorch layout; the engine
-    transposes at use through `ltx_audio.zig`'s conv helpers, which is the
+    transposes at use through `plugins/ltx/audio.zig`'s conv helpers, which is the
     convention that file already established. Do not pre-transpose here or the
     two halves disagree.
 

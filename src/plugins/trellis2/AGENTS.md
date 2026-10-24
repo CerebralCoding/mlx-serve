@@ -50,3 +50,9 @@ A pack has no root config.json: `pipeline.json` names it; Pixal3D keeps that nam
 ## Known issues
 
 - The golden covers the GPU half; the CPU half (no sdk change) is covered by its hermetic tests.
+
+## The row from the root architecture table
+
+microsoft/TRELLIS.2-4B (MIT): a `pipeline.json`-only pack (`pack_claims`), `.mesh` modality, always textured. Gated
+DINOv3 rides in the pack; no background remover (RMBG-2.0 is non-commercial), a cutout's alpha is the subject.
+512/1024/1536 cascade

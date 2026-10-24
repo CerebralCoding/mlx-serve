@@ -10,7 +10,7 @@
 #
 #   ./tests/test_kv_quant_fused_equivalence.sh [/path/to/model] [port]
 #
-# Hermetic twins: grouped-Q/strided parity tests in kv_quant.zig, `qkvVerParityCase`, kvAttnFusedEligible /
+# Hermetic twins: grouped-Q/strided parity tests in engines/mlx/cache/kv_quant.zig, `qkvVerParityCase`, kvAttnFusedEligible /
 # kvAttnVerifyEligible, resolveKvAttnFusedPure.
 
 set -e

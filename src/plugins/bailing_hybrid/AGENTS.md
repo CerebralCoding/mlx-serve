@@ -34,3 +34,10 @@ only, `MtpModel.bind`), so a Ling-flash head is a new feature with no oracle yet
   the proof compares the rows rollback reads.
 - No `[dtype-trace]`, ladder or ANE-prefill diagnostics on the table forward (the dense layer still asks
   `denseMLPMaybeAne`, so `--ane-prefill` behaves as legacy).
+
+## The row from the root architecture table
+
+Ling 3.0 (BailingMoeV3): KDA + MLA hybrid MoE, `layer_group_size` → `full_attention_interval`; KDA = GDN with
+PER-CHANNEL gate (`_vec` kernel), BOUNDED-SIGMOID gate (`kda_lower_bound` REPLACES softplus), sigmoid out-gate; MLA =
+naive DeepSeek-V3 (ASYMMETRIC K192/V128 cache; `--kv-quant 4|8` ok); `noaux_tc` routing. Thinking ON; GLM tool tags.
+Mirror `rapid-mlx/Ling-3.0-tiny-MLX-4bit`

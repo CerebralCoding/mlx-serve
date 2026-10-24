@@ -9,7 +9,7 @@
 #   ./tests/test_ane_prefill.sh [/path/to/model] [port]   # default Qwen3.5-0.8B-MLX-4bit (ANE_PREFILL_MODEL)
 #
 # SKIPs when the private framework is absent. Hermetic twins: unitCount / bankGroupLen / engineBillBytes /
-# gateAllows in ane.zig, anePropsJson.
+# gateAllows in sdk/ane/offload.zig, anePropsJson.
 
 set -u
 source "$(dirname "$0")/lib/server.sh"

@@ -55,7 +55,7 @@ echo "== token accounting (the splice depends on it) =="
 # 730x487 → smart_resize 756x504 → grid 54x36 patches → (54/2)*(36/2) = 486 pads,
 # plus <|image_start|>/<|image_end|>. A drift here scatters the tower's rows
 # into the wrong positions rather than failing loudly.
-# The arch name comes from `@tagName(vp.mode)` (server.zig), i.e. a Zig enum
+# The arch name comes from `@tagName(vp.mode)` (host/http/server.zig), i.e. a Zig enum
 # tag, so it is always lowercase — an older literal "Muse" in this pattern
 # broke the assertion on a refactor while the math stayed correct. Match
 # case-insensitively; the NUMBERS are the contract.

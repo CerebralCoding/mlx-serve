@@ -6,7 +6,7 @@
 #   [OLLAMA_CHAT_MODEL=<dir>] [OLLAMA_EMBED_ID=<id>] ./tests/test_ollama_api.sh [port]
 #   OLLAMA_PULL_NET=1 (a real HF download into a scratch HOME), OLLAMA_RUN_REPL=1 (pty REPL round trip)
 #
-# Hermetic twins: the translate/sink tests in src/host/api/ollama/translate.zig, alias/REPL tests in cli.zig.
+# Hermetic twins: the translate/sink tests in src/host/api/ollama/translate.zig, alias/REPL tests in host/cli/cli.zig.
 
 set -uo pipefail
 source "$(dirname "$0")/lib/server.sh"

@@ -3,7 +3,7 @@
 #
 # A cancelled image request (client hung up mid-denoise) must abort at the
 # next step — flux/krea/mage_flow poll progress.cancelled() like every other
-# media backend — and gen.zig logs it as a cancellation, not a failure.
+# media backend — and host/media_jobs/gen.zig logs it as a cancellation, not a failure.
 # Red on trees without the checks: the server burns through every remaining
 # step + VAE decode + PNG encode for a peer that is gone (the log shows
 # "[image] -> N PNG bytes" with nobody connected) while other requests queue

@@ -19,3 +19,9 @@ Owns `prism_hadamard_qwen35` (prism-ml Bonsai 2 packs). Table = `plugins/qwen3_5
   batched verify, an image prompt, and the MTP head (steps, picks, rounds) bit-equal to the legacy shell.
 - Not served: a DFlash drafter (its head reads the trunk's in f32, `lmHeadForeign`): a pack carrying one stays legacy;
   int8 prefill (the driver refuses it by name); routed experts (the format refuses rotated banks).
+
+## The row from the root architecture table
+
+prism-ml Bonsai 2 = qwen3_5 behind Hadamard rotations (block 512-4096 per pack: `sdk/quant/hadamard/rht.zig`,
+`hadamard_block` from `modules[].block`); in the pack's numerics: f16 activations over f16 scales, f32 GDN state;
+fused QKV declines; MTP depth 2

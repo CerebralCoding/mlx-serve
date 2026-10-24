@@ -43,7 +43,7 @@ packs (`experts.bin`) are refused by name: lib/mlx-stream serves them until P4 m
 - Serial is not exclusive: module-owned state needs admission single-flight.
 - The V4.1 template, like V4's, is byte-pinned (`tests/dsv41_template_ab.py`).
 
-## Known issues (`.bb/backlog/deepseek-v41.md` Context; not fixed here)
+## Known issues
 - Serial + single-flight; prefix cache off (module-owned rings).
 - Serial decode near the memory wall: 720 GB/s of ~1.1 TB/s, so kernel work buys 15-25%, not 2x.
 - Prefill compute-bound at ~16 TFLOPS; the MoE at 2048 rows streams each layer's expert bank 4x per 8192 chunk
@@ -58,3 +58,11 @@ packs (`experts.bin`) are refused by name: lib/mlx-stream serves them until P4 m
 ## Fixtures
 - `conformanceFixture`: `fixture.v41Files` (the `tests/dump_dsv41_fixtures.py` pipe layout, 8 layers, no Engram or
   DSpark). Parse fixtures: `src/fixtures/model-configs/deepseek_v41-*.json` (configs of the two packs above).
+
+## The row from the root architecture table
+
+DeepSeek-V4/V4.1 Flash, 1M ctx. Serial, spec off but DSpark, single-flight; DSML tools, OUR byte-pinned templates. V4:
+prefix cache OFF, 0731+, our layout. V4.1: MLX packs, DSpark ON, resumes one conversation (keyed on the image rows
+too); EXL3 repack on mlx-stream (`stream/`). V4.1 images: every span position carries `image_token_id` (without the
+request's rows that id is TEXT, as in the reference), the module splices the rows itself, image rows route by
+`gate.bias_vl` and get no Engram write (`Hash.DEAD`)

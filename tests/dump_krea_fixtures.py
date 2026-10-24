@@ -34,7 +34,7 @@ import sys
 import numpy as np
 
 # Fixed, reproducible fixture parameters. Keep in sync with the env defaults in
-# the krea.zig e2e oracle (W/H 512, seed 0, steps 8).
+# the plugins/krea/krea.zig e2e oracle (W/H 512, seed 0, steps 8).
 PROMPT = "a red fox in the snow, photorealistic"
 W, H, STEPS, SEED = 512, 512, 8, 0
 

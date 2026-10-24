@@ -8,7 +8,7 @@
 #                                          # LOAD_PROGRESS_ANE_MODEL (Qwen3.5-0.8B)
 #
 # Scratch HOME (the ANE opt-in goes in its model-settings.json); the ANE compile cache stays the real one. SKIPs
-# without the packs; the ANE half without the private framework. Hermetic twin: load_progress.zig tests.
+# without the packs; the ANE half without the private framework. Hermetic twin: host/registry/load_progress.zig tests.
 
 set -uo pipefail
 source "$(dirname "$0")/lib/server.sh"

@@ -4,9 +4,7 @@ Owns `gemma4`, `gemma4_text`, `gemma4_unified(_text)` (mlx-lm's layouts). The te
 per-layer embeddings and a KV-shared tail, 12B/31B, the 26B-A4B experts), with image and audio rows spliced at their
 placeholders (a unified pack's encoder-free embedder rows too), are served bit-equal to the legacy forward
 (`gemma4`, `gemma4_text`, `gemma4_unified(_text)` in `served.zig`); draft-model configs (DSpark / DFlash / EAGLE-3
-keys) are declined `unsupported`. The decoder also
-serves DiffusionGemma's encoder passes and canvas steps (`decoder.canvas`), and `bidirectional.zig` is the encoder
-base of both EmbeddingGemma plugins.
+keys) are declined `unsupported`. `bidirectional.zig` is the encoder base of both EmbeddingGemma plugins.
 
 ## Files
 - `config.zig`: MLX-free claim + parse over Gemma 3's `readCommon`/`finish` with the Gemma 4 traits (nested
@@ -27,7 +25,7 @@ base of both EmbeddingGemma plugins.
   assistant drafter (and a DFlash sidecar) serve on the plugin path; proven by `expectDrafter` (tokens, acceptance,
   each round's draft logits bit-equal on E-series and 26B-A4B trunks).
 - `batches_decode` (dense packs; a pack with experts decodes serial and declares `moe`), thinking off with the
-  `gemma_channel` dialect, `caps.images`/`audio` + `placeholder_ids` with towers, `exact_resumed` (`.bb/reports/exactness-declarations.tsv`: resumed yes, drafted and concurrent
+  `gemma_channel` dialect, `caps.images`/`audio` + `placeholder_ids` with towers, `exact_resumed` (`docs/known-issues.md`: resumed yes, drafted and concurrent
   no); stop set `{config eos} + {1, 106}`; sampling defaults top_k 64 / top_p 0.95; `weights.prefix`
   `language_model.model`, probed to `model.language_model` / `model` when the pack keeps its tensors there.
 

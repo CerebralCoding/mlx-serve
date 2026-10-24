@@ -23,3 +23,8 @@ Owns `embedding_gemma2` (the release's layout): the Gemma 4 text trunk trained a
 
 ## Known issues
 - Audio is not served (as the engine).
+
+## The row from the root architecture table
+
+EmbeddingGemma 2: Gemma 4 trunk trained bidirectional projection-only PLE, INCLUSIVE band, head in the dense0 slot;
+images (Gemma 4 SigLIP tower, budgeted size) and video FRAMES ride `messages` on `/v1/embeddings`; no audio.

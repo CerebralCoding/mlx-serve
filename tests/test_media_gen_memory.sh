@@ -6,7 +6,7 @@
 #
 #   MEDIA_MEM_MODEL=<dir> ./tests/test_media_gen_memory.sh [port]   # default Mage-Flow-Turbo-MLX-Serve-8bit; SKIP
 #
-# Hermetic twin: `materializing helpers hand back every array they take` (mage_flow.zig).
+# Hermetic twin: `materializing helpers hand back every array they take` (plugins/mage_flow/mage_flow.zig).
 
 set -uo pipefail
 source "$(dirname "$0")/lib/server.sh"
