@@ -5,9 +5,8 @@ const mlx = @import("../../../mlx/ffi.zig");
 const mrope = @import("../../../sdk/vision/mrope.zig");
 const ForwardCtx = @import("../forward_ctx.zig").ForwardCtx;
 const Transformer = @import("../transformer.zig").Transformer;
-const yarnMscale = @import("../../../sdk/blocks/rope/yarn.zig").yarnMscale;
+const yarnMscale = @import("yarn.zig").yarnMscale;
 const MropeCosSin = @import("../../../sdk/blocks/rope/mrope.zig").MropeCosSin;
-const mropeContext = @import("../../../sdk/blocks/rope/mrope.zig").mropeContext;
 
 /// Build per-token interleaved-M-RoPE cos/sin [1,1,seq_len,rope_dims] (bf16).
 /// Positions inside the prompt come from the explicit 3-D table; positions
@@ -130,4 +129,15 @@ pub fn applyMrope(self: *Transformer, arr: mlx.mlx_array, cos: mlx.mlx_array, si
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_concatenate_axis(&out, cat_vec, -1, self.s));
     return out;
+}
+
+pub fn mropeContext(ctx: *const ForwardCtx) mrope.PositionContext {
+    return .{ .pos = ctx.mrope_pos.?, .total = ctx.mrope_total, .delta = ctx.mrope_delta };
+}
+
+pub fn endMropeChunk(ctx: *ForwardCtx) void {
+    if (ctx.mrope_cos_cur) |c| _ = mlx.mlx_array_free(c);
+    if (ctx.mrope_sin_cur) |sn| _ = mlx.mlx_array_free(sn);
+    ctx.mrope_cos_cur = null;
+    ctx.mrope_sin_cur = null;
 }

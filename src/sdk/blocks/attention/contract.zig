@@ -20,7 +20,7 @@ const nax = @import("nax_attention.zig");
 const int8_attn = @import("../dit/int8_attn.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const kv_view = @import("kv_view.zig");
-const qsa_score = @import("../../../plugins/qwen4_exp/qsa/score.zig");
+const qsa_score = @import("kv_quant_attn.zig");
 const fused_activations = @import("../mlp/fused_activations.zig");
 
 const spec = kc.spec;

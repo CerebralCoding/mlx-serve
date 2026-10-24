@@ -112,13 +112,7 @@ pub fn poolingFromDirName(dir_basename: []const u8, model_type: []const u8) ?Poo
 
 pub const Qwen4NormConvention = enum { delta, folded };
 
-/// Llama 3.x `rope_type: "llama3"` (HF `_compute_llama3_parameters`).
-pub const Llama3Rope = struct {
-    factor: f32,
-    low_freq_factor: f32 = 1.0,
-    high_freq_factor: f32 = 4.0,
-    original_max_position_embeddings: f32 = 8192.0,
-};
+pub const Llama3Rope = @import("../../sdk/blocks/rope/rope.zig").Llama3Rope;
 
 /// `thinker_config.audio_config` of a Qwen3-ASR pack (mlx-audio's `AudioEncoderConfig`).
 pub const QwenAudioConfig = struct {

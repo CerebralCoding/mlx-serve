@@ -1059,8 +1059,8 @@ pub const Transformer = struct {
     pub const supportsBatchedGdnDecode = @import("batched/caps.zig").supportsBatchedGdnDecode;
     // sdk/blocks/rope/rope.zig
     pub const ropeInvFreq = @import("methods/rope.zig").ropeInvFreq;
-    pub const ropeAtPositions = @import("../../sdk/blocks/rope/rope.zig").ropeAtPositions;
-    pub const ropeAtFreqs = @import("../../sdk/blocks/rope/rope.zig").ropeAtFreqs;
+    pub const ropeAtPositions = @import("methods/rope.zig").ropeAtPositions;
+    pub const ropeAtFreqs = @import("methods/rope.zig").ropeAtFreqs;
     pub const ropeCosSinFromFreqs = @import("methods/rope.zig").ropeCosSinFromFreqs;
     pub const ropeApplyCosSin = @import("methods/rope.zig").ropeApplyCosSin;
     // plugins/qwen4_exp/qsa/indexer.zig
@@ -1103,9 +1103,9 @@ pub const Transformer = struct {
     pub const buildMropeCosSin = @import("methods/mrope.zig").buildMropeCosSin;
     pub const MropeCosSin = @import("../../sdk/blocks/rope/mrope.zig").MropeCosSin;
     pub const mropeCosSinAt = @import("methods/mrope.zig").mropeCosSinAt;
-    pub const mropeContext = @import("../../sdk/blocks/rope/mrope.zig").mropeContext;
+    pub const mropeContext = @import("methods/mrope.zig").mropeContext;
     pub const beginMropeChunk = @import("methods/mrope.zig").beginMropeChunk;
-    pub const endMropeChunk = @import("../../sdk/blocks/rope/mrope.zig").endMropeChunk;
+    pub const endMropeChunk = @import("methods/mrope.zig").endMropeChunk;
     pub const applyMrope = @import("methods/mrope.zig").applyMrope;
     // sdk/blocks/rope/yarn.zig
     pub const yarnActive = @import("methods/yarn.zig").yarnActive;

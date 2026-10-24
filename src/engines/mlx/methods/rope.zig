@@ -123,3 +123,17 @@ pub fn ropeApplyCosSin(self: *Transformer, x: mlx.mlx_array, rope_dims: c_int, c
     try mlx.check(mlx.mlx_concatenate_axis(&out, ovec, -1, self.s));
     return out;
 }
+
+/// Partial neox RoPE of `x [B,1,N,hd]` at positions `base + step*i` with explicit cos/sin.
+pub fn ropeAtPositions(self: *Transformer, x: mlx.mlx_array, rope_dims: c_int, theta: f32, base: f32, step: f32, n: c_int) !mlx.mlx_array {
+    return self.ropeAtFreqs(x, rope_dims, try self.ropeInvFreq(rope_dims, theta), base, step, n); // takes ownership
+}
+
+/// The shared tail of `ropeAtPositions`: rotate `x` at positions
+/// `base + step*i` using the given inv_freq array (`[half]`, f32).
+pub fn ropeAtFreqs(self: *Transformer, x: mlx.mlx_array, rope_dims: c_int, inv_freq: mlx.mlx_array, base: f32, step: f32, n: c_int) !mlx.mlx_array {
+    const cs = try self.ropeCosSinFromFreqs(rope_dims, inv_freq, base, step, n, mlx.mlx_array_dtype(x));
+    defer _ = mlx.mlx_array_free(cs.cos);
+    defer _ = mlx.mlx_array_free(cs.sin);
+    return self.ropeApplyCosSin(x, rope_dims, cs.cos, cs.sin);
+}
