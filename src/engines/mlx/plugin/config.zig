@@ -90,6 +90,32 @@ pub fn bindServed(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, confi
     return error.PluginDeclinedNoLegacy;
 }
 
+/// `table`'s parse of the pack at `dir` (caller owns the binding), for an engine that serves a pack through one named
+/// plugin whatever else claims it (a decision pack's trunk); null when the parse declines it.
+pub fn bindTable(io: std.Io, a: std.mem.Allocator, dir: []const u8, table: *const abi.ModelTable) !?*Binding {
+    return bindTableWith(io, a, dir, table, "{}");
+}
+
+/// `bindTable` over the pack's config.json with `overrides` deep-merged in (`model.mergeConfigJson`).
+pub fn bindTableWith(io: std.Io, a: std.mem.Allocator, dir: []const u8, table: *const abi.ModelTable, overrides: []const u8) !?*Binding {
+    var fs = try FsPackDir.open(io, dir);
+    defer fs.close();
+    const pd = fs.packDir();
+    const buf = try a.alloc(u8, 1 << 20);
+    defer a.free(buf);
+    var why: abi.Verdict = .{};
+    const raw = pd.readFile("config.json", buf, &why) orelse return error.ConfigUnreadable;
+    const cfg = try model.mergeConfigJson(a, raw, overrides);
+    defer a.free(cfg);
+    const b = try a.create(Binding);
+    b.* = .{ .table = table };
+    if (!table.parse(&pd, .of(cfg), .{}, null, false, &b.parsed).isOk()) {
+        a.destroy(b);
+        return null;
+    }
+    return b;
+}
+
 /// `config_json` with the launch's `--config-overrides` merged in, as the legacy parse reads it; in `a`.
 pub fn withOverrides(a: std.mem.Allocator, config_json: []const u8) ![]const u8 {
     const ov = model.getConfigOverrides() orelse return config_json;

@@ -146,12 +146,31 @@ pub fn load(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir: [
 /// `load`; with `tower`, the vision tower's tensors load too and move into it (the engine's encoder reads them, the
 /// plugin never sees them).
 pub fn loadWith(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir: []const u8, s: mlx.mlx_stream, tower: ?*model.Weights) !Transformer {
+    try preflight(config);
+    return loadTensors(io, a, config, model_dir, s, try loadSplit(io, a, model_dir, config, tower));
+}
+
+/// `load` over a tensor map the caller prepared (renamed or converted from the pack's own), which it hands over.
+pub fn loadMap(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir: []const u8, s: mlx.mlx_stream, map: model.Weights) !Transformer {
+    preflight(config) catch |e| {
+        var m = map;
+        m.deinit();
+        return e;
+    };
+    return loadTensors(io, a, config, model_dir, s, map);
+}
+
+fn preflight(config: *const ModelConfig) !void {
     const b = config.plugin orelse return error.NotPluginServed;
     if (lossyUnserved(config)) |what| {
         log.err("[plugin] {s}: {s} is not served on the plugin path yet; turn the model's {s} setting off\n", .{ b.table.name.slice(), what, what });
         return error.PluginServedLossySetting;
     }
-    var res = Resident.adopt(try loadSplit(io, a, model_dir, config, tower));
+}
+
+fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir: []const u8, s: mlx.mlx_stream, map: model.Weights) !Transformer {
+    const b = config.plugin.?;
+    var res = Resident.adopt(map);
     // The model holds its own references: the map's go once the plugin has read it.
     defer res.deinit();
     const src = res.source();

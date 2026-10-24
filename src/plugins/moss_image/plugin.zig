@@ -140,7 +140,8 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
         try te.rand("language_model.model.layers.{d}.mlp.down_proj.weight", .{i}, &.{ te_h, 64 }, .BF16, 0.2);
     }
     const te_cfg = try std.fmt.allocPrint(a,
-        \\{{"model_type":"qwen3_5","hidden_size":{d},"num_hidden_layers":2,"num_attention_heads":2,"num_key_value_heads":1,"head_dim":16,"intermediate_size":64,"vocab_size":{d},"rms_norm_eps":1e-6,"rope_theta":10000.0,"full_attention_interval":1,"max_position_embeddings":4096}}
+        \\{{"model_type":"qwen3_5","text_config":{{"model_type":"qwen3_5_text","hidden_size":{d},"num_hidden_layers":2,"num_attention_heads":2,"num_key_value_heads":1,"head_dim":16,"intermediate_size":64,"vocab_size":{d},"rms_norm_eps":1e-6,"rope_theta":10000.0,"full_attention_interval":1,"max_position_embeddings":4096,
+        \\ "linear_num_key_heads":1,"linear_num_value_heads":1,"linear_key_head_dim":16,"linear_value_head_dim":16,"linear_conv_kernel_dim":4}}}}
     , .{ te_h, vocab });
 
     var dit = T.init(a, 12);

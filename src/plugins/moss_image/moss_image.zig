@@ -26,6 +26,9 @@ const sse = @import("../../sdk/media/progress.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const tok_mod = @import("../../sdk/tokenizer/tokenizer.zig");
 const transformer_mod = @import("../../engines/mlx/transformer.zig");
+const plugin_config = @import("../../engines/mlx/plugin/config.zig");
+const plugin_driver = @import("../../engines/mlx/plugin/driver.zig");
+const qwen3_5 = @import("../qwen3_5/plugin.zig");
 const cache_mod = @import("../../engines/mlx/kv/cache.zig");
 const entry = @import("../../engines/mlx/ssm/entry.zig");
 const history = @import("../qwen4_exp/qsa/history.zig");
@@ -231,31 +234,25 @@ fn sanitizeTextEncoder(a: std.mem.Allocator, src: *Weights, s: S) !Weights {
 const TextEncoder = struct {
     allocator: std.mem.Allocator,
     config: model_mod.ModelConfig,
-    /// The Transformer borrows these handles: they live as long as it does.
-    weights: Weights,
     xfm: transformer_mod.Transformer,
 
     fn load(self: *TextEncoder, io: std.Io, a: std.mem.Allocator, model_dir: []const u8, s: S) !void {
         const dir = try std.fmt.allocPrint(a, "{s}/text_encoder", .{model_dir});
         defer a.free(dir);
         self.allocator = a;
-        self.config = try model_mod.parseConfig(io, a, dir);
+        self.config = try model_mod.parseConfigLegacy(io, a, dir);
         errdefer self.config.deinit(a);
-        {
-            var raw = try model_mod.loadWeights(io, a, dir);
-            defer raw.deinit();
-            self.weights = try sanitizeTextEncoder(a, &raw, s);
-        }
-        errdefer self.weights.deinit();
         // The encoder ships no lm_head and only its final hidden state is read.
+        const tied = "{\"tie_word_embeddings\":true,\"text_config\":{\"tie_word_embeddings\":true}}";
         self.config.tie_word_embeddings = true;
-        model_mod.resolveWeightPrefix(&self.config, &self.weights);
-        self.xfm = try transformer_mod.Transformer.init(io, a, self.config, &self.weights);
+        self.config.plugin = try plugin_config.bindTableWith(io, a, dir, &qwen3_5.table, tied) orelse return error.MossTextEncoderUnsupported;
+        var raw = try model_mod.loadWeights(io, a, dir);
+        defer raw.deinit();
+        self.xfm = try plugin_driver.loadMap(io, a, &self.config, dir, mlx.gpuStream(), try sanitizeTextEncoder(a, &raw, s));
     }
 
     fn deinit(self: *TextEncoder) void {
         self.xfm.deinit();
-        self.weights.deinit();
         self.config.deinit(self.allocator);
     }
 
@@ -1170,4 +1167,32 @@ test "MOSS-Image: text encoder, DiT, VAE and the whole pipeline match the refere
         const img = try sc.keep(try eng.generateFrom(prompt, @intCast(lw * 16), @intCast(lh * 16), init, 4, .{ .guidance_scale = 3.0, .negative_prompt = "worst quality" }, null));
         try expectParity("pipeline", img, try get(&fx.w, "e2e_image"), s, 0.999);
     }
+}
+
+// Bar: the text encoder's hidden rows bit-equal to the legacy trunk's on the tiny pack, recorded in
+// `fixtures/text_encoder.tape`.
+test "MOSS-Image: the text encoder's served trunk is bit-equal to the engine's own trunk" {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const tape_mod = @import("../../engines/mlx/plugin/tape.zig");
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const fx = try @import("plugin.zig").conformanceFixture(arena.allocator());
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for (fx.files) |f| {
+        if (std.fs.path.dirname(f.name)) |d| try tmp.dir.createDirPath(io, d);
+        try tmp.dir.writeFile(io, .{ .sub_path = f.name, .data = f.bytes });
+    }
+    var pbuf: [512]u8 = undefined;
+    const dir = pbuf[0..try tmp.dir.realPath(io, &pbuf)];
+    const eng = try Engine.loadOn(io, a, dir, mlx.mlx_default_gpu_stream_new());
+    defer eng.deinit();
+    const h = try eng.encodePrompt("a red cat on a chair");
+    defer _ = mlx.mlx_array_free(h);
+    var tape = try tape_mod.Tape.player(@embedFile("fixtures/text_encoder.tape"));
+    defer tape.finish() catch |e| std.debug.panic("proof tape: {t}", .{e});
+    try tape.expectNext(h, false);
+    try tape.expectDone();
 }

@@ -6,6 +6,9 @@ const kev = @import("../kev/kev.zig");
 const model = @import("../../engines/mlx/model.zig");
 const tokenizer = @import("../../sdk/tokenizer/tokenizer.zig");
 const transformer = @import("../../engines/mlx/transformer.zig");
+const plugin_config = @import("../../engines/mlx/plugin/config.zig");
+const plugin_driver = @import("../../engines/mlx/plugin/driver.zig");
+const qwen3_5 = @import("../qwen3_5/plugin.zig");
 const cache_mod = @import("../../engines/mlx/kv/cache.zig");
 const entry_mod = @import("../../engines/mlx/ssm/entry.zig");
 const history = @import("../qwen4_exp/qsa/history.zig");
@@ -590,7 +593,8 @@ pub const Engine = struct {
         errdefer a.destroy(self);
         self.allocator = a;
         self.stream = s;
-        self.config = try model.parseConfig(io, a, dir);
+        // The legacy parse alone: Clef's marker keeps the registry's claim off the pack, so the trunk is bound here.
+        self.config = try model.parseConfigLegacy(io, a, dir);
         errdefer self.config.deinit(a);
         if (!std.mem.startsWith(u8, self.config.model_type, "qwen3_5") or self.config.isMoe() or self.config.hadamard_block != 0) return error.ClefUnsupportedBase;
         const cfg_path = try std.fmt.allocPrint(a, "{s}/joint_head_config.json", .{dir});
@@ -619,12 +623,12 @@ pub const Engine = struct {
         self.tok = try tokenizer.loadTokenizer(io, a, dir);
         errdefer self.tok.deinit();
         if (self.tok.definedVocabSize() > self.config.vocab_size) return error.ClefVocabMismatch;
-        self.weights = try model.loadModelWeights(io, a, dir, &self.config, true);
+        self.config.plugin = try plugin_config.bindTable(io, a, dir, &qwen3_5.table) orelse return error.ClefUnsupportedBase;
+        // The vision tower's tensors (the plugin never reads them).
+        self.weights = model.Weights.init(a);
         errdefer self.weights.deinit();
-        model.resolveWeightPrefix(&self.config, &self.weights);
-        self.xfm = try transformer.Transformer.init(io, a, self.config, &self.weights);
+        self.xfm = try plugin_driver.loadWith(io, a, &self.config, dir, mlx.gpuStream(), &self.weights);
         errdefer self.xfm.deinit();
-        self.xfm.compileGdnGate();
         const raw_gelu = mlx.mlx_closure_new_func_payload(&geluClosure, &self.stream, null);
         defer _ = mlx.mlx_closure_free(raw_gelu);
         self.gelu = .{};
@@ -1071,4 +1075,32 @@ test "clef: live joint head agrees with the published MLX loader" {
     }
     try fixture.compare(expected.object.get("image").?.object.get("answers").?, image_result.value.object.get("answers").?);
     try fixture.compare(expected.object.get("image").?.object.get("usage").?, image_result.value.object.get("usage").?);
+}
+
+// Bar: Clef's hidden rows bit-equal to the legacy trunk's, recorded in `fixtures/trunk.tape`.
+test "clef: the served qwen3_5 trunk's hidden rows are bit-equal to the engine's own trunk" {
+    const testing = std.testing;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const tape_mod = @import("../../engines/mlx/plugin/tape.zig");
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const fx = try @import("plugin.zig").conformanceFixture(arena.allocator());
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for (fx.files) |f| try tmp.dir.writeFile(io, .{ .sub_path = f.name, .data = f.bytes });
+    var pbuf: [512]u8 = undefined;
+    const dir = pbuf[0..try tmp.dir.realPath(io, &pbuf)];
+    const s = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(s);
+    const eng = try Engine.load(io, a, dir, s);
+    defer eng.deinit();
+    const ids = [_]u32{ 116, 104, 101, 32, 111, 114, 100, 101, 114, 10, 83, 58, 32, 120, 97, 98 };
+    const h = try eng.hidden(a, &ids, &.{});
+    defer free(h);
+    var tape = try tape_mod.Tape.player(@embedFile("fixtures/trunk.tape"));
+    defer tape.finish() catch |e| std.debug.panic("proof tape: {t}", .{e});
+    try tape.expectNext(h, false);
+    try tape.expectDone();
 }
