@@ -10,12 +10,10 @@ const Transformer = @import("../transformer.zig").Transformer;
 const qmatmulBits = @import("../../../sdk/blocks/linear/qmatmul.zig").qmatmulBits;
 const ropeAngleRows = @import("../../../sdk/blocks/rope/qk_norm_rope.zig").ropeAngleRows;
 const AttnDqCopy = @import("../../../sdk/blocks/attention/decode_attn_quant.zig").AttnDqCopy;
-const attnDqRequantEnabled = @import("../../../sdk/blocks/attention/decode_attn_quant.zig").attnDqRequantEnabled;
 const attnDqUseNvfp4 = @import("../../../sdk/blocks/attention/decode_attn_quant.zig").attnDqUseNvfp4;
 const buildAttnDqCopy = @import("../../../sdk/blocks/attention/decode_attn_quant.zig").buildAttnDqCopy;
 const decodeAttnQuantEligible = @import("../../../sdk/blocks/attention/decode_attn_quant.zig").decodeAttnQuantEligible;
 const decodeAttnQuantEnabled = @import("../../../sdk/blocks/attention/decode_attn_quant.zig").decodeAttnQuantEnabled;
-const denseFromAffine8 = @import("../../../sdk/blocks/attention/decode_attn_quant.zig").denseFromAffine8;
 
 // ── Laguna attention (per-layer heads, YaRN/default RoPE, softplus gate) ──
 // Full-attention layers: 48 Q-heads, YaRN RoPE (theta 5e5, partial 0.5),
@@ -61,28 +59,16 @@ pub fn qkAngleRowsFor(self: *Transformer, family: usize, rd: c_int, base: mlx.ml
 /// int8-g32 affine for the body, real nvfp4-g16 for the tail (see
 /// `attnDqUseNvfp4`) — each weight belongs to exactly one layer, so the
 /// pointer-keyed cache stays mode-stable.
-pub fn attnDqFor(self: *Transformer, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, in_dim: ?u32, layer: u32) !?AttnDqCopy {
+pub fn attnDqFor(self: *Transformer, w: mlx.mlx_array, layer: u32) !?AttnDqCopy {
     const key = @intFromPtr(w.ctx orelse return null);
     if (self.attn_dq.get(key)) |slot| return slot;
-    // An 8-bit affine weight is requantized from its dequantized values,
-    // and only to nvfp4: an int8 copy of it would read the same bytes.
-    var dense = mlx.mlx_array{ .ctx = null };
-    defer if (dense.ctx != null) {
-        _ = mlx.mlx_array_free(dense);
-    };
-    if (sc.ctx != null) {
-        const qp = self.quantParamsHinted(w, sc, in_dim);
-        if (qp.mode == .affine and qp.bits == 8) dense = try denseFromAffine8(self.s, w, sc, bi, qp.group_size);
-    }
-    const src = if (dense.ctx != null) dense else w;
-    const wsh = mlx.getShape(src);
-    if (!decodeAttnQuantEligible(wsh, mlx.mlx_array_dtype(src), sc.ctx != null and dense.ctx == null)) {
+    if (!decodeAttnQuantEligible(mlx.getShape(w), mlx.mlx_array_dtype(w), false)) {
         try self.attn_dq.put(self.allocator, key, null);
         log.debug("[decode-attn-quant] declined a projection: shape/dtype ineligible\n", .{});
         return null;
     }
-    const nvfp4 = dense.ctx != null or attnDqUseNvfp4(layer, @intCast(self.config.num_hidden_layers));
-    const copy = (try buildAttnDqCopy(self.s, src, nvfp4)) orelse {
+    const nvfp4 = attnDqUseNvfp4(layer, @intCast(self.config.num_hidden_layers));
+    const copy = (try buildAttnDqCopy(self.s, w, nvfp4)) orelse {
         try self.attn_dq.put(self.allocator, key, null);
         return null;
     };
@@ -106,10 +92,10 @@ pub fn attnDqFor(self: *Transformer, w: mlx.mlx_array, sc: mlx.mlx_array, bi: ml
 /// decode steps produced them from, making PLD-on vs PLD-off diverge at
 /// temp 0); prefill and batched forwards keep the dense weight.
 pub inline fn attnProj(self: *Transformer, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, decode_shape: bool, layer: u32) !mlx.mlx_array {
-    if (decode_shape and (sc.ctx == null or attnDqRequantEnabled()) and decodeAttnQuantEnabled()) {
+    if (decode_shape and sc.ctx == null and decodeAttnQuantEnabled()) {
         // A build failure falls back to the dense weight, never errors the
         // request out.
-        if (self.attnDqFor(w, sc, bi, lastDim(x), layer) catch null) |dq| {
+        if (self.attnDqFor(w, layer) catch null) |dq| {
             return qmatmulBits(x, dq.w, dq.s, dq.b, dq.bits, dq.group_size, dq.mode, self.s);
         }
     }

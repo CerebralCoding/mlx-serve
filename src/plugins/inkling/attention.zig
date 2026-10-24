@@ -319,7 +319,7 @@ pub const Attention = struct {
         const step = c.slots == 1 and c.rows == 1 and dq.decodeAttnQuantEnabled();
         var lins = [_]Linear{ w.q, w.k, w.v, w.rel, w.o };
         if (step) for (&lins, w.dq) |*l, d| {
-            if (d.w.ctx != null and (l.s.ctx == null or dq.attnDqRequantEnabled())) l.* = d;
+            if (d.w.ctx != null) l.* = d;
         };
         const q_proj = try lins[0].forward(g, x);
         const k_proj = try lins[1].forward(g, x);

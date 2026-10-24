@@ -208,8 +208,9 @@ How the long prompts stay inside the bill:
 MiMo-V2.6-Flash's served path has no environment switch of its own: its routes come from the pack's settings
 ([docs/mimo.md, Settings](docs/mimo.md#settings)), and its four profile switches compile only into profile builds.
 
-DeepSeek-V4.1's served path reads two environment variables, both at construction (GLM-5.3's reads `GLM53_WAVE_PROBE`,
-see GLM-5.3; its route recorder, `GLM53_ROUTES` below, exists in profile builds only). DeepSeek-V4.1's routes, schedules
+DeepSeek-V4.1's served path reads `DSV41_BILL_VARIANT` and the diag `dsv41-selfcheck-report`, both at construction
+(GLM-5.3's reads the diag `glm53-wave-probe`, see GLM-5.3; its route recorder, `glm53-routes` below, exists in profile
+builds only). DeepSeek-V4.1's routes, schedules
 and memory bill come
 from the tier defaults and the model settings (`model-settings.json`: `numeric_tier`, `ctx_size`, `expert_event_gates`,
 `layer_major_prefill`, `expert_wide_*`, `embedding_host_rows`), never from the environment.
@@ -231,8 +232,8 @@ served behavior.
 | Variable | Read by | Default | Effect |
 |---|---|---|---|
 | `DSV41_BILL_VARIANT` | server | `conservative` | `tight` bills one live K16 routed-group stream instead of four (only with the model's chunk-fenced taps). Any other value is refused by name at construction. |
-| `DSV41_SELFCHECK_REPORT` | server | off | `1` logs every kernel self-check result at construction (a failure is always logged and refuses the load). |
-| `GLM53_ROUTES` | server (profile builds) | off | Any value other than `0` arms GLM-5.3's route recorder: at each request's end, `glm53-routes-<pid>-<n>.bin` gets every decode route (layer, step, rows, routed ids, what served each id, the lookahead's records), each step's rows, drafts, accepted drafts and emitted tokens, and per layer the prompt's counts per expert and the residents at the handover. A value that starts with `/` is the directory; any other value writes to `/tmp`. The file layout is in `src/sdk_ext/expert/routes.zig`. |
+| `MLX_SERVE_DIAG=dsv41-selfcheck-report` | server | off | `1` logs every kernel self-check result at construction (a failure is always logged and refuses the load). |
+| `MLX_SERVE_DIAG=glm53-routes` | server (profile builds) | off | Any value other than `0` arms GLM-5.3's route recorder: at each request's end, `glm53-routes-<pid>-<n>.bin` gets every decode route (layer, step, rows, routed ids, what served each id, the lookahead's records), each step's rows, drafts, accepted drafts and emitted tokens, and per layer the prompt's counts per expert and the residents at the handover. A value that starts with `/` is the directory; any other value writes to `/tmp`. The file layout is in `src/sdk_ext/expert/routes.zig`. |
 | `DSV41_CELL_ROUTED_FORMS` | cell | `down_pair,gu_one` (stack4) | `stock`, `down_pair`, `gu_one` or both (comma list): the routed decode GEMVs rebuilt on those exact texts. |
 | `DSV41_CELL_ROUTED_BANKED` | cell | `1` (stack4) | `1`: each routed decode stage runs as one launch over every bank's rows (exact); `0`: one launch per bank. |
 | `DSV41_CELL_DEVROUTE` | cell | `1` (stack4) | `1`: decode's hit wave runs as a device graph before the host's routing wait (exact; needs `ROUTED_BANKED`); `0`: the host builds it. |
@@ -482,7 +483,7 @@ schedule's bounds (the slice and span windows above). One term is a margin sized
 side past the staging. At construction, the end of the prompt pass,
 the decode handover and the request's end the module logs one `glm_moe_dsa: phase memory` record: the billed terms,
 MLX's active, cache and peak bytes, the footprint and its peak, the box's pages, and billed less measured. With
-`GLM53_WAVE_PROBE` set, the prompt pass also logs each layer's MLX peak by stage (`glm_moe_dsa: wave probe`). The
+`MLX_SERVE_DIAG=glm53-wave-probe` set, the prompt pass also logs each layer's MLX peak by stage (`glm_moe_dsa: wave probe`). The
 receipts test (`src/arch/glm_moe_dsa/bill_receipts_test.zig`) rebuilds the box's runs from their records.
 
 The construction admits both phases of the longest request (the billed context and `max_output` generated tokens)

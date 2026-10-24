@@ -4,7 +4,6 @@
 //! which serves these gathers on the composed chain), and the activation and weighted sum use MLX's
 //! own functors in the chain's order, so a decode row reproduces the chain's rounding sites.
 const std = @import("std");
-const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../util/log.zig");
@@ -28,17 +27,6 @@ var dr_kernel: ?mlx.mlx_fast_cuda_kernel = null;
 var engaged = false;
 /// Decodes served by the two launches (the tests assert the path engaged).
 pub var served: u64 = 0;
-
-var env_enabled: ?bool = null;
-pub var override: ?bool = null;
-/// `MLX_SERVE_MOE_CUDA=0` keeps the composed chain.
-pub fn enabled() bool {
-    if (override) |v| return v;
-    if (env_enabled) |v| return v;
-    const raw = env.get(.MLX_SERVE_MOE_CUDA);
-    env_enabled = raw == null or raw.?[0] != '0';
-    return env_enabled.?;
-}
 
 fn makeKernel(name: [*:0]const u8, ins: []const [*:0]const u8, source: [*:0]const u8, out: [*:0]const u8) !mlx.mlx_fast_cuda_kernel {
     const in_vec = mlx.mlx_vector_string_new_data(ins.ptr, ins.len);
@@ -73,7 +61,7 @@ fn launch(kernel: mlx.mlx_fast_cuda_kernel, out_size: c_int, dt: mlx.mlx_dtype, 
 /// sum_k scores[b,k] * down_e(silu(gate_e(x_b) * gscale_e) * up_e(x_b)), e = inds[b,k]: [B, D] in x's
 /// dtype, or null outside the kernels' envelope. x [B, D]; inds uint32 and scores [B, TOPK].
 pub fn decode(s: mlx.mlx_stream, x: mlx.mlx_array, gate: Bank, up: Bank, down: Bank, gate_scale: ?mlx.mlx_array, inds: mlx.mlx_array, scores: mlx.mlx_array, fmt: Format) !?mlx.mlx_array {
-    if (!enabled() or !mlx.cudaAvailable()) return null;
+    if (!mlx.cudaAvailable()) return null;
     const dt = mlx.mlx_array_dtype(x);
     if (dt != .bfloat16 and dt != .float16) return null;
     if (mlx.mlx_array_dtype(scores) != dt or mlx.mlx_array_dtype(inds) != .uint32) return null;
@@ -110,7 +98,7 @@ pub fn decode(s: mlx.mlx_stream, x: mlx.mlx_array, gate: Bank, up: Bank, down: B
     const y = try launch(dr_kernel.?, rows * D, dt, .{ 256 * @divTrunc(D + dpb - 1, dpb), rows, 1 }, &tmpl, &.{ act, down.w, down.s, inds, scores }, s);
     if (!engaged) {
         engaged = true;
-        log.info("[moe] CUDA fused decode engaged: {s} top-{d} D={d} I={d} (MLX_SERVE_MOE_CUDA=0 restores the composed chain)\n", .{ @tagName(fmt), topk, D, I });
+        log.info("[moe] CUDA fused decode engaged: {s} top-{d} D={d} I={d}\n", .{ @tagName(fmt), topk, D, I });
     }
     served += 1;
     return y;

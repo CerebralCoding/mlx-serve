@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# fwd_ubench.sh — diagnostic, NOT a test: boot one model, fire MLX_SERVE_DECODE_FWD_UBENCH at load, print ms/forward,
+# fwd_ubench.sh — diagnostic, NOT a test: boot one model, fire diag decode-fwd-ubench at load, print ms/forward,
 # the CPU graph-build vs GPU eval split, ops/forward and a terminal lm_head ablation, shut down.
 #
 #   tests/fwd_ubench.sh <model-dir> [iters] [extra mlx-serve flags...]
 #
 # The unit of every decode-perf A/B here: one run per boot per arm, ALTERNATING arms per boot (a block-of-N schedule
-# reads drift as an effect). Exported MLX_SERVE_* reach the server: MLX_SERVE_LAYER_CAP=N (slope vs fixed cost),
-# MLX_SERVE_DISPATCH_PROBE=N (prices one dispatch with N exact-1.0 multiplies per MoE layer).
+# reads drift as an effect). An exported MLX_SERVE_DIAG joins the server's: layer-cap=N (slope vs fixed cost),
+# dispatch-probe=N (prices one dispatch with N exact-1.0 multiplies per MoE layer).
 
 set -uo pipefail
 
@@ -21,7 +21,7 @@ LOG="${LOG:-/tmp/fwd-ubench-$PORT.log}"
 pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
 sleep 1
 
-MLX_SERVE_DECODE_FWD_UBENCH="$ITERS" "$BIN" --model "$MODEL" --serve --port "$PORT" \
+MLX_SERVE_DIAG="decode-fwd-ubench=$ITERS${MLX_SERVE_DIAG:+,$MLX_SERVE_DIAG}" "$BIN" --model "$MODEL" --serve --port "$PORT" \
   --log-level info "$@" >"$LOG" 2>&1 &
 SRV=$!
 

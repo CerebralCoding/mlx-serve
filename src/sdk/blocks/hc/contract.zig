@@ -881,9 +881,6 @@ test "kernel contract hc: each declared launch is the shipped wrapper's, byte fo
         try std.testing.expectEqualSlices(u8, try m.wrapper(), ours);
     }
     // The down weights the wrapper reads are the nd test's; the up launch binds them through `u`'s slots.
-    const hd2_override = hd2.override;
-    hd2.override = true;
-    defer hd2.override = hd2_override;
     inline for (.{ .{ Cfg{ .bits = 8 }, &nd8, &upv8, true, 4 }, .{ Cfg{ .bits = 4 }, &nd4, &up4, false, 3 }, .{ Cfg{ .bits = 16, .inj = false }, &nd16, &up16, false, 1 } }) |case| {
         var nd = Nd.init(a, case[1], case[0], .streams);
         defer nd.deinit();

@@ -38,7 +38,7 @@ packs (`experts.bin`) are refused by name: lib/mlx-stream serves them until P4 m
   (`Hash.DEAD`).
 - The resume key includes the image rows: a different image at the same tokens is a cold prompt.
 - DSpark = DFlash + Markov head: `block_size` at ROOT; `rope_is_neox_style:false` = MLX `traditional=true`; `w1`
-  DENSE; sampled requests via one-hot acceptance (`MLX_SERVE_DSV4_DSPARK_STOCH=0`). Per-model `mtp:false` keeps the
+  DENSE; sampled requests via one-hot acceptance. Per-model `mtp:false` keeps the
   stages off (`mtpSetting`).
 - Serial is not exclusive: module-owned state needs admission single-flight.
 - The V4.1 template, like V4's, is byte-pinned (`tests/dsv41_template_ab.py`).

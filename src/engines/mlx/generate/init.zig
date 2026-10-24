@@ -11,7 +11,6 @@ const io_util = @import("../../../sdk/util/io_util.zig");
 const mtp_mod = @import("../../../sdk/spec/mtp/mtp.zig");
 const mtp_acceptance = @import("../spec/mtp_acceptance.zig");
 const round_cost = @import("../spec/round_cost.zig");
-const dflash_policy = @import("../spec/dflash/policy.zig");
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const ForwardCtx = transformer_mod.ForwardCtx;
@@ -32,7 +31,6 @@ const countSpliceRows = @import("prefill_chunk.zig").countSpliceRows;
 const decodeShareCapped = @import("prefill_chunk.zig").decodeShareCapped;
 const dsparkArmFor = @import("../spec/dspark.zig").dsparkArmFor;
 const dsparkEnabled = @import("../spec/dspark.zig").dsparkEnabled;
-const dsparkPolicyEnabled = @import("../spec/dspark.zig").dsparkPolicyEnabled;
 const effectiveMtpHistoryWindow = @import("prefill_chunk.zig").effectiveMtpHistoryWindow;
 const effectivePrefillChunk = @import("prefill_chunk.zig").effectivePrefillChunk;
 const effectiveSsmCheckpointStride = @import("prefill_chunk.zig").effectiveSsmCheckpointStride;
@@ -199,10 +197,10 @@ pub fn initWithOptions(
         options.pinned_prefill_chunk,
     ), options.decode_share_width_cap);
     // Phase-level prefill instrumentation. Enabled at debug level OR via
-    // MLX_SERVE_PREFILL_TRACE=1 (which forces the trace line at info).
+    // diag prefill-trace (which forces the trace line at info).
     // Phase 0 of plan 04 — gives us a decomposed view of where cold prefill
     // time goes (chunked-forward vs eval vs last-token-forward).
-    const trace_force: bool = generate_mod.prefill_trace_force or env.one(.MLX_SERVE_PREFILL_TRACE);
+    const trace_force: bool = generate_mod.prefill_trace_force or env.one(.PREFILL_TRACE);
     const trace_enabled = log.isDebug() or trace_force;
     var prefill_sw = io_util.Stopwatch.init(io);
     var chunked_ns: u64 = 0;
@@ -905,7 +903,7 @@ pub fn initWithOptions(
     }
 
     if (dspark_active) if (intree.dsv41(xfm)) |m41| {
-        m41.ds_want_conf = dsparkPolicyEnabled();
+        m41.ds_want_conf = true;
     };
     // Drafter / PLD-v2 / MTP path: sample synchronously and DO NOT
     // pre-forward the sampled token. The first nextDrafter / nextPld /
@@ -961,13 +959,13 @@ pub fn initWithOptions(
             .pld_enabled = pld_active,
             .dspark_enabled = dspark_active,
             .dspark_stochastic = dspark_stochastic,
-            .dspark_pol = if (dspark_active and intree.dsv41(xfm) != null and dsparkPolicyEnabled()) .{} else null,
+            .dspark_pol = if (dspark_active and intree.dsv41(xfm) != null) .{} else null,
             .drafter = if (drafter_active) options.drafter else null,
             .drafter_block_size = options.drafter_block_size,
             .dflash = if (dflash_active) options.dflash else null,
             .dflash_ctx = dflash_ctx,
             .dflash_block_size = dflash_bs,
-            .dflash_pol = if (dflash_active and options.dflash_policy) .{ .pin_rows = @intCast(@min(env.int(.MLX_SERVE_DFLASH_ROWS, usize, 0), dflash_policy.MAX_ROWS)) } else null,
+            .dflash_pol = if (dflash_active and options.dflash_policy) .{} else null,
             .dflash_min_accepted_per_round = options.dflash_min_accepted_per_round,
             .mtp = if (mtp_active) options.mtp else null,
             .mtp_accept_graph = accept_route.graph,

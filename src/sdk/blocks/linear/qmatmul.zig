@@ -2,7 +2,6 @@
 //! Owns and 8 more.
 
 const std = @import("std");
-const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const qmv_cuda = @import("../qmm/qmv_cuda.zig");
 const rowqmv = @import("../qmm/rowqmv.zig");
@@ -42,20 +41,18 @@ pub fn rowExactQmm(rowqmv_only: bool, x: mlx.mlx_array, w: mlx.mlx_array, sc: ml
 }
 
 /// The verify lanes cover 2..7 rows everywhere and take 8+ only with a NAX or shader tile,
-/// so by default simd_qmm starts at 8 rows where there is no tile and stays off where there is.
-/// MLX_SERVE_SIMD_QMM_DECODE=N overrides (0 = off).
-pub fn simdQmmDecodeMinRows(raw: ?[*:0]const u8, tile: VqmmTile) c_int {
-    if (raw) |r| return std.fmt.parseInt(c_int, std.mem.sliceTo(r, 0), 10) catch 0;
+/// so simd_qmm starts at 8 rows where there is no tile and stays off where there is.
+pub fn simdQmmDecodeMinRows(tile: VqmmTile) c_int {
     return if (tile == .off) 8 else 0;
 }
 
-var simd_qmm_decode_env: ?c_int = null;
+var simd_qmm_decode_rows: ?c_int = null;
 /// Affine projections of N to simd_qmm.MAX_ROWS rows go through simd_qmm with no drafter
 /// bound (batched decode widths). N comes from `simdQmmDecodeMinRows`.
 pub fn simdQmmDecode(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, s: mlx.mlx_stream) !?mlx.mlx_array {
-    const min_rows = simd_qmm_decode_env orelse blk: {
-        const v = simdQmmDecodeMinRows(env.get(.MLX_SERVE_SIMD_QMM_DECODE), verifyQmmTile());
-        simd_qmm_decode_env = v;
+    const min_rows = simd_qmm_decode_rows orelse blk: {
+        const v = simdQmmDecodeMinRows(verifyQmmTile());
+        simd_qmm_decode_rows = v;
         if (v > 0) log.info("[simd_qmm] batched projections of {d}..{d} rows\n", .{ v, simd_qmm.MAX_ROWS });
         break :blk v;
     };

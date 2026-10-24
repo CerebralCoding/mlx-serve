@@ -15,7 +15,7 @@ pub fn debugTraceHead(label: []const u8, arr: mlx.mlx_array, s: mlx.mlx_stream) 
     std.debug.print("{s}: {any}\n", .{ label, d[0..8] });
 }
 
-// ── Decode sub-block profiler (MLX_SERVE_DECODE_PROFILE=1) ──
+// ── Decode sub-block profiler (diag decode-profile) ──
 // Serializes the S=1 decode forward with per-sub-block evals to attribute the
 // per-token GPU cost across embed / attn / mlp / lm_head. DIAGNOSTIC ONLY: the
 // evals defeat the async pipeline (absolute tok/s drops while active), so the
@@ -35,7 +35,7 @@ const DecodeProf = struct {
     moe_shared_ns: u64 = 0,
 };
 
-/// DIAGNOSTIC (MLX_SERVE_LAYER_CAP): clamp the layer loop so a ms-vs-layers
+/// DIAGNOSTIC (diag layer-cap): clamp the layer loop so a ms-vs-layers
 /// sweep separates per-layer slope from fixed cost. Unset — the only shipped
 /// state — returns the model's real depth.
 var layer_cap_env: ?usize = null;
@@ -43,7 +43,7 @@ var layer_cap_env: ?usize = null;
 pub fn layerCap(n: usize) usize {
     if (layer_cap_env == null) {
         layer_cap_env = blk: {
-            const raw = env.get(.MLX_SERVE_LAYER_CAP) orelse break :blk 0;
+            const raw = env.get(.LAYER_CAP) orelse break :blk 0;
             break :blk std.fmt.parseInt(usize, std.mem.sliceTo(raw, 0), 10) catch 0;
         };
     }
@@ -79,17 +79,17 @@ pub const ProfClock = struct {
 
 pub fn decodeProfileEnabled() bool {
     if (profileState().decode_prof_enabled) |v| return v;
-    const v = env.get(.MLX_SERVE_DECODE_PROFILE) != null;
+    const v = env.get(.DECODE_PROFILE) != null;
     profileState().decode_prof_enabled = v;
     return v;
 }
 
 /// Extra per-MoE-layer elementwise dispatches injected by the sizing probe
-/// (`MLX_SERVE_DISPATCH_PROBE`). 0 = off, which is every non-diagnostic run.
+/// (diag `dispatch-probe`). 0 = off, which is every non-diagnostic run.
 var dispatch_probe_cached: ?usize = null;
 pub fn dispatchProbeCount() usize {
     if (dispatch_probe_cached) |v| return v;
-    const raw = env.get(.MLX_SERVE_DISPATCH_PROBE);
+    const raw = env.get(.DISPATCH_PROBE);
     const n: usize = if (raw) |r| std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 0 else 0;
     dispatch_probe_cached = n;
     return n;

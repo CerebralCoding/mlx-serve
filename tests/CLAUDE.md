@@ -168,7 +168,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 - `bench.sh` THE bench · `bench_versions.sh` (+ `bench_csv.py`, `plot_version_ab.py`) two builds · `bench_chart.py` PR charts
 - `bench_concurrency_ladder.sh`, `bench_batched_spec.sh`, `bench_laguna_xs.sh`
 - `fwd_ubench.sh` ms/forward · `greedy_ab.sh` output-preservation bar · `prefill_ab.sh` · `qwen4_ab.sh` · `qwen4_engagement.sh`
-- `MLX_SERVE_VQMM_FN_UBENCH=1 zig build test -Doptimize=ReleaseFast -Dtest-filter="Flash Next shapes µbench"` verify-lane prices
+- `MLX_SERVE_DIAG=vqmm-fn-ubench zig build test -Doptimize=ReleaseFast -Dtest-filter="Flash Next shapes µbench"` verify-lane prices
 
 **Converters, pack tools, calibration** (user-run; the header names inputs and the bar)
 - `convert_{acestep_weights,dsv4_weights,hunyuan3d_weights,hunyuan3d_paint_weights,kev_weights,kokoro_weights,mageflow_weights,mimo_v2,minicpmv4_7,minimax_h3_weights,moss_image_weights,nemotron_lilicorr,qwen38_flash_next,qwen38_iq,qwen_image21_weights,trellis2_pixal3d,yue2}.py`

@@ -1,6 +1,5 @@
 //! Runtime spec gates: warmups, per-draft rate, DFlash and yield gates, re-enable, yielding to company.
 const std = @import("std");
-const env = @import("../../../env.zig");
 const model_mod = @import("../model.zig");
 const log = @import("../../../sdk/util/log.zig");
 const pld_index = @import("pld_index.zig");
@@ -70,11 +69,8 @@ pub const DFLASH_MOE_GATE_MIN_ACCEPTED_PER_ROUND: f32 = 1.8;
 
 /// The round policy (`dflash_policy.zig`) drives DFlash on a sparse target whose verify rows cost
 /// (GLM-5.3); every other arch keeps the fixed block until it is A/B'd on its own.
-/// `MLX_SERVE_DFLASH_POLICY=0` restores the fixed block and the sticky yield gate.
 pub fn dflashPolicyFor(config: *const model_mod.ModelConfig) bool {
-    if (!config.isGlm5()) return false;
-    const raw = env.get(.MLX_SERVE_DFLASH_POLICY) orelse return true;
-    return !std.mem.eql(u8, std.mem.span(raw), "0");
+    return config.isGlm5();
 }
 
 pub fn dflashGateShouldDisable(attempted: u64, accepted: u64, min_avg: f32) bool {

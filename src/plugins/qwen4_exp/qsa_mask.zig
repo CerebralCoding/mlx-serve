@@ -3,7 +3,6 @@
 //! launches per attention layer; the mask is just "this token's block is in the sorted selection, or
 //! the token is in the incomplete tail" (every key of a one-row step is causal-visible).
 const std = @import("std");
-const env = @import("../../env.zig");
 const kernelSource = @import("../../mlx/kernels.zig").source;
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../sdk/util/log.zig");
@@ -14,16 +13,11 @@ pub const SOURCE = kernelSource("plugins/qwen4_exp/kernels/qsa_mask.metal");
 
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
 var engaged = false;
-var env_enabled: ?bool = null;
+/// Test seam: false keeps the op chain.
 pub var override: ?bool = null;
 
-/// `MLX_SERVE_QSA_MASK_KERNEL=0` keeps the op chain.
 fn enabled() bool {
-    if (override) |v| return v;
-    if (env_enabled) |v| return v;
-    const raw = env.get(.MLX_SERVE_QSA_MASK_KERNEL);
-    env_enabled = raw == null or raw.?[0] != '0';
-    return env_enabled.?;
+    return override orelse true;
 }
 
 /// `[1, 1, 1, kv]` bool mask for one decode row over `blocks` `[1, 1, kb]` int32, or null outside
@@ -62,7 +56,7 @@ pub fn rowMask(s: mlx.mlx_stream, blocks: mlx.mlx_array, kv: c_int, ratio: c_int
     try mlx.check(mlx.mlx_vector_array_get(&out, o, 0));
     if (!engaged) {
         engaged = true;
-        log.info("[qsa] one-row key mask kernel engaged (MLX_SERVE_QSA_MASK_KERNEL=0 restores the op chain)\n", .{});
+        log.info("[qsa] one-row key mask kernel engaged\n", .{});
     }
     return out;
 }

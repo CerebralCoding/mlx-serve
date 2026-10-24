@@ -15,7 +15,6 @@ const prof = @import("prof.zig");
 const MAX_BATCH_ROWS = @import("../../engines/mlx/batched/layered.zig").MAX_BATCH_ROWS;
 const L10VerifySlots = @import("../../engines/mlx/batched/row_axis_verify.zig").L10VerifySlots;
 const ProfClock = @import("../../engines/mlx/diag/profile.zig").ProfClock;
-const diagEnvOnCached = @import("../../engines/mlx/env_transformer.zig").diagEnvOnCached;
 const ForwardCtx = @import("../../engines/mlx/forward_ctx.zig").ForwardCtx;
 const KVCache = @import("../../engines/mlx/kv/cache.zig").KVCache;
 const testing = @import("../../engines/mlx/kv/cache.zig").testing;
@@ -385,11 +384,11 @@ pub fn pleFillFromIds(self: *Trunk, ctx: *ForwardCtx, ids_c: mlx.mlx_array, entr
     const emb_dim: usize = st.table.dim * nh;
     const host = try self.allocator.alloc(f32, n * emb_dim);
     defer self.allocator.free(host);
-    var gclk: ProfClock = if (diagEnvOnCached(&prof.qwen4_profile_fwd_env, "QWEN4_PROFILE_FWD")) ProfClock.init() else undefined;
+    var gclk: ProfClock = if (prof.profileFwdOn()) ProfClock.init() else undefined;
     // The pool's arm is a kv-length question; `ctx.moe_seq_offset` is the pre-chunk
     // position (`cache.step` is 0 forever on a GDN trunk).
     st.table.gather(rows, host, @intCast(ctx.moe_seq_offset.*));
-    if (diagEnvOnCached(&prof.qwen4_profile_fwd_env, "QWEN4_PROFILE_FWD")) log.info("[qwen4-prof] ple gather S={d}: {d:.2} ms\n", .{ seq_len, @as(f64, @floatFromInt(gclk.lap())) / 1e6 });
+    if (prof.profileFwdOn()) log.info("[qwen4-prof] ple gather S={d}: {d:.2} ms\n", .{ seq_len, @as(f64, @floatFromInt(gclk.lap())) / 1e6 });
     std.debug.assert(pk.len == host.len);
     for (host, pk) |v, *o| o.* = qwen4_mod.bf16Rne(v);
 }

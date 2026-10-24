@@ -97,15 +97,13 @@ pub fn parseDecodeShare(text: []const u8) error{InvalidDecodeShare}!f32 {
     return @min(v, PREFILL_DECODE_SHARE_MAX);
 }
 
-/// The flag's text if given, else the env's, else 0.
 /// The decode share a server runs with when nothing names one: the boundary admission and the
 /// smallest-tail-first batch only engage under a share, and without it a quick question waited
 /// 90-120 s behind a 90k prefill (26.10.3 validation). `--prefill-decode-share 0` restores the old schedule.
 pub const DEFAULT_DECODE_SHARE: f32 = 0.25;
 
-pub fn resolveDecodeShare(flag: ?[]const u8, env_value: ?[]const u8) error{InvalidDecodeShare}!f32 {
-    const text = flag orelse env_value orelse return DEFAULT_DECODE_SHARE;
-    return parseDecodeShare(text);
+pub fn resolveDecodeShare(flag: ?[]const u8) error{InvalidDecodeShare}!f32 {
+    return parseDecodeShare(flag orelse return DEFAULT_DECODE_SHARE);
 }
 
 /// An echo prefill ranks every row against the whole vocab: the top-k sort peaks at five
@@ -706,12 +704,11 @@ test "decode share: parse clamps above 0.9 and rejects anything that is not a sh
     for ([_][]const u8{ "", "abc", "nan", "-0.3", "0.5x" }) |bad| {
         try testing.expectError(error.InvalidDecodeShare, parseDecodeShare(bad));
     }
-    // The flag outranks the env; neither set is 0; a bad env is an error, not 0.
-    try testing.expectEqual(@as(f32, 0.3), try resolveDecodeShare("0.3", "0.5"));
-    try testing.expectEqual(@as(f32, 0.5), try resolveDecodeShare(null, "0.5"));
-    try testing.expectEqual(DEFAULT_DECODE_SHARE, try resolveDecodeShare(null, null));
-    try testing.expectEqual(@as(f32, 0), try resolveDecodeShare("0", null));
-    try testing.expectError(error.InvalidDecodeShare, resolveDecodeShare(null, "abc"));
+    // Unset is the default; a bad flag is an error, not 0.
+    try testing.expectEqual(@as(f32, 0.3), try resolveDecodeShare("0.3"));
+    try testing.expectEqual(DEFAULT_DECODE_SHARE, try resolveDecodeShare(null));
+    try testing.expectEqual(@as(f32, 0), try resolveDecodeShare("0"));
+    try testing.expectError(error.InvalidDecodeShare, resolveDecodeShare("abc"));
 }
 
 test "decode share: the budget is chunk * S / (1 - S), zero when off" {

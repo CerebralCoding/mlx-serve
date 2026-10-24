@@ -46,14 +46,14 @@ an in-checkpoint MTP layer, a Qwen3-VL tower. Packs, oracle: `docs/reference.md`
   spec slot at build time; the GPU arm settles its n-gram history at the NEXT forward.
 - PLE read path is calibrated on the inference thread before and after warming, median of 5 (`calibrateArm`); a cold
   32 GB mmap is a serial SSD fault (`PrefetchPool`, `startWarm`); `--ple-gpu` gates the no-copy wrap BEFORE wrapping.
-- Residual stream is bf16; the f32 fixture is the MATH oracle (`QWEN4_STREAM_F32=1`); `qwen4 fixture bf16` pins
+- Residual stream is bf16; the f32 fixture is the MATH oracle (`MLX_SERVE_DIAG=qwen4-stream-f32`); `qwen4 fixture bf16` pins
   streams at 0.999. GDN state + gate in f32 (`MLX_SERVE_GDN_STATE_F32=0` = bf16), its own SSD namespace.
 - Tiny MoE oracles tie everywhere: fixtures dump the reference's own margins; `Qwen4Ties` acquits by those.
 - MTP head state is a `Qwen4MtpState` swapped onto the module (`qwen4MtpActivate` before EVERY head touch); the head
   projects only the consumed row; its rounds stay solo (`mtpRoundsStaySolo`).
 - A fast path keyed on one pack's quant layout is silent on another's: new pack layout => `tests/qwen4_engagement.sh`.
 - Decode is kernel-time and dispatch bound: a kernel that replaces ONE dispatch loses to MLX's qmv; rows per simdgroup
-  is an occupancy decision (sweep in situ). Meters: `fwd-ubench`, `MLX_SERVE_STEP_TRACE=1`.
+  is an occupancy decision (sweep in situ). Meters: `tests/fwd_ubench.sh`, `MLX_SERVE_DIAG=step-trace`.
 
 - MTP specifics: the head projects only the consumed row (`Qwen4MtpProject`) and rides the slot's M-RoPE table on image turns; the grouped-expert NAX tile is a LOSS; solo greedy rounds pad the head history and pre-draft lazily, lagging one round at auto depth BY DESIGN.
 

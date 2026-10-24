@@ -1622,13 +1622,13 @@ test "gdnBlockedEligible: width floor + exact-128 Dk + Dv/head-group alignment" 
     try testing.expect(!gdnBlockedEligible(2048, 128, 128, 3, 32));
 }
 
-test "GDN µbench: sequential kernel vs bare qmm at 27B shapes (attribution; MLX_SERVE_GDN_UBENCH=1)" {
+test "GDN µbench: sequential kernel vs bare qmm at 27B shapes (attribution; diag gdn-ubench)" {
     // ATTRIBUTION probe, not a pass/fail guard (live A/Bs decide shipping):
     // decomposes the multi-token forward ladder into (a) the GDN recurrence
     // kernel's sequential-over-T cost and (b) qmm row-count effects, at the
     // real Qwen3.6-27B geometry. Run with:
-    //   MLX_SERVE_GDN_UBENCH=1 zig build test -Doptimize=ReleaseFast -Dtest-filter="GDN µbench"
-    if (env.get(.MLX_SERVE_GDN_UBENCH) == null) return error.SkipZigTest;
+    //   MLX_SERVE_DIAG=gdn-ubench zig build test -Doptimize=ReleaseFast -Dtest-filter="GDN µbench"
+    if (env.get(.GDN_UBENCH) == null) return error.SkipZigTest;
     const io_util = @import("../../util/io_util.zig");
     const tio = testing.io;
     const s = mlx.gpuStream();

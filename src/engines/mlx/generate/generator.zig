@@ -236,7 +236,7 @@ pub const Generator = struct {
     ssm_lag: [2]SsmLag = .{ .{}, .{} },
     /// Stats: cumulative draft tokens accepted (excluding always-accepted t1).
     dflash_accepted_tokens: u64 = 0,
-    /// Per-phase wall-time trace (MLX_SERVE_DFLASH_TRACE=1; else untouched).
+    /// Per-phase wall-time trace (diag dflash-trace; else untouched).
     /// Unlike the MTP trace this one INSERTS eval barriers to attribute a
     /// fully-lazy round — a traced round is slower than a real one by
     /// whatever overlap the barriers destroy. Diagnostic only.
@@ -393,7 +393,7 @@ pub const Generator = struct {
     /// This slot's next `mtpRoundBegin` inits the chain and returns `.open` so the
     /// scheduler can run the head step for the group in one graph.
     mtp_batch_head: bool = false,
-    /// Per-phase wall-time trace (MLX_SERVE_MTP_TRACE=1; else untouched).
+    /// Per-phase wall-time trace (diag mtp-trace; else untouched).
     mtp_trace: MtpTrace = .{},
     /// Trace-only: stopwatch running across the scheduler gap (round return
     /// → next round entry); bills the `.gap` phase. Null when not tracing.
@@ -512,7 +512,6 @@ pub const Generator = struct {
     pub const DsparkArm = @import("../spec/dspark.zig").DsparkArm;
     pub const dsparkArmFor = @import("../spec/dspark.zig").dsparkArmFor;
     pub const dsparkEnabled = @import("../spec/dspark.zig").dsparkEnabled;
-    const dsparkPolicyEnabled = @import("../spec/dspark.zig").dsparkPolicyEnabled;
     pub const initWithOptions = @import("init.zig").initWithOptions;
 
     /// Return the prefill's parked transients once, at the handover to decode.
@@ -663,7 +662,6 @@ pub const Generator = struct {
     pub const commitForcedTokens = @import("pipeline.zig").commitForcedTokens;
     pub const PldStepResult = @import("../spec/pld.zig").PldStepResult;
     pub const nextDspark = @import("../spec/dspark.zig").nextDspark;
-    const dsparkCopyOff = @import("../spec/dspark.zig").dsparkCopyOff;
     pub const dsparkCopyStep = @import("../spec/dspark.zig").dsparkCopyStep;
     pub const dsparkStep = @import("../spec/dspark.zig").dsparkStep;
     pub const dsparkPlainPipelined = @import("../spec/dspark.zig").dsparkPlainPipelined;
@@ -681,7 +679,6 @@ pub const Generator = struct {
     pub const nextDflash = @import("../spec/dflash.zig").nextDflash;
     const VerifyIn = @import("../spec/dflash.zig").VerifyIn;
     pub const dflashVerify = @import("../spec/dflash.zig").dflashVerify;
-    const dflashCopyOff = @import("../spec/dflash.zig").dflashCopyOff;
     const DFLASH_COPY_MAX = @import("../spec/dflash.zig").DFLASH_COPY_MAX;
     pub const dflashCopyRound = @import("../spec/dflash.zig").dflashCopyRound;
     const DFLASH_PENDING_MAX = @import("../spec/dflash.zig").DFLASH_PENDING_MAX;

@@ -241,7 +241,7 @@ fn expectVerifyQmmNoWorseThanStock(
     const cos_stock = dot_s / (@sqrt(ns) * @sqrt(nt));
     const cos_kern = dot_k / (@sqrt(nk) * @sqrt(nt));
 
-    if (env.get(.MLX_SERVE_VQMM_PARITY_DEBUG) != null) {
+    if (env.get(.VQMM_PARITY_DEBUG) != null) {
         std.debug.print(
             "[vqmm-parity] {s:>16}: n={d} max {d:.5}/{d:.5} rms {d:.6}/{d:.6} (ratio {d:.3}) cos {d:.7}/{d:.7}\n",
             .{ label, count, stock_max, kern_max, rms_stock, rms_kern, if (rms_stock > 0) rms_kern / rms_stock else 0, cos_stock, cos_kern },
@@ -982,8 +982,8 @@ test "NAX host scaffolding: zero-pad to 16 rows + slice-back are exact (runs off
     }
 }
 
-test "verifyQmm µbench: kernel vs stock per 27B shape (MLX_SERVE_VQMM_UBENCH=1)" {
-    if (env.get(.MLX_SERVE_VQMM_UBENCH) == null) return error.SkipZigTest;
+test "verifyQmm µbench: kernel vs stock per 27B shape (diag vqmm-ubench)" {
+    if (env.get(.VQMM_UBENCH) == null) return error.SkipZigTest;
     const io_util = @import("../../util/io_util.zig");
     const tio = testing.io;
     const s = mlx.gpuStream();
@@ -1123,8 +1123,8 @@ test "verifyQmm µbench: kernel vs stock per 27B shape (MLX_SERVE_VQMM_UBENCH=1)
     }
 }
 
-test "verifyQmm Flash Next shapes µbench: stock vs plain vs NAX per width (MLX_SERVE_VQMM_FN_UBENCH=1)" {
-    if (env.get(.MLX_SERVE_VQMM_FN_UBENCH) == null) return error.SkipZigTest;
+test "verifyQmm Flash Next shapes µbench: stock vs plain vs NAX per width (diag vqmm-fn-ubench)" {
+    if (env.get(.VQMM_FN_UBENCH) == null) return error.SkipZigTest;
     const io_util = @import("../../util/io_util.zig");
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0xF1A5);
@@ -1208,8 +1208,8 @@ test "verifyQmm Flash Next shapes µbench: stock vs plain vs NAX per width (MLX_
     }
 }
 
-test "verifyQmm mixed-width NAX µbench (MLX_SERVE_VQMM_MIXED_UBENCH=1)" {
-    if (env.get(.MLX_SERVE_VQMM_MIXED_UBENCH) == null) return error.SkipZigTest;
+test "verifyQmm mixed-width NAX µbench (diag vqmm-mixed-ubench)" {
+    if (env.get(.VQMM_MIXED_UBENCH) == null) return error.SkipZigTest;
     if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
     const io_util = @import("../../util/io_util.zig");
     const tio = testing.io;

@@ -432,10 +432,10 @@ clock, counter or branch for them.
 
 | variable | effect |
 |---|---|
-| `MIMO_ROUTE_TRACE=<file prefix>` | one request's per-token, per-layer top-8 routes for the prompt and decode, the plan each decode call returned, the residency at the phase change and at the end, and the predictor's top-16, in files under the prefix |
-| `MIMO_PREFILL_TIMELINE=1` | the first prompt pass's per-layer, per-stage and per-tile timeline, on the host clock and the GPU's |
-| `MIMO_GPU_TIMELINE=1` | the draft lane's verify GPU timeline for the first request |
-| `MIMO_DIAG=missfree` | serves decode's misses from resident slots, reading nothing: a diagnostic of the read cost whose outputs are garbage, never a measured cell |
+| `MLX_SERVE_DIAG=mimo-route-trace=<file prefix>` | one request's per-token, per-layer top-8 routes for the prompt and decode, the plan each decode call returned, the residency at the phase change and at the end, and the predictor's top-16, in files under the prefix |
+| `MLX_SERVE_DIAG=mimo-prefill-timeline` | the first prompt pass's per-layer, per-stage and per-tile timeline, on the host clock and the GPU's |
+| `MLX_SERVE_DIAG=mimo-gpu-timeline` | the draft lane's verify GPU timeline for the first request |
+| `MLX_SERVE_DIAG=mimo-diag=missfree` | serves decode's misses from resident slots, reading nothing: a diagnostic of the read cost whose outputs are garbage, never a measured cell |
 
 ## Tests
 

@@ -1,8 +1,8 @@
 #!/bin/bash
-# test_mlx_error_recovery.sh — an MLX error costs ONE REQUEST, never the server. MLX_SERVE_MLX_FAULT_CHUNK=<n> /
-# _STEP=<n> latch a synthetic Metal OOM at the n-th prefill-chunk / decode-step checkpoint and disarm: the faulting
+# test_mlx_error_recovery.sh — an MLX error costs ONE REQUEST, never the server. MLX_SERVE_DIAG=mlx-fault-chunk=<n> /
+# mlx-fault-step=<n> latch a synthetic Metal OOM at the n-th prefill-chunk / decode-step checkpoint and disarm: the faulting
 # request gets a 503 with a body (streaming: the SSE `error` event), `[mlx]` is logged, the process lives, and the
-# next request is a 200 with content; plus a long prompt with no max_tokens. MLX_SERVE_MLX_FAULT_KIND=cuda_lost: the
+# next request is a 200 with content; plus a long prompt with no max_tokens. mlx-fault-kind=cuda_lost: the
 # faulting and every later request answer the named 503 `gpu_context_lost`, /health answers 503 `cuda context lost`,
 # the loss is logged once, the process stays up.
 #
@@ -22,7 +22,7 @@ bad()  { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
 
 LOG=$(mktemp -t mlxerr.XXXXXX).log
 # Chunk 2, not 1, so real forward work precedes the fault.
-MLX_SERVE_MLX_FAULT_CHUNK=2 ./zig-out/bin/mlx-serve serve --model "$MODEL" \
+MLX_SERVE_DIAG=mlx-fault-chunk=2 ./zig-out/bin/mlx-serve serve --model "$MODEL" \
   --host 127.0.0.1 --port "$PORT" --log-level info > "$LOG" 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null' EXIT
@@ -69,7 +69,7 @@ kill $SRV 2>/dev/null; wait $SRV 2>/dev/null
 # The decode checkpoint: a decode-time failure used to finish 200 and become the next request's 503.
 echo "[4] an MLX error during DECODE fails that request, not the next one"
 LOG2=$(mktemp -t mlxerr2.XXXXXX).log
-MLX_SERVE_MLX_FAULT_STEP=2 ./zig-out/bin/mlx-serve serve --model "$MODEL" \
+MLX_SERVE_DIAG=mlx-fault-step=2 ./zig-out/bin/mlx-serve serve --model "$MODEL" \
   --host 127.0.0.1 --port "$PORT" --log-level info > "$LOG2" 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null' EXIT
@@ -93,7 +93,7 @@ fi
 echo "[6] a decode-time MLX error on a STREAMING request sends the mapped SSE error"
 kill $SRV 2>/dev/null; wait $SRV 2>/dev/null
 LOG3=$(mktemp -t mlxerr3.XXXXXX).log
-MLX_SERVE_MLX_FAULT_STEP=2 ./zig-out/bin/mlx-serve serve --model "$MODEL" \
+MLX_SERVE_DIAG=mlx-fault-step=2 ./zig-out/bin/mlx-serve serve --model "$MODEL" \
   --host 127.0.0.1 --port "$PORT" --log-level info > "$LOG3" 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null' EXIT
@@ -152,7 +152,7 @@ fi
 echo "[7] a lost GPU context: every request is a named 503, /health says so, the process stays up"
 kill $SRV 2>/dev/null; wait $SRV 2>/dev/null
 LOG7=$(mktemp -t mlxerr7.XXXXXX).log
-MLX_SERVE_MLX_FAULT_STEP=2 MLX_SERVE_MLX_FAULT_KIND=cuda_lost ./zig-out/bin/mlx-serve serve --model "$MODEL" \
+MLX_SERVE_DIAG=mlx-fault-step=2,mlx-fault-kind=cuda_lost ./zig-out/bin/mlx-serve serve --model "$MODEL" \
   --host 127.0.0.1 --port "$PORT" --log-level info > "$LOG7" 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null' EXIT

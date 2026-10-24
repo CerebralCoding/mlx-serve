@@ -23,7 +23,6 @@ const crt = @import("../../../sdk/util/crt.zig");
 const os_mutex = @import("../../../sdk/util/os_mutex.zig");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
-const transformer_mod = @import("../transformer.zig");
 
 /// Drafts per round the table covers (MTP depth <= 8, a DFlash block up to 16); index 0 is serial.
 pub const MAX_WIDTH: u32 = 16;
@@ -714,19 +713,19 @@ pub fn persistEnabled() bool {
 
 pub fn persistDiagArmedFrom(raws: []const ?[*:0]const u8) bool {
     for (raws) |raw| {
-        if (transformer_mod.diagEnvValueOn(raw)) return true;
+        if (env.onValue(raw)) return true;
     }
     return false;
 }
 
 fn qwen4ProfileArmed() bool {
-    return env.anyOnWithPrefix("QWEN4_PROFILE_");
+    return env.diagAny("qwen4-profile-");
 }
 
 pub fn persistDiagArmed() bool {
     return qwen4ProfileArmed() or @import("mtp_depth_bounds.zig").active.pinned() != null or
         persistDiagArmedFrom(&.{
-            env.get(.MLX_SERVE_MTP_TRACE),
+            env.get(.MTP_TRACE),
         });
 }
 

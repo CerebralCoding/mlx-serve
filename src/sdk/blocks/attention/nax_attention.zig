@@ -6,7 +6,6 @@
 //! (bit-identical to one dispatch), so a pass's K/V stays in the on-chip caches;
 //! those passes also split the head dims over simdgroup pairs.
 const std = @import("std");
-const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const Scope = @import("../../../mlx/scope.zig").Scope;
@@ -162,20 +161,13 @@ pub fn dispatch(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.ml
 /// Head dim 256 with int8 Q and K (SageAttention): Q per 64-row tile, K per
 /// 32-key block after removing each KV head's mean key (a constant offset on
 /// every key moves each score row by a constant, which softmax ignores).
-/// P and V stay in the activation dtype. Opt-in and lossy (`MLX_SERVE_INT8_QK`).
+/// P and V stay in the activation dtype. Opt-in and lossy (`--int8-qk`).
 pub const SOURCE_256Q8 = kernelSource("kernels/attention/nax_attention_256q8_entry.metal");
 const Q8_WM: c_int = 4;
 const Q8_BQ: c_int = 16 * Q8_WM;
 
 var kernel_256q8: ?mlx.mlx_fast_metal_kernel = null;
 var engaged_256q8 = false;
-var int8_qk_env: ?bool = null;
-
-pub fn int8QkEnabledFrom(raw: ?[*:0]const u8) bool {
-    const v = raw orelse return false;
-    return v[0] != 0 and v[0] != '0';
-}
-
 /// Process-wide under `-Dunits` (sdk/util/shared.zig): one copy in the host.
 const NaxCliState = struct {
     /// Set by `--int8-qk`.
@@ -186,13 +178,8 @@ pub inline fn naxCli() *NaxCliState {
     return naxCli_shared.get();
 }
 
-pub fn int8QkOn(cli: bool, raw: ?[*:0]const u8) bool {
-    return cli or int8QkEnabledFrom(raw);
-}
-
 fn int8QkEnabled() bool {
-    if (int8_qk_env == null) int8_qk_env = int8QkOn(naxCli().int8_qk_cli, env.get(.MLX_SERVE_INT8_QK));
-    return int8_qk_env.?;
+    return naxCli().int8_qk_cli;
 }
 
 fn getKernel256Q8() !mlx.mlx_fast_metal_kernel {
@@ -218,7 +205,7 @@ pub fn attention256Int8(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v
     @import("../../util/log.zig").debug("[attn] int8 QK call qL={d} kL={d}\n", .{ mlx.getShape(q)[2], mlx.getShape(k)[2] });
     if (!engaged_256q8) {
         engaged_256q8 = true;
-        @import("../../util/log.zig").info("[attn] int8 QK hd-256 prefill attention engaged (MLX_SERVE_INT8_QK; lossy)\n", .{});
+        @import("../../util/log.zig").info("[attn] int8 QK hd-256 prefill attention engaged (--int8-qk; lossy)\n", .{});
     }
     return out;
 }
@@ -482,11 +469,7 @@ test "nax attention 256 int8 QK: causal prefill tracks fp32 attention, tails and
     }
 }
 
-test "nax attention 256 int8 QK: off unless MLX_SERVE_INT8_QK is set and not 0; verify widths decline" {
-    try testing.expect(!int8QkEnabledFrom(null));
-    try testing.expect(!int8QkEnabledFrom("0"));
-    try testing.expect(!int8QkEnabledFrom(""));
-    try testing.expect(int8QkEnabledFrom("1"));
+test "nax attention 256 int8 QK: verify widths decline" {
     if (mlx.noGpuBackend() or !@import("../linear/verify_qmm_nax.zig").verifyQmmNaxAvailable()) return;
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(256009);
@@ -496,14 +479,6 @@ test "nax attention 256 int8 QK: off unless MLX_SERVE_INT8_QK is set and not 0; 
     const k = try randBf16(rnd, &.{ 1, 1, 400, 256 }, s);
     defer _ = mlx.mlx_array_free(k);
     try testing.expect((try attention256Int8Impl(s, q, k, k, 0.0625)) == null);
-}
-
-test "nax attention 256 int8 QK: --int8-qk turns it on beside the env gate" {
-    try testing.expect(!int8QkOn(false, null));
-    try testing.expect(!int8QkOn(false, "0"));
-    try testing.expect(int8QkOn(false, "1"));
-    try testing.expect(int8QkOn(true, null));
-    try testing.expect(int8QkOn(true, "0"));
 }
 
 /// Host [H, L, D] values as a bf16 [1, H, L, D] array, a transposed [1, L, H, D] buffer when `strided`.

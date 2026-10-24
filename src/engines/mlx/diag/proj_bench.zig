@@ -60,7 +60,7 @@ pub fn diagProjBench(self: *Transformer, iters: usize, ctx: *ForwardCtx) void {
     // lazy astype nodes outlive their f32 sources in a way the
     // single-input form never exposed), and this is a diagnostic, not
     // shipped behaviour. Size the MoE share off the REAL forward
-    // (MLX_SERVE_DECODE_FWD_UBENCH) instead, which routes through the
+    // (diag decode-fwd-ubench) instead, which routes through the
     // shipped kernels with real embeddings.
     const xsh = [_]c_int{ 1, 1, HID };
     const xb = self.allocator.alloc(f32, @intCast(HID)) catch return;

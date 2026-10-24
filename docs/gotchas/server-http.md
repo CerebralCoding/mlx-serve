@@ -768,8 +768,8 @@ errors are sticky and host-to-device copies assume they cannot fail. Fix: the la
 
 ### Chat interleaved inside an image job faulted the CUDA context
 Defect: the stress shape faulted 5 times in 8: a decode inside an image job's yields left state the next job's first
-step touched after an eviction. Fix: the chat-interleave hook is off on CUDA (`genYieldEnabled`;
-`MLX_SERVE_GEN_YIELD=1` restores it), Metal unchanged. Guard: `genYieldEnabled: off on CUDA unless asked for`.
+step touched after an eviction. Fix: the chat-interleave hook is off on CUDA (`genYieldEnabled`), Metal unchanged.
+Guard: `genYieldEnabled: off on CUDA`.
 
 ### A short GLM prompt without `max_tokens` was refused for 43 GB
 Defect: a 431-token prompt needed ~43 GB. Cause: decode growth was priced for the rest of a 1M window. Fix: growth

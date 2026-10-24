@@ -10,7 +10,6 @@ const log = @import("../../../sdk/util/log.zig");
 const history = @import("history.zig");
 const select = @import("select.zig");
 const transformer = @import("../../../engines/mlx/transformer.zig");
-const diagEnvValueOn = @import("../../../engines/mlx/env_transformer.zig").diagEnvValueOn;
 const testing = @import("../../../engines/mlx/kv/cache.zig").testing;
 const SSMCacheEntry = @import("../../../engines/mlx/ssm/entry.zig").SSMCacheEntry;
 const Transformer = @import("../trunk.zig").Trunk;
@@ -339,7 +338,7 @@ fn qsaDumpBlocksPath() ?[]const u8 {
     if (qsa_dump_blocks_read) return qsa_dump_blocks_cached;
     qsa_dump_blocks_read = true;
     const raw = env.get(.QWEN4_DUMP_QSA_BLOCKS) orelse return null;
-    if (!diagEnvValueOn(raw)) return null;
+    if (!env.onValue(raw)) return null;
     const s = std.mem.sliceTo(raw, 0);
     qsa_dump_blocks_cached = s;
     return s;

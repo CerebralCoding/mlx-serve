@@ -6,7 +6,6 @@
 //! key `lane >> 2` on lanes `4k..4k+3` (9 shuffles, not 8 x 5). More heads per simdgroup lose to
 //! register pressure.
 const std = @import("std");
-const env = @import("../../env.zig");
 const kernelSource = @import("../../mlx/kernels.zig").source;
 const mlx = @import("../../mlx/ffi.zig");
 
@@ -26,18 +25,6 @@ var merge_kernel: ?mlx.mlx_fast_metal_kernel = null;
 const Key = struct { hq: c_int, hk: c_int, kb: c_int, ratio: c_int };
 const Cfgs = struct { key: Key, parts: mlx.mlx_fast_metal_kernel_config, merge: mlx.mlx_fast_metal_kernel_config };
 var cfgs: ?Cfgs = null;
-
-var env_enabled: ?bool = null;
-pub var override: ?bool = null;
-
-/// `MLX_SERVE_QSA_DEC_KERNEL=0` keeps the mask / gather arms.
-pub fn enabled() bool {
-    if (override) |v| return v;
-    if (env_enabled) |v| return v;
-    const raw = env.get(.MLX_SERVE_QSA_DEC_KERNEL);
-    env_enabled = raw == null or raw.?[0] != '0';
-    return env_enabled.?;
-}
 
 fn newKernel(name: [*:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0]const u8, source: [*:0]const u8) !mlx.mlx_fast_metal_kernel {
     const in_vec = mlx.mlx_vector_string_new_data(ins.ptr, ins.len);
@@ -83,7 +70,7 @@ fn configsFor(key: Key, ns: c_int) !Cfgs {
 /// selects (RATIO tokens each) plus the incomplete tail; `k`/`v` are the dense cache views
 /// `[1, Hk, kv, 256]`. Null when the geometry is outside the kernel's set (the caller keeps its arm).
 pub fn attend(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, blocks: mlx.mlx_array, ratio: c_int, attn_scale: f32) !?mlx.mlx_array {
-    if (!enabled() or !mlx.streamIsGpu(s) or q.ctx == null or k.ctx == null or v.ctx == null or blocks.ctx == null) return null;
+    if (!mlx.streamIsGpu(s) or q.ctx == null or k.ctx == null or v.ctx == null or blocks.ctx == null) return null;
     if (mlx.mlx_array_ndim(q) != 4 or mlx.mlx_array_ndim(k) != 4 or mlx.mlx_array_ndim(blocks) != 3) return null;
     if (mlx.mlx_array_dtype(q) != .bfloat16 or mlx.mlx_array_dtype(k) != .bfloat16 or mlx.mlx_array_dtype(v) != .bfloat16) return null;
     if (mlx.mlx_array_dtype(blocks) != .int32) return null;
@@ -161,7 +148,6 @@ fn hostF32(s: mlx.mlx_stream, a: mlx.mlx_array) !struct { arr: mlx.mlx_array, da
 
 test "qsa decode: the one-token kernel is no worse than the masked SDPA against the f64 truth" {
     const xfm = @import("../../engines/mlx/transformer.zig");
-    defer override = null;
     const s = mlx.gpuStream();
     const hq: usize = 24;
     const hk: usize = 2;
@@ -239,7 +225,6 @@ test "qsa decode: the one-token kernel is no worse than the masked SDPA against 
             }
         }
 
-        override = true;
         const got = (try attend(s, q, kview, vview, blocks, @intCast(ratio), scale)) orelse return error.KernelDeclined;
         defer _ = mlx.mlx_array_free(got);
         const mask = try xfm.qsaMaskFromBlocks(s, blocks, @intCast(kv), @intCast(ratio));

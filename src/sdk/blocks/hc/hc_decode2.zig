@@ -6,7 +6,6 @@
 //! threadgroup. Rounding sites are the three-kernel path's (xn, silu, up, gate, mix); only the
 //! f32 accumulation order differs.
 const std = @import("std");
-const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../util/log.zig");
@@ -35,33 +34,16 @@ pub const U2_SOURCE = kernelSource("kernels/hc/hc_decode2_u2.metal");
 /// silu) are staged once per threadgroup. Rounding sites are U2_SOURCE's; only the f32 summation order differs.
 pub const U2V_SOURCE = kernelSource("kernels/hc/hc_decode2_u2v.metal");
 
-var env_enabled: ?bool = null;
-pub var override: ?bool = null;
 var engaged = false;
 /// Reads served by the two launches (the tests assert the path engaged).
 pub var served: u64 = 0;
 /// Of those, reads whose up launch took the vectorized kernel.
 pub var served_vec: u64 = 0;
 
-/// `MLX_SERVE_HC_DECODE2=0` keeps the unfused chain.
-pub fn enabled() bool {
-    if (override) |v| return v;
-    if (env_enabled) |v| return v;
-    const raw = env.get(.MLX_SERVE_HC_DECODE2);
-    env_enabled = raw == null or raw.?[0] != '0';
-    return env_enabled.?;
-}
-
-var env_rows: ?c_int = null;
 pub var rows_override: ?c_int = null;
-/// Widest read the two launches serve (the verify widths and batched slots); `MLX_SERVE_HC_DECODE2_ROWS=1` limits it to one row.
+/// Widest read the two launches serve (the verify widths and batched slots).
 pub fn maxRows() c_int {
-    if (rows_override) |v| return v;
-    if (env_rows) |v| return v;
-    const raw = env.get(.MLX_SERVE_HC_DECODE2_ROWS);
-    const parsed = if (raw) |r| std.fmt.parseInt(c_int, std.mem.span(r), 10) catch 16 else 16;
-    env_rows = std.math.clamp(parsed, 1, 16);
-    return env_rows.?;
+    return rows_override orelse 16;
 }
 
 /// Values per pack the HC kernels read: one word at 2/4/8 bits, 8 values in BITS bytes at 3/5/6.
@@ -174,7 +156,7 @@ pub fn read(
     group_size: u32,
     pend: ?Pending,
 ) !?Out {
-    if (!enabled() or !mlx.streamIsGpu(s)) return null;
+    if (!mlx.streamIsGpu(s)) return null;
     const dt = mlx.mlx_array_dtype(x);
     if (dt != .bfloat16 and dt != .float16) return null;
     const dense = bits == 16;
@@ -267,7 +249,7 @@ pub fn read(
     }
     if (!engaged) {
         engaged = true;
-        log.info("[qwen4] two-launch hyper-connection read engaged: hc={d} hidden={d} lowrank={d} {d}-bit g{d} (MLX_SERVE_HC_DECODE2=0 restores the unfused chain)\n", .{ hc, hidden, R, bits, group_size });
+        log.info("[qwen4] two-launch hyper-connection read engaged: hc={d} hidden={d} lowrank={d} {d}-bit g{d}\n", .{ hc, hidden, R, bits, group_size });
     }
     served += 1;
     return .{ .mixed = upmix[0], .inj = inj_out, .stream = stream };

@@ -49,7 +49,7 @@ const moeRoutingChain = @import("routing.zig").moeRoutingChain;
 /// each group is scored by the SUM OF ITS TOP TWO, and every expert outside the
 /// best TOPKG groups is pushed to the composed chain's own finite -1e4 penalty
 /// before selection. The composed chain is ~28 dispatches per MoE layer x 41 layers,
-/// and a dispatch prices at 1.76 us on this arch (MLX_SERVE_DISPATCH_PROBE
+/// and a dispatch prices at 1.76 us on this arch (diag dispatch-probe
 /// slope over 1000 injected ops), so that chain alone is ~2 ms of a 19 ms token.
 /// `softmax_gate` is `softmax` plus the shared-expert gate's logit, a dot of one x row with a flat
 /// weight vector that the simdgroups sitting out the selection compute while it runs (the matmul it

@@ -10,8 +10,7 @@ const history = @import("history.zig");
 const mtp = @import("../mtp.zig");
 const prof_mod = @import("../prof.zig");
 const ProfClock = @import("../../../engines/mlx/diag/profile.zig").ProfClock;
-const diagEnvOnCached = @import("../../../engines/mlx/env_transformer.zig").diagEnvOnCached;
-const envFlagCached = @import("../../../engines/mlx/env_transformer.zig").envFlagCached;
+const env = @import("../../../env.zig");
 const ForwardCtx = @import("../../../engines/mlx/forward_ctx.zig").ForwardCtx;
 const FullAttnWeights = @import("../../../engines/mlx/layer_weights.zig").FullAttnWeights;
 const SSMCacheEntry = @import("../../../engines/mlx/ssm/entry.zig").SSMCacheEntry;
@@ -432,7 +431,7 @@ pub fn qsaMaskFromQk(self: *Trunk, ctx: *ForwardCtx, qk: mlx.mlx_array, fa: *con
     const kv: c_int = offset + seq_len;
     entry.qsa_ratio = ratio;
     if (!qsaEntrySatisfiesForward(entry, offset)) return error.QsaHistoryGap;
-    if (envFlagCached(&prof_mod.qwen4_no_pooled_env, "QWEN4_NO_POOLED")) return error.QsaPooledRequired;
+    if (env.onCached(&prof_mod.qwen4_no_pooled_env, .QWEN4_NO_POOLED)) return error.QsaPooledRequired;
     const nb: c_int = @divTrunc(kv, ratio);
     const nb_cached: c_int = if (entry.qsa_pooled.ctx != null) mlx.getShape(entry.qsa_pooled)[1] else 0;
     if (nb > nb_cached) {
@@ -526,7 +525,7 @@ pub fn qsaMaskFromQk(self: *Trunk, ctx: *ForwardCtx, qk: mlx.mlx_array, fa: *con
     }
 
     // Pooled block keys: mean of leftover + this chunk, already appended above.
-    if (envFlagCached(&prof_mod.qwen4_debug_scores_env, "QWEN4_DEBUG_SCORES")) {
+    if (env.onCached(&prof_mod.qwen4_debug_scores_env, .QWEN4_DEBUG_SCORES)) {
         const qs = mlx.getShape(entry.qsa_pooled);
         std.debug.print("[qsa] kv={d} nb={d} cached={d} pooled shape {any} keys {any}\n", .{ kv, nb, nb_cached, qs, mlx.getShape(keys) });
     }
@@ -549,12 +548,12 @@ pub fn qsaMaskFromQk(self: *Trunk, ctx: *ForwardCtx, qk: mlx.mlx_array, fa: *con
     // A placed draft row takes the mask arm: its dead rows are masked, which no gatherer reads.
     const want_blocks = qsaWantsBlocks(batch, kv, seq_len, ctx.cache.config.scheme == .affine) and ctx.head_place == null;
     // A solo decode row on dense KV hands its picks to `qsa_decode` at every kv; the mask arm needs none.
-    const dec_row = solo and batch == 1 and seq_len == 1 and ctx.head_place == null and !ctx.cache.config.isQuant() and qsa_decode.enabled();
+    const dec_row = solo and batch == 1 and seq_len == 1 and ctx.head_place == null and !ctx.cache.config.isQuant();
     if (want_blocks or dec_row) {
         // Prefill: sorted per-row block indices for the gather kernel;
         // the dense [S, kv] mask is never built. Decode (S==1): the same
         // single-row selection for the decode gatherer.
-        const prof = diagEnvOnCached(&prof_mod.qwen4_profile_qsa_env, "QWEN4_PROFILE_QSA");
+        const prof = env.onCached(&prof_mod.qwen4_profile_qsa_env, .QWEN4_PROFILE_QSA);
         var clk: ProfClock = undefined;
         if (prof) {
             if (k32.ctx != null) try mlx.check(mlx.mlx_array_eval(k32));
@@ -582,7 +581,7 @@ pub fn qsaMaskFromQk(self: *Trunk, ctx: *ForwardCtx, qk: mlx.mlx_array, fa: *con
         _ = mlx.mlx_array_free(scores);
     };
 
-    if (envFlagCached(&prof_mod.qwen4_debug_scores_env, "QWEN4_DEBUG_SCORES")) {
+    if (env.onCached(&prof_mod.qwen4_debug_scores_env, .QWEN4_DEBUG_SCORES)) {
         var f = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(f);
         try mlx.check(mlx.mlx_astype(&f, scores, .float32, self.s));
