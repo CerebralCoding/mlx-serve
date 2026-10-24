@@ -12,7 +12,7 @@ const qwen_audio = @import("../../plugins/qwen3_asr/audio_tower.zig");
 const radio_vision = @import("../../plugins/nemotron_h/radio_vision.zig");
 
 const ModelConfig = model_mod.ModelConfig;
-const Weights = model_mod.Weights;
+const Weights = @import("../weights/resident.zig").Weights;
 
 // ── Linear Weight (optionally clipped) ──
 // Gemma 4 E4B vision uses "clipped linears": bf16 dense weights with input/output clamping.

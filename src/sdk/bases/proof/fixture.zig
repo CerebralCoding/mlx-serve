@@ -19,6 +19,7 @@ const ssmFreeSpecCapture = @import("../../../engines/mlx/ssm/entry.zig").ssmFree
 
 const gguf_kernels = @import("../../quant/gguf/kernels.zig");
 const gguf_quants = @import("../../quant/gguf/quants.zig");
+const Weights = @import("../../weights/resident.zig").Weights;
 
 const testing = std.testing;
 const Array = mlx.mlx_array;
@@ -191,7 +192,7 @@ pub const Pack = struct {
 pub const Legacy = struct {
     tmp: testing.TmpDir,
     config: model.ModelConfig,
-    weights: model.Weights,
+    weights: Weights,
     xfm: Transformer,
 
     pub fn deinit(lg: *Legacy) void {

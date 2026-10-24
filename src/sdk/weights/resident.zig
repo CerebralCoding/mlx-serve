@@ -6,8 +6,6 @@ const abi = @import("../../abi/quant.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const model = @import("../../engines/mlx/model.zig");
 
-pub const Weights = model.Weights;
-
 pub const Resident = struct {
     weights: Weights,
 
@@ -44,6 +42,86 @@ pub const Resident = struct {
         const self: *const Resident = @ptrCast(@alignCast(ctx.?));
         const a = self.weights.get(name.slice()) orelse return .{};
         return .{ .ctx = a.ctx };
+    }
+};
+
+/// Holds all loaded weights as mlx arrays, keyed by name.
+pub const Weights = struct {
+    map: std.StringHashMap(mlx.mlx_array),
+    allocator: std.mem.Allocator,
+    /// Int8 copies of block linears that replace their packed arrays (`--w8a8`); only the media
+    /// DiTs that read through a name-keyed map fill it.
+    w8: @import("../blocks/dit/w8a8.zig").Overlay = .{},
+
+    pub fn init(allocator: std.mem.Allocator) Weights {
+        return .{
+            .map = std.StringHashMap(mlx.mlx_array).init(allocator),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Weights) void {
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            _ = mlx.mlx_array_free(entry.value_ptr.*);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.map.deinit();
+        self.w8.deinit(self.allocator);
+    }
+
+    pub fn get(self: *const Weights, name: []const u8) ?mlx.mlx_array {
+        return self.map.get(name);
+    }
+
+    /// Hand the map a new array under `name`, freeing the one it held (load-time
+    /// weight fusion parks its row views here so the originals go away).
+    pub fn replace(self: *Weights, name: []const u8, arr: mlx.mlx_array) void {
+        if (self.map.getPtr(name)) |p| {
+            _ = mlx.mlx_array_free(p.*);
+            p.* = arr;
+        }
+    }
+
+    /// Drop every entry named `prefix...` and free its array: a loader that built a block from them (its
+    /// structs hold their own refs) lets the originals go before the next block loads, which is when an
+    /// int8 copy and the packed weight it replaced would otherwise both be resident.
+    pub fn dropPrefix(self: *Weights, prefix: []const u8) void {
+        var found = true;
+        while (found) {
+            found = false;
+            var it = self.map.iterator();
+            while (it.next()) |e| if (std.mem.startsWith(u8, e.key_ptr.*, prefix)) {
+                self.remove(e.key_ptr.*);
+                found = true;
+                break;
+            };
+        }
+    }
+
+    /// `dropPrefix` for the `idx`-th block of a stack, named by `fmt` (`"blocks.{d}."`).
+    pub fn dropBlock(self: *Weights, comptime fmt: []const u8, idx: usize) void {
+        var buf: [128]u8 = undefined;
+        self.dropPrefix(std.fmt.bufPrint(&buf, fmt, .{idx}) catch return);
+    }
+
+    /// Hand the map `arr` under `name` (the key is copied), freeing an array it held there.
+    pub fn put(self: *Weights, name: []const u8, arr: mlx.mlx_array) !void {
+        if (self.map.contains(name)) return self.replace(name, arr);
+        const key = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(key);
+        try self.map.put(key, arr);
+    }
+
+    /// Drop `name` and free its array (a loader that copied it elsewhere lets the original go).
+    pub fn remove(self: *Weights, name: []const u8) void {
+        const kv = self.map.fetchRemove(name) orelse return;
+        _ = mlx.mlx_array_free(kv.value);
+        self.allocator.free(kv.key);
+    }
+
+    pub fn count(self: *const Weights) u32 {
+        return @intCast(self.map.count());
     }
 };
 

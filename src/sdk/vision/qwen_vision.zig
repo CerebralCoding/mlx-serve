@@ -14,7 +14,7 @@ const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const ModelConfig = model_mod.ModelConfig;
-const Weights = model_mod.Weights;
+const Weights = @import("../weights/resident.zig").Weights;
 const log = @import("../../host/log.zig");
 
 /// Qwen3VLImageProcessor fallbacks (processing_qwen3_vl.py:96-98). Checkpoint

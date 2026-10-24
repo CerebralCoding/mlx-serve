@@ -11,6 +11,7 @@ const env = @import("../../../env.zig");
 const model = @import("../../../engines/mlx/model.zig");
 const driver = @import("../../../engines/mlx/plugin/driver.zig");
 const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
+const Weights = @import("../resident.zig").Weights;
 
 const testing = std.testing;
 const top_k = 5;
@@ -22,7 +23,7 @@ pub const Step = struct { id: u32, top: [top_k]struct { u32, f32 } };
 /// `open` is given.
 pub const Served = struct {
     cfg: model.ModelConfig,
-    weights: model.Weights,
+    weights: Weights,
     xfm: Transformer,
 
     pub fn open(io: std.Io, a: std.mem.Allocator, dir: []const u8, s: mlx.mlx_stream) !*Served {
@@ -32,7 +33,7 @@ pub const Served = struct {
         errdefer p.cfg.deinit(a);
         // The engine's two arms (`load.zig`): a served plugin reads its own tensors; the rest load the map first.
         if (p.cfg.plugin != null) {
-            p.weights = model.Weights.init(a);
+            p.weights = Weights.init(a);
             p.xfm = try driver.loadWith(io, a, &p.cfg, dir, s, null);
         } else {
             p.weights = try model.loadModelWeights(io, a, dir, &p.cfg, false);

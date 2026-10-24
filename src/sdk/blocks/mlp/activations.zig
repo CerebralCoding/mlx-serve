@@ -319,3 +319,5 @@ pub fn swigluClampLimit(cfg: *const ModelConfig) ?u32 {
     if (!cfg.swiglu_clamp or @round(cfg.swiglu_limit) != cfg.swiglu_limit or cfg.swiglu_limit > 1 << 16) return null;
     return @intFromFloat(cfg.swiglu_limit);
 }
+
+pub const HiddenAct = enum { gelu_approx, gelu, silu, relu_sq };

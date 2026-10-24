@@ -9,7 +9,7 @@ const params = @import("../sdk/quant/params.zig");
 
 const S = mlx.mlx_stream;
 const A = mlx.mlx_array;
-const Weights = model_mod.Weights;
+const Weights = @import("../sdk/weights/resident.zig").Weights;
 
 /// A projection resolved once at load: affine-quantized (width solved from the packed
 /// geometry, never a literal) or dense, with an optional bias. Handles are borrowed from `Weights`.

@@ -7,7 +7,7 @@ const log = @import("../../../host/log.zig");
 const model_mod = @import("../../../engines/mlx/model.zig");
 const model_discovery = @import("../../../host/registry/discovery.zig");
 
-const Weights = model_mod.Weights;
+const Weights = @import("../../weights/resident.zig").Weights;
 const ModelConfig = model_mod.ModelConfig;
 
 /// Also serves NVIDIA's ModelOpt GLM pack, which ships the same source layout.

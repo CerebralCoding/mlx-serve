@@ -17,7 +17,7 @@ const qvis = @import("qwen_vision.zig");
 const A = mlx.mlx_array;
 const Scope = scope_mod.Scope;
 const Linear = scope_mod.Linear;
-const Weights = model_mod.Weights;
+const Weights = @import("../weights/resident.zig").Weights;
 const NONE = A{ .ctx = null };
 
 const FINAL_LN_EPS: f32 = 1e-5;

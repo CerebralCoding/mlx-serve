@@ -1,10 +1,10 @@
 //! sdk/quant/params, split out of engines/mlx/transformer.zig (P1, moves only).
 //! Owns BITS_CACHE_CAP, QuantParams, QuantParamsCache, BitsCache, quantParamsOrDense, affineParamsFromGeometry, and 4 more.
 
+const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const ModelConfig = @import("../../engines/mlx/model.zig").ModelConfig;
-const QuantMode = @import("../../engines/mlx/model.zig").QuantMode;
-const testing = @import("std").testing;
+const testing = std.testing;
 const detectQuantBits = @import("../../engines/mlx/load/weights.zig").detectQuantBits;
 
 // ── Quantization params cache ──
@@ -196,6 +196,46 @@ pub fn computeQuantParams(config: *const ModelConfig, w: mlx.mlx_array, sc: mlx.
     }
     return .{ .bits = 8, .group_size = 64, .mode = .affine };
 }
+
+/// MLX quantization mode from config.json's `quantization.mode`. All
+/// non-affine modes store NO `.biases` tensors (per-group fp8-encoded uint8
+/// scales only) but share the packed-u32 weight layout, so supporting them is
+/// a matter of skipping the biases fetch and passing the right mode string to
+/// the mlx quantized ops. Tag names match the mlx-c mode strings exactly.
+pub const QuantMode = enum {
+    affine,
+    nvfp4,
+    mxfp4,
+    mxfp8,
+    /// Raw ggml blocks (src/sdk/quant/gguf). Never reaches an MLX quantized op:
+    /// the per-tensor type rides on the weight, see `mlx_gguf.kernels.Info`.
+    gguf,
+
+    pub fn fromString(name: []const u8) ?QuantMode {
+        return std.meta.stringToEnum(QuantMode, name);
+    }
+
+    /// Mode string for mlx_quantized_matmul / mlx_gather_qmm / mlx_dequantize.
+    pub fn cstr(self: QuantMode) [*:0]const u8 {
+        return switch (self) {
+            .affine => "affine",
+            .nvfp4 => "nvfp4",
+            .mxfp4 => "mxfp4",
+            .mxfp8 => "mxfp8",
+            .gguf => "gguf",
+        };
+    }
+
+    /// Affine is the only mode whose checkpoints carry per-group biases.
+    pub fn hasBiases(self: QuantMode) bool {
+        return self == .affine;
+    }
+
+    /// The e2m1 nibble modes (byte scales, no biases): MXFP4 g32, NVFP4 g16.
+    pub fn isFp4(self: QuantMode) bool {
+        return self == .mxfp4 or self == .nvfp4;
+    }
+};
 
 // ── tests ──
 

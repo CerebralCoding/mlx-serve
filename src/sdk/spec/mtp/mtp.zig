@@ -47,10 +47,11 @@ const log = @import("../../../host/log.zig");
 const io_util_mod = @import("../../util/io_util.zig");
 const ane_mod = @import("../../ane/offload.zig");
 const sushi_pack = @import("../../quant/exl3/sushi_pack.zig");
+const QuantMode = @import("../../quant/params.zig").QuantMode;
 
 const Transformer = transformer_mod.Transformer;
 const KVCache = cache_mod.KVCache;
-const Weights = model_mod.Weights;
+const Weights = @import("../../weights/resident.zig").Weights;
 
 /// Default draft depth (tokens drafted per round). Flipped 1 -> 3 after the
 /// round-v2 rebuild made rejected drafts ~free (scalar-anchor rollback + the
@@ -599,7 +600,7 @@ pub const MtpModel = struct {
     /// no config, so this is solved from geometry at load
     /// (`params_mod.quantParamsFromGeometry`) and handed to every
     /// `mlx_quantized_matmul` — passing "affine" over fp8 scales throws.
-    quant_mode: model_mod.QuantMode = .affine,
+    quant_mode: QuantMode = .affine,
 
     /// Qwen heads' concat projection (empty for Hy3). Dense bf16 ships
     /// pre-transposed `[2H, H]` for plain matmul; a checkpoint that ships it
@@ -2047,7 +2048,7 @@ fn inferBits(q: *const QLinear, hidden: u32) ?u32 {
 /// contracted weight whose input width is known exactly (`hidden`). Per-weight
 /// modes still resolve individually in `qLinearFwd`; this is only the fallback
 /// for geometry that will not solve.
-fn sidecarQuantMode(q: *const QLinear, hidden: u32) model_mod.QuantMode {
+fn sidecarQuantMode(q: *const QLinear, hidden: u32) QuantMode {
     const qp = params_mod.quantParamsFromGeometry(q.w, q.s, q.b.ctx != null, hidden) orelse return .affine;
     return qp.mode;
 }
@@ -2095,7 +2096,7 @@ fn loadMoeTriple(w: *const Weights, prefix: []const u8) !MoeTriple {
 /// lazy/mmapped — pulling a multi-GB shard in costs its header parse; only
 /// the head's tensors ever materialize, and `weights.deinit()` after the
 /// head build releases the rest untouched.
-fn loadMtpWeightsFromCheckpoint(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !model_mod.Weights {
+fn loadMtpWeightsFromCheckpoint(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !Weights {
     var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{});
     defer dir.close(io);
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -2108,7 +2109,7 @@ fn loadMtpWeightsFromCheckpoint(io: std.Io, allocator: std.mem.Allocator, model_
             allocator.free(shards);
         }
         if (shards.len == 0) return error.MissingMtpWeight;
-        var weights = model_mod.Weights.init(allocator);
+        var weights = Weights.init(allocator);
         errdefer weights.deinit();
         const s = mlx.weightLoadStream();
         defer _ = mlx.mlx_stream_free(s);
@@ -4129,7 +4130,7 @@ test "mtp: headQuantParams never mis-resolves a non-affine lm_head as affine (is
     cfg.quant_mode = .mxfp8;
 
     const qp8 = headQuantParams(&cfg, w8, s8);
-    try testing.expectEqual(model_mod.QuantMode.mxfp8, qp8.mode);
+    try testing.expectEqual(QuantMode.mxfp8, qp8.mode);
     try testing.expectEqual(@as(u32, 8), qp8.bits);
     try testing.expectEqual(@as(u32, 32), qp8.group_size);
 
@@ -4139,7 +4140,7 @@ test "mtp: headQuantParams never mis-resolves a non-affine lm_head as affine (is
     cfg.quant_bits = 4;
     cfg.quant_mode = .mxfp4;
     const qp4 = headQuantParams(&cfg, w4, s8);
-    try testing.expectEqual(model_mod.QuantMode.mxfp4, qp4.mode);
+    try testing.expectEqual(QuantMode.mxfp4, qp4.mode);
 
     // Characterization (green before AND after): the mixed-AFFINE shape this
     // function exists for — hy_v3's 8-bit/gs32 head (bf16 scales) over a
@@ -4150,7 +4151,7 @@ test "mtp: headQuantParams never mis-resolves a non-affine lm_head as affine (is
     cfg.quant_group_size = 64;
     cfg.quant_mode = .affine;
     const qpa = headQuantParams(&cfg, w8, sb);
-    try testing.expectEqual(model_mod.QuantMode.affine, qpa.mode);
+    try testing.expectEqual(QuantMode.affine, qpa.mode);
     try testing.expectEqual(@as(u32, 8), qpa.bits);
     try testing.expectEqual(@as(u32, 32), qpa.group_size);
 }
@@ -5194,7 +5195,7 @@ test "mtp: a QUANTIZED fc loads verbatim and binds (avlp12 Alis layout)" {
     try testing.expect(!fcMatchesHidden(&m.fc, 8));
 }
 
-fn fpSidecarCase(mode: [*:0]const u8, bits: c_int, group: c_int, want: model_mod.QuantMode) !void {
+fn fpSidecarCase(mode: [*:0]const u8, bits: c_int, group: c_int, want: QuantMode) !void {
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();

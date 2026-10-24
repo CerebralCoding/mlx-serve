@@ -10,7 +10,7 @@ const mlx = @import("../../../mlx/ffi.zig");
 const fused_activations = @import("../mlp/fused_activations.zig");
 const parity = @import("../../testing/parity.zig");
 const moe_affine4 = @import("../../../plugins/qwen4_exp/moe_affine4.zig");
-const QuantMode = @import("../../../engines/mlx/model.zig").QuantMode;
+const QuantMode = @import("../../quant/params.zig").QuantMode;
 
 pub const ROWS: c_int = 4;
 pub const SGS: c_int = 2;
@@ -322,7 +322,7 @@ fn fp4DecodeCase(I: c_int) !void {
     const H: c_int = 1536;
     const R: c_int = 3;
     const TOPK: c_int = 8;
-    const Fmt = struct { name: [:0]const u8, gs: c_int, mode: @import("../../../engines/mlx/model.zig").QuantMode };
+    const Fmt = struct { name: [:0]const u8, gs: c_int, mode: @import("../../quant/params.zig").QuantMode };
     for ([_]Fmt{ .{ .name = "mxfp4", .gs = 32, .mode = .mxfp4 }, .{ .name = "nvfp4", .gs = 16, .mode = .nvfp4 } }) |f| {
         var banks: [3]Bank = undefined;
         var deq: [3]mlx.mlx_array = undefined;
@@ -425,7 +425,7 @@ test "moe fp4 decode: a clamped SwiGLU with per-expert gate and up scales matche
     const H: c_int = 1536;
     const TOPK: c_int = 8;
     const CLAMP: u32 = 2;
-    const Fmt = struct { name: [:0]const u8, gs: c_int, mode: @import("../../../engines/mlx/model.zig").QuantMode };
+    const Fmt = struct { name: [:0]const u8, gs: c_int, mode: @import("../../quant/params.zig").QuantMode };
     for ([_]Fmt{ .{ .name = "mxfp4", .gs = 32, .mode = .mxfp4 }, .{ .name = "nvfp4", .gs = 16, .mode = .nvfp4 } }) |f| {
         var banks: [3]Bank = undefined;
         var deq: [3]mlx.mlx_array = undefined;
@@ -508,7 +508,7 @@ test "moe fp4 decode: one-expert bank views and the fused shared expert match fp
     const I: c_int = 640;
     const H: c_int = 1536;
     const TOPK: c_int = 8;
-    const Fmt = struct { name: [:0]const u8, gs: c_int, mode: @import("../../../engines/mlx/model.zig").QuantMode };
+    const Fmt = struct { name: [:0]const u8, gs: c_int, mode: @import("../../quant/params.zig").QuantMode };
     for ([_]Fmt{ .{ .name = "mxfp4", .gs = 32, .mode = .mxfp4 }, .{ .name = "nvfp4", .gs = 16, .mode = .nvfp4 } }) |f| {
         var banks: [3]Bank = undefined;
         var deq: [3]mlx.mlx_array = undefined;

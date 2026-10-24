@@ -7,7 +7,7 @@ const mlx = @import("../../../mlx/ffi.zig");
 const model_mod = @import("../../../engines/mlx/model.zig");
 const log = @import("../../../host/log.zig");
 const ModelConfig = @import("../../../engines/mlx/model.zig").ModelConfig;
-const QuantMode = @import("../../../engines/mlx/model.zig").QuantMode;
+const QuantMode = @import("../../quant/params.zig").QuantMode;
 const moe_fp4 = @import("moe_fp4.zig");
 const moe_affine4 = @import("../../../plugins/qwen4_exp/moe_affine4.zig");
 const glm5 = @import("../../../plugins/glm5_next/glm5_next.zig");
@@ -409,7 +409,7 @@ pub fn useGatherQmvDecode(self: *const Transformer, gate_qp: QuantParams, up_qp:
 /// The fp4 MoE decode kernels read no expert biases, and apply a SwiGLU clamp only as a whole-number
 /// limit: a pack with a bias, or `clamp` null (`swigluClampLimit`: a clamp no kernel serves), keeps the
 /// composed chain, as does an activation that is not 16-bit (the SwiGLU table covers 16-bit patterns).
-pub fn moeFp4DecodeEligible(rows: c_int, has_expert_bias: bool, clamp: ?u32, act: mlx.mlx_dtype, gate: model_mod.QuantMode, up: model_mod.QuantMode, down: model_mod.QuantMode) bool {
+pub fn moeFp4DecodeEligible(rows: c_int, has_expert_bias: bool, clamp: ?u32, act: mlx.mlx_dtype, gate: QuantMode, up: QuantMode, down: QuantMode) bool {
     return rows <= moe_fp4.MAX_ROWS and !has_expert_bias and clamp != null and (act == .bfloat16 or act == .float16) and (gate == .mxfp4 or gate == .nvfp4) and up == gate and down == gate;
 }
 

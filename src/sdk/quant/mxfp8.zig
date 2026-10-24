@@ -4,7 +4,7 @@
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
-const Weights = @import("../../engines/mlx/model.zig").Weights;
+const Weights = @import("../weights/resident.zig").Weights;
 const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
 
 /// LOSSY, so on by default only where it was measured: Flash Next (`qwen4`) on an integrated

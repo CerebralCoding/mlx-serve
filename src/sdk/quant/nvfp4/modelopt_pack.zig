@@ -7,7 +7,7 @@ const builtin = @import("builtin");
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 const crt = @import("../../util/crt.zig");
-const Weights = @import("../../../engines/mlx/model.zig").Weights;
+const Weights = @import("../../weights/resident.zig").Weights;
 const sushi_pack = @import("../exl3/sushi_pack.zig");
 const status = @import("../../../host/status.zig");
 

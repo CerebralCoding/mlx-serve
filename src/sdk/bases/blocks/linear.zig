@@ -3,7 +3,7 @@
 
 const mlx = @import("../../../mlx/ffi.zig");
 const ops = @import("../../../mlx/ops.zig");
-const QuantMode = @import("../../../engines/mlx/model.zig").QuantMode;
+const QuantMode = @import("../../quant/params.zig").QuantMode;
 const qmatmulBits = @import("../../blocks/linear/qmatmul.zig").qmatmulBits;
 const sliceQkvPart = @import("../../blocks/linear/fused_rows.zig").sliceQkvPart;
 const qmv2 = @import("../../blocks/qmm/qmv2.zig");

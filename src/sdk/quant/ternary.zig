@@ -6,7 +6,7 @@ const mlx = @import("../../mlx/ffi.zig");
 const qmv2 = @import("../blocks/qmm/qmv2.zig");
 const rowqmv = @import("../blocks/qmm/rowqmv.zig");
 const ModelConfig = @import("../../engines/mlx/model.zig").ModelConfig;
-const Weights = @import("../../engines/mlx/model.zig").Weights;
+const Weights = @import("../weights/resident.zig").Weights;
 const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
 const computeQuantParams = @import("params.zig").computeQuantParams;
 

@@ -16,7 +16,7 @@ const transposeBf16Weight = @import("../../engines/mlx/load/weights.zig").transp
 
 const Str = abi.Str;
 const Verdict = abi.Verdict;
-const QuantMode = model.QuantMode;
+const QuantMode = @import("params.zig").QuantMode;
 
 /// `Weight.layout`: dense (pre-transposed `[in, out]`), an MLX mode, or row-scaled e4m3 (`sushi_pack.fp8Linear`).
 pub const Layout = enum(u8) { dense, affine, nvfp4, mxfp4, mxfp8, fp8_rows };
