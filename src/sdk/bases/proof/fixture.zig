@@ -189,7 +189,7 @@ pub const Pack = struct {
         errdefer lg.weights.deinit();
         model.resolveWeightPrefix(&lg.config, &lg.weights);
         try model.narrowHadamardPackTables(&lg.config, &lg.weights, stream());
-        lg.xfm = try Transformer.init(io, a, lg.config, &lg.weights);
+        lg.xfm = try Transformer.init(io, a, lg.config);
         return lg;
     }
 };

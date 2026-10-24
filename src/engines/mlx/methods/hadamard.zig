@@ -3,7 +3,7 @@
 const mlx = @import("../../../mlx/ffi.zig");
 const rht = @import("../../../sdk/quant/hadamard/rht.zig");
 const Transformer = @import("../transformer.zig").Transformer;
-const MoeLayerWeights = @import("../forward/layered.zig").MoeLayerWeights;
+const MoeLayerWeights = @import("../layer_weights.zig").MoeLayerWeights;
 
 /// Hadamard packs: gathered embedding rows back to the residual basis.
 /// Takes ownership of `rows`.

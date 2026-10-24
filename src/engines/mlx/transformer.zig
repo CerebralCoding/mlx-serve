@@ -231,8 +231,8 @@ pub const QW = @import("layer_weights.zig").QW;
 const AneChanRest = @import("ane_prefill.zig").AneChanRest;
 // sdk/blocks/moe/weights.zig
 pub const MoeMlpWeights = @import("../../sdk/blocks/moe/weights.zig").MoeMlpWeights;
-// engines/mlx/forward/layered.zig
-const MoeLayerWeights = @import("forward/layered.zig").MoeLayerWeights;
+// engines/mlx/layer_weights.zig
+const MoeLayerWeights = @import("layer_weights.zig").MoeLayerWeights;
 // sdk/quant/params.zig
 pub const QuantParams = @import("../../sdk/quant/params.zig").QuantParams;
 const BitsCache = @import("../../sdk/quant/params.zig").BitsCache;
@@ -379,17 +379,6 @@ pub const Transformer = struct {
     lm_head_s: mlx.mlx_array,
     lm_head_b: mlx.mlx_array,
     layers: []LayerWeights,
-
-    // EmbeddingGemma sentence-transformers projection head (dense.0 →
-    // dense.1, identity activations, no layer bias), applied between
-    // mean-pool and L2-normalize. Borrowed from the weights map (map outlives
-    // the Transformer; never freed here). Null-ctx when absent.
-    dense0_w: mlx.mlx_array = .{},
-    dense0_s: mlx.mlx_array = .{},
-    dense0_b: mlx.mlx_array = .{},
-    dense1_w: mlx.mlx_array = .{},
-    dense1_s: mlx.mlx_array = .{},
-    dense1_b: mlx.mlx_array = .{},
 
     owns_lm_head: bool,
     owns_norms: bool,
@@ -600,8 +589,8 @@ pub const Transformer = struct {
     // engines/mlx/batched/layered.zig
     pub const forwardMoeBatchedDecode = @import("batched/layered.zig").forwardMoeBatchedDecode;
     pub const forwardMoeBatchedVerify = @import("batched/layered.zig").forwardMoeBatchedVerify;
+    pub const forwardBatchedDecode = @import("batched/layered.zig").forwardBatchedDecode;
     pub const sliceBatchRows = @import("batched/layered.zig").sliceBatchRows;
-    pub const forwardMoeBatchedRows = @import("batched/layered.zig").forwardMoeBatchedRows;
     pub const flushDeferredPle = @import("plugin/settle.zig").flush;
     pub const flushDeferredPleGroup = @import("plugin/settle.zig").flushGroup;
     pub const settleDeferredPle = @import("plugin/settle.zig").settleWith;
@@ -655,8 +644,6 @@ pub const Transformer = struct {
     pub const buildAnePrefill = @import("ane_prefill.zig").buildAnePrefill;
     pub const aneBuildMlpRest = @import("ane_prefill.zig").aneBuildMlpRest;
     pub const aneBuildGdnRest = @import("ane_prefill.zig").aneBuildGdnRest;
-    // engines/mlx/forward/layered.zig
-    pub const forwardMoeWith = @import("forward/layered.zig").forwardMoeWith;
     // engines/mlx/spec/mtp_nax_profile.zig
     pub const mtpNaxProfileEnabledForTrunk = @import("spec/mtp_nax_profile.zig").mtpNaxProfileEnabledForTrunk;
     pub const mtpNaxProfileEnabled = @import("spec/mtp_nax_profile.zig").mtpNaxProfileEnabled;
@@ -762,7 +749,6 @@ pub const Transformer = struct {
     pub const moduleStateSpecRollback = @import("dispatch.zig").moduleStateSpecRollback;
     pub const forward = @import("dispatch.zig").forward;
     pub const forwardWith = @import("dispatch.zig").forwardWith;
-    pub const usesStandardForward = @import("dispatch.zig").usesStandardForward;
     pub const supportsLayerCapture = @import("dispatch.zig").supportsLayerCapture;
     // engines/mlx/spec/trunk_hooks.zig
     pub const lmHeadForDraft = @import("spec/trunk_hooks.zig").lmHeadForDraft;
@@ -779,10 +765,6 @@ pub const Transformer = struct {
     // plugins/gemma4/ple.zig
     pub const computePLEInput = @import("../../plugins/gemma4/ple.zig").computePLEInput;
     pub const pleProject = @import("../../plugins/gemma4/ple.zig").pleProject;
-    // engines/mlx/forward/dense.zig
-    pub const forwardStandardWith = @import("forward/dense.zig").forwardStandardWith;
-    // engines/mlx/batched/dense.zig
-    pub const forwardBatchedDecode = @import("batched/dense.zig").forwardBatchedDecode;
     // engines/mlx/batched/row_axis_verify.zig
     pub const VerifyLaps = @import("batched/row_axis_verify.zig").VerifyLaps;
     pub const VerifyRollback = @import("batched/row_axis_verify.zig").VerifyRollback;
@@ -808,9 +790,6 @@ pub const Transformer = struct {
     pub const forwardEmbeddingMasked = @import("forward/encoder_head.zig").forwardEmbeddingMasked;
     pub const hasEmbedProjection = @import("forward/encoder_head.zig").hasEmbedProjection;
     pub const embedProjection = @import("forward/encoder_head.zig").embedProjection;
-    pub const denseHead = @import("forward/encoder_head.zig").denseHead;
-    // plugins/gemma3/encoder.zig
-    pub const forwardGemma3EncoderWith = @import("../../plugins/gemma3/encoder.zig").forwardGemma3EncoderWith;
     // sdk/blocks/rope/mrope.zig
     pub const buildMropeCosSin = @import("methods/mrope.zig").buildMropeCosSin;
     pub const MropeCosSin = @import("../../sdk/blocks/rope/mrope.zig").MropeCosSin;
@@ -1061,7 +1040,6 @@ test {
     _ = @import("../../sdk/blocks/mlp/dense.zig");
     _ = @import("ane_prefill.zig");
     _ = @import("../../sdk/blocks/moe/weights.zig");
-    _ = @import("forward/layered.zig");
     _ = @import("../../sdk/quant/params.zig");
     _ = @import("spec/mtp_nax_profile.zig");
     _ = @import("../../sdk/blocks/attention/kv_quant_attn.zig");
@@ -1089,8 +1067,6 @@ test {
     _ = @import("warmup.zig");
     _ = @import("capture.zig");
     _ = @import("../../plugins/gemma4/ple.zig");
-    _ = @import("forward/dense.zig");
-    _ = @import("batched/dense.zig");
     _ = @import("batched/row_axis_verify.zig");
     _ = @import("batched/caps.zig");
     _ = @import("../../sdk/blocks/rope/rope.zig");
@@ -1099,7 +1075,6 @@ test {
     _ = @import("../../plugins/gemma4/moe_tail.zig");
     _ = @import("diag/profile.zig");
     _ = @import("forward/encoder_head.zig");
-    _ = @import("../../plugins/gemma3/encoder.zig");
     _ = @import("../../sdk/blocks/rope/mrope.zig");
     _ = @import("../../sdk/blocks/rope/yarn.zig");
     _ = @import("methods/gated_full_attn.zig");
@@ -1112,7 +1087,6 @@ test {
     _ = @import("methods/moe.zig");
     _ = @import("../../sdk/blocks/moe/decode.zig");
     _ = @import("../../sdk/blocks/attention/masks.zig");
-    _ = @import("load/layers_dense.zig");
     _ = @import("../../sdk/quant/mxfp8.zig");
     _ = @import("../../plugins/qwen4_exp/load.zig");
     _ = @import("load/layers_layered.zig");

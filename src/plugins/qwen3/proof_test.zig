@@ -339,7 +339,7 @@ test "qwen3 plugin: the served ModelConfig equals the legacy parse on every gene
     }
 }
 
-test "qwen3 plugin: a dense pack named as an embedding model is served, last-token pooled by its folder name; MoE stays legacy" {
+test "qwen3 plugin: a dense pack named as an embedding model is served, last-token pooled by its folder name; MoE is refused by name" {
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     for ([_]Geo{ .{ .quantized = true }, .{ .quantized = true, .experts = 4 } }) |geo| {
@@ -353,10 +353,14 @@ test "qwen3 plugin: a dense pack named as an embedding model is served, last-tok
         const root = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
         const dir = try std.fmt.allocPrint(a, "{s}/Qwen3-Embedding-0.6B-4bit", .{root});
         defer a.free(dir);
+        if (geo.experts > 0) {
+            try testing.expectError(error.PluginDeclinedNoLegacy, model.parseConfig(io, a, dir));
+            continue;
+        }
         var cfg = try model.parseConfig(io, a, dir);
         defer cfg.deinit(a);
         try testing.expectEqual(model.PoolingMode.last_token, cfg.pooling_mode.?);
-        try testing.expectEqual(geo.experts == 0, cfg.plugin != null);
+        try testing.expect(cfg.plugin != null);
     }
 }
 

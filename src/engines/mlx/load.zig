@@ -192,6 +192,8 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // A served plugin reads the pack's tensors itself (`plugin/driver.zig`): the entry's map holds only the vision
     // tower, for the encoder below.
     const served = params.config.plugin != null;
+    // Only a plugin or an mlx-stream module serves a pack: refuse the rest before reading any weights.
+    if (!served and !params.config.mlxStream()) return error.PluginDeclinedNoLegacy;
     weights_ptr.* = if (served) Weights.init(sch.allocator) else try model_mod.loadModelWeights(sch.io, sch.allocator, params.model_dir, params.config, params.load_vision);
     errdefer weights_ptr.deinit();
     if (!served) {
@@ -205,7 +207,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     xfm_ptr.* = if (served)
         try plugin_driver.loadWith(sch.io, sch.allocator, params.config, params.model_dir, mlx.gpuStream(), if (params.load_vision) weights_ptr else null)
     else
-        try Transformer.init(sch.io, sch.allocator, params.config.*, weights_ptr);
+        try Transformer.init(sch.io, sch.allocator, params.config.*);
     errdefer xfm_ptr.deinit();
 
     // Reserved-token suppression mask (never sample `<|fim_hole|>`-class

@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const fixture = @import("../../sdk/bases/proof/fixture.zig");
-const pack = @import("../../sdk/bases/proof/qwen35_test.zig");
+const pack = @import("../../sdk/bases/proof/qwen35_pack.zig");
 const twin = @import("../qwen3/twin_test.zig");
 const qwen3_5 = @import("plugin.zig");
 

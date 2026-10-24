@@ -1,5 +1,5 @@
-//! The model types the MLX engine serves through their plugin's table. A family flips by adding its types here once
-//! its plugin is proven against the legacy forward; every other type keeps the legacy path.
+//! The model types the MLX engine serves through their plugin's table. A served type's pack its plugin declines is
+//! refused by name; an mlx-stream pack goes to its stream module.
 
 const std = @import("std");
 
@@ -54,43 +54,8 @@ pub const types = [_][]const u8{
     "bailing_hybrid",
 };
 
-/// Served types whose legacy forward is deleted: a pack the plugin declines is refused by name, never handed to the
-/// legacy path.
-pub const legacy_removed = [_][]const u8{
-    "kolibri1",
-    "flint",
-    "laguna",
-    "gpt_oss",
-    "spark2_5",
-    "embedding_gemma2",
-    "deepseek_v4",
-    "inkling_mm_model",
-    "muse_glimmer",
-    "muse_glimmer_text",
-    "bert",
-    "lfm2",
-    "lfm2_moe",
-    "lfm2_vl",
-    "lfm2-vl",
-    "nemotron_h",
-    "nemotron_h_puzzle",
-    "nemotron_h_omni",
-    "mimo_v2",
-    "mimo_v2_flash",
-    "qwen4_exp",
-    "qwen4_exp_text",
-    "glm5_next",
-    "glm5_next_text",
-    "bailing_hybrid",
-};
-
-pub fn legacyRemoved(model_type: []const u8) bool {
-    for (legacy_removed) |t| if (std.mem.eql(u8, t, model_type)) return true;
-    return false;
-}
-
 /// Decoder types whose plugin serves the embedding arm too (a padded batch, no cache): a pack whose folder name makes
-/// it an embedding model (`model.poolingFromDirName`) stays on the plugin path.
+/// it an embedding model (`model.poolingFromDirName`) is served only here.
 pub const decoder_embedders = [_][]const u8{"qwen3"};
 
 pub fn servesDecoderEmbedding(model_type: []const u8) bool {

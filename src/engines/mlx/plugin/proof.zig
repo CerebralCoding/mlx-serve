@@ -254,17 +254,17 @@ test "plugin config: the served ModelConfig equals the legacy parse on every gen
     }
 }
 
-test "plugin config: an unserved type or a declined shape keeps the legacy parse; a drafter sidecar or launch overrides do not" {
+test "plugin config: a shape its plugin declines is refused by name; a drafter sidecar or launch overrides serve" {
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     const q4 = try configJson(a, .{ .quantized = true });
     defer a.free(q4);
     const sliding = try std.mem.concat(a, u8, &.{ q4[0 .. q4.len - 1], ",\"layer_types\":[\"full_attention\",\"sliding_attention\"]}" });
     defer a.free(sliding);
-    const cases = [_]struct { json: []const u8, drafter: bool = false, legacy: bool = true }{
+    const cases = [_]struct { json: []const u8, drafter: bool = false, refused: bool = true }{
         .{ .json = "{\"model_type\":\"qwen3\",\"hidden_size\":128,\"num_attention_heads\":4}" },
         .{ .json = sliding },
-        .{ .json = q4, .drafter = true, .legacy = false },
+        .{ .json = q4, .drafter = true, .refused = false },
     };
     for (cases) |c| {
         var tmp = testing.tmpDir(.{});
@@ -276,9 +276,12 @@ test "plugin config: an unserved type or a declined shape keeps the legacy parse
         }
         var path_buf: [512]u8 = undefined;
         const dir = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
-        var got = try plugin_config.parseServed(io, a, dir, c.json);
-        defer if (got) |*g| g.deinit(a);
-        try testing.expectEqual(c.legacy, got == null);
+        if (c.refused) {
+            try testing.expectError(error.PluginDeclinedNoLegacy, plugin_config.parseServed(io, a, dir, c.json));
+        } else {
+            var got = (try plugin_config.parseServed(io, a, dir, c.json)) orelse return error.TestExpectedPluginParse;
+            got.deinit(a);
+        }
     }
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -452,7 +455,6 @@ fn expectLegacy(got: ?model.ModelConfig) !void {
 test {
     _ = @import("served.zig");
     _ = @import("proof_mtp.zig");
-    _ = @import("proof_ssm.zig");
     _ = @import("proof_settle.zig");
     _ = @import("mlx_lm_configs_test.zig");
     _ = @import("intree.zig");

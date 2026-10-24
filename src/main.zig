@@ -1688,6 +1688,7 @@ pub fn main(init: std.process.Init) !void {
         log.info("Loading weights...\n", .{});
         // A served model loads through its plugin, as the serve path does (`engines/mlx/load.zig`).
         const served = config.plugin != null;
+        if (!served and !config.mlxStream()) return error.PluginDeclinedNoLegacy;
         var weights = if (served) model_mod.Weights.init(allocator) else try model_mod.loadModelWeights(io, allocator, model_dir, config, load_vision);
         defer weights.deinit();
         if (!served) {
@@ -1698,7 +1699,7 @@ pub fn main(init: std.process.Init) !void {
         var xfm = if (served)
             try plugin_driver.loadWith(io, allocator, config, model_dir, mlx.gpuStream(), if (load_vision) &weights else null)
         else
-            try transformer_mod.Transformer.init(io, allocator, config.*, &weights);
+            try transformer_mod.Transformer.init(io, allocator, config.*);
         defer xfm.deinit();
 
         xfm.round_cost.layout = round_cost_mod.layoutFor(config);

@@ -557,7 +557,7 @@ test "gemma4 plugin: an NVIDIA ModelOpt NVFP4 pack is declined, and the legacy l
     var buf: [512]u8 = undefined;
     const dir = buf[0..try tmp.dir.realPath(io, &buf)];
     const out = try plugin_config.resolve(io, a, dir, json);
-    try testing.expectEqualStrings("gemma: a quantization_config naming a quant_method", out.legacy);
+    try testing.expectEqualStrings("gemma: a quantization_config naming a quant_method", out.declined);
     try testing.expectError(error.ModelOptUnsupportedGlobalScale, p.load(json));
 }
 

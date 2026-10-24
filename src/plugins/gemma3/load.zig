@@ -375,3 +375,31 @@ pub fn headOf(r: *Reader, o: *Owned, embed: Linear, hidden: u32, tied: bool) !Li
     if (!tied) return error.MissingWeight;
     return embed;
 }
+
+/// The embedding table and head a Gemma model lends the engine.
+pub fn TrunkWeight(comptime L: type) type {
+    return struct {
+        pub fn get(mp: *anyopaque, which: abi.TrunkWeight, out: *quant_abi.Weight) callconv(.c) abi.Verdict {
+            const m: *L = @ptrCast(@alignCast(mp));
+            const w = &m.base.weights;
+            const l = switch (which) {
+                .embed => w.embed.table,
+                .head => w.head.head,
+            };
+            out.* = .{
+                .w = .{ .ctx = l.w.ctx },
+                .scales = .{ .ctx = l.s.ctx },
+                .biases = .{ .ctx = l.b.ctx },
+                .bits = @intCast(l.bits),
+                .group_size = l.group_size,
+                .layout = @backingInt(if (l.s.ctx == null) native.Layout.dense else switch (l.mode) {
+                    .nvfp4 => native.Layout.nvfp4,
+                    .mxfp4 => .mxfp4,
+                    .mxfp8 => .mxfp8,
+                    else => .affine,
+                }),
+            };
+            return .ok;
+        }
+    };
+}

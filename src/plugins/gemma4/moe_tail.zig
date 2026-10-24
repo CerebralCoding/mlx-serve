@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const MoeLayerWeights = @import("../../engines/mlx/forward/layered.zig").MoeLayerWeights;
+const MoeLayerWeights = @import("../../engines/mlx/layer_weights.zig").MoeLayerWeights;
 const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
 const fusedResidualNorm = @import("../../sdk/blocks/norms/residual_norm.zig").fusedResidualNorm;
 

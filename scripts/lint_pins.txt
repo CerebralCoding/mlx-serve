@@ -24,11 +24,8 @@ src/engines/mlx/scheduler.zig	coldLoadDrafterDir(self.no_drafter, self.primary_m
 src/engines/mlx/load.zig	clamped_prefix_mem,	HotPrefixCache.initWithMem takes the clamped budget, never the raw launch flag
 src/engines/mlx/load.zig	loadRequirementBytes(weights_bytes))) / gb	a preflight refusal quotes the requirement it compared
 src/host/media_jobs/load.zig	loadRequirementBytes(bill.ram))) / gb	a preflight refusal quotes the requirement it compared
-src/engines/mlx/forward/dense.zig	DtypeTrace.begin(	every forward path arms a dtype trace
-src/engines/mlx/forward/layered.zig	DtypeTrace.begin(	every forward path arms a dtype trace
 src/sdk/bases/hybrid.zig	DtypeTrace.begin(	every forward path arms a dtype trace
 src/sdk/bases/encoder.zig	DtypeTrace.begin(	every forward path arms a dtype trace
-src/plugins/gemma3/encoder.zig	DtypeTrace.begin(	every forward path arms a dtype trace
 src/sdk/bases/decoder.zig	DtypeTrace.begin(	every forward path arms a dtype trace
 src/plugins/qwen4_exp/forward.zig	DtypeTrace.begin(	every forward path arms a dtype trace
 src/engines/mlx/prefill.zig	.interleave_hook = .{ .ctx = &interleave_ctx, .call = interleaveDecodeTickCb }	the one Generator construction site wires the prefill interleave hook
@@ -78,9 +75,7 @@ src/engines/mlx/grammar/constraint.zig	advanceStep(1)	a forced grammar recovery 
 src/sdk/blocks/attention/attn256.zig	if (qs[2] < FUSED256_MIN_Q_LEN) return null;	the hd-256 decline and the sliding trim read one constant
 src/engines/mlx/kv/sliding.zig	cfg.head_dim == 256 and seq_len >= FUSED256_MIN_Q_LEN	the hd-256 decline and the sliding trim read one constant
 src/sdk/blocks/attention/attn256.zig	!if (qs[2] < 16)	the hd-256 floor is never respelled as a literal
-src/engines/mlx/forward/dense.zig	const sliding_span = sliding.span;	a sliding arm sizes its KV view from slidingViewFor, never the raw window
 src/plugins/gemma4/attention.zig	sliding.span	a sliding arm sizes its KV view from slidingViewFor, never the raw window
-src/engines/mlx/forward/dense.zig	!max_kv: u32 = if (is_full) 0 else cfg.sliding_window	a sliding arm sizes its KV view from slidingViewFor, never the raw window
 src/plugins/gemma4/attention.zig	!max_kv: u32 = if (is_global) 0 else cfg.sliding_window	a sliding arm sizes its KV view from slidingViewFor, never the raw window
 src/engines/mlx/kv/cache.zig	!.cache = try 	a live KV cache re-inits through KVCache.reinit, which builds before it frees
 src/engines/mlx/prompt_cache.zig	!.cache = try 	a live KV cache re-inits through KVCache.reinit, which builds before it frees

@@ -200,9 +200,9 @@ fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
         xfm.ssm_entries = entries;
     }
     const caps = b.parsed.caps;
-    // Drafters and an MTP head read the trunk's table and head.
+    // Drafters, an MTP head and a masked text encoder (LTX's, `Transformer.embedding`) read the trunk's table and head.
     const has_head = if (b.table.spec) |sp| sp.head != null else false;
-    const trunk = (caps.dflash_capture or has_head) and adoptTrunkWeights(&xfm, b.table, m);
+    const trunk = (caps.dflash_capture or caps.prefill_mask or has_head) and adoptTrunkWeights(&xfm, b.table, m);
     if (trunk) try adoptRotations(&xfm, b.table, m);
     intree.lendTrunk(&xfm);
     xfm.dense_attn_proj = @import("../load/init.zig").denseAttnProj(&xfm.config, xfm.config.num_experts > 0, &res.weights);
