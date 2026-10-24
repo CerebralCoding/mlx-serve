@@ -187,10 +187,11 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // Weights — first mlx call. Binds the stream on this thread.
     const weights_ptr = try sch.allocator.create(Weights);
     errdefer sch.allocator.destroy(weights_ptr);
+    // A Thunderbolt pair plans the model before it loads (a type with no multi-Mac path is refused by name there).
+    if (params.config.plugin != null) _ = try distributed.planFor(params.model_dir, params.config);
+    _ = plugin_driver.declineLossy(sch.allocator, params.config);
     // A served plugin reads the pack's tensors itself (`plugin/driver.zig`): the entry's map holds only the vision
     // tower, for the encoder below.
-    if (params.config.plugin != null) _ = plugin_driver.declinePlanned(sch.allocator, params.config, (try distributed.planFor(params.model_dir, params.config)) != null);
-    _ = plugin_driver.declineLossy(sch.allocator, params.config);
     const served = params.config.plugin != null;
     weights_ptr.* = if (served) Weights.init(sch.allocator) else try model_mod.loadModelWeights(sch.io, sch.allocator, params.model_dir, params.config, params.load_vision);
     errdefer weights_ptr.deinit();

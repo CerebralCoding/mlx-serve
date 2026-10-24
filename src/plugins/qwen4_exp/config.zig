@@ -679,7 +679,6 @@ pub fn facts(c: *Config) abi.Parsed {
         .spec_rollback = true,
         .images = c.qwen_vision,
         .video = c.qwen_vision,
-        .cluster_plan = true,
     };
     const s = &p.shell;
     s.* = .{

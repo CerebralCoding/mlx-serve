@@ -115,10 +115,7 @@ pub const Caps = packed struct(u64) {
     /// A pack another pack loads beside it (the ASR forced aligner).
     companion: bool = false,
     drafter: bool = false,
-    /// The model reads a Thunderbolt cluster's plan itself (`distributed.planFor`); a planned pack whose plugin does
-    /// not is loaded by the legacy path.
-    cluster_plan: bool = false,
-    _: u39 = 0,
+    _: u40 = 0,
 };
 
 pub const ThinkingDefault = enum(u8) { unset, off, on, on_with_tools };

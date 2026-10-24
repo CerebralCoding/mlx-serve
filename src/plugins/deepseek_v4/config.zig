@@ -402,8 +402,6 @@ fn facts(c: *const Config) abi.Parsed {
             .prefix_cache = false,
             .moe = c.num_experts > 0,
             .images = c.dsv41_vision,
-            // V4.1 re-reads a Thunderbolt pair's plan at load (`deepseek_v41/plugin.zig`).
-            .cluster_plan = v41,
         },
         .chat = .{
             .thinking_default = if (v41) .on else .off,
@@ -501,7 +499,7 @@ test "deepseek_v4 config: the release parses into the family config and the host
     try testing.expectEqual(@as(u32, 3), c.dsparkStages());
     try testing.expectEqual(@as(u8, 128), c.dsv4_compress_ratios[3]);
     try testing.expectEqual(@as(u64, 1 << 20), p.shell.context_cap);
-    try testing.expect(p.caps.owns_decode_state and !p.caps.prefix_cache and !p.caps.batches_decode and p.caps.moe and !p.caps.cluster_plan);
+    try testing.expect(p.caps.owns_decode_state and !p.caps.prefix_cache and !p.caps.batches_decode and p.caps.moe);
     try testing.expectEqual(abi.EffortVocab.dsv4, p.chat.effort_vocab);
     try testing.expectEqualStrings("deepseek_v4", p.chat.template_family.slice());
     try testing.expectEqual(@as(u32, 5), p.spec.native_block);

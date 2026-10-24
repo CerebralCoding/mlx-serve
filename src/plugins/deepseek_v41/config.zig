@@ -161,7 +161,7 @@ test "deepseek_v41 config: the release pack parses with its sources, Engram, DSp
     try testing.expectEqual(@as(u64, (1 << 2) | (1 << 8) | (1 << 14) | (1 << 20)), c.dsv41_kv_sources);
     try testing.expectEqual(@as(u32, 2), c.dsv41_n_engram_layers);
     try testing.expectEqual(@as(u32, 128), c.dsv41_dspark_experts);
-    try testing.expect(c.dsv41_vision and p.caps.images and !p.caps.spec_rollback and p.caps.cluster_plan);
+    try testing.expect(c.dsv41_vision and p.caps.images and !p.caps.spec_rollback);
     try testing.expectEqual(@as(u32, 129264), p.placeholder_ids.image);
     try testing.expectEqual(abi.ThinkingDefault.on, p.chat.thinking_default);
     try testing.expectEqual(abi.EffortVocab.dsv41, p.chat.effort_vocab);

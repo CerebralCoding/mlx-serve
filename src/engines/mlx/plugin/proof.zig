@@ -577,22 +577,3 @@ test "plugin load: a lossy setting the plugin does not run sends the pack back t
     try testing.expect(driver.declineLossy(a, &cfg) and cfg.plugin == null);
 }
 
-test "plugin load: a cluster-planned pack whose plugin does not read the plan goes back to the legacy path" {
-    const a = testing.allocator;
-    var b = try Both.open(.{}, 0xc1a5);
-    defer b.close();
-    var cfg = try model.parseConfig(std.Io.Threaded.global_single_threaded.io(), a, b.dir);
-    defer cfg.deinit(a);
-    try testing.expect(cfg.plugin != null);
-    try testing.expect(!driver.declinePlanned(a, &cfg, false) and cfg.plugin != null);
-    cfg.plugin.?.parsed.caps.cluster_plan = true;
-    try testing.expect(!driver.declinePlanned(a, &cfg, true) and cfg.plugin != null);
-    cfg.plugin.?.parsed.caps.cluster_plan = false;
-    try testing.expect(driver.declinePlanned(a, &cfg, true) and cfg.plugin == null);
-    // The legacy path loads it: the shell has no plugin.
-    var w = try model.loadModelWeights(std.Io.Threaded.global_single_threaded.io(), a, b.dir, &cfg, false);
-    defer w.deinit();
-    var x = try Transformer.init(std.Io.Threaded.global_single_threaded.io(), a, cfg, &w);
-    defer x.deinit();
-    try testing.expect(x.plugin == null);
-}
