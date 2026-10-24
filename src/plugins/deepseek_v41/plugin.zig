@@ -34,7 +34,7 @@ pub const table = abi.ModelTable{
     .cache = &.{ .layout = &layout, .resume_prompt = &resumePrompt, .state_bytes = &stateBytes },
     .media = &.{ .tower = &media.tower, .prepare = &media.prepare, .placeholder_rows = &media.placeholderRows },
     .spec = &.{ .trunk_weight = &trunkWeight },
-    .weights = &.{},
+    .weights = &.{ .resident_bytes = &residentBytes },
 };
 
 const Verdict = abi.Verdict;
@@ -226,12 +226,68 @@ pub fn stateBytes(mp: *anyopaque) callconv(.c) u64 {
     return if (m.mdl.dec_state) |*st| dsv41.stateBytes(st) else 0;
 }
 
+/// The load reads its Engram tables from disk per lookup and drops the tensors it never loads
+/// (`dsv41.residentDiskBytes`); the `mtp` setting decides the DSpark stages.
+fn residentBytes(p: *const abi.Parsed, model_dir: abi.Str, settings_json: abi.Str, shards: u64, out: *u64) callconv(.c) Verdict {
+    var mc = toModelConfig(gpa, config.of(p), null) catch |e| return Verdict.named(.failed, @errorName(e));
+    defer mc.deinit(gpa);
+    mc.mtp_override = mtpSetting(settings_json.slice());
+    out.* = dsv41.residentDiskBytes(gpa, model_dir.slice(), &mc, shards) catch |e| return Verdict.named(.failed, @errorName(e));
+    return .ok;
+}
+
 /// The tiny pack the conformance suite runs: the oracle's pipe layout without Engram or DSpark.
 pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
     return .{ .files = try fixture.v41Files(a, 7) };
 }
 
 // ── tests ──
+
+/// `residentBytes` over the Engram fixture (`engram.writeAffineFixture`) in `dir`, from `shards` bytes.
+fn engramResident(dir: []const u8, settings_json: []const u8, shards: u64) !u64 {
+    var c: config.Config = .{ .model_type = "deepseek_v41", .dsv41_n_engram_layers = 1, .dsv41_engram_head_dim = 64 };
+    c.dsv41_engram_layers[0] = 1;
+    c.dsv41_engram_rows[0] = 4;
+    var out: u64 = 0;
+    const v = residentBytes(&.{ .private = &c }, .of(dir), .of(settings_json), shards, &out);
+    if (!v.isOk()) return error.Refused;
+    return out;
+}
+
+test "deepseek_v41 resident bill: the Engram tables it preads are not billed" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try @import("engram.zig").writeAffineFixture(io, td.dir, "");
+    var buf: [512]u8 = undefined;
+    const dir = buf[0..try td.dir.realPath(io, &buf)];
+    try std.testing.expectEqual(@as(u64, 10_000 - 288), try engramResident(dir, "", 10_000));
+}
+
+test "deepseek_v41 resident bill: neither the vision tower nor DSpark stages that will not load" {
+    @import("../../env.zig").unset(.MLX_SERVE_DSV4_DSPARK); // test-order hygiene: `--dspark` (and tests) force the stages on
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try @import("engram.zig").writeAffineFixture(io, td.dir, "");
+    const hdr = "{\"layers.0.attn_norm.weight\":{\"dtype\":\"BF16\",\"shape\":[8],\"data_offsets\":[0,16]}," ++
+        "\"vision.patch.weight\":{\"dtype\":\"BF16\",\"shape\":[16],\"data_offsets\":[16,48]}," ++
+        "\"language_model.mtp.0.norm.weight\":{\"dtype\":\"BF16\",\"shape\":[32],\"data_offsets\":[48,112]}}";
+    var shard: [8 + hdr.len + 112]u8 = @splat(0);
+    std.mem.writeInt(u64, shard[0..8], hdr.len, .little);
+    @memcpy(shard[8..][0..hdr.len], hdr);
+    try td.dir.writeFile(io, .{ .sub_path = "model-00002.safetensors", .data = &shard });
+    const e = "layers.1.engram.embed.";
+    try td.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{" ++
+        "\"" ++ e ++ "weight\":\"model-00001.safetensors\",\"" ++ e ++ "scales\":\"model-00001.safetensors\",\"" ++ e ++ "biases\":\"model-00001.safetensors\"," ++
+        "\"layers.0.attn_norm.weight\":\"model-00002.safetensors\",\"vision.patch.weight\":\"model-00002.safetensors\"," ++
+        "\"language_model.mtp.0.norm.weight\":\"model-00002.safetensors\"}}" });
+    var buf: [512]u8 = undefined;
+    const dir = buf[0..try td.dir.realPath(io, &buf)];
+    // The stages load by default; the tower never does.
+    try std.testing.expectEqual(@as(u64, 10_000 - 288 - 32), try engramResident(dir, "", 10_000));
+    try std.testing.expectEqual(@as(u64, 10_000 - 288 - 32 - 64), try engramResident(dir, "{\"mtp\":false}", 10_000));
+}
 
 test {
     _ = config;

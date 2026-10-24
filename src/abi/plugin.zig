@@ -647,6 +647,9 @@ pub const WeightHooks = extern struct {
     keep_key: ?*const fn (p: *const Parsed, key: Str) callconv(.c) bool = null,
     /// Layer `layer`'s projection `which` as loaded (borrowed until `unload`); refused where the layer has none.
     layer_weight: ?*const fn (m: *anyopaque, layer: u32, which: LayerWeight, out: *quant.Weight) callconv(.c) Verdict = null,
+    /// The bytes a load of the pack at `model_dir` holds resident, from `shards` (the safetensors bytes its index
+    /// names) and the load's `settings_json` (`LoadCtx.settings_json`); null = `shards`.
+    resident_bytes: ?*const fn (p: *const Parsed, model_dir: Str, settings_json: Str, shards: u64, out: *u64) callconv(.c) Verdict = null,
 };
 
 // ── The table ──

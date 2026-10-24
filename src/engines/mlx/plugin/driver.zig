@@ -109,10 +109,15 @@ fn headMxfp8Setting(config: *const ModelConfig) ?bool {
     return config.lm_head_mxfp8_override orelse transformer_mod.cli().lm_head_mxfp8_cli;
 }
 
-/// `LoadCtx.settings_json`: the lossy load settings stated for this model (a plugin that serves them reads them).
-fn loadSettings(buf: []u8, config: *const ModelConfig) []const u8 {
-    const head = headMxfp8Setting(config) orelse return "{}";
-    return std.fmt.bufPrint(buf, "{{\"lm_head_mxfp8\":{s}}}", .{if (head) "true" else "false"}) catch unreachable;
+/// `LoadCtx.settings_json`: the load settings stated for this model (a plugin that serves them reads them): the lossy
+/// `lm_head_mxfp8` and the `mtp` head. `buf` holds 64 bytes.
+pub fn loadSettings(buf: []u8, config: *const ModelConfig) []const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    w.writeByte('{') catch unreachable;
+    if (headMxfp8Setting(config)) |on| w.print("\"lm_head_mxfp8\":{s}", .{if (on) "true" else "false"}) catch unreachable;
+    if (config.mtp_override) |on| w.print("{s}\"mtp\":{s}", .{ if (w.end > 1) "," else "", if (on) "true" else "false" }) catch unreachable;
+    w.writeByte('}') catch unreachable;
+    return w.buffered();
 }
 
 /// A pack with a lossy setting its plugin does not run goes back to the legacy path while one exists (a type whose
@@ -641,4 +646,14 @@ fn perSlot(xfm: *Transformer, x: Array, n: usize) ![]Array {
         made += 1;
     }
     return rows;
+}
+
+test "plugin driver: the load settings carry the model's lm_head_mxfp8 and mtp" {
+    var buf: [64]u8 = undefined;
+    var c: ModelConfig = .{};
+    try std.testing.expectEqualStrings("{}", loadSettings(&buf, &c));
+    c.mtp_override = false;
+    try std.testing.expectEqualStrings("{\"mtp\":false}", loadSettings(&buf, &c));
+    c.lm_head_mxfp8_override = false;
+    try std.testing.expectEqualStrings("{\"lm_head_mxfp8\":false,\"mtp\":false}", loadSettings(&buf, &c));
 }

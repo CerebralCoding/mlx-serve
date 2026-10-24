@@ -9,6 +9,7 @@ const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const fixture = @import("../../sdk/bases/proof/fixture.zig");
 const exl3 = @import("../../sdk/quant/exl3/format.zig");
+const sushi_pack = @import("../../sdk/quant/exl3/sushi_pack.zig");
 const trunk = @import("proof_test.zig");
 const both = @import("../../engines/mlx/plugin/both.zig");
 const mimo = @import("plugin.zig");
@@ -159,4 +160,20 @@ test "mimo_v2 Sushi served: steps, greedy and batched decode through the driver 
     try b.expectBatched(.layered);
     try heads_test.expectServedHeads(&b, 0x5a53);
     try b.expectDone();
+}
+
+test "mimo_v2 resident bill: a Sushi pack holds QKV as stored, the dense MLP decoded, the MTP heads, nothing unserved" {
+    const header =
+        \\{"__metadata__":{"format":"pt"},
+        \\"model.layers.0.self_attn.qkv_proj.weight":{"dtype":"F8_E4M3","shape":[1,1],"data_offsets":[0,1000]},
+        \\"model.layers.0.self_attn.qkv_proj.weight_scale_inv":{"dtype":"F32","shape":[1,1],"data_offsets":[1000,1100]},
+        \\"model.layers.0.mlp.gate_proj.weight":{"dtype":"F8_E4M3","shape":[1,1],"data_offsets":[1100,1300]},
+        \\"model.layers.0.mlp.gate_proj.weight_scale_inv":{"dtype":"F32","shape":[1,1],"data_offsets":[1300,1400]},
+        \\"model.layers.0.mlp.switch_mlp.up_proj.trellis":{"dtype":"U16","shape":[1,1],"data_offsets":[1400,1900]},
+        \\"model.mtp.layers.0.eh_proj.weight":{"dtype":"BF16","shape":[1,1],"data_offsets":[1900,2900]},
+        \\"visual.blocks.0.attn.proj.weight":{"dtype":"BF16","shape":[1,1],"data_offsets":[2900,3900]}}
+    ;
+    // qkv 1000 + its scales 100 x 128 + gate 200 held twice + trellis 500 + the MTP head's 1000.
+    const got = try sushi_pack.headerResidentBytes(testing.allocator, header, "a.safetensors", null, mimo.SushiBill{ .layers = 48 });
+    try testing.expectEqual(@as(u64, 1000 + 100 * 128 + 400 + 500 + 1000), got);
 }
