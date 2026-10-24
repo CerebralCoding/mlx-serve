@@ -548,6 +548,8 @@ pub const ModelConfig = struct {
     lm_head_mxfp8_override: ?bool = null,
     /// The model's `ane` setting: serve it on the Neural Engine; null follows `--ane`.
     ane_override: ?bool = null,
+    /// The model's `stream_experts` setting: its routed experts read from the pack into slot rows; null = resident.
+    stream_experts_override: ?@import("../../sdk/weights/streamed.zig").Setting = null,
     /// Dense context K/V a loaded DFlash drafter keeps per trunk token, per request. Stamped at load.
     drafter_ctx_bytes_per_token: u64 = 0,
     /// `drafter` setting: null or "auto" = the in-dir probe, "off", or a path. Owned.

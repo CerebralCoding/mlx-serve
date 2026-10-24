@@ -14,6 +14,7 @@ const model_discovery = @import("discovery.zig");
 const mlx_gguf = @import("../../sdk/quant/gguf/claim.zig");
 const status = @import("../status.zig");
 const dsv41_mod = @import("../../plugins/deepseek_v41/deepseek_v41.zig");
+const streamed = @import("../../sdk/weights/streamed.zig");
 const mlx_stream = if (@import("build_options").mlx_stream) @import("../../engines/mlx/modules/stream_glue.zig") else @import("../../engines/mlx/modules/stream_stub.zig");
 const testing = std.testing;
 
@@ -136,6 +137,11 @@ fn shardResidentBytes(allocator: std.mem.Allocator, io: std.Io, model_dir: []con
     if (config.exl3 != null and (config.isGlm5() or config.isMimo())) return sushi_pack.residentBytes(io, std.heap.page_allocator, model_dir, config);
     const total = modelDiskBytes(io, model_dir);
     if (config.mlxStream()) return mlx_stream.loadBytes(allocator, io, config);
+    if (config.stream_experts_override) |st| {
+        // The routed experts stay on disk; their slot rows are resident.
+        const b = try streamed.Streamed.packBytes(allocator, model_dir, st.slotRows(config.num_experts));
+        return total -| b.experts +| b.slots;
+    }
     if (config.isDsv41()) return dsv41_mod.residentDiskBytes(allocator, model_dir, config, total);
     if (!config.isQwen4() or config.embedded_ple_payload_bytes == null) return total;
     const info = (try @import("../../plugins/qwen4_exp/qwen4_exp.zig").inspectEmbedded(model_dir, try model_mod.qwen4EmbeddedSpec(config))) orelse return error.MissingEmbeddedNgramTable;
@@ -404,6 +410,21 @@ test "residentModelDiskBytes: deepseek_v41 does not bill the Engram tables it pr
     config.dsv41_engram_layers[0] = 1;
     config.dsv41_engram_rows[0] = 4;
     try std.testing.expectEqual(modelDiskBytes(io, dir) - 288, try residentModelDiskBytes(std.testing.allocator, io, dir, &config));
+}
+
+test "residentModelDiskBytes: with stream_experts a pack bills its residents and slot rows, not the experts" {
+    if (!@import("build_options").mlx_stream) return error.SkipZigTest;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    var buf: [512]u8 = undefined;
+    const dir = buf[0..try td.dir.realPath(io, &buf)];
+    try @import("../../sdk/weights/streamed/mlx_pack_test.zig").writePack(dir);
+    var config: model_mod.ModelConfig = .{ .num_experts = @import("../../sdk/weights/streamed/mlx_pack_test.zig").E, .stream_experts_override = .{ .rows = 2 } };
+    const b = try streamed.Streamed.packBytes(std.testing.allocator, dir, 2);
+    try std.testing.expectEqual(modelDiskBytes(io, dir) - b.experts + b.slots, try residentModelDiskBytes(std.testing.allocator, io, dir, &config));
+    config.stream_experts_override = null;
+    try std.testing.expectEqual(modelDiskBytes(io, dir), try residentModelDiskBytes(std.testing.allocator, io, dir, &config));
 }
 
 test "residentModelDiskBytes: deepseek_v41 bills neither the vision tower nor DSpark stages that will not load" {
