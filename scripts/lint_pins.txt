@@ -126,7 +126,7 @@ src/plugins/ltx/video.zig	!some(4)	LTX quant reads solve (bits, gs) from geometr
 src/plugins/ltx/video.zig	!some(8)	LTX quant reads solve (bits, gs) from geometry, never a hardcoded width
 src/plugins/qwen4_exp/*.zig	!MTP_EV_SEED_DEPTH	the qwen4 EV seed width is mtp.MAX_DEPTH itself
 src/plugins/qwen4_exp/mtp.zig	ev_seed_accept: ?[mtp_mod.MAX_DEPTH]f32	the qwen4 EV seed width is mtp.MAX_DEPTH itself
-src/sdk/blocks/attention/gated_full.zig	&ctx.qsa_arms, seq_len	the QSA arm tally lives on the request's ForwardCtx
+src/plugins/qwen4_exp/trunk/attn.zig	&ctx.qsa_arms, seq_len	the QSA arm tally lives on the request's ForwardCtx
 src/plugins/qwen4_exp/qsa/*.zig	!self.qsa_arms	the QSA arm tally never lives on the shared Transformer
 src/plugins/qwen4_exp/plugin.zig	r.arms.add(ctx.qsa_arms)	the QSA arm log reads the request's own ctx
 src/plugins/qwen4_exp/qsa/*.zig	const want_blocks = qsaWantsBlocks(	the QSA selection arm takes the block branch at verify widths

@@ -3,7 +3,6 @@
 
 const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
-const transformer_mod = @import("../../engines/mlx/transformer.zig");
 const gather_mod = @import("qsa/gather.zig");
 const score_mod = @import("qsa/score.zig");
 const attn256 = @import("../../sdk/blocks/attention/attn256.zig");
@@ -86,6 +85,7 @@ test "qwen4_exp bill: every term is the engine's arithmetic on the shipped pack"
 }
 
 test "qsaMaskBytes: a qwen4_exp twin bills the QSA mask and steps a rung the qwen3_5 twin keeps" {
+    const transformer_mod = @import("../../engines/mlx/transformer.zig");
     const t = std.testing;
     var twin = model_mod.ModelConfig{};
     twin.num_hidden_layers = 40;

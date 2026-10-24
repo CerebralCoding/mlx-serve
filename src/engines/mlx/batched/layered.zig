@@ -131,7 +131,7 @@ pub fn forwardMoeBatchedRows(
     hidden_last: ?*mlx.mlx_array,
     hidden_all: ?*mlx.mlx_array,
 ) !mlx.mlx_array {
-    self.fwd_gen +%= 1; // per-forward QSA scratch key
+    if (self.qwen4) |t| return t.forwardMoeBatchedRows(token_arr, ctxs, rope_offsets, capture_ssm, hidden_last, hidden_all);
     const N: c_int = @intCast(ctxs.len);
     std.debug.assert(ctxs.len == rope_offsets.len);
     std.debug.assert(N >= 1);
@@ -191,24 +191,14 @@ pub fn forwardMoeBatchedRows(
         .vision_embeddings = null,
         .batch_slots = ctxs,
         .batch_rope_offsets = rope_offset_arr,
-        .ple_defer = self.qwen4 != null,
     };
     // A verify's captures live on the merged entries until split below.
     defer if (capture_ssm) {
         for (merged) |*m| ssmFreeSpecCapture(m);
     };
 
-    // qwen4_exp rides the same driver: GDN + PLE window merged here, QSA
-    // key histories reached per slot through `batch_slots` (kv differs).
-    const logits = (if (self.qwen4 != null) self.forwardQwen4With(&bctx, token_arr) else self.forwardMoeWith(&bctx, token_arr)) catch |e| {
-        self.discardDeferredPle(&bctx);
-        return e;
-    };
-    errdefer {
-        self.discardDeferredPle(&bctx);
-        _ = mlx.mlx_array_free(logits);
-    }
-    try self.flushDeferredPle(&bctx);
+    const logits = try self.forwardMoeWith(&bctx, token_arr);
+    errdefer _ = mlx.mlx_array_free(logits);
     if (stateless) return logits;
 
     if (persist) {

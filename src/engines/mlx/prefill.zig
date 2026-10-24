@@ -209,7 +209,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             };
             const mtp_kv: ?*KVCache = if (mtp_target) |*mc| mc.kv() else null;
             // qwen4_exp: the head's QSA half travels with its KV; adoption is all-or-nothing.
-            const mtp_head: ?*Transformer = if (mtp_target) |*mc| mc.head() else null;
+            const mtp_head = if (mtp_target) |*mc| mc.head() else null;
             // Restore by move: the slot names itself, opting into the checkout; `finishSlot`
             // releases it on every path that ends the slot.
             const lookup = hc.lookupAndRestoreWithMedia(

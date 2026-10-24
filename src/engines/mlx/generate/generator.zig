@@ -583,7 +583,7 @@ pub const Generator = struct {
             self.prompt_ids_owned = &.{};
             self.prompt_ids_alloc = null;
         }
-        self.xfm.markQsaPooledRopeStale();
+        if (self.xfm.qwen4Trunk()) |t| t.markQsaPooledRopeStale();
         if (self.mtp_cache) |*mc| {
             mc.deinit();
             self.mtp_cache = null;

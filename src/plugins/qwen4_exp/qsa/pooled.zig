@@ -11,7 +11,7 @@ const KVCache = @import("../../../engines/mlx/kv/cache.zig").KVCache;
 const testing = @import("../../../engines/mlx/kv/cache.zig").testing;
 const scalarOf = @import("../../../engines/mlx/load/weights.zig").scalarOf;
 const SSMCacheEntry = @import("../../../engines/mlx/ssm/entry.zig").SSMCacheEntry;
-const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
+const Trunk = @import("../trunk.zig").Trunk;
 const materializedOwnedCopy = @import("../../../mlx/array.zig").materializedOwnedCopy;
 const attn256MaxDiff = @import("../../../sdk/blocks/attention/attn256.zig").attn256MaxDiff;
 const attn256RandBf16 = @import("../../../sdk/blocks/attention/attn256.zig").attn256RandBf16;
@@ -107,11 +107,11 @@ pub const QsaBlockConsts = struct {
     }
 };
 
-pub fn resetQsaPooledRope(self: *Transformer) void {
+pub fn resetQsaPooledRope(self: *Trunk) void {
     self.qsa_pooled_rope.deinit();
 }
 
-pub fn markQsaPooledRopeStale(self: *Transformer) void {
+pub fn markQsaPooledRopeStale(self: *Trunk) void {
     self.qsa_pooled_rope.stale.store(true, .release);
 }
 
@@ -301,7 +301,7 @@ fn qsaIdxTestKeys(rnd: std.Random, b: c_int, nb: c_int, ratio: c_int, lo_exp: f3
 }
 
 /// Fused vs composed pooled keys for one case; returns the bit-mismatch count (fails if the kernel declines).
-fn qsaIdxRopeCase(xfm: *Transformer, kb4: mlx.mlx_array, norm_w: mlx.mlx_array, base: c_int, table_scale: ?f32) !usize {
+fn qsaIdxRopeCase(xfm: *Trunk, kb4: mlx.mlx_array, norm_w: mlx.mlx_array, base: c_int, table_scale: ?f32) !usize {
     const s = xfm.s;
     const rope_dims: c_int = 64;
     const nb = mlx.getShape(kb4)[1];
@@ -332,9 +332,8 @@ fn qsaIdxRopeCase(xfm: *Transformer, kb4: mlx.mlx_array, norm_w: mlx.mlx_array, 
     return qsaIdxBitMismatches(want, got, s);
 }
 
-fn qsaIdxRopeTestXfm(s: mlx.mlx_stream) Transformer {
-    var xfm: Transformer = undefined;
-    xfm.rht = null;
+fn qsaIdxRopeTestXfm(s: mlx.mlx_stream) Trunk {
+    var xfm: Trunk = undefined;
     xfm.s = s;
     xfm.allocator = std.testing.allocator;
     xfm.config = .{};
@@ -544,9 +543,8 @@ test "qsa pooled bank: capacity append equals the concat, and the f32 score oper
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
 
-    var t: Transformer = undefined;
+    var t: Trunk = undefined;
 
-    t.rht = null;
     t.s = s;
     t.allocator = testing.allocator;
     t.qsa_score_bank_builds = 0;
@@ -624,9 +622,8 @@ test "qsa pooled rope: one cos/sin build per forward, not one per full-attention
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
 
-    var t: Transformer = undefined;
+    var t: Trunk = undefined;
 
-    t.rht = null;
     t.s = s;
     t.allocator = testing.allocator;
     t.config = .{};
@@ -700,9 +697,8 @@ test "qsa pooled rope: a mark from another thread is observed by the next lookup
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
 
-    var t: Transformer = undefined;
+    var t: Trunk = undefined;
 
-    t.rht = null;
     t.s = s;
     t.allocator = testing.allocator;
     t.config = .{};
@@ -730,7 +726,7 @@ test "qsa pooled rope: a mark from another thread is observed by the next lookup
     try testing.expectEqual(@as(usize, 1), t.qsa_pooled_rope.builds);
 
     const Worker = struct {
-        fn run(xfm: *Transformer) void {
+        fn run(xfm: *Trunk) void {
             xfm.markQsaPooledRopeStale();
         }
     };

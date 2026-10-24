@@ -224,8 +224,10 @@ pub fn emptySlotCache(slot: *Slot) void {
     if (slot.ssm_entries) |ents| prefix_cache_mod.HotPrefixCache.resetSsmEntries(ents);
     if (slot.model.transformer) |xf| {
         slot.cache.truncate(0, xf.s) catch {};
-        xf.qwen4Host().resetQsaPooledRope();
-        xf.qwen4Host().qwen4MtpResetOwned(slot.enable_mtp);
+        if (xf.qwen4Trunk()) |t| {
+            t.resetQsaPooledRope();
+            t.qwen4MtpResetOwned(slot.enable_mtp);
+        }
     }
     slot.moe_seq_offset = 0;
     slot.cached_tokens = 0;

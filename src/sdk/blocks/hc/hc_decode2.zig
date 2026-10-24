@@ -372,8 +372,9 @@ fn parityRows(h: c_int, r: c_int, bits: u32, gs: u32, seed: u64, rows: c_int) !v
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(seed);
     const rnd = prng.random();
-    xfm.hc_fused_override = true;
-    defer xfm.hc_fused_override = null;
+    const hcf = @import("../../../plugins/qwen4_exp/hc_fused.zig");
+    hcf.hc_fused_override = true;
+    defer hcf.hc_fused_override = null;
     rows_override = rows;
     defer rows_override = null;
     const hc: c_int = 4;

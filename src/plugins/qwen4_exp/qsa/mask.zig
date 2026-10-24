@@ -3,7 +3,7 @@
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const qsa_row_mask = @import("../qsa_mask.zig");
-const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
+const Trunk = @import("../trunk.zig").Trunk;
 
 /// Dense [B,1,S,kv] bool mask equivalent to a block selection (fallback arm
 /// + fixture trace): the selected blocks' tokens ∪ each row's own incomplete
@@ -43,7 +43,7 @@ pub fn qsaMaskFromBlocks(s: mlx.mlx_stream, blocks: mlx.mlx_array, kv: c_int, ra
 /// causal bound. `offset` is the cache position of row 0.
 /// `[1]` int32 RoPE position of a placed draft row: `live_end + (slot - dead_end)`, with the
 /// head's absolute origin folded into `shift` (`pos_base + slot - dead_end`).
-pub fn headPlaceRopePos(s: mlx.mlx_stream, p: *const Transformer.HeadPlace, shift: c_int) !mlx.mlx_array {
+pub fn headPlaceRopePos(s: mlx.mlx_stream, p: *const Trunk.HeadPlace, shift: c_int) !mlx.mlx_array {
     const shift_v = mlx.mlx_array_new_int(shift);
     defer _ = mlx.mlx_array_free(shift_v);
     var pos = mlx.mlx_array_new();
@@ -56,7 +56,7 @@ pub fn headPlaceRopePos(s: mlx.mlx_stream, p: *const Transformer.HeadPlace, shif
 
 /// Block scores with every block that reaches a dead row (or lies past one) at -inf, so a
 /// dead row's pooled key can never win or displace a top-k pick.
-pub fn headPlaceScores(s: mlx.mlx_stream, scores: mlx.mlx_array, p: *const Transformer.HeadPlace, ratio: c_int, nb: c_int) !mlx.mlx_array {
+pub fn headPlaceScores(s: mlx.mlx_stream, scores: mlx.mlx_array, p: *const Trunk.HeadPlace, ratio: c_int, nb: c_int) !mlx.mlx_array {
     const ratio_v = mlx.mlx_array_new_int(ratio);
     defer _ = mlx.mlx_array_free(ratio_v);
     var eligible_n = mlx.mlx_array_new();
@@ -78,7 +78,7 @@ pub fn headPlaceScores(s: mlx.mlx_stream, scores: mlx.mlx_array, p: *const Trans
 /// Key visibility `[1,1,1,kv]` for a placed draft row: every row but the dead ones, narrowed
 /// by the QSA selection when there is one. Rows from the first block that reaches a dead row
 /// on stay visible, since `headPlaceScores` keeps those blocks out of the selection.
-pub fn headPlaceVisibility(s: mlx.mlx_stream, qsa_mask: mlx.mlx_array, p: *const Transformer.HeadPlace, ratio: c_int, kv: c_int) !mlx.mlx_array {
+pub fn headPlaceVisibility(s: mlx.mlx_stream, qsa_mask: mlx.mlx_array, p: *const Trunk.HeadPlace, ratio: c_int, kv: c_int) !mlx.mlx_array {
     var r = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(r);
     try mlx.check(mlx.mlx_arange(&r, 0, @floatFromInt(kv), 1, .int32, s));

@@ -135,7 +135,7 @@ pub fn ssmFreeMergedLayer(m: *SSMCacheEntry) void {
     m.initialized = false;
 }
 
-fn ssmMergeLayer(s: mlx.mlx_stream, ctxs: []const *ForwardCtx, layer: usize, kind: SsmMergeKind) !SSMCacheEntry {
+pub fn ssmMergeLayer(s: mlx.mlx_stream, ctxs: []const *ForwardCtx, layer: usize, kind: SsmMergeKind) !SSMCacheEntry {
     // The qwen4 PLE layer's dilated-conv window is merged like the SSM state.
     var out: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = kind.linear };
     errdefer ssmFreeMergedLayer(&out);
@@ -154,7 +154,7 @@ fn ssmMergeLayer(s: mlx.mlx_stream, ctxs: []const *ForwardCtx, layer: usize, kin
     return out;
 }
 
-fn ssmSplitLayer(s: mlx.mlx_stream, m: *const SSMCacheEntry, ctxs: []const *ForwardCtx, layer: usize, kind: SsmMergeKind) !void {
+pub fn ssmSplitLayer(s: mlx.mlx_stream, m: *const SSMCacheEntry, ctxs: []const *ForwardCtx, layer: usize, kind: SsmMergeKind) !void {
     for (ctxs, 0..) |c, i| {
         var e = &c.ssm_entries.?[layer];
         if (kind.linear) {
@@ -492,7 +492,7 @@ fn ssmRepackMembers(
     }
 }
 
-fn ssmGroupDropMember(group: *PersistentSsmGroup, s: mlx.mlx_stream, entries: []SSMCacheEntry) !void {
+pub fn ssmGroupDropMember(group: *PersistentSsmGroup, s: mlx.mlx_stream, entries: []SSMCacheEntry) !void {
     if (!group.live) return;
     const key = @intFromPtr(entries.ptr);
     var row: ?usize = null;
@@ -530,7 +530,7 @@ fn ssmGroupDropMember(group: *PersistentSsmGroup, s: mlx.mlx_stream, entries: []
     };
 }
 
-fn ssmGroupReleaseCtx(group: *PersistentSsmGroup, s: mlx.mlx_stream, ctx: *ForwardCtx) !void {
+pub fn ssmGroupReleaseCtx(group: *PersistentSsmGroup, s: mlx.mlx_stream, ctx: *ForwardCtx) !void {
     const entries = ctx.ssm_entries orelse return;
     if (!group.live) return;
     const key = @intFromPtr(entries.ptr);
@@ -639,6 +639,8 @@ pub fn ssmLiveAux(e: *const SSMCacheEntry) mlx.mlx_array {
 }
 
 pub fn ssmGroupDrop(self: *Transformer, entries: []SSMCacheEntry) void {
+    // A legacy qwen4_exp shell's batched group lives on its trunk module.
+    if (self.qwen4) |t| return t.ssmGroupDrop(entries);
     ssmGroupDropMember(&self.ssm_group, self.s, entries) catch {};
 }
 
@@ -646,6 +648,7 @@ pub fn ssmGroupDrop(self: *Transformer, entries: []SSMCacheEntry) void {
 /// MTP solo arms): a member's live row goes back to its own entries before the
 /// solo path reads or writes them. A no-op for a slot that is not bound.
 pub fn ssmGroupRelease(self: *Transformer, ctx: *ForwardCtx) !void {
+    if (self.qwen4) |t| return t.ssmGroupRelease(ctx);
     try ssmGroupReleaseCtx(&self.ssm_group, self.s, ctx);
 }
 
@@ -1054,6 +1057,7 @@ test "persistent group: drop a member does not free kinds the adopt still reads"
     var ctxs = [_]*ForwardCtx{ &slots[0].ctx, &slots[1].ctx };
     var xfm: Transformer = undefined;
     xfm.rht = null;
+    xfm.qwen4 = null;
     xfm.s = s;
     xfm.allocator = alloc;
     xfm.ssm_group = .{ .allocator = alloc };
@@ -1070,6 +1074,7 @@ test "persistent group: drop a member does not free kinds the adopt still reads"
 fn ssmTickStubXfm(alloc: std.mem.Allocator, s: mlx.mlx_stream, persist: bool) Transformer {
     var xfm: Transformer = undefined;
     xfm.rht = null;
+    xfm.qwen4 = null;
     xfm.s = s;
     xfm.allocator = alloc;
     xfm.persistent_group_state_override = persist;

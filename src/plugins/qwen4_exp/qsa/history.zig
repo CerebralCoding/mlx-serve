@@ -12,7 +12,7 @@ const spanPreservingDropIndex = @import("../../../engines/mlx/ssm/checkpoint.zig
 const SSMCacheEntry = @import("../../../engines/mlx/ssm/entry.zig").SSMCacheEntry;
 const qsaRawKeyBytes = @import("../../../engines/mlx/ssm/entry.zig").qsaRawKeyBytes;
 const ssmRollbackFromCapture = @import("../../../engines/mlx/ssm/entry.zig").ssmRollbackFromCapture;
-const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
+const Trunk = @import("../trunk.zig").Trunk;
 const materializedOwnedCopy = @import("../../../mlx/array.zig").materializedOwnedCopy;
 const attn256MaxDiff = @import("../../../sdk/blocks/attention/attn256.zig").attn256MaxDiff;
 const attn256RandBf16 = @import("../../../sdk/blocks/attention/attn256.zig").attn256RandBf16;
@@ -373,7 +373,7 @@ fn capBufReslice(s: mlx.mlx_stream, buf: mlx.mlx_array, view: *mlx.mlx_array, co
     count.* = new_count;
 }
 
-pub fn qsaTestAppendPool(xfm: *Transformer, entry: *SSMCacheEntry, chunk: mlx.mlx_array, offset: c_int, s: mlx.mlx_stream) !void {
+pub fn qsaTestAppendPool(xfm: *Trunk, entry: *SSMCacheEntry, chunk: mlx.mlx_array, offset: c_int, s: mlx.mlx_stream) !void {
     const ratio = @max(entry.qsa_ratio, 1);
     const add = mlx.getShape(chunk)[1];
     const kv = offset + add;
@@ -473,8 +473,7 @@ test "QSA key history advances by S not 1" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const t = std.testing;
     const s = mlx.gpuStream();
-    var xfm: Transformer = undefined;
-    xfm.rht = null;
+    var xfm: Trunk = undefined;
     xfm.s = s;
     xfm.allocator = t.allocator;
     var entry: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
@@ -491,8 +490,7 @@ test "qsa raw-key ring is O(RING_ROWS) at N rows" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const t = std.testing;
     const s = mlx.gpuStream();
-    var xfm: Transformer = undefined;
-    xfm.rht = null;
+    var xfm: Trunk = undefined;
     xfm.s = s;
     xfm.allocator = t.allocator;
 
@@ -541,8 +539,7 @@ test "qsa leftover: restore at L-30 then append/rollback re-pools bit-identicall
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const t = std.testing;
     const s = mlx.gpuStream();
-    var xfm: Transformer = undefined;
-    xfm.rht = null;
+    var xfm: Trunk = undefined;
     xfm.s = s;
     xfm.allocator = t.allocator;
 
@@ -630,8 +627,7 @@ test "qsa rollback: a partial accept keeps the raw-key buffer and re-slices to k
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const t = std.testing;
     const s = mlx.gpuStream();
-    var xfm: Transformer = undefined;
-    xfm.rht = null;
+    var xfm: Trunk = undefined;
     xfm.s = s;
     xfm.allocator = t.allocator;
     xfm.qsa_score_bank_builds = 0;
@@ -798,9 +794,8 @@ test "qsa history reservation: a reserved prefill allocates its buffers ONCE (#3
     const chunk_rows: c_int = 4096;
     const total: usize = 409_600;
 
-    var t: Transformer = undefined;
+    var t: Trunk = undefined;
 
-    t.rht = null;
     t.s = s;
     t.allocator = ta;
     var entries = [_]SSMCacheEntry{.{ .ssm_state = mlx.mlx_array_new(), .conv_state = mlx.mlx_array_new(), .initialized = false }};
@@ -839,9 +834,8 @@ test "qsa key history: capacity-buffer append equals the concatenated reference,
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
 
-    var t: Transformer = undefined;
+    var t: Trunk = undefined;
 
-    t.rht = null;
     t.s = s;
     t.allocator = testing.allocator;
 
@@ -946,9 +940,8 @@ test "qsa history: a restore-shaped re-seed lands AT the reservation, so the app
     const held: c_int = 4096;
     const reserve: usize = 8192;
 
-    var t: Transformer = undefined;
+    var t: Trunk = undefined;
 
-    t.rht = null;
     t.s = s;
     t.allocator = ta;
     var entries = [_]SSMCacheEntry{.{ .ssm_state = mlx.mlx_array_new(), .conv_state = mlx.mlx_array_new(), .initialized = false }};

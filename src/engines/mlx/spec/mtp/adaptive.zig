@@ -339,7 +339,7 @@ pub fn mtpAdaptiveSerialStep(self: *Generator, m_lo: u32, kv_len: u32) bool {
         }
         // Nothing to decide with: teach the bucket a serial token, once.
         const idle = self.mtp_serial_left == 0 and self.mtp_serial_exit == .none;
-        const useful = mtpSerialProbeUseful(window_ms_tok) and mtpSerialProbeEarned(self.xfm.qwen4Host().qwen4_mtp != null, self.mtp_low_accept);
+        const useful = mtpSerialProbeUseful(window_ms_tok) and mtpSerialProbeEarned(if (self.xfm.qwen4Trunk()) |trunk| trunk.qwen4_mtp != null else false, self.mtp_low_accept);
         if (mtpSerialProbeArm(t, b, self.spec_cost_solo, idle, self.mtpAdaptiveHeadMayResume(), useful)) |own| {
             self.mtp_serial_left = MTP_ADAPTIVE_PROBE_TOKENS;
             log.info(

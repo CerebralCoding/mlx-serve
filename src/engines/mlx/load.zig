@@ -230,7 +230,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         try xfm_ptr.cache.reinit(params.config.num_hidden_layers, kv_quant_config);
     }
     Transformer.mtp_head_kv_quant_flag = params.mtp_head_kv_quant;
-    try xfm_ptr.qwen4Host().qwen4MtpApplyKvQuant(kv_quant_config);
+    if (xfm_ptr.qwen4Trunk()) |t| try t.qwen4MtpApplyKvQuant(Transformer.qwen4MtpHeadKvConfig(kv_quant_config));
 
     // Wire model weights into GPU memory (prevents paging, matches mlx-lm).
     // Policy in mlx.applyWiredPolicy; re-applied in runLoadRequest /
@@ -258,9 +258,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         if (params.config.linear_num_key_heads > 0) {
             xfm_ptr.compileGdnGate();
         }
-        if (params.config.isQwen4()) {
-            xfm_ptr.compileQwen4Hc();
-        }
+        if (xfm_ptr.qwen4) |t| t.prepare();
     }
 
     // Vision encoder if requested. `MissingVisionWeights` is a benign opt-out
@@ -686,7 +684,9 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // Gated exactly like `entry.mtp`'s `.qwen4` arm below: `--no-mtp` never
     // drafts, so it never pays. One-shot, so the draft path's ask stays a
     // pure read; if this ever does not run, that ask still builds.
-    if (mtp_ptr == null and mtp_enabled) _ = xfm_ptr.qwen4Host().qwen4BuildDraftRerank();
+    if (mtp_ptr == null and mtp_enabled) if (xfm_ptr.qwen4Trunk()) |t| {
+        _ = t.qwen4BuildDraftRerank();
+    };
 
     // ANE prefill-MLP offload (`--ane-prefill`, perf-plan-aug-17 P5): built
     // HERE because the mlx dequant must run on the inference thread (sole
@@ -742,12 +742,12 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         };
         const warmup_ns: u64 = @intCast(warmup_start.untilNow(sch.io, .awake).nanoseconds);
         log.info("Warmup complete ({d} ms).\n", .{warmup_ns / std.time.ns_per_ms});
-        if (mtp_enabled and xfm_ptr.qwen4Host().qwen4_mtp != null) {
+        if (mtp_enabled) if (xfm_ptr.qwen4Trunk()) |t| if (t.qwen4_mtp != null) {
             const cap = generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile);
-            xfm_ptr.qwen4Host().warmupSpecVerify(cap, params.kv_quant_config) catch |err| {
+            t.warmupSpecVerify(cap, params.kv_quant_config) catch |err| {
                 log.warn("[spec-warmup] failed ({s}); the first round at each width pays its kernel compile inside the round.\n", .{@errorName(err)});
             };
-        }
+        };
     }
 
     // ── Phase 05: install everything onto the LoadedModel entry, mark
@@ -775,8 +775,8 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         generate_mod.MtpHeadRef{ .glm = h }
     else if (plugin_mtp) |h|
         generate_mod.MtpHeadRef{ .plugin = h }
-    else if (mtp_enabled and xfm_ptr.qwen4Host().qwen4_mtp != null)
-        generate_mod.MtpHeadRef{ .qwen4 = xfm_ptr.qwen4Host() }
+    else if (mtp_enabled and xfm_ptr.qwen4Trunk() != null and xfm_ptr.qwen4Trunk().?.qwen4_mtp != null)
+        generate_mod.MtpHeadRef{ .qwen4 = xfm_ptr.qwen4Trunk().? }
     else
         null;
     // Resolve the auto (0) cap here so every downstream reader of

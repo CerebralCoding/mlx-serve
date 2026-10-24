@@ -3,9 +3,9 @@
 
 const std = @import("std");
 const env = @import("../../../env.zig");
-const qwen4_mod = @import("../../../plugins/qwen4_exp/qwen4_exp.zig");
+const Qwen4Trunk = @import("../../../plugins/qwen4_exp/trunk.zig").Trunk;
+const qwen4_trunk_load = @import("../../../plugins/qwen4_exp/trunk_load.zig");
 const distributed_mod = @import("../cluster/distributed.zig");
-const ple_gpu = @import("../../../plugins/qwen4_exp/ple_gpu.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const rht = @import("../../../sdk/quant/hadamard/rht.zig");
 const qmm_int8 = @import("../../../sdk/blocks/qmm/qmm_int8.zig");
@@ -15,15 +15,7 @@ const ModelConfig = @import("../model.zig").ModelConfig;
 const Weights = @import("../model.zig").Weights;
 const fused_rows = @import("../../../sdk/blocks/linear/fused_rows.zig");
 const transformer = @import("../transformer.zig");
-const QWEN4_DECODE_ASYNC_LADDER_DEFAULT = @import("../../../plugins/qwen4_exp/forward.zig").QWEN4_DECODE_ASYNC_LADDER_DEFAULT;
-const loadHcWeights = @import("../../../plugins/qwen4_exp/load.zig").loadHcWeights;
-const Qwen4Mtp = @import("../../../plugins/qwen4_exp/mtp.zig").Qwen4Mtp;
-const loadQwen4Mtp = @import("../../../plugins/qwen4_exp/mtp.zig").loadQwen4Mtp;
-const qsaNaxArm = @import("../../../plugins/qwen4_exp/qsa/gather.zig").qsaNaxArm;
-const checkQsaCompressRatio = @import("../../../plugins/qwen4_exp/qsa/history.zig").checkQsaCompressRatio;
 const ssmFreeQsaState = @import("../../../plugins/qwen4_exp/qsa/history.zig").ssmFreeQsaState;
-const qsaScoreFusedArm = @import("../../../plugins/qwen4_exp/qsa/score.zig").qsaScoreFusedArm;
-const HcWeights = @import("../../../plugins/qwen4_exp/weights.zig").HcWeights;
 const attnProjRouted = @import("../../../sdk/blocks/attention/decode_attn_quant.zig").attnProjRouted;
 const weightsHaveDenseAttnProj = @import("../../../sdk/blocks/attention/decode_attn_quant.zig").weightsHaveDenseAttnProj;
 const DenseMlpWeights = @import("../../../sdk/blocks/mlp/dense.zig").DenseMlpWeights;
@@ -42,6 +34,7 @@ const MoeLayerWeights = @import("../forward/layered.zig").MoeLayerWeights;
 const KVCache = @import("../kv/cache.zig").KVCache;
 const LayerWeights = @import("../layer_weights.zig").LayerWeights;
 const initMlxStream = @import("../modules/mlx_stream.zig").initMlxStream;
+const moduleShell = @import("../modules/shell.zig").moduleShell;
 const mtpNaxCalibratedModelFrom = @import("../spec/mtp_nax_profile.zig").mtpNaxCalibratedModelFrom;
 const mtpNaxOqeAffineTrunkFrom = @import("../spec/mtp_nax_profile.zig").mtpNaxOqeAffineTrunkFrom;
 const mtpNaxUniformAffineTrunkFrom = @import("../spec/mtp_nax_profile.zig").mtpNaxUniformAffineTrunkFrom;
@@ -69,10 +62,6 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
     // tried to use it. We re-bind `self.s` to the connection thread's default stream
     // via `useCurrentThreadStream` before each request.
     const s = mlx.gpuStream();
-    if (config.indexer_budget != 0) {
-        qsaScoreFusedArm();
-        qsaNaxArm();
-    }
     const prefix = config.weight_prefix;
 
     var name_buf: [256]u8 = undefined;
@@ -87,6 +76,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
     if (config.glm_stream) return initMlxStream(io, allocator, config, s);
     if (config.glm5_stream) return initMlxStream(io, allocator, config, s);
     if (config.dsv41_stream) return initMlxStream(io, allocator, config, s);
+    if (config.isQwen4()) return initQwen4(io, allocator, config, weights, s);
 
     // Embeddings: the table's own name is the checkpoint's, not a family
     // trait — one lookup table, three call sites (weight/scales/biases)
@@ -197,7 +187,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
             return error.MissingWeight;
         }
     }
-    if (lmHeadMxfp8On(config.lm_head_mxfp8_override, transformer.cli().lm_head_mxfp8_cli, mlx.cudaIntegrated(), config.isQwen4(), config.quant_bits)) {
+    if (lmHeadMxfp8On(config.lm_head_mxfp8_override, transformer.cli().lm_head_mxfp8_cli, mlx.cudaIntegrated(), false, config.quant_bits)) {
         if (head_key != null and lm_head_s.ctx == null) {
             lm_head_s = try quantizeHeadMxfp8(weights, head_key.?, lm_head_w, s);
             lm_head_w = weights.get(head_key.?).?;
@@ -320,15 +310,6 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
             v_norm_weight_global = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_full(&v_norm_weight_global.?, &ghd_shape, 1, one_val, .bfloat16, s));
         }
-    }
-
-    var ones_hidden: ?mlx.mlx_array = null;
-    if (config.isQwen4()) {
-        const one_val = bf16Scalar(1.0, s);
-        defer _ = mlx.mlx_array_free(one_val);
-        const h_shape = [_]c_int{@intCast(config.hidden_size)};
-        ones_hidden = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_full(&ones_hidden.?, &h_shape, 1, one_val, .bfloat16, s));
     }
 
     // Gemma 4: proportional RoPE frequencies for global/full attention layers
@@ -573,59 +554,6 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
         log.info("Batch eval all weights: {d}ms\n", .{eval_ms});
     }
 
-    // qwen4_exp: the final hyper-connection read (replaces model.norm)
-    // and the module-owned n-gram hash + mmapped table.
-    var qwen4_state: ?*qwen4_mod.Qwen4State = null;
-    var qwen4_mixer: ?HcWeights = null;
-    var qwen4_mtp: ?Qwen4Mtp = null;
-    if (config.isQwen4()) {
-        var extra: std.ArrayList(mlx.mlx_array) = .empty;
-        defer extra.deinit(allocator);
-        var mb: [160]u8 = undefined;
-        qwen4_mixer = try loadHcWeights(weights, std.fmt.bufPrint(&mb, "{s}.hyper_connection_mixer", .{prefix}) catch unreachable, false, config.hc_count, config.hidden_size, &extra, allocator, s);
-        if (extra.items.len > 0) {
-            const old = moe_owned_bf16 orelse &[_]mlx.mlx_array{};
-            const merged = try std.mem.concat(allocator, mlx.mlx_array, &.{ old, extra.items });
-            if (moe_owned_bf16) |o| allocator.free(o);
-            moe_owned_bf16 = merged;
-        }
-        const eos: u32 = config.ngram_eos;
-        // The `0` is the PLE's ordinal among the config's injection points, not
-        // `config.ple_layer_idx` (pinned by the oracle fixture with `ple_layer_ids=[2]`).
-        try checkQsaCompressRatio(config.indexer_compress_ratio);
-        const st = try allocator.create(qwen4_mod.Qwen4State);
-        errdefer allocator.destroy(st);
-        st.* = .{
-            .hash = try qwen4_mod.NgramHash.init(config.vocab_size, config.ngram_size, config.heads_per_ngram, config.ngram_vocab_base, config.ngram_vocab_divisor, config.ngram_seed, 0, eos),
-            .table = if (config.embedded_ple_payload_bytes != null)
-                try qwen4_mod.NgramTable.openEmbedded(std.fs.path.dirname(config.ngram_table_path orelse return error.MissingNgramTable) orelse return error.MissingNgramTable, try model_mod.qwen4EmbeddedSpec(&config))
-            else
-                try qwen4_mod.NgramTable.open(config.ngram_table_path orelse return error.MissingNgramTable),
-        };
-        errdefer st.deinit();
-        if (config.embedded_ple_payload_bytes) |bytes| {
-            if (st.table.embeddedPayloadBytes() != bytes) return error.EmbeddedNgramTableChanged;
-        }
-        if (st.table.rows != st.hash.total_rows or st.table.dim * st.hash.n_heads != config.ple_embed_dim) {
-            log.err("[qwen4] ngram_table.bin geometry {d}x{d} does not match the config ({d} rows, {d} heads x dim)\n", .{ st.table.rows, st.table.dim, st.hash.total_rows, st.hash.n_heads });
-            return error.NgramTableMismatch;
-        }
-        var weights_bytes: usize = 0;
-        _ = mlx.mlx_get_active_memory(&weights_bytes);
-        // A pipeline rank without the PLE layer, or a tensor worker, never reads the table.
-        if (config.pleLocalLayer() != null and !(if (config.dist_shard) |sh| sh.rank != 0 else false)) {
-            st.gpu = ple_gpu.load(&st.table, ple_gpu.pleGpu().enabled, weights_bytes);
-            if (st.gpu == null) st.table.calibrateArm();
-            // The weights load just evicted the table from page cache; an embedded pack's GPU
-            // arm holds its own copy.
-            if (st.gpu == null or st.table.embedded == null) st.table.startWarm();
-        }
-        qwen4_state = st;
-        // A pipeline split's head would read the last layer's stream, which lives on the worker.
-        qwen4_mtp = if (config.dist_span != null) null else try loadQwen4Mtp(allocator, config, weights, &name_buf, s);
-        log.info("[qwen4] n-gram table {d} rows x {d} ({d}-bit, mmapped), PLE at layer {d}, QSA budget {d}/{d}\n", .{ st.table.rows, st.table.dim, st.table.bits, config.ple_layer_idx, config.indexer_budget, config.indexer_compress_ratio });
-    }
-
     const int8_on = (config.int8_prefill_override orelse false) and mlx.metalKernelsAvailable();
     var int8_cache: ?*qmm_int8.Cache = null;
     errdefer if (int8_cache) |c| allocator.destroy(c);
@@ -683,17 +611,12 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
         .cache = cache,
         .s = s,
         .allocator = allocator,
-        .dense_attn_proj = attnProjRouted(&config, moe_layers != null or qwen4_state != null) and weightsHaveDenseAttnProj(weights),
+        .dense_attn_proj = attnProjRouted(&config, moe_layers != null) and weightsHaveDenseAttnProj(weights),
         .emb_w = emb_w,
         .emb_s = emb_s_arr,
         .emb_b = emb_b_arr,
         .emb_scale = emb_scale,
         .final_norm = final_norm,
-        .qwen4 = qwen4_state,
-        .dist_peer = if (config.dist_span) |sp| if (sp.first()) distributed_mod.peer() else null else null,
-        .dist_tp = if (config.dist_shard) |sh| if (sh.rank == 0) distributed_mod.peer() else null else null,
-        .qwen4_mixer = qwen4_mixer,
-        .qwen4_mtp = qwen4_mtp,
         .lm_head_w = lm_head_w,
         .lm_head_s = lm_head_s,
         .lm_head_b = lm_head_b,
@@ -706,7 +629,6 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
         .layers = layers,
         .owns_lm_head = owns_lm_head,
         .owns_norms = config.norm_has_offset,
-        .decode_async_ladder_qwen4 = QWEN4_DECODE_ASYNC_LADDER_DEFAULT,
         .gelu_coeff = if (need_gelu) bf16Scalar(0.7978845608028654, s) else null,
         .gelu_inner = if (need_gelu) bf16Scalar(0.044715, s) else null,
         .half = bf16Scalar(0.5, s),
@@ -726,7 +648,6 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
         .softcap_scalar = softcap_scalar,
         .v_norm_weight = v_norm_weight,
         .v_norm_weight_global = v_norm_weight_global,
-        .ones_hidden = ones_hidden,
         .rope_freqs_global = rope_freqs_global,
         .rope_freqs_yarn = rope_freqs_yarn,
         .yarn_mscale = yarn_mscale,
@@ -744,4 +665,32 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
         .mtp_uniform_affine_trunk = mtp_uniform_affine_trunk,
         .mtp_oqe_affine_trunk = mtp_oqe_affine_trunk,
     };
+}
+
+/// qwen4_exp on the legacy path (a pack its plugin declines): a shell whose forwards, head and verify run on the
+/// plugin's trunk module, which it owns; the shell lends the trunk's table and head to the drafters.
+fn initQwen4(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights, s: mlx.mlx_stream) !Transformer {
+    var xfm = try moduleShell(allocator, config, s);
+    errdefer xfm.deinit();
+    xfm.cache.deinit();
+    xfm.cache = try KVCache.init(allocator, config.num_hidden_layers);
+    const entries = try allocator.alloc(SSMCacheEntry, config.num_hidden_layers);
+    for (entries) |*e| e.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
+    xfm.ssm_entries = entries;
+    const t = try allocator.create(Qwen4Trunk);
+    errdefer allocator.destroy(t);
+    t.* = try qwen4_trunk_load.load(io, allocator, &config, weights, .{
+        .head_mxfp8 = lmHeadMxfp8On(config.lm_head_mxfp8_override, transformer.cli().lm_head_mxfp8_cli, mlx.cudaIntegrated(), true, config.quant_bits),
+    });
+    xfm.qwen4 = t;
+    xfm.emb_w = t.emb_w;
+    xfm.emb_s = t.emb_s;
+    xfm.emb_b = t.emb_b;
+    xfm.lm_head_w = t.lm_head_w;
+    xfm.lm_head_s = t.lm_head_s;
+    xfm.lm_head_b = t.lm_head_b;
+    xfm.dense_attn_proj = attnProjRouted(&config, true) and weightsHaveDenseAttnProj(weights);
+    xfm.mtp_uniform_affine_trunk = t.mtp_uniform_affine_trunk;
+    xfm.mtp_oqe_affine_trunk = t.mtp_oqe_affine_trunk;
+    return xfm;
 }

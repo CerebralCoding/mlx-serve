@@ -1,6 +1,6 @@
 //! Parity proof for the qwen4_exp plugin: on a tiny random pack, the table's forward (prefill, decode across the QSA
 //! budget, verify, a later chunk, layer and stream captures, batched rows) is bit-equal to the legacy forward the
-//! engine runs (`Transformer.forwardWith` / `forwardMoeBatchedDecode`), on the engine's slot caches and on the
+//! engine ran (`Transformer.forwardWith` / `forwardMoeBatchedDecode`, recorded on the tapes), on the engine's slot caches and on the
 //! model's own.
 
 const std = @import("std");
@@ -10,8 +10,7 @@ const ops = @import("../../mlx/ops.zig");
 const model = @import("../../engines/mlx/model.zig");
 const sdk = @import("../../sdk/root.zig");
 const engine_cache_ops = @import("../../engines/mlx/kv/cache_ops.zig");
-const batched_caps = @import("../../engines/mlx/batched/caps.zig");
-const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
+const Trunk = @import("trunk.zig").Trunk;
 const ForwardCtx = @import("../../engines/mlx/forward_ctx.zig").ForwardCtx;
 const CaptureLayers = @import("../../engines/mlx/forward_ctx.zig").CaptureLayers;
 const KVCache = @import("../../engines/mlx/kv/cache.zig").KVCache;
@@ -39,7 +38,7 @@ const Caches = struct {
         return .{ .kv = try KVCache.init(testing.allocator, layers), .ssm = ssm };
     }
 
-    fn deinit(c: *Caches, xfm: *Transformer) void {
+    fn deinit(c: *Caches, xfm: *Trunk) void {
         xfm.ssmGroupDrop(c.ssm);
         for (c.ssm) |*e| {
             _ = mlx.mlx_array_free(e.conv_state);
@@ -56,12 +55,12 @@ const Caches = struct {
     }
 };
 
-/// A pack on disk, loaded twice on the GPU stream: the legacy Transformer and the plugin's table.
+/// A pack on disk, loaded twice on the GPU stream: a bare trunk module and the plugin's table.
 const Twin = struct {
     tmp: testing.TmpDir,
     cfg: model.ModelConfig,
     weights: model.Weights,
-    xfm: Transformer,
+    xfm: Trunk,
     parsed: abi.Parsed = .{},
     m: *anyopaque,
 
@@ -80,9 +79,9 @@ const Twin = struct {
         t.weights = try model.loadModelWeights(io, a, dir, &t.cfg, false);
         errdefer t.weights.deinit();
         model.resolveWeightPrefix(&t.cfg, &t.weights);
-        t.xfm = try Transformer.init(io, a, t.cfg, &t.weights);
+        t.xfm = try Trunk.init(io, a, t.cfg, &t.weights);
         errdefer t.xfm.deinit();
-        q4.prepare(&t.xfm);
+        t.xfm.prepare();
         const mem: sdk.fixture.MemDir = .{ .files = files };
         const pd = mem.packDir();
         try testing.expect(q4.table.parse(&pd, .of(files[0].bytes), .{}, null, false, &t.parsed).isOk());
@@ -105,8 +104,8 @@ const Twin = struct {
     }
 
     /// The plugin's trunk module: the engine slots it batched are dropped from its group.
-    fn inner(t: *Twin) *Transformer {
-        return &@as(*q4.Model, @ptrCast(@alignCast(t.m))).xfm;
+    fn inner(t: *Twin) *Trunk {
+        return &@as(*q4.Model, @ptrCast(@alignCast(t.m))).trunk;
     }
 
     fn ids(toks: []const u32) Array {
@@ -256,7 +255,7 @@ test "qwen4_exp plugin: batched rows equal the legacy batched GDN tick per slot,
             lptr[i] = &lctx[i];
         }
         // Both slots' recurrent state is live: the engine's gate takes the batched tick, not the serial fallback.
-        try testing.expect(batched_caps.batchedGdnReady(&t.xfm, &lptr));
+        try testing.expect(t.xfm.batchedGdnReady(&lptr));
         const want = try t.xfm.forwardMoeBatchedDecode(&toks, &lptr, &pos, null);
         defer {
             for (want) |w| _ = mlx.mlx_array_free(w);

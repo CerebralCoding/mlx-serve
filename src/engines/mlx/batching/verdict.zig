@@ -451,17 +451,17 @@ test "batchKvLenOf bills raw when any gather switch is off or the slot is vision
     const prev_b = transformer_mod.qsa_batched_gather_override;
     const prev_g = transformer_mod.qsa_gather_override;
     const prev_d = transformer_mod.qsa_decode_gather_override;
-    const prev_v = transformer_mod.qsa_verify_gather_override;
+    const prev_v = @import("../../../plugins/qwen4_exp/qsa/verify_gather.zig").qsa_verify_gather_override;
     defer {
         transformer_mod.qsa_batched_gather_override = prev_b;
         transformer_mod.qsa_gather_override = prev_g;
         transformer_mod.qsa_decode_gather_override = prev_d;
-        transformer_mod.qsa_verify_gather_override = prev_v;
+        @import("../../../plugins/qwen4_exp/qsa/verify_gather.zig").qsa_verify_gather_override = prev_v;
     }
     transformer_mod.qsa_batched_gather_override = true;
     transformer_mod.qsa_gather_override = true;
     transformer_mod.qsa_decode_gather_override = true;
-    transformer_mod.qsa_verify_gather_override = true;
+    @import("../../../plugins/qwen4_exp/qsa/verify_gather.zig").qsa_verify_gather_override = true;
     var q4 = model_mod.ModelConfig{
         .model_type = "qwen4_exp",
         .indexer_budget = 2048,
@@ -483,7 +483,7 @@ test "batchKvLenOf bills raw when any gather switch is off or the slot is vision
     try testing.expectEqual(@as(u32, 162_000), batchKvLenOfWith(&cache, &q4, 1));
     try testing.expectEqual(@as(u32, 2052), batchKvLenOfWith(&cache, &q4, 4));
     transformer_mod.qsa_decode_gather_override = true;
-    transformer_mod.qsa_verify_gather_override = false;
+    @import("../../../plugins/qwen4_exp/qsa/verify_gather.zig").qsa_verify_gather_override = false;
     try testing.expectEqual(@as(u32, 2052), batchKvLenOfWith(&cache, &q4, 1));
     // The fused verify kernel still serves S=4 on blocks; with it off too, the mask bills raw kv.
     try testing.expectEqual(@as(u32, 2052), batchKvLenOfWith(&cache, &q4, 4));
@@ -534,21 +534,21 @@ test "a 300k slot beside a 1k slot is billed sparse, so the pair groups (M-RoPE 
 test "S>=2 pad-waste floor: none under the fused verify kernel, else max of gather and verify mins" {
     const prev_b = transformer_mod.qsa_batched_gather_override;
     const prev_g = transformer_mod.qsa_gather_override;
-    const prev_v = transformer_mod.qsa_verify_gather_override;
+    const prev_v = @import("../../../plugins/qwen4_exp/qsa/verify_gather.zig").qsa_verify_gather_override;
     const prev_gm = transformer_mod.qsa_gather_min_kv_override;
-    const prev_vm = transformer_mod.qsa_verify_gather_min_kv_override;
+    const prev_vm = @import("../../../plugins/qwen4_exp/qsa/verify_gather.zig").qsa_verify_gather_min_kv_override;
     defer {
         transformer_mod.qsa_batched_gather_override = prev_b;
         transformer_mod.qsa_gather_override = prev_g;
-        transformer_mod.qsa_verify_gather_override = prev_v;
+        @import("../../../plugins/qwen4_exp/qsa/verify_gather.zig").qsa_verify_gather_override = prev_v;
         transformer_mod.qsa_gather_min_kv_override = prev_gm;
-        transformer_mod.qsa_verify_gather_min_kv_override = prev_vm;
+        @import("../../../plugins/qwen4_exp/qsa/verify_gather.zig").qsa_verify_gather_min_kv_override = prev_vm;
     }
     transformer_mod.qsa_batched_gather_override = true;
     transformer_mod.qsa_gather_override = true;
-    transformer_mod.qsa_verify_gather_override = true;
+    @import("../../../plugins/qwen4_exp/qsa/verify_gather.zig").qsa_verify_gather_override = true;
     transformer_mod.qsa_gather_min_kv_override = 20_000;
-    transformer_mod.qsa_verify_gather_min_kv_override = 16_384;
+    @import("../../../plugins/qwen4_exp/qsa/verify_gather.zig").qsa_verify_gather_min_kv_override = 16_384;
     var q4 = model_mod.ModelConfig{
         .model_type = "qwen4_exp",
         .indexer_budget = 2048,

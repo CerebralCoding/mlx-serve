@@ -1,5 +1,7 @@
 //! References to the MTP head and its cache across the sidecar, in-checkpoint and module-owned heads.
 const std = @import("std");
+const Qwen4Mtp = @import("../../../plugins/qwen4_exp/mtp.zig");
+const Qwen4Trunk = @import("../../../plugins/qwen4_exp/trunk.zig").Trunk;
 const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
@@ -28,10 +30,10 @@ pub const MAX_ROUND_DRAFTS: usize = @max(mtp_mod.MAX_DEPTH, mtp_lookup.MAX_DRAFT
 
 pub const MtpHeadRef = union(enum) {
     qwen: *mtp_mod.MtpModel,
-    /// qwen4_exp: the head and its history live on the Transformer
+    /// qwen4_exp: the head and its history live on the plugin's trunk module
     /// (`qwen4_mtp`, module-owned ⇒ single-flight); row r of the history is
     /// (pre-mixer stream at position r, token r+1), query position r+1.
-    qwen4: *Transformer,
+    qwen4: *Qwen4Trunk,
     /// glm5_next: the checkpoint's `mtp.0` NextN layer; per-request state is a one-layer `KVCache`.
     glm: *glm_mtp.Head,
     /// A served model's head (`SpecHooks.head`); its cache is a one-layer `KVCache` (`MtpCacheRef.qwen`).
@@ -51,7 +53,7 @@ pub const MtpHeadRef = union(enum) {
         return switch (self) {
             .qwen => |h| .{ .qwen = try h.makeCache(allocator) },
             .qwen4 => |t| blk: {
-                const st = try allocator.create(transformer_mod.Transformer.Qwen4MtpState);
+                const st = try allocator.create(Qwen4Mtp.Qwen4MtpState);
                 errdefer allocator.destroy(st);
                 st.* = try t.qwen4MtpStateNew();
                 t.qwen4MtpActivate(st);
@@ -67,11 +69,11 @@ pub const MtpHeadRef = union(enum) {
     /// the merged history step after a partial accept is `1 + accepted` rows
     /// wide and a full-block mixer + 248320-wide lm_head over it is thrown
     /// away but for one row.
-    fn qwen4Step(t: *Transformer, id_arr: mlx.mlx_array, hidden: mlx.mlx_array, rope_offset: c_int, want: mtp_mod.StepWant, mrope_ctx: ?mtp_mod.MropeContext) !mtp_mod.StepOut {
+    fn qwen4Step(t: *Qwen4Trunk, id_arr: mlx.mlx_array, hidden: mlx.mlx_array, rope_offset: c_int, want: mtp_mod.StepWant, mrope_ctx: ?mtp_mod.MropeContext) !mtp_mod.StepOut {
         // `.mixed` is NOT `.none`: a rerank draft still needs the mixer output,
         // which is the vector the lm_head consumes. `hidden_next` is the
         // PRE-mixer stream on this arm and would be a silent shape error there.
-        const project: Transformer.Qwen4MtpProject = switch (want) {
+        const project: Qwen4Mtp.Qwen4MtpProject = switch (want) {
             .logits => .last_row,
             .mixed => .mixed_last_row,
             .none => .none,
@@ -108,14 +110,14 @@ pub const MtpHeadRef = union(enum) {
         };
     }
 
-    /// One draft row past a padded history append (`Transformer.HeadPlace`); qwen4 only.
-    pub fn forwardPlaced(self: MtpHeadRef, cache: *MtpCacheRef, id_arr: mlx.mlx_array, hidden: mlx.mlx_array, place: *const Transformer.HeadPlace, want: mtp_mod.StepWant) !mtp_mod.StepOut {
+    /// One draft row past a padded history append (`HeadPlace`); qwen4 only.
+    pub fn forwardPlaced(self: MtpHeadRef, cache: *MtpCacheRef, id_arr: mlx.mlx_array, hidden: mlx.mlx_array, place: *const Qwen4Mtp.HeadPlace, want: mtp_mod.StepWant) !mtp_mod.StepOut {
         const t = switch (self) {
             .qwen, .glm, .plugin => return error.MtpPlacement,
             .qwen4 => |t| t,
         };
         cache.activate();
-        const project: Transformer.Qwen4MtpProject = switch (want) {
+        const project: Qwen4Mtp.Qwen4MtpProject = switch (want) {
             .logits => .last_row,
             .mixed => .mixed_last_row,
             .none => .none,
@@ -237,7 +239,7 @@ pub const MtpHeadRef = union(enum) {
     pub fn costProfile(self: MtpHeadRef, target: *const Transformer, kv: transformer_mod.KVQuantConfig) mtp_mod.MtpCostProfile {
         return switch (self) {
             .qwen => |h| h.m5NaxCostProfile(target),
-            .qwen4 => |t| mtp_mod.qwen4G17CostProfileForKv(t, kv),
+            .qwen4 => |t| @import("../../../plugins/qwen4_exp/cost_profile.zig").qwen4G17CostProfileForKv(t, kv),
             .glm => .generic,
             .plugin => |h| h.profile,
         };
@@ -328,7 +330,7 @@ pub const MtpCacheRef = union(enum) {
     };
 
     /// The in-checkpoint head plus this request's own half of it.
-    pub const Qwen4Ref = struct { t: *Transformer, st: *transformer_mod.Transformer.Qwen4MtpState, allocator: std.mem.Allocator };
+    pub const Qwen4Ref = struct { t: *Qwen4Trunk, st: *Qwen4Mtp.Qwen4MtpState, allocator: std.mem.Allocator };
 
     /// Install this request's state on the qwen4 head; no-op on the sidecar arm.
     pub fn activate(self: *const MtpCacheRef) void {
@@ -338,7 +340,7 @@ pub const MtpCacheRef = union(enum) {
         }
     }
 
-    pub fn qwen4StateForBatch(self: *const MtpCacheRef) *Transformer.Qwen4MtpState {
+    pub fn qwen4StateForBatch(self: *const MtpCacheRef) *Qwen4Mtp.Qwen4MtpState {
         const ref = self.qwen4;
         ref.t.qwen4MtpRelease(ref.st);
         return ref.st;
@@ -372,8 +374,8 @@ pub const MtpCacheRef = union(enum) {
         };
     }
 
-    /// The Transformer owning the in-checkpoint head; null on the sidecar arm and whenever `kv()` is null.
-    pub fn head(self: *MtpCacheRef) ?*Transformer {
+    /// The trunk owning the in-checkpoint head; null on the sidecar arm and whenever `kv()` is null.
+    pub fn head(self: *MtpCacheRef) ?*Qwen4Trunk {
         return switch (self.*) {
             .qwen, .glm, .plugin => null,
             .qwen4 => |r| blk: {

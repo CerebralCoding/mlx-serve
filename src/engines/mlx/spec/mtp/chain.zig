@@ -1,5 +1,6 @@
 //! MTP draft chain state: history stash, pre-drafts, prompt lookup, lazy pre-draft, padded head history.
 const depth_bounds = @import("../mtp_depth_bounds.zig");
+const HeadPlace = @import("../../../../plugins/qwen4_exp/mtp.zig").HeadPlace;
 const std = @import("std");
 const env = @import("../../../../env.zig");
 const mlx = @import("../../../../mlx/ffi.zig");
@@ -200,7 +201,7 @@ pub const MtpPreDraft = struct {
     /// build, and no MTP statistics are fed.
     lookup: bool = false,
     /// Set when step 0 consumed a padded history append: every draft step sits past its dead rows.
-    place: ?Transformer.HeadPlace = null,
+    place: ?HeadPlace = null,
 
     pub fn deinit(self: *MtpPreDraft, allocator: std.mem.Allocator) void {
         _ = mlx.mlx_array_free(self.t1_arr);
@@ -606,7 +607,7 @@ pub fn mtpPaddedHeadEnabled() bool {
 }
 
 /// Does this request's head append the whole verify row as history and draft past its
-/// dead rows (`Transformer.HeadPlace`)? The qwen4 head, solo, text-only.
+/// dead rows (`HeadPlace`)? The qwen4 head, solo, text-only.
 pub fn mtpPaddedHistory(self: *const Generator) bool {
     if (!mtpPaddedHeadEnabled() or self.mtp_batch_head) return false;
     if (self.mtp.? != .qwen4) return false;
@@ -729,7 +730,7 @@ pub const MtpChainTestSlot = struct {
         const ctx: ForwardCtx = .{ .cache = &slot.cache, .moe_seq_offset = &slot.off, .ssm_entries = entries, .capture_hidden = null, .vision_embeddings = null };
         slot.gen = try Generator.initWithOptions(io, a, xfm, tok, prompt, 256, .{ .temperature = 0 }, &.{}, .{
             .ctx = ctx,
-            .mtp = .{ .qwen4 = xfm },
+            .mtp = .{ .qwen4 = xfm.qwen4Trunk().? },
             .mtp_enabled = true,
             .model_has_mtp = true,
             .mtp_depth = depth,
@@ -814,9 +815,7 @@ const LazyRig = struct {
         rig.weights = try model_mod.loadWeights(io, a, std.mem.span(model_dir));
         model_mod.resolveWeightPrefix(&rig.config, &rig.weights);
         rig.xfm = try Transformer.init(io, a, rig.config, &rig.weights);
-        rig.xfm.compileQwen4Hc();
-        rig.xfm.compileGdnGate();
-        rig.xfm.compileMoeRouting();
+        rig.xfm.qwen4.?.prepare();
         rig.tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
         return rig;
     }

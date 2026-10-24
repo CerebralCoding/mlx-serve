@@ -57,7 +57,6 @@ pub const MoeLayerWeights = struct {
 };
 
 pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
-    self.fwd_gen +%= 1; // per-forward QSA scratch key
     const ml = self.moe_layers.?;
     const offset = ctx.moe_seq_offset.*;
     const cfg = &self.config;

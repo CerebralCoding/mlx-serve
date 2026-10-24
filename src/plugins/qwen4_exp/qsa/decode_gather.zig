@@ -2,6 +2,7 @@
 //! `qsaBatchedGatherAttn`).
 
 const std = @import("std");
+const verify_gather = @import("verify_gather.zig");
 const qwen4_mod = @import("../qwen4_exp.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const kv_quant = @import("../../../engines/mlx/cache/kv_quant.zig");
@@ -10,11 +11,10 @@ const arms_mod = @import("arms.zig");
 const gather = @import("gather.zig");
 const sparse_attn = @import("sparse_attn.zig");
 const standin = @import("../../../sdk/diag/standin.zig");
-const transformer = @import("../../../engines/mlx/transformer.zig");
 const ForwardCtx = @import("../../../engines/mlx/forward_ctx.zig").ForwardCtx;
 const KVCache = @import("../../../engines/mlx/kv/cache.zig").KVCache;
 const bf16Scalar = @import("../../../engines/mlx/load/weights.zig").bf16Scalar;
-const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
+const Trunk = @import("../trunk.zig").Trunk;
 const takeContig = @import("../../../mlx/array.zig").takeContig;
 const FUSED256_MIN_Q_LEN = @import("../../../sdk/blocks/attention/attn256.zig").FUSED256_MIN_Q_LEN;
 const attn256MaxDiff = @import("../../../sdk/blocks/attention/attn256.zig").attn256MaxDiff;
@@ -359,7 +359,7 @@ pub fn qsaBatchedGatherAttn(
 }
 
 pub fn qsaBatchedAttn(
-    self: *Transformer,
+    self: *Trunk,
     ctx: *ForwardCtx,
     slots: []const *ForwardCtx,
     q_rope: mlx.mlx_array,
@@ -493,6 +493,7 @@ test "qsa decode gather: take-then-dequantize equals dequantize-then-take" {
 }
 
 test "qsa decode gather: subset SDPA matches masked full SDPA at decode width" {
+    const transformer = @import("../../../engines/mlx/transformer.zig");
     // End-to-end parity for `qsaDecodeGatherAttn` on synthetic geometry:
     // same selection + tail, ascending order, causal-visible by construction.
     // Remaining deltas are kernel tiling order only.
@@ -565,6 +566,7 @@ test "qsa decode gather: subset SDPA matches masked full SDPA at decode width" {
 }
 
 test "qsa batched gather S=1: N=1 is byte-identical to solo, N=2 matches per-slot solos" {
+    const transformer = @import("../../../engines/mlx/transformer.zig");
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const ta = std.testing.allocator;
@@ -720,6 +722,7 @@ test "qsa batched gather S=1: two or more slots take the fused kernel exactly as
 }
 
 test "qsa batched gather mixed group: a mask-only slot matches its solo masked SDPA" {
+    const transformer = @import("../../../engines/mlx/transformer.zig");
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const ta = std.testing.allocator;
@@ -780,13 +783,14 @@ test "qsa batched gather mixed group: a mask-only slot matches its solo masked S
 }
 
 test "qsa batched gather S=2 and S=4: N=1 is byte-identical to solo verify, N=2 matches per-slot solos" {
+    const transformer = @import("../../../engines/mlx/transformer.zig");
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const ta = std.testing.allocator;
-    transformer.qsa_verify_gather_override = true;
-    defer transformer.qsa_verify_gather_override = null;
-    transformer.qsa_verify_gather_min_kv_override = 16;
-    defer transformer.qsa_verify_gather_min_kv_override = null;
+    verify_gather.qsa_verify_gather_override = true;
+    defer verify_gather.qsa_verify_gather_override = null;
+    verify_gather.qsa_verify_gather_min_kv_override = 16;
+    defer verify_gather.qsa_verify_gather_min_kv_override = null;
     transformer.qsa_batched_gather_override = true;
     defer transformer.qsa_batched_gather_override = null;
     // Dense views: keep the fused kernel's bf16 variant out so the union gather is the arm under test.
@@ -850,9 +854,10 @@ test "qsa batched gather S=2 and S=4: N=1 is byte-identical to solo verify, N=2 
 }
 
 test "qsaBatchedAttn: the kill switch refuses the gather arm" {
+    const transformer = @import("../../../engines/mlx/transformer.zig");
     if (mlx.noGpuBackend()) return error.SkipZigTest;
-    var xfm_bytes: [@sizeOf(Transformer)]u8 align(@alignOf(Transformer)) = @splat(0);
-    const xfm: *Transformer = @ptrCast(&xfm_bytes);
+    var xfm_bytes: [@sizeOf(Trunk)]u8 align(@alignOf(Trunk)) = @splat(0);
+    const xfm: *Trunk = @ptrCast(&xfm_bytes);
     xfm.allocator = std.testing.allocator;
     var q4_bytes: [@sizeOf(qwen4_mod.Qwen4State)]u8 align(@alignOf(qwen4_mod.Qwen4State)) = @splat(0);
     xfm.qwen4 = @ptrCast(&q4_bytes);
@@ -872,6 +877,7 @@ test "qsaBatchedAttn: the kill switch refuses the gather arm" {
 }
 
 test "qsaBatchedAttn: an M-RoPE slot takes the gather arm, byte-identical to the same slot without positions" {
+    const transformer = @import("../../../engines/mlx/transformer.zig");
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const ta = std.testing.allocator;
@@ -888,8 +894,8 @@ test "qsaBatchedAttn: an M-RoPE slot takes the gather arm, byte-identical to the
     const hd: c_int = 64;
     const kls = [_]c_int{ 50, 36 };
 
-    var xfm_bytes: [@sizeOf(Transformer)]u8 align(@alignOf(Transformer)) = @splat(0);
-    const xfm: *Transformer = @ptrCast(&xfm_bytes);
+    var xfm_bytes: [@sizeOf(Trunk)]u8 align(@alignOf(Trunk)) = @splat(0);
+    const xfm: *Trunk = @ptrCast(&xfm_bytes);
     xfm.allocator = ta;
     xfm.s = s;
     xfm.config.indexer_compress_ratio = @intCast(ratio);
@@ -937,20 +943,21 @@ test "qsaBatchedAttn: an M-RoPE slot takes the gather arm, byte-identical to the
 }
 
 test "qsaBatchedGatherOn matches the arm's switches" {
+    const transformer = @import("../../../engines/mlx/transformer.zig");
     const prev_b = transformer.qsa_batched_gather_override;
     const prev_g = transformer.qsa_gather_override;
     const prev_d = transformer.qsa_decode_gather_override;
-    const prev_v = transformer.qsa_verify_gather_override;
+    const prev_v = verify_gather.qsa_verify_gather_override;
     defer {
         transformer.qsa_batched_gather_override = prev_b;
         transformer.qsa_gather_override = prev_g;
         transformer.qsa_decode_gather_override = prev_d;
-        transformer.qsa_verify_gather_override = prev_v;
+        verify_gather.qsa_verify_gather_override = prev_v;
     }
     transformer.qsa_batched_gather_override = true;
     transformer.qsa_gather_override = true;
     transformer.qsa_decode_gather_override = true;
-    transformer.qsa_verify_gather_override = true;
+    verify_gather.qsa_verify_gather_override = true;
     try std.testing.expect(qsaBatchedGatherOn(1));
     try std.testing.expect(qsaBatchedGatherOn(4));
     transformer.qsa_batched_gather_override = false;
@@ -963,7 +970,7 @@ test "qsaBatchedGatherOn matches the arm's switches" {
     try std.testing.expect(!qsaBatchedGatherOn(1));
     try std.testing.expect(qsaBatchedGatherOn(4));
     transformer.qsa_decode_gather_override = true;
-    transformer.qsa_verify_gather_override = false;
+    verify_gather.qsa_verify_gather_override = false;
     try std.testing.expect(qsaBatchedGatherOn(1));
     // The fused verify kernel still takes blocks at verify widths; its switch too turns them off.
     try std.testing.expect(qsaBatchedGatherOn(4));
@@ -973,7 +980,7 @@ test "qsaBatchedGatherOn matches the arm's switches" {
         transformer.qsa_attn_kernel_override = false;
         try std.testing.expect(!qsaBatchedGatherOn(4));
     }
-    transformer.qsa_verify_gather_override = true;
+    verify_gather.qsa_verify_gather_override = true;
     const prev_st = standin.qwen4_standin_override;
     defer standin.qwen4_standin_override = prev_st;
     standin.qwen4_standin_override = .{ .attn_qsa = true };
@@ -985,6 +992,7 @@ test "qsaBatchedGatherOn matches the arm's switches" {
 }
 
 test "qsaBatchedGatherEnabled: default on, override restores the dense padded mask" {
+    const transformer = @import("../../../engines/mlx/transformer.zig");
     const prev = transformer.qsa_batched_gather_override;
     defer transformer.qsa_batched_gather_override = prev;
     transformer.qsa_batched_gather_override = true;

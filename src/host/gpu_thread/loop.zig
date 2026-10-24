@@ -214,7 +214,7 @@ pub fn drainSideQueues(sch: *Scheduler) bool {
         // Second slot-end path (a decode-phase cancel never reaches finishSlot); the
         // record must not outlive the bytes `s.deinit()` frees.
         if (s.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(s), "slot cleanup");
-        if (s.model.transformer) |xfm| xfm.resetQsaPooledRope();
+        if (s.model.transformer) |xfm| if (xfm.qwen4Trunk()) |t| t.resetQsaPooledRope();
         s.deinit();
     }
     for (vision_batch[0..vision_n]) |req| runVisionEncode(sch, req);

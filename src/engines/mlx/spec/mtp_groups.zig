@@ -79,7 +79,7 @@ pub fn plannerShape(slots: []const *Slot, widths: []const u8) group_cost_mod.Gro
         } else {
             const off = Generator.mtpRoundOff0(gen.mtp_hist_stash, gen.mtp_cache.?.step());
             const history = 1 + if (gen.mtp_hist_stash) |stash| stash.n else @as(usize, 0);
-            shape.head_format = cacheCostFormat(xfm.qwen4Host().qwen4_mtp.?.cache.config);
+            shape.head_format = cacheCostFormat(xfm.qwen4Trunk().?.qwen4_mtp.?.cache.config);
             shape.rows[i] = group_cost_mod.GroupShape.row(width, width, width, kv, @intCast(xfm.round_cost.bucketOf(@intCast(off))), @intCast(@min(history, round_cost_mod.MAX_WIDTH + 2)), gen.mtpPlannerMode());
         }
     }
@@ -311,7 +311,7 @@ fn planProbe(
 pub fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!bool {
     if (!Planner.enabled() or active.len == 0 or active.len > Planner.MAX_ROWS) return false;
     const xfm = active[0].model.transformer orelse return false;
-    if (xfm.qwen4Host().qwen4 == null or xfm.qwen4Host().qwen4_mtp == null) return false;
+    if ((xfm.qwen4Trunk() orelse return false).qwen4_mtp == null) return false;
     if (active.len == 1) {
         const gen = if (active[0].legacy_gen) |*g| g else return false;
         if (!gen.mtp_planner_owned) return false;
@@ -476,7 +476,7 @@ fn mtpRoundsStaySolo(slot: *const Slot) bool {
     // GLM-5-Next likewise: its head drafts one slot at a time.
     if (t.config.isGlm5()) return true;
     // qwen4_exp verify rows are expert bytes: a batched verify measured no better than solo rounds.
-    return t.qwen4Host().qwen4 != null;
+    return t.qwen4Trunk() != null;
 }
 
 pub fn mtpCrowdThresholdFor(slot: *const Slot) usize {
@@ -488,11 +488,17 @@ pub fn mtpCrowdThresholdFor(slot: *const Slot) usize {
 
 fn runBatchedMtpHeadTick(sch: *Scheduler, group: []*Slot) !void {
     const cost_xfm = group[0].model.transformer.?;
-    cost_xfm.cost_trace_active = cost_xfm.qwen4Host().qwen4 != null;
-    cost_xfm.cost_attention = 0;
-    cost_xfm.cost_moe = 0;
+    // The forward records its attention and MoE arms on qwen4_exp's trunk.
+    const cost_trunk = cost_xfm.qwen4Trunk();
+    if (cost_trunk) |t| {
+        t.cost_trace_active = true;
+        t.cost_attention = 0;
+        t.cost_moe = 0;
+    }
     const head_calls_before = transformer_mod.mtp_head_row_dispatches;
-    defer cost_xfm.cost_trace_active = false;
+    defer if (cost_trunk) |t| {
+        t.cost_trace_active = false;
+    };
     defer for (group) |slot| {
         if (slot.legacy_gen) |*gen| gen.mtp_batch_head = false;
     };
@@ -957,9 +963,9 @@ fn observeGroupRound(live: []*Slot, states: []const Generator.MtpRoundState, exp
     var key = group_cost_mod.GroupShape{
         .n = @intCast(live.len),
         .kv_format = cacheCostFormat(live[0].cache.config),
-        .head_format = if (xfm.qwen4Host().qwen4_mtp) |head| cacheCostFormat(head.cache.config) else 0,
-        .attention = xfm.cost_attention,
-        .moe = xfm.cost_moe,
+        .head_format = if (xfm.qwen4Trunk()) |t| if (t.qwen4_mtp) |head| cacheCostFormat(head.cache.config) else 0 else 0,
+        .attention = if (xfm.qwen4Trunk()) |t| t.cost_attention else 0,
+        .moe = if (xfm.qwen4Trunk()) |t| t.cost_moe else 0,
         .head_calls = @intCast(@min(std.math.maxInt(u16), transformer_mod.mtp_head_row_dispatches -% head_calls_before)),
     };
     for (live, states, 0..) |slot, st, i| {

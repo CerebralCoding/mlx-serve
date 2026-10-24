@@ -1090,7 +1090,7 @@ test "embedded PLE rows and gathers match the merged table" {
 }
 
 /// Module-owned state for one loaded qwen4_exp model: the n-gram hash and
-/// the mmapped table. Non-null on `Transformer.qwen4` ⇒ the arch is served
+/// the mmapped table. Non-null on `Trunk.qwen4` ⇒ the arch is served
 /// serially with speculation off (`ownsModuleDecodeState`), which is what
 /// the per-request PLE/indexer state in `SSMCacheEntry.aux_state` needs
 /// until the snapshot machinery carries it.

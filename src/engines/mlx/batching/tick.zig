@@ -47,23 +47,25 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
         for (active) |s| std.debug.assert(s.model.transformer.? == xfm_ptr);
     }
 
-    const observe_plain = Planner.enabled() and xfm_ptr.qwen4Host().qwen4 != null and N <= Planner.MAX_ROWS;
+    // The forward records its attention and MoE arms on qwen4_exp's trunk.
+    const plain_trunk = xfm_ptr.qwen4Trunk();
+    const observe_plain = Planner.enabled() and plain_trunk != null and N <= Planner.MAX_ROWS;
     var price_watch = io_util.Stopwatch.init(active[0].io);
     var price_key: group_cost_mod.GroupShape = .{};
     var price_clean = observe_plain;
     if (observe_plain) {
         const zeros: [Planner.MAX_ROWS]u8 = @splat(0);
         price_key = plannerShape(active, zeros[0..N]);
-        xfm_ptr.cost_trace_active = true;
-        xfm_ptr.cost_attention = 0;
-        xfm_ptr.cost_moe = 0;
+        plain_trunk.?.cost_trace_active = true;
+        plain_trunk.?.cost_attention = 0;
+        plain_trunk.?.cost_moe = 0;
         for (active) |slot| {
             const gen = &slot.legacy_gen.?;
             if (gen.has_pending_logits or gen.has_pending_token or slot.planner_plain_transition or slot.mtp_plain_tick) price_clean = false;
         }
     }
     defer if (observe_plain) {
-        xfm_ptr.cost_trace_active = false;
+        plain_trunk.?.cost_trace_active = false;
     };
 
     // Legacy→batched transition: a slot arriving from a legacy single-slot
@@ -267,8 +269,8 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
             if (slot.state != .decoding or slot.cancelled.load(.acquire)) return;
             gaps[i] = slot.mtp_publish_gap_ms;
         }
-        price_key.attention = xfm_ptr.cost_attention;
-        price_key.moe = xfm_ptr.cost_moe;
+        price_key.attention = plain_trunk.?.cost_attention;
+        price_key.moe = plain_trunk.?.cost_moe;
         const emitted: [Planner.MAX_ROWS]u32 = @splat(1);
         const ms = @as(f32, @floatFromInt(price_watch.read())) / std.time.ns_per_ms;
         _ = xfm_ptr.mtp_group_cost.observeShape(price_key, ms, emitted[0..N], gaps[0..N], .round);

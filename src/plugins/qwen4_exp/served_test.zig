@@ -64,7 +64,7 @@ const Pair = struct {
         model.resolveWeightPrefix(&p.lcfg, &p.weights);
         p.legacy = try Transformer.init(io, a, p.lcfg, &p.weights);
         errdefer p.legacy.deinit();
-        qwen4.prepare(&p.legacy);
+        p.legacy.qwen4.?.prepare();
 
         p.scfg = try model.parseConfig(io, a, dir);
         if (p.scfg.plugin == null) return error.NotServed;
@@ -73,7 +73,8 @@ const Pair = struct {
         errdefer p.served.deinit();
         if (intree.inner(&p.served) == null) return error.NoInnerTrunk;
 
-        for ([_]*Transformer{ &p.legacy, p.served.qwen4Host() }) |x| {
+        for ([_]*Transformer{ &p.legacy, &p.served }) |shell| {
+            const x = shell.qwen4Trunk().?;
             try x.qwen4MtpApplyKvQuant(.dense);
             _ = x.qwen4BuildDraftRerank();
         }
@@ -113,7 +114,7 @@ const Slot = struct {
     fn deinit(s: *Slot, x: *Transformer) void {
         x.discardDeferredPle(&s.ctx);
         @import("../../engines/mlx/plugin/settle.zig").release(x, &s.ctx);
-        x.qwen4Host().ssmGroupDrop(s.ssm);
+        x.qwen4Trunk().?.ssmGroupDrop(s.ssm);
         for (s.ssm) |*e| {
             _ = mlx.mlx_array_free(e.conv_state);
             _ = mlx.mlx_array_free(e.ssm_state);
@@ -158,7 +159,7 @@ fn generate(x: *Transformer, head: ?MtpHeadRef, run: *Run) !void {
 /// Returns the drafts the plugin's rounds accepted.
 fn expectSameRuns(p: *Pair, mtp: bool, oracle: *Oracle) !u32 {
     const xs = p.both();
-    const heads = [_]?MtpHeadRef{ if (mtp) .{ .qwen4 = &p.legacy } else null, if (mtp) .{ .qwen4 = p.served.qwen4Host() } else null };
+    const heads = [_]?MtpHeadRef{ if (mtp) .{ .qwen4 = p.legacy.qwen4Trunk().? } else null, if (mtp) .{ .qwen4 = p.served.qwen4Trunk().? } else null };
     var runs: [2]Run = .{ .{}, .{} };
     defer for (&runs) |*r| r.accepted.deinit(testing.allocator);
     for (xs, heads, &runs) |x, h, *r| try generate(x, h, r);
@@ -179,10 +180,10 @@ test "qwen4_exp served: the plugin claims the pack and the engine config is the 
     var cfg = p.scfg;
     cfg.plugin = null;
     try testing.expectEqualDeep(p.lcfg, cfg);
-    try testing.expect(p.served.plugin != null and p.served.qwen4Host().qwen4_mtp != null);
+    try testing.expect(p.served.plugin != null and p.served.qwen4Trunk().?.qwen4_mtp != null);
     // load.zig compiles nothing on a served shell, and every test here forwards through shells like this one.
     const x = &p.served;
-    try testing.expect(x.compiled_gdn_gate == null and x.compiled_moe_routing == null and x.compiled_hc_mix == null and x.compiled_gelu == null and x.compiled_softcap == null);
+    try testing.expect(x.compiled_gdn_gate == null and x.compiled_moe_routing == null and x.compiled_gelu == null and x.compiled_softcap == null);
 }
 
 test "qwen4_exp served: captured steps and a pipelined greedy decode equal the legacy path bit for bit" {
@@ -314,7 +315,7 @@ test "qwen4_exp served: greedy decode and MTP rounds emit the legacy tokens and 
             else => Oracle.open("served-runs-2"),
         };
         const p = try Pair.openWith(.q4, seed, opts);
-        if (gpu) try testing.expect(p.legacy.qwen4.?.gpu != null and p.served.qwen4Host().qwen4.?.gpu != null);
+        if (gpu) try testing.expect(p.legacy.qwen4.?.qwen4.?.gpu != null and p.served.qwen4Trunk().?.qwen4.?.gpu != null);
         defer p.close();
         _ = try expectSameRuns(p, false, &oracle);
         const auto = try expectSameRuns(p, true, &oracle);

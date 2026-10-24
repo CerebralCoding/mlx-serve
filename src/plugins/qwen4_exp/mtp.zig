@@ -2,7 +2,6 @@
 //! stream, QSA layer, history capture and rollback, the draft rerank, and the head-graph meters.
 
 const std = @import("std");
-const qwen4_mod = @import("qwen4_exp.zig");
 const mtp_mod = @import("../../sdk/spec/mtp/mtp.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const mrope = @import("../../sdk/vision/mrope.zig");
@@ -14,7 +13,6 @@ const log = @import("../../host/log.zig");
 const ModelConfig = @import("../../engines/mlx/model.zig").ModelConfig;
 const Weights = @import("../../engines/mlx/model.zig").Weights;
 const fused_activations = @import("../../sdk/blocks/mlp/fused_activations.zig");
-const transformer = @import("../../engines/mlx/transformer.zig");
 const verify_projection = @import("../../sdk/blocks/linear/verify_projection.zig");
 const MAX_BATCH_ROWS = @import("../../engines/mlx/batched/layered.zig").MAX_BATCH_ROWS;
 const expectRowsByteEqual = @import("../../engines/mlx/batched/row_axis_verify.zig").expectRowsByteEqual;
@@ -33,8 +31,7 @@ const ssmFreeSpecCapture = @import("../../engines/mlx/ssm/entry.zig").ssmFreeSpe
 const ssmRestore = @import("../../engines/mlx/ssm/entry.zig").ssmRestore;
 const ssmSnapshot = @import("../../engines/mlx/ssm/entry.zig").ssmSnapshot;
 const ssmSnapshotDeinit = @import("../../engines/mlx/ssm/entry.zig").ssmSnapshotDeinit;
-const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
-const deinit = @import("../../engines/mlx/transformer.zig").Transformer.deinit;
+const Trunk = @import("trunk.zig").Trunk;
 const concatAxis0 = @import("../../mlx/array.zig").concatAxis0;
 const materializedOwnedCopy = @import("../../mlx/array.zig").materializedOwnedCopy;
 const attn256MaxDiff = @import("../../sdk/blocks/attention/attn256.zig").attn256MaxDiff;
@@ -124,7 +121,7 @@ pub const Qwen4Mtp = struct {
     /// Draft rerank (`mtp.rerankSelect`): a low-bit copy of the TRUNK lm_head
     /// that shortlists 32 candidates, which the real head then re-scores.
     /// Built at LOAD by `qwen4BuildDraftRerank` — not in `loadQwen4Mtp`, which
-    /// runs while the Transformer is still under construction and `lm_head_w`
+    /// runs while the Trunk is still under construction and `lm_head_w`
     /// is not assigned yet, but from the scheduler's load path once it is.
     /// `tried` makes it (and the refusal) one-shot, so the draft path's own
     /// ask is a pure read; a null `rerank` after it means the full readout is
@@ -132,6 +129,18 @@ pub const Qwen4Mtp = struct {
     rerank: ?mtp_mod.RerankCoarse = null,
     rerank_logged: bool = false,
     rerank_tried: bool = false,
+
+    /// Frees what the loader built and the head's per-request state.
+    pub fn deinit(m: *Qwen4Mtp, a: std.mem.Allocator) void {
+        for (m.owned) |arr| _ = mlx.mlx_array_free(arr);
+        a.free(m.owned);
+        m.cache.deinit();
+        _ = mlx.mlx_array_free(m.entry.conv_state);
+        _ = mlx.mlx_array_free(m.entry.ssm_state);
+        ssmFreeQsaState(&m.entry);
+        m.qsa_marks.deinit();
+        if (m.rerank) |*rc| rc.deinit();
+    }
 };
 
 /// Load the qwen4_exp MTP head when the pack ships `mtp.*` (null otherwise).
@@ -260,7 +269,7 @@ pub fn qwen4MtpLiveModule(m: *Qwen4Mtp) Qwen4MtpLive {
 }
 
 /// A fresh, empty per-request head state (what `qwen4MtpReset` leaves behind).
-pub fn qwen4MtpStateNew(self: *Transformer) !Qwen4MtpState {
+pub fn qwen4MtpStateNew(self: *Trunk) !Qwen4MtpState {
     const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
     var entry = m.entry;
     entry.conv_state = .{ .ctx = null };
@@ -292,7 +301,7 @@ pub fn qwen4MtpSwapState(m: *Qwen4Mtp, st: *Qwen4MtpState) void {
 }
 
 /// Install `st` as the head's live state (swapping the previous owner's out). Idempotent.
-pub fn qwen4MtpActivate(self: *Transformer, st: *Qwen4MtpState) void {
+pub fn qwen4MtpActivate(self: *Trunk, st: *Qwen4MtpState) void {
     const m = &(self.qwen4_mtp orelse return);
     if (self.qwen4_mtp_owner == st) return;
     if (self.qwen4_mtp_owner) |prev| qwen4MtpSwapState(m, prev);
@@ -301,7 +310,7 @@ pub fn qwen4MtpActivate(self: *Transformer, st: *Qwen4MtpState) void {
 }
 
 /// Take `st` back off the module before it is freed.
-pub fn qwen4MtpRelease(self: *Transformer, st: *Qwen4MtpState) void {
+pub fn qwen4MtpRelease(self: *Trunk, st: *Qwen4MtpState) void {
     const m = &(self.qwen4_mtp orelse return);
     if (self.qwen4_mtp_owner != st) return;
     qwen4MtpSwapState(m, st);
@@ -309,7 +318,7 @@ pub fn qwen4MtpRelease(self: *Transformer, st: *Qwen4MtpState) void {
 }
 
 /// Reset the MTP head's per-request state (KV, indexer keys, position).
-pub fn qwen4MtpReset(self: *Transformer) !void {
+pub fn qwen4MtpReset(self: *Trunk) !void {
     const m = &(self.qwen4_mtp orelse return);
     try m.cache.reinit(self.config.num_hidden_layers + 1, m.cache.config);
     ssmFreeQsaState(&m.entry);
@@ -318,29 +327,14 @@ pub fn qwen4MtpReset(self: *Transformer) !void {
     m.pos_base = -1;
 }
 
-pub fn qwen4MtpResetOwned(self: *Transformer, enable_mtp: bool) void {
+pub fn qwen4MtpResetOwned(self: *Trunk, enable_mtp: bool) void {
     if (enable_mtp) self.qwen4MtpReset() catch {};
 }
 
-pub fn mtpHeadKvQuantEnabled() bool {
-    if (Transformer.mtp_head_kv_quant_override) |v| return v;
-    return Transformer.mtp_head_kv_quant_flag;
-}
-
-/// The head's KV scheme: dense unless `--mtp-head-kv-quant` is set, then the trunk's.
-/// Fixed at load at both construction sites, so a session never mixes schemes and the
-/// bill prices the head at THIS scheme, never at a request's kv_quant override.
-pub fn qwen4MtpHeadKvConfig(trunk: KVQuantConfig) KVQuantConfig {
-    if (mtpHeadKvQuantEnabled()) return trunk;
-    return KVQuantConfig.dense;
-}
-
-/// Re-creates the head cache under the chosen scheme with the HEAD's own geometry
-/// (layers + 1, its key head dim). Acceptance measured within noise of dense at
-/// 4k-128k; 960 B/token saved with MTP on.
-pub fn qwen4MtpApplyKvQuant(self: *Transformer, trunk: KVQuantConfig) !void {
+/// Re-creates the head cache under `cfg` (the engine's choice for the head) with the HEAD's own geometry (layers +
+/// 1, its key head dim).
+pub fn qwen4MtpApplyKvQuant(self: *Trunk, cfg: KVQuantConfig) !void {
     const m = &(self.qwen4_mtp orelse return);
-    const cfg = qwen4MtpHeadKvConfig(trunk);
     const n_layers: u32 = self.config.num_hidden_layers + 1;
     if (std.meta.eql(m.cache.config, cfg) and m.cache.entries.len == n_layers) return;
     try m.cache.reinit(n_layers, cfg);
@@ -351,7 +345,7 @@ pub fn qwen4MtpApplyKvQuant(self: *Transformer, trunk: KVQuantConfig) !void {
 /// exactly that row, by then a whole generated tail below its ring. A head that is not at
 /// `row` — one whose history window skipped these chunks — marks nothing. Best effort; a
 /// missing mark is a blind head, never a wrong one.
-pub fn qwen4MtpMarkQsaLeftover(self: *Transformer, row: usize) !void {
+pub fn qwen4MtpMarkQsaLeftover(self: *Trunk, row: usize) !void {
     const m = &(self.qwen4_mtp orelse return);
     if (row != m.seq_offset) return;
     const pos: c_int = @intCast(m.seq_offset);
@@ -371,7 +365,7 @@ pub fn qwen4MtpMarkQsaLeftover(self: *Transformer, row: usize) !void {
 }
 
 /// The marks a commit stores beside the head's QSA half.
-pub fn qwen4MtpMarks(self: *const Transformer) []const QsaHeadMark {
+pub fn qwen4MtpMarks(self: *const Trunk) []const QsaHeadMark {
     if (self.qwen4_mtp) |*m| return m.qsa_marks.slice();
     return &.{};
 }
@@ -439,18 +433,18 @@ pub const Qwen4MtpProject = enum {
 };
 
 /// Truncate the head's committed history to `len` rows.
-pub fn qwen4MtpTruncate(self: *Transformer, len: usize) !void {
+pub fn qwen4MtpTruncate(self: *Trunk, len: usize) !void {
     const m = &(self.qwen4_mtp orelse return);
     var live = qwen4MtpLiveModule(m);
     try self.qwen4MtpTruncateLive(&live, len);
 }
 
-pub fn qwen4MtpTruncateOn(self: *Transformer, st: *Qwen4MtpState, len: usize) !void {
+pub fn qwen4MtpTruncateOn(self: *Trunk, st: *Qwen4MtpState, len: usize) !void {
     var live = qwen4MtpLiveState(st);
     try self.qwen4MtpTruncateLive(&live, len);
 }
 
-pub fn qwen4MtpTruncateLive(self: *Transformer, live: *Qwen4MtpLive, len: usize) !void {
+pub fn qwen4MtpTruncateLive(self: *Trunk, live: *Qwen4MtpLive, len: usize) !void {
     if (len >= live.seq_offset.*) return;
     try live.cache.truncate(len, self.s);
     if (live.entry.aux_state.ctx != null or live.entry.qsa_pooled.ctx != null) {
@@ -494,7 +488,7 @@ pub fn qwen4MtpTruncateLive(self: *Transformer, live: *Qwen4MtpLive, len: usize)
     live.seq_offset.* = len;
 }
 
-pub fn qwen4MtpTruncateToMarkLive(self: *Transformer, live: *Qwen4MtpLive, keep: c_int) !void {
+pub fn qwen4MtpTruncateToMarkLive(self: *Trunk, live: *Qwen4MtpLive, keep: c_int) !void {
     const want_lv = @mod(keep, @max(live.entry.qsa_ratio, 1));
     var rows: mlx.mlx_array = .{ .ctx = null };
     if (want_lv > 0) {
@@ -519,7 +513,7 @@ pub fn qwen4MtpTruncateToMarkLive(self: *Transformer, live: *Qwen4MtpLive, keep:
 /// Adopt a committed head history from the prefix cache: the head's KV plus the QSA aux
 /// entry it is only valid with, trimmed to `want` rows. Any failure resets the head to blank.
 pub fn qwen4MtpAdopt(
-    self: *Transformer,
+    self: *Trunk,
     kv_snap: *const KVCacheSnapshot,
     aux: *const SSMCacheEntrySnapshot,
     marks: []const QsaHeadMark,
@@ -565,13 +559,13 @@ pub fn qwen4MtpAdvance(cache: *KVCache, seq_offset: *usize, seq_len: c_int) void
 /// `pos_base + seq_offset ..`, so its attention + QSA indexer read the
 /// slot's 3-D table there (prompt rows spanning the image) and the
 /// scalar `offset + delta` past it — the same two arms as the trunk.
-pub fn qwen4MtpForward(self: *Transformer, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, pos_offset: c_int, mrope_ctx: ?mrope.PositionContext, project: Qwen4MtpProject) !Qwen4MtpOut {
+pub fn qwen4MtpForward(self: *Trunk, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, pos_offset: c_int, mrope_ctx: ?mrope.PositionContext, project: Qwen4MtpProject) !Qwen4MtpOut {
     const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
     var live = qwen4MtpLiveModule(m);
     return self.qwen4MtpForwardLive(m, &live, stream_prev, token_ids_in, pos_offset, mrope_ctx, project, null);
 }
 
-pub fn qwen4MtpForwardOn(self: *Transformer, st: *Qwen4MtpState, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, pos_offset: c_int, mrope_ctx: ?mrope.PositionContext, project: Qwen4MtpProject) !Qwen4MtpOut {
+pub fn qwen4MtpForwardOn(self: *Trunk, st: *Qwen4MtpState, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, pos_offset: c_int, mrope_ctx: ?mrope.PositionContext, project: Qwen4MtpProject) !Qwen4MtpOut {
     const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
     var live = qwen4MtpLiveState(st);
     return self.qwen4MtpForwardLive(m, &live, stream_prev, token_ids_in, pos_offset, mrope_ctx, project, null);
@@ -586,7 +580,7 @@ pub const HeadPlace = struct {
     dead_end: c_int,
 };
 
-pub fn qwen4MtpForwardPlaced(self: *Transformer, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, place: *const HeadPlace, project: Qwen4MtpProject) !Qwen4MtpOut {
+pub fn qwen4MtpForwardPlaced(self: *Trunk, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, place: *const HeadPlace, project: Qwen4MtpProject) !Qwen4MtpOut {
     const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
     var live = qwen4MtpLiveModule(m);
     return self.qwen4MtpForwardLive(m, &live, stream_prev, token_ids_in, 0, null, project, place);
@@ -600,7 +594,7 @@ pub const Qwen4MtpBatchRow = struct {
     mrope_ctx: ?mrope.PositionContext = null,
 };
 
-pub fn mtpPadSeq(self: *Transformer, arr: mlx.mlx_array, want: c_int) !mlx.mlx_array {
+pub fn mtpPadSeq(self: *Trunk, arr: mlx.mlx_array, want: c_int) !mlx.mlx_array {
     const sh = mlx.getShape(arr);
     if (sh[1] == want) {
         var out = mlx.mlx_array_new();
@@ -619,7 +613,7 @@ pub fn mtpHeadForceBatched() bool {
     return mtp_head_force_batched_override orelse false;
 }
 
-pub fn mtpMoeRows(self: *Transformer, x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
+pub fn mtpMoeRows(self: *Trunk, x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
     // EXL3 head rows ride the decode chain only.
     if (self.config.exl3 != null and exl3.kernels.usesPrefillArm(exl3.kernels.rowsOfShape(mlx.getShape(x))))
         return error.Exl3MtpRowsExceedDecode;
@@ -636,7 +630,7 @@ pub fn mtpMoeRows(self: *Transformer, x: mlx.mlx_array, mw: *const MoeMlpWeights
 }
 
 pub fn qwen4MtpForwardBatched(
-    self: *Transformer,
+    self: *Trunk,
     rows: []const Qwen4MtpBatchRow,
     project: Qwen4MtpProject,
     depth: u32,
@@ -883,7 +877,7 @@ pub fn qwen4MtpForwardBatched(
     return buf.abandon();
 }
 
-pub fn qwen4MtpForwardLive(self: *Transformer, m: *Qwen4Mtp, live: *Qwen4MtpLive, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, pos_offset: c_int, mrope_ctx: ?mrope.PositionContext, project: Qwen4MtpProject, place: ?*const HeadPlace) !Qwen4MtpOut {
+pub fn qwen4MtpForwardLive(self: *Trunk, m: *Qwen4Mtp, live: *Qwen4MtpLive, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, pos_offset: c_int, mrope_ctx: ?mrope.PositionContext, project: Qwen4MtpProject, place: ?*const HeadPlace) !Qwen4MtpOut {
     qwen4_mtp_head_graphs += 1;
     self.fwd_gen +%= 1; // per-forward QSA scratch key
     const cfg = &self.config;
@@ -1012,7 +1006,7 @@ pub fn qwen4MtpForwardLive(self: *Transformer, m: *Qwen4Mtp, live: *Qwen4MtpLive
 /// the trunk lm_head plus a synchronous eval of its ~240 MB is a LOAD
 /// cost, and inside the first request's draft chain it was first-token
 /// latency on the inference thread with the stream drained mid-round.
-pub fn qwen4BuildDraftRerank(self: *Transformer) bool {
+pub fn qwen4BuildDraftRerank(self: *Trunk) bool {
     const m = &(self.qwen4_mtp orelse return false);
     if (m.rerank_tried) return m.rerank != null;
     m.rerank_tried = true;
@@ -1032,9 +1026,9 @@ pub fn qwen4BuildDraftRerank(self: *Transformer) bool {
 
 /// Is the qwen4_exp head's draft rerank available? A pure read once the
 /// load-time build has run; the build is only reached here when it did
-/// NOT (an offline path, a directly-constructed Transformer), and it is
+/// NOT (an offline path, a directly-constructed Trunk), and it is
 /// one-shot either way.
-pub fn qwen4DraftRerankReady(self: *Transformer) bool {
+pub fn qwen4DraftRerankReady(self: *Trunk) bool {
     const m = &(self.qwen4_mtp orelse return false);
     if (m.rerank_tried) return m.rerank != null;
     return self.qwen4BuildDraftRerank();
@@ -1044,7 +1038,7 @@ pub fn qwen4DraftRerankReady(self: *Transformer) bool {
 /// sidecar head's scheme verbatim; a coarse-head absence or a shortlist
 /// failure falls through to the full trunk-head readout, which is exactly
 /// what this path replaced.
-pub fn qwen4DraftSelect(self: *Transformer, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !mlx.mlx_array {
+pub fn qwen4DraftSelect(self: *Trunk, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !mlx.mlx_array {
     const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
     if (try mtp_mod.rerankSelect(self.s, self, &m.rerank, &m.rerank_logged, x, suppress_mask)) |tok| return tok;
     return mtp_mod.fullReadoutArgmax(self.s, self, x, suppress_mask);
@@ -1052,7 +1046,7 @@ pub fn qwen4DraftSelect(self: *Transformer, x: mlx.mlx_array, suppress_mask: ?ml
 
 /// The exact re-scored top-32 shortlist for a SAMPLED draft. Null = the
 /// coarse head is unavailable and the caller falls back to a greedy draft.
-pub fn qwen4DraftShortlist(self: *Transformer, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !?mtp_mod.Shortlist {
+pub fn qwen4DraftShortlist(self: *Trunk, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !?mtp_mod.Shortlist {
     const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
     return mtp_mod.rerankShortlist(self.s, self, &m.rerank, &m.rerank_logged, x, suppress_mask);
 }
@@ -1060,7 +1054,7 @@ pub fn qwen4DraftShortlist(self: *Transformer, x: mlx.mlx_array, suppress_mask: 
 /// Per-row exact re-scored shortlists for a batched SAMPLED draft step.
 /// False = no coarse head; the caller drafts greedily instead.
 pub fn qwen4DraftShortlistsBatched(
-    self: *Transformer,
+    self: *Trunk,
     x: mlx.mlx_array,
     suppress_mask: ?mlx.mlx_array,
     out: []mtp_mod.Shortlist,
@@ -1069,7 +1063,7 @@ pub fn qwen4DraftShortlistsBatched(
     return mtp_mod.rerankShortlistsBatched(self.s, self, &m.rerank, &m.rerank_logged, x, suppress_mask, out);
 }
 
-pub fn qwen4DraftSelectBatched(self: *Transformer, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !mlx.mlx_array {
+pub fn qwen4DraftSelectBatched(self: *Trunk, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !mlx.mlx_array {
     const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
     if (try mtp_mod.rerankSelectBatched(self.s, self, &m.rerank, &m.rerank_logged, x, suppress_mask)) |tok| return tok;
     return mtp_mod.fullReadoutArgmax(self.s, self, x, suppress_mask);
@@ -1104,8 +1098,7 @@ pub const Qwen4Trace = struct {
 test "qwen4 MTP head: two explicit states with different origins and stash lengths round-trip" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const t = std.testing;
-    var xfm: Transformer = undefined;
-    xfm.rht = null;
+    var xfm: Trunk = undefined;
     xfm.s = mlx.gpuStream();
     xfm.allocator = t.allocator;
     xfm.qwen4_mtp_owner = null;
@@ -1121,16 +1114,16 @@ test "qwen4 MTP head: two explicit states with different origins and stash lengt
     defer m.cache.deinit();
 
     const ca = try KVCache.init(t.allocator, 1);
-    var a: Transformer.Qwen4MtpState = .{ .cache = ca, .entry = m.entry, .seq_offset = 7, .pos_base = 3 };
+    var a: Trunk.Qwen4MtpState = .{ .cache = ca, .entry = m.entry, .seq_offset = 7, .pos_base = 3 };
     a.cache.step = 7;
     defer a.deinit();
     const cb = try KVCache.init(t.allocator, 1);
-    var b: Transformer.Qwen4MtpState = .{ .cache = cb, .entry = m.entry, .seq_offset = 2, .pos_base = 11 };
+    var b: Trunk.Qwen4MtpState = .{ .cache = cb, .entry = m.entry, .seq_offset = 2, .pos_base = 11 };
     b.cache.step = 2;
     defer b.deinit();
 
-    const live_a = Transformer.qwen4MtpLiveState(&a);
-    const live_b = Transformer.qwen4MtpLiveState(&b);
+    const live_a = Trunk.qwen4MtpLiveState(&a);
+    const live_b = Trunk.qwen4MtpLiveState(&b);
     try t.expect(live_a.cache == &a.cache);
     try t.expect(live_b.cache == &b.cache);
     try t.expect(xfm.qwen4_mtp_owner == null);
@@ -1160,8 +1153,7 @@ test "qwen4 MTP head: two requests keep their own state through activate/release
     // sees them again; releasing hands the module its own copy back.
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const t = std.testing;
-    var xfm: Transformer = undefined;
-    xfm.rht = null;
+    var xfm: Trunk = undefined;
     xfm.s = mlx.gpuStream();
     xfm.allocator = t.allocator;
     xfm.qwen4_mtp_owner = null;
@@ -1177,10 +1169,10 @@ test "qwen4 MTP head: two requests keep their own state through activate/release
     defer m.cache.deinit();
 
     const ca = try KVCache.init(t.allocator, 1);
-    var a: Transformer.Qwen4MtpState = .{ .cache = ca, .entry = m.entry };
+    var a: Trunk.Qwen4MtpState = .{ .cache = ca, .entry = m.entry };
     defer a.deinit();
     const cb = try KVCache.init(t.allocator, 1);
-    var b: Transformer.Qwen4MtpState = .{ .cache = cb, .entry = m.entry };
+    var b: Trunk.Qwen4MtpState = .{ .cache = cb, .entry = m.entry };
     defer b.deinit();
 
     xfm.qwen4MtpActivate(&a);
@@ -1217,7 +1209,7 @@ test "qwen4 MTP head: N=1 FORCE_BATCHED draft ids and logits mlx_equal solo at d
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
     try t.expect(xfm.qwen4_mtp != null);
     xfm.compileQwen4Hc();
@@ -1288,7 +1280,7 @@ test "qwen4 MTP head: N=1 FORCE_BATCHED draft ids and logits mlx_equal solo at d
             defer _ = mlx.mlx_array_free(os.logits);
             defer _ = mlx.mlx_array_free(os.stream);
             qwen4_mtp_head_graphs = 0;
-            const brows = [_]Transformer.Qwen4MtpBatchRow{
+            const brows = [_]Trunk.Qwen4MtpBatchRow{
                 .{ .st = &bat, .stream = h_b, .token_ids = id_b, .pos_offset = po_b },
             };
             const bout = try xfm.qwen4MtpForwardBatched(&brows, .last_row, depth);
@@ -1318,11 +1310,11 @@ test "qwen4 MTP head: N=1 FORCE_BATCHED draft ids and logits mlx_equal solo at d
     }
 }
 
-/// A loaded qwen4_exp pack for the head tests; heap-held because the Transformer keeps a pointer to the weights.
+/// A loaded qwen4_exp pack for the head tests; heap-held because the Trunk keeps a pointer to the weights.
 const Qwen4HeadRig = struct {
     config: model_mod.ModelConfig,
     weights: model_mod.Weights,
-    xfm: Transformer,
+    xfm: Trunk,
 
     fn load(alloc: std.mem.Allocator) !*Qwen4HeadRig {
         const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
@@ -1333,7 +1325,7 @@ const Qwen4HeadRig = struct {
         rig.config = try model_mod.parseConfig(io, alloc, std.mem.span(model_dir));
         rig.weights = try model_mod.loadWeights(io, alloc, std.mem.span(model_dir));
         model_mod.resolveWeightPrefix(&rig.config, &rig.weights);
-        rig.xfm = try Transformer.init(io, alloc, rig.config, &rig.weights);
+        rig.xfm = try Trunk.init(io, alloc, rig.config, &rig.weights);
         rig.xfm.compileQwen4Hc();
         rig.xfm.compileGdnGate();
         rig.xfm.compileMoeRouting();
@@ -1365,7 +1357,7 @@ const Qwen4HeadRig = struct {
     }
 
     /// Committed history of `n` rows, appended in prefill-sized chunks.
-    fn history(rig: *Qwen4HeadRig, st: *Transformer.Qwen4MtpState, n: c_int) !void {
+    fn history(rig: *Qwen4HeadRig, st: *Trunk.Qwen4MtpState, n: c_int) !void {
         var done: c_int = 0;
         while (done < n) {
             const chunk = @min(n - done, 2048);
@@ -1381,7 +1373,7 @@ const Qwen4HeadRig = struct {
     }
 
     /// One round's padded history: `1+m` rows at the committed end, rows past `a` built from `dead_seed`.
-    fn paddedHistory(rig: *Qwen4HeadRig, st: *Transformer.Qwen4MtpState, m: c_int, a: c_int, dead_seed: u64) !void {
+    fn paddedHistory(rig: *Qwen4HeadRig, st: *Trunk.Qwen4MtpState, m: c_int, a: c_int, dead_seed: u64) !void {
         const live = try rig.stream(77, 1 + a);
         defer _ = mlx.mlx_array_free(live);
         const dead = try rig.stream(dead_seed, m - a);
@@ -1406,7 +1398,7 @@ const Qwen4HeadRig = struct {
 
     /// `steps` placed draft rows chained like `mtpChainBuild`: each feeds the next its stream and argmax.
     /// Returns every step's logits, concatenated `[steps, V]`.
-    fn placedDrafts(rig: *Qwen4HeadRig, alloc: std.mem.Allocator, st: *Transformer.Qwen4MtpState, place: *const Transformer.HeadPlace, steps: usize) !mlx.mlx_array {
+    fn placedDrafts(rig: *Qwen4HeadRig, alloc: std.mem.Allocator, st: *Trunk.Qwen4MtpState, place: *const Trunk.HeadPlace, steps: usize) !mlx.mlx_array {
         const s = rig.xfm.s;
         var h = try rig.stream(55, 1);
         defer _ = mlx.mlx_array_free(h);
@@ -1460,7 +1452,7 @@ test "qwen4 MTP head: placed draft rows ignore dead history rows, below and past
                 try rig.history(&st, base);
                 const hist0: c_int = @intCast(st.seq_offset);
                 try rig.paddedHistory(&st, m, a, dead_seed);
-                var place: Transformer.HeadPlace = .{ .live_end = mlx.mlx_array_new_int(hist0 + 1 + a), .dead_end = hist0 + 1 + m };
+                var place: Trunk.HeadPlace = .{ .live_end = mlx.mlx_array_new_int(hist0 + 1 + a), .dead_end = hist0 + 1 + m };
                 defer _ = mlx.mlx_array_free(place.live_end);
                 outs[n_out] = try rig.placedDrafts(allocator, &st, &place, 3);
                 try mlx.check(mlx.mlx_array_eval(outs[n_out]));
@@ -1497,7 +1489,7 @@ test "qwen4 MTP head: truncating to the live end after placed drafts leaves the 
             try rig.history(&st, base);
             const hist0: c_int = @intCast(st.seq_offset);
             try rig.paddedHistory(&st, m, a, 11);
-            var place: Transformer.HeadPlace = .{ .live_end = mlx.mlx_array_new_int(hist0 + 1 + a), .dead_end = hist0 + 1 + m };
+            var place: Trunk.HeadPlace = .{ .live_end = mlx.mlx_array_new_int(hist0 + 1 + a), .dead_end = hist0 + 1 + m };
             defer _ = mlx.mlx_array_free(place.live_end);
             if (steps > 0) {
                 const d = try rig.placedDrafts(allocator, &st, &place, steps);
@@ -1509,7 +1501,7 @@ test "qwen4 MTP head: truncating to the live end after placed drafts leaves the 
             // The next round's history and draft read the committed rows, and nothing past them.
             try rig.paddedHistory(&st, m, m, 13);
             const end: c_int = @intCast(st.seq_offset);
-            var place2: Transformer.HeadPlace = .{ .live_end = mlx.mlx_array_new_int(end), .dead_end = end };
+            var place2: Trunk.HeadPlace = .{ .live_end = mlx.mlx_array_new_int(end), .dead_end = end };
             defer _ = mlx.mlx_array_free(place2.live_end);
             next[n_next] = try rig.placedDrafts(allocator, &st, &place2, 2);
             try mlx.check(mlx.mlx_array_eval(next[n_next]));
@@ -1523,6 +1515,7 @@ test "qwen4 MTP head: truncating to the live end after placed drafts leaves the 
 }
 
 test "MTP head row widths pick the verify lane, the MoE arm and the QSA score kernel" {
+    const transformer = @import("../../engines/mlx/transformer.zig");
     const t = std.testing;
     try t.expectEqual(VqmmLane.none, vqmmLaneFor(1, 5120, 248320, false, 8));
     try t.expectEqual(VqmmLane.msg, vqmmLaneFor(2, 5120, 248320, false, 8));
@@ -1560,7 +1553,7 @@ test "MTP head: N=2/4 mlx_equal drafts/logits vs solo" {
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
     try t.expect(xfm.qwen4_mtp != null);
     xfm.compileQwen4Hc();
@@ -1610,7 +1603,7 @@ test "MTP head: N=2/4 mlx_equal drafts/logits vs solo" {
             }
             return .{ .id = id };
         }
-        fn pos(st: *Transformer.Qwen4MtpState) c_int {
+        fn pos(st: *Trunk.Qwen4MtpState) c_int {
             return if (st.seq_offset == 0) st.pos_base else st.pos_base + @as(c_int, @intCast(st.seq_offset));
         }
     };
@@ -1636,8 +1629,8 @@ test "MTP head: N=2/4 mlx_equal drafts/logits vs solo" {
         for (ns) |N| {
             const n_use: usize = N;
             for (depths) |depth| {
-                var solo: [4]Transformer.Qwen4MtpState = undefined;
-                var bat: [4]Transformer.Qwen4MtpState = undefined;
+                var solo: [4]Trunk.Qwen4MtpState = undefined;
+                var bat: [4]Trunk.Qwen4MtpState = undefined;
                 for (0..n_use) |k| {
                     solo[k] = try xfm.qwen4MtpStateNew();
                     bat[k] = try xfm.qwen4MtpStateNew();
@@ -1687,7 +1680,7 @@ test "MTP head: N=2/4 mlx_equal drafts/logits vs solo" {
                         _ = mlx.mlx_array_free(ids_s[k]);
                         _ = mlx.mlx_array_free(ids_b[k]);
                     };
-                    var solo_out: [4]Transformer.Qwen4MtpOut = undefined;
+                    var solo_out: [4]Trunk.Qwen4MtpOut = undefined;
                     for (0..n_use) |k| {
                         solo_out[k] = try xfm.qwen4MtpForwardOn(&solo[k], hs[k], ids_s[k], H.pos(&solo[k]), null, .last_row);
                     }
@@ -1695,7 +1688,7 @@ test "MTP head: N=2/4 mlx_equal drafts/logits vs solo" {
                         if (solo_out[k].logits.ctx != null) _ = mlx.mlx_array_free(solo_out[k].logits);
                         _ = mlx.mlx_array_free(solo_out[k].stream);
                     };
-                    var brows_buf: [4]Transformer.Qwen4MtpBatchRow = undefined;
+                    var brows_buf: [4]Trunk.Qwen4MtpBatchRow = undefined;
                     for (0..n_use) |k| {
                         brows_buf[k] = .{ .st = &bat[k], .stream = hb2[k], .token_ids = ids_b[k], .pos_offset = H.pos(&bat[k]) };
                     }
@@ -1745,8 +1738,7 @@ test "qwen4 MTP head: a clamp below the raw ring is named, not an emptied histor
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const t = std.testing;
     const s = mlx.gpuStream();
-    var xfm: Transformer = undefined;
-    xfm.rht = null;
+    var xfm: Trunk = undefined;
     xfm.s = s;
     xfm.allocator = t.allocator;
 
@@ -1818,8 +1810,7 @@ test "qwen4 MTP head: a warm clamp restores exactly from the leftover marked at 
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const t = std.testing;
     const s = mlx.gpuStream();
-    var xfm: Transformer = undefined;
-    xfm.rht = null;
+    var xfm: Trunk = undefined;
     xfm.s = s;
     xfm.allocator = t.allocator;
 
@@ -1921,8 +1912,7 @@ test "qwen4 MTP head: a clamp whose retained ring is shorter than the kept lefto
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const t = std.testing;
     const s = mlx.gpuStream();
-    var xfm: Transformer = undefined;
-    xfm.rht = null;
+    var xfm: Trunk = undefined;
     xfm.s = s;
     xfm.allocator = t.allocator;
 
@@ -2008,8 +1998,7 @@ test "qwen4 MTP head: a clamp whose retained ring is shorter than the kept lefto
 
 test "qwen4MtpResetOwned: a non-MTP request leaves the head untouched" {
     const t = std.testing;
-    var xfm: Transformer = undefined;
-    xfm.rht = null;
+    var xfm: Trunk = undefined;
     xfm.s = mlx.gpuStream();
     xfm.allocator = t.allocator;
     const head_cache = try KVCache.init(t.allocator, 1);
@@ -2031,7 +2020,7 @@ test "qwen4MtpResetOwned: a non-MTP request leaves the head untouched" {
     try t.expectEqual(@as(i32, 3), m.pos_base);
 }
 
-pub fn qwen4MtpForwardPlacedOn(self: *Transformer, st: *Qwen4MtpState, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, place: *const HeadPlace, project: Qwen4MtpProject) !Qwen4MtpOut {
+pub fn qwen4MtpForwardPlacedOn(self: *Trunk, st: *Qwen4MtpState, stream_prev: mlx.mlx_array, token_ids_in: mlx.mlx_array, place: *const HeadPlace, project: Qwen4MtpProject) !Qwen4MtpOut {
     const m = &(self.qwen4_mtp orelse return error.NoMtpHead);
     var live = qwen4MtpLiveState(st);
     return self.qwen4MtpForwardLive(m, &live, stream_prev, token_ids_in, 0, null, project, place);
@@ -2062,7 +2051,7 @@ test "qwen4 MTP head: last-row and no-logits projections match the full block (Q
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
     if (xfm.qwen4_mtp == null) return error.SkipZigTest;
     xfm.compileQwen4Hc();
@@ -2134,13 +2123,9 @@ test "qwen4 MTP head: last-row and no-logits projections match the full block (Q
     }
 }
 
-test "qwen4 MTP head KV scheme follows the trunk under kv-quant 8" {
+test "qwen4 MTP head KV: the head cache is rebuilt under the scheme it is handed" {
     const t = std.testing;
-    const saved = Transformer.mtp_head_kv_quant_override;
-    defer Transformer.mtp_head_kv_quant_override = saved;
-    Transformer.mtp_head_kv_quant_override = false;
-    var xfm: Transformer = undefined;
-    xfm.rht = null;
+    var xfm: Trunk = undefined;
     xfm.config = .{};
     xfm.config.num_hidden_layers = 4;
     xfm.config.head_dim = 64;
@@ -2151,10 +2136,9 @@ test "qwen4 MTP head KV scheme follows the trunk under kv-quant 8" {
     xfm.qwen4_mtp = head;
     defer xfm.qwen4_mtp.?.cache.deinit();
     try t.expectEqual(kv_quant.Scheme.off, xfm.qwen4_mtp.?.cache.config.scheme);
-    const trunk = kv_quant.KVQuantConfig.affine(8);
-    try xfm.qwen4MtpApplyKvQuant(trunk);
+    try xfm.qwen4MtpApplyKvQuant(.dense);
     try t.expectEqual(kv_quant.Scheme.off, xfm.qwen4_mtp.?.cache.config.scheme);
-    Transformer.mtp_head_kv_quant_override = true;
+    const trunk = kv_quant.KVQuantConfig.affine(8);
     try xfm.qwen4MtpApplyKvQuant(trunk);
     try t.expectEqual(trunk.scheme, xfm.qwen4_mtp.?.cache.config.scheme);
     try t.expectEqual(trunk.bits, xfm.qwen4_mtp.?.cache.config.bits);
@@ -2172,15 +2156,11 @@ test "qwen4 MTP head: quantized KV rollback + re-append matches dense draft ids 
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
     if (xfm.qwen4_mtp == null) return error.SkipZigTest;
     xfm.compileQwen4Hc();
     xfm.compileMoeRouting();
-
-    const saved = Transformer.mtp_head_kv_quant_override;
-    defer Transformer.mtp_head_kv_quant_override = saved;
-    Transformer.mtp_head_kv_quant_override = true;
 
     const hcH: usize = @as(usize, config.hc_count) * @as(usize, config.hidden_size);
     const dt = mlx.mlx_array_dtype(xfm.qwen4_mtp.?.pre_norm_hidden);
@@ -2205,7 +2185,7 @@ test "qwen4 MTP head: quantized KV rollback + re-append matches dense draft ids 
     defer _ = mlx.mlx_array_free(ids);
 
     const Run = struct {
-        fn lastLogits(xf: *Transformer, st: mlx.mlx_stream, alloc: std.mem.Allocator, stream: mlx.mlx_array, tok: mlx.mlx_array, kkeep: usize) ![]f32 {
+        fn lastLogits(xf: *Trunk, st: mlx.mlx_stream, alloc: std.mem.Allocator, stream: mlx.mlx_array, tok: mlx.mlx_array, kkeep: usize) ![]f32 {
             try xf.qwen4MtpReset();
             const full = try xf.qwen4MtpForward(stream, tok, 1, null, .all_rows);
             defer _ = mlx.mlx_array_free(full.logits);
@@ -2286,7 +2266,7 @@ test "qwen4MtpForward: every error path of the MTP head forward releases its str
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    var xfm = try Trunk.init(io, allocator, config, &weights);
     defer xfm.deinit();
     if (xfm.qwen4_mtp == null) return error.SkipZigTest;
     xfm.compileQwen4Hc();
@@ -2314,7 +2294,7 @@ test "qwen4MtpForward: every error path of the MTP head forward releases its str
     const ids = mlx.mlx_array_new_data(&id_buf, &ishape, 2, .int32);
     defer _ = mlx.mlx_array_free(ids);
 
-    inline for ([_]Transformer.Qwen4MtpProject{ .all_rows, .last_row, .mixed_last_row, .none }) |proj| {
+    inline for ([_]Trunk.Qwen4MtpProject{ .all_rows, .last_row, .mixed_last_row, .none }) |proj| {
         // Un-faulted warm-up: builds every lazy artefact the forward touches
         // and counts the checked ops it issues. Its outputs are freed HERE, or
         // every later baseline would carry them and the equality would be a
@@ -2382,9 +2362,8 @@ test "qwen4 MTP adopt rejects a negative origin before mutating nonempty state" 
     };
     defer ssmSnapshotDeinit(&aux);
 
-    var xfm: Transformer = undefined;
+    var xfm: Trunk = undefined;
 
-    xfm.rht = null;
     xfm.allocator = allocator;
     xfm.s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(xfm.s);
@@ -2416,26 +2395,20 @@ test "qwen4 MTP adopt rejects a negative origin before mutating nonempty state" 
 }
 
 test "single-stream verify feature selection excludes prefill and ordinary decoding" {
-    var xfm: Transformer = undefined;
-    xfm.rht = null;
-    var qwen4: qwen4_mod.Qwen4State = undefined;
+    var xfm: Trunk = undefined;
     const old_features = verify_projection.single_verify_test_features;
     defer verify_projection.single_verify_test_features = old_features;
     verify_projection.single_verify_test_features = @splat(true);
     inline for (.{ SingleVerifyFeature.routing, SingleVerifyFeature.down_reduce }) |feature| {
-        for ([_]bool{ false, true }) |is_qwen4| {
-            xfm.qwen4 = if (is_qwen4) &qwen4 else null;
-            for ([_]bool{ false, true }) |capture| {
-                xfm.spec_capture_ssm = capture;
-                for ([_]c_int{ 1, 2, 4 }) |batch| {
-                    for ([_]c_int{ 1, 2, 3, 4, 5, 6, 7, 16, 4096 }) |width| {
-                        try testing.expectEqual(is_qwen4 and capture and batch == 1 and width >= 2 and width <= 6, xfm.verifyFeatureEnabled(feature, false, batch, width));
-                        try testing.expectEqual(is_qwen4, xfm.verifyFeatureEnabled(feature, true, batch, width));
-                    }
+        for ([_]bool{ false, true }) |capture| {
+            xfm.spec_capture_ssm = capture;
+            for ([_]c_int{ 1, 2, 4 }) |batch| {
+                for ([_]c_int{ 1, 2, 3, 4, 5, 6, 7, 16, 4096 }) |width| {
+                    try testing.expectEqual(capture and batch == 1 and width >= 2 and width <= 6, xfm.verifyFeatureEnabled(feature, false, batch, width));
+                    try testing.expect(xfm.verifyFeatureEnabled(feature, true, batch, width));
                 }
             }
         }
-        xfm.qwen4 = &qwen4;
         xfm.spec_capture_ssm = true;
         verify_projection.single_verify_test_features[@backingInt(feature)] = false;
         try testing.expect(!xfm.verifyFeatureEnabled(feature, false, 1, 5));
@@ -2456,10 +2429,10 @@ const SingleVerifyTestResult = struct {
     }
 };
 
-fn singleVerifyTestRound(xfm: *Transformer, slot: *Qwen4TestSlot, row: mlx.mlx_array) !SingleVerifyTestResult {
+fn singleVerifyTestRound(shell: *@import("../../engines/mlx/transformer.zig").Transformer, slot: *Qwen4TestSlot, row: mlx.mlx_array) !SingleVerifyTestResult {
     const Gen = @import("../../engines/mlx/generate.zig").Generator;
     var gen: Gen = undefined;
-    gen.xfm = xfm;
+    gen.xfm = shell;
     gen.ctx = slot.ctx;
     defer slot.ctx = gen.ctx;
     var state: Gen.MtpRoundState = undefined;
@@ -2475,6 +2448,7 @@ fn singleVerifyTestRound(xfm: *Transformer, slot: *Qwen4TestSlot, row: mlx.mlx_a
 }
 
 test "single-stream verify optimizations preserve native outputs and captures (QWEN4_TEST_MODEL)" {
+    const transformer = @import("../../engines/mlx/transformer.zig");
     const path = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const a = testing.allocator;
@@ -2486,11 +2460,10 @@ test "single-stream verify optimizations preserve native outputs and captures (Q
     var weights = try model_mod.loadWeights(io, a, std.mem.span(path));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, a, config, &weights);
-    defer xfm.deinit();
-    xfm.compileQwen4Hc();
-    xfm.compileGdnGate();
-    xfm.compileMoeRouting();
+    var shell = try transformer.Transformer.init(io, a, config, &weights);
+    defer shell.deinit();
+    const xfm = shell.qwen4.?;
+    xfm.prepare();
     const prefix_len = if (std.c.getenv("SINGLE_MTP_TEST_CONTEXT")) |value| try std.fmt.parseInt(usize, std.mem.span(value), 10) else 4101;
     const ids = try a.alloc(i32, prefix_len + 64);
     defer a.free(ids);
@@ -2498,7 +2471,7 @@ test "single-stream verify optimizations preserve native outputs and captures (Q
     var slots: [2]*Qwen4TestSlot = undefined;
     var initialized: usize = 0;
     defer for (slots[0..initialized]) |slot| slot.deinit(a);
-    const prefill_routes = transformer.mtp_verify_kernel_calls[2];
+    const prefill_routes = verify_projection.mtp_verify_kernel_calls[2];
     for (&slots, 0..) |*target, arm| {
         verify_projection.single_verify_test_features = @splat(arm == 1);
         target.* = try Qwen4TestSlot.init(a, config.num_hidden_layers);
@@ -2508,26 +2481,26 @@ test "single-stream verify optimizations preserve native outputs and captures (Q
         var start: usize = 0;
         while (start < prefix_len) {
             const end = @min(start + 4096, prefix_len);
-            const output = try target.*.forward(&xfm, ids[start..end]);
+            const output = try target.*.forward(xfm, ids[start..end]);
             try mlx.check(mlx.mlx_array_eval(output));
             _ = mlx.mlx_array_free(output);
             start = end;
         }
         target.*.ctx.skip_lm_head = false;
     }
-    try testing.expectEqual(prefill_routes, transformer.mtp_verify_kernel_calls[2]);
+    try testing.expectEqual(prefill_routes, verify_projection.mtp_verify_kernel_calls[2]);
     var position = prefix_len;
     for ([_]usize{ 1, 2, 3, 4, 5, 6, 7 }) |width| {
         const input = mlx.mlx_array_new_data(@ptrCast(ids[position..][0..width].ptr), &.{ 1, @as(c_int, @intCast(width)) }, 2, .int32);
         defer _ = mlx.mlx_array_free(input);
         verify_projection.single_verify_test_features = @splat(false);
-        var reference = try singleVerifyTestRound(&xfm, slots[0], input);
+        var reference = try singleVerifyTestRound(&shell, slots[0], input);
         defer reference.deinit();
-        const before = [_]u64{ transformer.mtp_verify_kernel_calls[2], verify_projection.mtp_verify_indexed_input_calls, verify_projection.mtp_verify_expert_pairs_calls, verify_projection.mtp_verify_expert_reduce_calls };
+        const before = [_]u64{ verify_projection.mtp_verify_kernel_calls[2], verify_projection.mtp_verify_indexed_input_calls, verify_projection.mtp_verify_expert_pairs_calls, verify_projection.mtp_verify_expert_reduce_calls };
         verify_projection.single_verify_test_features = @splat(true);
-        var candidate = try singleVerifyTestRound(&xfm, slots[1], input);
+        var candidate = try singleVerifyTestRound(&shell, slots[1], input);
         defer candidate.deinit();
-        const after = [_]u64{ transformer.mtp_verify_kernel_calls[2], verify_projection.mtp_verify_indexed_input_calls, verify_projection.mtp_verify_expert_pairs_calls, verify_projection.mtp_verify_expert_reduce_calls };
+        const after = [_]u64{ verify_projection.mtp_verify_kernel_calls[2], verify_projection.mtp_verify_indexed_input_calls, verify_projection.mtp_verify_expert_pairs_calls, verify_projection.mtp_verify_expert_reduce_calls };
         inline for (.{ "logits", "last", "all" }) |field| try expectRowsByteEqual(a, xfm.s, @field(reference, field), @field(candidate, field), "single verify " ++ field);
         for (slots[0].entries, slots[1].entries) |*left, *right| {
             inline for (.{ "conv_state", "ssm_state", "aux_state", "qsa_pooled", "spec_conv_input", "spec_ple_input" }) |field| {

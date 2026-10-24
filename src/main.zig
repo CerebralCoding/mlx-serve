@@ -1713,7 +1713,7 @@ pub fn main(init: std.process.Init) !void {
         if (kv_quant_config.scheme != .off) {
             try xfm.cache.reinit(config.num_hidden_layers, kv_quant_config);
         }
-        try xfm.qwen4MtpApplyKvQuant(kv_quant_config);
+        if (xfm.qwen4Trunk()) |t| try t.qwen4MtpApplyKvQuant(transformer_mod.Transformer.qwen4MtpHeadKvConfig(kv_quant_config));
 
         // JIT-compile + wire memory limits (policy: mlx.applyWiredPolicy).
         {
@@ -1732,6 +1732,10 @@ pub fn main(init: std.process.Init) !void {
         }
         if (config.linear_num_key_heads > 0) {
             xfm.compileGdnGate();
+        }
+        if (xfm.qwen4) |t| {
+            t.compileMoeRouting();
+            t.compileGdnGate();
         }
         log.info("Model ready.\n", .{});
 

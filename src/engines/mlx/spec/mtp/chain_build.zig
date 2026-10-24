@@ -1,5 +1,6 @@
 //! Building and dispatching MTP draft chains (solo, batched, lanes).
 const std = @import("std");
+const Qwen4MtpBatchRow = @import("../../../../plugins/qwen4_exp/mtp.zig").Qwen4MtpBatchRow;
 const mlx = @import("../../../../mlx/ffi.zig");
 const transformer_mod = @import("../../transformer.zig");
 const log = @import("../../../../host/log.zig");
@@ -430,7 +431,6 @@ pub fn mtpBatchHeadPosition(pos_base: c_int, seq_offset: usize) c_int {
 pub fn mtpChainBuildBatchedActive(gens: []const *Generator, chains: []MtpPreDraft, from: u32, to: u32) !void {
     if (gens.len == 0) return;
     std.debug.assert(gens.len == chains.len);
-    const xfm = gens[0].xfm.qwen4Host();
     var any_mrope = false;
     var all_qwen4 = true;
     var one_sidecar = true;
@@ -456,10 +456,11 @@ pub fn mtpChainBuildBatchedActive(gens: []const *Generator, chains: []MtpPreDraf
         for (gens, chains) |g, *c| try g.mtpChainBuild(c, from, to);
         return;
     }
+    const xfm = gens[0].mtp.?.qwen4;
     const n = gens.len;
     var i: u32 = from;
     while (i < to) : (i += 1) {
-        var rows: [32]transformer_mod.Transformer.Qwen4MtpBatchRow = undefined;
+        var rows: [32]Qwen4MtpBatchRow = undefined;
         var merged_ids: [32]mlx.mlx_array = undefined;
         var merged_hidden: [32]mlx.mlx_array = undefined;
         var own_ids: [32]bool = @splat(false);
@@ -475,7 +476,7 @@ pub fn mtpChainBuildBatchedActive(gens: []const *Generator, chains: []MtpPreDraf
         var modes: [32]bool = undefined;
         for (gens, chains, 0..) |g, *c, row| modes[row] = mtpRowRerankMode(g, c, i);
         const use_rerank = modes[0];
-        const project: transformer_mod.Transformer.Qwen4MtpProject = if (use_rerank) .mixed_last_row else .last_row;
+        const project: @import("../../../../plugins/qwen4_exp/mtp.zig").Qwen4MtpProject = if (use_rerank) .mixed_last_row else .last_row;
         for (gens, chains, 0..) |g, *c, k| {
             const qref = g.mtp_cache.?.qwen4;
             const st = g.mtp_cache.?.qwen4StateForBatch();

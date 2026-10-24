@@ -13,6 +13,11 @@ const mtp_mod = @import("../../../../sdk/spec/mtp/mtp.zig");
 const round_cost = @import("../round_cost.zig");
 const group_planner = @import("../mtp_group_planner.zig");
 const Transformer = transformer_mod.Transformer;
+const intree = @import("../../plugin/intree.zig");
+const verify_projection = @import("../../../../sdk/blocks/linear/verify_projection.zig");
+const Qwen4Trunk = @import("../../../../plugins/qwen4_exp/trunk.zig").Trunk;
+const Qwen4MtpState = @import("../../../../plugins/qwen4_exp/mtp.zig").Qwen4MtpState;
+const Qwen4Mtp = @import("../../../../plugins/qwen4_exp/mtp.zig").Qwen4Mtp;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const ForwardCtx = transformer_mod.ForwardCtx;
 const dflash_mod = @import("../dflash/dflash.zig");
@@ -496,7 +501,7 @@ pub fn mtpRoundVerify(self: *Generator, st: *MtpRoundState) !void {
     errdefer _ = mlx.mlx_array_free(verify_logits);
     self.ctx.ple_defer = false;
     self.ctx.capture_ssm_seq = false;
-    xfm.verify_laps.ple_sync_ns = 0;
+    xfm.verifyLaps().ple_sync_ns = 0;
     if (tracing) {
         const build_ns = st.ph.read();
         self.mtp_trace.add(.verify, build_ns);
@@ -506,7 +511,7 @@ pub fn mtpRoundVerify(self: *Generator, st: *MtpRoundState) !void {
     const ple_lap = SubLap.start(tracing, self.timer.io);
     defer if (tracing) {
         ple_lap.stop(&self.mtp_trace, .ple);
-        self.mtp_trace.addSub(.ple_sync, xfm.verify_laps.ple_sync_ns);
+        self.mtp_trace.addSub(.ple_sync, xfm.verifyLaps().ple_sync_ns);
     };
     // Fill the deferred PLE leaf: the one host read of the verify ids, and
     // the point at which the entry's n-gram history + `spec_ple_tokens`
@@ -539,7 +544,7 @@ pub fn mtpGroupVerify(gens: []const *Generator, states: []const *MtpRoundState) 
         ctxs[i] = &gen.ctx;
     }
     var rollback: [MTP_GROUP_ROWS_MAX]Transformer.VerifyRollback = undefined;
-    const retain_rollback = n > 1 and xfm.qwen4Host().qwen4 != null;
+    const retain_rollback = n > 1 and intree.trunk(xfm) != null;
     for (gens, states) |gen, st| st.verify_ctx = &gen.ctx;
     var row_ns: [MTP_GROUP_ROWS_MAX]u64 = undefined;
     var tracing_any = false;
@@ -556,7 +561,7 @@ pub fn mtpGroupVerify(gens: []const *Generator, states: []const *MtpRoundState) 
         if (i == 0) st.group_logits = xfm.takeJoinedVerifyLogits();
         if (st.tracing) {
             gen.mtp_trace.add(.verify, row_ns[i]);
-            const laps = xfm.verify_laps;
+            const laps = xfm.verifyLaps().*;
             gen.mtp_trace.addSub(.build, laps.build_ns);
             gen.mtp_trace.addSub(.ple, laps.ple_ns);
             gen.mtp_trace.addSub(.ple_sync, laps.ple_sync_ns);
@@ -839,36 +844,42 @@ test "qwen4: the coarse rerank head is READY before any draft has run" {
 
     var fx = try mtp_mod.RerankFixture.init(s, mtp_mod.TOP32_MIN_ROWS + 96, 256, 8, 64, 0xC0DE);
     defer fx.deinit();
+    var t: Qwen4Trunk = undefined;
+    t.config = fx.xfm.config;
+    t.s = s;
+    t.lm_head_w = fx.xfm.lm_head_w;
+    t.lm_head_s = fx.xfm.lm_head_s;
+    t.lm_head_b = fx.xfm.lm_head_b;
     // Only the rerank fields are read by the build; the rest of the head is
     // the trunk's business.
-    var head: transformer_mod.Qwen4Mtp = undefined;
+    var head: Qwen4Mtp = undefined;
     head.rerank = null;
     head.rerank_logged = false;
     head.rerank_tried = false;
-    fx.xfm.qwen4_mtp = head;
-    defer if (fx.xfm.qwen4_mtp) |*m| {
+    t.qwen4_mtp = head;
+    defer if (t.qwen4_mtp) |*m| {
         if (m.rerank) |*rc| rc.deinit();
     };
 
     // Nothing is built by construction...
-    try testing.expect(fx.xfm.qwen4_mtp.?.rerank == null);
+    try testing.expect(t.qwen4_mtp.?.rerank == null);
     // ...the eager build stands on its own...
-    try testing.expect(fx.xfm.qwen4BuildDraftRerank());
-    const built = fx.xfm.qwen4_mtp.?.rerank orelse return error.NoCoarseHead;
+    try testing.expect(t.qwen4BuildDraftRerank());
+    const built = t.qwen4_mtp.?.rerank orelse return error.NoCoarseHead;
     try testing.expectEqual(fx.vocab, built.rows);
     try testing.expect(built.bits > 0 and built.bits < 8);
 
     // ...and the draft path now only READS it. Same mlx handle => the ask
     // did not rebuild anything (which is what the lazy path did).
     const head_ctx = built.q.w.ctx;
-    const ref = MtpHeadRef{ .qwen4 = &fx.xfm };
+    const ref = MtpHeadRef{ .qwen4 = &t };
     try testing.expect(ref.canRerankDrafts());
-    try testing.expectEqual(head_ctx, fx.xfm.qwen4_mtp.?.rerank.?.q.w.ctx);
+    try testing.expectEqual(head_ctx, t.qwen4_mtp.?.rerank.?.q.w.ctx);
 
     // One-shot: a second eager build (both load paths firing, a re-probe)
     // keeps the head it already has.
-    try testing.expect(fx.xfm.qwen4BuildDraftRerank());
-    try testing.expectEqual(head_ctx, fx.xfm.qwen4_mtp.?.rerank.?.q.w.ctx);
+    try testing.expect(t.qwen4BuildDraftRerank());
+    try testing.expectEqual(head_ctx, t.qwen4_mtp.?.rerank.?.q.w.ctx);
 }
 
 test "mtpPreDraftOpenAllows: an eager pre-draft needs a reader, planner-owned or not" {
@@ -974,12 +985,14 @@ test "MTP continuation releases its owned chain when drafting fails" {
     var xfm: Transformer = undefined;
     xfm.rht = null;
     xfm.s = s;
-    xfm.qwen4_mtp = null;
-    var state: Transformer.Qwen4MtpState = undefined;
+    var trunk: Qwen4Trunk = undefined;
+    trunk.s = s;
+    trunk.qwen4_mtp = null;
+    var state: Qwen4MtpState = undefined;
     var gen: Generator = undefined;
     gen.xfm = &xfm;
-    gen.mtp = .{ .qwen4 = &xfm };
-    gen.mtp_cache = .{ .qwen4 = .{ .t = &xfm, .st = &state, .allocator = allocator } };
+    gen.mtp = .{ .qwen4 = &trunk };
+    gen.mtp_cache = .{ .qwen4 = .{ .t = &trunk, .st = &state, .allocator = allocator } };
     gen.sampling = .{ .temperature = 0 };
     gen.ctx.mrope_pos = null;
     gen.mtp_hist_stash = null;
@@ -1010,10 +1023,9 @@ test "MTP continuation releases its owned chain when drafting fails" {
 
 test "batched MTP state includes the last row activated by round begin" {
     const allocator = testing.allocator;
-    var xfm: Transformer = undefined;
-    xfm.rht = null;
+    var xfm: Qwen4Trunk = undefined;
     xfm.qwen4_mtp_owner = null;
-    var head: transformer_mod.Qwen4Mtp = undefined;
+    var head: Qwen4Mtp = undefined;
     head.cache = try KVCache.init(allocator, 1);
     head.entry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
     head.qsa_marks = .{};
@@ -1021,9 +1033,9 @@ test "batched MTP state includes the last row activated by round begin" {
     head.pos_base = 0;
     xfm.qwen4_mtp = head;
     defer xfm.qwen4_mtp.?.cache.deinit();
-    var a: Transformer.Qwen4MtpState = .{ .cache = try KVCache.init(allocator, 1), .entry = head.entry };
+    var a: Qwen4MtpState = .{ .cache = try KVCache.init(allocator, 1), .entry = head.entry };
     defer a.deinit();
-    var b: Transformer.Qwen4MtpState = .{ .cache = try KVCache.init(allocator, 1), .entry = head.entry };
+    var b: Qwen4MtpState = .{ .cache = try KVCache.init(allocator, 1), .entry = head.entry };
     defer b.deinit();
     xfm.qwen4MtpActivate(&a);
     xfm.qwen4_mtp.?.seq_offset = 7;
@@ -1037,7 +1049,7 @@ test "batched MTP state includes the last row activated by round begin" {
         .{ .qwen4 = .{ .t = &xfm, .st = &a, .allocator = allocator } },
         .{ .qwen4 = .{ .t = &xfm, .st = &b, .allocator = allocator } },
     };
-    const want = [_]Transformer.Qwen4MtpState.Meta{
+    const want = [_]Qwen4MtpState.Meta{
         .{ .stash_len = 7, .origin = 3, .cache_step = 7 },
         .{ .stash_len = 2, .origin = 11, .cache_step = 2 },
     };
@@ -1067,8 +1079,8 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
     group_planner.enabled_override = true;
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    const coarse_before = transformer_mod.mtp_coarse_pair_dispatches;
-    const verify_kernel_before = transformer_mod.mtp_verify_kernel_calls;
+    const coarse_before = verify_projection.mtp_coarse_pair_dispatches;
+    const verify_kernel_before = verify_projection.mtp_verify_kernel_calls;
     var config = try model_mod.parseConfig(io, a, std.mem.span(model_dir));
     defer if (config.ngram_table_path) |path| a.free(path);
     var weights = try model_mod.loadWeights(io, a, std.mem.span(model_dir));
@@ -1076,9 +1088,7 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, a, config, &weights);
     defer xfm.deinit();
-    xfm.compileQwen4Hc();
-    xfm.compileGdnGate();
-    xfm.compileMoeRouting();
+    xfm.qwen4.?.prepare();
     var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
     defer tok.deinit();
     var prompt: [96]u32 = undefined;
@@ -1183,11 +1193,11 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
         }
     }
     if (transformer_mod.verifySharedHardware()) {
-        try testing.expect(transformer_mod.mtp_coarse_pair_dispatches > coarse_before);
+        try testing.expect(verify_projection.mtp_coarse_pair_dispatches > coarse_before);
         inline for (.{ .dense_tiles, .hc_rows, .route_pack }, 0..) |lever, i| {
             {
-                try testing.expect(transformer_mod.mtp_verify_kernel_calls[i] > verify_kernel_before[i]);
-                std.debug.print("[verify kernel] {s} calls={d}\n", .{ @tagName(lever), transformer_mod.mtp_verify_kernel_calls[i] - verify_kernel_before[i] });
+                try testing.expect(verify_projection.mtp_verify_kernel_calls[i] > verify_kernel_before[i]);
+                std.debug.print("[verify kernel] {s} calls={d}\n", .{ @tagName(lever), verify_projection.mtp_verify_kernel_calls[i] - verify_kernel_before[i] });
             }
         }
     }
@@ -1205,9 +1215,7 @@ test "acceptance failure restores every unfinished row after verify returns" {
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, a, config, &weights);
     defer xfm.deinit();
-    xfm.compileQwen4Hc();
-    xfm.compileGdnGate();
-    xfm.compileMoeRouting();
+    xfm.qwen4.?.prepare();
     var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
     defer tok.deinit();
     var prompt: [96]u32 = undefined;
@@ -1279,9 +1287,9 @@ test "acceptance failure restores every unfinished row after verify returns" {
         for (slot.entries, saved_ssm[i]) |*entry, *snapshot| snapshot.* = transformer_mod.ssmSnapshot(entry);
         saved_rows += 1;
     }
-    const syncs = transformer_mod.cli().deferred_ple_group_syncs;
+    const syncs = @import("../../../../plugins/qwen4_exp/ple.zig").deferred_ple_group_syncs;
     try Generator.mtpGroupVerify(&gens, &ptrs);
-    try testing.expectEqual(@as(u64, 1), transformer_mod.cli().deferred_ple_group_syncs - syncs);
+    try testing.expectEqual(@as(u64, 1), @import("../../../../plugins/qwen4_exp/ple.zig").deferred_ple_group_syncs - syncs);
     for (states) |state| try testing.expect(state.?.verify_rollback != null);
     mlx.fault.arm(1);
     const result = Generator.mtpGroupAccept(&gens, &ptrs);
@@ -1468,9 +1476,7 @@ test "plain to prime resumes the same MTP history and next draft as legacy hidde
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, a, config, &weights);
     defer xfm.deinit();
-    xfm.compileQwen4Hc();
-    xfm.compileGdnGate();
-    xfm.compileMoeRouting();
+    xfm.qwen4.?.prepare();
     var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
     defer tok.deinit();
     const previous = group_planner.enabled_override;
@@ -1569,9 +1575,7 @@ test "cold grouped MTP rounds detach and resume exactly like solo heads" {
     model_mod.resolveWeightPrefix(&config, &weights);
     var xfm = try Transformer.init(io, a, config, &weights);
     defer xfm.deinit();
-    xfm.compileQwen4Hc();
-    xfm.compileGdnGate();
-    xfm.compileMoeRouting();
+    xfm.qwen4.?.prepare();
     var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
     defer tok.deinit();
     const prior = group_planner.enabled_override;
@@ -1598,7 +1602,7 @@ test "cold grouped MTP rounds detach and resume exactly like solo heads" {
             const gen = &slot.gen.?;
             try testing.expect(gen.mtp_hist_stash == null and gen.mtp_pre_draft == null);
             gen.mtp_cache.?.activate();
-            try xfm.qwen4MtpReset();
+            try xfm.qwen4.?.qwen4MtpReset();
             gen.mtp_planner_owned = true;
             gen.mtp_planner_width = 1;
             gen.mtp_batch_head = true;

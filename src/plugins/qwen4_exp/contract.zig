@@ -13,7 +13,7 @@ const qsa_row_mask = @import("qsa_mask.zig");
 const qsaMaskFromBlocks = @import("qsa/mask.zig").qsaMaskFromBlocks;
 const ple_gpu = @import("ple_gpu.zig");
 const qwen4 = @import("qwen4_exp.zig");
-const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
+const Trunk = @import("trunk.zig").Trunk;
 
 const spec = kc.spec;
 const metal = kc.metal;
@@ -181,8 +181,7 @@ const PoolRope = struct {
 
     /// The composed chain on the same inputs: `qsaPoolNorm` then `qsaPooledRopeComposed`.
     pub fn replaced(self: *PoolRope) ![]const u8 {
-        var xfm: Transformer = undefined;
-        xfm.rht = null;
+        var xfm: Trunk = undefined;
         xfm.s = self.rig.stream();
         xfm.allocator = self.rig.a;
         xfm.config = .{};
