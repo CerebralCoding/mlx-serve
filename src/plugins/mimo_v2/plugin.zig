@@ -15,6 +15,7 @@ const reader = @import("../../sdk/bases/reader.zig");
 const EitherMlp = @import("../lfm2/plugin.zig").EitherMlp;
 const SinkAttention = @import("sink_attention.zig").SinkAttention;
 const mtp_head = @import("mtp_head.zig");
+const sushi_pack = @import("../../sdk/quant/exl3/sushi_pack.zig");
 pub const config = @import("config.zig");
 
 pub const plugin = config.plugin;
@@ -47,7 +48,7 @@ pub const table = abi.ModelTable{
     .forward = &forward,
     .cache = &.{ .layout = &config.layout },
     .spec = &.{ .trunk_weight = b.trunk_weight.trunkWeightHook(Loaded), .head = head_hooks },
-    .weights = &.{},
+    .weights = &.{ .resident_bytes = &residentBytes },
 };
 
 const head_hooks = reader.headHooks(Loaded, mtp_head.Heads, struct {
@@ -65,6 +66,32 @@ const head_hooks = reader.headHooks(Loaded, mtp_head.Heads, struct {
 fn bill(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
     out.* = .{};
 }
+
+/// A Sushi pack is held as its adapter leaves it (`SushiBill`); every other pack as stored.
+fn residentBytes(p: *const abi.Parsed, model_dir: abi.Str, _: abi.Str, shards: u64, out: *u64) callconv(.c) Verdict {
+    const c = config.of(p);
+    out.* = shards;
+    if (c.expert_block_json.len == 0) return .ok;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    out.* = sushi_pack.residentBytes(io, std.heap.page_allocator, model_dir.slice(), SushiBill{ .layers = c.num_hidden_layers }) catch |e|
+        return Verdict.named(.failed, @errorName(e));
+    return .ok;
+}
+
+/// A Sushi MiMo tensor as the load holds it: the towers and anything past the trunk not at all, a QKV part's tile
+/// scales one row per code row, the dense MLP's dropped once it is decoded (bf16, twice its e4m3 codes).
+pub const SushiBill = struct {
+    layers: u32,
+
+    pub fn bill(f: SushiBill, t: sushi_pack.Stored) !u64 {
+        for ([_][]const u8{ "visual.", "audio_encoder.", "speech_embeddings." }) |u| if (std.mem.startsWith(u8, t.key, u)) return 0;
+        if (sushi_pack.pastTrunk(t.key, f.layers)) return 0;
+        if (std.mem.endsWith(u8, t.key, ".weight_scale_inv"))
+            return if (std.mem.indexOf(u8, t.key, ".self_attn.qkv_proj.") != null) t.bytes * sushi_pack.FP8_BLOCK else 0;
+        if (std.mem.eql(u8, t.dtype, "F8_E4M3") and std.mem.indexOf(u8, t.key, ".mlp.") != null) return 2 * t.bytes;
+        return t.bytes;
+    }
+};
 
 pub const Loaded = struct {
     base: bases.Model(Model),

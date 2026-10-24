@@ -1008,7 +1008,7 @@ test "the allocator pool is returned at the prefill/decode handover, long-contex
     // 524k died 0.5 GB over the plan ceiling on exactly that tick). One clear at the
     // handover returns it. Every other arch keeps its previous call pattern.
     const t = testing;
-    var qwen4 = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
+    var qwen4 = model_mod.ModelConfig{ .model_type = "qwen4_exp", .legacy = .{ .caps = .{ .long_ctx = true } } };
     try t.expect(clearsPoolAtPrefillEnd(&qwen4));
     for ([_][]const u8{
         "qwen3_5",
@@ -1044,7 +1044,7 @@ test "reservedPrefillTokens: every arch reserves its prompt; only qwen4_exp pre-
     const seq: u64 = 200_000;
     const max_tokens: u64 = 2048;
 
-    var qwen4 = model_mod.ModelConfig{ .model_type = "qwen4_exp", .max_position_embeddings = 1_048_576 };
+    var qwen4 = model_mod.ModelConfig{ .model_type = "qwen4_exp", .legacy = .{ .caps = .{ .long_ctx = true } }, .max_position_embeddings = 1_048_576 };
     const KVC = transformer_mod.KVCache;
     try t.expectEqual(
         KVC.reservedTokens(seq, max_tokens, chunk, 1_048_576),

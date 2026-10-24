@@ -344,7 +344,7 @@ fn handleMessagesEmbedding(
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'messages' must be a non-empty array", null);
         return;
     }
-    if (!config.isEmbeddingGemma2()) {
+    if (!config.gv_budgeted) {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'messages' is served by multimodal embedding models (EmbeddingGemma 2); this model takes 'input'", null);
         return;
     }

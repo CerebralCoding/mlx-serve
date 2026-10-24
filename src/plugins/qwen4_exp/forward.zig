@@ -1886,7 +1886,7 @@ const Qwen4LadderRig = struct {
         const x = self.fx.xfm();
         const st = x.qwen4.?;
         const emb_dim: c_int = @intCast(st.table.dim * st.hash.n_heads);
-        x.config = .{ .model_type = "qwen4_exp", .hidden_size = HIDDEN, .hc_count = HC, .num_hidden_layers = LAYERS, .vocab_size = VOCAB };
+        x.config = .{ .model_type = "qwen4_exp", .legacy = .{ .caps = .{ .long_ctx = true } }, .hidden_size = HIDDEN, .hc_count = HC, .num_hidden_layers = LAYERS, .vocab_size = VOCAB };
         var prng = std.Random.DefaultPrng.init(59);
         const r = prng.random();
         x.emb_w = try self.weight(r, &.{ VOCAB, HIDDEN });

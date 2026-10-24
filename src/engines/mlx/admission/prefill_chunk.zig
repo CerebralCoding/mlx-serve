@@ -698,6 +698,7 @@ test "SSD-first is gated on a DISK TIER: with --prefix-cache-disk off, qwen4_exp
     try t.expect(prefix_cache_mod.ssdFirstActive(&cfg, true, true));
     var dense = model_mod.ModelConfig{};
     dense.model_type = "qwen3";
+    dense.legacy.caps.long_ctx = std.mem.eql(u8, dense.model_type, "qwen4_exp");
     try t.expect(!prefix_cache_mod.ssdFirstActive(&dense, true, true));
     try t.expect(prefix_cache_mod.ssdFirstActive(&dense, true, false));
     prefix_cache_mod.ssd_first_override = false;
@@ -922,6 +923,7 @@ test "clampReserveWidth: the load-time reserve is a promise to the FIRST request
 
     var other = qwen4RequestTestConfig();
     other.model_type = "qwen3_5";
+    other.legacy.caps.long_ctx = std.mem.eql(u8, other.model_type, "qwen4_exp");
     const neutral = planHotCache(&other, kv_bits, weights + 28_909 * MiB, weights, ctx_tokens, 0, 10 * GiB, 0);
     try t.expectEqual(neutral.chunk, neutral.reserve_chunk);
 }
@@ -1133,6 +1135,7 @@ test "chooseRequestPrefillChunk: the explicit flag and the gate both outrank it"
     // Another arch keeps the load-time pin exactly.
     var other = qwen4RequestTestConfig();
     other.model_type = "qwen3_5";
+    other.legacy.caps.long_ctx = std.mem.eql(u8, other.model_type, "qwen4_exp");
     try t.expect(!other.perRequestPrefillChunk());
     try t.expectEqual(pin, chooseRequestPrefillChunk(&other, 300_000, 2048, kv_bits, roomy, pin, 0, .{}));
     try t.expect(cfg.perRequestPrefillChunk());
@@ -1211,6 +1214,7 @@ test "the post-eviction re-ask never exceeds what live memory affords, and never
     // A non-qwen4 arch is untouched end to end.
     var other = qwen4RequestTestConfig();
     other.model_type = "qwen3_5";
+    other.legacy.caps.long_ctx = std.mem.eql(u8, other.model_type, "qwen4_exp");
     const other_pre = chooseRequestPrefillChunk(&other, seq, 2048, kv_bits, 0, pin, 0, .{});
     const other_post = chooseRequestPrefillChunk(&other, seq, 2048, kv_bits, roomy, pin, 0, .{});
     try t.expectEqual(pin, other_pre);
@@ -1443,6 +1447,7 @@ test "the tail-merge gate reads the ARCH, not the installed hook (serve installs
 
     var other = qwen4RequestTestConfig();
     other.model_type = "qwen3_5";
+    other.legacy.caps.long_ctx = std.mem.eql(u8, other.model_type, "qwen4_exp");
     const adaptive = scheduler_mod.adaptiveChunkWidthFor(&other);
     try t.expect(!adaptive);
     try t.expect(hook_installed != adaptive);
@@ -1477,6 +1482,7 @@ test "the tail-merge bound scales ONLY where the per-chunk adaptive width is liv
 
     var other = qwen4RequestTestConfig();
     other.model_type = "qwen3_5";
+    other.legacy.caps.long_ctx = std.mem.eql(u8, other.model_type, "qwen4_exp");
     try t.expect(!other.perRequestPrefillChunk());
     try t.expect(!adaptivePrefillChunkEnabled(&other));
     const off = adaptivePrefillChunkEnabled(&other);
@@ -1636,6 +1642,7 @@ test "adaptivePrefillChunkEnabled: the arch, both kill switches, and any pinned 
     const cfg = qwen4RequestTestConfig();
     var other = qwen4RequestTestConfig();
     other.model_type = "qwen3_5_moe";
+    other.legacy.caps.long_ctx = std.mem.eql(u8, other.model_type, "qwen4_exp");
 
     try t.expect(adaptivePrefillChunkEnabled(&cfg));
     // Another arch never adapts; one switch disables both.
@@ -1732,6 +1739,7 @@ test "prefillChunkCap: the chunk sizer's two long-context changes are qwen4_exp-
     for ([_][]const u8{ "qwen3_5", "qwen3_5_moe", "lfm2", "nemotron_h", "bailing_hybrid", "llama", "mistral" }) |mt| {
         var cfg = longCtxTestConfig();
         cfg.model_type = mt;
+        cfg.legacy.caps.long_ctx = std.mem.eql(u8, cfg.model_type, "qwen4_exp");
         const baseline: u64 = (ceiling - (weights + ask)) / PREFILL_RESERVE_BUDGET_SHARE;
         try t.expectEqual(baseline, prefillChunkCap(&cfg, ceiling, weights, ctx_kv, ask));
         try t.expectEqual(baseline, prefillChunkCap(&cfg, ceiling, weights, 48 * GiB, ask));
@@ -1741,6 +1749,7 @@ test "prefillChunkCap: the chunk sizer's two long-context changes are qwen4_exp-
     // qwen4_exp: the ask is ignored, and the ctx bar binds.
     var q4 = longCtxTestConfig();
     q4.model_type = "qwen4_exp";
+    q4.legacy.caps.long_ctx = true;
     const serving: u64 = ceiling - weights;
     const share_bar: u64 = serving / PREFILL_RESERVE_BUDGET_SHARE;
     const want: u64 = @min(share_bar, (serving - ctx_kv) -| HOT_CACHE_FLOOR_BYTES);

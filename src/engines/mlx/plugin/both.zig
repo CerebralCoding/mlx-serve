@@ -361,7 +361,7 @@ pub fn expectGenericFieldsEqual(served: *const model.ModelConfig, legacy: *const
             if (std.mem.eql(u8, n, name)) break true;
         } else false;
         const idle = comptime std.mem.startsWith(u8, name, "sliding_window");
-        if (comptime !std.mem.eql(u8, name, "plugin")) if (!skip and !(idle and !legacy.has_sliding_window)) {
+        if (comptime !std.mem.eql(u8, name, "plugin") and !std.mem.eql(u8, name, "legacy")) if (!skip and !(idle and !legacy.has_sliding_window)) {
             const x = @field(served, name);
             const y = @field(legacy, name);
             const same = switch (@typeInfo(@FieldType(model.ModelConfig, name))) {

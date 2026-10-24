@@ -67,10 +67,10 @@ pub const DFLASH_THINKING_GATE_MIN_ACCEPTED_PER_ROUND: f32 = 1.0;
 /// break-even acceptance is several times a dense trunk's.
 pub const DFLASH_MOE_GATE_MIN_ACCEPTED_PER_ROUND: f32 = 1.8;
 
-/// The round policy (`dflash_policy.zig`) drives DFlash on a sparse target whose verify rows cost
-/// (GLM-5.3); every other arch keeps the fixed block until it is A/B'd on its own.
+/// The round policy (`dflash_policy.zig`) drives DFlash where the model declares it (`Caps.dflash_policy`); every
+/// other model keeps the fixed block until it is A/B'd on its own.
 pub fn dflashPolicyFor(config: *const model_mod.ModelConfig) bool {
-    return config.isGlm5();
+    return config.caps().dflash_policy;
 }
 
 pub fn dflashGateShouldDisable(attempted: u64, accepted: u64, min_avg: f32) bool {

@@ -112,7 +112,7 @@ test "embedding_gemma2 plugin: a 4-bit pack through a served shell (one sequence
     try writePack(&p, .{});
     var b = try Both.openAs(&embedding_gemma2.table, &p, config_json, oracle("4bit"));
     defer b.close();
-    try testing.expect(b.cfg.isEmbeddingGemma2() and b.xfm.plugin != null);
+    try testing.expect(b.cfg.gv_budgeted and b.xfm.plugin != null);
     // The short row's padding runs past its band: the floored mask keeps it finite on both paths.
     try served.expectServed(&b, &seq, &batch, &.{ 10, 5 });
     try expectImageRows(&b);

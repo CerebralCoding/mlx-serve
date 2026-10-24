@@ -20,6 +20,8 @@ pub fn toModelConfig(a: std.mem.Allocator, c: *const Config, dir: ?[]const u8) !
     m.has_pre_ff_norm = false;
     m.has_qk_norm = false; // q-norm is on the lora rank + an unweighted per-head RMS, in the module
     m.hidden_act = .silu;
+    m.legacy.caps.prefix_cache = false;
+    if (c.isV41()) m.legacy.thinking = .on;
     if (c.isV41()) if (dir) |d| {
         m.pack_dir = try a.dupe(u8, d);
     };

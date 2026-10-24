@@ -56,6 +56,7 @@ const prefill_dq_gemm = @import("../../../sdk/blocks/linear/prefill_dq_gemm.zig"
 pub fn longCtxTestConfig() model_mod.ModelConfig {
     var cfg = model_mod.ModelConfig{};
     cfg.model_type = "qwen4_exp"; // arch-scan-exempt: test fixture, not a gate
+    cfg.legacy.caps.long_ctx = true;
     cfg.num_hidden_layers = 40;
     cfg.num_attention_heads = 24;
     cfg.num_key_value_heads = 2;
@@ -86,6 +87,7 @@ pub fn qsaScoreFusedOffGuard() struct {
 pub fn qwen4RequestTestConfig() model_mod.ModelConfig {
     var cfg = model_mod.ModelConfig{};
     cfg.model_type = "qwen4_exp"; // arch-scan-exempt: test fixture, not a gate
+    cfg.legacy.caps.long_ctx = true;
     cfg.num_hidden_layers = 48;
     cfg.full_attention_interval = 4;
     cfg.num_attention_heads = 24;
@@ -1052,6 +1054,7 @@ test "prefillFfnWidth: a declared MoE width beats the struct default, which is o
 pub fn qwen4ExpOomConfig() model_mod.ModelConfig {
     var cfg = model_mod.ModelConfig{};
     cfg.model_type = "qwen4_exp"; // arch-scan-exempt: test fixture, not a gate
+    cfg.legacy.caps.long_ctx = true;
     cfg.num_hidden_layers = 48;
     cfg.full_attention_interval = 4; // 12 caching layers, 36 GatedDeltaNet
     cfg.num_attention_heads = 24;
@@ -1403,6 +1406,7 @@ test "prefillRequestTerms: the reservation terms are qwen4_exp-only, a donated w
     // A 27B-class GDN pack: `ssmCheckpointBytes()` is non-zero here.
     var q35 = qwen4ExpOomConfig();
     q35.model_type = "qwen3_5_moe";
+    q35.legacy.caps.long_ctx = std.mem.eql(u8, q35.model_type, "qwen4_exp");
     try t.expect(q35.ssmCheckpointBytes() > 0);
     try t.expect(retainedSsmCheckpointBytes(&q35, seq, 0, chunk) > 0);
 
@@ -1414,6 +1418,7 @@ test "prefillRequestTerms: the reservation terms are qwen4_exp-only, a donated w
     for ([_][]const u8{ "qwen3_5", "qwen3_5_moe", "qwen3_next", "bailing_hybrid", "lfm2", "nemotron_h", "llama", "mistral" }) |mt| {
         var cfg = qwen4ExpOomConfig();
         cfg.model_type = mt;
+        cfg.legacy.caps.long_ctx = std.mem.eql(u8, cfg.model_type, "qwen4_exp");
         const terms = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, warm);
         try t.expectEqual(@as(u64, 0), terms.reserved_kv_bytes);
         try t.expectEqual(@as(u64, 0), terms.checkpoint_bytes);
@@ -1467,6 +1472,7 @@ test "GLM ledger: unrelated ungated request terms are unchanged" {
     for ([_][]const u8{ "qwen3_5", "lfm2", "nemotron_h", "llama" }) |mt| {
         var cfg = qwen4ExpOomConfig();
         cfg.model_type = mt;
+        cfg.legacy.caps.long_ctx = std.mem.eql(u8, cfg.model_type, "qwen4_exp");
         const terms = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, .{});
         try t.expectEqual(@as(u64, 0), terms.checkpoint_bytes);
         try t.expectEqual(@as(u64, 0), terms.reserved_kv_bytes);
@@ -1509,6 +1515,7 @@ test "prefillRequestTerms: qwen4 MTP head KV is billed when MTP is on and zero w
     try t.expectEqual(reserved * statePerTokenBilled(&cfg), off.state_bytes);
     var other = cfg;
     other.model_type = "qwen3_5_moe";
+    other.legacy.caps.long_ctx = std.mem.eql(u8, other.model_type, "qwen4_exp");
     const other_on = prefillRequestTerms(&other, seq, max_tokens, kv_bits, chunk, .{ .mtp_on = true });
     try t.expectEqual(@as(u64, 0), other_on.mtp_head_kv_bytes);
 }
@@ -1550,6 +1557,7 @@ test "prefillAdmissionBill: every arch carries the evict-to-admit credits (#492)
     for ([_][]const u8{ "qwen3_5", "qwen3_5_moe", "llama", "gemma4", "qwen4_exp" }) |mt| {
         var cfg = qwen4ExpOomConfig();
         cfg.model_type = mt;
+        cfg.legacy.caps.long_ctx = std.mem.eql(u8, cfg.model_type, "qwen4_exp");
         const bill = prefillAdmissionBill(&cfg, 100_000, 2048, null, null, .{});
         try t.expectEqual(9000 * MB, bill.evictable);
         try t.expectEqual(8000 * MB, bill.reclaimable);

@@ -109,11 +109,13 @@ fn headMxfp8Setting(config: *const ModelConfig) ?bool {
     return config.lm_head_mxfp8_override orelse transformer_mod.cli().lm_head_mxfp8_cli;
 }
 
-/// `LoadCtx.settings_json`: the load settings stated for this model (a plugin that serves them reads them).
-fn loadSettings(buf: []u8, config: *const ModelConfig) []const u8 {
+/// `LoadCtx.settings_json`: the load settings stated for this model (a plugin that serves them reads them): the lossy
+/// `lm_head_mxfp8`, the `mtp` head and `stream_experts`. `buf` holds 96 bytes.
+pub fn loadSettings(buf: []u8, config: *const ModelConfig) []const u8 {
     var w: std.Io.Writer = .fixed(buf);
     w.writeByte('{') catch unreachable;
-    if (headMxfp8Setting(config)) |head| w.print("\"lm_head_mxfp8\":{s}", .{if (head) "true" else "false"}) catch unreachable;
+    if (headMxfp8Setting(config)) |on| w.print("\"lm_head_mxfp8\":{s}", .{if (on) "true" else "false"}) catch unreachable;
+    if (config.mtp_override) |on| w.print("{s}\"mtp\":{s}", .{ if (w.end > 1) "," else "", if (on) "true" else "false" }) catch unreachable;
     if (config.stream_experts_override) |st| {
         if (w.end > 1) w.writeByte(',') catch unreachable;
         switch (st) {
@@ -661,4 +663,14 @@ test "driver: the load settings JSON carries the head and stream_experts setting
     try std.testing.expectEqualStrings("{\"lm_head_mxfp8\":false,\"stream_experts\":true}", loadSettings(&buf, &config));
     config.stream_experts_override = .{ .rows = 64 };
     try std.testing.expectEqualStrings("{\"lm_head_mxfp8\":false,\"stream_experts\":64}", loadSettings(&buf, &config));
+}
+
+test "plugin driver: the load settings carry the model's lm_head_mxfp8 and mtp" {
+    var buf: [96]u8 = undefined;
+    var c: ModelConfig = .{};
+    try std.testing.expectEqualStrings("{}", loadSettings(&buf, &c));
+    c.mtp_override = false;
+    try std.testing.expectEqualStrings("{\"mtp\":false}", loadSettings(&buf, &c));
+    c.lm_head_mxfp8_override = false;
+    try std.testing.expectEqualStrings("{\"lm_head_mxfp8\":false,\"mtp\":false}", loadSettings(&buf, &c));
 }
