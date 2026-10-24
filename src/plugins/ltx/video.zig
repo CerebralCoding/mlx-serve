@@ -3104,7 +3104,7 @@ fn ditX0(comp: *const Component, alloc: std.mem.Allocator, cfg: LtxConfig, vx: m
 }
 
 /// Optional progress sink for long generations (shared with flux/tts servers).
-pub const Progress = @import("../../host/media_jobs/sse.zig").Progress;
+pub const Progress = @import("../../sdk/media/progress.zig").Progress;
 
 /// Whether classifier-free guidance needs the second (negative) DiT forward.
 /// Both scales at 1.0 → guidance is a no-op, so the negative pass is skipped.
@@ -3166,12 +3166,12 @@ fn tryEmitLtxPreview(
 /// already exactly the wanted frames in order.
 fn renderLtxPreview(
     alloc: std.mem.Allocator,
-    opts: @import("../../host/media_jobs/preview.zig").Opts,
+    opts: @import("../../sdk/media/preview.zig").Opts,
     win: ProgressWindow,
     x0_tokens: mlx.mlx_array,
     s: S,
-) !@import("../../host/media_jobs/preview.zig").Encoded {
-    const preview_mod = @import("../../host/media_jobs/preview.zig");
+) !@import("../../sdk/media/preview.zig").Encoded {
+    const preview_mod = @import("../../sdk/media/preview.zig");
     const shp = mlx.getShape(x0_tokens);
     if (shp.len < 3) return error.BadLatentShape;
     const nv: u32 = @intCast(shp[1]);
@@ -5140,7 +5140,7 @@ test "ltx preview: the Latent2RGB preview resembles the decoded frame" {
     const raw = std.c.getenv("LTX_VAE_DIR") orelse std.c.getenv("LTX_TEST_MODEL") orelse return error.SkipZigTest;
     const dir = std.mem.span(raw);
     if (dir.len == 0) return error.SkipZigTest;
-    const preview_mod = @import("../../host/media_jobs/preview.zig");
+    const preview_mod = @import("../../sdk/media/preview.zig");
     const allocator = testing.allocator;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);

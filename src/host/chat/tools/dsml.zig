@@ -5,7 +5,7 @@ const testing = std.testing;
 
 const parseToolCalls = @import("parse.zig").parseToolCalls;
 const ParsedToolCall = @import("parse.zig").ParsedToolCall;
-const appendJsonString = @import("../json_text.zig").appendJsonString;
+const appendJsonString = @import("../../../sdk/util/json_text.zig").appendJsonString;
 
 /// Inkling tool calls: `NAME<|content_invoke_tool_json|>{"name":…,"args":{…}}<|end_message|>`
 /// per call (one message each; parallel calls are consecutive messages). The

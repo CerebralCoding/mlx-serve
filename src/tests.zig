@@ -225,7 +225,7 @@ test {
     _ = @import("sdk/media/image_pixels.zig");
     _ = @import("sdk/media/lora_set.zig");
     _ = @import("sdk/blocks/dit/w8a8_bill.zig");
-    _ = @import("host/media_jobs/plugin_job.zig");
+    _ = @import("sdk/media/job.zig");
     _ = @import("sdk/media/image_request.zig");
     _ = @import("sdk/media/image_pixels.zig");
     _ = @import("sdk/media/mesh_request.zig");
@@ -260,8 +260,8 @@ test {
     _ = @import("plugins/minimax_h3/vae.zig");
     _ = @import("plugins/minimax_h3/audio.zig");
     _ = @import("sdk/media/png.zig");
-    _ = @import("host/media_jobs/jpeg.zig");
-    _ = @import("host/media_jobs/preview.zig");
+    _ = @import("sdk/media/jpeg.zig");
+    _ = @import("sdk/media/preview.zig");
     _ = @import("sdk/mesh/marching_cubes.zig");
     _ = @import("sdk/mesh/glb.zig");
     _ = @import("plugins/hunyuan3d/hunyuan3d.zig");

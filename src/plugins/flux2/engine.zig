@@ -7,7 +7,7 @@ const ops = @import("../../mlx/ops.zig");
 const flux = @import("flux.zig");
 const tok_mod = @import("../../sdk/tokenizer/tokenizer.zig");
 const log = @import("../../sdk/util/log.zig");
-const sse = @import("../../host/media_jobs/sse.zig");
+const sse = @import("../../sdk/media/progress.zig");
 const image_request = @import("../../sdk/media/image_request.zig");
 
 /// Qwen2/3's pad token and mflux's tokenizer max_length: the DiT's text positions are built for this length.

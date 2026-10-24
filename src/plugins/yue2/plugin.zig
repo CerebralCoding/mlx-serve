@@ -4,8 +4,8 @@
 const std = @import("std");
 const abi = @import("../../abi/media.zig");
 const sdk = @import("../../sdk/root.zig");
-const job = @import("../../host/media_jobs/plugin_job.zig");
-const json_str = @import("../../host/chat/json_text.zig");
+const job = @import("../../sdk/media/job.zig");
+const json_str = @import("../../sdk/util/json_text.zig");
 const yue2 = @import("yue2.zig");
 pub const config = @import("config.zig");
 

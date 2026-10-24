@@ -1769,7 +1769,7 @@ const png_mod = @import("../../sdk/media/png.zig");
 const mc = @import("../../sdk/mesh/marching_cubes.zig");
 const mesh_simplify = @import("../../sdk/mesh/mesh_simplify.zig");
 const punet = @import("paint_unet.zig");
-const sse = @import("../../host/media_jobs/sse.zig");
+const sse = @import("../../sdk/media/progress.zig");
 
 pub const PaintOpts = struct {
     steps: u32 = 30,

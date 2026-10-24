@@ -5,7 +5,7 @@
 //! tables are least-squares fits published upstream, not something we derived;
 //! `src/fixtures/latent_rgb.json` pins these numbers and the projection they
 //! produce against the reference's own output (`latent2rgb fixtures` in
-//! src/host/media_jobs/preview.zig).
+//! src/sdk/media/preview.zig).
 //!
 //! Reference: https://github.com/comfyanonymous/ComfyUI
 //! Commit:    8a33128f2f8c5585c57486c07de481241e70a39c

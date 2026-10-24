@@ -8,7 +8,7 @@ const Message = @import("types.zig").Message;
 const ChatConfig = @import("types.zig").ChatConfig;
 const templateRequiresReasoningField = @import("serialize.zig").templateRequiresReasoningField;
 const serializeMessagesJsonFor = @import("serialize.zig").serializeMessagesJsonFor;
-const appendJsonString = @import("json_text.zig").appendJsonString;
+const appendJsonString = @import("../../sdk/util/json_text.zig").appendJsonString;
 
 /// Whether the template READS `reasoning_effort` — i.e. the word is a
 /// BEHAVIORAL lever on this checkpoint (dsv4's preamble, Qwen3.8's and

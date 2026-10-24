@@ -5,9 +5,9 @@ const testing = std.testing;
 
 const parseToolCalls = @import("parse.zig").parseToolCalls;
 const ParsedToolCall = @import("parse.zig").ParsedToolCall;
-const isPlausibleParamName = @import("../json_text.zig").isPlausibleParamName;
-const isJsonLiteral = @import("../json_text.zig").isJsonLiteral;
-const appendJsonString = @import("../json_text.zig").appendJsonString;
+const isPlausibleParamName = @import("../../../sdk/util/json_text.zig").isPlausibleParamName;
+const isJsonLiteral = @import("../../../sdk/util/json_text.zig").isJsonLiteral;
+const appendJsonString = @import("../../../sdk/util/json_text.zig").appendJsonString;
 const freeParsedCalls = @import("dsml.zig").freeParsedCalls;
 
 /// End of a `<parameter=…>` value: the LAST `</parameter>` before the next opener (a value may

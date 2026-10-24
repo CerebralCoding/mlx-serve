@@ -1,18 +1,18 @@
-//! What a media plugin's `step` needs from the host while its backend still speaks the host's job types: the
-//! table's `Progress` as an `sse.Progress`, a request body's top-level fields, and a job error as a `Verdict`.
+//! What a media plugin's `step` needs around its backend: the table's `Progress` as the backend's `progress.Progress`,
+//! a request body's top-level fields, and a job error as a `Verdict`.
 
 const std = @import("std");
 const abi = @import("../../abi/media.zig");
 const mlx = @import("../../mlx/ffi.zig");
-const sse = @import("sse.zig");
+const progress = @import("progress.zig");
 const webp = @import("webp");
-const png = @import("../../sdk/media/png.zig");
+const png = @import("png.zig");
 
 const Verdict = abi.Verdict;
 
 /// `p` as the progress the backends take: `boundary` answers both the per-step poll and the cancel probe, and the
 /// table's `boundary` is where the host gives chat its turn (once per step, never also here).
-pub fn progressOf(p: *const abi.Progress) sse.Progress {
+pub fn progressOf(p: *const abi.Progress) progress.Progress {
     const o = p.preview_opts;
     return .{
         .ctx = @constCast(p),

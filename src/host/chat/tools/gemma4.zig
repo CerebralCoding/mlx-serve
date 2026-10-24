@@ -9,8 +9,8 @@ const ParsedToolCall = @import("parse.zig").ParsedToolCall;
 const looseRepairToolCallJson = @import("json_repair.zig").looseRepairToolCallJson;
 const unwrapDoubleBraces = @import("json_repair.zig").unwrapDoubleBraces;
 const sanitizeToolName = @import("json_repair.zig").sanitizeToolName;
-const isJsonLiteral = @import("../json_text.zig").isJsonLiteral;
-const appendJsonString = @import("../json_text.zig").appendJsonString;
+const isJsonLiteral = @import("../../../sdk/util/json_text.zig").isJsonLiteral;
+const appendJsonString = @import("../../../sdk/util/json_text.zig").appendJsonString;
 
 /// Parse Gemma 4 tool call format: "call:function_name{json_args}"
 /// `input_truncated`: the call had NO `<tool_call|>` close tag — the

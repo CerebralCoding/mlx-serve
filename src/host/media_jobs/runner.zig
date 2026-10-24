@@ -3,6 +3,7 @@
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const gen_sse = @import("sse.zig");
+const media_progress = @import("../../sdk/media/progress.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const log = @import("../../sdk/util/log.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
@@ -94,13 +95,13 @@ pub fn runGenRequests(sch: *Scheduler, reqs: []*GenRequest) void {
     req.model.gen_busy = true;
     var gy = GenYield{ .sch = sch, .step_sw = io_util.Stopwatch.init(sch.io) };
     const hook = gen_sse.Yield{ .ctx = &gy, .step = GenYield.step, .serve_until = GenYield.serveUntil, .wake = GenYield.wake };
-    if (scheduler_mod.gen_yield_enabled) gen_sse.gen_yield = &hook;
+    if (scheduler_mod.gen_yield_enabled) media_progress.gen_yield = &hook;
     // The whole estimated peak, though live memory already holds part of it: the side that
     // cannot OOM.
     sch.gen_reserve_bytes = if (req.peak_bytes > 0) req.peak_bytes else sch.mediaPeakFor(req.model);
     defer {
-        gen_sse.gen_yield = null;
-        gen_sse.stream_conn = null;
+        media_progress.gen_yield = null;
+        media_progress.stream_keepalive = null;
         sch.gen_reserve_bytes = 0;
         sch.queue_mu.lockUncancelable(sch.io);
         invalidateDecodeClocks(sch.decoding.items);
