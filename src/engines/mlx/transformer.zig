@@ -956,7 +956,7 @@ pub const Transformer = struct {
     pub const rmsNorm = @import("../../sdk/blocks/norms/rms.zig").rmsNorm;
     pub const layerNorm = @import("../../sdk/blocks/norms/rms.zig").layerNorm;
     // sdk/quant/ternary.zig
-    pub const ternaryWideVerify = @import("../../sdk/quant/ternary.zig").ternaryWideVerify;
+    pub const ternaryWideVerify = @import("methods/ternary.zig").ternaryWideVerify;
     // sdk/quant/hadamard.zig
     pub const unrotateEmbedding = @import("../../sdk/quant/hadamard.zig").unrotateEmbedding;
     // sdk/blocks/embedding.zig

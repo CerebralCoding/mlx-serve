@@ -645,7 +645,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
         if (moe_layers) |ml| try aliasFusedRotations(reg, ml);
     }
     var ternary_2bit = false;
-    if (ternaryKernelCandidate(&config)) {
+    if (ternaryKernelCandidate(config.hadamard_block, .of(&config))) {
         // An embedding that is not also the lm_head is only ever gathered.
         const gather_only = if (lm_head_b.ctx == emb_b_arr.ctx) mlx.mlx_array{ .ctx = null } else emb_b_arr;
         if (try firstNonTernaryBias(weights, gather_only, s)) |key| {
@@ -672,7 +672,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
     var cfg = config;
     if (cfg.rowExactArch()) {
         const gather_only = if (lm_head_w.ctx == emb_w.ctx) mlx.mlx_array{ .ctx = null } else emb_w;
-        if (firstRowExactMiss(&cfg, weights, gather_only)) |key| {
+        if (firstRowExactMiss(.of(&cfg), weights, gather_only)) |key| {
             log.info("[row-exact] {s} is outside the row kernels: verify rows are not byte-exact\n", .{key});
         } else cfg.row_exact_covered = true;
     }

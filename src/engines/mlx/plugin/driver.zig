@@ -184,7 +184,7 @@ pub fn loadWith(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_di
     // The engine's row-exact sampling reads coverage off the config, measured over the pack as the legacy load does.
     if (trunk and xfm.config.rowExactArch()) {
         const gather_only: Array = if (xfm.lm_head_w.ctx == xfm.emb_w.ctx) .{ .ctx = null } else xfm.emb_w;
-        xfm.config.row_exact_covered = firstRowExactMiss(&xfm.config, &res.weights, gather_only) == null;
+        xfm.config.row_exact_covered = firstRowExactMiss(.of(&xfm.config), &res.weights, gather_only) == null;
     }
     const bound = try a.create(Bound);
     bound.* = .{ .table = b.table, .model = m, .drafters = caps.dflash_capture and trunk, .trunk = trunk };

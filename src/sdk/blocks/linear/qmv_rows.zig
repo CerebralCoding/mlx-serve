@@ -161,10 +161,7 @@ test "firstRowExactMiss: 4, 6 and 8-bit trunk projections are inside the row ker
             }
         }
     };
-    var cfg = ModelConfig{};
-    cfg.quant_bits = 4;
-    cfg.quant_group_size = 64;
-    cfg.quant_mode = .affine;
+    const cfg: @import("../../quant/params.zig").QuantParams = .{ .bits = 4, .group_size = 64, .mode = .affine };
     var w = Weights.init(std.testing.allocator);
     defer w.deinit();
     try Q.put(&w, "m.layers.0.q", 4);
@@ -172,9 +169,9 @@ test "firstRowExactMiss: 4, 6 and 8-bit trunk projections are inside the row ker
     try Q.put(&w, "m.layers.2.q", 8);
     try Q.put(&w, "vision_tower.fc", 3);
     try Q.put(&w, "mtp.layers.0.fc", 3);
-    try std.testing.expectEqual(@as(?[]const u8, null), firstRowExactMiss(&cfg, &w, .{ .ctx = null }));
+    try std.testing.expectEqual(@as(?[]const u8, null), firstRowExactMiss(cfg, &w, .{ .ctx = null }));
     try Q.put(&w, "m.layers.3.q", 3);
-    try std.testing.expectEqualStrings("m.layers.3.q.scales", firstRowExactMiss(&cfg, &w, .{ .ctx = null }).?);
+    try std.testing.expectEqualStrings("m.layers.3.q.scales", firstRowExactMiss(cfg, &w, .{ .ctx = null }).?);
 }
 
 test "msv_qmv_rows is mlx_equal per row to stock M=1 qmv at every head shape, width and group" {
