@@ -1801,6 +1801,8 @@ pub const Generator = struct {
     /// per round, oldest first. One append later costs what one token's does, so a plain stretch pays none.
     dflash_pending: std.ArrayList(mlx.mlx_array) = .empty,
     dflash_pending_rounds: u32 = 0,
+    /// Positions those parked captures cover (a forced commit parks several rows at once).
+    dflash_pending_rows: u32 = 0,
     /// Tree rounds that verified a context copy: consecutive ones that kept
     /// none of it, and rounds left without copies after four of those.
     dflash_copy_misses: u8 = 0,
@@ -4034,6 +4036,7 @@ pub const Generator = struct {
         self.dflash_pending.deinit(allocator);
         self.dflash_pending = .empty;
         self.dflash_pending_rounds = 0;
+        self.dflash_pending_rows = 0;
         if (self.mtp_hist_stash) |*st| {
             st.deinit();
             self.mtp_hist_stash = null;
@@ -4228,12 +4231,14 @@ pub const Generator = struct {
         /// regular tick to publish.
         emitted: []const u32,
         stopped: bool,
+        /// The forward's DFlash taps joined the assistant context: DFlash may keep drafting.
+        dflash_synced: bool = false,
     };
 
     /// Commit `forced` through the model as ONE multi-token forward, from any
     /// of the three inter-tick states (pipelined, spec exit, shim-seeded), and
     /// leave the generator in the shim-seeded state a regular `next()` reads.
-    /// The caller routes every later tick through the regular path.
+    /// A bound DFlash drafter's taps for the span are parked (`ForcedCommit.dflash_synced`).
     pub fn commitForcedTokens(self: *Generator, allocator: std.mem.Allocator, forced: []const u32) !ForcedCommit {
         std.debug.assert(forced.len > 0);
         var emitted = std.ArrayList(u32).empty;
@@ -4274,7 +4279,21 @@ pub const Generator = struct {
         const shape = [_]c_int{ 1, @intCast(input.items.len) };
         const tok_input = mlx.mlx_array_new_data(ids_i32.ptr, &shape, 2, .int32);
         defer _ = mlx.mlx_array_free(tok_input);
-        const all_logits = try self.xfm.forwardWith(&self.ctx, tok_input);
+        const dflash_live = self.dflash != null and self.dflash_ctx != null and !self.spec_disabled_runtime;
+        const caps = try allocator.alloc(mlx.mlx_array, if (dflash_live) self.dflash.?.config.target_layer_ids.len else 0);
+        defer {
+            for (caps) |a| _ = mlx.mlx_array_free(a);
+            allocator.free(caps);
+        }
+        for (caps) |*a| a.* = mlx.mlx_array_new();
+        var cl = transformer_mod.CaptureLayers{ .ids = if (dflash_live) self.dflash.?.config.captureIds() else &.{}, .out = caps };
+        if (dflash_live) {
+            self.ctx.capture_layers = &cl;
+            self.ctx.capture_ssm_seq = false; // a forced span never rolls back
+        }
+        const forward = self.xfm.forwardWith(&self.ctx, tok_input);
+        self.ctx.capture_layers = null;
+        const all_logits = try forward;
         defer _ = mlx.mlx_array_free(all_logits);
         const shp = mlx.getShape(all_logits);
         var logits = mlx.mlx_array_new();
@@ -4284,13 +4303,15 @@ pub const Generator = struct {
         try mlx.check(mlx.mlx_slice(&logits, all_logits, &start, 3, &stop, 3, &strides, 3, self.xfm.s));
         const arr = [_]mlx.mlx_array{logits};
         const vec = mlx.mlx_vector_array_new_data(&arr, 1);
+        for (caps) |c| _ = mlx.mlx_vector_array_append_value(vec, c);
         _ = mlx.mlx_async_eval(vec);
         _ = mlx.mlx_vector_array_free(vec);
         self.pending_logits = logits;
         self.has_pending_logits = true;
         self.next_token_id = forced[forced.len - 1];
         self.mtp_hidden_stale = true;
-        return .{ .emitted = try emitted.toOwnedSlice(allocator), .stopped = false };
+        if (dflash_live) try self.dflashPark(allocator, caps, @intCast(input.items.len));
+        return .{ .emitted = try emitted.toOwnedSlice(allocator), .stopped = false, .dflash_synced = dflash_live };
     }
 
     /// Result of one `nextPld` step. Yields 1..=(1+max_draft_len) tokens.
@@ -5594,6 +5615,8 @@ pub const Generator = struct {
             if (!policy_draft and self.dflashCanPipeline()) return try self.dflashPlainPipelined(allocator);
             pol.plain_watch = null;
             if (self.has_pending_logits or self.has_pending_token) return try self.dflashLeavePipeline(allocator);
+        } else if (self.has_pending_logits or self.has_pending_token) {
+            return try self.dflashLeavePipeline(allocator);
         }
 
         // Per-round width: the chooser's argmax over measured tokens/ms
@@ -5657,7 +5680,7 @@ pub const Generator = struct {
         const kv_step_snap = self.ctx.cache.step;
         // A drafted round reads the whole context: whatever the plain rounds parked joins it first.
         if (m_draft > 0) try self.dflashFlushPending(allocator);
-        std.debug.assert(dctx.absLen() + self.dflash_pending_rounds == anchor_pos);
+        std.debug.assert(dctx.absLen() + self.dflash_pending_rows == anchor_pos);
 
         const tracing = dflashTraceEnabled();
         var ph: io_util.Stopwatch = undefined;
@@ -6394,7 +6417,7 @@ pub const Generator = struct {
         };
         if (serial) self.sampling.draw = self.generated_ids.items.len + 2;
 
-        try self.dflashPark(allocator, caps);
+        try self.dflashPark(allocator, caps, 1);
 
         const tokens = try allocator.alloc(u32, 1);
         errdefer allocator.free(tokens);
@@ -6412,10 +6435,11 @@ pub const Generator = struct {
     }
 
     /// Park one forward's captures (and take them over: the caller's handles are left empty).
-    fn dflashPark(self: *Generator, allocator: std.mem.Allocator, caps: []mlx.mlx_array) !void {
+    fn dflashPark(self: *Generator, allocator: std.mem.Allocator, caps: []mlx.mlx_array, rows: u32) !void {
         try self.dflash_pending.appendSlice(allocator, caps);
         for (caps) |*a| a.* = .{ .ctx = null };
         self.dflash_pending_rounds += 1;
+        self.dflash_pending_rows += rows;
         if (self.dflash_pending_rounds >= DFLASH_PENDING_MAX) try self.dflashFlushPending(allocator);
     }
 
@@ -6468,7 +6492,7 @@ pub const Generator = struct {
         defer _ = mlx.mlx_vector_array_free(vec);
         for (caps) |c| _ = mlx.mlx_vector_array_append_value(vec, c);
         try mlx.check(mlx.mlx_async_eval(vec));
-        try self.dflashPark(allocator, caps);
+        try self.dflashPark(allocator, caps, 1);
         for (caps) |*a| a.* = mlx.mlx_array_new();
     }
 
@@ -6509,6 +6533,7 @@ pub const Generator = struct {
         for (self.dflash_pending.items) |a| _ = mlx.mlx_array_free(a);
         self.dflash_pending.clearRetainingCapacity();
         self.dflash_pending_rounds = 0;
+        self.dflash_pending_rows = 0;
         const eval_vec = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(eval_vec);
         dctx.appendEvalArrays(eval_vec);
@@ -6517,7 +6542,7 @@ pub const Generator = struct {
 
     /// The assistant context's length once the parked captures are counted: the trunk's cursor, always.
     pub fn dflashContextLen(self: *const Generator) usize {
-        return self.dflash_ctx.?.absLen() + self.dflash_pending_rounds;
+        return self.dflash_ctx.?.absLen() + self.dflash_pending_rows;
     }
 
     /// Bring the assistant context to the position `covers` (the committed prefix): parked captures appended, and a

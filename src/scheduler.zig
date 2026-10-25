@@ -9352,7 +9352,7 @@ fn commitForcedTick(sch: *Scheduler, slot: *Slot, gen: *Generator, forced: []con
         finishSlot(sch, slot, gen.finish_reason);
         return false;
     }
-    if (!try gen.mtpResumeAfterForced(slot.allocator)) {
+    if (!r.dflash_synced and !try gen.mtpResumeAfterForced(slot.allocator)) {
         gen.spec_disabled_runtime = true;
         gen.spec_disable_reason = reason;
     }
