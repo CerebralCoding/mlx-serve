@@ -344,7 +344,7 @@ pub const ModelConfig = struct {
     /// config does.
     ngram_table_path: ?[]const u8 = null,
     /// The pack's directory: deepseek_v41's Engram tables sit beside the
-    /// weights, an mlx-stream pack (DeepSeek-V4.1, `glm_stream` or `glm5_stream`) loads from it, and an `expert_bank`
+    /// weights, an mlx-stream pack (`glm_stream`) loads from it, and an `expert_bank`
     /// pack streams its experts from it. Set by `parseConfig`.
     pack_dir: ?[]const u8 = null,
 
@@ -490,10 +490,6 @@ pub const ModelConfig = struct {
     /// A GLM-5.3 pack (`glm_moe_dsa`, its routed experts in an `experts.bin` bank): mlx-stream serves it
     /// (`arch/mlx_stream.zig`) and loads its weights. Set by `parseConfig`.
     glm_stream: bool = false,
-    /// A GLM-5.3-Flash pack prepared for mlx-stream (`glm5_next`, its config declares `expert_streaming`: the NVFP4
-    /// bank): mlx-stream serves it (`arch/mlx_stream.zig`) and loads its weights; a `glm5_next` config without the
-    /// block is the host's resident arch. Set by `parseConfig`.
-    glm5_stream: bool = false,
 
     // BERT encoder-only
     is_encoder_only: bool = false,
@@ -1210,7 +1206,7 @@ pub const ModelConfig = struct {
 
     /// The pack is mlx-stream's (`arch/mlx_stream.zig`): a GLM-5.3 or GLM-5.3-Flash pack.
     pub fn mlxStream(self: *const ModelConfig) bool {
-        return self.glm_stream or self.glm5_stream;
+        return self.glm_stream;
     }
 
     pub fn isMoe(self: *const ModelConfig) bool {
@@ -7355,7 +7351,7 @@ test "parseConfig: a glm5_next pack that declares expert_streaming streams its e
     const dir = buf[0..try tmp.dir.realPath(io, &buf)];
     var resident = try parseConfig(io, testing.allocator, dir);
     defer resident.deinit(testing.allocator);
-    try testing.expect(resident.isGlm5() and !resident.glm5_stream and !resident.mlxStream());
+    try testing.expect(resident.isGlm5() and !resident.expert_bank and !resident.mlxStream());
     const marked = try std.mem.replaceOwned(u8, testing.allocator, glm5_next_pack_json, "\"model_type\": \"glm5_next\",", "\"model_type\": \"glm5_next\", \"expert_streaming\": {\"family\": \"mlx-stream\", \"format\": \"mlx-stream-nvfp4-expert-bank-v1\", \"manifest\": \"expert-manifest.json\"},");
     defer testing.allocator.free(marked);
     try testing.expect(!std.mem.eql(u8, marked, glm5_next_pack_json));

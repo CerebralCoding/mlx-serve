@@ -8,12 +8,13 @@ const std = @import("std");
 const sdk = @import("sdk");
 const mlx = sdk.mlx;
 const sdk_ext = @import("sdk_ext.zig");
-const experts = @import("../../../plugins/glm5_next/stream/experts.zig");
-const settings = @import("../../../plugins/glm5_next/stream/settings.zig");
-const gpu_warm = @import("../../../plugins/mimo_v2/stream/gpu_warm.zig");
+const experts = @import("glm5n/experts.zig");
+const settings = @import("glm5n/settings.zig");
+const prompt_levers = @import("glm5n/prompt_levers.zig");
+const gpu_warm = @import("mimo/gpu_warm.zig");
 const expert_usage = sdk_ext.expert.usage;
-const exl3_bank = @import("../../../plugins/glm5_next/stream/exl3_bank.zig");
-const mimo_stream = @import("../../../plugins/mimo_v2/stream/stream.zig");
+const exl3_bank = @import("glm5n/exl3_bank.zig");
+const mimo_stream = @import("mimo/stream.zig");
 
 const T = mlx.mlx_array;
 pub const Gate = experts.Gate;
@@ -47,17 +48,19 @@ pub const Source = struct {
     /// decode rows). `gates`: every model layer's router as stored (bf16 `[experts, hidden]`) and its correction bias,
     /// the dense layers' empty (borrowed for the source's life).
     pub fn open(a: std.mem.Allocator, io: std.Io, dir: []const u8, s: mlx.mlx_stream, gates: []const Gate, n_moe: u32, n_experts: u32, slot_rows: sdk.Rows) !*Source {
-        var cfg: settings.Config = .{ .expert_family = .exl3 };
         const prompt_rows = try a.alloc(u32, n_moe);
         defer a.free(prompt_rows);
         const decode_rows = try a.alloc(u32, n_moe);
         defer a.free(decode_rows);
-        try settings.layerRows(cfg.expert_rows_by_layer, slot_rows, n_experts, prompt_rows, decode_rows);
-        const inner = try experts.Exl3Source.init(a, io, dir, prompt_rows, decode_rows, gates, s, cfg.decode_moe, cfg.decode_predict, cfg.warmRoute(gpu_warm.gpuStream(s)), cfg.tally, cfg.exl3_forms, cfg.prompt, cfg.missReadsRoute(), cfg.prompt_residents);
+        try settings.layerRows(settings.defaultLayerRows(), slot_rows, n_experts, prompt_rows, decode_rows);
+        // The stack of record's routes: the decode hit pass, the BF16 predictor, the keep-warm waits on a GPU stream, no
+        // rate tally, the EXL3 forms, the prompt levers, direct demand reads, the prompt residents kept.
+        const warm: gpu_warm.Route = if (gpu_warm.gpuStream(s)) .waits else .off;
+        const inner = try experts.Exl3Source.init(a, io, dir, prompt_rows, decode_rows, gates, s, .hitpass, .bf16, warm, .{ .ratio = settings.default_tally_ratio }, .{}, prompt_levers.Settings{}, .direct, .keep);
         errdefer inner.deinit();
-        if (cfg.fusionRoutes().merge_waits) try inner.ex.bindMergeGateWaits();
+        try inner.ex.bindMergeGateWaits();
         _ = try inner.prebuildExperts();
-        var d = try expert_usage.decide(a, io, &cfg.residency, dir, "glm5_next", n_moe, n_experts);
+        var d = try expert_usage.decide(a, io, &expert_usage.Settings{}, dir, "glm5_next", n_moe, n_experts);
         defer if (d.profile) |*p| p.deinit();
         if (d.profile) |*p| _ = try inner.seedResidents(p);
         const self = try a.create(Source);

@@ -25,17 +25,9 @@ pub const glm = struct {
     pub const generation_headroom: u64 = @import("plugins/glm_moe_dsa/settings.zig").Config.default_max_output;
 };
 
-/// What the host's glue calls for the fourth arch: GLM-5.3-Flash (`glm5_next`, the NVFP4 pack): its entry points, the
-/// context a load bills when the model sets none (the standard request: 16,384 prompt tokens and 1,024 generated) and
-/// the positions a request may generate past it (none: the context holds the generation).
-pub const glm5_next = struct {
-    pub const arch = @import("plugins/glm5_next/stream/root.zig");
-    pub const default_context: u64 = @import("plugins/glm5_next/stream/settings.zig").fill_reserve_tokens;
-    pub const generation_headroom: u64 = 0;
-};
 
 /// Every arch the package serves through the SDK's table (`sdk.Arch.of`), in claim order (the conformance suite's list;
-/// the host's glue binds each arch by its own entry: `glm` and `glm5_next`).
+/// the host's glue binds each arch by its own entry: `glm`).
 pub const archs = .{@import("plugins/glm_moe_dsa/arch.zig")};
 pub const sdk = @import("sdk");
 /// The expert bank source a resident trunk streams its routed experts from (`sdk/weights/streamed.zig` `Streamed`).

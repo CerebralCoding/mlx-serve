@@ -16,7 +16,7 @@ import os
 import sys
 
 SRC = 'src/sdk/quant/exl3/stream/kernels/exl3'
-DST = 'src/plugins/glm5_next/stream/kernels/exl3'
+DST = 'src/sdk/weights/streamed/glm5n/kernels/exl3'
 
 
 def sub(text, pairs, name):

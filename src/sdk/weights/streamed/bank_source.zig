@@ -8,8 +8,8 @@ const std = @import("std");
 const sdk = @import("sdk");
 const mlx = sdk.mlx;
 const ops = @import("ops.zig");
-const bank_mod = @import("../../../plugins/mimo_v2/stream/bank.zig");
-const stream_mod = @import("../../../plugins/mimo_v2/stream/stream.zig");
+const bank_mod = @import("mimo/bank.zig");
+const stream_mod = @import("mimo/stream.zig");
 const G = ops.MlxOps;
 
 const T = mlx.mlx_array;

@@ -1,5 +1,5 @@
 //! The streaming packs on mlx-stream (module `mlx_stream`, rooted at `src/mlx_stream.zig`):
-//! GLM-5.3's pack (`ModelConfig.glm_stream`) and GLM-5.3-Flash's NVFP4 pack (`ModelConfig.glm5_stream`).
+//! GLM-5.3's pack (`ModelConfig.glm_stream`).
 //! The plugin owns each arch, its kernels and the expert streamer, and loads its own weights; the host parses the
 //! config, renders the template, samples and schedules. The plugin exports one glue surface per arch (`arch`,
 //! `default_context`, `generation_headroom`): `glm`'s for GLM-5.3, `glm5_next`'s for GLM-5.3-Flash.
@@ -26,17 +26,17 @@ pub fn setForeignBytes(n: u64) void {
 }
 
 /// The plugin's arches this host serves.
-const Kind = enum { glm, glm5 };
+const Kind = enum { glm };
 
 fn Side(comptime k: Kind) type {
     return switch (k) {
         .glm => plugin.glm,
-        .glm5 => plugin.glm5_next,
     };
 }
 
 fn kindOf(config: *const ModelConfig) Kind {
-    return if (config.glm_stream) .glm else .glm5;
+    _ = config;
+    return .glm;
 }
 
 fn Bound(comptime k: Kind) type {
@@ -47,7 +47,7 @@ fn Bound(comptime k: Kind) type {
 pub const Model = struct {
     gpa: std.mem.Allocator,
     /// The arch's config and module (it keeps references into `weights`).
-    arch: union(Kind) { glm: Bound(.glm), glm5: Bound(.glm5) },
+    arch: union(Kind) { glm: Bound(.glm) },
     /// The trunk the module binds.
     weights: sdk.Weights,
     /// The request `begin` started: its prompt pass's shape, then its decode handover.
@@ -237,10 +237,7 @@ pub fn loadBytes(gpa: std.mem.Allocator, io: std.Io, config: *const ModelConfig)
 /// Positions a request may span: the prompts the load bills (the model's context, else the plugin's standard
 /// request) and the generation past them (GLM-5.3: its arch's `maxOutput`).
 pub fn contextLength(config: *const ModelConfig) u32 {
-    return switch (kindOf(config)) {
-        .glm => @intCast(billedContext(.glm, config) + maxOutputOf(config.pack_dir.?)),
-        inline else => |k| @intCast(billedContext(k, config) + Side(k).generation_headroom),
-    };
+    return @intCast(billedContext(.glm, config) + maxOutputOf(config.pack_dir.?));
 }
 
 pub fn open(gpa: std.mem.Allocator, io: std.Io, s: mlx.mlx_stream, config: *const ModelConfig) !*Model {
@@ -400,15 +397,6 @@ pub fn laneReceipt(m: *Model, buf: []u8) ?[]const u8 {
 
 const testing = std.testing;
 
-test "mlx_stream: a GLM-5.3-Flash request spans the billed context (its generation inside it)" {
-    try testing.expectEqual(@as(u64, 0), plugin.glm5_next.generation_headroom);
-    var config: ModelConfig = .{ .model_type = "glm5_next", .pack_dir = "/packs/glm-5.3-flash", .glm5_stream = true, .ctx_override = 32768 };
-    try testing.expectEqual(Kind.glm5, kindOf(&config));
-    try testing.expectEqual(@as(u32, 32768), contextLength(&config));
-    config.ctx_override = 0;
-    try testing.expectEqual(@as(u32, @intCast(plugin.glm5_next.default_context)), contextLength(&config));
-}
-
 test "mlx_stream: a model that sets no context takes the largest rung whose load fits; none fitting keeps the standard request" {
     const Bills = struct {
         per_token: u64,
@@ -432,12 +420,11 @@ test "mlx_stream: a model that sets no context takes the largest rung whose load
     };
     try testing.expectEqual(@as(?u64, 65536), largestFitting(1, &auto_context_rungs, Broken{}));
     // The recorded auto context is what `contextLength` reads for a model without ctx_size.
-    var config: ModelConfig = .{ .model_type = "glm5_next", .pack_dir = "/packs/glm5-stream", .glm5_stream = true, .ctx_override = 0 };
-    try testing.expectEqual(@as(u32, @intCast(plugin.glm5_next.default_context)), contextLength(&config));
-    glueState().auto_context.note("/packs/glm5-stream", 131072);
-    try testing.expectEqual(@as(u32, 131072), contextLength(&config));
+    var config: ModelConfig = .{ .model_type = "glm_moe_dsa", .pack_dir = "/packs/glm-stream", .glm_stream = true, .ctx_override = 0 };
+    glueState().auto_context.note("/packs/glm-stream", 131072);
+    try testing.expectEqual(@as(u32, 131072 + 131072), contextLength(&config));
     config.ctx_override = 40000;
-    try testing.expectEqual(@as(u32, 40000), contextLength(&config));
+    try testing.expectEqual(@as(u32, 40000 + 131072), contextLength(&config));
 }
 
 test "mlx_stream: a GLM-5.3 request spans the billed context and the arch's maxOutput (131,072 by default)" {
