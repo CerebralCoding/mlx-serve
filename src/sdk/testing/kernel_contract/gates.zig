@@ -236,7 +236,9 @@ pub fn shapes(a: std.mem.Allocator, k: Kernel, seed: u64) !Verdict {
         for (want, mag, 0..) |w, m, i| {
             const o = c.readOut(k.spec, shape, out, i);
             const got = o.v;
-            const q = if (got == w) 0 else @abs(got - w) / c.bound(k.spec, o.elem, shape, w, m);
+            // A GPU that flushes f32 subnormals (M4) reads a subnormal reference as zero.
+            const flushed = got == 0 and @abs(w) < std.math.floatMin(f32);
+            const q = if (got == w or flushed) 0 else @abs(got - w) / c.bound(k.spec, o.elem, shape, w, m);
             if (!(q <= 1)) return say(.fail, .shapes, name, "at {d}x{d}x{d} output {d} is {e:.6} where float64 gives {e:.6}: {d:.2} of its bound", .{ shape.rows, shape.n, shape.k, i, got, w, q });
             worst = @max(worst, q);
         }

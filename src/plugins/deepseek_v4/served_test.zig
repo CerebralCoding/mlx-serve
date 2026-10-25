@@ -247,7 +247,8 @@ fn expectDspark(comptime P: type, files: []const sdk.fixture.File, sampling: Sam
         rec[r.tokens.len..][0..3].* = .{ r.accepted_tokens, gen.next_token_id, @intCast(gen.ctx.cache.step) };
         try p.checkInts(&g, rec[0 .. r.tokens.len + 3], true);
     }
-    try testing.expect(gen.dspark_attempted >= 4 and gen.dspark_accepted_tokens >= min_accepted);
+    // How many drafts the random pack accepts is a property of the recording GPU's numerics.
+    if (p.tape.same_device) try testing.expect(gen.dspark_attempted >= 4 and gen.dspark_accepted_tokens >= min_accepted);
     try p.tape.expectDone();
 }
 

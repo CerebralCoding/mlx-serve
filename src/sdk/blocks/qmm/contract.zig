@@ -1890,7 +1890,7 @@ pub fn register(set: *kc.Set) !void {
         if (r[0].kind == .prefill) l.header = try lane_qmm.prefillHeader();
         const tiles: [3]spec.Tile = if (r[0].kind == .prefill) .{ .{}, .{}, .{} } else .{ .{ .size = 16, .step = 1, .min = 1 }, .{}, .{} };
         var sp = affineSpec(laneName(r[0]), .bf16, r[1], tiles, if (r[0].kind == .prefill) "MLX quantized_matmul (its NAX qmm, K unsplit)" else null);
-        sp.nax = r[0].kind == .prefill;
+        sp.nax = true; // the engine tiles lane weights and reads them only where naxAvailable()
         try set.add(Lane, .init(a, l, r[0]), sp, null);
     }
     inline for (.{ .{ "nax2_qmm_m16 f16 (2-bit, group 128)", .float16 }, .{ "nax2_qmm_m16 bf16 (2-bit, group 128)", .bfloat16 } }) |r| {
