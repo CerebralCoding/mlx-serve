@@ -178,6 +178,8 @@ pub const LoadParams = struct {
 /// deinit).
 pub const SubmitParams = struct {
     prompt_ids: []const u32,
+    /// Where the request's events go (`abi.Event`): the host's stream. Null = the slot's own buffer only.
+    sink: ?@import("../../../abi/engine.zig").Sink = null,
     /// Full original prompt for PLD lookup. When null, defaults to
     /// `prompt_ids` (PLD's lookup table = full_prompt + generated).
     full_prompt: ?[]const u32 = null,
