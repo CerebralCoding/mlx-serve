@@ -10,8 +10,8 @@ const Scheduler = @import("scheduler.zig").Scheduler;
 const Slot = @import("slot.zig").Slot;
 
 /// A thinking budget at its limit: commit the early-stop line and the closer
-/// through the model this tick, and decode the answer regular from here on
-/// (`spec_disable_reason = .think_bound`). True = the slot's tick is spent.
+/// through the model this tick; an MTP slot ramps back to speculating, any other
+/// spec mode decodes regular (`spec_disable_reason = .think_bound`). True = the slot's tick is spent.
 pub fn thinkBoundTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
     const tb = gen.sampling.think_bound orelse return false;
     tb.observe(gen.generated_ids.items);
@@ -46,8 +46,8 @@ pub fn toolForceTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
     return true;
 }
 
-/// Commit `forced` through the model and publish it; the slot decodes regular
-/// from here. False = the pending token stopped the slot first.
+/// Commit `forced` through the model and publish it; an MTP or DFlash slot keeps
+/// speculating, any other decodes regular. False = the pending token stopped the slot first.
 pub fn commitForcedTick(sch: *Scheduler, slot: *Slot, gen: *Generator, forced: []const u32, reason: generate_mod.SpecDisableReason) !bool {
     const r = try gen.commitForcedTokens(slot.allocator, forced);
     defer slot.allocator.free(r.emitted);
@@ -61,12 +61,9 @@ pub fn commitForcedTick(sch: *Scheduler, slot: *Slot, gen: *Generator, forced: [
         finishSlot(sch, slot, gen.finish_reason);
         return false;
     }
-    gen.spec_disabled_runtime = true;
-    gen.spec_disable_reason = reason;
+    if (!r.dflash_synced and !try gen.mtpResumeAfterForced(slot.allocator)) {
+        gen.spec_disabled_runtime = true;
+        gen.spec_disable_reason = reason;
+    }
     return true;
-}
-
-pub fn thinkBoundFired(gen: *const Generator) bool {
-    const tb = gen.sampling.think_bound orelse return false;
-    return tb.fired;
 }

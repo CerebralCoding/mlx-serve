@@ -1,8 +1,7 @@
 //! The pinned Metal kernel registry of GLM-5.3's trunk routes: the indexer's top-k (`topk.zig`: one buffer of rows, or
 //! up to eight rows of their own lengths in one launch) and the decode lane's routed combine (`experts.zig`). The texts
 //! under kernels/glm_moe_dsa/ with a manifest of their signatures, template parameters, threadgroups, registered
-//! instantiations (GLM-5.3's and the tiny fixture's) and checks; `scripts/glm_trunk_manifest.py` writes it and prints its
-//! pin. `Registry.init` checks the manifest against `manifest_sha256` and every text against the manifest, once, and
+//! instantiations (GLM-5.3's and the tiny fixture's) and checks, pinned by its sha256. `Registry.init` checks the manifest against `manifest_sha256` and every text against the manifest, once, and
 //! refuses by name; `Registry.bind` builds the mlx fast kernels on a GPU stream, once. The set is
 //! `sdk_ext.kernels.KernelSet`'s: the module builds it at its construction, where a route takes a kernel, and runs each
 //! route's kernels once at the model's instantiation there (`selfcheck`), never inside a request.
@@ -16,7 +15,7 @@ pub const selfcheck = @import("trunk_selfcheck.zig");
 
 const Allocator = std.mem.Allocator;
 
-/// sha256 of kernels/glm_moe_dsa/manifest.json (scripts/glm_trunk_manifest.py prints it): pins every text.
+/// sha256 of kernels/glm_moe_dsa/manifest.json: pins every text.
 pub const manifest_sha256 = "b88bc31a210fda60daa31e068cdc1e16f1da9a2147e06409470597f2084310f8";
 pub const format = "mlx-stream-glm-trunk-kernels-v1";
 const dir = "kernels/";

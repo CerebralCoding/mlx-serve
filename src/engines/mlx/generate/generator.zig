@@ -223,6 +223,8 @@ pub const Generator = struct {
     /// per round, oldest first. One append later costs what one token's does, so a plain stretch pays none.
     dflash_pending: std.ArrayList(mlx.mlx_array) = .empty,
     dflash_pending_rounds: u32 = 0,
+    /// Positions those parked captures cover (a forced commit parks several rows at once).
+    dflash_pending_rows: u32 = 0,
     /// Tree rounds that verified a context copy: consecutive ones that kept
     /// none of it, and rounds left without copies after four of those.
     dflash_copy_misses: u8 = 0,
@@ -594,6 +596,7 @@ pub const Generator = struct {
         self.dflash_pending.deinit(allocator);
         self.dflash_pending = .empty;
         self.dflash_pending_rounds = 0;
+        self.dflash_pending_rows = 0;
         if (self.mtp_hist_stash) |*st| {
             st.deinit();
             self.mtp_hist_stash = null;
@@ -765,6 +768,7 @@ pub const Generator = struct {
     pub const mtpPreDraftOpen = @import("../spec/mtp/serial.zig").mtpPreDraftOpen;
     pub const mtpGroupPreDraft = @import("../spec/mtp/serial.zig").mtpGroupPreDraft;
     pub const mtpSerialMayResume = @import("../spec/mtp/serial.zig").mtpSerialMayResume;
+    pub const mtpResumeAfterForced = @import("../spec/mtp/serial.zig").mtpResumeAfterForced;
     pub const mtpDetachHead = @import("../spec/mtp/serial.zig").mtpDetachHead;
     pub const mtpApplyStash = @import("../spec/mtp/serial.zig").mtpApplyStash;
     const mtpSerialOneToken = @import("../spec/mtp/serial.zig").mtpSerialOneToken;

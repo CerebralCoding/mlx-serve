@@ -15,7 +15,7 @@ pub const selfcheck = @import("selfcheck.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
-/// sha256 of kernels/glm53_exl3/manifest.json (scripts/glm53_exl3_manifest.py prints it): pins every text.
+/// sha256 of kernels/glm53_exl3/manifest.json: pins every text.
 pub const manifest_sha256 = "e03389a3295242904c6ae3393f4c9bc309351e1e34b66b20d6234d0a34217ca9";
 pub const format = "mlx-stream-glm53-exl3-kernels-v1";
 const dir = "../../../sdk/quant/exl3/stream/kernels/glm53_exl3/";

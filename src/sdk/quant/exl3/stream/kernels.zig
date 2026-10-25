@@ -157,7 +157,7 @@ pub const Kernel = enum {
     dsv41_exl3_b3_pair_k3_5120,
     dsv41_exl3_b3_guone_k3_2304,
     dsv41_jl_combine_bf16,
-    // The K = 2 twins (10-20, scripts/dsv41_exl3_k2_gen.py): layers whose EXL3 code tiles are 16 u32 words (2 bits per
+    // The K = 2 twins (10-20): layers whose EXL3 code tiles are 16 u32 words (2 bits per
     // weight) decode and prefill through these; a layer's K reaches the dispatch as its code array's tile width
     dsv41_exl3_mul1h_k2_2304,
     dsv41_exl3_mul1h_k2_5120,

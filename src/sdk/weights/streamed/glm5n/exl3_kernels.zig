@@ -1,7 +1,7 @@
 //! GLM-5.3-Flash's EXL3 K=3 expert kernels (the seam of the `exl3` expert family): DeepSeek-V4.1's mul1h texts at
-//! GLM's expert shape (hidden 4096, inter 2048) as compile-time instantiations. `scripts/glm5next_exl3_kernels_gen.py`
-//! writes `src/kernels/glm5_next_exl3/` from `src/kernels/exl3/` by exact text replacement: each shape literal becomes a
-//! template constant (HID, INTER, IT, OT, KD, ND, SGS), the arithmetic, its order and the bank reads stay DeepSeek's. The
+//! GLM's expert shape (hidden 4096, inter 2048) as compile-time instantiations. The texts in kernels/exl3/ are
+//! DeepSeek's with each shape literal a template constant (HID, INTER, IT, OT, KD, ND, SGS); the arithmetic, its order
+//! and the bank reads stay DeepSeek's. The
 //! DIG-X GEMMs read DeepSeek's `header_dig_mul1h_k3.metal` as it is (no shape literal in it).
 //!
 //! The seam (what the glm5_next decode stack and prompt path call; a kernel variant keeps these signatures):
@@ -95,7 +95,7 @@ pub const texts: [n_kernels][:0]const u8 = .{
 pub const header_gemm: [:0]const u8 = @embedFile("../../../quant/exl3/stream/kernels/exl3/header_dig_mul1h_k3.metal");
 pub const header_onepass: [:0]const u8 = @embedFile("../../../quant/exl3/stream/kernels/exl3/header_dig2_x.metal") ++ @embedFile(dir ++ "header_glm5n_exl3_dig2.metal");
 
-/// sha256 of each text as `scripts/glm5next_exl3_kernels_gen.py` writes it (checked once at install and in the tests).
+/// sha256 of each text (checked once at install and in the tests).
 pub const text_sha256 = [n_kernels]*const [64]u8{
     "6b5d6987c06750e44ff16cd4d92142ede9b1693643cae6c1ec6391cfad8162d2",
     "632af1fde45f91dd64b1c7c4ba05562d50bdcf4587fbe4e6ca5a91d64a5c6bbe",
@@ -277,7 +277,7 @@ pub const Kernels = struct {
 /// width, one launch of each decode text over zeros as the compile check. Refused by name.
 pub fn install(a: std.mem.Allocator, s: mlx.mlx_stream, diag: *sdk.Diag) !*Kernels {
     checkPins() catch |e| {
-        diag.set("glm5_next exl3 kernels: a text is not the pinned one (scripts/glm5next_exl3_kernels_gen.py --check)", .{});
+        diag.set("glm5_next exl3 kernels: a text is not the pinned one", .{});
         return e;
     };
     if (!mlx.streamIsGpu(s)) {

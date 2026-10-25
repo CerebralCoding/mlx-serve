@@ -4,7 +4,7 @@
 //! construction-time route: `install` builds the chosen form's launches for every wave width once; `gateUp` / `down`
 //! keep the seam's signatures and run them with no per-call choice.
 //!
-//! Forms (texts in src/kernels/glm5_next_exl3_forms/; `scripts/glm5next_exl3_forms_gen.py` writes the generated ones):
+//! Forms (texts in kernels/exl3_forms/):
 //!   gate / up (`GuForm`): `seam` (two GEMV launches + gu_epi), `guone` (DeepSeek's gu_one: both GEMVs in one launch).
 //!   down (`DnForm`): `seam`, `pair` (DeepSeek's down_pair).
 //! Every form keeps the seam's arithmetic and order per output word (fma chains per lane over the k-tiles, the column
@@ -50,7 +50,7 @@ pub const texts: [n_kernels][:0]const u8 = blk: {
     for (std.meta.fieldNames(Kernel), 0..) |n, i| out[i] = @embedFile(dir ++ n ++ ".metal");
     break :blk out;
 };
-/// sha256 of each text as `scripts/glm5next_exl3_forms_gen.py` writes it.
+/// sha256 of each text.
 pub const text_sha256 = [n_kernels]*const [64]u8{
     "85dcbd286beb00d7ec1f80b298967859090c0f8aedf29824380a5c5027df3374",
     "0732d4840889255ad9499b30e1431fc2ff78ec19d72ebc89f5a1d9df31440110",

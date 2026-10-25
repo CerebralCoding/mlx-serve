@@ -145,6 +145,8 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
         if (!policy_draft and self.dflashCanPipeline()) return try self.dflashPlainPipelined(allocator);
         pol.plain_watch = null;
         if (self.has_pending_logits or self.has_pending_token) return try self.dflashLeavePipeline(allocator);
+    } else if (self.has_pending_logits or self.has_pending_token) {
+        return try self.dflashLeavePipeline(allocator);
     }
 
     var round_width: u32 = @max(self.dflash_block_size, 2) - 1;
@@ -184,7 +186,7 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
     const kv_step_snap = self.ctx.cache.step;
     // A drafted round reads the whole context: whatever the plain rounds parked joins it first.
     if (m_draft > 0) try self.dflashFlushPending(allocator);
-    std.debug.assert(dctx.absLen() + self.dflash_pending_rounds == anchor_pos);
+    std.debug.assert(dctx.absLen() + self.dflash_pending_rows == anchor_pos);
 
     const tracing = dflashTraceEnabled();
     var ph: io_util.Stopwatch = undefined;
@@ -892,7 +894,7 @@ pub fn dflashPlainRound(self: *Generator, allocator: std.mem.Allocator, t1: u32,
     };
     if (serial) self.sampling.draw = self.generated_ids.items.len + 2;
 
-    try self.dflashPark(allocator, caps);
+    try self.dflashPark(allocator, caps, 1);
 
     const tokens = try allocator.alloc(u32, 1);
     errdefer allocator.free(tokens);
@@ -910,10 +912,11 @@ pub fn dflashPlainRound(self: *Generator, allocator: std.mem.Allocator, t1: u32,
 }
 
 /// Park one forward's captures (and take them over: the caller's handles are left empty).
-pub fn dflashPark(self: *Generator, allocator: std.mem.Allocator, caps: []mlx.mlx_array) !void {
+pub fn dflashPark(self: *Generator, allocator: std.mem.Allocator, caps: []mlx.mlx_array, rows: u32) !void {
     try self.dflash_pending.appendSlice(allocator, caps);
     for (caps) |*a| a.* = .{ .ctx = null };
     self.dflash_pending_rounds += 1;
+    self.dflash_pending_rows += rows;
     if (self.dflash_pending_rounds >= DFLASH_PENDING_MAX) try self.dflashFlushPending(allocator);
 }
 
@@ -966,7 +969,7 @@ pub fn dflashEvalPark(self: *Generator, allocator: std.mem.Allocator, caps: []ml
     defer _ = mlx.mlx_vector_array_free(vec);
     for (caps) |c| _ = mlx.mlx_vector_array_append_value(vec, c);
     try mlx.check(mlx.mlx_async_eval(vec));
-    try self.dflashPark(allocator, caps);
+    try self.dflashPark(allocator, caps, 1);
     for (caps) |*a| a.* = mlx.mlx_array_new();
 }
 
@@ -1007,6 +1010,7 @@ pub fn dflashFlushPending(self: *Generator, allocator: std.mem.Allocator) !void 
     for (self.dflash_pending.items) |a| _ = mlx.mlx_array_free(a);
     self.dflash_pending.clearRetainingCapacity();
     self.dflash_pending_rounds = 0;
+    self.dflash_pending_rows = 0;
     const eval_vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(eval_vec);
     dctx.appendEvalArrays(eval_vec);
@@ -1015,7 +1019,7 @@ pub fn dflashFlushPending(self: *Generator, allocator: std.mem.Allocator) !void 
 
 /// The assistant context's length once the parked captures are counted: the trunk's cursor, always.
 pub fn dflashContextLen(self: *const Generator) usize {
-    return self.dflash_ctx.?.absLen() + self.dflash_pending_rounds;
+    return self.dflash_ctx.?.absLen() + self.dflash_pending_rows;
 }
 
 /// Bring the assistant context to the position `covers` (the committed prefix): parked captures appended, and a

@@ -1,5 +1,5 @@
 //! GLM-5.3's EXL3 expert bank: the pack's `experts.bin` and its `expert-manifest-exl3-v1.json` (the contract the
-//! converter `scripts/convert_glm_exl3_bank.py` writes, docs/glm53-exl3-pack-format.md) as a bank module for the
+//! `scripts/glm53_pack.py exl3` writes) as a bank module for the
 //! expert stream (`sdk_ext.expert.assertBank`).
 //!   - A stream layer is one bank layer: a routed layer's experts at one K, its K3 bank layer at `2 r`, its K4 bank
 //!     layer at `2 r + 1`. A routed layer of one K (a uniform pack, `k_values` [3]) has an empty bank layer at

@@ -21,7 +21,6 @@ const groupAttendsPerSlot = @import("batching/verdict.zig").groupAttendsPerSlot;
 const batchedPadWaste = @import("batching/verdict.zig").batchedPadWaste;
 const fillGroupPadWasteKvLens = @import("batching/verdict.zig").fillGroupPadWasteKvLens;
 const finishSlot = @import("finish.zig").finishSlot;
-const thinkBoundFired = @import("logit_features.zig").thinkBoundFired;
 const sumInflightGeneratedTokens = @import("prefill.zig").sumInflightGeneratedTokens;
 const Scheduler = @import("scheduler.zig").Scheduler;
 const Slot = @import("slot.zig").Slot;
@@ -261,7 +260,7 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
     // disabled branch is also where the mid-request RE-ENABLE check lives
     // (bypassing it pinned PLD off for the rest of the request even when the
     // generated tail turned echo-heavy).
-    const tick_mode: SpecTickMode = if ((Planner.enabled() and slot.planner_force_plain) or thinkBoundFired(gen)) .regular else specTickMode(
+    const tick_mode: SpecTickMode = if (Planner.enabled() and slot.planner_force_plain) .regular else specTickMode(
         slot.enable_mtp,
         gen.mtp != null,
         slot.enable_drafter,

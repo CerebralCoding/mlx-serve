@@ -1,5 +1,5 @@
 //! GLM-5.3's affine expert bank: the pack's `experts.bin` and its `expert-manifest-affine-v1.json` (the contract the
-//! converter `scripts/convert_glm_bank.py` writes) as a bank module for the expert stream (`sdk_ext.expert.assertBank`).
+//! `scripts/glm53_pack.py affine` writes) as a bank module for the expert stream (`sdk_ext.expert.assertBank`).
 //! One record = one routed expert of one MoE layer: nine segments in the source tensors' bytes, gate / up / down each
 //! `weight` U32 `[out, in * bits / 32]`, `scales` and `biases` BF16 `[out, in / 64]`; the gate/up span is the first six.
 //! Every rule runs once in `Bank.open`, which also opens the sidecar the read pool reads through; a mismatch refuses
@@ -172,7 +172,7 @@ pub const Bank = struct {
     /// Each layer's slots (`geometryOf`): its logical bytes a row, its experts, one row a unit.
     slots: []LayerSlots = &.{},
     /// sha256 of each record's logical bytes, [layer * n_experts + expert]; stored, not verified at open
-    /// (`convert_glm_bank.py --verify` does).
+    /// (`scripts/glm53_pack.py --verify` does).
     digests: [][32]u8 = &.{},
     sidecar_path: [:0]const u8 = "",
     /// experts.bin, opened once for the reader (`openUncached`: read-only, O_NOFOLLOW, F_NOCACHE, no read-ahead).

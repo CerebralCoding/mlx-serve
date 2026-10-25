@@ -45,8 +45,8 @@ pub const SpecDisableReason = enum {
     none,
     acceptance,
     max_ctx,
-    /// A thinking budget closed the thought through a plain forward; the spec
-    /// state is not resynced, the answer decodes regular.
+    /// A thinking budget closed the thought through a plain forward; a spec mode
+    /// other than MTP is not resynced, the answer decodes regular.
     think_bound,
     /// A forced tool-call opener went through a plain forward (`ToolForce`).
     tool_choice,

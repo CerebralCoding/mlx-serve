@@ -155,7 +155,7 @@ pub fn facts(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: *const glm.
     defer arena.deinit();
     const a = arena.allocator();
     const path = try std.fmt.allocPrintSentinel(a, "{s}/{s}/{s}", .{ dir, dir_name, residents_file }, 0);
-    if (std.c.access(path.ptr, std.c.F_OK) != 0) return refuse(diag, error.MtpPackMissing, "{s}: no MTP layer in this pack (mtp_depth > 0 needs {s}/ beside the shards: convert_glm_exl3_bank.py --mtp-only)", .{ path, dir_name });
+    if (std.c.access(path.ptr, std.c.F_OK) != 0) return refuse(diag, error.MtpPackMissing, "{s}: no MTP layer in this pack (mtp_depth > 0 needs {s}/ beside the shards: scripts/glm53_pack.py mtp)", .{ path, dir_name });
     var ck = glm.Checkpoint.openFile(gpa, path, diag) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return refuse(diag, error.MtpPackMissing, "{s}: {s}", .{ path, @errorName(e) }),
@@ -228,7 +228,7 @@ pub const Dense = struct {
 
 /// The EXL3 bank: each bank layer (one K) its nine components as resident arrays `[minis, ...]` (the records'
 /// segments, bytes unchanged; the trellis read as uint16), and per expert its first mini's slot across the bank
-/// layers. A routed expert is its `tp` minis at the expert's score (docs/glm53-exl3-pack-format.md, Mini-expert).
+/// layers. A routed expert is its `tp` minis at the expert's score (`scripts/glm53_pack.py`).
 pub const Exl3 = struct {
     banks: [2]sushi.Bank = undefined,
     n_banks: usize = 0,

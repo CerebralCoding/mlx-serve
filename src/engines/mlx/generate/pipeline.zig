@@ -159,12 +159,14 @@ pub const ForcedCommit = struct {
     /// regular tick to publish.
     emitted: []const u32,
     stopped: bool,
+    /// The forward's DFlash taps joined the assistant context: DFlash may keep drafting.
+    dflash_synced: bool = false,
 };
 
 /// Commit `forced` through the model as ONE multi-token forward, from any
 /// of the three inter-tick states (pipelined, spec exit, shim-seeded), and
 /// leave the generator in the shim-seeded state a regular `next()` reads.
-/// The caller routes every later tick through the regular path.
+/// A bound DFlash drafter's taps for the span are parked (`ForcedCommit.dflash_synced`).
 pub fn commitForcedTokens(self: *Generator, allocator: std.mem.Allocator, forced: []const u32) !ForcedCommit {
     std.debug.assert(forced.len > 0);
     var emitted = std.ArrayList(u32).empty;
@@ -205,7 +207,21 @@ pub fn commitForcedTokens(self: *Generator, allocator: std.mem.Allocator, forced
     const shape = [_]c_int{ 1, @intCast(input.items.len) };
     const tok_input = mlx.mlx_array_new_data(ids_i32.ptr, &shape, 2, .int32);
     defer _ = mlx.mlx_array_free(tok_input);
-    const all_logits = try self.xfm.forwardWith(&self.ctx, tok_input);
+    const dflash_live = self.dflash != null and self.dflash_ctx != null and !self.spec_disabled_runtime;
+    const caps = try allocator.alloc(mlx.mlx_array, if (dflash_live) self.dflash.?.config.target_layer_ids.len else 0);
+    defer {
+        for (caps) |a| _ = mlx.mlx_array_free(a);
+        allocator.free(caps);
+    }
+    for (caps) |*a| a.* = mlx.mlx_array_new();
+    var cl = transformer_mod.CaptureLayers{ .ids = if (dflash_live) self.dflash.?.config.captureIds() else &.{}, .out = caps };
+    if (dflash_live) {
+        self.ctx.capture_layers = &cl;
+        self.ctx.capture_ssm_seq = false; // a forced span never rolls back
+    }
+    const forward = self.xfm.forwardWith(&self.ctx, tok_input);
+    self.ctx.capture_layers = null;
+    const all_logits = try forward;
     defer _ = mlx.mlx_array_free(all_logits);
     const shp = mlx.getShape(all_logits);
     var logits = mlx.mlx_array_new();
@@ -215,13 +231,15 @@ pub fn commitForcedTokens(self: *Generator, allocator: std.mem.Allocator, forced
     try mlx.check(mlx.mlx_slice(&logits, all_logits, &start, 3, &stop, 3, &strides, 3, self.xfm.s));
     const arr = [_]mlx.mlx_array{logits};
     const vec = mlx.mlx_vector_array_new_data(&arr, 1);
+    for (caps) |c| _ = mlx.mlx_vector_array_append_value(vec, c);
     _ = mlx.mlx_async_eval(vec);
     _ = mlx.mlx_vector_array_free(vec);
     self.pending_logits = logits;
     self.has_pending_logits = true;
     self.next_token_id = forced[forced.len - 1];
     self.mtp_hidden_stale = true;
-    return .{ .emitted = try emitted.toOwnedSlice(allocator), .stopped = false };
+    if (dflash_live) try self.dflashPark(allocator, caps, @intCast(input.items.len));
+    return .{ .emitted = try emitted.toOwnedSlice(allocator), .stopped = false, .dflash_synced = dflash_live };
 }
 
 /// The ONE place a partial accept rolls recurrent state back from the verify capture:
