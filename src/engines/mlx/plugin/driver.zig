@@ -23,6 +23,7 @@ const mtp_nax_profile = @import("../spec/mtp_nax_profile.zig");
 const firstRowExactMiss = @import("../../../sdk/quant/ternary.zig").firstRowExactMiss;
 const FsPackDir = @import("../../../host/registry/pack_dir.zig").FsPackDir;
 const moduleShell = @import("../modules/shell.zig").moduleShell;
+const dsv41VisionKey = @import("../../../sdk/weights/load.zig").dsv41VisionKey;
 const KVCache = @import("../kv/cache.zig").KVCache;
 const bf16Scalar = @import("../load/weights.zig").bf16Scalar;
 const mrope = @import("../../../sdk/vision/mrope.zig");
@@ -81,6 +82,12 @@ pub fn positionsOf(xfm: *const Transformer) Positions {
     return b.positions;
 }
 
+/// A tensor the engine's vision encoder reads: the shared tower names, and DeepSeek-V4.1's own (`vision.`,
+/// `aligner.`, `image_*`), which the shared filter does not name.
+fn towerKey(config: *const ModelConfig, key: []const u8) bool {
+    return !model.shouldKeepWeightKey(key, false) or (config.isDsv41() and dsv41VisionKey(key));
+}
+
 /// The pack's map; with `tower`, loaded with the vision tower, whose tensors move there.
 fn loadSplit(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, config: *ModelConfig, tower: ?*model.Weights) !model.Weights {
     var w = try model.loadModelWeights(io, a, model_dir, config, tower != null);
@@ -90,7 +97,7 @@ fn loadSplit(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, config: *M
     var keys: std.ArrayList([]const u8) = .empty;
     defer keys.deinit(a);
     var it = w.map.keyIterator();
-    while (it.next()) |k| if (!model.shouldKeepWeightKey(k.*, false)) try keys.append(a, k.*);
+    while (it.next()) |k| if (towerKey(config, k.*)) try keys.append(a, k.*);
     try t.map.ensureUnusedCapacity(@intCast(keys.items.len));
     for (keys.items) |k| {
         const kv = w.map.fetchRemove(k).?;
@@ -696,4 +703,12 @@ test "plugin driver: the load settings carry the model's lm_head_mxfp8 and mtp" 
     try std.testing.expectEqualStrings("{\"mtp\":false}", loadSettings(&buf, &c));
     c.lm_head_mxfp8_override = false;
     try std.testing.expectEqualStrings("{\"lm_head_mxfp8\":false,\"mtp\":false}", loadSettings(&buf, &c));
+}
+
+test "driver: a DeepSeek-V4.1 pack's vision, aligner and image rows move to the tower; its trunk stays" {
+    var c: ModelConfig = .{ .model_type = "deepseek_v41" };
+    for ([_][]const u8{ "vision.patch_embed.proj.weight", "aligner.w1.weight", "image_newline" }) |k| try std.testing.expect(towerKey(&c, k));
+    try std.testing.expect(!towerKey(&c, "layers.0.attn.wq_a.weight"));
+    c.model_type = "qwen3_5";
+    try std.testing.expect(!towerKey(&c, "vision.patch_embed.proj.weight"));
 }
