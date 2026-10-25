@@ -77,6 +77,32 @@ pub fn exl3Routed(src: *Exl3.Source) Routed {
     return .{ .ctx = src, .math = .{ .source = C.rows }, .settle_fn = C.settle, .phase_fn = C.phase, .read_ahead_fn = C.readAhead };
 }
 
+/// GLM-5.3-Flash's EXL3 bank (`streamed/glm5n_source.zig`): the source returns routed sums.
+pub const Glm5n = if (build_options.mlx_stream) plugin.glm5n_source else struct {};
+
+/// `src`'s `Routed` (`source` math, its phases, read-ahead and settle).
+pub fn glm5nRouted(src: *Glm5n.Source) Routed {
+    const C = struct {
+        fn rows(ctx: *anyopaque, layer: u32, x: mlx.mlx_array, idx: mlx.mlx_array, wts: mlx.mlx_array) anyerror!mlx.mlx_array {
+            const s: *Glm5n.Source = @ptrCast(@alignCast(ctx));
+            return s.rows(layer, x, idx, wts);
+        }
+        fn settle(ctx: *anyopaque) anyerror!void {
+            const s: *Glm5n.Source = @ptrCast(@alignCast(ctx));
+            return s.settle();
+        }
+        fn phase(ctx: *anyopaque, prompt: bool) anyerror!void {
+            const s: *Glm5n.Source = @ptrCast(@alignCast(ctx));
+            return s.setPhase(prompt);
+        }
+        fn readAhead(ctx: *anyopaque, layer: u32, experts: []const u16) anyerror!void {
+            const s: *Glm5n.Source = @ptrCast(@alignCast(ctx));
+            return s.readAhead(layer, experts);
+        }
+    };
+    return .{ .ctx = src, .math = .{ .source = C.rows }, .settle_fn = C.settle, .phase_fn = C.phase, .read_ahead_fn = C.readAhead };
+}
+
 pub const Streamed = struct {
     pub const refusal = abi.Verdict.refuse(.unsupported, "streamed weights: no expert bank, or a build without mlx-stream");
 

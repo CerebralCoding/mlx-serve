@@ -1,4 +1,5 @@
 const std = @import("std");
+const fp8_grid = @import("../../sdk/quant/fp8_block128_gemv.zig");
 const env = @import("../../env.zig");
 const builtin = @import("builtin");
 const mlx = @import("../../mlx/ffi.zig");
@@ -1696,7 +1697,7 @@ fn parseConfigWith(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     }
     if (config.isGlm5() and declaresExpertStreaming(allocator, content)) {
         config.pack_dir = try allocator.dupe(u8, model_dir);
-        config.glm5_stream = true;
+        config.expert_bank = true;
     }
     if (std.mem.eql(u8, config.model_type, "glm_moe_dsa")) {
         // No in-tree arch serves the 744B: only an mlx-stream pack (the trunk beside an experts.bin bank) loads.
@@ -2646,7 +2647,8 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             if (kv.value_ptr.* != .object) continue;
             const mode = kv.value_ptr.object.get("mode") orelse continue;
             if (mode != .string) continue;
-            if (QuantMode.fromString(mode.string) == null) {
+            // A release's e4m3 projection on a 64 x 128 grid (`fp8_block128`) is read by its dtypes.
+            if (QuantMode.fromString(mode.string) == null and !fp8_grid.isEntry(kv.value_ptr.object)) {
                 log.err("unsupported quantization mode '{s}' on '{s}' (supported: affine, nvfp4, mxfp4, mxfp8)\n", .{ mode.string, kv.key_ptr.* });
                 return error.UnsupportedQuantMode;
             }
@@ -4998,7 +5000,7 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
         defer _ = mlx.mlx_stream_free(s);
         try resolveAndFoldQwen4Norms(config, &weights, s, model_dir);
     }
-    if (config.exl3 != null or config.modelopt) {
+    if (config.exl3 != null or config.modelopt or (config.expert_bank and config.isGlm5())) {
         const s = mlx.mlx_default_cpu_stream_new();
         defer _ = mlx.mlx_stream_free(s);
         try sushi_pack.adapt(config, &weights, s);
@@ -7344,7 +7346,7 @@ test "parseConfig: a MiMo pack that declares expert_streaming streams its expert
     try testing.expectEqualStrings(dir, pack.pack_dir.?);
 }
 
-test "parseConfig: a glm5_next pack that declares expert_streaming is mlx-stream's; a resident glm5_next config is the host's" {
+test "parseConfig: a glm5_next pack that declares expert_streaming streams its expert bank; a resident one does not" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7360,11 +7362,8 @@ test "parseConfig: a glm5_next pack that declares expert_streaming is mlx-stream
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = marked });
     var pack = try parseConfig(io, testing.allocator, dir);
     defer pack.deinit(testing.allocator);
-    try testing.expect(pack.isGlm5() and pack.glm5_stream and pack.mlxStream() and !pack.expert_bank and !pack.glm_stream);
+    try testing.expect(pack.isGlm5() and pack.expert_bank and !pack.mlxStream() and !pack.glm_stream);
     try testing.expectEqualStrings(dir, pack.pack_dir.?);
-    var w = try loadModelWeights(io, testing.allocator, dir, &pack, false);
-    defer w.deinit();
-    try testing.expectEqual(@as(u32, 0), w.count());
 }
 
 const glm_moe_dsa_config =

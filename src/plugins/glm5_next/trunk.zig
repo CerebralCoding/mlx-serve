@@ -21,6 +21,7 @@ const compiled = @import("../../sdk/bases/blocks/compiled.zig");
 const gdn_base = @import("../../sdk/bases/blocks/gdn.zig");
 const exl3 = @import("../../sdk/quant/exl3/format.zig");
 const params = @import("../../sdk/quant/params.zig");
+const fp8_block128 = @import("../../sdk/quant/fp8_block128.zig");
 const fused_rows = @import("../../sdk/blocks/linear/fused_rows.zig");
 const qmatmulBits = @import("../../sdk/blocks/linear/qmatmul.zig").qmatmulBits;
 const fused_act = @import("../../sdk/blocks/mlp/fused_activations.zig");
@@ -32,6 +33,8 @@ const glm5 = @import("glm5_next.zig");
 
 const Array = mlx.mlx_array;
 pub const Linear = linear.Linear;
+const build_options = @import("build_options");
+pub const Bank = if (build_options.mlx_stream) @import("../../sdk/weights/streamed.zig").Glm5n.Source else void;
 const QuantMode = @FieldType(Linear, "mode");
 const QuantParams = params.QuantParams;
 const Config = config.Config;
@@ -119,6 +122,8 @@ pub const Layer = struct {
     ffn_hc: ?Mhc = null,
     mixer: union(enum) { kda: Kda, dsa: Dsa, mla: Mla },
     mlp: union(enum) { dense: Dense, moe: moe.Moe.Weights },
+    /// A streamed pack's router as stored (bf16 `[experts, hidden]`): the bank's lookahead predictor reads it.
+    router_raw: Array = .{},
 };
 
 /// GLM's `mtp.0` head: `eh_proj(cat[enorm(embed(x)), hnorm(h)])` through one plain DSA + MoE block, then `norm`.
@@ -158,8 +163,12 @@ pub const Model = struct {
     /// `rms_norm_eps` as an array (the add+norm kernel's).
     rms_eps: Array = .{},
     owned: std.ArrayList(Array) = .empty,
+    /// A streamed pack's expert bank, bound to every routed layer after the load (`plugin.zig` `openBank`).
+    bank: ?*Bank = null,
 
     pub fn deinit(m: *Model) void {
+        if (comptime build_options.mlx_stream) if (m.bank) |b| b.deinit();
+        m.bank = null;
         for (m.layers) |*l| if (l.mlp == .moe) compiled.free(&l.mlp.moe.route_fn);
         if (m.mtp) |*h| compiled.free(&h.moe.route_fn);
         inline for (.{ m.kda.q_scale, m.kda.k_scale, m.kda.ones, m.kda.eps, m.rms_eps }) |a| if (a.ctx != null) {
@@ -431,11 +440,13 @@ const Loader = struct {
         return l.keep(try l.need(name));
     }
 
+    /// A release's e4m3 projection carries its 64 x 128 scale grid as `weight_scale_inv` (`fp8_block128`).
     fn triple(l: *const Loader, base: []const u8) !Triple {
         var nb: [256]u8 = undefined;
+        const sc = l.get(try std.fmt.bufPrint(&nb, "{s}.scales", .{base}));
         return .{
             .w = try l.need(try std.fmt.bufPrint(&nb, "{s}.weight", .{base})),
-            .s = l.get(try std.fmt.bufPrint(&nb, "{s}.scales", .{base})),
+            .s = if (sc.ctx != null) sc else l.get(try std.fmt.bufPrint(&nb, "{s}.weight_scale_inv", .{base})),
             .b = l.get(try std.fmt.bufPrint(&nb, "{s}.biases", .{base})),
         };
     }
@@ -453,6 +464,8 @@ const Loader = struct {
     fn lin(l: *Loader, raw: Triple, in_dim: ?u32) !Linear {
         const t = try l.kept(raw);
         if (t.s.ctx == null) return .{ .w = t.w };
+        // e4m3: the matmul knows it by its dtypes; no affine kernel may claim it.
+        if (fp8_block128.isBlockScaled(t.w, t.s)) return .{ .w = t.w, .s = t.s, .bits = 0, .group_size = fp8_block128.block_cols };
         const qp = resolve(l.c, t.w, t.s, in_dim);
         return .{ .w = t.w, .s = t.s, .b = t.b, .bits = qp.bits, .group_size = qp.group_size, .mode = qp.mode };
     }
@@ -570,6 +583,8 @@ const Loader = struct {
             joined_conv = try l.own(try array.materializedOwnedCopy(l.s, t));
             try mlx.check(mlx.mlx_array_eval(joined_conv));
         }
+        // A release storing the conv in f32 runs it in the model's bf16, as the reference loads it.
+        if (mlx.mlx_array_dtype(joined_conv) == .float32) joined_conv = try l.own(try astypeEval(joined_conv, .bfloat16, l.s));
         // A_log is per value head, the gate per key channel: expanded once so the hot path stays elementwise.
         const a_log_raw = try l.need(try std.fmt.bufPrint(&nb, "{s}.A_log", .{fg}));
         const dk: c_int = @intCast(c.linear_key_head_dim);
@@ -675,7 +690,8 @@ const Loader = struct {
     /// The routed MoE under `<base>.mlp` (a trunk layer, or the MTP head's block) as the shared block reads it: the
     /// sigmoid router with its selection bias, the ungated shared expert, ModelOpt's per-expert scales, a Sushi
     /// pack's EXL3 banks through the format table, GLM's one-kernel decode as the `fused` arm.
-    fn routed(l: *Loader, base: []const u8) !moe.Moe.Weights {
+    /// `streamed`: the layer's experts live in the pack's bank (bound after the load), not the shards.
+    fn routed(l: *Loader, base: []const u8, streamed: bool) !moe.Moe.Weights {
         const c = l.c;
         const glm = c.isGlm5();
         var nb: [256]u8 = undefined;
@@ -684,11 +700,14 @@ const Loader = struct {
         const ex = if (l.has(try std.fmt.bufPrint(&nb, "{s}.mlp.experts.gate_proj.weight", .{base}))) "mlp.experts" else "mlp.switch_mlp";
         const spec: ?exl3.Spec = if (glm) l.exl3 else null;
         const lf: [3][]const u8 = if (spec != null) .{ "trellis", "suh", "svh" } else .{ "weight", "scales", "biases" };
-        var banks: [3]Triple = undefined;
-        for (&banks, [_][]const u8{ "gate_proj", "up_proj", "down_proj" }) |*bk, p| bk.* = .{
-            .w = try l.need(try std.fmt.bufPrint(&nb, "{s}.{s}.{s}.{s}", .{ base, ex, p, lf[0] })),
-            .s = l.get(try std.fmt.bufPrint(&nb, "{s}.{s}.{s}.{s}", .{ base, ex, p, lf[1] })),
-            .b = l.get(try std.fmt.bufPrint(&nb, "{s}.{s}.{s}.{s}", .{ base, ex, p, lf[2] })),
+        // A streamed pack's experts live in its bank (`experts.bin`), bound after the load.
+        var banks: [3]Triple = @splat(.{ .w = .{} });
+        if (!streamed) for (&banks, [_][]const u8{ "gate_proj", "up_proj", "down_proj" }) |*bk, p| {
+            bk.* = .{
+                .w = try l.need(try std.fmt.bufPrint(&nb, "{s}.{s}.{s}.{s}", .{ base, ex, p, lf[0] })),
+                .s = l.get(try std.fmt.bufPrint(&nb, "{s}.{s}.{s}.{s}", .{ base, ex, p, lf[1] })),
+                .b = l.get(try std.fmt.bufPrint(&nb, "{s}.{s}.{s}.{s}", .{ base, ex, p, lf[2] })),
+            };
         };
         var router = try l.triple(try std.fmt.bufPrint(&nb, "{s}.{s}", .{ base, rt }));
         var shared: [3]Triple = undefined;
@@ -709,10 +728,10 @@ const Loader = struct {
         try l.transposed(&router);
         // GLM routes in f32 (`moe_router_dtype`).
         if (glm and router.s.ctx == null) router.w = try l.f32Table(router.w, false);
-        for (&banks) |*t| {
+        if (!streamed) for (&banks) |*t| {
             try l.transposed(t);
             t.* = try l.kept(t.*);
-        }
+        };
         for (&shared) |*t| try l.transposed(t);
         if (spec) |sp| for (banks, [_][2]u32{ .{ c.hidden_size, c.moe_intermediate_size }, .{ c.hidden_size, c.moe_intermediate_size }, .{ c.moe_intermediate_size, c.hidden_size } }) |t, io|
             try exl3.admit(.{ .trellis = t.w, .suh = t.s, .svh = t.b }, c.num_experts, io[0], io[1], sp);
@@ -744,7 +763,7 @@ const Loader = struct {
         };
         if (spec) |sp| {
             w.format_banks = .{ .table = &exl3.table, .gate = exl3Weight(banks[0], sp), .up = exl3Weight(banks[1], sp), .down = exl3Weight(banks[2], sp) };
-        } else if (glm) w.fused = .{ .rows = glm5.MOE_DECODE_MAX_ROWS, .limit = c.swiglu_limit, .run = &@import("moe.zig").fusedDecode };
+        } else if (glm and !streamed) w.fused = .{ .rows = glm5.MOE_DECODE_MAX_ROWS, .limit = c.swiglu_limit, .run = &@import("moe.zig").fusedDecode };
         w.route_fn = moe.compileRouting(&w, l.s);
         return w;
     }
@@ -767,7 +786,7 @@ const Loader = struct {
             .post_norm = try l.tensor(try std.fmt.bufPrint(&nb, "{s}.post_attention_layernorm.weight", .{block})),
             .eh_proj = try l.proj(try std.fmt.bufPrint(&nb, "{s}.eh_proj", .{base}), 2 * c.hidden_size),
             .dsa = try l.dsa(block),
-            .moe = try l.routed(block),
+            .moe = try l.routed(block, false),
         };
     }
 
@@ -796,7 +815,8 @@ const Loader = struct {
                 L.ffn_hc = try l.mhc(base, "ffn_hc");
             }
             L.mixer = if (c.isLinearLayer(i)) .{ .kda = try l.kda(i) } else if (c.isGlm5()) .{ .dsa = try l.dsa(base) } else .{ .mla = try l.mla(i) };
-            L.mlp = if (c.num_experts > 0 and i >= c.first_k_dense_replace) .{ .moe = try l.routed(base) } else .{ .dense = try l.dense(i) };
+            L.mlp = if (c.num_experts > 0 and i >= c.first_k_dense_replace) .{ .moe = try l.routed(base, c.streamed) } else .{ .dense = try l.dense(i) };
+            if (c.streamed and L.mlp == .moe) L.router_raw = try l.keep(try l.need(try l.layerName(&nb, i, "mlp.gate.weight")));
             built += 1;
         }
         return out;

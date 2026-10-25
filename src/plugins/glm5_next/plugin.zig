@@ -11,6 +11,10 @@ const fwd = @import("table_forward.zig");
 const head = @import("head.zig");
 const fixture = @import("fixture.zig");
 const sushi_pack = @import("../../sdk/quant/exl3/sushi_pack.zig");
+const build_options = @import("build_options");
+const streamed = @import("../../sdk/weights/streamed.zig");
+const trunk = @import("trunk.zig");
+const bill_mod = @import("bill.zig");
 pub const config = @import("config.zig");
 
 pub const plugin = sdk.Plugin{
@@ -61,18 +65,76 @@ fn bill(p: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) 
 }
 
 fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
-    return host.load(plugin.name, ctx, out);
+    const mp = host.load(plugin.name, ctx, out) orelse return null;
+    if (config.of(ctx.parsed).streamed) openBank(host.of(mp), ctx.model_dir.slice(), ctxSetting(ctx.settings_json.slice())) catch |e| {
+        std.log.err("glm5_next: the streamed bank does not open: {t}", .{e});
+        host.unload(mp);
+        out.* = if (e == error.StreamedWeightsUnsupported) Verdict.refuse(.unsupported, "glm5_next: a streamed (experts.bin) pack needs the macOS build's expert streamer") else Verdict.named(.failed, @errorName(e));
+        return null;
+    };
+    return mp;
 }
 
-/// A Sushi pack is held as its adapter leaves it (`SushiBill`); every other pack as stored.
+/// The pack's EXL3 bank bound to every routed layer, at the slot rows the box holds beside the loaded residents and
+/// one prompt of the model's `ctx_size`.
+fn openBank(m: *host.Model, dir: []const u8, ctx_size: ?u64) !void {
+    if (comptime !build_options.mlx_stream) return error.StreamedWeightsUnsupported;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const gpa = std.heap.c_allocator;
+    const geo = try streamed.Glm5n.geometryOf(gpa, io, dir);
+    var mc = try @import("model_config.zig").toModelConfig(m.c);
+    defer mc.deinit(gpa);
+    const rows = bill_mod.streamRows(&mc, ctx_size, geo.record_bytes, geo.num_moe_layers, streamed.Glm5n.transient_rows);
+    const gates = try gpa.alloc(streamed.Glm5n.Gate, m.layers.len);
+    defer gpa.free(gates);
+    for (gates, m.layers) |*g, *l| g.* = if (l.mlp == .moe) .{ .w = l.router_raw, .bias = l.mlp.moe.route.sigmoid_bias.expert_bias } else .{ .w = .{ .ctx = null }, .bias = .{ .ctx = null } };
+    _ = mlx.mlx_synchronize(m.s);
+    const b = try streamed.Glm5n.Source.open(gpa, io, dir, m.s, gates, geo.num_moe_layers, geo.num_experts, .{ .prompt = rows.prompt, .decode = rows.decode });
+    std.log.info("glm5_next: streamed experts, {d} prompt / {d} decode slot rows per layer ({d} B a row)", .{ rows.prompt, rows.decode, geo.record_bytes });
+    m.bank = b;
+    const r = streamed.glm5nRouted(b);
+    for (m.layers, 0..) |*l, li| if (l.mlp == .moe) {
+        l.mlp.moe.streamed = .{ .routed = r, .layer = @intCast(li) };
+    };
+}
+
+/// The per-model `ctx_size` setting: the prompt positions a streamed bank's rows leave room for.
+fn ctxSetting(settings_json: []const u8) ?u64 {
+    if (settings_json.len == 0) return null;
+    const S = struct { ctx_size: ?u64 = null };
+    const parsed = std.json.parseFromSlice(S, std.heap.c_allocator, settings_json, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    return parsed.value.ctx_size;
+}
+
+/// A Sushi pack is held as its adapter leaves it (`SushiBill`); a streamed pack as stored beside its bank's fewest
+/// slot rows and transient rows; every other pack as stored.
 fn residentBytes(p: *const abi.Parsed, model_dir: abi.Str, _: abi.Str, shards: u64, out: *u64) callconv(.c) Verdict {
     const c = config.of(p);
     out.* = shards;
+    if (c.streamed) {
+        if (comptime !build_options.mlx_stream) return Verdict.refuse(.unsupported, "glm5_next: a streamed pack needs the expert streamer");
+        const geo = streamed.Glm5n.geometryOf(std.heap.page_allocator, std.Io.Threaded.global_single_threaded.io(), model_dir.slice()) catch |e|
+            return Verdict.named(.failed, @errorName(e));
+        out.* = shards +| (@as(u64, c.num_experts_per_tok) * geo.num_moe_layers + streamed.Glm5n.transient_rows) * geo.record_bytes +| mtpBankBytes(model_dir.slice());
+        return .ok;
+    }
     if (c.expert_quant_json.len == 0) return .ok;
     const io = std.Io.Threaded.global_single_threaded.io();
     out.* = sushi_pack.residentBytes(io, std.heap.page_allocator, model_dir.slice(), SushiBill{ .layers = c.num_hidden_layers, .kv_lora_rank = c.dsa_kv_lora_rank }) catch |e|
         return Verdict.named(.failed, @errorName(e));
     return .ok;
+}
+
+/// The NextN layer's NVFP4 experts a streaming pack ships beside its bank (held resident); 0 without them.
+fn mtpBankBytes(dir: []const u8) u64 {
+    const crt = @import("../../sdk/util/crt.zig");
+    var buf: [std.fs.max_path_bytes:0]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&buf, "{s}/mtp-experts-nvfp4.bin", .{dir}, 0) catch return 0;
+    const fd = crt.openRead(path);
+    if (fd < 0) return 0;
+    defer crt.close(fd);
+    return @intCast(@max(crt.seekEnd(fd), 0));
 }
 
 /// A Sushi GLM tensor as the load holds it: the vision tower and the EXL3 MTP layer past the trunk not at all, the
@@ -134,6 +196,7 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     const m = host.of(mp);
     if (!abi.declaresMode(m.caps, f.mode)) return Verdict.refuse(.unsupported, "glm5_next: forward mode not declared");
     const ops = f.cache_ops orelse return Verdict.refuse(.unsupported, "glm5_next: a forward without cache_ops");
+    if (comptime build_options.mlx_stream) if (m.bank) |b| return streamedForward(m, b, ops, f, out);
     if (f.mode == .batched_rows) {
         if (f.rows != 1 or f.tokens.len != f.caches.len or f.positions.len != f.caches.len) return Verdict.refuse(.unsupported, "glm5_next: batched rows take one host token per slot");
         if (f.capture_layers.len > 0 or f.media.ctx != null) return Verdict.refuse(.unsupported, "glm5_next: no captures or media on batched rows");
@@ -144,6 +207,22 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
         return .ok;
     }
     return host.forwardOne(plugin.name, fwd, m, ops, f, out);
+}
+
+/// A streamed pack's forward: a call past the bank's decode lane in its prompt phase, every other in decode; the
+/// result evaluated before the call's routes settle (their slot rows are free for the next call's reads).
+fn streamedForward(m: *host.Model, b: *trunk.Bank, ops: *const abi.CacheOps, f: *const abi.Forward, out: *abi.ForwardOut) Verdict {
+    b.setPhase(f.rows > streamed.Glm5n.decode_lane_rows) catch |e| return Verdict.named(.failed, @errorName(e));
+    const v = host.forwardOne(plugin.name, fwd, m, ops, f, out);
+    if (!v.isOk()) return v;
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    inline for (.{ out.logits, out.hidden }) |a| if (a.ctx != null) {
+        _ = mlx.mlx_vector_array_append_value(vec, .{ .ctx = a.ctx });
+    };
+    mlx.check(mlx.mlx_eval(vec)) catch |e| return Verdict.named(.failed, @errorName(e));
+    b.settle() catch |e| return Verdict.named(.failed, @errorName(e));
+    return .ok;
 }
 
 /// N slots' next tokens in as few trunk forwards as the MoE row limit allows, each slot's token a row of one window:
@@ -214,4 +293,5 @@ test {
     _ = fixture;
     _ = @import("proof_test.zig");
     _ = @import("served_test.zig");
+    _ = @import("../../sdk/quant/nvfp4/stream_bank.zig");
 }

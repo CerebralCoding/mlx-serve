@@ -23,6 +23,23 @@ const prefillFfnWidth = @import("../../engines/mlx/admission/bills.zig").prefill
 const retainedSsmCheckpointBytes = @import("../../engines/mlx/admission/bills.zig").retainedSsmCheckpointBytes;
 const prefillNeededAtChunk = @import("../../engines/mlx/admission/prefill_chunk.zig").prefillNeededAtChunk;
 
+/// A streamed pack's slot rows per routed layer (`record` bytes a row in each of `n_moe` layers), sized after the
+/// residents load: the GPU ceiling less the memory in use, one prompt's bill at the billed context (`ctx_size`, else
+/// 16K + 1K) and the wired margin; the prompt phase also leaves the bank's `transient` rows for its wide calls. At least `top_k` rows.
+pub fn streamRows(config: *const model_mod.ModelConfig, ctx_size: ?u64, record: u64, n_moe: u32, transient: u32) struct { prompt: u32, decode: u32 } {
+    const ctx: u64 = ctx_size orelse 16_384 + 1_024;
+    const need = glm5PrefillMemoryNeeded(config, ctx, 1, 16, generate_mod.WIDE_PREFILL_CHUNK, .{});
+    const system = @import("../../sdk/util/system.zig");
+    const in_use = system.getTotalMemBytes() -| system.getAvailableMemBytes();
+    const room = @import("../../host/registry/memory_ceiling.zig").staticGpuMemoryCeiling() -| in_use -| need -|
+        http_server.serverState().wired_limit_margin_bytes;
+    const row = @max(record * n_moe, 1);
+    const lo: u64 = @max(config.num_experts_per_tok, 1);
+    const decode = std.math.clamp(room / row, lo, config.num_experts);
+    const prompt = std.math.clamp((room -| @as(u64, transient) * record) / row, lo, decode);
+    return .{ .prompt = @intCast(prompt), .decode = @intCast(decode) };
+}
+
 /// Bytes per (query, key pool) GLM's DSA indexer holds while it selects (`selectRows`):
 /// f32 scores, their negation and the argpartition result.
 const GLM5_INDEXER_BYTES_PER_POOL: u64 = 12;

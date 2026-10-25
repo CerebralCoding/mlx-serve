@@ -71,7 +71,11 @@ pub fn bindServed(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, confi
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const model_type = sdk_plugin.modelTypeOf(arena.allocator(), config_json) catch return null;
-    if (!served.serves(model_type) or streamPack(io, a, model_dir, config_json)) return null;
+    if (!served.serves(model_type)) return null;
+    if (streamPack(io, a, model_dir, config_json)) {
+        log.info("[plugin] {s}: {s}; its stream module serves it\n", .{ model_type, why });
+        return null;
+    }
     log.err("[plugin] {s}: {s}; no other path serves it\n", .{ model_type, why });
     return error.PluginDeclinedNoLegacy;
 }
