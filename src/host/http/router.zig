@@ -1,5 +1,6 @@
 //! ROUTE_PATHS, routeExists, request size limits; handleConnection (route dispatch); isStatusRoute, isTextGenRoute
 
+const request_options = @import("../api/request_options.zig");
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../sdk/util/log.zig");
@@ -465,6 +466,13 @@ pub fn handleConnection(
         try handleLanProxy(allocator, stream, http_server.g_lan.?, method, raw_path, request_body, body_model, requested_model_id);
         return;
     }
+    // Counted from here to the response's end: a burst's requests decide their spec mode before any reaches the
+    // engine, so the engine's own count misses them (`request_options.requestHasCompany`).
+    const text_gen = isTextGenRoute(method, path);
+    if (text_gen) _ = request_options.text_gen_live.fetchAdd(1, .monotonic);
+    defer if (text_gen) {
+        _ = request_options.text_gen_live.fetchSub(1, .monotonic);
+    };
     switch (resolveRequestModelId(registry, &request_model.g_model_aliases, requested_model_id, path)) {
         .id => |id| requested_model_id = id,
         .unknown_path => {

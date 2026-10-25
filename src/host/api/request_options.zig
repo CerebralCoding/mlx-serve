@@ -221,7 +221,12 @@ pub fn requestEnableDrafter(explicit: ?std.json.Value, gemma_loaded: bool, dflas
 
 pub const RequestSpec = struct { use_mtp: bool, use_drafter: bool, use_pld: bool };
 
+/// Generation requests between the router and their response's end (`router.handleConnection`).
+pub var text_gen_live = std.atomic.Value(u32).init(0);
+
+/// Another request is live: one already in the engine, or one still between the router and its submit.
 pub fn requestHasCompany() bool {
+    if (text_gen_live.load(.monotonic) > 1) return true;
     return if (http_server.launch().global_scheduler) |sch| mlx_engine.api().has_company(sch) else false;
 }
 
@@ -459,4 +464,12 @@ test "admitMtpForCtx: the --max-mtp-ctx ceiling outranks the request's own flag"
     try std.testing.expect(!admitMtpForCtxWith(4096, true, 4097));
     // It never turns MTP on for a request that had it off for another reason.
     try std.testing.expect(!admitMtpForCtxWith(4096, false, 1));
+}
+
+test "requestHasCompany: a second generation request still before its submit is company" {
+    defer text_gen_live.store(0, .monotonic);
+    text_gen_live.store(1, .monotonic);
+    try std.testing.expect(!requestHasCompany());
+    text_gen_live.store(2, .monotonic);
+    try std.testing.expect(requestHasCompany());
 }
