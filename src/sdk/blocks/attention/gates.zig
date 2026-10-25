@@ -1,4 +1,4 @@
-//! sdk/blocks/attention/gates, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/blocks/attention/gates.
 //! Owns ATTN_GATE_SOURCE, attn_gate_kernel, attn_gate_engaged, attn_gate_fused_override, attn_gate_fused_env, and 18 more.
 
 const std = @import("std");

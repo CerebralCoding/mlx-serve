@@ -1,4 +1,4 @@
-//! engines/mlx/methods/moe, the legacy `Transformer`'s methods split out of engines/mlx/transformer.zig.
+//! engines/mlx/methods/moe: `Transformer` methods (aliased from engines/mlx/transformer.zig).
 //! Owns moeRouterLogits, moeSharedDown, moeSharedProject, moeSharedGateTail, ungatedSharedA4, moeAddUngatedShared, and 10 more.
 
 const distributed_mod = @import("../cluster/distributed.zig");

@@ -1,4 +1,4 @@
-//! engines/mlx/methods/rms, the legacy `Transformer`'s methods split out of engines/mlx/transformer.zig.
+//! engines/mlx/methods/rms: `Transformer` methods (aliased from engines/mlx/transformer.zig).
 //! Owns rmsNormEps, rhtAddNormRotate, narrowAddNorm, rmsNorm, layerNorm.
 
 const mlx = @import("../../../mlx/ffi.zig");

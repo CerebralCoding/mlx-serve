@@ -104,7 +104,7 @@ pub fn loopGuardTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
         }
         var stop = relative_stop;
         stop.trim_start += loop_guard_start;
-        // Never cut silently: the 2026-07-14 php.html post-mortem took log
+        // Never cut silently: the php.html post-mortem took log
         // archaeology because this guard left no trace of having fired. The
         // tier and the trim point are logged too — five cuts in a row is a
         // different diagnosis from one, and the trim is what breaks the chain.
@@ -147,7 +147,7 @@ test "loopStopReason: a degenerate tail cut reports stop, a healthy tail is not 
 }
 
 test "loopStopReason: a LONG-period sentence loop is cut at the second tier" {
-    // The 2026-08-02 shooter wrap-up failure: a two-sentence cycle ("The game
+    // The shooter wrap-up failure: a two-sentence cycle ("The game
     // is complete. Let me do a final review... Let me verify main.js...") of
     // ~58 tokens repeated 26 times sailed through the 8-token-period tier and
     // was never cut. Tier 2 scans periods 9..64 and requires 10 exact
@@ -219,7 +219,7 @@ test "loopStopReason: periods past the long tier stay uncut" {
 }
 
 test "loopStopReason: a VARIED-phrasing restatement loop is cut at the near-repeat tier" {
-    // The agent-traffic shape (2026-08-04): the same intent restated forever in
+    // The agent-traffic shape: the same intent restated forever in
     // slightly different words. No exact cycle exists, so tiers 1 and 2 are
     // blind and this ran to max_tokens.
     var ids = std.ArrayList(u32).empty;

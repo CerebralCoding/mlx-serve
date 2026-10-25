@@ -90,7 +90,7 @@ pub fn loadWeightsOpt(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
 /// Load every `*.safetensors` in an already-open `dir` into a Weights map.
 /// `model_dir` is the on-disk path string, used both to build the per-file
 /// absolute path for `mlx_load_safetensors` and to phrase the error message.
-/// Split out of `loadWeightsOpt` so the incomplete-checkpoint guard below is
+/// Kept apart from `loadWeightsOpt` so the incomplete-checkpoint guard below is
 /// unit-testable against a `tmpDir` (mirrors `model_discovery.discoverModelsInDir`).
 pub fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, model_dir: []const u8, opts: LoadOpts) !Weights {
     var weights = Weights.init(allocator);
@@ -200,7 +200,7 @@ pub fn viewByteAffineWeights(weights: *Weights, s: mlx.mlx_stream) !void {
 ///
 ///   - Quant SIDE tensors (scales/biases), which can be 2-D so they are keyed
 ///     on the suffix. f16 side tensors force gather_qmm/qmatmul onto a ~4x
-///     slower mixed-dtype path (hy_v3 2-bit live, 2026-07-14: 0.70 vs 0.18 ms
+///     slower mixed-dtype path (hy_v3 2-bit live, 0.70 vs 0.18 ms
 ///     per 8-expert gather — 1.2 tok/s on the 295B instead of ~15+).
 ///   - ANY 1-D f16 tensor: a per-channel table (norm weight, bias, A_log,
 ///     dt_bias) that is multiplied or added straight into the residual. Leave

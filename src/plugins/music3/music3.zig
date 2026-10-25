@@ -143,21 +143,21 @@ pub const INSTRUMENTAL_LYRICS = "[Instrumental]";
 ///
 /// MiniMax's api marks `prompt` REQUIRED for an instrumental track while making
 /// `lyrics` optional, which says the CAPTION carries the no-vocals intent and
-/// the lyric tag was never meant to carry it alone. Measured 2026-08-18:
+/// the lyric tag was never meant to carry it alone. Measured:
 /// `[Instrumental]` by itself sang no words but still produced vocal texture —
 /// exactly what a SECTION tag would do.
 pub const INSTRUMENTAL_CAPTION_CLAUSE = "Instrumental only: no vocals, no singing, no lyrics.";
 
 /// Only guards against stacking OUR OWN clause twice.
 ///
-/// This used to fuzzy-match "instrumental" / "no vocal" / "without vocal" /
+/// Never fuzzy-match "instrumental" / "no vocal" / "without vocal" /
 /// "no singing" anywhere in the caption, on the theory that appending on top
 /// repeats the user back at the model. That was wrong, and it silently
 /// disabled the feature for exactly the people using it: a real caption opens
 /// "Instrumental ambient field-recording piece, freely paced, no vocals" —
 /// where "Instrumental" is the GENRE, not an instruction — so the guard
 /// matched, the clause never fired, and every take was secretly a tag-only
-/// take. Measured on a live session 2026-08-19: `caption_facts=false` on nine
+/// take. Measured on a live session `caption_facts=false` on nine
 /// consecutive runs the user believed were testing the clause.
 ///
 /// A short clause repeated near a user's own wording is harmless, and emphasis
@@ -3049,7 +3049,7 @@ test "music3 instrumental caption: the clause is appended only when the user did
     // MiniMax's own api marks `prompt` REQUIRED for an instrumental track while
     // making `lyrics` optional — which says the CAPTION is where the no-vocals
     // intent lives, and the lyric tag alone was never meant to carry it. Live
-    // 2026-08-18: `[Instrumental]` alone sang no words but still produced vocal
+    // `[Instrumental]` alone sang no words but still produced vocal
     // texture, exactly what a SECTION tag would do.
     try std.testing.expect(!captionMentionsNoVocals("upbeat synthwave with driving bass"));
     // A caption whose GENRE is instrumental music must still get the clause —

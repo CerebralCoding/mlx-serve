@@ -1035,7 +1035,7 @@ const VLM_MAX_PIXELS: u32 = 16_777_216;
 const VLM_FACTOR: u32 = 32; // patch(16) × merge(2)
 
 /// The edit capability is gated on the repo/dir NAME. Verified against both
-/// released repos side by side (2026-07-24): `model_index.json`,
+/// released repos side by side: `model_index.json`,
 /// `transformer/config.json` and `text_encoder/config.json` are BYTE-IDENTICAL
 /// between Mage-Flow-Turbo and Mage-Flow-Edit-Turbo, and both ship the same
 /// `visual.*` weights — nothing inside the checkpoint distinguishes them, so

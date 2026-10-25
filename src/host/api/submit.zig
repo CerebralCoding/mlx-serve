@@ -143,7 +143,7 @@ pub fn nonStreamingViaScheduler(
     // A loop cut is a truncation, and the degenerate span is the part the
     // client must not get: an agent re-sends the cut turn as history, the
     // model reads its own loop back and resumes it — five loop-stops in a
-    // row, each firing sooner than the last (live 2026-08-05, under pi).
+    // row, each firing sooner than the last (live, under pi).
     // Only reachable non-streaming: a delta cannot be retracted, so a
     // streaming client has already received the tail.
     const emit_ids = loopTrimmedIds(output_ids.items, slot.loop_trim_start);

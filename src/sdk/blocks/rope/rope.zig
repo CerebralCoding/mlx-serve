@@ -1,4 +1,4 @@
-//! sdk/blocks/rope/rope, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/blocks/rope/rope.
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");

@@ -2106,7 +2106,7 @@ test "discovery skips an incomplete media pack (media model_type without its mar
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    // The live 2026-08-08 shape: a turbo-lora fragment (and equally, any
+    // The live shape: a turbo-lora fragment (and equally, any
     // in-flight H3 pack) holds a valid minimax_h3 config.json and SOME
     // safetensors, but not transformer.safetensors. Registering it shadows
     // complete copies in later roots and the text loader dies on it.

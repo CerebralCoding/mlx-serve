@@ -59,7 +59,7 @@ pub fn nextPld(
     // guard, or a caller that simply didn't ask). The dispatching caller's
     // flag alone must never put a verify forward through the trunk — on
     // dsv4 the verify appends draft tokens into module-owned state that
-    // the KV snapshot rollback cannot restore (the 2026-07-31 mangled-DSML
+    // the KV snapshot rollback cannot restore (the mangled-DSML
     // corruption). Unlike `spec_disabled_runtime` below this is permanent:
     // no re-enable check can ever resurrect it.
     if (!self.pld_enabled) {

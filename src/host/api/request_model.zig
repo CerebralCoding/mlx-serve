@@ -96,7 +96,7 @@ pub fn resolveRequestModelId(registry: *ModelRegistry, aliases: *model_settings_
 /// Every endpoint we serve takes JSON except `/v1/images/edits`, which is
 /// `multipart/form-data` — and model resolution runs BEFORE that route
 /// translates the form to JSON, so a JSON-only scan reads no id and the request
-/// silently falls back to the default model. Live via Open WebUI (2026-07-25):
+/// silently falls back to the default model. Live via Open WebUI:
 /// an edit naming a Mage-Flow model ran against the default CHAT model and 400'd
 /// "Target model does not support this media modality"; on a headless boot with
 /// no default it 503'd "No default model configured" instead. Both existing edit
@@ -191,7 +191,7 @@ test "parseModelFromRequest reads the model out of a multipart form, not just JS
     // `/v1/images/edits` is the ONE endpoint whose body is multipart, and model
     // resolution runs BEFORE the route translates that form to JSON. A JSON-only
     // scan finds no `"model":` key, so the request silently ran against the
-    // DEFAULT model: live via Open WebUI (2026-07-25) an edit naming a Mage-Flow
+    // DEFAULT model: live via Open WebUI an edit naming a Mage-Flow
     // model hit the default chat model and 400'd "Target model does not support
     // this media modality"; headless with no default it 503'd instead.
     const ct = "multipart/form-data; boundary=abc123";

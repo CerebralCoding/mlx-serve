@@ -150,15 +150,15 @@ pub fn chipBrandString(buf: []u8) []const u8 {
 
 /// Per-silicon default share. Every row is a MEASURED optimum of its own sweep, never interpolated (a share change
 /// needs its own A/B):
-///   M4 Max: 0.45 (2026-08-18, Qwen3.8-27B oQ4e: 0.40/0.45/0.50 ranked 305/311/297 at 16k — rollover at 0.50).
-///   M3 Ultra: 0.35 (PR #223 tester, 2026-08-19: 0.45/0.40/0.35/0.30 ranked 398/421/440/438 at 32k; the smaller share
+///   M4 Max: 0.45 (Qwen3.8-27B oQ4e: 0.40/0.45/0.50 ranked 305/311/297 at 16k — rollover at 0.50).
+///   M3 Ultra: 0.35 ( tester, 0.45/0.40/0.35/0.30 ranked 398/421/440/438 at 32k; the smaller share
 ///     also drops the int8 copy 9.47 → 7.30 GB); dual 0.50. The share is the TOTAL ANE share, halved across units.
 pub fn defaultShare(chip: []const u8) f32 {
     return defaultShareFor(chip, dualDefault(chip));
 }
 
-/// M3 Ultra: 0.35 on one ANE (PR #223 tester: 0.45 was nothing, 0.35
-/// +8.5%/+13.7% at 16k/32k); with BOTH ANEs 0.50 (2026-08-22 sweep, 16k
+/// M3 Ultra: 0.35 on one ANE ( tester: 0.45 was nothing, 0.35
+/// +8.5%/+13.7% at 16k/32k); with BOTH ANEs 0.50 ( sweep, 16k
 /// prefill: single 0.35 465 tok/s, dual 0.35 471, 0.45 482-492, 0.50 498,
 /// 0.55 490, 0.65 466 — the rollover is one notch past 0.50).
 pub fn defaultShareFor(chip: []const u8, dual: bool) f32 {
@@ -166,7 +166,7 @@ pub fn defaultShareFor(chip: []const u8, dual: bool) f32 {
     return 0.45;
 }
 
-/// Dual ANE is the default on the M3 Ultra: measured 2026-08-22 on a 512 GB
+/// Dual ANE is the default on the M3 Ultra: measured on a 512 GB
 /// box, both instances at equal eval counts, zero failures, both IOReport
 /// ANE0_ counters moving, +7.1% 16k prefill over the single-ANE best.
 pub fn dualDefault(chip: []const u8) bool {
@@ -510,7 +510,7 @@ fn cachedShare(group: [:0]const u8) ?f32 {
 
 /// ANE prefill is for M4-and-below: on NAX-class GPUs (M5+) the GPU prefill
 /// already outruns the seam — measured a LOSS on M5 Max (channel 0.45 median
-/// -11%/-7.5% at 16k/32k, PR #223, two testers). MLX_SERVE_ANE_FORCE=1 keeps
+/// -11%/-7.5% at 16k/32k,, two testers). MLX_SERVE_ANE_FORCE=1 keeps
 /// the build for future silicon measurement (M6 etc.). Pure so it is
 /// hermetically testable; the scheduler passes the live NAX probe + env.
 pub fn anePrefillAllowed(nax_available: bool, force_env: ?[]const u8) bool {
@@ -521,7 +521,7 @@ pub fn anePrefillAllowed(nax_available: bool, force_env: ?[]const u8) bool {
 
 /// Every projection splits by output CHANNEL: all units see ALL chunk tokens through sliced weights — the ANE holds
 /// output channels [0..k) of gate/up (and qkv/z), the GPU the rest; the down projection contributes PARTIAL sums
-/// added at the seam, so the resident int8 copy scales with the share. Measured 2026-08-18 (27B oQ4e, M4 Max,
+/// added at the seam, so the resident int8 copy scales with the share. Measured (27B oQ4e, M4 Max,
 /// medians): channel-0.45 306.4/301.1 vs a token-row split at 0.40 300.7/294.3 vs off 258.2/239.0 at 16k/32k, at
 /// 9.3 GB ANE bytes against the row split's 20.4.
 /// Dual-ANE split: two pinned units computing disjoint channel slices
@@ -533,7 +533,7 @@ pub fn dualEnabled() bool {
 
 /// Neural Engine instances a chip carries. Ultra parts fuse two dies and
 /// expose two ANE services with two IOReport counters (H11ANE/H11ANE1,
-/// `macpow --dump | grep ANE0_` — measured on an M3 Ultra, PR #223, where
+/// `macpow --dump | grep ANE0_` — measured on an M3 Ultra,, where
 /// all energy landed on ANE0_0 because nothing named a die); everything
 /// else has one.
 pub fn aneInstanceCount(chip: []const u8) u32 {
@@ -613,7 +613,7 @@ pub const GATE_BASELINE_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 /// int8 copies come out of the same memory the KV cache is sized from, and
 /// auto-context is pinned AFTER the build — so with no reserve, admitting the
 /// offload silently shrank the number clients read once per session (measured
-/// 2026-08-20, Qwen3.8-27B iQ on a 32 GB M1 Pro: 97,280 tokens off, 5,120 on).
+/// Qwen3.8-27B iQ on a 32 GB M1 Pro: 97,280 tokens off, 5,120 on).
 /// Reserving the KV up front means an offload is admitted only if a usable
 /// context still fits beside it, and the sizer then finds that memory free.
 pub const MIN_CONTEXT_TOKENS: u32 = 32768;
@@ -649,7 +649,7 @@ pub fn mediaGateRefusal(total_mem: u64, avail_mem: u64, resident: u64, bill: u64
 /// The hard floor for starting an ANE build at all: below this much free
 /// internal disk even cache RESTORES and the framework's own model saves
 /// start failing bare ("Write weightsFilePath failed" in the unified log),
-/// and the build ships silent partial coverage — the 2026-08-18 class. The
+/// and the build ships silent partial coverage — the class. The
 /// build is SKIPPED with a named refusal instead.
 pub const BUILD_DISK_FLOOR_BYTES: u64 = 1 << 30;
 
@@ -1646,7 +1646,7 @@ fn sumUnitTiles(s: mlx.mlx_stream, outs: []const mlx.mlx_vector_array, n: c_int,
 const testing = std.testing;
 
 test "defaultShare: per-silicon channel rows, row mode keeps its M4 optimum" {
-    // M3 Ultra channel row (PR #223 tester): 0.45 measured ≈ nothing, 0.35
+    // M3 Ultra channel row ( tester): 0.45 measured ≈ nothing, 0.35
     // measured +8.5%/+13.7% at 16k/32k — the default must be the measured
     // optimum for the machine, never one machine's number everywhere.
     try std.testing.expectEqual(@as(f32, 0.50), defaultShare("Apple M3 Ultra")); // dual by default
@@ -1663,7 +1663,7 @@ test "anePrefillAllowed: NAX-class GPUs refuse the seam unless forced" {
     // No NAX (M1-M4): allowed regardless of the force env.
     try std.testing.expect(anePrefillAllowed(false, null));
     try std.testing.expect(anePrefillAllowed(false, "0"));
-    // NAX present (M5+): refused — the GPU prefill measured faster (PR #223).
+    // NAX present (M5+): refused — the GPU prefill measured faster.
     try std.testing.expect(!anePrefillAllowed(true, null));
     try std.testing.expect(!anePrefillAllowed(true, "0"));
     try std.testing.expect(!anePrefillAllowed(true, ""));
@@ -1870,7 +1870,7 @@ test "quantizeRowsInt8: round-trip, per-row scales, zero row" {
 
 test "solveShare: lands on the four measured optima, clamps, degenerate probe = default" {
     const a = ANE_TFLOPS_M1_M4;
-    // (implied GPU rate, measured optimum) from the 2026-09-10 sweeps.
+    // (implied GPU rate, measured optimum) from the sweeps.
     const rows = [_]struct { g: f64, want: f32 }{
         .{ .g = 0.18 * a, .want = 0.85 }, // M4 base / ACE-Step
         .{ .g = 0.33 * a, .want = 0.75 }, // M1 Pro / ACE-Step

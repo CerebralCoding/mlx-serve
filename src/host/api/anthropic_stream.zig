@@ -175,7 +175,7 @@ pub fn handleAnthropicStreaming(
     // templates render the opener when thinking is on, so `promptOpensThink`
     // sees it; LFM2-VL's generation prompt is a bare `<|im_start|>assistant`
     // and its model answers directly, so seeding from the flag routed the whole
-    // answer into reasoning_content and left `content` empty (live 2026-08-13).
+    // answer into reasoning_content and left `content` empty.
     // A model that opens the block itself is picked up by `saw_think_open`.
     var channel_armed = false; // the `<|channel>` marker that may open a Gemma 4 thought
     const gated_stream = has_tools or (sampling.constraint == null and reasoningDialect(config) == .harmony);
@@ -314,7 +314,7 @@ pub fn handleAnthropicStreaming(
             // Buffer for tool detection. Detection rules live in
             // `chat.streamShouldBufferForTools` — the SAME predicate as the
             // chat-completions stream (this path once carried its own inline
-            // subset, which missed the Inkling invoke marker: the 2026-07-30
+            // subset, which missed the Inkling invoke marker: the
             // NAME+JSON content leak, and before that the drift class the
             // think gate was unified for).
             try token_texts.append(allocator, token_text);

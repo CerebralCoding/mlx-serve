@@ -1,4 +1,4 @@
-//! sdk/blocks/attention/sdpa, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/blocks/attention/sdpa.
 //! Owns nax_sdpa_avail_cache, nax_sdpa_override, nax_sdpa_env, naxSdpaPreferredFrom, naxSdpaPreferred, sdpaForceFusedFor, and 15 more.
 
 const std = @import("std");

@@ -1,4 +1,4 @@
-//! sdk/blocks/gdn/gated_delta_net, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/blocks/gdn/gated_delta_net.
 //! Owns LinearAttnWeights, GdnProj, and 1 more.
 
 const mlx = @import("../../../mlx/ffi.zig");

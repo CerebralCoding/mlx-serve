@@ -401,7 +401,7 @@ test "auto-context on a 16 GB profile: activations are a chunk reserve, not a pe
 
     // Corrected, the same machine holds a real working context. The band is
     // what the RESERVE is worth, and the reserve is measured: this checkpoint
-    // peaks 1.06 GB above steady state at chunk 512 (M4 Max, 2026-08-14), so
+    // peaks 1.06 GB above steady state at chunk 512 (M4 Max), so
     // a sizer that reported the ~51k tokens the first cut of this fix did was
     // spending memory the prefill needs. Halve the chunk and it comes back.
     try t.expect(got > 15_000);
@@ -556,7 +556,7 @@ test "kvBytesPerToken bills only the CACHING layers, at the arch's own K and V w
 }
 
 test "prefillMemoryNeeded: a prompt shorter than the chunk bills the prompt-width forward, not the chunk cap" {
-    // hy_v3 live 2026-07-14: with 111 GB of weights resident (~4 GB headroom),
+    // hy_v3 with 111 GB of weights resident (~4 GB headroom),
     // a 31-TOKEN prompt was rejected "needs ~6246MB" — the MLP envelope was
     // billed at the hd-128 8192 chunk cap while the actual prefill runs ONE
     // 31-token forward (~25 MB). A forward is never wider than the prompt:
@@ -739,7 +739,7 @@ test "resolvePrefillChunk: the sizer and the guard bill the chunk that was pinne
 test "prefillMemoryNeeded: every prefill peak the box measured, re-derived for the conv_state compaction" {
     // Peak GPU bytes above steady state for ONE request on a clean boot
     // (`--prefix-cache-entries 0 --no-mtp --no-drafter --no-pld`, /props
-    // peak_bytes minus active_bytes, M4 Max, 2026-08-14) — byte-identical
+    // peak_bytes minus active_bytes, M4 Max) — byte-identical
     // across repeat boots, so these are exact figures, not samples. An
     // estimate BELOW a peak we have actually seen is the case that ends in an
     // uncatchable Metal OOM instead of a 400, so every row must be covered.
@@ -922,7 +922,7 @@ test "prefillDequantWeightBytes: affine-quantized weights only, and it reads the
 
 test "prefillMemoryNeeded: a sparse-attention arch bills its KEY BOUND, not the whole prompt" {
     const t = std.testing;
-    // DeepSeek-V4-Flash shape (live 2026-07-31): 64 heads, ONE latent kv head,
+    // DeepSeek-V4-Flash shape: 64 heads, ONE latent kv head,
     // 43 layers, head_dim 512 — outside every fused kernel, so the score term
     // fires. But DSV4 attends to sliding_window(128) + index_topk(512) + sink
     // keys per query, NEVER the whole prompt (deepseek_v4.zig: `tk = wk +
@@ -1324,7 +1324,7 @@ test "the warm KV credit fires ONLY where the restore checked its entry out" {
     defer sparse_score.qsa_score_fused_override = null;
     // `KVCache.restore` binds by refcount and mlx donates only at `use_count() == 1`, so on a
     // shared restore the first `writeAtOffset` copies the whole prefix: the credited bytes are
-    // allocated. Only the checkout makes the credit true; it used to fire on `matched > 0` alone.
+    // allocated. Only the checkout makes the credit true; `matched > 0` alone is not enough.
     const cfg = qwen4ExpOomConfig();
     const seq: u64 = 786_707;
     const chunk: u64 = 512;

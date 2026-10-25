@@ -1,4 +1,4 @@
-//! sdk/blocks/moe/gather_qmv, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/blocks/moe/gather_qmv.
 //! Owns gatherQmvSource, GQMV_BODY_AFFINE, GQMV_BODY_NVFP4, GQMV_AFFINE_HEADER, GQMV_NVFP4_HEADER, gatherQmvGateUpSource, and 28 more.
 
 const std = @import("std");

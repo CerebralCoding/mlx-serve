@@ -86,7 +86,7 @@ pub fn initWithOptions(
     // (rings + compressed caches) and a spec VERIFY forward appends
     // draft tokens to it with NO rollback — two rejected PLD drafts
     // permanently corrupted a live generation (mangled DSML with dropped
-    // token runs, 2026-07-31; the per-site `is_dsv4` wiring guard in
+    // token runs; the per-site `is_dsv4` wiring guard in
     // scheduler.runPrefill demonstrably did not cover the engaged path,
     // and per-site wiring is the class the spec-dispatch rule warns
     // about).

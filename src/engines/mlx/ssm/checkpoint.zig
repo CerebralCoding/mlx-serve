@@ -1,4 +1,4 @@
-//! engines/mlx/ssm/checkpoint, split out of engines/mlx/transformer.zig (P1, moves only).
+//! engines/mlx/ssm/checkpoint.
 //! Owns SSMCheckpoint, captureSsmCheckpoint, compact_conv_state_override, compact_conv_state_copy_count, cadence_conv_eval_count, compactConvStateEnabled, and 15 more.
 
 const std = @import("std");

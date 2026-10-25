@@ -1,4 +1,4 @@
-//! sdk/blocks/attention/kv_quant_attn, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/blocks/attention/kv_quant_attn.
 //! Owns QKV_DEC_NT, qkvDecBlockFor, QKV_DEC_KERNEL_SOURCE, qkv_dec_kernel_cached, getQkvDecKernel, qkv_dec_override, and 52 more.
 
 const std = @import("std");
@@ -458,7 +458,7 @@ pub fn qkvAttnVerifyKernel(
     // Shape gate is MEASURED adoption (the mixedNaxShapeEnabled rule): every
     // win shape is dk <= 256 (qwen3_5 24/4 hd256: +4..+7% over dense at
     // 8k/16k/32k spec-on); gemma4's full-attn gqa16 x dk512 measured a
-    // consistent −1% at Tq 2 (2026-08-15) and reads dense instead.
+    // consistent −1% at Tq 2 and reads dense instead.
     if (dk > 256) return null;
     if (@rem(dk, @as(c_int, @intCast(view.group_size))) != 0 or @rem(dv, @as(c_int, @intCast(view.group_size))) != 0) return null;
     const h_q: c_int = qs[1];
@@ -737,7 +737,7 @@ pub fn qkvAttnMppKernel(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const Den
 /// sliding layers measured a net −2% when they fused, and gemma4-12B's
 /// 1024-window sliding layers sat exactly AT the old 1024 floor and measured
 /// a ~4 tok/s decode loss fused (masked kernel at ~1k KV vs near-free dense
-/// SDPA, 2026-08-15). Short-KV layers keep dense reads even inside a fused
+/// SDPA). Short-KV layers keep dense reads even inside a fused
 /// request (a PERF gate, not a correctness gate).
 pub const KV_ATTN_FUSED_MIN_TK: c_int = 2048;
 
@@ -751,7 +751,7 @@ pub const KV_ATTN_FUSED_MIN_TK: c_int = 2048;
 /// serves (the measured +10..+56% serial win). Verify widths (T_q 2..32
 /// under MTP/spec) used to be admitted and fell to the composed qmm chain —
 /// 2 packed matmuls x every attention layer per spec round at qmm's M 2..7
-/// dead zone, measured a 2.1x decode LOSS at 8k+ (2026-08-15). They read
+/// dead zone, measured a 2.1x decode LOSS at 8k+. They read
 /// the dense view now, like prefill always has. A forced per-request
 /// `kv_attn_mode:"fused"` gets the dense read at those widths too.
 pub fn kvAttnFusedEligible(view: *const DenseKVView, t_q: c_int) bool {

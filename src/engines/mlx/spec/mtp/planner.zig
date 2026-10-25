@@ -226,7 +226,7 @@ pub fn mtpWidthTrialTarget(t: *const round_cost.Table, kv_len: u32, plan: MtpRou
     // 27B warm boot: one block at w3 in rep 1).
     if (t.measuredMs(plan.m_lo, b) == null) return if (plan.m_hi > plan.m_lo and base_settled) plan.m_lo else null;
     // m_lo-1 is deliberately NOT trialled: every trial block is a 3-4%
-    // hit on the request that carries it (peer cells, 2026-08-22), the
+    // hit on the request that carries it (peer cells), the
     // prior below the anchor already prices narrower widths, and the
     // one cliff this was for (M1 Pro 27B, 4 -> 5) is found from 4 by
     // the m_lo+1 trial below.

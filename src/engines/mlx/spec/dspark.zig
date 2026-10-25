@@ -343,7 +343,7 @@ fn servedMini(io: std.Io, a: std.mem.Allocator, path: []const u8, cfg: *model_mo
 test "dsv4: nextPld on a chokepoint-disabled generator stays serial (DSV4_MINI)" {
     // DSpark is opt-in at load; the nextDspark arm below needs it armed.
     env.set(.MLX_SERVE_DSV4_DSPARK, "1");
-    // The live corruption path (2026-07-31, log 166348-166361): the scheduler
+    // The live corruption path (log 166348-166361): the scheduler
     // decode tick dispatched on `slot.enable_pld` alone, so it called
     // `nextPld` on a generator whose init the dsv4 guard had already flipped
     // to pld_enabled=false — and nextPld trusted its caller, ran lookup +

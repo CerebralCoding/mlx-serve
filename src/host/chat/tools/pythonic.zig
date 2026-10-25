@@ -234,7 +234,7 @@ pub fn parsePythonicToolCalls(allocator: std.mem.Allocator, text: []const u8, ca
 
 test "pythonic: the real LFM2.5 capture, with every literal type" {
     // Verbatim from mlx-community/LFM2.5-2.6B-8bit via /v1/completions
-    // (2026-08-04). The model emits full Python repr — note `True` and the
+    // The model emits full Python repr — note `True` and the
     // SINGLE-quoted list, which is NOT the `tojson` form its own template
     // renders history with. A JSON-only value reader gets both wrong.
     const allocator = testing.allocator;

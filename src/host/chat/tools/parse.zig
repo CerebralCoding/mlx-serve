@@ -130,7 +130,7 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
         // one more chance as the XML-element-TAG form before being rejected:
         // DSV4 embeds the tool name in the tag itself —
         //   `<tool_read>\n<path>mlx.html</path>\n</tool_read>`
-        // (2026-06-10 pi html-ds4 capture; both calls leaked as text and pi
+        // ( pi html-ds4 capture; both calls leaked as text and pi
         // scored 0/4). Conditions kept tight: tag must close with `>` right
         // after the name (no attributes), an EXACT `</tool_NAME>` close must
         // exist, the name must not be a result-ish marker (`<tool_output>`
@@ -300,7 +300,7 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
             // that (parseHermesToolCall breaks out of its parameter loop on a
             // missing `</parameter>`, yielding name + `{}` args) so the call is
             // recognized as a truncated writeFile instead of being DROPPED and
-            // leaked into visible content (live JFK-novel capture, 2026-06-20:
+            // leaked into visible content (live JFK-novel capture,
             // a 19k-char writeFile cut off mid-content was silently lost and
             // the app fired the wrong "malformed tag" ghost nudge). Recovering
             // the name is enough for the client to fire the right chunk/append
@@ -356,7 +356,7 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
         // mandates rides inside the SAME `<tool_call>` wrapper the JSON form
         // uses, and a `<parameter=…>` VALUE is arbitrary bytes — a written
         // package.json made `balancedJsonObject` snap the FILE CONTENT, whose
-        // "name" key then became the tool name (live 2026-08-12: pi answered
+        // "name" key then became the tool name (pi answered
         // "Tool voxel-pagoda-garden not found" and the model looped on it).
         // The JSON shapes below can never contain that opener, so this only
         // reorders the case that was being read wrong.
@@ -577,7 +577,7 @@ pub const ParsedToolCall = struct {
     /// The request chokepoint validates inferred names against the declared
     /// tools schema: a truncated DATA object like {"name": "George
     /// Washington", "num": 1, …} must never become a tool call (live pi
-    /// capture 2026-07-13). Explicit tag-format calls keep flowing even with
+    /// capture). Explicit tag-format calls keep flowing even with
     /// unknown names — "tool not found" is feedback the model corrects from.
     inferred: bool = false,
 };
@@ -1213,7 +1213,7 @@ test "parseToolCalls: <tool_call>{JSON} truncated before </tool_call>" {
 }
 
 test "parseToolCalls: mismatched </tool_action> close still parses" {
-    // Verbatim DSV4-Flash capture (2026-06-10 pi html-ds4 turn 2): opened
+    // Verbatim DSV4-Flash capture ( pi html-ds4 turn 2): opened
     // with <tool_call>, closed with the hallucinated </tool_action>. The
     // edit call must parse; pre-fix it leaked into visible text and the
     // agent executed nothing.
@@ -1251,7 +1251,7 @@ test "parseToolCalls: fenced JSON array of parallel calls parses all" {
 }
 
 test "parseToolCalls: XML-element tool form (tool_name + arg children)" {
-    // Verbatim DSV4-Flash capture (2026-06-10, MLX Core agent chat): the
+    // Verbatim DSV4-Flash capture (MLX Core agent chat): the
     // tool name and each argument arrive as XML child elements — no JSON.
     const allocator = testing.allocator;
     const text = "Let me check the available disk space on this device.\n\n<tool_calls>\n<tool_name>shell</tool_name>\n<command>df -h / | grep -v \"Filesystem\"</command>\n</tool_calls>";
@@ -1269,7 +1269,7 @@ test "parseToolCalls: XML-element tool form (tool_name + arg children)" {
 }
 
 test "parseToolCalls: XML-element-TAG form (<tool_NAME> with arg children)" {
-    // Verbatim DSV4-Flash capture (2026-06-10 pi html-ds4 turn 2): the tool
+    // Verbatim DSV4-Flash capture ( pi html-ds4 turn 2): the tool
     // name rides in the tag itself — <tool_read>, <tool_edit> — with each
     // argument as an XML child element. Nested elements (the <edits> body)
     // stay verbatim as the arg's string value, matching what working models
@@ -1298,7 +1298,7 @@ test "parseToolCalls: XML-element-TAG form (<tool_NAME> with arg children)" {
 }
 
 test "parseToolCalls: XML-element-TAG form with JSON args body" {
-    // Verbatim-shape DSV4-Flash capture (2026-06-10 pi html-ds4, second
+    // Verbatim-shape DSV4-Flash capture ( pi html-ds4, second
     // sampling): same name-in-tag form but the body is a bare JSON args
     // object instead of XML elements — `<tool_write>\n{…}\n</tool_write>`.
     const allocator = testing.allocator;

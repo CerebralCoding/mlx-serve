@@ -64,7 +64,7 @@ pub fn lanShareDenial(l: *lan_mod.Lan, registry: *ModelRegistry, method: []const
         // A remote (@peer) id from a DIRECT client is allowed — dispatch
         // proxies exactly one hop and the peer's own gate governs its model
         // (the old blanket deny also 403'd the agent-sandbox guest, which is
-        // non-loopback by construction; live 2026-07-21). A request that
+        // non-loopback by construction; live). A request that
         // arrived through a peer's tunnel never hops again.
         if (tunneled) return "Remote (@peer) model ids cannot be proxied onward — ask that peer directly";
         return null;
@@ -226,7 +226,7 @@ test "lanShareDenial: shared inference surface only, resolved like dispatch" {
 
     // @peer ids: a DIRECT client (not tunneled) may initiate the single hop —
     // the old blanket deny also 403'd the agent-sandbox guest, which reaches
-    // this host over the VM NAT interface (live 2026-07-21). A request that
+    // this host over the VM NAT interface. A request that
     // ARRIVED through a peer's tunnel never hops again (the multi-hop bound).
     try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/messages", "{\"model\":\"x@peer\"}", "application/json", false) == null);
     try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/messages", "{\"model\":\"x@peer\"}", "application/json", true) != null);

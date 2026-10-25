@@ -84,7 +84,7 @@ fn parseJsonTopKOpt(root: std.json.ObjectMap, key: []const u8) ?u32 {
 /// is genuinely unknown (0) do we fall back to a finite 4096.
 ///
 /// Takes the EFFECTIVE context, not `server_config.max_context_size`: that
-/// global is set only by `--ctx-size`, so under auto-context this used to
+/// global is set only by `--ctx-size`, so under auto-context reading it would
 /// return 4096 — an omitted-max_tokens client silently capped at 4096 tokens,
 /// truncating any large tool call. Same class as the 256 default it replaced.
 pub fn omittedMaxTokensDefault(effective_ctx: u32) u32 {

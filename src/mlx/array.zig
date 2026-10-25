@@ -1,4 +1,4 @@
-//! mlx/array, split out of engines/mlx/transformer.zig (P1, moves only).
+//! mlx/array.
 //! Owns takeContig, materializedOwnedCopy, concatAxis0, axisView, concatAxis1, sliceLastDim, and 4 more.
 
 const std = @import("std");

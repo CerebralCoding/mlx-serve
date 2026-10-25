@@ -175,7 +175,7 @@ pub const ChatConfig = struct {
 // ── tests ──
 
 test "foldSystemMessages: a system turn past index 0 joins the leading system message" {
-    // Live 2026-09-15: Claude Code carries SessionStart hook output as a
+    // Claude Code carries SessionStart hook output as a
     // `system`-role message INSIDE `messages`, after the top-level system
     // prompt. Qwen's template raises on a system turn that is not first, and
     // the raise is a silent generic fallback (the model loses its stop token).

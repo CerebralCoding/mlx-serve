@@ -1984,7 +1984,7 @@ pub const AttnBroadcast = struct {
 ///
 /// The width has to follow the run length: as literals, warmup 4 + tail 2 are
 /// the whole of a 6-step run, so the fast recipe silently did nothing at or
-/// below that (live 2026-08-04 — a 4-step 768p run logged "attn-broadcast k=2"
+/// below that (live — a 4-step 768p run logged "attn-broadcast k=2"
 /// and then four identical full steps). Clamping at the 30-step value means no
 /// schedule anyone has eyeballed moves: 30 and 50 are bit-identical to the
 /// literals, only shorter runs change.
@@ -3908,7 +3908,7 @@ fn generateOne(
 
     // H3's DiT runs EVERY forward at prefill width (~9K rows at 480p), where
     // the wide-M dequant+GEMM route measured −13%/step on the 8-bit pack
-    // (2/2 adjacent pairs, 2026-08-03): on for THIS backend only.
+    // (2/2 adjacent pairs): on for THIS backend only.
     const dq_override_prev = mage_flow.mf_dq_gemm_override;
     mage_flow.mf_dq_gemm_override = @as(?usize, 2048);
     defer mage_flow.mf_dq_gemm_override = dq_override_prev;
@@ -6806,7 +6806,7 @@ test "minimax h3: a forward after a step-cache skip recomputes attention" {
 }
 
 test "minimax h3: the broadcast schedule scales down to few-step runs" {
-    // Live 2026-08-04: warmup (4) and tail (2) were LITERALS, so a run of <=6
+    // Warmup (4) and tail (2) were LITERALS, so a run of <=6
     // steps is entirely warmup+tail and every step force-refreshes — the fast
     // recipe becomes a silent no-op while the server still logs
     // "attn-broadcast k=2". The log of a 4-step 768p run shows it: four

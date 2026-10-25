@@ -1,4 +1,4 @@
-//! engines/mlx/modules/shell, split out of engines/mlx/transformer.zig (P1, moves only).
+//! engines/mlx/modules/shell.
 //! Owns moduleShell.
 
 const std = @import("std");

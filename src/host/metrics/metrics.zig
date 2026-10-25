@@ -677,7 +677,7 @@ test "prefill throughput must exclude cache-restored tokens" {
     // `prompt_tokens_total` counts the FULL prompt, including tokens the hot
     // prefix cache restored without forwarding them. Dividing that by
     // `prefill_time_seconds` (which only ticks for work actually done) inflates
-    // prefill tok/s by prompt/(prompt-cached). Live 2026-07-09: a 35B MoE with
+    // prefill tok/s by prompt/(prompt-cached). A 35B MoE with
     // a 91% token-level cache hit rate reported 9.8K tok/s where the server's
     // own log line said ~220-1100. The panel needs the FORWARDED token count.
     var m = Metrics.init();

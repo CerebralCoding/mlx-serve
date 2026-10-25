@@ -1,4 +1,4 @@
-//! sdk/blocks/linear/prefill_dq_gemm, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/blocks/linear/prefill_dq_gemm.
 //! Owns PREFILL_DQ_GEMM_MIN_M, prefillDqGemmMinRows, prefillDqGemmRowFloor, prefillDqGemmRowFloorNow, prefill_dq_gemm_env_cached, prefillDqGemmEnabled, and 2 more.
 
 const std = @import("std");

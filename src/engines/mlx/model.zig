@@ -1487,7 +1487,7 @@ pub const ModelConfig = struct {
 
     /// Fill still-null sampling recommendations with the FAMILY's documented
     /// upstream defaults. Community re-quants/distills routinely ship no
-    /// generation_config.json (live 2026-07-13: a Qwen3.6-35B distill served
+    /// generation_config.json (a Qwen3.6-35B distill served
     /// to pi resolved omitted fields to the hardcoded 1.0/1.0/off — full
     /// untruncated tail sampling on a 4-bit MoE — and a 16K-token agent turn
     /// degenerated into word salad). Same pattern as the gemma3 head-count
@@ -1520,7 +1520,7 @@ pub const ModelConfig = struct {
             // generation_config.json in any Inkling repo; their bundled
             // tooling samples greedily), so top_p 0.95 is OUR choice to cut
             // the untruncated tail — the first real pi agent session
-            // (2026-07-30) ran the hardcoded 1.0/1.0/off and degenerated
+            // ran the hardcoded 1.0/1.0/off and degenerated
             // into duplicated tool calls.
             if (self.gen_top_p == null) self.gen_top_p = 0.95;
         }
@@ -1531,7 +1531,7 @@ pub const ModelConfig = struct {
     /// IGNORES — its default is temperature 0.6, the value our converter
     /// writes into our mirrors. External conversions (pipenetwork REAP) copy
     /// the source file verbatim, and an agent CLI that omits temperature then
-    /// samples the untruncated tail (live 2026-08-01: pi against REAP37
+    /// samples the untruncated tail (pi against REAP37
     /// degenerated into token loops on its FIRST turn). When the reference
     /// implementation deliberately ignores a config field, that field is not
     /// the source of truth (the laguna YaRN class): the EXACT untouched
@@ -2890,7 +2890,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // ONE theta for every roped layer: sliding layers read
         // rope_local_base_freq in the forward, but muse ships its base only as
         // rope_parameters.rope_theta — without this the Gemma-flavored 10000
-        // default mis-rotates all 39 roped layers (the 2026-08-11 first-turn
+        // default mis-rotates all 39 roped layers (the first-turn
         // repetition-loop root cause; global layers are NoPE so EVERY rotated
         // layer ran at the wrong base).
         if (jsonField(cfg_obj, "rope_local_base_freq") == null)
@@ -5344,7 +5344,7 @@ test "ModelConfig defaults" {
 test "loadWeights casts f16 quant scales/biases to bf16 (mixed-dtype qmm slow-path class)" {
     // hy_v3 2-bit (ox-ox) ships F16 scales/biases beside bf16 activations —
     // MLX's gather_qmm/qmatmul take a ~4x slower mixed-dtype path (measured
-    // 2026-07-14: 0.70 vs 0.18 ms per 8-expert gather; 1.2 tok/s on the 295B
+    // 0.70 vs 0.18 ms per 8-expert gather; 1.2 tok/s on the 295B
     // instead of ~15+). The loader must cast quant SIDE tensors to bf16 once;
     // weights and non-quant tensors keep their dtype. Dequant delta from the
     // 3 dropped mantissa bits: cos 0.99999994 — under the 2-bit noise floor.
@@ -5524,7 +5524,7 @@ test "resolveWeightPrefix: the CHECKPOINT decides the nesting, not the config ke
     // text_config (just an empty `vision_config`), yet ship every weight under
     // `language_model.model.*`. The config-key guess picked "model" and the
     // load died on `MISSING WEIGHT: model.embed_tokens.weight` (live
-    // 2026-08-04). The same class shipped in the opposite direction before, so
+    // ). The same class shipped in the opposite direction before, so
     // the probe corrects either way.
     const allocator = testing.allocator;
     const put = struct {
@@ -5601,7 +5601,7 @@ test "resolveWeightPrefix: the CHECKPOINT decides the nesting, not the config ke
         resolveWeightPrefix(&config, &w);
         try testing.expectEqualStrings("language_model.model", config.weight_prefix);
     }
-    // mlx-community/Muse-Glimmer-30B-4bit (live 2026-08-11): meta's config
+    // mlx-community/Muse-Glimmer-30B-4bit: meta's config
     // keeps text_config, so the guess is the VL-original "model.language_model"
     // — but mlx_lm convert re-nests every text weight under
     // "language_model.model.*". The third spelling joins the probe.
@@ -5643,7 +5643,7 @@ test "applyDsv4ReferenceSampling: the source's wild signature resolves to the re
     // default is 0.6, which our converter writes into our mirrors). External
     // conversions (pipenetwork REAP) copy the file verbatim; pi (omits
     // temperature) against REAP37 degenerated into token loops on its first
-    // turn (live 2026-08-01). The exact untouched signature resolves to the
+    // turn. The exact untouched signature resolves to the
     // reference default; anything an author actually tuned is untouched.
     var wild = ModelConfig{ .model_type = "deepseek_v4" };
     wild.gen_temperature = 1.0;
@@ -5673,7 +5673,7 @@ test "applyDsv4ReferenceSampling: the source's wild signature resolves to the re
 }
 
 test "applyFamilySamplingDefaults: qwen family gets top_k 20 / top_p 0.95 when the checkpoint ships no generation_config" {
-    // Live soak capture 2026-07-13 (stamsam Qwen3.6-35B distill, served to pi):
+    // Live soak capture (stamsam Qwen3.6-35B distill, served to pi):
     // the community re-quant ships NO generation_config.json, so omitted-field
     // sampling resolution bottomed out at the hardcoded 1.0/1.0/off — full
     // untruncated tail sampling on a 4-bit MoE. A 16K-token turn degenerated
@@ -5699,7 +5699,7 @@ test "applyFamilySamplingDefaults: qwen family gets top_k 20 / top_p 0.95 when t
 
     // Inkling ships no generation_config.json anywhere and TM publishes no
     // sampling recommendation (their own tooling is greedy-only), so top_p
-    // 0.95 is OUR tail cut — the first real pi agent session (2026-07-30) ran
+    // 0.95 is OUR tail cut — the first real pi agent session ran
     // wild-sampled at 1.0/1.0/off and degenerated into duplicate calls.
     var inkling = ModelConfig{ .model_type = "inkling_mm_model" };
     inkling.applyFamilySamplingDefaults();
@@ -6833,7 +6833,7 @@ test "ModelConfig parses muse_glimmer (Muse-Glimmer-30B): NoPE full layers, qk s
     // Sliding layers read rope_local_base_freq in EVERY forward path, and muse
     // ships ONE theta for all roped layers (rope_parameters.rope_theta) — the
     // Gemma-flavored 10000 default silently mis-rotated all 39 roped layers
-    // (2026-08-11 first-turn repetition-loop root cause).
+    // ( first-turn repetition-loop root cause).
     try testing.expectApproxEqAbs(@as(f32, 500000.0), config.rope_local_base_freq, 1e-3);
     // Attention scale folds the post-qk-norm Q multiplier into 1/sqrt(head_dim).
     try testing.expectApproxEqAbs(@as(f32, 3.87 / 11.313708), config.attnScale(), 1e-6);
@@ -7427,7 +7427,7 @@ test "prefillAttnKeys: dense archs bill the whole prompt, deepseek_v4 bills its 
     // The admission guard's score term asks ONE question: how many keys does a
     // single query actually read during prefill? Dense causal attention reads
     // the whole prompt; DSV4 reads a 128-wide raw window plus ONE compressed
-    // arm, and that difference is the whole 10.3 GB spurious-400 (2026-07-31).
+    // arm, and that difference is the whole 10.3 GB spurious-400.
     var dense = ModelConfig{};
     dense.model_type = "qwen3_5";
     try testing.expectEqual(@as(u64, 100_000), dense.prefillAttnKeys(100_000));

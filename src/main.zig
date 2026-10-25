@@ -1250,7 +1250,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Persist the server log. The macOS app only keeps stderr in a 64 KB
     // in-memory ring, so a server that crashed or was restarted takes its
-    // history with it — exactly when you need it (see the 2026-07-08 pi
+    // history with it — exactly when you need it (see the pi
     // session post-mortem). Serving paths only; `pull`/`list` stay quiet.
     //
     // NOTE: opened AFTER `--log-level` is parsed (so the level gates what

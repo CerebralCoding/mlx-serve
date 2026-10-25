@@ -1,4 +1,4 @@
-//! engines/mlx/prompt_cache, split out of engines/mlx/transformer.zig (P1, moves only).
+//! engines/mlx/prompt_cache.
 //! Owns PrefillCache, resetCache, tryRestoreCache, savePromptCache.
 
 const std = @import("std");

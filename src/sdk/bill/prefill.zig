@@ -12,7 +12,7 @@ pub fn kvBytesPerTokenAtBits(dense: u64, kv_bits: u64) u64 {
 /// KV cache's proportional capacity growth (old + new buffer coexist across a
 /// grow), and the graph live-set no other term models. MEASURED as the
 /// intercept of peak-above-steady-state against the chunk, on five checkpoints
-/// spanning 2.6B to 30B (M4 Max, 2026-08-14): 0.39 GB (qwen3_5 27B), 0.67
+/// spanning 2.6B to 30B (M4 Max): 0.39 GB (qwen3_5 27B), 0.67
 /// (qwen3_5 4B), 0.81 (lfm2 2.6B), ~0.1 (gemma4 26B-A4B), 1.27 (muse 30B). It
 /// does NOT scale with the weights — a dense bf16 checkpoint pays it too — so
 /// it is billed as what it measures as: a constant.
@@ -48,7 +48,7 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64,
     // chunk runs ONE seq-wide forward, so the per-chunk transient envelope
     // scales with min(chunk, seq) — billing the raw chunk cap rejected a
     // 31-token prompt for "needing" 6.2 GB on a memory-squeezed hy_v3 host
-    // (live 2026-07-14). No-op for prompts >= one chunk.
+    // No-op for prompts >= one chunk.
     const fwd: u64 = @min(chunk, @max(seq, 1));
     const kv_bytes: u64 = seq * kvBytesPerTokenAtBits(kv_per_tok, kv_bits);
     const scores: u64 = if (!prefillHeadDimFused(@intCast(score_hdim))) heads * fwd * @min(attn_keys, seq) * 2 else 0;

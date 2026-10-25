@@ -32,7 +32,7 @@ test "hy3ExpertContainer resolves both mlx-lm switch_mlp and ox-ox experts namin
     // hy_v3 MoE experts stack under `mlp.experts.*` in ox-ox-style MLX builds
     // but `mlp.switch_mlp.*` in mlx-lm builds (mlx-community Hy3-oQ2e,
     // pipenetwork Hy3-REAP*). Same [E, out, in] tensor; the loader must accept
-    // either name or it crashes with MISSING WEIGHT at load (live 2026-07-16).
+    // either name or it crashes with MISSING WEIGHT at load.
     const allocator = testing.allocator;
     var buf: [256]u8 = undefined;
     const put = struct {

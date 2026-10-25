@@ -147,7 +147,7 @@ test "GLM-5.3-Flash images decode onto the processor's padded canvas" {
 }
 
 test "an x-mlx-pixels payload is refused by a patch-grid tower (it is a Gemma format)" {
-    // Live crash 2026-08-11: the app preprocesses images into Gemma's square
+    // Live crash the app preprocesses images into Gemma's square
     // `x-mlx-pixels` buffer unless it recognises the arch, so Muse-Glimmer got
     // one. That buffer carries NO patch grid, so the encode routed to the SigLIP
     // `forward` — whose weights are null sentinels on a patch-grid encoder —

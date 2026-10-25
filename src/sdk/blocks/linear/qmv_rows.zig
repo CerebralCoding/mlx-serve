@@ -1,4 +1,4 @@
-//! sdk/blocks/linear/qmv_rows, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/blocks/linear/qmv_rows.
 //! Owns MSV_QMV_ROWS_SOURCE, msv_qmv_rows_kernel, MsvQmvRowsCfgKey, msv_qmv_rows_cfgs, msv_qmv_rows_logged, getMsvQmvRowsKernel, and 1 more.
 
 const kernelSource = @import("../../../mlx/kernels.zig").source;

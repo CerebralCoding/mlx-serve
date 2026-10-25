@@ -41,10 +41,10 @@ const supported_drafter_model_types = [_][]const u8{
 
 /// Default block_size used when neither `--draft-block-size` nor the per-target
 /// auto-detect table picks a value. 4 = 3 drafter forwards + 1 verify token,
-/// matches vLLM PR #41745's default for E4B/26B-A4B.
+/// matches vLLM's default for E4B/26B-A4B.
 pub const DEFAULT_BLOCK_SIZE: u32 = 4;
 
-/// Per-target block_size recommendation. Mirrors vLLM PR #41745
+/// Per-target block_size recommendation. Mirrors vLLM
 /// (Google's reference Gemma 4 assistant-drafter implementation):
 ///
 ///   E2B    (dense, ~30 layers):    2
@@ -85,7 +85,7 @@ pub fn recommendedBlockSize(target_config: *const ModelConfig) u32 {
     }
 
     // Dense Gemma 4: pick based on depth. E2B has ~30 layers, E4B ~42, 31B ~60.
-    // Cutoffs chosen to match vLLM PR #41745's per-model table.
+    // Cutoffs chosen to match vLLM's per-model table.
     const layers = target_config.num_hidden_layers;
     if (layers >= 56) return 8;     // 31B class
     if (layers >= 36) return 4;     // E4B class

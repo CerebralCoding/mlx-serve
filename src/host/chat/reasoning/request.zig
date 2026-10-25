@@ -365,7 +365,7 @@ pub fn reasoningEffortFromWord(word: []const u8, default_budget: i32, template_c
 /// in place of the older `thinking` budget object, and `format` where this
 /// surface previously had no structured-output request at all. Ignored, it
 /// served every Claude Code request at the arch default with an UNLIMITED
-/// thinking budget (live 2026-08-16: 8-minute retries at 16k thinking tokens
+/// thinking budget (8-minute retries at 16k thinking tokens
 /// each) and answered `json_schema` requests with markdown prose the client
 /// rejects — which is what fed the retry loop.
 const AnthropicOutputConfig = struct {
@@ -516,7 +516,7 @@ test "parseReasoningEffort: a template that READS the effort word gets no budget
     // word already shortens the THOUGHT; a budget that is only a delivery cap
     // fights it: pi asking Qwen3.8 for `medium` got the model's unguided (long)
     // thinking AND a 2048-token cut, followed by 25.9k tokens of invisible
-    // generation (live 2026-08-14). The third argument is `effortWordOnly`:
+    // generation. The third argument is `effortWordOnly`:
     // true when the template reads the word AND `armThinkBound` cannot close
     // the thought at the budget (non-atomic markers). With atomic markers the
     // budget is enforced in-stream and the word maps like everywhere else.
@@ -553,7 +553,7 @@ test "parseReasoningEffort: a template that READS the effort word gets no budget
 
 test "parseAnthropicOutputConfig: Claude Code's shape yields effort AND the schema" {
     const allocator = std.testing.allocator;
-    // Verbatim shape from the live 2026-08-16 capture (schema abbreviated).
+    // Verbatim shape from the live capture (schema abbreviated).
     const body =
         \\{"output_config":{"effort":"high","format":{"type":"json_schema","schema":{"type":"object","properties":{"title":{"type":"string"}}}}}}
     ;
@@ -744,7 +744,7 @@ test "messageReasoningFromObj: reasoning_content round-trip, reasoning fallback,
     const t = std.testing;
     const allocator = t.allocator;
     const cases = [_]struct { body: []const u8, want: ?[]const u8 }{
-        // pi/vLLM SSE spelling — the live laguna case (2026-07-29).
+        // pi/vLLM SSE spelling — the live laguna case.
         .{ .body = "{\"role\":\"assistant\",\"content\":\"4\",\"reasoning_content\":\"two plus two\"}", .want = "two plus two" },
         // vLLM request spelling.
         .{ .body = "{\"role\":\"assistant\",\"content\":\"4\",\"reasoning\":\"twice two\"}", .want = "twice two" },

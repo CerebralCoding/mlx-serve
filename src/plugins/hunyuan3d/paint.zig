@@ -10,7 +10,7 @@
 //! back-project bake (cos⁴ blend) → vertex-graph inpaint (src/sdk/mesh/texinpaint.zig)
 //! → textured GLB (src/sdk/mesh/glb.zig).
 //!
-//! Parity facts honored here (verified against reference sources 2026-07-04):
+//! Parity facts honored here (verified against reference sources):
 //! - Runtime scheduler in the reference is UniPCMultistep FROM the shipped
 //!   DDIM config; we implement DDIM (same config: v-prediction,
 //!   rescale_betas_zero_snr, trailing spacing) first — fixtures are dumped

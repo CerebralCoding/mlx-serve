@@ -1,4 +1,4 @@
-//! sdk/blocks/attention/masks, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/blocks/attention/masks.
 //! Owns encoderBandMask.
 
 const std = @import("std");

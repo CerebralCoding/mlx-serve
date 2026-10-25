@@ -11,7 +11,7 @@ const prefillMemoryNeeded = @import("../../sdk/bill/prefill.zig").prefillMemoryN
 
 /// deepseek_v4 sibling of `prefillMemoryNeeded`: bills what `extendState`
 /// ACTUALLY allocates (third bite of the bills-what-the-arch-reads class,
-/// live 2026-08-01: the generic estimator billed 4069 MB for a 7514-token pi
+/// the generic estimator billed 4069 MB for a 7514-token pi
 /// prompt against 3610 MB available and 400'd it; the honest bill is ~2.3 GB).
 /// Two generic terms are wrong for this arch: `chunk` is the generic MoE
 /// prefill cap (4096) but dsv4 sub-chunks internally at `prefillSub()` (512),
@@ -29,7 +29,7 @@ pub fn dsv4PrefillMemoryNeeded(seq: u64, layers: u64, latent: u64, hidden: u64, 
     const mlp: u64 = 8 * fwd * @max(hidden, ffn) * 2;
     // Same chunk-independent runtime floor the generic estimator bills: it is
     // a property of the MLX runtime and the KV cache's growth, not of the arch
-    // (the 2026-08-01 live case still admits — 2984 MB against 3610 free).
+    // (the live case still admits — 2984 MB against 3610 free).
     return (kv_bytes + gather + 3 * mlp + PREFILL_RUNTIME_FLOOR_BYTES) * 5 / 4;
 }
 
@@ -83,7 +83,7 @@ fn prefillBytes(p: *const abi.Parsed, seq: u64, chunk: u32, kv_bits: u8, warm: u
 
 test "dsv4PrefillMemoryNeeded: bills the arch's own sub-chunk and f32 gather, not the generic MoE chunk" {
     const t = std.testing;
-    // Live 2026-08-01 (pi + stochastic DSpark, stages resident): a 7514-token
+    // Live (pi + stochastic DSpark, stages resident): a 7514-token
     // prompt was 400-rejected — the generic estimator billed 4069 MB against
     // 3610 MB available. Its chunk term is the generic MoE prefill cap (4096)
     // but dsv4 sub-chunks internally at 512 (deepseek_v4.prefillSub — the

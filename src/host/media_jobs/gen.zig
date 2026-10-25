@@ -124,7 +124,7 @@ pub fn detectModality(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
 /// is missing — an incomplete pack (an in-flight or interrupted download, or
 /// a stray fragment). The load path refuses these BY NAME: falling through to
 /// the text loader globs whatever safetensors ARE present and dies on the
-/// first missing weight (`unreachable` in ReleaseFast — live 2026-08-08, a
+/// first missing weight (`unreachable` in ReleaseFast — live, a
 /// turbo-lora fragment killed the server on a plain Generate).
 pub fn incompleteMediaDir(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
     const mt = peekModelType(io, allocator, model_dir) orelse return false;
@@ -756,7 +756,7 @@ fn sendBytes(conn: *Conn, allocator: std.mem.Allocator, content_type: []const u8
 
 pub fn sendError(conn: *Conn, code: u16, msg: []const u8) !void {
     // A refusal that logs nothing is invisible the moment a client drops the
-    // body (live 2026-08-06: the app's stream path showed a bare "HTTP 400"
+    // body (the app's stream path showed a bare "HTTP 400"
     // while the log showed a clean load→unload and nothing else).
     log.warn("[gen] {d}: {s}\n", .{ code, msg });
     // Escape at the SINK: several of these messages quote a field value

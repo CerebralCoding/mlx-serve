@@ -458,7 +458,7 @@ fn buriedParamIn(
 /// know. Strict clients reject it ("path: must have required properties path"),
 /// and the model, which cannot see its own serialized request, re-emits the same
 /// call until it gives up and falls back to rewriting the whole file with
-/// `write` — three dead multi-thousand-token rounds in the live 2026-07-13 pi
+/// `write` — three dead multi-thousand-token rounds in the live pi
 /// session (gemma-4-26B-A4B). Same shape as the Claude Code replace_all loop.
 ///
 /// Contract — every condition is read off the SCHEMA, never guessed:
@@ -675,7 +675,7 @@ test "toolNameIsDeclared: wrapped + flat forms; unparseable schema never drops" 
 test "issue #94: a container param carried as literal TEXT coerces to a real array/object" {
     // #94 reports this as an open gap on the strength of the doc comment
     // ("only SCALARS are touched"), which was stale — `coerceValueToType` has
-    // had its array/object arm since 60ba5ec (2026-07-09), two weeks before
+    // had its array/object arm since 60ba5ec, two weeks before
     // the issue was filed. Pinned as a TEST rather than left as a code read,
     // so the claim is settled by evidence and cannot silently regress.
     const allocator = testing.allocator;
@@ -716,7 +716,7 @@ fn parseArgsObj(allocator: std.mem.Allocator, args: []const u8) !std.json.Parsed
 }
 
 test "coerceToolArgsToSchema: Python-style False on a boolean param becomes JSON false" {
-    // VERBATIM capture, 2026-07-09, Qwen3.6-35B-A3B via Claude Code on
+    // VERBATIM capture, Qwen3.6-35B-A3B via Claude Code on
     // ~/.mlx-serve/logs/mlx-serve-11234.log:109471. The model emits the Hermes
     // XML parameter form with Python's `False`; parseHermesToolCall's
     // isJsonLiteral only knows lowercase, so it shipped the STRING "False" and
@@ -1147,7 +1147,7 @@ test "coerceToolArgsToSchema: a MANGLED array-typed param is tolerantly repaired
 
 // ── Misplaced required param (buried-`path` class) ──────────────────────────
 //
-// VERBATIM captured arguments, 2026-07-13 pi session (gemma-4-26B-A4B-it-qat-4bit,
+// VERBATIM captured arguments pi session (gemma-4-26B-A4B-it-qat-4bit,
 // ~/.mlx-serve/logs/mlx-serve-11234.log around the us_presidents run). The model
 // put `path` INSIDE each edits[] item and emitted no top-level `path`, so pi
 // answered

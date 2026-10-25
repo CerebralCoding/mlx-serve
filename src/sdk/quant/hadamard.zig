@@ -1,4 +1,4 @@
-//! sdk/quant/hadamard, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/quant/hadamard.
 //! Owns registerRhtSigns.
 
 const std = @import("std");

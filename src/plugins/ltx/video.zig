@@ -5187,7 +5187,7 @@ test "ltx preview: the Latent2RGB preview resembles the decoded frame" {
         "[ltx-preview] latent={d}x{d}x{d} decode={d}x{d}x{d} corr_fit={d:.4} corr_huewheel={d:.4} chroma_fit={d:.4} chroma_huewheel={d:.4}\n",
         .{ lc, lh, lw, ot, oh, ow, corr_fit, corr_ctrl, chroma_fit, chroma_ctrl },
     );
-    // Same four-part bar as the H3 twin. Measured 2026-08-30 (LTX-2.5 8-bit VAE
+    // Same four-part bar as the H3 twin. Measured (LTX-2.5 8-bit VAE
     // pair, M-series): fit 0.898 / chroma 0.923, control 0.196 / 0.262.
     try testing.expect(corr_fit > 0.6);
     try testing.expect(corr_fit > corr_ctrl + 0.3);
@@ -6589,7 +6589,7 @@ test "ltx latent upsampler reproduces reference LatentUpsampler" {
 }
 
 test "loadComponent releases every tensor on deinit (phantom-ref leak class)" {
-    // Live 2026-07-03: every video load→generate→unload cycle leaked the
+    // Every video load→generate→unload cycle leaked the
     // whole materialized engine (~18 GB) because loadComponent kept the
     // iterator's +1 reference on each tensor (copied via mlx_array_set,
     // never freed the original handle) — Component.deinit decremented to 1,

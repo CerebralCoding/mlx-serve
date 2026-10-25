@@ -178,7 +178,7 @@ pub fn modelBatchable(cfg: *const model_mod.ModelConfig) bool {
 /// `Dsv4Model.dec_state` is rebuilt at cache.step==0 and advanced by every
 /// decode tick, so a second interleaved slot deinit+rebuilds the active
 /// request's state and both then append tokens to the ONE state (live
-/// 2026-08-02: an app chat leaked into a pi stream, every word doubled).
+/// an app chat leaked into a pi stream, every word doubled).
 /// Serial-tick interleave stays safe for per-slot-state archs (laguna/hy3)
 /// — ask the transformer which archs own their decode state, NEVER key on
 /// !modelBatchable, and never name ONE arch here: when a second module-owned

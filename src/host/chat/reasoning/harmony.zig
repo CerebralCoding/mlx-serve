@@ -151,7 +151,7 @@ pub fn harmonyThinkOpenerAt(buf: []const u8) HarmonyOpener {
 /// everything before it, which assumes the reasoning starts at byte 0. Harmony
 /// puts a header there instead, and every byte of it is ordinary text — so
 /// without this the first reasoning delta opens with a literal
-/// `<|channel|>analysis<|message|>` (live 2026-08-12).
+/// `<|channel|>analysis<|message|>`.
 pub fn harmonyAnalysisHeaderLen(buf: []const u8) ?usize {
     var i: usize = 0;
     if (std.mem.startsWith(u8, buf, HARMONY_START_TAG)) {

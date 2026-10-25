@@ -1,4 +1,4 @@
-//! sdk/blocks/attention/attn256, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/blocks/attention/attn256.
 //! Owns ATTN256_KERNEL_HEADER, ATTN256_KERNEL_SOURCE, attn256_kernel_cached, getAttn256Kernel, fused256_env_cached, fused256_causal_env_cached, and 29 more.
 
 const std = @import("std");
@@ -33,7 +33,7 @@ const naxSdpaPreferred = @import("sdpa.zig").naxSdpaPreferred;
 // shared predicate, so they cannot drift.
 pub const ATTN256_KERNEL_HEADER = kernelSource("kernels/attention/attn256_header.metal");
 
-// v2 tile geometry (2026-07-12 micro-bench sweep on the M4 Max, Qwen 24q/4kv
+// v2 tile geometry ( micro-bench sweep on the M4 Max, Qwen 24q/4kv
 // and Gemma geometries): BQ=64 with 8 simdgroups halves the K/V staging walks
 // per query row vs the v1 32-row tile; BK=32 halves the per-column softmax
 // rescale + barrier overhead; Q lives in REGISTERS loaded straight from
@@ -80,7 +80,7 @@ pub fn fused256Enabled() bool {
 }
 
 /// Plain-CAUSAL dispatch mode. Default `.all` since the kv-chunk dispatch
-/// budget landed (2026-07-22): the historical net-LOSS of every pre-budget
+/// budget landed: the historical net-LOSS of every pre-budget
 /// ratio-gated variant (8K: fused-to-ratio-4 231.5, fused-to-ratio-2 232.9,
 /// composed 234.7 tok/s — monotonic: more fused = slower, despite the v2
 /// kernel winning the µbench at kL <= 2*qL) was the macOS IOGPU

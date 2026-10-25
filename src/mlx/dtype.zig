@@ -1,4 +1,4 @@
-//! mlx/dtype, split out of engines/mlx/transformer.zig (P1, moves only).
+//! mlx/dtype.
 //! Owns DtypeCastCache, constTableAs.
 
 const std = @import("std");

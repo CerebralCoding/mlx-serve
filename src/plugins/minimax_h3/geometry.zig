@@ -97,7 +97,7 @@ pub const Geometry = struct {
 
 pub const SpeedConfig = struct { step_cache: f64, bcast_k: u32 };
 
-/// The 2026-08-03 eyeball verdict on the same-seed capstone pair made the
+/// The eyeball verdict on the same-seed capstone pair made the
 /// fast recipe (velocity cache 0.05 + attention broadcast k=2 — 2.83x at the
 /// trained config) DEFAULT-ON, with `"fast": false` on the request as the
 /// off switch for final renders ("non fast just a smidge better").

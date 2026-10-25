@@ -1,4 +1,4 @@
-//! sdk/blocks/linear/fused_rows, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/blocks/linear/fused_rows.
 //! Owns FusedQkv, fused_qkv_engaged, fused_qkv_override, fused_qkv_env, fusedQkvEnabled, FusedRows, and 7 more.
 
 const std = @import("std");

@@ -1,4 +1,4 @@
-//! sdk/blocks/norms/grouped_rms, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/blocks/norms/grouped_rms.
 //! Owns groupedRmsNorm.
 
 const std = @import("std");

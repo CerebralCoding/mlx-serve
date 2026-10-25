@@ -82,7 +82,7 @@ test "spliceVisionRows: two chunks with row offsets equal the whole-prompt splic
 }
 
 test "spliceVisionRows: video placeholders are scattered like image rows (Qwen video_token_id)" {
-    // Live 2026-08-26 (qwen4_exp, 4-frame clip): 690 <|video_pad|> tokens were
+    // Live (qwen4_exp, 4-frame clip): 690 <|video_pad|> tokens were
     // inserted and the tower encoded 690 rows, but the mask keyed on image |
     // audio ids only, so no video row ever reached the prompt and the model
     // described a clip it never saw. Same hole on qwen3_5 (its e2e bar of

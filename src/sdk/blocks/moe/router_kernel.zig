@@ -1,4 +1,4 @@
-//! sdk/blocks/moe/router_kernel, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/blocks/moe/router_kernel.
 //! Owns RouterMode, ROUTER_MAX_EXPERTS, moeRouterSource, ROUTER_SOURCES, ROUTER_NAMES, router_kernels, and 13 more.
 
 const std = @import("std");
@@ -198,7 +198,7 @@ pub fn moeRouterThreadGroup(num_experts: c_int) c_int {
 /// bakes the OUTPUT SHAPES (and grid) of the call that built it, so the key
 /// must carry the caller's actual dims: keying on a PRODUCT (rows, n) collides
 /// across layouts with equal element counts and hands the colliding caller an
-/// output labeled with the FIRST caller's shape. Live 2026-07-29 (Laguna XS):
+/// output labeled with the FIRST caller's shape. Live (Laguna XS):
 /// a MoE-layer SwiGLU at a 16-token hot-cache-restore prefill is (1,16,512) =
 /// 8192 elements — the same count/rank/dtype as a dense mlp_only layer at
 /// decode (1,1,8192) — and the mislabeled activation killed the server in the

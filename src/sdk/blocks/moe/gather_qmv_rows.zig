@@ -1,4 +1,4 @@
-//! sdk/blocks/moe/gather_qmv_rows, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/blocks/moe/gather_qmv_rows.
 //! Owns gatherQmvGateUpRowsSource, GQMV_GATEUP_ROWS_SOURCES, GQMV_GATEUP_ROWS_NAMES, gqmv_gateup_rows_kernels, getGatherQmvGateUpRowsKernel, GateUpRowsCfgKey, and 19 more.
 
 const std = @import("std");

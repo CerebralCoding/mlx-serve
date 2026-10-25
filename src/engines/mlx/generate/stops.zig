@@ -20,7 +20,7 @@ pub fn tokenStops(next_token_id: u32, eos_token_ids: []const u32, consecutive_pa
 
 /// Stall clock for the request timeout: the deadline measures time since the
 /// last PRODUCED token, not since the request started. A wall-clock request
-/// timeout kills legitimate long generations — live capture 2026-07-03:
+/// timeout kills legitimate long generations — live capture
 /// Qwen3.6-27B writing a 33KB file in one tool call decodes for >300s at
 /// ~30 tok/s and was guillotined mid-call by the 300s default, which then
 /// surfaced as a "butchered" path-only tool call. Progress is detected from

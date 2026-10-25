@@ -111,7 +111,7 @@ pub const TrimDecline = enum {
 
 /// Outcome of a cache commit, so callers can log the truth. A budget
 /// decline used to exit `commitWithMediaState` via plain return and the
-/// scheduler logged "committed N/M" for it (live 2026-09-07: a 122k agent
+/// scheduler logged "committed N/M" for it (a 122k agent
 /// session cold-prefilled ~95k tokens per retry while the log claimed
 /// cancelled-prefill commits every time).
 pub const CommitStatus = union(enum) {
@@ -1236,7 +1236,7 @@ pub const HotPrefixCache = struct {
             // restored row IS what the vision splice would have produced.
             const dm = d.bestMatch(prompt_ids, has_tools, target_cache.config, media) orelse {
                 // Silent no-entry misses are why a 40 GB disk tier looked
-                // dead in a live post-mortem (2026-09-07): nothing in the
+                // dead in a live post-mortem: nothing in the
                 // log ever said the tier was consulted and found nothing.
                 if (d.entryCount() > 0)
                     log.debug("  [disk-cache] lookup miss: {d} entries on disk, none share a token prefix under this (tools, quant) key\n", .{d.entryCount()});
@@ -1492,7 +1492,7 @@ pub const HotPrefixCache = struct {
         // (then skipping the truncate) left `cache.offset` AHEAD of the matched
         // length that generation tracks (`moe_seq_offset`) — a silent drift that
         // corrupts RoPE positions and CRASHES the Gemma sliding-window prefill mask
-        // (`broadcast_shapes` mask-vs-KV mismatch; live 2026-07-09 on
+        // (`broadcast_shapes` mask-vs-KV mismatch; live on
         // gemma-4-26B-A4B at ~16K ctx). truncate is a no-op when the buffer is
         // already `final_len`, so unconditional clamping is safe and restores the
         // invariant cache.offset == matched. The stale KV tail has no matching
@@ -2162,7 +2162,7 @@ pub const HotPrefixCache = struct {
     /// it. The RAM budget declines RETENTION, not value: under a small
     /// --prefix-cache-mem a long agent session's cancelled-prefill prefixes
     /// were thrown away on every retry while a much larger disk tier sat
-    /// idle (live 2026-09-07). Text-prefix candidates only — the disk never
+    /// idle. Text-prefix candidates only — the disk never
     /// holds pixel-keyed rows. Best-effort: a failed write costs nothing the
     /// RAM decline hadn't already lost, and a byte-capped write continues
     /// from the next commit of the same conversation (chunks are
@@ -2189,7 +2189,7 @@ pub const HotPrefixCache = struct {
         const rec_media = spansBelow(media, tokens.len);
         // A decline-spill runs after the client is gone: the per-flush cap
         // exists to bound the stall a LIVE next request pays, and capping
-        // here stranded most of each retry's work (live 2026-09-07: 512 MB
+        // here stranded most of each retry's work (512 MB
         // ≈ 13k tokens banked per retry while ~35k were recomputed every
         // time). Raise the budget for the spill's duration — the tier's
         // byte budget + LRU eviction is the real bound.
@@ -3263,7 +3263,7 @@ test "HotPrefixCache: findBestMatch returns longest shared prefix" {
 }
 
 test "HotPrefixCache: restore clamps an inflated snapshot to the matched length (gemma mask crash)" {
-    // Root cause of the live gemma-4-26B-A4B crash (2026-07-09, broadcast_shapes
+    // Root cause of the live gemma-4-26B-A4B crash (broadcast_shapes
     // mask 16890 vs KV 16892 at ~16K ctx): a snapshot committed with a KV buffer
     // LONGER than its logical token count — PLD/speculative decode leaves stale
     // draft positions in the buffer past the committed step. When the NEXT prompt
@@ -3749,7 +3749,7 @@ test "HotPrefixCache: a disk restore leaves room for the token it re-forwards" {
 }
 
 test "HotPrefixCache: budget decline reports a status, not a silent success" {
-    // Live 2026-09-07: every oversized decline from a cancelled prefill
+    // Every oversized decline from a cancelled prefill
     // logged "[hot-cache] committed N/M" at the scheduler because the
     // decline exits commitWithMediaState via plain return — a 122k agent
     // session looked cached while it cold-prefilled ~95k tokens per retry.
@@ -3828,7 +3828,7 @@ test "HotPrefixCache: media spans bound the reusable prefix at the first differi
 }
 
 test "HotPrefixCache: media request restores the pre-media text prefix from SSD" {
-    // Live 2026-09-07: the SSD-tier lookup skipped ANY request with a
+    // The SSD-tier lookup skipped ANY request with a
     // non-zero vision_key (`vision_key != 0 → break :disk`) — a 122k agent
     // session whose LAST turn carries one screenshot never touched the
     // 40 GB of persisted text prefixes, though 99.8% of the prompt is
@@ -4570,7 +4570,7 @@ test "HotPrefixCache: hybrid SSM state restores from the SSD tier across a resta
 }
 
 test "HotPrefixCache: chunk-heavy hybrid flush still lands its SSM checkpoints" {
-    // Live 2026-09-07: checkpoints were written AFTER the chunks from the
+    // Checkpoints were written AFTER the chunks from the
     // REMAINING per-flush budget — a turn appending ≥ the cap in chunks
     // (cancel-salvage retries: +16 chunks ≈ 544 MB vs a 512 MB cap) left
     // ZERO checkpoint budget every time, and the same-token catch-up path
@@ -4661,7 +4661,7 @@ test "HotPrefixCache: under SSD-first a decline rides pending_disk, never a seco
 }
 
 test "HotPrefixCache: a budget-declined candidate spills to the SSD tier" {
-    // Live 2026-09-07: an oversized decline discarded the cancelled
+    // An oversized decline discarded the cancelled
     // prefill's work entirely — under a 1 GB hot budget a 122k session's
     // 76-82k-token forwarded prefixes were thrown away on every retry
     // while a 40 GB SSD tier sat idle. The decline must OFFER the
@@ -4713,7 +4713,7 @@ test "HotPrefixCache: a budget-declined candidate spills to the SSD tier" {
 test "HotPrefixCache: a decline-spill is not bounded by the per-flush byte cap" {
     // The per-flush cap bounds the stall a LIVE next request pays after a
     // response. A decline-spill runs on a request whose client is already
-    // gone — capping it (live 2026-09-07: 512 MB ≈ 13k tokens banked per
+    // gone — capping it (512 MB ≈ 13k tokens banked per
     // retry) stranded most of each retry's work while ~35k tokens were
     // recomputed every time. The spill owes no latency; the tier's byte
     // budget + LRU is the real bound.
@@ -4763,7 +4763,7 @@ test "HotPrefixCache: hybrid disk restore ranks entries by restorable checkpoint
     // tier's hybrid arm used bestMatch (ranked by usable length) and then
     // took that ONE entry's checkpoint — an entry with a high usable length
     // but low checkpoints shadowed a shorter entry with a higher
-    // restorable position (live 2026-09-07: the growing conversation entry
+    // restorable position (the growing conversation entry
     // would have shadowed the old entry's cp@51200 with cp@49152).
     const io = std.testing.io;
     const s = mlx.gpuStream();

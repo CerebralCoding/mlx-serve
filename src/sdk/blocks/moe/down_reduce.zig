@@ -1,4 +1,4 @@
-//! sdk/blocks/moe/down_reduce, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/blocks/moe/down_reduce.
 //! Owns gatherQmvDownReduceSource, GQMV_DOWNRED_SOURCES, GQMV_DOWNRED_NAMES, gqmv_downred_kernels, getGatherQmvDownReduceKernel, downredLanesFor, and 20 more.
 
 const std = @import("std");

@@ -18,7 +18,7 @@
 //!    (two sites in src/host/http/server.zig — streaming and non-streaming). The inline
 //!    dump caps at 4KB; for mega-tool-calls also set
 //!    MLX_SERVE_RAW_DUMP_FILE=<abs path> to write the FULL pre-parse buffer
-//!    of the last streamed tools request (how the 2026-07-03 timeout-guillotine
+//!    of the last streamed tools request (how the timeout-guillotine
 //!    class was captured).
 //! 2. Grep the server log for that line (or for the misbehaving output).
 //! 3. Paste the raw text into a new `Expect` entry below with the family it
@@ -26,7 +26,7 @@
 //!    tags in visible content, tool args must be valid JSON) apply
 //!    automatically; add per-entry expectations for the specific behavior.
 //!
-//! Origin: the 2026-06-10 live pi-agent session caught five format bugs unit
+//! Origin: the live pi-agent session caught five format bugs unit
 //! tests missed. Three are pure-function bugs pinned here (truncated
 //! template-opened thinking leaking into content; a trailing raw
 //! `<|channel>thought` tag leaking into visible output; an unterminated
@@ -266,7 +266,7 @@ const write_read_tools_schema =
 ;
 
 /// pi's bash tool (one required string arg) — used by the LIVE Inkling agent
-/// captures below (pi v0.83.0 session, 2026-07-30).
+/// captures below (pi v0.83.0 session).
 const bash_tool_schema =
     \\[{"type":"function","function":{"name":"bash","description":"Run a shell command","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}]
 ;
@@ -296,7 +296,7 @@ const corpus = [_]Expect{
         .reasoning_contains = "17*20=340",
     },
     .{
-        // BUG 1 (2026-06-10 pi session): generation hit max_tokens before
+        // BUG 1 ( pi session): generation hit max_tokens before
         // `</think>`, so the output has NO think tags at all. Pre-fix the
         // truncated reasoning was dumped into visible content.
         .family = "qwen",
@@ -323,7 +323,7 @@ const corpus = [_]Expect{
         .content_exact = "17 × 23 = 391.",
     },
     .{
-        // LIVE 2026-10-19 (Qwen3.8-27B 4bit, MTP, temp 1.0, agent turn beside media jobs, m4max):
+        // LIVE (Qwen3.8-27B 4bit, MTP, temp 1.0, agent turn beside media jobs, m4max):
         // the `<` of `<function=` was sampled as the `<|im_start|>` special, the JSON shapes
         // failed and the agent got an empty `stop`. One mangled delimiter, name and args intact.
         .family = "qwen",
@@ -344,7 +344,7 @@ const corpus = [_]Expect{
         .tool_arg_value = "UTC",
     },
     .{
-        // LIVE capture 2026-08-12 (ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve via
+        // LIVE capture (ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve via
         // pi). Qwen 3.5/3.6's OWN template mandates this `<function=` dialect,
         // and it rides inside the SAME `<tool_call>` wrapper the JSON form
         // uses — so the JSON branch snapped the first balanced object in the
@@ -391,7 +391,7 @@ const corpus = [_]Expect{
         .reasoning_contains = "340+51",
     },
     .{
-        // BUG 3 (2026-06-10 pi session): Gemma 4 12B answers in prose, then
+        // BUG 3 ( pi session): Gemma 4 12B answers in prose, then
         // opens a NEW thought channel right before the turn ends. The raw
         // opener tag leaked into visible output; pi rendered it to the user.
         .family = "gemma4",
@@ -417,7 +417,7 @@ const corpus = [_]Expect{
         .content_exact = "The answer is 42.",
     },
     .{
-        // Live 2026-07-16 soak: gemma-4-26B degenerated into a bare 1-token
+        // Live soak: gemma-4-26B degenerated into a bare 1-token
         // <tool_call|> CLOSE with NO <|tool_call> opener (a "no tools needed"
         // probe with tools present, temp 0.7). parseToolCalls found no call, so
         // the orphan control token used to leak as the WHOLE content. A tool
@@ -428,7 +428,7 @@ const corpus = [_]Expect{
         .content_exact = "",
     },
     .{
-        // BUG 4 (2026-06-10 pi session, verbatim capture): the LAST string
+        // BUG 4 ( pi session, verbatim capture): the LAST string
         // value lost its closing <|"|> delimiter and carried a stray markdown
         // backtick. The unterminated-string scan used to run to end of body,
         // so the parsed path was literally "mlx_pi1.html`}" — and pi created
@@ -537,7 +537,7 @@ const corpus = [_]Expect{
         .tool_arg_absent = "content",
     },
     .{
-        // Verbatim capture (2026-08-01, agent session on
+        // Verbatim capture (agent session on
         // DeepSeek-V4-Flash-0731): the model emitted a COMPLETE DSML call
         // INSIDE its think block, closed the block, then issued a different
         // call in content. Tool parse runs on the post-think text only, so the
@@ -563,7 +563,7 @@ const corpus = [_]Expect{
         .tool_arg_value = "index.html",
     },
     .{
-        // Verbatim capture (2026-08-01, same session): the model answered a
+        // Verbatim capture (same session): the model answered a
         // plain question and then emitted a BARE DSML marker with no call
         // behind it. Nothing parses, so the buffered tail flushes as visible
         // content — raw marker included.
@@ -574,7 +574,7 @@ const corpus = [_]Expect{
         .content_exact = "",
     },
     .{
-        // Verbatim capture (2026-07-31 log): the model mangled the opener
+        // Verbatim capture ( log): the model mangled the opener
         // (`<｜DSML｜toolinvoke name"` where the spec is
         // `<｜DSML｜tool_calls>\n<｜DSML｜invoke name=`), so no call parses and
         // the whole block became the visible answer.
@@ -617,7 +617,7 @@ const corpus = [_]Expect{
         .tool_arg_value = "ls",
     },
     .{
-        // Claude Code capture (2026-06-10, gemma-4-12b via /v1/messages): the
+        // Claude Code capture (gemma-4-12b via /v1/messages): the
         // model closed its thought, emitted content, then RE-OPENED an empty
         // thought channel mid-text and closed it immediately. The raw
         // `<|channel>thought\n<channel|>` pair leaked verbatim into the text
@@ -641,7 +641,7 @@ const corpus = [_]Expect{
         .reasoning_contains = "Should I add more detail",
     },
     .{
-        // pi capture (2026-06-10, gemma-4-26B-A4B GGUF via llama engine, same
+        // pi capture (gemma-4-26B-A4B GGUF via llama engine, same
         // shared split code): the model emits its answer, then opens TWO
         // thought channels in a row, neither ever closed. The cut must happen
         // at the FIRST unclosed opener — cutting at the last one leaks the
@@ -662,7 +662,7 @@ const corpus = [_]Expect{
         .content_exact = "Here is the summary.",
     },
     .{
-        // 2026-06-19 live Claude Code agentic session (gemma-4): the model
+        // live Claude Code agentic session (gemma-4): the model
         // CLOSED its thought channel and IMMEDIATELY re-opened a fresh one with
         // NOTHING between, then the turn ended. The leading-strip consumed the
         // first closed block, leaving the bare re-opened opener at the START
@@ -696,7 +696,7 @@ const corpus = [_]Expect{
         .reasoning_contains = "Plan it.",
     },
     .{
-        // Live soak capture (2026-07-09, record 2151, a Gemma reasoning variant):
+        // Live soak capture (record 2151, a Gemma reasoning variant):
         // the model emitted reasoning, one close, a content scrap, then SPAMMED
         // 16 more bare `<channel|>` close markers. The leading strip cut the FIRST
         // close; the trailing-strip only handled unclosed OPENERS — so the stray
@@ -721,7 +721,7 @@ const corpus = [_]Expect{
     // ── Gemma 3 (no native tool syntax — markdown-fenced JSON) ──────────────
     .{
         // Verbatim capture from gemma-3-12b-it-qat-4bit on the live matrix
-        // (2026-06-10): models without a trained tool format emit the call as
+        // models without a trained tool format emit the call as
         // a ```json fence. The raw-JSON fallback must tolerate the fence.
         .family = "gemma3",
         .name = "markdown-fenced raw JSON tool call",
@@ -731,7 +731,7 @@ const corpus = [_]Expect{
         .tool_arg_value = "report_v2.html",
     },
     .{
-        // Verbatim capture from gemma-3-12b-it-qat-4bit (2026-06-10 llmprobe
+        // Verbatim capture from gemma-3-12b-it-qat-4bit ( llmprobe
         // tool-parallel): asked for parallel calls, the model emits a fenced
         // JSON ARRAY of {name, arguments} objects. Pre-fix only the first
         // object parsed — the second call was silently dropped on all three
@@ -814,7 +814,7 @@ const corpus = [_]Expect{
     },
     .{
         // Verbatim capture from DeepSeek-V4-Flash via the ds4 engine
-        // (2026-06-10, MLX Core agent chat): tool name and each argument as
+        // (MLX Core agent chat): tool name and each argument as
         // XML child elements, no JSON anywhere. Pre-fix this leaked as
         // visible text and the app's ghost-tool-call nudge fired
         // ("your last response contained a malformed tool-call tag").
@@ -828,7 +828,7 @@ const corpus = [_]Expect{
     },
     .{
         // Verbatim capture from DeepSeek-V4-Flash via the ds4 engine
-        // (2026-06-10 pi html-ds4 turn 2): opened with <tool_call>, closed
+        // ( pi html-ds4 turn 2): opened with <tool_call>, closed
         // with the hallucinated </tool_action>. The edit call must parse;
         // pre-fix it leaked as visible text and pi executed nothing.
         .family = "dsv4",
@@ -841,7 +841,7 @@ const corpus = [_]Expect{
     },
     .{
         // Verbatim capture from DeepSeek-V4-Flash via the ds4 engine
-        // (2026-06-10 validator-matrix pi html-ds4 turn 2): the tool NAME is
+        // ( validator-matrix pi html-ds4 turn 2): the tool NAME is
         // embedded in the tag itself (<tool_read>, <tool_edit>) with XML
         // child elements as args. Pre-fix the `<tool_*>` suffix gate only
         // accepted _call/_calls/_request/_requests, so BOTH calls leaked as
@@ -857,7 +857,7 @@ const corpus = [_]Expect{
     },
     .{
         // Verbatim-shape capture from the SAME pi case, second sampling
-        // (2026-06-10): name-in-tag form again, but the body is a bare JSON
+        // name-in-tag form again, but the body is a bare JSON
         // args object — `<tool_write>\n{…}\n</tool_write>` — followed by
         // trailing prose. Both body shapes are live DSV4 behavior.
         .family = "dsv4",
@@ -884,7 +884,7 @@ const corpus = [_]Expect{
     // the token cap mid-content, so the call arrives with an OPENING tag but no
     // close (`</parameter>`/`</function>`/`</tool_call>`). Pre-fix the
     // close_rel==null branch only tried JSON shapes, so the whole writeFile was
-    // DROPPED and leaked as visible text (live JFK-novel capture, 2026-06-20),
+    // DROPPED and leaked as visible text (live JFK-novel capture),
     // and the app misclassified it as a "malformed tag" ghost call. We recover
     // the tool NAME (content is intentionally NOT salvaged — a half-written file
     // is worse than a re-issued chunked write) so the client fires the right
@@ -925,7 +925,7 @@ const corpus = [_]Expect{
     // the universal declared-type invariant below. Reverting the coercion turns
     // both entries red.
     .{
-        // VERBATIM capture, 2026-07-09 (~/.mlx-serve/logs/mlx-serve-11234.log:109471):
+        // VERBATIM capture (~/.mlx-serve/logs/mlx-serve-11234.log:109471):
         // Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled via Claude Code.
         // The model writes Python's `False` for a boolean param. isJsonLiteral
         // only knows lowercase `false`, so the arg shipped as the STRING
@@ -1012,7 +1012,7 @@ const corpus = [_]Expect{
     // path" and the model, blind to its own serialized request, re-emits the same
     // call. The universal buried-param invariant below pins the whole class.
     .{
-        // Live pi session 2026-07-13 (gemma-4-26B-A4B-it-qat-4bit, us_presidents):
+        // Live pi session (gemma-4-26B-A4B-it-qat-4bit, us_presidents):
         // three consecutive rejections, each a full multi-thousand-token
         // generation, then the model abandoned `edit` and rewrote the entire file
         // with `write`. The raw pre-parse bytes were not dumped (the server was
@@ -1038,7 +1038,7 @@ const corpus = [_]Expect{
     // finish_reason "stop" with repetition_loop details; HTTP handlers suppress
     // tool parsing for that cause instead of exposing the salvaged fragment.
     .{
-        // Live 2026-07-14 (pi → gemma-4-26B-A4B-it-qat-4bit, plang/php.html):
+        // Live (pi → gemma-4-26B-A4B-it-qat-4bit, plang/php.html):
         // the model looped "server-side scripting language, " (a ~6-token
         // cycle) inside `content`; the guard cut at its 16-rep threshold
         // mid-word. `path` was never generated — no parse layer can conjure
@@ -1076,7 +1076,7 @@ const corpus = [_]Expect{
     },
     // ── Hallucinated raw-JSON tool calls (George Washington class) ──────────
     .{
-        // Live pi capture 2026-07-13 (Qwen3.6-35B-A3B distilled): generation
+        // Live pi capture (Qwen3.6-35B-A3B distilled): generation
         // hit max_tokens midway through a presidents data script. The raw-JSON
         // fallback found the first balanced object — {"name": "George
         // Washington", "num": 1, …} — and the flat-shape synthesis promoted it
@@ -1415,7 +1415,7 @@ const corpus = [_]Expect{
         .content_contains = "arg_key/arg_value pair",
     },
     .{
-        // LIVE capture 2026-07-14 — first Hy3 (295B, 2-bit) run on this
+        // LIVE capture — first Hy3 (295B, 2-bit) run on this
         // engine; raw bytes verbatim from the debug log ("Weather in Tokyo in
         // celsius please", temp 0). Confirms the shipped model emits the
         // template-spec format exactly; the "true" arg is a STRING in the tag
@@ -1437,7 +1437,7 @@ const corpus = [_]Expect{
         .tool_bool_value = true,
     },
     .{
-        // LIVE capture 2026-07-16 (pipenetwork/Hy3-REAP62 via MLX_SERVE_RAW_DUMP_FILE,
+        // LIVE capture (pipenetwork/Hy3-REAP62 via MLX_SERVE_RAW_DUMP_FILE,
         // the soak): the pruned model emitted the PLURAL wrapper
         // <tool_calls:opensource> and jumped STRAIGHT to the NAME, dropping the
         // singular per-call <tool_call:opensource> opener the parser keys on — so
@@ -1550,7 +1550,7 @@ const corpus = [_]Expect{
     // ── Inkling (inkling_mm_model, Thinking Machines Inkling Small) ────────
     // The model emits role-less MESSAGES, each `<|channel marker|>…<|end_message|>`;
     // thinking, text and tool-invoke are separate messages. Captured live from
-    // pipenetwork/Inkling-Small-MLX-REAP25-4bit, 2026-07-30.
+    // pipenetwork/Inkling-Small-MLX-REAP25-4bit.
     .{
         // Live capture: thinking-off chat ("What is 2+2?").
         .family = "inkling",
@@ -1612,7 +1612,7 @@ const corpus = [_]Expect{
     },
     // The four entries below are VERBATIM captures from the first real pi
     // agent session on Inkling (pi v0.83.0 → app server :11234, REAP25,
-    // 2026-07-30; log lines 61961/62828/63285/63543). One compounding loop:
+    // log lines 61961/62828/63285/63543). One compounding loop:
     // streamed tool text leaked as content, the salvage name swallowed the
     // <|content_text|> marker, pi replied "Tool <|content_text|>… not found",
     // and the model started echoing that garbage name into its own payloads.
@@ -1679,7 +1679,7 @@ const corpus = [_]Expect{
 
     // ── lfm2 (LFM2.5) — pythonic call expressions ──────────────────────
     // Verbatim from mlx-community/LFM2.5-2.6B-8bit via /v1/completions
-    // against its own rendered template (2026-08-04). Values are PYTHON
+    // against its own rendered template. Values are PYTHON
     // literals, so this family is the corpus's only source of natively-typed
     // arguments — the declared-type invariant reads them without any coercion
     // firing, which is the property a JSON-only value reader would break.
@@ -2010,7 +2010,7 @@ const corpus = [_]Expect{
         .tool_arg_value = "a.txt",
     },
     .{
-        // LIVE capture 2026-09-14 (K2-Horizon 7B, llmprobe agentic): a GLM
+        // LIVE capture (K2-Horizon 7B, llmprobe agentic): a GLM
         // call to a PARAMETERLESS tool has no <arg_key>, the one signal the
         // GLM route keyed on, so it fell to the Hermes path and vanished.
         .family = "k2",
@@ -2120,7 +2120,7 @@ test "format corpus: recorded model outputs across families" {
         if (calls) |cs| {
             for (cs) |tc| {
                 // Universal name invariant: a parsed tool NAME never carries a
-                // channel marker. Live 2026-07-30: a salvage name of
+                // channel marker. A salvage name of
                 // `<|content_text|>bash` reached pi, whose "Tool ... not found"
                 // error taught the model to echo the garbage name back into its
                 // own payloads — a self-reinforcing loop the parser started.
@@ -2235,7 +2235,7 @@ test "format corpus: recorded model outputs across families" {
         // into the next request's history (assistant-history reasoning rule),
         // so a call block the parser skipped — one the model emitted inside
         // its think block — re-enters every later prompt and teaches the model
-        // to keep calling tools from inside thinking (live 2026-08-01, DSV4
+        // to keep calling tools from inside thinking (live, DSV4
         // agent session).
         //
         // KNOWN GAP: a re-opened `<|channel>thought` marker can still sit
@@ -2279,7 +2279,7 @@ test "format corpus: streaming think-gate never leaks thinking mid-stream" {
     // gate (chat.streamThinkGate — used by both the chat-completions and
     // /v1/messages SSE handlers with tools present). Invariants:
     //   1. With thinking enabled, NOTHING flushes as visible text before the
-    //      think close tag has fully arrived — the 2026-06-10 Claude Code
+    //      think close tag has fully arrived — the Claude Code
     //      failure streamed Qwen's template-opened thinking as text_deltas,
     //      raw `</think>` included.
     //   2. The split fires only once the close tag is actually in the buffer.
@@ -2483,7 +2483,7 @@ test "format corpus: streaming tool buffer never flushes Inkling call text" {
     // clears the buffer). Channel markers are SINGLE special tokens, so they
     // arrive whole — the replay feeds them atomically and everything else
     // byte-by-byte. Invariant: no flush may cover any byte at or past the
-    // start of the first call's NAME — that is exactly the live 2026-07-30
+    // start of the first call's NAME — that is exactly the live
     // leak (NAME + full JSON streamed as visible content deltas, landing in
     // pi's transcript and contaminating every later turn's history).
     const inkling_markers = [_][]const u8{
@@ -2609,7 +2609,7 @@ test "format corpus: history round-trip serialization survives any byte content"
     // Inverse direction of the corpus: everything a model emits (and every
     // tool result an agent echoes back) re-enters the NEXT request's history
     // and is serialized by chat.serializeMessagesJson into the JSON that the
-    // C++ Jinja engine (nlohmann, strict) parses. 2026-06-11 pi/gemma-4-31b
+    // C++ Jinja engine (nlohmann, strict) parses. pi/gemma-4-31b
     // failure: a tool result with a raw ESC byte (`\x1b[?25l`, ANSI
     // hide-cursor from an interactive npm CLI) produced invalid JSON →
     // jinja_render_chat returned NULL → silent fallback to the wrong prompt
@@ -2684,7 +2684,7 @@ test "format corpus: history round-trip serialization survives any byte content"
 // ── Dialect matrix ────────────────────────────────────────────────────────
 //
 // A family's own chat template often declares MORE THAN ONE call syntax, and
-// the parser has to read every one of them. On 2026-08-12 qwen 3.5/3.6 shipped
+// the parser has to read every one of them. On qwen 3.5/3.6 shipped
 // a `<function=NAME>`/`<parameter=KEY>` form INSIDE the same `<tool_call>`
 // wrapper its JSON form uses; the JSON branch ran first, `balancedJsonObject`
 // snapped a package.json out of a `content` PARAMETER, and that object's
@@ -2812,7 +2812,7 @@ test "format corpus: every dialect a family declares parses to the same call" {
 test "format corpus: a parameter VALUE never decides the call" {
     // A parameter value is arbitrary bytes. Feed each wrapper dialect a value
     // that LOOKS like call syntax — a balanced JSON object carrying its own
-    // "name" (the live 2026-08-12 bug), a nested closing tag, a literal
+    // "name" (the live bug), a nested closing tag, a literal
     // <tool_call> opener, a lone brace — and the parsed NAME must still be the
     // one the call declared.
     const allocator = testing.allocator;

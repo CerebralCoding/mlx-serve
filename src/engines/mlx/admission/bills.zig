@@ -32,7 +32,7 @@ pub fn defaultKvBits(config: *const model_mod.ModelConfig) u64 {
 /// CONTEXT: 272 KB/token beside a 64 KB/token KV cache on a qwen3_5 27B, i.e.
 /// 81% of the budget spent on a transient that never scales with the context
 /// length, which caps a 16 GB Mac under 4k tokens whatever the weights cost.
-/// Measured on the shipped 4-bit 27B (2026-08-14): the peak above steady state
+/// Measured on the shipped 4-bit 27B: the peak above steady state
 /// is flat in prompt length and tracks the chunk — 3.34 GB at chunk 2048 for
 /// prompts from 3k to 51k tokens.
 ///
@@ -114,7 +114,7 @@ pub fn aneGateHeadroom(config: *const model_mod.ModelConfig, chunk: u32) u64 {
 ///   - mlp: QKV/MLP transient envelope; ~3 layers coexist between eval
 ///     points, and it is CHUNK-bounded, never seq-scaled — the old
 ///     8×seq×ffn envelope over-billed a 255K prompt by ~60 GB and rejected
-///     requests that fit comfortably (PR #69).
+///     requests that fit comfortably.
 ///
 /// `attn_keys` is how many keys one query actually reads (config.
 /// prefillAttnKeys): `seq` for dense causal attention, a much smaller bound for
@@ -266,7 +266,7 @@ pub fn glm5DequantWidth(config: *const model_mod.ModelConfig) u64 {
 /// Per-TOKEN bytes of prefill working set that live OUTSIDE the MLP envelope,
 /// because the arch runs streams the envelope does not model. MEASURED as the
 /// slope of peak-above-steady-state against the prefill chunk (M4 Max,
-/// 2026-08-14, one request per boot, byte-identical across repeats):
+/// one request per boot, byte-identical across repeats):
 ///
 /// | checkpoint | measured B/chunk-token | one MLP envelope | this term |
 /// |---|---|---|---|
@@ -345,7 +345,7 @@ pub fn prefillFfnWidth(config: *const model_mod.ModelConfig) u64 {
 /// still advertises head/layer counts (ds4: 56 heads, 61 layers, hidden 7168),
 /// so without this early-out the guard projected ~25 GB for an 8.6K-token ds4
 /// prompt and 400-rejected it — a prompt the SAME server had just served on the
-/// MLX qwen35 engine one model-switch earlier (live 2026-07-15, pi + ds4). Skip
+/// MLX qwen35 engine one model-switch earlier (live, pi + ds4). Skip
 /// the memory guard whenever an embedded engine will serve; the context-length
 /// guard still bounds the prompt against ds4's own session ctx.
 pub fn mlxMemoryGuardApplies(engine_backed: bool) bool {

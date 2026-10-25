@@ -540,7 +540,7 @@ pub fn serve(
     // encoder architectures clamp to 1 — they need single-slot serial
     // because the batched kernel doesn't model their state. DSV4 is
     // honored (per-slot LatentKVCache landed in Plan 04 Section 4
-    // Phase A+B; Section B fix 2026-05-13 excludes DSV4 from
+    // Phase A+B; Section B fix excludes DSV4 from
     // `Scheduler.batchable` so two DSV4 slots fall through to per-slot
     // `runSingleDecodeTick` — sequential through the inference thread,
     // safe).

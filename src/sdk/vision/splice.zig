@@ -1,4 +1,4 @@
-//! sdk/vision/splice, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/vision/splice.
 //! Owns spliceVisionRows.
 
 const std = @import("std");

@@ -24,7 +24,7 @@ const appendJsonString = @import("../../sdk/util/json_text.zig").appendJsonStrin
 /// The first test asks whether the KEY exists, the second indexes into the
 /// VALUE — so `"content": null` passes the guard and then substring-searches
 /// None. A tool-calling assistant turn is exactly the message that carries no
-/// content, so every tool round-trip hit it (live 2026-08-12: the reply came
+/// content, so every tool round-trip hit it (the reply came
 /// back with reasoning and raw `<|channel|>final>` markers in the content).
 /// Serializing `""` satisfies both readings — the key exists, and it is falsy
 /// everywhere the template branches on it.
@@ -249,7 +249,7 @@ test "renderChatTemplate: a tool with no description/parameters still renders (n
     // `parameters`, but muse's template dumps all three through `tojson`, and
     // `tojson` RAISES on Undefined — so a description-less tool killed the
     // render and fell back to ChatML with no tools preamble at all (found
-    // 2026-08-14 by a sweep whose own test tool omitted the key). Every family
+    // by a sweep whose own test tool omitted the key). Every family
     // that dumps `tool | tojson` wholesale is one missing key from the same
     // class, so the defaults are filled for ALL templates, not just this one.
     const allocator = testing.allocator;

@@ -88,7 +88,7 @@ test "fused SwiGLU is bit-identical to the sigmoid+multiply+multiply chain" {
 }
 
 test "fused SwiGLU config cache keys on the SHAPE, not the element count (Laguna restore crash)" {
-    // Live 2026-07-29: a 16-token hot-cache-restore suffix prefill on Laguna
+    // A 16-token hot-cache-restore suffix prefill on Laguna
     // XS killed the server with "[matmul] (1,16,512) vs (8192,2048)". A MoE
     // layer's SwiGLU at 16 tokens is (1,16,512) = 8192 elements — the SAME
     // count, rank and dtype as a dense mlp_only layer at decode (1,1,8192).

@@ -14,20 +14,20 @@ pub const degenerate_loop_reps: usize = 16;
 /// A short cycle must also cover this many tokens before it convicts: at
 /// period 1 or 2, 16 reps is a digit row or a zeroed array, not a loop.
 pub const degenerate_loop_min_span: usize = 128;
-// Tier 2 (2026-08-02 shooter wrap-up class): a two-sentence cycle of ~58
+// Tier 2 ( shooter wrap-up class): a two-sentence cycle of ~58
 // tokens repeated 26 times evaded the 8-token tier. Long periods demand
 // fewer reps — 10 verbatim repetitions of a 9..64-token cycle is
 // degeneration with overwhelming probability (identical long lines in real
 // code repeat a handful of times, not ten).
 pub const degenerate_loop_long_max_period: usize = 64;
 pub const degenerate_loop_long_reps: usize = 10;
-/// ...except when the "line" is a tile-map row (2026-09-15: a 27B wrote ten
+/// ..except when the "line" is a tile-map row (a 27B wrote ten
 /// identical `"100000000000000000000001",` rows, a 28-token cycle, in an
 /// honest map file). The long tier also demands this much cycling: 37 such
 /// rows, or a 58-token sentence 18 times. A real loop still dies in ~13 s.
 pub const degenerate_loop_long_min_span: usize = 1024;
 
-// Tier 3 (2026-08-04 agent-traffic class): a restatement loop that VARIES its
+// Tier 3 ( agent-traffic class): a restatement loop that VARIES its
 // phrasing has no exact cycle at any period, so both tiers above are blind by
 // construction. What it does have is a long stretch of output that recycles a
 // tiny vocabulary and introduces almost no new n-grams.
@@ -44,7 +44,7 @@ pub const near_repeat_window: usize = 1024;
 pub const near_repeat_ngram: usize = 4;
 pub const near_repeat_max_ngram_ratio: f32 = 0.35;
 pub const near_repeat_max_token_ratio: f32 = 0.12;
-/// Third ratio (2026-08-05): how much of the window's SECOND half is n-grams
+/// Third ratio: how much of the window's SECOND half is n-grams
 /// its first half never had. Measured across both shapes at the shipped
 /// window: restatement loops 0.019-0.022, healthy repetitive output
 /// 0.298-0.827 (dense procedural scene code, a markdown table, the voxel
@@ -114,7 +114,7 @@ fn nearRepeatWindowIsDegenerate(window: []const u32) bool {
     // Third ratio: is the window still PROGRESSING? Both ratios above are
     // properties of a vocabulary, and procedurally generated code has the same
     // vocabulary profile as a loop — a fixed call template plus a small colour
-    // palette (live 2026-08-05: a voxel scene cut at 16241 tokens, the user got
+    // palette (a voxel scene cut at 16241 tokens, the user got
     // no file at all). What a loop does NOT do is keep introducing material:
     // measured, a restatement loop's second half brings 1.9-2.2% n-grams its
     // first half never had, while healthy repetitive output brings 29.8-82.7%.
@@ -169,7 +169,7 @@ pub fn isNearRepeatTailLoop(tokens: []const u32) bool {
 /// however long the loop ran — sizing a set to the FULL span instead would
 /// put tens of KB on the inference thread's stack.
 pub const near_repeat_step: usize = 128;
-/// Live 2026-09-15: a 27B wrote five 24x19 maps of identical rows in 2.8k tokens.
+/// A 27B wrote five 24x19 maps of identical rows in 2.8k tokens.
 pub const near_repeat_min_span: usize = 4096;
 pub const near_repeat_max_lookback: usize = 8192;
 
@@ -179,7 +179,7 @@ pub const near_repeat_max_lookback: usize = 8192;
 /// The start is what makes a loop cut recoverable. An agent client re-sends
 /// the cut turn's content as history, the model reads its own loop back and
 /// resumes it — five loop-stops in a row, each firing sooner than the last
-/// (live 2026-08-05, under pi). Emitting only the prefix means
+/// (live, under pi). Emitting only the prefix means
 /// the loop cannot round-trip into the next prompt.
 pub const DegenerateTail = struct {
     tier: Tier,
@@ -322,7 +322,7 @@ test "isDegenerateTailLoop catches a repeated channel-opener cycle" {
 
 test "degenerateTail: a short exact cycle convicts only past the minimum span" {
     const al = testing.allocator;
-    // Live 2026-09-15 (pi, Qwen3.8 per-digit tokenizer): a 24-wide map wall
+    // Live (pi, Qwen3.8 per-digit tokenizer): a 24-wide map wall
     // row "111111111111111111111111" is 24 identical tokens and was cut as a
     // period-1 loop mid-thought. Short cycles are common in honest code (digit
     // rows, zeroed arrays), so the bar is a SPAN of identical cycling, not a
@@ -358,7 +358,7 @@ fn tVaried(al: std.mem.Allocator, phrasings: []const []const u32, n: usize) !std
 }
 
 test "isNearRepeatTailLoop catches a VARIED-phrasing restatement loop" {
-    // Live 2026-08-04, under pi: the model restated the same
+    // Live, under pi: the model restated the same
     // intent forever while varying the wording — "I need to break this down."
     // / "I need to break this." / "I need to break this down into pieces." —
     // so no exact cycle exists at ANY period and both exact tiers are blind by
@@ -428,7 +428,7 @@ test "isNearRepeatTailLoop leaves legitimately repetitive output alone" {
 }
 
 test "degenerateTail acquits a low-entropy STRUCTURED file that ends inside the span bar" {
-    // Live 2026-09-15 under pi: a tool call rewriting five 24x19 tile maps of
+    // Live under pi: a tool call rewriting five 24x19 tile maps of
     // '0'/'1' on a per-digit tokenizer was cut as a near-repeat loop at window
     // fill and the agent got an empty turn. Six distinct tokens and sixteen
     // possible 4-grams satisfy every content ratio by construction, and the
@@ -499,7 +499,7 @@ test "isDegenerateTailLoop does not fire on healthy or briefly-repeating output"
 }
 
 test "isNearRepeatTailLoop leaves PROCEDURAL code alone — it recycles a vocabulary while still progressing" {
-    // Live 2026-08-05: a pi session was asked for an elaborate voxel scene and
+    // A pi session was asked for an elaborate voxel scene and
     // the tier cut it at 16241 generated tokens, so the user got NO file at
     // all. The output was healthy — dense `fillBox(x,y,z, x,y,z, C.name);`
     // lines — but it is exactly the shape the first two ratios were built to

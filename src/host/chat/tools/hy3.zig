@@ -26,7 +26,7 @@ pub fn parseHy3ToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: 
             // DSV4/generic `<tool_calls>` wrapper is a different format and must
             // fall through to its own parser). Normally an inner singular
             // `<tool_call:sfx>` opener follows — defer to it (the next loop
-            // iteration parses that). A weak model (Hy3-REAP62, live 2026-07-16
+            // iteration parses that). A weak model (Hy3-REAP62, live
             // raw capture) DROPS the singular opener and jumps straight to the
             // NAME, leaking the whole (otherwise well-formed) call; recover by
             // treating the wrapper's end as the opener. Same weak-model
@@ -70,7 +70,7 @@ pub fn parseHy3ToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: 
 
         // NAME runs to the first structural marker after the opener. Canonically
         // that's <tool_sep:sfx>; a mangled call (weak model dropped <tool_sep> —
-        // live 2026-07-16, Hy3-REAP62 via pi) instead closes the name with
+        // live, Hy3-REAP62 via pi) instead closes the name with
         // </arg_value>/<arg_key>/</tool_call>, so accept any of them. No marker
         // at all → the cut happened inside the name; nothing to recover.
         const name_end = earliestIndexOfAny(text, name_start, &.{
@@ -99,7 +99,7 @@ pub fn parseHy3ToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: 
         // SCAN to the next <arg_key> (rather than requiring it right here) so a
         // stray name-close tag between the name and the first key is skipped, and
         // match the KEY block's close TOLERANTLY (</arg_key> OR </arg_value>) —
-        // REAP closes it with </arg_value> (live 2026-07-16 raw capture: bash /
+        // REAP closes it with </arg_value> (live raw capture: bash /
         // command / "ls -la"). The well-formed path is unchanged: its <tool_sep>
         // is consumed above, <arg_key> is found immediately, and </arg_key> is the
         // earliest close.
@@ -242,7 +242,7 @@ test "parseToolCalls hy3: truncated mid-value recovers name + closed args only" 
 }
 
 test "parseToolCalls hy3: dropped <tool_sep> + mangled key-close still recovers name AND args" {
-    // Live 2026-07-16 RAW capture (pipenetwork/Hy3-REAP62 via the running server,
+    // Live RAW capture (pipenetwork/Hy3-REAP62 via the running server,
     // MLX_SERVE_RAW_DUMP_FILE): the pruned model drops <tool_sep> (closes the NAME
     // with </arg_value:opensource>) and closes the arg KEY block with
     // </arg_value:opensource> instead of </arg_key:opensource> — the VALUE block is
@@ -271,7 +271,7 @@ test "parseToolCalls hy3: dropped <tool_sep> + mangled key-close still recovers 
 }
 
 test "parseToolCalls hy3: dropped singular <tool_call> opener (plural wrapper only) still recovers" {
-    // Live 2026-07-16 RAW capture (pipenetwork/Hy3-REAP62 via the running server,
+    // Live RAW capture (pipenetwork/Hy3-REAP62 via the running server,
     // MLX_SERVE_RAW_DUMP_FILE): the pruned model emitted the PLURAL wrapper
     // <tool_calls:opensource> and jumped STRAIGHT to the NAME, dropping the
     // singular per-call <tool_call:opensource> opener the parser keys on — so the

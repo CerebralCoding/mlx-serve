@@ -33,7 +33,7 @@ pub const SpecInitWiring = struct {
 /// already absorbed every draft token, and the shell's snapshot/truncate run
 /// over an empty entries array. So every shell-driven spec mode is off there.
 ///
-/// This used to be three hand-written `!is_dsv4` conjuncts. A second
+/// One predicate, never hand-written `!is_dsv4` conjuncts. A second
 /// module-owned arch arrived with the same `Model.state` shape and a 0-layer
 /// shell cache, got no conjunct, and `--pld` drove verify forwards straight
 /// through it. One predicate, one place to extend.
@@ -106,7 +106,7 @@ pub const SpecTickMode = enum { dspark, mtp, dflash, drafter, pld, regular };
 /// wish; the generator-side values carry what `Generator.initWithOptions`
 /// actually armed (after its deepseek_v4 spec chokepoint). Every arm must
 /// require BOTH: dispatching on the slot flag alone is the exact wiring that
-/// put PLD verify forwards through a dsv4 trunk (2026-07-31) — mtp/drafter
+/// put PLD verify forwards through a dsv4 trunk — mtp/drafter
 /// had their generator-state conjunct (`gen.mtp != null`), model-less PLD
 /// did not, so runPrefill's `use_pld=false` shaped init options while every
 /// tick still called `gen.nextPld`.
@@ -354,7 +354,7 @@ test "specInitWiring: a module-owned arch only gets the spec modes it can roll b
 }
 
 test "specTickMode: every spec arm requires the GENERATOR's armed state, not the slot flag alone" {
-    // The dsv4 PLD-corruption wiring class (2026-07-31): runPrefill's
+    // The dsv4 PLD-corruption wiring class: runPrefill's
     // per-site guard computed use_pld=false for a deepseek_v4 slot and wired
     // it into Generator init options — but the decode tick dispatched on
     // `slot.enable_pld` alone, so every tick still called `gen.nextPld` and

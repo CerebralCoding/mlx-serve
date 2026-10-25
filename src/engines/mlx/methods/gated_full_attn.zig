@@ -1,4 +1,4 @@
-//! engines/mlx/methods/gated_full_attn, the legacy `Transformer`'s methods split out of engines/mlx/transformer.zig.
+//! engines/mlx/methods/gated_full_attn: `Transformer` methods (aliased from engines/mlx/transformer.zig).
 //! Owns gatedFullAttnWith, gatedFullAttnProjected, gatedAttnTail.
 
 const mlx = @import("../../../mlx/ffi.zig");

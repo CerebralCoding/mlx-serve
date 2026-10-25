@@ -1,4 +1,4 @@
-//! engines/mlx/compiled, split out of engines/mlx/transformer.zig (P1, moves only).
+//! engines/mlx/compiled.
 //! Owns compileGelu, compileGeglu, gegluClosureCallback, and 7 more.
 
 const mlx = @import("../../mlx/ffi.zig");

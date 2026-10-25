@@ -1,6 +1,6 @@
 //! Qwen-Image-2.1 text-to-image (`Qwen/Qwen-Image-2.1`): a 7.1B single-stream
 //! BLOCK-CAUSAL DiT over a Qwen3-VL-8B text encoder and a 64-channel /16 VAE.
-//! Port of the pure-MLX reference (mflux PR #736). Sibling of `krea.zig` /
+//! Port of the pure-MLX reference (mflux). Sibling of `krea.zig` /
 //! `mage_flow.zig`; the text encoder and the dense-or-quantized linear are
 //! MageFlow's, everything else is this model's own.
 //!

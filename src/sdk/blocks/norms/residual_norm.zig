@@ -1,4 +1,4 @@
-//! sdk/blocks/norms/residual_norm, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/blocks/norms/residual_norm.
 //! Owns add_norm_max_rows, RESIDUAL_NORM_HEADER, RESIDUAL_NORM_SOURCE, residual_norm_kernel, residual_norm_engaged, add_rmsnorm_override, and 12 more.
 
 const std = @import("std");

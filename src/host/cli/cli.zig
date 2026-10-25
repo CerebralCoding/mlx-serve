@@ -31,8 +31,8 @@ const log = @import("../../sdk/util/log.zig");
 /// Why main.zig's flag loop could not consume an argument.
 ///
 /// The loop matches every flag by EXACT name and reads its value from the
-/// NEXT argv slot, and it used to end with no else branch at all — so a
-/// misspelled flag, or the `--flag=value` shape it never accepted, was
+/// NEXT argv slot; without an else branch a
+/// misspelled flag, or the `--flag=value` shape it never accepted, is
 /// dropped in silence. That is the worst possible outcome for a launcher: the
 /// flag parses as far as the user can tell, `--help` documents it, and the
 /// server boots clean while ignoring what was asked for. Rejecting loudly is
@@ -1379,7 +1379,7 @@ test "cli: isModelDir accepts an mflux FLUX.2 repo (no config.json at all)" {
 test "cli: an unparsed argument is classified, never silently ignored" {
     // `--flag=value`: main.zig's flag loop matches names EXACTLY and takes the
     // value as the NEXT argument, so the '='-joined form is not a near-miss,
-    // it is a shape we have never accepted. It used to fall out of the loop in
+    // it is a shape we have never accepted. Without one it falls out of the loop in
     // silence — `--model=<path>` booted a healthy-looking headless server that
     // then auto-picked a different model and crashed on it.
     try testing.expectEqual(ArgReject.equals_form, classifyUnparsedArg("--model=/tmp/m", false));

@@ -56,7 +56,7 @@ const mtp_source = @import("source.zig");
 /// Default draft depth (tokens drafted per round). Flipped 1 -> 3 after the
 /// round-v2 rebuild made rejected drafts ~free (scalar-anchor rollback + the
 /// 3-bit draft-only lm_head replaced the old full trunk re-forward): the old
-/// cost model was what made depth 1 optimal. 2026-07-12 validation matrix on
+/// cost model was what made depth 1 optimal. validation matrix on
 /// Qwen3.6-27B 4-bit (M4 Max, adaptive controller active, decode tok/s
 /// depth-3 vs depth-1): code 54.3 vs 43.3 (+25%), coding-agent ladder 2K
 /// 52.1 vs 41.4 (+26%) and 16K 43.9 vs 38.1 (+15%), 2-turn pi agentic
@@ -78,7 +78,7 @@ pub fn mtpCtxWithinLimit(max: u32, ctx_tokens: usize) bool {
 /// Per-silicon adaptive depth cap for machines on the `.generic` cost
 /// surface. The cap is a MACHINE measurement, so each row is one, never
 /// interpolated between chips; an unmeasured chip keeps the default row.
-///   M1 Pro: 4 (2026-08-20, Qwen3.8-27B iQ-3.8bpw, forced-depth sweep:
+///   M1 Pro: 4 (Qwen3.8-27B iQ-3.8bpw, forced-depth sweep:
 ///     13.01 tok/s at depth 4 vs 10.78/9.63 at 5/6 — the verify width 6
 ///     cliff; auto at cap 6 measured 10.64, barely over --no-mtp's 10.57).
 /// `chip` is sysctl machdep.cpu.brand_string via `ane_mod.chipBrand`
@@ -93,7 +93,7 @@ pub const DepthCap = struct { cap: u32, label: []const u8, measured: bool = fals
 
 pub fn adaptiveDepthCapForMachine(chip: []const u8, default_cap: u32) DepthCap {
     if (std.mem.indexOf(u8, chip, "M1 Pro") != null) return .{ .cap = 4, .label = "m1-pro", .measured = true };
-    // Base M4 (2026-08-22, tester report, Qwen3.5-9B-MTPLX 6-bit, 16 GB):
+    // Base M4 (tester report, Qwen3.5-9B-MTPLX 6-bit, 16 GB):
     // saturated echo, median of 5, decode tok/s by forced depth —
     //   3: 47.44   4: 55.50   5: 47.50   6: 47.28
     // Depth 4 is the only width where the cap BINDS (m_lo == cap), so the
@@ -555,7 +555,7 @@ pub const MtpModel = struct {
         };
         self.maybeBuildDraftRerank(target);
         mlx.dropLatchedErrorUnless(had_err); // best effort: never the first request's MlxFailure
-        // NOTE (2026-07-13): mlx_compile'ing the offset-free front/back
+        // NOTE: mlx_compile'ing the offset-free front/back
         // halves of the seq-1 draft step (the compileMoeRouting pattern,
         // weights captured via payload) was built, verified equivalent at
         // toy scale, and A/B'd live on the 27B — DEAD EVEN at depths 3 and 6
@@ -3506,7 +3506,7 @@ test "mtp: a sidecar-NAMED file without a marker key is not a sidecar (dsv4 modu
     // DeepSeek-V4 mirrors ship their OWN (dsv4-shaped) MTP module at
     // `model-mtp.safetensors` — one of the house sidecar names. Claiming it
     // by NAME alone sent the qwen-shaped loader into MissingMtpWeight on
-    // every `--mtp` boot (live 2026-07-31). The sidecar claim rides the same
+    // every `--mtp` boot. The sidecar claim rides the same
     // marker gate as discovery + the in-checkpoint shard sweep: the header
     // must PROVE a loadable head.
     const io = testing.io;
@@ -3608,7 +3608,7 @@ test "mtp: reference-based head-norm repair rule (oMLX norm_repair)" {
     // exact value the delta fold produces — against a 1.93 mean-of-means
     // anchor whose own layers span 0.02..2.24. The gap rule alone convicted
     // it, double-shifted it to 2.21 and dropped per-draft acceptance from
-    // ~86% to 33% (live 2026-08-19).
+    // ~86% to 33%.
     try testing.expect(!mtpNormNeedsRepair(1.206, 1.930, 0.0));
 }
 

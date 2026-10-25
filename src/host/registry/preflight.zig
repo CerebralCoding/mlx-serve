@@ -292,7 +292,7 @@ pub fn preflightVerdict(weights_bytes: u64, drafter_bytes: u64, avail_bytes: u64
 /// preflight used to say "generation peaks at ~4.3 GB but only 5.4 GB is free"
 /// — two figures that, read together, say the load should have worked. It was
 /// refused for the headroom, which the sentence never mentioned, so the user
-/// went hunting for a problem that wasn't there (live 2026-08-08). Same class as
+/// went hunting for a problem that wasn't there. Same class as
 /// the context-overflow 400: a rejection has to state the bar it set.
 pub fn loadRequirementBytes(weights_bytes: u64) u64 {
     const HEADROOM_CAP: u64 = 6 * 1024 * 1024 * 1024;
@@ -549,7 +549,7 @@ test "a refusal quotes the number it actually compared" {
     const GB: u64 = 1024 * 1024 * 1024;
     const MB: u64 = 1024 * 1024;
 
-    // Live report 2026-08-08: FLUX.2-klein 4B refused with "generation peaks at
+    // Live report FLUX.2-klein 4B refused with "generation peaks at
     // ~4.3 GB but only 5.4 GB is free" — two numbers that say the load should
     // have worked. The guard was right (it also wants ~1.5 GB of headroom for
     // warmup buffers) but the message quoted the PEAK, so the user went looking

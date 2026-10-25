@@ -55,7 +55,7 @@ fn isIncludeStub(template: []const u8) bool {
 /// `{name, template}` objects (Mistral-7B-Instruct-v0.3 ships `default` +
 /// `tool_use`). Reading the list as `v.string` is not a graceful failure — it
 /// is a Zig union panic that kills the process at LOAD, so the checkpoint
-/// could not be served at all (live 2026-08-07: `access of union field
+/// could not be served at all (live: `access of union field
 /// 'string' while field 'array' is active`).
 ///
 /// Selection follows transformers: the entry named "default", which is what
@@ -126,7 +126,7 @@ pub fn loadChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
             // package does its own encoding) gets OUR byte-pinned DSV4
             // transcription. The generic fallback renders wrong-family
             // markers the model then echoes into degeneration (the
-            // silent-fallback class, live 2026-08-01), and DSML tool
+            // silent-fallback class, live), and DSML tool
             // calling depends on the real template.
             if (dirModelTypeIs(io, allocator, model_dir, "deepseek_v4")) {
                 log.info("chat: deepseek_v4 checkpoint ships no chat_template — using the embedded DSV4 transcription\n", .{});
@@ -332,7 +332,7 @@ test "RADIO video placeholders: only attached clips create video atoms" {
 test "loadChatConfig: template-less deepseek_v4 checkpoint gets the embedded DSV4 template" {
     // pipenetwork REAP builds ship NO chat_template (their python package
     // does its own encoding) — the generic fallback renders wrong-family
-    // markers and the model degenerates into echoing them (live 2026-08-01:
+    // markers and the model degenerates into echoing them (live:
     // pi against REAP37 looped `<start_of_turn>model`). A deepseek_v4
     // checkpoint with no template must get OUR byte-pinned transcription.
     const allocator = testing.allocator;

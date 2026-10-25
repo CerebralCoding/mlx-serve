@@ -1,4 +1,4 @@
-//! sdk/blocks/rope/qk_norm_rope, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/blocks/rope/qk_norm_rope.
 //! Owns QkAngleSlot, qk_fused_kernel, qk_fused_engaged, qk_fused_override, qk_fused_env, qkNormRopeFusedEnabled, and 18 more.
 
 const std = @import("std");

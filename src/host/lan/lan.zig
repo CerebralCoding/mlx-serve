@@ -384,7 +384,7 @@ const KNOWN_MAX_FAILS: u8 = 24;
 /// 3 s resolve timeout while the peer's GPU is pinned by a load — must not
 /// evict a live peer: its cached ip4:port still tunnels, and eviction turns
 /// the next chat into a "LAN peer for this model is offline" 404 (live
-/// 2026-07-19: chats through a proxy alternated success/404 while the peer
+/// chats through a proxy alternated success/404 while the peer
 /// stayed up and advertising the whole time). A genuinely-gone peer still
 /// leaves within PEER_DROP_FAILS refreshes; the tunnel answers 502 honestly
 /// if it is picked during the grace window.
@@ -1159,7 +1159,7 @@ pub fn headerValueCI(head: []const u8, name_lower: []const u8) ?[]const u8 {
 /// and port, different TXT token, so the resolve-time TXT check can't catch
 /// it — resolves back to this very server, and the loopback-first fetch
 /// would happily install our own models as a "peer" (live test_lan_share
-/// self-mirror after the peer-restart section, 2026-07-21).
+/// self-mirror after the peer-restart section).
 fn fetchPeerModels(alloc: std.mem.Allocator, ip4: [4]u8, port: u16, peer_display: []const u8, own_token: []const u8, key: ?[]const u8, machine: ?*PeerMachine) ![]PeerModel {
     const fd = try connectTimeout(ip4, port, 3000);
     defer _ = std.c.close(fd);
@@ -1408,7 +1408,7 @@ test "lan: parsePeerModels rewrites ids, adds lan_peer, keeps meta" {
     // The lan_peer entry above is the peer's OWN remote stub — a peer that
     // fails to filter its list (old binary, loopback fetch between two
     // servers on one Mac) would otherwise chain re-exports (`@a@b` ids;
-    // live 2026-07-21: a third server on the test Mac leaked its mirrors
+    // a third server on the test Mac leaked its mirrors
     // into test_lan_share's servers). Never mirror someone else's mirror.
     const models = try parsePeerModels(a, body, "Studio");
     defer freePeerModels(a, models);

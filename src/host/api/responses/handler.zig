@@ -405,7 +405,7 @@ fn handleResponsesInner(
     // carries no schema, so without a synthesized permissive one there is no
     // grammar constraint at all and prompt-ignoring models (Gemma 3 wraps the
     // object in a ```json fence — caught live by llmprobe
-    // structured-json-mode-valid, 2026-06-10) emit invalid JSON.
+    // structured-json-mode-valid) emit invalid JSON.
     var json_object_schema_holder: ?std.json.Parsed(std.json.Value) = null;
     defer if (json_object_schema_holder) |*p| p.deinit();
     if (text_format.schema_value == null and std.mem.eql(u8, text_format.kind, "json_object")) {
@@ -877,7 +877,7 @@ fn handleResponsesInner(
                 enable_drafter_resp = false;
             }
         }
-        // Heavy-echo MTP->PLD routing retired 2026-07-13 (see the NOTE at the
+        // Heavy-echo MTP->PLD routing retired (see the NOTE at the
         // chat-completions site): MTP wins whenever loaded.
     }
     // One token per tick: no draft round can carry the turn past the forced opener.

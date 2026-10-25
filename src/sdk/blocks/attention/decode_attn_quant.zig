@@ -1,4 +1,4 @@
-//! sdk/blocks/attention/decode_attn_quant, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/blocks/attention/decode_attn_quant.
 //! Owns AttnDqCopy, attnDqUseNvfp4, attn_dq_engaged, attn_dq_nvfp4_engaged, and 11 more.
 
 const std = @import("std");
@@ -47,7 +47,7 @@ pub fn attnDqNvfp4From(num_layers: u32) u32 {
 pub var attn_dq_engaged: bool = false;
 pub var attn_dq_nvfp4_engaged: bool = false;
 
-/// Default ON (2026-07-29 characterization on Laguna XS: decode forward
+/// Default ON ( characterization on Laguna XS: decode forward
 /// 13.285 -> 10.205 ms median, 3/3 paired boots both orders; greedy outputs
 /// across six code/reasoning prompts reached identical answers with
 /// wording-level divergence only). Flip together with the mirrored Swift
@@ -69,7 +69,7 @@ pub inline fn cli() *CliState {
 /// toggle) as opposed to riding the silent default. Archs whose
 /// characterization showed ANSWER MOVEMENT under the requant gate on this
 /// form (dsv4 comp_in: one duplicated paragraph on 1/7 greedy prompts,
-/// 2026-08-01); laguna's clean characterization keeps the plain default.
+/// ); laguna's clean characterization keeps the plain default.
 pub fn decodeAttnQuantExplicit() bool {
     if (decode_attn_quant_override) |v| return v; // test seam counts as explicit
     return cli().decode_attn_quant_flag orelse false;

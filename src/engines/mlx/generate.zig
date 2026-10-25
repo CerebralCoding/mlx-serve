@@ -137,7 +137,7 @@ pub var mtp_history_window_override: usize = 0;
 /// admission gate and by `nextMtp` per round (`mtp.mtpCtxWithinLimit`).
 pub var max_mtp_ctx: u32 = 0;
 
-/// The text of generate.zig and every file split out of it, for the source-scan tests that pinned generate.zig.
+/// The text of generate.zig and every file carved from it, for the source-scan tests that pinned generate.zig.
 pub const all_source = @embedFile("generate.zig") ++
     @embedFile("generate/generator.zig") ++
     @embedFile("spec/dflash.zig") ++

@@ -1273,7 +1273,7 @@ pub const ModelRegistry = struct {
         // default, so requests addressing the "mlx-serve" alias (the app's
         // chat/avatar surfaces, Claude Code) 503 with no_model even after the
         // user loads a chat model via /v1/load-model — the live gen-first→
-        // chat-later hole (2026-07-05). The LATEST chat-capable load is the
+        // chat-later hole. The LATEST chat-capable load is the
         // default, so a model-less request never swaps back to an older model;
         // media engines and embedding encoders never qualify, and an explicit
         // default (`--model`, `setDefault`) is never stolen.
@@ -1445,7 +1445,7 @@ pub const ModelRegistry = struct {
     /// `OutOfMemory` counts too: an allocator failure during a load is the same
     /// actionable thing to the user as the preflight's own refusal, and it
     /// reached the client as a generic "Model load failed" 500 before
-    /// (2026-08-08). Merge note: this arm came from the branch's
+    /// Merge note: this arm came from the branch's
     /// `scheduler.loadErrorFor`, which this function replaced — the name-based
     /// half survived the refactor, the second name did not.
     pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory } {
@@ -1457,7 +1457,7 @@ pub const ModelRegistry = struct {
     }
 
     test "a memory refusal keeps its own error out to the client" {
-        // Live 2026-08-08: the image engine refused for memory, the name was
+        // The image engine refused for memory, the name was
         // freed, and the pane showed a generic "Model load failed" with an
         // empty log — the one failure the user could have fixed, rendered
         // unactionable. Both spellings of "out of memory" have to survive.
@@ -2128,7 +2128,7 @@ test "grammar token-byte table is per MODEL, never a process-wide singleton" {
     // Two resident models, two vocabularies, the SAME ids meaning different
     // bytes. A table built for one and handed to the other maps every id to
     // the wrong bytes, so the JSON grammar mask allows tokens whose real
-    // bytes are off-schema — live 2026-08-11, muse served under LFM2.5's
+    // bytes are off-schema — live, muse served under LFM2.5's
     // table answered a `json_object` request with "## Attributes".
     var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
     defer reg.deinit();
@@ -2371,7 +2371,7 @@ test "reservation: released back to zero on markReady / markUnloaded" {
 }
 
 test "ModelRegistry: first chat-capable ready load becomes the default on a headless server" {
-    // gen-first→chat-later hole (live 2026-07-05): a server started headless
+    // gen-first→chat-later hole: a server started headless
     // (no --model) has no default, so requests addressing the "mlx-serve"
     // alias 503 with no_model even after the user loads a chat model via
     // /v1/load-model. The FIRST chat-capable load is promoted; media engines

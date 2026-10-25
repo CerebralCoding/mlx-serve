@@ -7,7 +7,7 @@ const balancedJsonObject = @import("json_infer.zig").balancedJsonObject;
 
 /// DSV4-Flash XML-element tool form: the body of a `<tool_calls>`-style
 /// wrapper carries the tool name and each argument as plain child elements —
-/// no JSON anywhere (captured live, 2026-06-10):
+/// no JSON anywhere (captured live):
 ///     <tool_name>shell</tool_name>
 ///     <command>df -h / | grep -v "Filesystem"</command>
 /// The name comes from a <tool_name>, <name>, or <tool> element; every other
@@ -26,7 +26,7 @@ const xml_tag_reserved_names = [_][]const u8{
 
 /// XML-element-TAG tool form: `<tool_NAME><key>value</key>…</tool_NAME>`,
 /// the tool name embedded in the tag itself (DSV4 training-bias family;
-/// captured live 2026-06-10: `<tool_read>` / `<tool_edit>`). `slice` starts
+/// captured live: `<tool_read>` / `<tool_edit>`). `slice` starts
 /// at `<tool`. Returns the parsed call plus bytes consumed through the close
 /// tag, or null when the shape doesn't hold (no attributes allowed, exact
 /// close required, reserved names rejected, body must be all elements).

@@ -1,4 +1,4 @@
-//! engines/mlx/batched/caps, split out of engines/mlx/transformer.zig (P1, moves only).
+//! engines/mlx/batched/caps.
 //! Owns hasRecurrentLayers, batchedGdnReady, supportsBatchedGdnDecode.
 
 const ForwardCtx = @import("../forward_ctx.zig").ForwardCtx;

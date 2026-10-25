@@ -1,4 +1,4 @@
-//! sdk/blocks/rope/mrope, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/blocks/rope/mrope.
 //! Owns MropeCosSin, and 1 more.
 
 const std = @import("std");

@@ -1,4 +1,4 @@
-//! sdk/blocks/embedding, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/blocks/embedding.
 //! Owns gatherQuantizedRows.
 
 const std = @import("std");

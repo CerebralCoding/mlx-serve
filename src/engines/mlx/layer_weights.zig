@@ -1,4 +1,4 @@
-//! engines/mlx/layer_weights, split out of engines/mlx/transformer.zig (P1, moves only).
+//! engines/mlx/layer_weights.
 //! Owns FullAttnWeights, QW, HybridMlpWeights, MoeLayerWeights.
 
 const mlx = @import("../../mlx/ffi.zig");

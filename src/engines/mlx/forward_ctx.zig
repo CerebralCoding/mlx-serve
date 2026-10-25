@@ -1,4 +1,4 @@
-//! engines/mlx/forward_ctx, split out of engines/mlx/transformer.zig (P1, moves only).
+//! engines/mlx/forward_ctx.
 //! Owns SpecTree, CaptureLayers, ForwardCtx.
 
 const mlx = @import("../../mlx/ffi.zig");

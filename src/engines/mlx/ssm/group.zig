@@ -1,4 +1,4 @@
-//! engines/mlx/ssm/group, split out of engines/mlx/transformer.zig (P1, moves only).
+//! engines/mlx/ssm/group.
 //! Owns SsmMergeKind, ssm_member_gen_src, nextSsmMemberGen, SsmGroupMember, SsmPatchFields, PersistentSsmGroup, and 42 more.
 
 const std = @import("std");
@@ -1616,7 +1616,7 @@ pub fn mergeSsmAcrossSlots(self: *Transformer, ctxs: []const *ForwardCtx, layer:
 ///
 /// The rows are handed over as SLICE VIEWS, not copies. mlx arrays are
 /// refcounted, so each view keeps the merged parent alive and the slot
-/// owns a perfectly valid state array — while the copy this used to make
+/// owns a perfectly valid state array — while a copy would make
 /// was the single most expensive thing on the batched path: the GDN state
 /// is ~2 MB per layer per slot, so materializing it here cost a full extra
 /// read+write of the whole trunk state (hundreds of MB) every step, for

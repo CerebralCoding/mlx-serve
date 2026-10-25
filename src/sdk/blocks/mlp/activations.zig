@@ -1,4 +1,4 @@
-//! sdk/blocks/mlp/activations, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/blocks/mlp/activations.
 //! Owns and 10 more.
 
 const std = @import("std");

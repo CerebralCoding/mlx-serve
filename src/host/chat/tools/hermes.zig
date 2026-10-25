@@ -181,7 +181,7 @@ pub fn stripHermesValueFraming(raw: []const u8) []const u8 {
 
 test "parseToolCalls recovers truncated <function=writeFile> (max_tokens mid-content)" {
     const allocator = testing.allocator;
-    // Live JFK-novel capture (2026-06-20): a Hermes-format writeFile dumped a
+    // Live JFK-novel capture: a Hermes-format writeFile dumped a
     // 19k-char novel into one <parameter=content> and hit the token cap before
     // any closing tag. Pre-fix the close_rel==null branch only tried JSON, so
     // the whole call was DROPPED and leaked as visible text. We must recover at
@@ -227,7 +227,7 @@ test "parseToolCalls recovers EOS-before-close-tag <function=> with full args" {
 
 test "parseToolCalls recovers a bare <function=> call with NO <tool_call> opener" {
     const allocator = testing.allocator;
-    // Live capture (soak, 2026-07-09, Qwen3.6-class via Claude Code): the model
+    // Live capture (soak, Qwen3.6-class via Claude Code): the model
     // emitted the CLOSING </tool_call> but DROPPED the opening <tool_call>, so the
     // whole call arrived as `<function=Write>…</function></tool_call>`. The outer
     // scan triggers on the substring `<tool` — which `</tool_call>` does NOT
@@ -475,7 +475,7 @@ test "parseToolCalls Hermes double-brace body: <tool_call>{{json}}</tool_call>" 
 }
 
 test "qwen xml: the live <function=…>/<parameter=…> capture (package.json class)" {
-    // Verbatim from ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve via pi (2026-08-12).
+    // Verbatim from ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve via pi.
     // Qwen 3.5/3.6's OWN template dictates this dialect ("ONLY reply in the
     // following format"), so it is the checkpoint's contract, not a mangle.
     // The JSON-only reader mined the first balanced object out of the body —

@@ -537,7 +537,7 @@ test "renderChatTemplate: a tool-aware template with a generic role header rende
 }
 
 test "renderChatTemplate: tool result with raw ANSI escapes still renders via Jinja" {
-    // Regression for the 2026-06-11 pi/gemma-4-31b session: the third request
+    // Regression for the pi/gemma-4-31b session: the third request
     // was the first whose history held a tool result with a raw ESC byte (the
     // interactive `npx sv create` output). The Jinja render failed on the
     // unescaped messages JSON and silently downgraded to fallbackFormatChat's
@@ -1034,7 +1034,7 @@ test "assistant history reasoning_content reaches a template that reads it (lagu
     // assistant messages render <think>{message.reasoning|reasoning_content}</think>.
     // When the parse layer drops the field, every history turn renders the
     // empty <think></think> nothink signature and the model stops thinking
-    // from turn 2 of a session (live 2026-07-29, pi agent on Laguna XS: one
+    // from turn 2 of a session (live, pi agent on Laguna XS: one
     // reasoning delta on the 2-msg turn, zero across the next 13k chunks).
     // Template fragment mirrors laguna's assistant-history branch.
     const allocator = testing.allocator;
@@ -1619,7 +1619,7 @@ test "renderChatTemplate: muse drops PRIOR-turn reasoning, keeps the current too
     // Harmony (muse's format ancestor) drops analysis from turns before the
     // last user message. Without that, the app's reasoning round-trip renders
     // every old chain — a loop-cut tail included — as a to=self history
-    // segment the model reads back on every later turn (live 2026-08-10: one
+    // segment the model reads back on every later turn (one
     // repetition-primed turn poisoned the rest of the chat).
     const allocator = testing.allocator;
     const tpl = @embedFile("../../fixtures/muse_chat_template.jinja");

@@ -1,4 +1,4 @@
-//! sdk/blocks/rope/yarn, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/blocks/rope/yarn.
 //! Owns computeYarnFreqs.
 
 const std = @import("std");

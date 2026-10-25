@@ -30,7 +30,7 @@ const eg2ProcessorConfig = @import("prepare.zig").eg2ProcessorConfig;
 /// BILINEAR (`Lfm2VlImageProcessor` uses it at all three sites — tile canvas,
 /// thumbnail, single view), Qwen with bicubic. Reusing a neighbouring tower's
 /// filter is silent: the geometry and token counts still match, the pixels do
-/// not (measured 2026-08-14: bicubic loses 3 of 144 ScreenSpot-v2 items on
+/// not (bicubic loses 3 of 144 ScreenSpot-v2 items on
 /// LFM2.5-VL and never wins one).
 pub fn resampleFilterFor(vp: chat_mod.VisionPreproc) qwen_vision.Filter {
     return switch (vp.mode) {

@@ -1,4 +1,4 @@
-//! engines/mlx/methods/conv1d_cache, the legacy `Transformer`'s methods split out of engines/mlx/transformer.zig.
+//! engines/mlx/methods/conv1d_cache: `Transformer` methods (aliased from engines/mlx/transformer.zig).
 //! Owns conv1dWithCache, conv1dTailRetentionDelta, conv1dBitCopy, conv1dTwoChunk, conv1dExpectBitEqual.
 
 const std = @import("std");

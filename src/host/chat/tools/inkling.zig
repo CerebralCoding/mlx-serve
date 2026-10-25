@@ -17,7 +17,7 @@ pub fn inklingIsNameChar(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_' or c == '.' or c == '-';
 }
 
-/// The trailing identifier run ending at `end` (exclusive). Live 2026-07-30:
+/// The trailing identifier run ending at `end` (exclusive). Live:
 /// the boundary-based prefix scan swallowed the `<|content_text|>` marker
 /// (name `<|content_text|>bash`), and a dropped `<|end_message|>` between
 /// calls produced `}}write` — both resolve to the bare NAME here.
@@ -34,7 +34,7 @@ pub fn parseInklingToolCalls(allocator: std.mem.Allocator, text: []const u8, cal
 
         // Body = the balanced JSON object right after the marker (string-aware
         // brace scan). The next <|end_message|> is NOT a reliable terminator:
-        // the model drops it between back-to-back calls (live 2026-07-30,
+        // the model drops it between back-to-back calls (live,
         // `{…}}write<|content_invoke_tool_json|>{…}`), and an end-tag-bounded
         // body then swallows the following call whole. No balance by end of
         // text = truncation → the NAME + `{}` salvage below.
@@ -66,7 +66,7 @@ pub fn parseInklingToolCalls(allocator: std.mem.Allocator, text: []const u8, cal
                         name = nv.string;
                         // Marker-echo repair: pi's "Tool <|content_text|>bash
                         // not found" reply taught the model to copy the garbage
-                        // name INTO its payloads (live 2026-07-30). No real
+                        // name INTO its payloads. No real
                         // tool name contains `<|` — keep the trailing
                         // identifier run; empty → fall back to the prefix name.
                         if (std.mem.indexOf(u8, name, "<|") != null) {
@@ -159,7 +159,7 @@ test "parseToolCalls: Inkling invoke_tool_json family" {
 
 test "parseToolCalls: Inkling name is the trailing identifier run" {
     const allocator = testing.allocator;
-    // Live 2026-07-30 pi session: the tool message opens with the
+    // Live pi session: the tool message opens with the
     // <|content_text|> marker glued to the NAME. When the payload is
     // truncated, the salvage name must be the bare identifier — never
     // `<|content_text|>bash` (pi's "Tool <|content_text|>bash not found"
@@ -204,7 +204,7 @@ test "parseToolCalls: Inkling name is the trailing identifier run" {
 
 test "parseToolCalls: Inkling back-to-back invokes without <|end_message|>" {
     const allocator = testing.allocator;
-    // Live 2026-07-30: the model drops the <|end_message|> between two calls
+    // The model drops the <|end_message|> between two calls
     // (`{…}}write<|content_invoke_tool_json|>{…}`). Body extraction must stop
     // at the balanced object — an end-tag-bounded body swallows call 2 whole.
     const text = "<|message_model|><|content_text|>write<|content_invoke_tool_json|>{\"name\":\"write\",\"args\":{\"path\":\"a.js\",\"content\":\"x\"}}write<|content_invoke_tool_json|>{\"name\":\"write\",\"args\":{\"path\":\"b.js\",\"content\":\"y\"}}<|end_message|>";

@@ -1,4 +1,4 @@
-//! sdk/quant/mxfp8, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/quant/mxfp8.
 //! Owns lmHeadMxfp8On, quantizeHeadMxfp8.
 
 const std = @import("std");

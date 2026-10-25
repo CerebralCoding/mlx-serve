@@ -128,7 +128,7 @@ pub fn boundedPrefillChunk(base_chunk: usize, score_head_dim: u32, n_heads: u32,
     // (the gemma-26B@99K lesson: +3% speed for +22 GB peak is a bad trade).
     // DENSE hybrids have no gather transients and a full-size chunk halves
     // the per-chunk dequant sweeps: chunk 8192 measured +1.4% over 4096 at
-    // the 8K rung on Qwen3.6-27B dense (M4 Max, 2026-07-30), flat at 32K.
+    // the 8K rung on Qwen3.6-27B dense (M4 Max), flat at 32K.
     // Never raises a caller-lowered base.
     if (head_dim == 256 and !sliding_band_arch and transformer_mod.fused256CausalMode() == .all) {
         // A long-context-gated MoE prices the 8192 rung per request in `chooseRequestPrefillChunk`
@@ -136,7 +136,7 @@ pub fn boundedPrefillChunk(base_chunk: usize, score_head_dim: u32, n_heads: u32,
         return @min(base_chunk, if (is_moe and !long_ctx_gated) @as(usize, 4096) else @as(usize, 8192));
     }
     // Composed-causal fallback (no fused causal kernel): SMALL chunks
-    // measured strictly faster AND lighter on the 27B (2026-07-12 ladder,
+    // measured strictly faster AND lighter on the 27B ( ladder,
     // M4 Max): 8K 225 -> 235.8 tok/s and peak 28.9 -> 19.8 GB at chunk
     // 2048; 32K 205.4 -> 209.3. Chunk boundaries ARE block-level causal
     // skipping for composed attention. Sliding-band archs (gemma) keep big
@@ -265,7 +265,7 @@ pub fn nextChunkEnd(
 /// ("<|im_start|>assistant\n" + think opener) renders differently once the
 /// turn enters history, so the match always falls a few tokens short of the
 /// full prompt — "[hot-cache] hybrid miss (no checkpoint ≤ 870 of 897)" was
-/// llmprobe's prompt-cache-prefix cell failing (the 2026-06-10 class; fine
+/// llmprobe's prompt-cache-prefix cell failing (the class; fine
 /// strides used to mask it by laying boundaries underneath). 30 covers every
 /// template suffix in the fleet with margin (ChatML+think ≈ 7 tokens, laguna
 /// pre-opened think ≈ 10) while keeping the tail forward UNDER the
@@ -332,7 +332,7 @@ pub fn ssmLowAnchorEnd(pos: usize, end: usize, offset: usize, stride: usize) usi
 /// M >= 2048, a fine stride pushes EVERY projection of EVERY chunk onto the
 /// slow small-M qmm path, and the per-chunk fixed costs (graph build, eval
 /// barrier, MTP history capture) multiply on top. Measured on Qwen3.6-27B
-/// dense GDN (M4 Max, 2026-07-30): stride 256 chunked an 8K prompt into 33
+/// dense GDN (M4 Max): stride 256 chunked an 8K prompt into 33
 /// pieces at 211 tok/s vs 254 at coarse chunks — a 17-20% cold-prefill tax at
 /// every context length, which is how llm_context_benchmarks read us 19%
 /// behind oMLX. MoE pays even more (expert re-streaming, ~25%).
@@ -852,7 +852,7 @@ test "boundedPrefillChunk: fused-causal (default) non-sliding hd-256 — MoE cap
     std.debug.assert(attn256.fused256_override == null);
     // DENSE hybrids (Qwen3.6-27B class): no expert-gather transients, and a
     // full-size chunk halves per-chunk dequant sweeps — chunk 8192 measured
-    // +1.4% over 4096 at the 8K rung (M4 Max, 2026-07-30), flat at 32K.
+    // +1.4% over 4096 at the 8K rung (M4 Max), flat at 32K.
     try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 24, 8192, false, false, false));
     try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 24, 65536, false, false, false));
     try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 24, 140_000, false, false, false));
@@ -907,7 +907,7 @@ test "boundedPrefillChunk: a long-context-gated MoE hd-256 arch offers the 8192 
 
 test "boundedPrefillChunk: composed-causal keeps the 2048 cap + score formula" {
     // Composed causal, where SMALLER
-    // chunks measured faster on the 27B ladder (2026-07-12, M4 Max): 8K
+    // chunks measured faster on the 27B ladder (M4 Max): 8K
     // prompt 225 -> 235.8 tok/s at chunk 2048 (peak 28.9 -> 19.8 GB).
     // Chunking IS block-level causal skipping for composed attention, and
     // the score transient shrinks with it.
@@ -949,7 +949,7 @@ test "effectiveSsmCheckpointStride: checkpointing never sub-divides the prefill 
     try testing.expectEqual(@as(usize, 0), effectiveSsmCheckpointStride(0, PREFILL_CHUNK));
     // Sub-chunk strides coarsen on ALL archs: they push every projection under
     // prefillDqGemm's M>=2048 floor (slow small-M qmm) and multiply per-chunk
-    // fixed costs. Measured on Qwen3.6-27B dense (M4 Max, 2026-07-30): stride
+    // fixed costs. Measured on Qwen3.6-27B dense (M4 Max): stride
     // 256 = 33 chunks at 8K = 211 tok/s vs 254 coarse.
     try testing.expectEqual(@as(usize, 8192), effectiveSsmCheckpointStride(256, PREFILL_CHUNK));
     // A larger explicit stride is respected (never shrunk).

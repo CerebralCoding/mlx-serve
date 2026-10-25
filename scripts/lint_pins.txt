@@ -42,7 +42,7 @@ src/engines/mlx/admission/admit.zig	!.hot_prefix_cache.?	the bill reads the publ
 src/engines/mlx/admission/*.zig	prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, chunk, config.prefillAttnKeys(seq)	the prefill bill takes the config's KV width, score width and key bound at the site
 src/engines/mlx/admission/*.zig	config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config), prefillRequestTerms(config, seq, max_tokens, kv_bits, chunk, warm))	the per-request bill terms are derived from the config at the site
 src/engines/mlx/admission/*.zig	    const seq: u64 = @max(kv_len, chunk);	the transient reserve bills at an explicit KV length
-src/engines/mlx/admission/*.zig	const kv_bytes: u64 = seq * kvBytesPerTokenAtBits(kv_per_tok, kv_bits);	the guard and auto-context bill KV through kvBytesPerTokenAtBits
+src/sdk/bill/prefill.zig	const kv_bytes: u64 = seq * kvBytesPerTokenAtBits(kv_per_tok, kv_bits);	the guard and auto-context bill KV through kvBytesPerTokenAtBits
 src/engines/mlx/admission/*.zig	(kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) *| ctx)	the guard and auto-context bill KV through kvBytesPerTokenAtBits
 src/engines/mlx/admission/*.zig	ctxCacheShare(ctxSizingCacheReserve(config), ceiling, active_mem, transient) +| transient	auto-context reserves the prefill transient once, never per token
 src/engines/mlx/prefill.zig	.pinned_prefill_chunk = companyPrefillChunk(req_prefill_chunk,	the prefill loop's width comes from the request's chosen chunk, never xfm.config

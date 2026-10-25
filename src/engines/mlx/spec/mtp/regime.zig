@@ -12,7 +12,7 @@ const MtpRoundPlan = @import("ev_plan.zig").MtpRoundPlan;
 /// consecutive extension-CONSIDERED rounds whose confidence gate never
 /// cleared, consideration collapses to single-chunk for
 /// MTP_EXT_DRY_COOLDOWN rounds, then re-opens for a fresh trial.
-/// Rationale (2026-07-22, post-round-pipelining sweep): a two-chunk
+/// Rationale (post-round-pipelining sweep): a two-chunk
 /// round pays a REAL mid-pipeline cost the EV surface can't see — the
 /// chunk-A boundary sync fires ~0.3 ms after the pre-draft dispatch, so
 /// it blocks on the still-running head chain + confidence graphs
@@ -378,7 +378,7 @@ test "mtpRegime: the worse shape runs as a scheduled trial block, unmeasured run
 }
 
 test "mtpRegime: a simulated round loop reaches BOTH shapes, and the worse one keeps being re-tried" {
-    // Live 2026-08-22 (M4 base): v2's "try the unmeasured single shape at
+    // Live (M4 base): v2's "try the unmeasured single shape at
     // once" rule compared one_m against a two_m that only a two-chunk round
     // can set, so it forced single-chunk forever — caps 5/6 reported cap-4
     // numbers with ext_rounds=0 and no verdict line, which reads as a PASS

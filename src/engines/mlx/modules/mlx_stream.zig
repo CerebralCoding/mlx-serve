@@ -1,4 +1,4 @@
-//! engines/mlx/modules/mlx_stream, split out of engines/mlx/transformer.zig (P1, moves only).
+//! engines/mlx/modules/mlx_stream.
 //! Owns forwardMlxStream, initMlxStream.
 
 const std = @import("std");

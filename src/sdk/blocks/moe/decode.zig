@@ -1,4 +1,4 @@
-//! sdk/blocks/moe/decode, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/blocks/moe/decode.
 //! Owns batchedExpertMm, and 9 more.
 
 const env = @import("../../../env.zig");

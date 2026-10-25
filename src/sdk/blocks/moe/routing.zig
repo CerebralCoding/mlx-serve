@@ -1,4 +1,4 @@
-//! sdk/blocks/moe/routing, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/blocks/moe/routing.
 //! Owns MoeRouting, and 6 more.
 
 const mlx = @import("../../../mlx/ffi.zig");

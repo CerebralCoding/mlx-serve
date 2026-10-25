@@ -19,7 +19,7 @@ pub fn add(b: *std.Build) void {
     // `zig build unit-closure`: no plugin's import closure leaves src/sdk, src/mlx, src/abi, src/kernels, env.zig and
     // the plugin folders (scripts/unit_closure.py), so a plugin edit rebuilds its -Dunits group alone. The plugins
     // named here still reach the engine; each leaves the list once it no longer does.
-    const closure = b.addSystemCommand(&.{ "python3", "scripts/unit_closure.py", "--except", "bailing_hybrid,clef,d1,deepseek_v4,deepseek_v41,diffusion_gemma,glm5_next,kev,ltx,minimax_h3,moss_image,prism_hadamard_qwen35,qwen3_5,qwen3_next,qwen4_exp" });
+    const closure = b.addSystemCommand(&.{ "python3", "scripts/unit_closure.py", "--except", "clef,qwen4_exp" });
     closure.setCwd(b.path("."));
     closure.has_side_effects = true;
     b.step("unit-closure", "Check every plugin's import closure stays in the SDK and the plugin folders").dependOn(&closure.step);

@@ -120,7 +120,7 @@ pub fn museStreamVerdict(buf: []const u8) ?StreamThinkGate {
         // only while every byte fits the recipient grammar, so prose that
         // merely starts with "to=" is released to the generic gate. The
         // first tokens can be SHORTER than "to=" (" to" leaked live
-        // 2026-08-10) — a strict prefix of it still holds.
+        // ) — a strict prefix of it still holds.
         const t = std.mem.trimStart(u8, buf, " \n");
         if (t.len < "to=".len) {
             return if (t.len > 0 and std.mem.startsWith(u8, "to=", t)) .hold_thinking else null;
@@ -160,7 +160,7 @@ pub fn museHeaderHoldsForTools(buf: []const u8) bool {
     } else {
         const lead = std.mem.trimStart(u8, buf, " \n");
         // A strict prefix of "to=" could still become a header (" to" leaked
-        // as a text delta live 2026-08-10) — hold it.
+        // as a text delta live) — hold it.
         if (lead.len < "to=".len) return lead.len > 0 and std.mem.startsWith(u8, "to=", lead);
         if (!std.mem.startsWith(u8, lead, "to=")) return false;
         header_from = buf.len - lead.len;

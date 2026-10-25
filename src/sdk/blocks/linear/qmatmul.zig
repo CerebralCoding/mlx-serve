@@ -1,4 +1,4 @@
-//! sdk/blocks/linear/qmatmul, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/blocks/linear/qmatmul.
 //! Owns and 8 more.
 
 const std = @import("std");

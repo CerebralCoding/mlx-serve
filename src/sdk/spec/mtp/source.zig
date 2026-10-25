@@ -24,7 +24,7 @@ pub const sidecar_rel_paths = [_][]const u8{
 /// sidecar when it provably contains a head this loader can bind (DeepSeek-V4
 /// mirrors ship their own dsv4-shaped MTP module at `model-mtp.safetensors`;
 /// claiming it by NAME alone sent the qwen-shaped loader into
-/// MissingMtpWeight on every `--mtp` boot, live 2026-07-31).
+/// MissingMtpWeight on every `--mtp` boot, live).
 pub fn resolveMtpSidecarInDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir) ?[]const u8 {
     for (&sidecar_rel_paths) |rel| {
         const st = dir.statFile(io, rel, .{}) catch continue;

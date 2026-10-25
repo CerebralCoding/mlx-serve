@@ -1,4 +1,4 @@
-//! engines/mlx/ane_prefill, split out of engines/mlx/transformer.zig (P1, moves only).
+//! engines/mlx/ane_prefill.
 //! Owns AneChanRest, denseMLPMaybeAne, denseMLPAneSplit, gdnProjMaybeAne, gdnProjAneSplit, anePackPlane, and 10 more.
 
 const std = @import("std");

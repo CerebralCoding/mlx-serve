@@ -1062,7 +1062,7 @@ pub fn initModel(gpa: std.mem.Allocator, cfg: *const Config, dw: Dsv4Weights, s:
 
     // comp_in int8-g32 side copies (decode/verify widths), gated on the
     // user-facing --decode-attn-quant flag in its EXPLICIT form: the
-    // 2026-08-01 characterization moved one answer (a duplicated paragraph
+    // characterization moved one answer (a duplicated paragraph
     // on 1/7 greedy prompts) against +7-8% decode, so dsv4 requires the
     // user to actually ask — the flag's silent default stays dense here
     // while laguna keeps its clean-characterization default. Built EAGERLY
@@ -2357,8 +2357,8 @@ test "dsv4: forwardPrefill on the REAL mirror continues 'The capital of France i
     // Ground truth RE-DERIVED per MIRROR (tests/dsv4_mlx_ref.py) — the
     // expectation is weights-pinned, so a checkpoint OR quant-recipe bump
     // re-derives it from the oracle before anyone calls a diff a bug.
-    // imx-2-3-8bit (imatrix gs128, 2026-08-01): 11111, 16 = ' Paris', '.'.
-    // iQ-MLX-3.3bpw (greedy late-layer 3b plan, 2026-08-03): re-derived,
+    // imx-2-3-8bit (imatrix gs128): 11111, 16 = ' Paris', '.'.
+    // iQ-MLX-3.3bpw (greedy late-layer 3b plan): re-derived,
     // SAME 11111, 16. The superseded mixed-2-3-8bit (minmax gs64) continued
     // 11111, 66910 ('.",') — same first token, near-tie second.
     const want = [_]u32{ 11111, 16 };
@@ -2443,7 +2443,7 @@ test "dsv4: incremental decode matches full re-forward (DSV4_MINI)" {
 
         // A ONE-token fresh prefill first: C==1 through the BATCH path is the
         // serving warmup's exact shape and produced a rank-1-vs-rank-2
-        // sinkhorn-output slice kill on first live boot (2026-07-31) — the
+        // sinkhorn-output slice kill on first live boot — the
         // 6-token prefill below never sees it.
         {
             var st1 = try initDecodeState(&mdl, allocator);
@@ -2831,7 +2831,7 @@ test "dsv4: toHostF32 reads non-contiguous f32 views in logical order" {
     // astype-to-same-dtype is an MLX no-op VIEW, so a broadcast/strided f32
     // input used to hand the raw (smaller) buffer to the memcpy — an overread
     // that read stale pool bytes (nondeterministic garbage) or a foreign
-    // stack guard (SIGBUS, live 2026-07-31 in the dspark trace).
+    // stack guard (SIGBUS, live in the dspark trace).
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     // broadcast [1,3] -> [2,3]: buffer holds 3 floats, logical is 6
@@ -3333,7 +3333,7 @@ test "dsv4: extendStateAllLogits rows match serial decode at every position (DSV
     // The verify primitive's PER-ROW contract: L[k] (logits after verify
     // tokens 0..k) must argmax-agree with the serial decodeStep at the same
     // position — this is exactly what the accept loop trusts, and a wrong
-    // later row fakes 100% acceptance of garbage (the live 2026-07-31 bos
+    // later row fakes 100% acceptance of garbage (the live bos
     // cascade). Feeds the SERIAL continuation as the verify block so every
     // row is on-distribution.
     const path_z = std.c.getenv("DSV4_MINI") orelse return;
@@ -4567,7 +4567,7 @@ pub const SinkhornK = struct { kernel: mlx.mlx_fast_metal_kernel, cfg: mlx.mlx_f
 /// Per-batch-size kernel config: output [tokens, pre|post|combT] — ALWAYS
 /// rank 2, tokens == 1 included. A rank-1 special case for decode made the
 /// batch path's rank-2 column slice an uncatchable MLX kill on a ONE-token
-/// prefill chunk (the serving warmup's exact shape, live 2026-07-31).
+/// prefill chunk (the serving warmup's exact shape, live).
 /// Widths whose sinkhorn config is worth keeping: every decode/verify width
 /// (1..32) plus the prefill sub-chunk. A prefill remainder is a one-off, so
 /// caching it would grow the table without ever hitting.
@@ -8751,7 +8751,7 @@ test "dsv4: fused emission kernel matches the composed emission graph (GPU)" {
 /// sits at the rounding midpoint between the two returned grid points: the
 /// two arms sum the hadamard matmul in different orders, and a value a few
 /// ulps from the midpoint legitimately rounds to ADJACENT fp4 points on
-/// another machine (M5 measured composed -0.5 vs kernel -0.75, PR #223).
+/// another machine (M5 measured composed -0.5 vs kernel -0.75).
 /// Anything not at a midpoint is a real mismatch and still fails.
 fn fp4MidpointAcquits(composed: f32, kernel: f32, prequant: f32) bool {
     const gap = @abs(composed - kernel);

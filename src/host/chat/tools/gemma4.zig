@@ -179,7 +179,7 @@ fn convertGemma4Object(
 
         // The truncation landed INSIDE this value — it is a fragment (partial
         // file content, partial url) and must never ship as a real argument
-        // (the Hermes-truncation rule, extended to the Gemma arm 2026-07-14:
+        // (the Hermes-truncation rule, extended to the Gemma arm
         // php.html loop-stop capture). Roll the whole pair back; the scan
         // consumed to end-of-body, so this object is done.
         if (cut.*) {
@@ -293,7 +293,7 @@ fn convertGemma4Value(
                 // The call itself was cut (no <tool_call|>): the truncation
                 // landed INSIDE this string — a fragment (partial file
                 // content, partial url) that must never ship as a real
-                // argument (live 2026-07-14 php.html: the loop-stop guard cut
+                // argument (live php.html: the loop-stop guard cut
                 // a write call mid-`content` and the 1.1 KB fragment shipped).
                 cut.* = true;
                 return body.len;
@@ -498,7 +498,7 @@ test "parseToolCalls Gemma 4 truncated (no closing tag)" {
 test "parseToolCalls Gemma 4 truncated mid-value drops the partial value" {
     const allocator = testing.allocator;
     // Model stopped mid-URL: no closing <|"|>, no `}`, no <tool_call|>. POLICY
-    // (2026-07-14, aligned with the Hermes truncation rule): a value whose scan
+    // (aligned with the Hermes truncation rule): a value whose scan
     // runs to end-of-body without its terminator is a truncation FRAGMENT —
     // partial bytes must never ship as a real argument (a client executes them:
     // a fragmentary url browses garbage, a fragmentary content writes a corrupt
@@ -524,7 +524,7 @@ test "parseToolCalls Gemma 4 truncated mid-value drops the partial value" {
 
 test "parseToolCalls Gemma 4 loop-stop truncated content dropped, name recovered (php.html capture)" {
     const allocator = testing.allocator;
-    // Live 2026-07-14 (pi → gemma-4-26B-A4B-it-qat-4bit, plang/php.html): the
+    // Live (pi → gemma-4-26B-A4B-it-qat-4bit, plang/php.html): the
     // model repetition-looped INSIDE the write call's content string and the
     // scheduler's degenerate-tail-loop guard cut generation mid-word — the
     // buffered call arrived with NO closing delimiter, NO `}`, NO <tool_call|>,

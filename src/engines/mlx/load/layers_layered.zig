@@ -1,4 +1,4 @@
-//! engines/mlx/load/layers_layered, split out of engines/mlx/transformer.zig (P1, moves only).
+//! engines/mlx/load/layers_layered.
 //! Owns initMoeLayers.
 
 const std = @import("std");

@@ -1,4 +1,4 @@
-//! sdk/blocks/mlp/fused_activations, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/blocks/mlp/fused_activations.
 //! Owns SWIGLU_SOURCE, SWIGLU_CLAMP_SOURCE, swiglu_sig_tables, sigmoidTableFor, swigluSigTable, swiglu_engaged, and 27 more.
 
 const std = @import("std");

@@ -1,4 +1,4 @@
-//! engines/mlx/ssm/entry, split out of engines/mlx/transformer.zig (P1, moves only).
+//! engines/mlx/ssm/entry.
 //! Owns SSMCacheEntry, arrayBytes, qsaRawKeyBytes, ssmEntryBytes, SSMCacheEntrySnapshot, ssmSnapshot, and 7 more.
 
 const qwen4_mod = @import("../../../plugins/qwen4_exp/qwen4_exp.zig");

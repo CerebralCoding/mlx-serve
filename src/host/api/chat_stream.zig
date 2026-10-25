@@ -389,7 +389,7 @@ pub fn handleStreamingGeneration(
     // whether the prompt ends inside a think block is a property of the
     // RENDERED BYTES. LFM2.5 pre-opens `<think>` unconditionally, so with
     // thinking off its reasoning is tag-free prose the gate flushed as the
-    // visible answer (live 2026-08-04). Families that gate the opener on
+    // visible answer. Families that gate the opener on
     // enable_thinking render the closed signature and stay false here.
     const prompt_opened_think = promptOpensThink(allocator, lm, tok, prompt_ids);
     const opens_think = prompt_opened_think;
@@ -502,7 +502,7 @@ pub fn handleStreamingGeneration(
     // templates render the opener when thinking is on, so `promptOpensThink`
     // sees it; LFM2-VL's generation prompt is a bare `<|im_start|>assistant`
     // and its model answers directly, so seeding from the flag routed the whole
-    // answer into reasoning_content and left `content` empty (live 2026-08-13).
+    // answer into reasoning_content and left `content` empty.
     // A model that opens the block itself is picked up by `saw_think_open`.
     var channel_armed = false; // the `<|channel>` marker that may open a Gemma 4 thought
     const gated_stream = has_tools or (sampling.constraint == null and reasoningDialect(config) == .harmony);
@@ -676,7 +676,7 @@ pub fn handleStreamingGeneration(
                         // This was gated on `reasoning_budget < 0`, so a capped
                         // tools request showed nothing for the whole generation
                         // and got one dump at the end — a capped agent session
-                        // looked frozen (live 2026-08-14, pi on Qwen3.8-27B).
+                        // looked frozen (live, pi on Qwen3.8-27B).
                         // Each loop iteration is one model token, so an
                         // iteration that produced fresh reasoning IS one
                         // reasoning token; at the cap the latch stops every
@@ -762,7 +762,7 @@ pub fn handleStreamingGeneration(
         } else if (in_think_block) {
             // Inside <think> block — stream as reasoning_content with </think>
             // detection. Also covers thinking-off + template-opened (LFM2.5
-            // renders `…assistant\n<think>` unconditionally, live 2026-08-04):
+            // renders `…assistant\n<think>` unconditionally, live):
             // the block used to be buffered and DROPPED there; now it streams
             // as reasoning_content like any other thought — generated tokens
             // are always delivered.
@@ -983,7 +983,7 @@ pub fn handleStreamingGeneration(
                 // Hold back a still-growing partial close tag (suffixed forms
                 // like `</think:opensource>` included), then back the cut off
                 // to a UTF-8 boundary — a flush cut mid-codepoint ships a lone
-                // continuation byte in the delta JSON (live hy_v3 2026-07-14:
+                // continuation byte in the delta JSON (live hy_v3
                 // `"reasoning_content":"2\xc2"` — '²' split across deltas).
                 var safe_len = think_buf.items.len - chat_mod.partialThinkCloseSuffixLen(think_buf.items);
                 while (safe_len > 0 and safe_len < think_buf.items.len and (think_buf.items[safe_len] & 0xC0) == 0x80) safe_len -= 1;
@@ -1068,7 +1068,7 @@ pub fn handleStreamingGeneration(
         // thinking was requested, so a Gemma turn answered directly (its
         // template renders a bare `<|turn>model` and lets the model decide)
         // shipped its whole answer as reasoning with EMPTY content, while
-        // non-streaming returned it correctly (live 2026-08-04).
+        // non-streaming returned it correctly.
         if (chat_mod.streamTailIsReasoning(in_think_block, prompt_opened_think, saw_think_open)) {
             if (!budget_exhausted) {
                 try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items }, null, null, null, .{});
@@ -1156,7 +1156,7 @@ pub fn handleStreamingGeneration(
             // reasoning the model produced ships as reasoning_content, and
             // split.content already passes trimLeakedToolMarkup, so unparsed
             // wreckage that held the buffer (markers the tokenizer split
-            // across tokens — live 2026-08-01, DSV4 `<` then `｜DSML｜`) is
+            // across tokens — live, DSV4 `<` then `｜DSML｜`) is
             // still cut once, at the end.
             {
                 // Concatenate all buffered tokens and split thinking from content
@@ -1214,7 +1214,7 @@ pub fn handleStreamingGeneration(
         // accounts for any prompt-cache hits in `ts.prompt_tokens` directly.
         // OpenAI ships this chunk with an EMPTY choices array — restating
         // finish_reason/finish_details here made every per-event client render
-        // the ending twice (PR #147's doubled truncation banner). Pending
+        // the ending twice ('s doubled truncation banner). Pending
         // logprobs all drained on the final chunk above.
         if (include_usage) {
             const usage_json = try formatChatUsage(allocator, total_prompt, ts.completion_tokens, ts.cached_tokens, "");

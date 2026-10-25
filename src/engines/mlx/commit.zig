@@ -251,7 +251,7 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
         return;
     };
     // Truthful outcome only: a budget decline must never print as a commit
-    // (live 2026-09-07: "skipped oversized" + "committed N/M" were the SAME
+    // (live: "skipped oversized" + "committed N/M" were the SAME
     // event and the cache looked healthy while a 122k session re-prefilled
     // ~95k tokens per retry).
     switch (st) {

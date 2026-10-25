@@ -1528,7 +1528,7 @@ pub const DiskTier = struct {
 
         // Phase 3 FIRST: checkpoints come off the TOP of the flush budget —
         // chunk-first budgeting starved them to ZERO on turns appending ≥
-        // the cap in chunks (live 2026-09-07: cancel-salvage retries at
+        // the cap in chunks (cancel-salvage retries at
         // +16 chunks ≈ 544 MB vs a 512 MB cap left no checkpoint budget,
         // ever; every entry of the Sep-4 disk wave landed KV-only and
         // unrestorable). Their share is capped at half the budget so chunk
@@ -2368,7 +2368,7 @@ pub const DiskTier = struct {
     /// accumulates the bytes this call wrote; `max_spend` is this call's
     /// own byte share of the flush budget (the caller decides how much of
     /// `max_flush_bytes` the checkpoints get — chunk-first budgeting
-    /// starved them to zero on chunk-heavy turns, live 2026-09-07).
+    /// starved them to zero on chunk-heavy turns, live).
     /// `kv_limit` is the WRITE-AHEAD bound, not the flushed kv_len: a
     /// checkpoint beyond the chunks this flush reaches is still written
     /// (position-keyed, immutable) and becomes restorable when a later
@@ -2420,7 +2420,7 @@ pub const DiskTier = struct {
             const cp = findCp(cps, p) orelse continue;
             // Under SSD-first a checkpoint is written beside its chunk, outside the byte budget;
             // elsewhere its share of the flush budget is bounded by `max_spend` (half the cap —
-            // chunk-first budgeting starved them to zero, live 2026-09-07).
+            // chunk-first budgeting starved them to zero, live).
             if (!self.ssd_first and written_bytes.* >= max_spend) {
                 complete = false;
                 continue; // share exhausted — persist on a later flush

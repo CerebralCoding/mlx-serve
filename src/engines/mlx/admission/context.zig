@@ -145,13 +145,13 @@ pub fn getEffectiveContextLength(config: *const model_mod.ModelConfig) u32 {
 /// Reserving the whole cache budget — not just its current residency — budgets
 /// for STEADY STATE. Over an agentic session the hot cache fills to its cap, so
 /// an auto-context computed against an empty cache (24k tokens on a 16 GB Mac,
-/// 2026-06-19 live qwen3_5_moe) later collides with the filled 2 GB cache plus a
+/// live qwen3_5_moe) later collides with the filled 2 GB cache plus a
 /// large cold MoE prefill and the command buffer OOMs. Subtracting it up front
 /// keeps the reported context stable across the session and within the ceiling
 /// once the cache is full. The 0.64 factor (two ×4/5 margins) absorbs the
 /// prefill compute spike that lands on top of `active_mem`.
 /// PURE: the raw largest context the budget fits — no 1024 floor, no
-/// `max_pos` clamp. Split out of `safeContextForBudget` because
+/// `max_pos` clamp. Kept apart from `safeContextForBudget` because
 /// `resolvePrefillChunk` compares rungs against each other and the floor makes
 /// a rung that fits NOTHING look identical to one that fits 1024 tokens.
 /// The 0.64 factor is the same two x4/5 margins documented below.

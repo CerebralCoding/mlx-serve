@@ -1071,7 +1071,7 @@ test "no comma after the last property when additionalProperties is false" {
     // every declared property seen and `additionalProperties:false`, a comma
     // leads to expect_key where NOTHING is legal — the mask comes back empty,
     // argmax over an all-(-inf) row picks id 0, and the resulting byte kills
-    // the grammar (live 2026-08-11: `"!__employee_id__"` spliced into an
+    // the grammar (live: `"!__employee_id__"` spliced into an
     // otherwise conforming object once enforcement switched off).
     var schema = try parseSchema(testing.allocator,
         \\{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}},"required":["name","age"],"additionalProperties":false}

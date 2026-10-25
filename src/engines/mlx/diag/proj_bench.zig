@@ -1,4 +1,4 @@
-//! engines/mlx/diag/proj_bench, split out of engines/mlx/transformer.zig (P1, moves only).
+//! engines/mlx/diag/proj_bench.
 //! Owns projLadderFits, ProjRung, ProjOrder, diagProjBench, projRungOnce.
 
 const std = @import("std");

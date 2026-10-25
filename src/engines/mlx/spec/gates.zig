@@ -55,7 +55,7 @@ pub fn runtimeGateShouldDisable(attempted: u64, accepted: u64, drafts_per_round:
 // 4.4-15.0 accepted/round and the regressing prose/vision class at
 // 1.0-1.5; two is the measured break-even boundary. M4 block-5 model-card
 // workloads accepting 62-86% remain above it as well.
-// Warmup 8, not 3 (2026-09-03): three rounds tripped on ONE dry opening
+// Warmup 8, not 3: three rounds tripped on ONE dry opening
 // (llmprobe's 16k rung: 0/3, drafter off for the whole request at 25
 // tok/s; the same prompt restored from cache decoded at 73).
 pub const DFLASH_GATE_WARMUP: u64 = 8;
@@ -266,7 +266,7 @@ test "Generator.dflashGateShouldDisable uses accepted yield across block widths"
 }
 
 test "Generator.yieldGateShouldDisable trips on cold-path-dominated workloads" {
-    // The 2026-06-10 baseline regression: PLD forced on for a creative essay
+    // The baseline regression: PLD forced on for a creative essay
     // prompt where the n-gram lookup almost never matches. The per-draft gate
     // never trips (it only counts verify ROUNDS, and there are few), but every
     // step pays the unpipelined cold forward → −14% measured on E2B. The

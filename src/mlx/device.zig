@@ -1,4 +1,4 @@
-//! mlx/device, split out of engines/mlx/transformer.zig (P1, moves only).
+//! mlx/device.
 //! Owns naxArchGeneration, DeviceGen, device_gen_cache, deviceGeneration, naxArchSupportedFrom, naxArchIsG17, and 11 more.
 
 const std = @import("std");

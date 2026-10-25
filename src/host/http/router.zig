@@ -283,7 +283,7 @@ pub fn handleConnection(
     // anything is loaded. Dispatched after resolution it rendered one
     // *LoadedModel and a headless boot (`mlx-serve serve`, and every
     // app-launched server) answered 503 "No default model configured" at the
-    // root — the first page a person opens. Everything it used to render from
+    // root — the first page a person opens. Everything it renders from
     // the model it now fetches from /v1/models + /props client-side.
     if (std.mem.eql(u8, method, "GET") and isRoute(path, "/")) {
         log.debug("GET  / -> 200 (console)\n", .{});
@@ -332,7 +332,7 @@ pub fn handleConnection(
         // discovery fetches self-identify with the X-MLX-LAN marker and get
         // the SAME filtered view even over loopback — two servers on one Mac
         // resolve each other loopback-first, and the unfiltered list leaked
-        // remote stubs into `@a@b` re-export chains (live 2026-07-21).
+        // remote stubs into `@a@b` re-export chains.
         try handleModels(allocator, stream, lanGateApplies(stream) or
             (http_server.g_lan != null and isTunneledRequest(request[0..header_end_pos])));
         return;
@@ -432,7 +432,7 @@ pub fn handleConnection(
     // id arrived as `Runpod\\/FLUX.2-…`, matched nothing in the registry, and
     // silently fell through to the default model — a 400 "does not support
     // this media modality" on the gen endpoints, and a wrong-model answer on
-    // chat (live from the iPhone app, 2026-07-25). Canonicalise once, here,
+    // chat (live from the iPhone app). Canonicalise once, here,
     // so every consumer below (proxy, peek, ensureLoaded) sees the real id.
     var model_id_buf: [512]u8 = undefined;
     var query_model_buf: [512]u8 = undefined;
@@ -738,7 +738,7 @@ test "routeExists answers endpoint existence without consulting the model" {
     // never reached the 404 branch and came back 503 "No default model
     // configured". Any client that maps endpoints by probing them then concludes
     // the server implements EVERYTHING (llmprobe: "server answers unknown paths
-    // with HTTP 503" → every surface scored absent, live 2026-07-25).
+    // with HTTP 503" → every surface scored absent, live).
     try std.testing.expect(routeExists("/v1/chat/completions"));
     try std.testing.expect(routeExists("/v1/images/edits"));
     try std.testing.expect(routeExists("/v1/embeddings"));

@@ -2821,7 +2821,7 @@ test "dflash: muse assistant config parses with the full DFlash contract" {
     for (cfg.layer_types) |lt| try testing.expectEqual(LayerType.sliding_attention, lt);
 }
 
-// The real incoai/Qwen3.8-27B-DFlash2 config shape (fetched 2026-08-18):
+// The real incoai/Qwen3.8-27B-DFlash2 config shape (fetched):
 // the contract nests under `dflash_config`, model_type is a bare "qwen3".
 const DFLASH2_CONFIG_JSON =
     \\{
@@ -2852,7 +2852,7 @@ const DFLASH2_CONFIG_JSON =
     \\}
 ;
 
-// LiquidAI/LFM2.5-2.6B-DSpark, fetched 2026-08-21. The contract is SPLIT:
+// LiquidAI/LFM2.5-2.6B-DSpark, fetched. The contract is SPLIT:
 // `block_size` sits at the root while `mask_token_id` / `target_layer_ids`
 // nest under `dflash_config`, rope theta is a ROOT `rope_theta`, and the
 // drafter's own rope is GPT-J interleaved (`rope_is_neox_style: false`).
@@ -3164,7 +3164,7 @@ test "dflash: no wide verify lane caps the block at the split-K width" {
 
 test "dflash: per-silicon cap table — M3 Ultra rides oMLX's block-8 evidence" {
     // The cap is a MACHINE measurement, keyed on the CPU brand string (the
-    // GPU arch cannot tell Ultra from Max). M3 Ultra -> 8 (oMLX PR #2850:
+    // GPU arch cannot tell Ultra from Max). M3 Ultra -> 8 (oMLX:
     // 1.33-1.43x at block 8 on the same pairing); everything else without a
     // wide lane keeps the M4-measured default.
     const ultra = blockCapForMachine("Apple M3 Ultra", false);

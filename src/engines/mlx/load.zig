@@ -611,7 +611,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                     // is that forward PLUS m sequential head steps — which on
                     // a 27B dominate the per-position marginal. Fitting the
                     // EV surface without this under-prices depth ~9x (live
-                    // 2026-08-21: forward marginal 0.8 ms/position against a
+                    // forward marginal 0.8 ms/position against a
                     // hand-measured composite of 7.6). A cached curve already
                     // carries it, so this is paid once per (chip, model,
                     // quant, OS build) like the ladder itself.
@@ -666,7 +666,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         const ane_force: ?[]const u8 = env.span(.MLX_SERVE_ANE_FORCE);
         if (!ane_mod.anePrefillAllowed(transformer_mod.verifyQmmNaxAvailable(), ane_force)) {
             // ANE prefill is M4-and-below: on NAX machines it measured a
-            // loss (M5 Max, PR #223). `/props` ane stays absent, as off.
+            // loss (M5 Max). `/props` ane stays absent, as off.
             log.info(
                 "[ane] --ane-prefill disabled: NAX-class GPU prefill already outruns the ANE seam " ++
                     "(measured a loss on M5 Max, PR #223); MLX_SERVE_ANE_FORCE=1 overrides\n",
@@ -679,7 +679,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             // the MoE 4096 / dense-hd-256 8192 caps + the --prefill-chunk and
             // env overrides) — compiling the tile at the pinned width alone
             // left every MoE program built at 8192 while the forward chunked
-            // at 4096: built, never dispatched (A7, 2026-08-18). total_ctx is
+            // at 4096: built, never dispatched (A7). total_ctx is
             // representative-large: under the default fused-causal mode the
             // policy arm is ctx-independent, and under the composed fallback
             // the chunk is ctx-dependent anyway (fixed shapes cannot follow
@@ -781,7 +781,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     {
         // The weights are resident here, so the resolver's active-memory read
         // is honest; the raw launch budget never reaches initWithMem (a 40 GB
-        // cap beside a ~70 GB pack was the 2026-08-30 uncatchable Metal OOM).
+        // cap beside a ~70 GB pack was the uncatchable Metal OOM).
         // Disk-only mode retains no reusable KV in RAM, so it asks for no RAM budget.
         var ssd_idle_mem: u64 = 0;
         const clamped_prefix_mem: u64 = if (!ram_prefix_cache)

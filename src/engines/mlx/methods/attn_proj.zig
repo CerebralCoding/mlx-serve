@@ -1,4 +1,4 @@
-//! engines/mlx/methods/attn_proj, the legacy `Transformer`'s methods split out of engines/mlx/transformer.zig.
+//! engines/mlx/methods/attn_proj: `Transformer` methods (aliased from engines/mlx/transformer.zig).
 //! Owns qkAngleFor, qkAngleRowsFor, attnDqFor, attnProj, attnProjBias.
 
 const mlx = @import("../../../mlx/ffi.zig");

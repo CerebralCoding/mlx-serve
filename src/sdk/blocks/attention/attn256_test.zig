@@ -291,7 +291,7 @@ test "fusedSdpa256Prefill: both arms FUSED off NAX, causal yields to stock ON NA
     // No master-switch override: the causal arm's historical net-loss (every
     // pre-budget ratio-gated variant lost same-boot on the 27B) was the IOGPU
     // preemption class — with the kv-chunk dispatch budget it wins live
-    // (2026-07-22 same-session A/B: +2.9%/+2.3%/+4.6% at 8K/16K/32K on the
+    // ( same-session A/B: +2.9%/+2.3%/+4.6% at 8K/16K/32K on the
     // 27B), so causal is default-on now.
     std.debug.assert(attn256.fused256_override == null);
     const q_shape = [_]c_int{ 1, 6, 64, 256 };

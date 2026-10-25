@@ -85,7 +85,7 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
 
     // Inkling: the invoke marker is a SINGLE special token (arrives whole) —
     // once present, everything from here on is call payload. Without this the
-    // NAME + full JSON streamed as visible content deltas (live 2026-07-30,
+    // NAME + full JSON streamed as visible content deltas (live,
     // first real pi session; the leak landed in pi's transcript and
     // contaminated every later turn's history).
     if (std.mem.indexOf(u8, buf, INKLING_INVOKE_TAG) != null) return true;
@@ -233,7 +233,7 @@ fn functionOpenerHoldsForTools(buf: []const u8) bool {
 /// already: /v1/messages only recognized think OPENERS present in the output,
 /// so Qwen-family template-opened thinking (opener injected into the PROMPT)
 /// streamed as visible text and a raw `</think>` leaked into Claude Code
-/// transcripts (2026-06-10 live).
+/// transcripts ( live).
 ///
 ///   .hold_thinking — inside an unclosed think block; buffer, stream only the
 ///                    reasoning not yet sent (`unstreamedReasoning`)
@@ -260,7 +260,7 @@ pub fn streamThinkGate(buf: []const u8, enable_thinking: bool, think_closed: boo
 /// BYTES, not about our request flag — LFM2.5's template pre-opens `<think>`
 /// unconditionally, so with thinking off the model's reasoning arrives as
 /// tag-free prose and the 3-arg gate flushed the whole chain-of-thought as the
-/// visible answer (live 2026-08-04). It can only ever ADD a hold: when
+/// visible answer. It can only ever ADD a hold: when
 /// thinking is on `enable_thinking` already held, and once `think_closed` the
 /// term is dropped so the answer after the block still flushes.
 /// Memoized marker scan for the streaming think gate, owned BESIDE the stream
@@ -441,7 +441,7 @@ pub fn streamThinkGate2(buf: []const u8, enable_thinking: bool, think_closed: bo
 /// answers directly ("391") carries no think markup at all — and the whole
 /// answer was flushed as `reasoning_content` with EMPTY content, while the
 /// non-streaming path (`splitThinkBlock`, no opener + no close + not
-/// template-opened ⇒ content) returned it correctly (live 2026-08-04).
+/// template-opened ⇒ content) returned it correctly.
 ///
 /// So require POSITIVE evidence a block was open: the PROMPT opened one, or the
 /// model emitted a literal opener. This is what makes the two paths agree.
@@ -460,7 +460,7 @@ pub fn streamTailIsReasoning(in_think_block: bool, prompt_opened_think: bool, sa
 /// opens `<think>` unconditionally, so its first generated token is the newline
 /// pair that follows the closer, and `splitThinkBlock` drops it while a stream
 /// flushing tokens verbatim shipped it — `'One, two…'` non-streaming,
-/// `'\n\nOne, two…'` streaming (live 2026-08-13). Any model whose first visible
+/// `'\n\nOne, two…'` streaming. Any model whose first visible
 /// token is whitespace is in this class, not just LFM2.5.
 ///
 /// Leading whitespace is the ONE thing a stream can still withhold: nothing
@@ -638,7 +638,7 @@ test "streamThinkGate: a prompt-opened block is held even with thinking OFF" {
     // enable_thinking branch in its template, so the model always reasons and
     // the opener is never in the OUTPUT. The gate saw tag-free prose with
     // thinking off and flushed the entire chain-of-thought as the answer
-    // (live 2026-08-04, streaming only — non-streaming strips it because the
+    // (live, streaming only — non-streaming strips it because the
     // `</think>` is present by the time the text is split).
     //
     // Whether the prompt ends inside a think block is a fact about the
@@ -674,7 +674,7 @@ test "streamTailIsReasoning: an unopened block was content all along" {
     // in the prompt (its template renders a bare `<|turn>model\n`) and none in
     // the output. Streamed, the whole answer arrived as reasoning_content with
     // EMPTY content while non-streaming returned it as content (live
-    // 2026-08-04). Content is the correct reading: nothing ever opened.
+    // ). Content is the correct reading: nothing ever opened.
     try testing.expect(!streamTailIsReasoning(true, false, false));
 
     // A template-opened block that never closed IS reasoning — the truncated
@@ -743,7 +743,7 @@ test "streamShouldBufferForTools: every prefix of a bare <invoke> call holds; pr
 
 test "muse streaming gate: headers hold, self holds then splits, user splits" {
     // Growing bare header — never flush the ` to=…` text. The sub-"to="
-    // prefixes are the live 2026-08-10 leak (" to" shipped as a text delta
+    // prefixes are the live leak (" to" shipped as a text delta
     // on a thinking-off /v1/messages stream).
     try testing.expect(museStreamVerdict(" t") == StreamThinkGate.hold_thinking);
     try testing.expect(museStreamVerdict(" to") == StreamThinkGate.hold_thinking);

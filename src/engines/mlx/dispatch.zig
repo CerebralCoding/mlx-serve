@@ -1,4 +1,4 @@
-//! engines/mlx/dispatch, split out of engines/mlx/transformer.zig (P1, moves only).
+//! engines/mlx/dispatch.
 //! Owns defaultCtx, module_owned_state_fields, module_shared_readonly_fields, ownsModuleDecodeState, sharesModuleReadonlyState, moduleSpecWiring, and 7 more.
 
 const std = @import("std");
@@ -143,7 +143,7 @@ pub fn supportsLayerCapture(self: *const Transformer) bool {
 test "ownsModuleDecodeState covers every module-owned arch" {
     // The bug this pins: a SECOND module-owned arch arrived and
     // `scheduler.modelExclusiveDecode` kept keying on `dsv4` alone, so two
-    // concurrent requests shared ONE module state — the 2026-08-02 dsv4
+    // concurrent requests shared ONE module state — the dsv4
     // clobber, verbatim. The predicate reads a NAMED LIST so it cannot
     // drift from itself; this test pins the list against the struct.
     var t: Transformer = undefined;

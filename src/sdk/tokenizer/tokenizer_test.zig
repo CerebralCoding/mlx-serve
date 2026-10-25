@@ -565,7 +565,7 @@ test "llama3PreTokenize: boundaries match the reference regex (muse_glimmer clas
     // punct tail class). BPE cannot merge across pre-tokens, so these
     // boundaries drive final token ids — per-digit splitting here was the
     // DSV4 echo-precision class all over again ("8 4" echoed for "84", live
-    // 2026-08-10 first boot).
+    // first boot).
     const a = testing.allocator;
     try expectPreTokensL3(a, "What is 84 * 3 / 2? In 1234 years.", &.{
         "What", " is", " ", "84", " *", " ", "3", " /", " ", "2", "?", " In", " ", "123", "4", " years", ".",
@@ -722,7 +722,7 @@ test "tokenizer.json digit-group parse: {1,3} Split rule sets digit_group 3" {
 test "tokenizer.json digit-group parse: {1,3} inside a COMBINED Split regex" {
     // LFM2.5-VL ships one alternation carrying the digit rule as a branch, so
     // an exact-match detector reads it as per-digit and every number in the
-    // prompt goes off-distribution (live 2026-08-14: "973, 162" served as
+    // prompt goes off-distribution (live: "973, 162" served as
     // '9','7','3' / '1','6','2' against HF's '973' / '162', measured on the
     // ScreenSpot-v2 grounding track). The contraction group is spelled
     // `'(?i:[sdmt]|ll|ve|re)`, not Llama-3's, so the style detector does not
@@ -1260,7 +1260,7 @@ test "parseMergePair handles both array and space-joined-string formats" {
 }
 
 test "reservedOutputIds: an OUTPUT-ONLY special is legit output the template cannot vouch for" {
-    // Live 2026-08-12, gpt-oss-20b. Harmony declares a tool call's argument
+    // Live, gpt-oss-20b. Harmony declares a tool call's argument
     // content type INSIDE the segment header the model generates:
     //   ...to=functions.get_weather <|constrain|>json<|message|>{...}<|call|>
     // The chat template renders tool calls only for HISTORY, and that rendering

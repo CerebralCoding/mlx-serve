@@ -742,7 +742,7 @@ pub fn handleAnthropicMessages(
                 enable_drafter = false;
             }
         }
-        // Heavy-echo MTP->PLD routing retired 2026-07-13 (see the NOTE at the
+        // Heavy-echo MTP->PLD routing retired (see the NOTE at the
         // chat-completions site): MTP wins whenever loaded.
     }
 

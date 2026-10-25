@@ -1,4 +1,4 @@
-//! sdk/blocks/linear/verify_projection, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/blocks/linear/verify_projection.
 //! Owns SingleVerifyFeature, single_verify_test_features, mtp_verify_shared_rows_calls, mtp_verify_shared_gate_rows_calls, mtp_verify_gdn_rows_calls, mtp_verify_gdn_output_calls, and 36 more.
 
 const std = @import("std");

@@ -1,4 +1,4 @@
-//! mlx/kernel_cache, split out of engines/mlx/transformer.zig (P1, moves only).
+//! mlx/kernel_cache.
 //! Owns QsaCfgCache, KernelCfgCache.
 
 const std = @import("std");

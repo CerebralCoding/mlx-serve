@@ -54,7 +54,7 @@ const SinksState = struct {
     /// actually fails, and Zig's build runner echoes any test stderr back tagged
     /// with a `failed command: …/test --listen=-` line — which READS AS A FAILURE
     /// even though the build exits 0 and every test passed. That false signal cost
-    /// real debugging time on both sides of a genuine CI break (2026-07-14). Test
+    /// real debugging time on both sides of a genuine CI break. Test
     /// failures themselves are unaffected: they surface through the test runner and
     /// through each test's own `std.debug.print`, neither of which goes through here.
     ///

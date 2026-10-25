@@ -212,7 +212,7 @@ test "parseToolCallsForRequest coerces args to the schema (server-side chokepoin
 }
 
 test "parseToolCallsForRequest hoists a misplaced required param (server-side chokepoint wiring)" {
-    // Live 2026-07-13 pi session, gemma-4-26B-A4B: the model buried `path` inside
+    // Live pi session, gemma-4-26B-A4B: the model buried `path` inside
     // each edits[] item and emitted none at the top level, so pi rejected three
     // consecutive multi-thousand-token generations with
     //   Validation failed for tool "edit": - path: must have required properties path
@@ -289,7 +289,7 @@ test "parseToolCallsForRequest: --no-tool-autocorrect leaves args verbatim" {
 }
 
 test "parseToolCallsForRequest: truncated DATA object is not promoted to a tool call (George Washington class)" {
-    // Live pi capture 2026-07-13 (Qwen3.6-35B-A3B distilled): generation hit
+    // Live pi capture (Qwen3.6-35B-A3B distilled): generation hit
     // max_tokens midway through a presidents data script. The raw-JSON fallback
     // found the first balanced object — {"name": "George Washington", "num": 1,
     // …} — and the flat-shape synthesis promoted it to a TOOL CALL named
@@ -491,7 +491,7 @@ test "toolCallFinishReason preserves truncation over parsed tool calls" {
     // "length" — clients key their truncation recovery (chunk-and-retry
     // nudges) on it. Reporting "tool_calls" hides the cut: the client
     // executes a half-argument call and tells the model IT made a mistake.
-    // Live capture 2026-07-03: Qwen3.6-27B 33KB writeFile guillotined by the
+    // Live capture Qwen3.6-27B 33KB writeFile guillotined by the
     // 300s default timeout arrived as {"path":...} with finish "tool_calls".
     try std.testing.expectEqualStrings("length", toolCallFinishReason("length"));
     // Everything else stays the normal tool-call finish.

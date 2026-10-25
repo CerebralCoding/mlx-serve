@@ -1,4 +1,4 @@
-//! engines/mlx/spec/trunk_hooks, split out of engines/mlx/transformer.zig (P1, moves only).
+//! engines/mlx/spec/trunk_hooks.
 //! Owns lmHeadForDraft, tileLaneWeights, specTreeSupported, lmHeadRowsForDraft.
 
 const std = @import("std");

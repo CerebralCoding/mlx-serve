@@ -1,4 +1,4 @@
-//! sdk/blocks/gdn/decode_fused, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/blocks/gdn/decode_fused.
 //! Owns GDN_KERNEL_HEADER, GDN_PREWORK_SOURCE, gdn_prework_kernel, gdn_prework_engaged, gdn_prework_override, gdn_prework_env, and 41 more.
 
 const std = @import("std");

@@ -75,7 +75,7 @@ pub fn splitThinkBlockKeepingMarkup(text: []const u8, thinking: bool, opened_by_
         // Strip the content channel tag: <|channel>\n or <|channel>. A
         // re-opened THOUGHT channel (`<|channel>thought…`) is NOT a content
         // opener — stripping its `<|channel>` prefix here left a bare "thought"
-        // in visible content (2026-06-19 live); leave it for stripTrailingThinkOpen.
+        // in visible content ( live); leave it for stripTrailingThinkOpen.
         if (std.mem.startsWith(u8, content, "<|channel>\n")) {
             content = content[11..];
         } else if (std.mem.startsWith(u8, content, "<|channel>") and !std.mem.startsWith(u8, content, "<|channel>thought")) {
@@ -362,7 +362,7 @@ test "splitThinkBlock strips think prefix in thinking mode" {
 }
 
 test "splitThinkBlock: Inkling message channels (thinking + text + truncation)" {
-    // Real REAP25 captures (2026-07-30): the model emits role-less MESSAGES —
+    // Real REAP25 captures: the model emits role-less MESSAGES —
     // a thinking message, then a fresh <|message_model|> text message — not a
     // tag pair. Channel markers must never leak into content or reasoning.
     {
@@ -464,7 +464,7 @@ test "splitThinkBlock truncated mid-thinking does not leak channel tag" {
     // Truncation regression: the model emitted the Gemma 4 *content* channel
     // opener (`<|channel>\n…`) directly — no thought block and no `<channel|>`
     // close — then hit the output cap. The raw `<|channel>` control tag must
-    // never reach visible content (it used to leak straight through).
+    // never reach visible content.
     {
         const r = splitThinkBlock("<|channel>\nThe answer is 42.", true, false);
         try testing.expect(r.reasoning_content == null);
@@ -521,7 +521,7 @@ test "split content: trailing unclosed thought opener does not leak" {
 }
 
 test "in-thought tool markup never rides out as reasoning" {
-    // Live 2026-08-01 (DeepSeek-V4-Flash-0731 agent session): the model
+    // Live (DeepSeek-V4-Flash-0731 agent session): the model
     // emitted a complete DSML call INSIDE its think block, closed the block,
     // then issued a different call in content. parseToolCalls works on the
     // post-think text, so the in-thought call is deliberately skipped — but
@@ -542,7 +542,7 @@ test "in-thought tool markup never rides out as reasoning" {
 }
 
 test "splitThinkBlock re-opened thought opener right after close does not leak" {
-    // 2026-06-19 live regression (gemma-4): the model closed its thought
+    // live regression (gemma-4): the model closed its thought
     // channel and IMMEDIATELY re-opened a fresh one with nothing between, then
     // the turn ended. The leading-strip consumed the first closed block,
     // leaving the bare re-opened opener at pos 0 of the remainder — it must
@@ -596,7 +596,7 @@ test "split content: trailing </think> close spam never leaks" {
 }
 
 test "split content: orphan Gemma <tool_call|> close never leaks (no-tag-leak)" {
-    // Live 2026-07-16 soak (gemma-4-26B-A4B-it-qat-4bit, tools present, a "no
+    // Live soak (gemma-4-26B-A4B-it-qat-4bit, tools present, a "no
     // tools needed" probe at temp 0.7): the model degenerated into a bare
     // 1-token <tool_call|> CLOSE with NO <|tool_call> opener, so parseToolCalls
     // found no call and the orphan control token leaked as the ENTIRE visible

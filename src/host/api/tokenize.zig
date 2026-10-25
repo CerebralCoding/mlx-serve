@@ -127,7 +127,7 @@ pub fn handleDetokenize(
 ///
 /// This handler used to hand-roll a five-character escape table and pass every
 /// other byte through raw, so any token whose bytes are below 0x20 produced a
-/// body no JSON parser accepts — found live 2026-08-04 detokenizing single ids
+/// body no JSON parser accepts — found live detokenizing single ids
 /// while cross-checking a vocabulary. Same class as the control-byte rule on
 /// the chat render path: a decoded token is arbitrary bytes, so it goes through
 /// `appendJsonString`, never a local switch.
@@ -182,7 +182,7 @@ test "detokenizeResponseJson escapes arbitrary token bytes (control-byte class)"
     // A decoded token is arbitrary bytes. The old hand-rolled escaper covered
     // five characters and passed everything else through, so a single id whose
     // bytes are below 0x20 shipped a body no JSON parser accepts — live
-    // 2026-08-04 while cross-checking a vocabulary id by id.
+    // while cross-checking a vocabulary id by id.
     const nasty = "a\x01b\x1fc\"d\\e\nf\tg";
     const out = try detokenizeResponseJson(allocator, nasty);
     defer allocator.free(out);

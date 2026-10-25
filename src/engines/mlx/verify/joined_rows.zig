@@ -1,4 +1,4 @@
-//! engines/mlx/verify/joined_rows, split out of engines/mlx/transformer.zig (P1, moves only).
+//! engines/mlx/verify/joined_rows.
 //! Owns AttnVerifyInputs, VerifyRowsKind, verifyRowsJoined, attnVerifyRows, GdnVerifyInputs, gdnVerifyRows.
 
 const mlx = @import("../../../mlx/ffi.zig");

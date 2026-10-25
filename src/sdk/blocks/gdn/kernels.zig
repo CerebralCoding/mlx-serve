@@ -1,4 +1,4 @@
-//! sdk/blocks/gdn/kernels, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/blocks/gdn/kernels.
 //! Owns gdnKernelSource, GdnOpsResult, gdnRecurOps, GDN_CUDA_HEADER, gdnCudaSource, getGdnCudaKernel, and 41 more.
 
 const std = @import("std");

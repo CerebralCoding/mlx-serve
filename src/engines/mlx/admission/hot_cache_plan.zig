@@ -84,7 +84,7 @@ pub fn effectiveSsmCheckpointStride(stride: u32, cache_capacity: u32, ram_enable
 /// leave under the GPU ceiling after the serving context's KV and the prefill
 /// transient reserve. A 40 GB `--prefix-cache-mem` beside a ~70 GB pack was
 /// never validated against this headroom: the cache filled toward its cap and
-/// a 143k prefill died in an uncatchable Metal OOM (2026-08-30, Flash-Next on
+/// a 143k prefill died in an uncatchable Metal OOM (Flash-Next on
 /// 128 GB). `requested == 0` (byte cap disabled) is bounded too — an uncapped
 /// cache beside a large model is exactly that crash. Never returns 0:
 /// `initWithMem` reads 0 as "no byte cap", the opposite of no headroom.

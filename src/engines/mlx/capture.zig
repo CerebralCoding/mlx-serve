@@ -1,4 +1,4 @@
-//! engines/mlx/capture, split out of engines/mlx/transformer.zig (P1, moves only).
+//! engines/mlx/capture.
 //! Owns forwardCaptureHidden, forwardWithCapture, forwardWithCaptureAll, captureHidden.
 
 const std = @import("std");

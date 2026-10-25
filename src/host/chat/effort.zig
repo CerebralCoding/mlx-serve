@@ -17,7 +17,7 @@ const appendJsonString = @import("../../sdk/util/json_text.zig").appendJsonStrin
 /// word: the budget only truncates what the client is shown, so the two
 /// levers fight — pi asking for `medium` on Qwen3.8 got the model's default
 /// (unguided, long) thinking AND a 2048-token display cut, then 25.9k tokens
-/// of invisible generation (live 2026-08-14). An explicit
+/// of invisible generation. An explicit
 /// `reasoning_budget_tokens` or `--reasoning-budget` is someone asking for a
 /// cap on purpose and still applies.
 ///
@@ -81,7 +81,7 @@ fn qwen38EffortFor(effort: ?[]const u8, enable_thinking: bool) []const u8 {
     // defaults to xhigh, whose preamble asks the model to validate assumptions
     // and consider alternatives, and nothing bounds the result: a pi agent turn
     // that sent no effort ran 16803 reasoning tokens before the client gave up
-    // (live 2026-08-14). The server-side `reasoning_effort` budget is NOT the
+    // The server-side `reasoning_effort` budget is NOT the
     // answer to that — it truncates rather than shortens, and on exhaustion the
     // model is still inside its block, so the rest of the thought streams as
     // CONTENT. Low is the only lever that makes the model itself stop early

@@ -1,4 +1,4 @@
-//! engines/mlx/load/weights, split out of engines/mlx/transformer.zig (P1, moves only).
+//! engines/mlx/load/weights.
 //! Owns structFields, transposeBf16WeightPub, transposeBf16Weight, depthwiseConvNeedsTranspose, depthwise_conv_layout_logged, maybeTransposeDepthwiseConv, and 41 more.
 
 const std = @import("std");

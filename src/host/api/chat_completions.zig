@@ -762,7 +762,7 @@ pub fn handleChatCompletions(
                 enable_drafter = false;
             }
         }
-        // NOTE (2026-07-13): the old heavy-echo MTP->PLD routing (score >=
+        // NOTE: the old heavy-echo MTP->PLD routing (score >=
         // 0.13 disabled MTP) was RETIRED with the verify-qmm kernels + EV
         // depth. The prompt-time n-gram score cannot separate "output will
         // echo verbatim" (PLD excels: 83 vs 75 tok/s live) from

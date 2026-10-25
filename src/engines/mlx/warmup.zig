@@ -1,4 +1,4 @@
-//! engines/mlx/warmup, split out of engines/mlx/transformer.zig (P1, moves only).
+//! engines/mlx/warmup.
 //! Owns warmup.
 
 const mlx = @import("../../mlx/ffi.zig");

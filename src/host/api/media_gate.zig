@@ -28,7 +28,7 @@ pub const TextGenTarget = struct {
 };
 
 /// Reason a text-generation route must reject this model with a 400, or
-/// null when it can serve text. Crash class (live SIGSEGV 2026-07-06): a
+/// null when it can serve text. Crash class (live SIGSEGV): a
 /// chat request routed at a media model has only the gen stub CPU state —
 /// the empty stub tokenizer produced 0 prompt tokens and prefill deref'd
 /// `transformer == null`, killing the whole server from one request (any

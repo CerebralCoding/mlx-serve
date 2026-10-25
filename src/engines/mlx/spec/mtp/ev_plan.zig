@@ -356,7 +356,7 @@ pub fn mtpEvPlanSrc(a: []const f32, cap_in: u32, src: MtpCostSource, m_lo_max: u
         m_hi += 1;
     }
     if (m_hi == m_lo) {
-        // Exploration valve for the horizon itself (2026-07-22): the
+        // Exploration valve for the horizon itself: the
         // index one past m_lo is observable ONLY when extension fires —
         // at m_lo-deep rounds a[m_lo] never updates — so an EMA dragged
         // cold under an earlier workload (or an easier tau regime)

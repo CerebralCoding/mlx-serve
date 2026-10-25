@@ -1,4 +1,4 @@
-//! engines/mlx/batched/row_axis_verify, split out of engines/mlx/transformer.zig (P1, moves only).
+//! engines/mlx/batched/row_axis_verify.
 //! Owns VerifyLaps, VerifyRollback, forwardRowAxisVerify, verifyLaps, takeJoinedVerifyLogits, expectRowsByteEqual, and 9 more.
 
 const std = @import("std");

@@ -8,7 +8,7 @@ const mtp_mod = @import("../../../../sdk/spec/mtp/mtp.zig");
 /// floor + round eval/read + commit ≈ 1.0 ≈ 32 ms on the 27B since the
 /// deferred history append). Ratios are machine-stable where absolute ms
 /// are not. Refit via diag mtp-trace on Qwen3.6-27B GDN (M4 Max,
-/// 2026-07-13, saturated fixed depths, same-session sweep AFTER the
+/// saturated fixed depths, same-session sweep AFTER the
 /// deferred-append round shape landed): T(1)=42.0, T(3)=62.6,
 /// T(6)=111.6, T(7)=114.9 ms — the surface is PIECEWISE: ~10.3 ms
 /// marginal per position in the flat verify region (seq <= 4), ~16.3
@@ -56,7 +56,7 @@ pub const MtpEvCosts = struct {
     /// allocating a 32k KV cache purely to time it.
     kv_ms_per_token: f32 = 0,
 };
-/// 2026-08-15 refit #4, AFTER the hd-256 causal sdpa split
+/// refit #4, AFTER the hd-256 causal sdpa split
 /// (`splitCausalSdpa` — dense verify q 6..9 now rides the vector path,
 /// invalidating the ramp the old hi partially priced): same-session
 /// saturated ECHO sweep, Jundot oQ4e 27B @8K cold reps
@@ -71,12 +71,12 @@ pub const MtpEvCosts = struct {
 /// tables below predate the sdpa split — refit them on an M5 when one
 /// is available. draft/verify split not separately identifiable; only
 /// the sums enter the controller.
-/// (Refit #3, 2026-07-22, post round-pipelining, for the record:
+/// (Refit #3, post round-pipelining, for the record:
 /// T(1)=45.4, T(2)=53.3 → .10/.10/.24@3/.01 on a ~37.9 ms floor.
-/// Refit #2, 2026-07-13, post-verify-qmm: T(1)=44.6, T(3)=54.4,
+/// Refit #2, post-verify-qmm: T(1)=44.6, T(3)=54.4,
 /// T(6)=89.9 → .06/.06/.24/.02 on a ~40 ms floor.)
 pub const MTP_EV_DEFAULT_COSTS: MtpEvCosts = .{ .draft = 0.10, .per_pos_lo = 0.10, .per_pos_hi = 0.26, .flat_max = 4, .sync = 0.01, .nax_from = 7, .per_pos_nax = 0.52 };
-/// M5 Max/G17 refit (2026-07-17), same-session saturated fixed-depth
+/// M5 Max/G17 refit, same-session saturated fixed-depth
 /// sweep after the NAX m16 verify lane landed: T(1..4) ~= 41.35 ms,
 /// T(6)=62.15 ms, T(8)=68.39 ms. In floor units this identifies
 /// draft+hi ~= .21 and draft+nax ~= .10; T(8)/T(6) is reproduced by
@@ -94,7 +94,7 @@ pub const MTP_EV_G17_NAX_COSTS: MtpEvCosts = .{
     .nax_from = 7,
     .per_pos_nax = 0.04,
 };
-/// M5 Max/G17 affine-4/gs-32 sidecar refit (2026-07-18). A saturated
+/// M5 Max/G17 affine-4/gs-32 sidecar refit. A saturated
 /// fixed-depth sweep gave T(1)=36.04, T(3)=43.01, T(6)=62.56, and
 /// T(8)=66.06 ms. The fitted composite marginals (`draft + verify`) are
 /// .107/.200/.054; depths 4 and 5 independently validate the rounded
@@ -109,7 +109,7 @@ pub const MTP_EV_G17_NAX_Q4_GS32_COSTS: MtpEvCosts = .{
     .nax_from = 7,
     .per_pos_nax = 0.02,
 };
-/// M5 Max/G17 uniform affine-4/gs-64 Qwen3.8-27B refit (2026-08-16).
+/// M5 Max/G17 uniform affine-4/gs-64 Qwen3.8-27B refit.
 /// Temperature-gated, reversed two-pass saturated echo gave T(1)=
 /// 33.61-33.91, T(3)=38.455-38.465, T(6)=56.555-57.000, and NAX T(8)=
 /// 61.890-61.925 ms/round. NAX-off T(8)=88.535-88.610 while depth-6
@@ -125,7 +125,7 @@ pub const MTP_EV_G17_NAX_Q4_GS64_COSTS: MtpEvCosts = .{
     .nax_from = 7,
     .per_pos_nax = 0.06,
 };
-/// M5 Max/G17 uniform affine-6/gs-64 Qwen3.8-27B refit (2026-08-17).
+/// M5 Max/G17 uniform affine-6/gs-64 Qwen3.8-27B refit.
 /// Temperature-gated, six-pass counterbalanced calibration gave median
 /// traced T(1)=44.98, T(3)=49.895, T(6)=64.495, and NAX T(8)=76.79
 /// ms/round. A 42.52 ms fitted floor yields rounded composite marginals
@@ -140,7 +140,7 @@ pub const MTP_EV_G17_NAX_Q6_GS64_COSTS: MtpEvCosts = .{
     .nax_from = 7,
     .per_pos_nax = 0.125,
 };
-/// M5 Max/G17 uniform affine-8/gs-64 Qwen3.8-27B refit (2026-08-17).
+/// M5 Max/G17 uniform affine-8/gs-64 Qwen3.8-27B refit.
 /// Five settled counterbalanced pairs found the q8-specific NAX takeover
 /// at verify M=7: depth 6 rose from 73.42 to 77.89 tok/s (+6.09%), while
 /// M=6 was -1.14%. Median traced NAX T(6)=85.94 ms and T(8)=90.68 ms over
@@ -158,7 +158,7 @@ pub const MTP_EV_G17_NAX_Q8_GS64_COSTS: MtpEvCosts = .{
     .nax_from = 7,
     .per_pos_nax = 0.04,
 };
-/// M5 Max/G17 oQ4e mixed affine q4/q5/q6, gs64 refit (2026-07-23).
+/// M5 Max/G17 oQ4e mixed affine q4/q5/q6, gs64 refit.
 /// Saturated deterministic echo, same-session fixed widths:
 /// T(1)=34.37, T(3)=40.31, T(6)=61.20, T(8)=62.79 ms/round.
 /// Normalizing the inferred 31.40 ms floor gives composite marginals
@@ -175,7 +175,7 @@ pub const MTP_EV_G17_NAX_OQ4E_Q4_GS64_COSTS: MtpEvCosts = .{
     .per_pos_nax = 0.005,
 };
 /// qwen4_exp (Qwen3.8-Flash-Next 125B-A6B) on G17, M5 Max 40-core refit
-/// (2026-08-27/28). Fitted at ~8.5k context like every prior surface
+/// (/28). Fitted at ~8.5k context like every prior surface
 /// (a short-context fit planned too shallow at 8.5k, measured -4% —
 /// every constant this controller ever shipped was fitted at ONE
 /// context length, and 8K is the house one). Forced-depth saturated
@@ -210,7 +210,7 @@ pub const MTP_EV_G17_NAX_QWEN4_Q4_GS64_COSTS: MtpEvCosts = .{
     .per_pos_nax = 0.325,
 };
 
-/// 2026-09-13 M5 Max mixed4/8 refit after the single-stream verifier
+/// M5 Max mixed4/8 refit after the single-stream verifier
 /// fast paths. Affine8 target/head KV, 3-bit draft shortlist, ~8.6k
 /// context; forced depths {1,2,3,4,5,6,8}, three echo repetitions in
 /// each of two reversed boot orders. Median full-round EMAs (ms):

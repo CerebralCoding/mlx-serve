@@ -1,4 +1,4 @@
-//! engines/mlx/spec/mtp_nax_profile, split out of engines/mlx/transformer.zig (P1, moves only).
+//! engines/mlx/spec/mtp_nax_profile.
 //! Owns MtpNaxProfileInputs, mtpNaxBf16EmbeddingMatchesFrom, mtpNaxBf16EmbeddingMatches, mtpNaxCalibratedModelFrom, mtpNaxProfileEnabledFrom, mtpNaxAffineProjectionMatchesQuant, and 20 more.
 
 const std = @import("std");

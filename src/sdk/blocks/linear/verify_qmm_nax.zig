@@ -1,4 +1,4 @@
-//! sdk/blocks/linear/verify_qmm_nax, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/blocks/linear/verify_qmm_nax.
 //! Owns vqmm_nax_avail_cache, verifyQmmNaxAvailable, vqmm_tile_cache, verifyQmmTile, vqmm_nax_env_cache, naxLaneEnvEnabled, and 19 more.
 
 const std = @import("std");

@@ -1,4 +1,4 @@
-//! sdk/diag/standin, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/diag/standin.
 //! Owns Standin, standin_cached, qwen4_standin_override, qwen4Standin, standin_ones, standinOnes, and 1 more.
 
 const std = @import("std");

@@ -1,4 +1,4 @@
-//! sdk/quant/ternary, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/quant/ternary.
 //! Owns biasNegScalePeak, firstRowExactMiss, ternaryKernelCandidate, firstNonTernaryBias.
 
 const std = @import("std");

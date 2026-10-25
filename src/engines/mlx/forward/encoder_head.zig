@@ -1,4 +1,4 @@
-//! engines/mlx/forward/encoder_head, split out of engines/mlx/transformer.zig (P1, moves only).
+//! engines/mlx/forward/encoder_head.
 //! Owns forwardEmbedding, forwardEmbeddingMasked, hasEmbedProjection, embedProjection.
 
 const mlx = @import("../../../mlx/ffi.zig");

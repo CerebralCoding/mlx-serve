@@ -166,7 +166,7 @@ test "a tool marker split across tokens is only visible once concatenated" {
     // The streaming tools flush holds a tail that looked like a tool call and
     // ships it when nothing parses. DSV4 spells the DSML marker as `<` then
     // `｜DSML｜` (two tokens), so a per-token filter sees neither piece as a
-    // marker and both went out as visible content (live 2026-08-01). The
+    // marker and both went out as visible content. The
     // flush concatenates first for exactly this reason.
     const pieces = [_][]const u8{ "My name is", "<", "｜DSML｜", "\n" };
     var joined: [64]u8 = undefined;

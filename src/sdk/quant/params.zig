@@ -1,4 +1,4 @@
-//! sdk/quant/params, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/quant/params.
 //! Owns BITS_CACHE_CAP, QuantParams, QuantParamsCache, BitsCache, quantParamsOrDense, affineParamsFromGeometry, and 4 more.
 
 const std = @import("std");

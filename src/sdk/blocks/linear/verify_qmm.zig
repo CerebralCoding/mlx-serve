@@ -1,4 +1,4 @@
-//! sdk/blocks/linear/verify_qmm, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/blocks/linear/verify_qmm.
 //! Owns vqmmAccLines, vqmmColumnLoad, vqmmColumnChain, verifyQmmSource, verifyQmmMsgSource, vqmmMsgBn, and 63 more.
 
 const std = @import("std");
@@ -340,7 +340,7 @@ var vqmm_scalar_tick: u64 = 0;
 /// in one `inputs_arr`. With the cache full, the K call evicts slot 0 and lands
 /// there; the N call then frees slot 0 again — which is now K's array — so the
 /// caller carried a dangling handle into `mlx_vector_array_new_data`. Observed
-/// live 2026-08-07 on a 40-layer qwen3_5_moe (GatedDeltaNet + MoE + a 248k
+/// live on a 40-layer qwen3_5_moe (GatedDeltaNet + MoE + a 248k
 /// vocab: enough distinct (K, N) pairs to overflow 16 slots) as SIGBUS building
 /// the vector and SIGSEGV freeing it — one request killed the server, and the
 /// surfaces probed after it all read as 0%.

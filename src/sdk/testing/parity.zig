@@ -1,4 +1,4 @@
-//! sdk/testing/parity, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/testing/parity.
 //! Owns hostF32, rmsVsTruth, testReadF32, jsonF64, jsonToMlxArray, maxAbsDiffF32, decidedMisses, and 12 more.
 
 const std = @import("std");

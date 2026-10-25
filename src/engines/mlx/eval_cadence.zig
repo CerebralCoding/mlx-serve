@@ -1,4 +1,4 @@
-//! engines/mlx/eval_cadence, split out of engines/mlx/transformer.zig (P1, moves only).
+//! engines/mlx/eval_cadence.
 //! Owns EVAL_EVERY_N_LAYERS, PREFILL_EVAL_CADENCE_DEFAULT, MOE_EVAL_EVERY_N_LAYERS, RECURRENCE_EVAL_INTERVAL, PREFILL_EVAL_TRANSIENT_BUDGET, PREFILL_EVAL_MIN_SEQ, and 8 more.
 
 const std = @import("std");
@@ -85,7 +85,7 @@ pub fn evalCadencePoint(h: mlx.mlx_array, ssm_entries: ?[]SSMCacheEntry) !void {
 
 // A PREFILL-side async-eval ladder (mlxfast-challenge prefillLadder:
 // asyncEval every 3rd-4th layer at seq >= 512) was ported and measured
-// 2026-08-16 (qwen3.8-27B-4bit, 43.7k-token prompt, M4 Max): off 227.9
+// (qwen3.8-27B-4bit, 43.7k-token prompt, M4 Max): off 227.9
 // vs ladder 225.9 tok/s median — null-to-negative, same reason the
 // decode ladder loses here: chunked prefill + the eval cadence already
 // collect the overlap. Removed rather than shipped as a dead knob.

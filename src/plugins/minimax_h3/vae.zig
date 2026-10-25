@@ -2039,7 +2039,7 @@ test "minimax h3 vae live: the Latent2RGB preview resembles the decoded frame" {
     // numbers are the assertion: an absolute bar alone passes on a metric any
     // linear map clears, a relative one alone passes on two bad maps, and full
     // RGB alone is mostly luminance — which is the half a hue wheel gets free.
-    // Measured 2026-08-30 (FL2VA 8-bit, M-series): fit 0.740 / chroma 0.880,
+    // Measured (FL2VA 8-bit, M-series): fit 0.740 / chroma 0.880,
     // control 0.029 / 0.042. The absolute floors are sanity bounds; the CONTROL
     // margin is the discriminator, and it sits near 0.7 with the bar at 0.3.
     try testing.expect(corr_fit > 0.6);

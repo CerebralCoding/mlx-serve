@@ -407,7 +407,7 @@ fn isIndividualDigitsRule(node: std.json.Value) bool {
 /// Llama-3 family ships ONE combined pattern whose signature is the attached
 /// contraction group PLUS the {1,3} digit rule — the exact-match digit
 /// detection alone misses it because `\p{N}{1,3}` is an alternation branch,
-/// not the whole regex (live 2026-08-10: "84" served per-digit, the model
+/// not the whole regex (live: "84" served per-digit, the model
 /// echoed "8 4" — the DSV4 echo-precision class on a new spelling).
 pub fn pretokStyleFromPreTokenizer(pt: std.json.Value) PretokStyle {
     if (pt != .object) return .gpt2;

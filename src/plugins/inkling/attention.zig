@@ -12,7 +12,7 @@ const inklingRouterChain = @import("moe.zig").inklingRouterChain;
 
 // ── Inkling (inkling_mm_model) forward helpers ──
 // Reference: the checkpoint's bundled inkling_mlx/ package (Apache-2.0,
-// parity-validated vs transformers PR #47347). Dtype discipline mirrors the
+// parity-validated vs transformers). Dtype discipline mirrors the
 // reference EXACTLY: the residual stream runs in the checkpoint's dtype (bf16
 // on the shipped builds — the dense mlp.global_scale tensors are STORED bf16,
 // so no promotion), while the short convs, the router chain and the rel-bias

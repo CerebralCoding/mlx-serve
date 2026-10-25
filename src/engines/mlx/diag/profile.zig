@@ -1,4 +1,4 @@
-//! engines/mlx/diag/profile, split out of engines/mlx/transformer.zig (P1, moves only).
+//! engines/mlx/diag/profile.
 //! Owns debugTraceHead, DecodeProf, layer_cap_env, layerCap, decode_prof, decode_prof_enabled, and 5 more.
 
 const std = @import("std");

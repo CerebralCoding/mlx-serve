@@ -1851,7 +1851,7 @@ pub const Engine = struct {
     /// Phone jetsam ceilings: load the 1.2 GB bf16 text encoder per request
     /// (freed after conditioning) and decode the VAE in small windows. The
     /// 4-bit model + resident TE + decode peak got the app SIGKILLed on an
-    /// 8 GB iPhone 16 Pro (2026-07-06).
+    /// 8 GB iPhone 16 Pro.
     low_mem: bool,
 
     /// ANE MLP offload (`--ane-audio`), built once the run's token
@@ -3044,7 +3044,7 @@ test "acestep chunked VAE encode matches the untiled pass on a multi-window clip
 // hints [1,10,2048] + codebook indices [1,10]. The bar is NEAR-TIE acquittal
 // (the MTP rule): a code may differ from the fp32 reference ONLY on a grid
 // dimension whose reference pre-quantization value sits within 0.05 cells of
-// a floor boundary. Measured 2026-08-22: dense-bf16 FSQ weights + f32
+// a floor boundary. Dense-bf16 FSQ weights + f32
 // activations are EXACT (0/10, max |Δz| 2e-5); the 8-bit pack moves z by up
 // to 0.039 and flips 3/10 codes, all at ≤ 0.012 cells. A wrong grid formula
 // (the hard clamp without the soft clamp) or a wrong RoPE/mask/window layout

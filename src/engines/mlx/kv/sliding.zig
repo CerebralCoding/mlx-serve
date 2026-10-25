@@ -1,4 +1,4 @@
-//! engines/mlx/kv/sliding, split out of engines/mlx/transformer.zig (P1, moves only).
+//! engines/mlx/kv/sliding.
 //! Owns SLIDING_TRIM_UNBOUNDED, slidingTailSpan, sliding_block_trim_cached, slidingBlockTrimEnabled, sliding_block_trim_logged, sliding_ring_off_for_test, and 1 more.
 
 const std = @import("std");

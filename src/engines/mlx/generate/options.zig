@@ -67,7 +67,7 @@ pub const InitOptions = struct {
     /// the pin is written to the registry's config after load — the copy
     /// never sees it. The scheduler reads `slot.model.config`, which IS the
     /// object the admission guard bills against, so bill and forward cannot
-    /// disagree. (Live 2026-08-14: pinned 4096, prefilled at 8192.)
+    /// disagree. (Pinned 4096, prefilled at 8192.)
     pinned_prefill_chunk: usize = 0,
     /// `--prefill-decode-share` width while someone decodes, 0 = none. Applied after
     /// `effectivePrefillChunk`, so it narrows an explicit or env width too: the

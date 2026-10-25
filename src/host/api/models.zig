@@ -107,7 +107,7 @@ const ReadyCaps = struct {
 /// header still serves chat via fallback formatting, and gating on the
 /// template made a loaded DSV4-Flash advertise capabilities:[] — LAN clients
 /// hid the peer's model as "no chat models" while chatting on it (live
-/// 2026-07-21). The unloaded GGUF stub path already advertises the chat set
+/// ). The unloaded GGUF stub path already advertises the chat set
 /// unconditionally; loaded must never advertise less than its stub.
 fn readyHasChat(is_encoder_only: bool, chat_template_len: usize, has_embedded_lm: bool) bool {
     if (is_encoder_only) return false;
@@ -574,7 +574,7 @@ fn appendAliasedRow(allocator: std.mem.Allocator, out: *std.ArrayList(u8), row: 
 /// recognize a fetch that landed on ITSELF: a stale Bonjour record of a
 /// former self (same name + port, different TXT token) walks through the
 /// resolve-time TXT check, and the loopback-first fetch would install our
-/// own models as a "peer" (live self-mirror after a restart, 2026-07-21).
+/// own models as a "peer" (live self-mirror after a restart).
 fn sendModelsResponse(stream: *Conn, body: []const u8) !void {
     logHttpResponse("200 OK", "application/json", body);
     const l = http_server.g_lan orelse return sendResponseFramed(stream, "200 OK", "application/json", body);
@@ -659,7 +659,7 @@ pub fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, reques
     // Parse the model field with std.json (NOT the quick scanner): clients
     // like Swift's JSONSerialization legally escape '/' as '\/', and the raw
     // scanner slice would read "\/Users\/…" — missing the absolute-path
-    // branch below and 404ing on the mangled id (live failure 2026-06-12).
+    // branch below and 404ing on the mangled id (live failure).
     var requested_id: []const u8 = "";
     // `"default": true` — promote the loaded model to the server default
     // (requests that omit `model` / the "mlx-serve" alias, and /v1/models'
@@ -1102,7 +1102,7 @@ test "readyCapsJson: every resident media engine surfaces its capability (mesh -
 
     // A ready 3D shape model (no chat template, no encoder) must advertise
     // "3d" — the stub path already did; the READY path shipped without the
-    // mesh arm and rendered [] (live 2026-07-04, test_3d_gen.sh check 1).
+    // mesh arm and rendered [] (live, test_3d_gen.sh check 1).
     var mesh = try readyCapsJson(a, .{ .has_mesh_engine = true });
     defer mesh.deinit(a);
     try std.testing.expectEqualStrings("[\"3d\"]", mesh.items);
@@ -1138,7 +1138,7 @@ test "readyHasChat: embedded-engine GGUF without a chat template still advertise
     // Encoder-only never chats, template or not.
     try t.expect(!readyHasChat(true, 1234, false));
     try t.expect(!readyHasChat(true, 0, true));
-    // The live bug (2026-07-21): a loaded DSV4-Flash GGUF ships no
+    // The live bug: a loaded DSV4-Flash GGUF ships no
     // chat_template in its header (fallback formatting serves chat fine), but
     // the ready path gated "chat" on template presence — the peer advertised
     // capabilities:[] and LAN clients hid the model ("No models yet" in the

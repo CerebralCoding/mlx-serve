@@ -1,4 +1,4 @@
-//! sdk/blocks/moe/experts, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/blocks/moe/experts.
 //! Owns gatherExpertMm.
 
 const std = @import("std");

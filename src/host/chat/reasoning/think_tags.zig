@@ -18,7 +18,7 @@ const nextThinkOpen = @import("split.zig").nextThinkOpen;
 /// reported too: callers (the split arms / stripTrailingThinkOpen) strip
 /// their leading CLOSED block first, so an unclosed opener at the start of the
 /// remainder is a genuine dangling re-open (`…<channel|>\n<|channel>thought\n`,
-/// 2026-06-19 live) — excluding it leaked the bare opener into content.
+/// live) — excluding it leaked the bare opener into content.
 const TrailingThinkOpen = struct { pos: usize, after: usize };
 pub fn lastUnclosedThinkOpen(text: []const u8) ?TrailingThinkOpen {
     var from: usize = 0;
@@ -197,7 +197,7 @@ fn endsWithThinkOpenTag(text: []const u8) ?usize {
 /// `<channel|>` after its answer; the leading strip cuts the FIRST close, the
 /// trailing-OPEN strip ignores closes, so they leaked). The Gemma tool CLOSE
 /// `<tool_call|>` is here too: a degenerate 1-token bare close with no
-/// `<|tool_call>` opener leaked as the entire content (live 2026-07-16 soak,
+/// `<|tool_call>` opener leaked as the entire content (live soak,
 /// gemma-4-26B). parseToolCalls runs BEFORE this strip and extracts any real
 /// call, so any residual `<tool_call|>` reaching here is orphan by construction.
 /// Loops so a run of closers is fully removed. Returns a prefix slice (no alloc).

@@ -519,7 +519,7 @@ test "composed quantAttention is correct on STRIDED cache views" {
     // are non-contiguous whenever buffer capacity > logical length. Covers
     // multi-row widths, the gemma E4B live geometry (single 15-token chunk,
     // hd 256, 4-bit — the "<pad><pad>" shape), and the sliding "array" mask.
-    // (Serving only routes t_q == 1 here since 2026-08-15, but the helper's
+    // (Serving only routes t_q == 1 here , but the helper's
     // contract is width-agnostic and the strided-view class is the point.)
     try composedStridedCase(8, 2, 64, 4, 20, 4, "causal");
     try composedStridedCase(8, 2, 256, 4, 0, 15, "causal");
@@ -660,7 +660,7 @@ test "kvAttnFusedEligible: fused reads are decode-width (t_q == 1) only" {
     // The ONE gate every fused call site reads. Verify widths (T_q 2..32
     // under MTP/spec) used to be admitted and fell to the composed qmm
     // chain — a deliberate choice that predates deep-MTP defaults and was
-    // never A/B'd at spec depth. Measured (M4 Max, 2026-08-15, 8k+ ctx,
+    // never A/B'd at spec depth. Measured (M4 Max, 8k+ ctx,
     // deep MTP rounds): 28 tok/s decode vs 60 on the dense read — the
     // composed chain runs 2 packed matmuls x every attention layer per spec
     // round, at qmm's M 2..7 dead zone. Decode width keeps the packed-read

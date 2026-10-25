@@ -1,4 +1,4 @@
-//! sdk/blocks/attention/batched, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/blocks/attention/batched.
 //! Owns BATCHED_PER_SLOT_ATTN_MIN_KV, batchedAttnPerSlot.
 
 const mlx = @import("../../../mlx/ffi.zig");

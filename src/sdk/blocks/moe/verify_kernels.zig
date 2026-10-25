@@ -1,4 +1,4 @@
-//! sdk/blocks/moe/verify_kernels, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/blocks/moe/verify_kernels.
 //! Owns VERIFY_EXPERT_REUSE_SOURCE, verify_expert_reuse_kernel, and the other verify-row MoE kernels.
 
 const std = @import("std");

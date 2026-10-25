@@ -36,7 +36,7 @@ pub const KVQuantConfig = kv_quant.KVQuantConfig;
 /// already expects.
 pub const WeightField = struct { name: [:0]const u8, type: type };
 
-// ── declarations split out by meaning (P1); aliases keep every call site unchanged ──
+// ── declarations by meaning; aliases keep every call site unchanged ──
 // engines/mlx/load/weights.zig
 pub const transposeBf16WeightPub = @import("load/weights.zig").transposeBf16WeightPub;
 pub const depthwiseConvNeedsTranspose = @import("load/weights.zig").depthwiseConvNeedsTranspose;
@@ -543,7 +543,7 @@ pub const Transformer = struct {
     // the homogeneous profile because its measured NAX cost surface differs.
     mtp_oqe_affine_trunk: bool = false,
 
-    // ── methods split out by meaning (P1); aliases keep `x.method(...)` call syntax ──
+    // ── methods by meaning; aliases keep `x.method(...)` call syntax ──
     // sdk/blocks/linear/verify_projection.zig
     pub const verifyFeatureEnabled = @import("methods/verify_projection.zig").verifyFeatureEnabled;
     pub const mtpProjectionRows = @import("methods/verify_projection.zig").mtpProjectionRows;

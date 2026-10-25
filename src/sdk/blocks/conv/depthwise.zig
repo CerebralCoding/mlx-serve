@@ -1,4 +1,4 @@
-//! sdk/blocks/conv/depthwise, split out of engines/mlx/transformer.zig (P1, moves only).
+//! sdk/blocks/conv/depthwise.
 //! Owns depthwiseConvStep, DWCONV_CUDA_SOURCE, dwconv_cuda_kernel, depthwiseConvCuda.
 
 const std = @import("std");

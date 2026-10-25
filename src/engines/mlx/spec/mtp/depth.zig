@@ -37,7 +37,7 @@ pub const MTP_DEMOTE_BELOW: f32 = 0.40; // per-draft rate at depth > 1 → step 
 pub const MTP_PROMOTE_ABOVE: f32 = 0.60; // per-draft rate below configured depth → step up
 // Disable floor = the MEASURED depth-1 breakeven plus margin, not a
 // quality judgment: a d1 round costs ~AR+6 ms (44 vs 38.4 ms at 8K on
-// the 27B, mtp-trace 2026-07-22) and yields (1+p) tokens, so speculation
+// the 27B, mtp-trace) and yields (1+p) tokens, so speculation
 // pays down to p ≈ 0.15 — at p=0.45 it is +27% over AR. The old 0.50
 // floor sticky-disabled mid-request on the oQ4e head at long context
 // (window rate dips 0.45-0.55) and cratered 16K/32K ladder decode to
@@ -87,7 +87,7 @@ pub fn mtpDraftTempFor(config: *const model_mod.ModelConfig) f32 {
 /// Draft-proposal sampler for a round: greedy targets keep greedy drafts
 /// (temp-0 identity contract); stochastic targets draft from the fixed
 /// sharpened distribution unless greedy is forced. The constants are not
-/// tunable: swept 2026-08-04 on the oQ4e head (prose@0.6, forced depth 3,
+/// tunable: swept on the oQ4e head (prose@0.6, forced depth 3,
 /// sampled drafts) at draft temp 0.6/0.7/0.85/1.0 and per-draft
 /// acceptance was flat at 49.7-56.9% — no arm beat 0.6.
 pub fn mtpDraftSamplingFor(target: SamplingParams, force_greedy: bool, draft_temp: f32) SamplingParams {
