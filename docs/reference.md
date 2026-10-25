@@ -1,3 +1,6 @@
+> Written before the big-bang rewrite: file names and paths describe the old flat `src/`. Where this page and a
+> folder's `AGENTS.md` disagree, the `AGENTS.md` is right.
+
 # mlx-serve reference
 
 Verbatim deep detail: per-file contracts, subsystem designs, API surfaces. Root AGENTS.md holds the compressed operational summary; read the relevant section here BEFORE deep work on that subsystem. New subsystem detail goes here, with a one-line summary in root.
