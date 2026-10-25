@@ -29,6 +29,12 @@ pub const Known = error{
     NotEmbeddingModel,
     NoVisionEncoder,
     Timeout,
+    EmbedFailed,
+    VisionEncodeFailed,
+    ModelNotReady,
+    SlotFailed,
+    Open,
+    VideoUnsupported,
     EngineFailed,
 };
 
