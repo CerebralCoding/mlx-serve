@@ -2,7 +2,7 @@ const std = @import("std");
 const crt = @import("../../sdk/util/crt.zig");
 const builtin = @import("builtin");
 const plugin_driver = @import("plugin/driver.zig");
-const mlx_stream_mod = if (@import("build_options").mlx_stream) @import("modules/stream_glue.zig") else @import("modules/stream_stub.zig");
+const mlx_stream_mod = @import("modules/stream.zig");
 const distributed_mod = @import("cluster/distributed.zig");
 // The qwen4_exp MTP head shares the sidecar head's draft-rerank scheme
 // (`mtp.rerankSelect` + `QLinear`), which reads only the TARGET's lm_head and

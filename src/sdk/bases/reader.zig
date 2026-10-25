@@ -102,7 +102,8 @@ pub const Reader = struct {
 
     /// The projection (or bank) `base` through the pack's quant format (`in_dim` pins its quant params), unowned.
     pub fn proj(r: *Reader, base: []const u8, in_dim: u32) !Linear {
-        if (r.fmt == &gguf_format.table) return r.ggufProj(base, in_dim);
+        // By name: under `-Dunits` another unit may hand over its own copy of the table.
+        if (std.mem.eql(u8, r.fmt.name.slice(), gguf_format.table.name.slice())) return r.ggufProj(base, in_dim);
         var w: quant_abi.Weight = .{};
         const v = r.fmt.load_tensor(&r.qctx, abi.Str.of(base), in_dim, &w);
         if (!v.isOk()) return if (std.mem.eql(u8, v.why.slice(), "MissingWeight")) error.MissingWeight else error.QuantFormatRefused;

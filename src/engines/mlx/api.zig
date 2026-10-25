@@ -14,7 +14,7 @@ const model_state = @import("runtime/model_state.zig");
 const distributed = @import("cluster/distributed.zig");
 const request_policy = @import("request_policy.zig");
 const configure_mod = @import("configure.zig");
-const mlx_stream = if (@import("build_options").mlx_stream) @import("modules/stream_glue.zig") else @import("modules/stream_stub.zig");
+const mlx_stream = @import("modules/stream.zig");
 const Scheduler = scheduler.Scheduler;
 const Slot = scheduler.Slot;
 
@@ -70,7 +70,7 @@ comptime {
 }
 
 fn clusterWorker(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) ?[]const u8 {
-    distributed.cmdWorker(io, gpa, args) catch |e| return @errorName(e);
+    @import("modules/call.zig").call("cluster_worker", .{ io, gpa, args }) catch |e| return @errorName(e);
     return null;
 }
 

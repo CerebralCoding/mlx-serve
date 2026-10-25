@@ -13,7 +13,7 @@ const prefill_interleave = @import("prefill_interleave.zig");
 const distributed = @import("cluster/distributed.zig");
 const sleep_inhibit = @import("runtime/sleep_inhibit.zig");
 const depth_bounds = @import("spec/mtp_depth_bounds.zig");
-const mlx_stream = if (@import("build_options").mlx_stream) @import("modules/stream_glue.zig") else @import("modules/stream_stub.zig");
+const mlx_stream = @import("modules/stream.zig");
 
 pub fn settings(out: *host.Settings) void {
     out.* = .{

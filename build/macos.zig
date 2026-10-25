@@ -187,7 +187,7 @@ pub fn addServer(g: *const Graph, plugin_names: []const []const u8) void {
     // `-Dunits`: each plugin is an object of its own, compiled in parallel with the host and linked in.
     const units_step = b.step("units", "Compile every unit (-Dunits: host, engine, plugin groups) without linking");
     // Every unit compiles its own copy of the globals it reaches: scripts/unit_globals.py fails on one in a plugin unit
-    // or in both the host and the engine that is not `Shared` (names survive in a Debug build only).
+    // or in two of the host, the engine and the module archs that is not `Shared` (names survive in a Debug build only).
     const units_check = b.step("units-check", "Check no unit holds a copy of another's state (-Dunits, Debug)");
     const check_run = b.addSystemCommand(&.{ "python3", "scripts/unit_globals.py" });
     check_run.has_side_effects = true;
@@ -200,11 +200,14 @@ pub fn addServer(g: *const Graph, plugin_names: []const []const u8) void {
         mod.addObject(host_obj);
         units_step.dependOn(&b.addInstallFile(host_obj.getEmittedBin(), "units/host.o").step);
         check_run.addFileArg(host_obj.getEmittedBin());
-        // The MLX engine: the host reaches it only through its exported table (`host/engines/mlx.zig`).
-        const engine_obj = b.addObject(.{ .name = "engine-mlx", .root_module = unitModule(g, unit_includes, "src/engine_unit.zig") });
-        mod.addObject(engine_obj);
-        units_step.dependOn(&b.addInstallFile(engine_obj.getEmittedBin(), "units/engine-mlx.o").step);
-        check_run.addFileArg(engine_obj.getEmittedBin());
+        // The MLX engine (the host reaches it only through its table, `host/engines/mlx.zig`), and the module archs it
+        // calls through tables (`engines/mlx/modules/split.zig`).
+        for ([_][2][]const u8{ .{ "engine-mlx", "src/engine_unit.zig" }, .{ "engine-modules", "src/modules_unit.zig" } }) |u| {
+            const obj = b.addObject(.{ .name = u[0], .root_module = unitModule(g, unit_includes, u[1]) });
+            mod.addObject(obj);
+            units_step.dependOn(&b.addInstallFile(obj.getEmittedBin(), b.fmt("units/{s}.o", .{u[0]})).step);
+            check_run.addFileArg(obj.getEmittedBin());
+        }
         mod.root_source_file = b.path("src/exe.zig");
         // Plugins dealt round-robin into `unit-groups` objects: each compiles the shared code it reaches once, so fewer
         // groups cost less CPU, more groups more parallelism.

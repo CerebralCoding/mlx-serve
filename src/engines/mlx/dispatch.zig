@@ -2,7 +2,7 @@
 //! Owns defaultCtx, module_owned_state_fields, module_shared_readonly_fields, ownsModuleDecodeState, sharesModuleReadonlyState, moduleSpecWiring, and 7 more.
 
 const std = @import("std");
-const mlx_stream_mod = if (@import("build_options").mlx_stream) @import("modules/stream_glue.zig") else @import("modules/stream_stub.zig");
+const mlx_stream_mod = @import("modules/stream.zig");
 const distributed_mod = @import("cluster/distributed.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const abi = @import("../../abi/plugin.zig");

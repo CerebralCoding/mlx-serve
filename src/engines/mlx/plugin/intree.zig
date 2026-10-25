@@ -38,13 +38,19 @@ const v41plugin = @import("../../../plugins/deepseek_v41/plugin.zig");
 /// The DeepSeek-V4 module of the served plugin behind `xfm`; null for any other model.
 pub fn dsv4(xfm: *const Transformer) ?*v4plugin.Module {
     const b = xfm.plugin orelse return null;
-    return if (b.table == &v4plugin.table) v4plugin.moduleOf(b.model) else null;
+    return if (served(b.table, @import("../../../plugins/deepseek_v4/config.zig").plugin.name)) v4plugin.moduleOf(b.model) else null;
 }
 
 /// The DeepSeek-V4.1 module of the served plugin behind `xfm`; null for any other model.
 pub fn dsv41(xfm: *const Transformer) ?*v41plugin.Module {
     const b = xfm.plugin orelse return null;
-    return if (b.table == &v41plugin.table) v41plugin.moduleOf(b.model) else null;
+    return if (served(b.table, @import("../../../plugins/deepseek_v41/config.zig").plugin.name)) v41plugin.moduleOf(b.model) else null;
+}
+
+/// Whether `table` is the plugin named `name`. By name: under `-Dunits` the served table is the plugin unit's export,
+/// and this unit's copy of it sits at another address.
+fn served(table: *const abi.ModelTable, name: []const u8) bool {
+    return std.mem.eql(u8, table.name.slice(), name);
 }
 
 // ── qwen4_exp ──
@@ -60,7 +66,7 @@ pub fn dsv41(xfm: *const Transformer) ?*v41plugin.Module {
 // keeps the legacy path, `declines`).
 
 fn isQwen4(table: *const abi.ModelTable) bool {
-    return table.load == qwen4.table.load;
+    return served(table, @import("../../../plugins/qwen4_exp/config.zig").plugin.name);
 }
 
 /// qwen4_exp builds its own MXFP8 head (`lm_head_mxfp8`, its default on for a quantized pack on an integrated CUDA

@@ -310,7 +310,8 @@ pub fn moeMLP2WithRouter(self: *Transformer, router_x: mlx.mlx_array, expert_x_i
             .down = .{ .trellis = mw.switch_down_w, .suh = mw.switch_down_s, .svh = mw.switch_down_b },
         };
         const clamp = swigluClampLimit(cfg.swiglu_limit, cfg.swiglu_clamp) orelse return error.Exl3SwigluLimitUnsupported;
-        const y = try exl3.routed(self.s, expert_x, bank, inds, norm_scores, spec, .{ .limit = @intCast(clamp), .verify_rows = skip_shared and router_override != null });
+        const opts: exl3.Routed = .{ .limit = @intCast(clamp), .verify_rows = skip_shared and router_override != null };
+        const y = try @import("../modules/call.zig").call("exl3_routed", .{ self.s, expert_x, bank, inds, norm_scores, spec, opts });
         if (skip_shared) return y;
         if (mw.shared_ungated) return self.moeAddUngatedShared(y, expert_x, mw);
         if (mw.shared_expert_gate_w == null or qwen4Standin().moe_shared) return y;

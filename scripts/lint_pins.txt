@@ -83,7 +83,7 @@ src/plugins/qwen4_exp/mtp.zig	!.cache = try 	a live KV cache re-inits through KV
 src/sdk/blocks/attention/kv_quant_attn_test.zig	fn composedStridedCase(	composed quantized-KV attention is a parity reference only; serving arms are kernel or dense
 # Load.
 src/engines/mlx/load.zig	effectivePrefillChunk(	the ANE build resolves its tile through effectivePrefillChunk, never the bare pin
-src/engines/mlx/load.zig	qwen4BuildDraftRerank()	the qwen4 coarse rerank head is built at load, gated on mtp_enabled
+src/engines/mlx/load.zig	modules.call("qwen4_build_draft_rerank"	the qwen4 coarse rerank head is built at load, gated on mtp_enabled
 src/engines/mlx/runtime/*.zig	doLoadOnInferenceThread(sch, params)	the boot load goes through the one Transformer construction site
 src/engines/mlx/runtime/*.zig	doLoadOnInferenceThread(sch, req)	the cold load goes through the one Transformer construction site
 # Prefill, scheduler, spec wiring.

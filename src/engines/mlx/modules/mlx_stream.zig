@@ -2,7 +2,7 @@
 //! Owns forwardMlxStream, initMlxStream.
 
 const std = @import("std");
-const mlx_stream_mod = if (@import("build_options").mlx_stream) @import("stream_glue.zig") else @import("stream_stub.zig");
+const mlx_stream_mod = @import("stream.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const ModelConfig = @import("../../../sdk/config/model.zig").ModelConfig;
 const ForwardCtx = @import("../forward_ctx.zig").ForwardCtx;
