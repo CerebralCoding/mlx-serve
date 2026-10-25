@@ -7,17 +7,15 @@ const build_options = @import("build_options");
 const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 const mlx = @import("../../mlx/ffi.zig");
-const model = @import("../../engines/mlx/model.zig");
 const dsv41 = @import("deepseek_v41.zig");
 const vision = @import("vision.zig");
 const media = @import("media.zig");
 const bill_mod = @import("bill.zig");
 const fixture = @import("../deepseek_v4/fixture.zig");
 const v4plugin = @import("../deepseek_v4/plugin.zig");
-const toModelConfig = @import("../deepseek_v4/model_config.zig").toModelConfig;
 const quant_abi = @import("../../abi/quant.zig");
-const intree = @import("../../engines/mlx/plugin/intree.zig");
-const distributed = @import("../../engines/mlx/cluster/distributed.zig");
+const Resident = @import("../../sdk/weights/resident.zig").Resident;
+const Weights = @import("../../sdk/weights/resident.zig").Weights;
 const Layout = @import("../../sdk/quant/native.zig").Layout;
 const streamed = @import("../../sdk/weights/streamed.zig");
 pub const config = @import("config.zig");
@@ -73,8 +71,8 @@ pub fn moduleOf(mp: *anyopaque) *Module {
 }
 
 pub const Model = struct {
-    cfg: model.ModelConfig,
-    weights: model.Weights,
+    cfg: config.Config,
+    weights: Weights,
     mdl: *dsv41.Dsv41Model,
     tower: ?vision.Dsv41Vision,
     caps: abi.Caps,
@@ -110,7 +108,7 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     };
     return loadModel(ctx, s) catch |e| {
         std.log.err("deepseek_v41: load failed: {t}", .{e});
-        out.* = switch (e) {
+        out.* = switch (@as(anyerror, e)) {
             error.OutOfMemory => Verdict.refuse(.failed, "deepseek_v41: out of memory"),
             error.MissingWeight => Verdict.refuse(.failed, "deepseek_v41: a weight is missing"),
             error.StreamedWeightsUnsupported => Verdict.refuse(.unsupported, "deepseek_v41: a streamed (experts.bin) pack needs the macOS build's expert streamer"),
@@ -141,21 +139,16 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     const c = config.of(ctx.parsed);
     const m = try gpa.create(Model);
     errdefer gpa.destroy(m);
-    m.cfg = try toModelConfig(gpa, c, ctx.model_dir.slice());
-    errdefer m.cfg.deinit(gpa);
-    m.cfg.mtp_override = mtpSetting(ctx.settings_json.slice());
+    m.cfg = c.*;
     // The driver's map never holds the vision tower (the engine's encoder reads it and hands its rows to `forward`).
-    const taken = intree.takeWeights(ctx);
-    m.weights = taken orelse try model.loadModelWeights(io, gpa, ctx.model_dir.slice(), &m.cfg, c.dsv41_vision);
+    const taken = if (ctx.weights) |w| Resident.take(w) else null;
+    m.weights = taken orelse try dsv41.loadPack(io, gpa, ctx.model_dir.slice(), c.dsv41_vision);
     errdefer m.weights.deinit();
-    // The driver's load planned a Thunderbolt pair on the engine's config (`model.loadModelWeights`): the same plan.
-    if (taken != null) if (try distributed.planFor(ctx.model_dir.slice(), &m.cfg)) |part| switch (part) {
-        .remote => |r| m.cfg.dist_dsv41 = .{ .lo = r.start, .hi = r.end, .worker = false },
-        .span, .shard => {},
-    };
+    // The worker's layers when the driver's load planned a Thunderbolt pair.
+    const pair: ?dsv41.Pair = if (ctx.pair_remote.count > 0) .{ .lo = ctx.pair_remote.first, .hi = ctx.pair_remote.first + ctx.pair_remote.count, .worker = false } else null;
     m.s = s;
     m.caps = ctx.parsed.caps;
-    m.mdl = try dsv41.init(gpa, &m.cfg, &m.weights, s, .{ .dspark = dsv41.dsparkWanted(&m.cfg), .pair = m.cfg.dist_dsv41, .head_8bit = dsv41.head8Wanted(), .streamed_experts = c.dsv41_streamed });
+    m.mdl = try dsv41.init(gpa, &m.cfg, &m.weights, s, .{ .dspark = dsv41.dsparkWanted(&m.cfg, pair, mtpSetting(ctx.settings_json.slice())), .pair = pair, .head_8bit = dsv41.head8Wanted(), .streamed_experts = c.dsv41_streamed, .pack_dir = ctx.model_dir.slice() });
     errdefer m.mdl.deinit();
     m.bank = null;
     if (c.dsv41_streamed) try openBank(m, io, ctx.model_dir.slice(), ctxSetting(ctx.settings_json.slice()));
@@ -212,7 +205,6 @@ fn unload(mp: *anyopaque) callconv(.c) void {
     if (m.tower) |*t| t.deinit();
     m.mdl.deinit();
     m.weights.deinit();
-    m.cfg.deinit(gpa);
     gpa.destroy(m);
 }
 
@@ -300,10 +292,7 @@ pub fn stateBytes(mp: *anyopaque) callconv(.c) u64 {
 /// The load reads its Engram tables from disk per lookup and drops the tensors it never loads
 /// (`dsv41.residentDiskBytes`); the `mtp` setting decides the DSpark stages.
 fn residentBytes(p: *const abi.Parsed, model_dir: abi.Str, settings_json: abi.Str, shards: u64, out: *u64) callconv(.c) Verdict {
-    var mc = toModelConfig(gpa, config.of(p), null) catch |e| return Verdict.named(.failed, @errorName(e));
-    defer mc.deinit(gpa);
-    mc.mtp_override = mtpSetting(settings_json.slice());
-    out.* = dsv41.residentDiskBytes(gpa, model_dir.slice(), &mc, shards) catch |e| return Verdict.named(.failed, @errorName(e));
+    out.* = dsv41.residentDiskBytes(gpa, model_dir.slice(), config.of(p), mtpSetting(settings_json.slice()), shards) catch |e| return Verdict.named(.failed, @errorName(e));
     return .ok;
 }
 
@@ -365,5 +354,4 @@ test {
     _ = bill_mod;
     _ = media;
     _ = @import("contract.zig");
-    _ = intree;
 }

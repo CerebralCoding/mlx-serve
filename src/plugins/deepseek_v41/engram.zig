@@ -5,7 +5,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const crt = @import("../../sdk/util/crt.zig");
 const mlx = @import("../../mlx/ffi.zig");
-const model = @import("../../engines/mlx/model.zig");
+const Config = @import("config.zig").Config;
+const weights_load = @import("../../sdk/weights/load.zig");
+const QuantMode = @import("../../sdk/quant/params.zig").QuantMode;
 const qwen4_ple = @import("../qwen4_exp/ple_table.zig");
 
 pub const MAX_LAYERS = 4;
@@ -118,7 +120,7 @@ pub const Hash = struct {
 
     /// `pad` is the compressed id of the config's pad token. Refuses a config
     /// whose prime buckets do not add up to its declared table rows.
-    pub fn init(cfg: *const model.ModelConfig, pad: u32) !Hash {
+    pub fn init(cfg: *const Config, pad: u32) !Hash {
         const n_layers = cfg.dsv41_n_engram_layers;
         var h: Hash = .{ .n_layers = n_layers, .max_ngram = cfg.dsv41_engram_max_ngram, .heads = cfg.dsv41_engram_n_heads, .pad = pad };
         if (n_layers > MAX_LAYERS or h.max_ngram < 2 or h.max_ngram > MAX_NGRAM or h.heads == 0 or h.heads > MAX_HEADS) return error.EngramGeometry;
@@ -238,7 +240,7 @@ pub const Table = struct {
     fd: c_int,
     rows: u64,
     head_dim: u32,
-    mode: model.QuantMode,
+    mode: QuantMode,
     bits: u32,
     group_size: u32,
     w_off: u64,
@@ -298,7 +300,7 @@ pub const Table = struct {
         var file: ?[]const u8 = null;
         for ([_][]const u8{ "weight", "scales", "biases" }, 0..) |part, i| {
             names[i] = try std.fmt.allocPrint(a, "layers.{d}.engram.embed.{s}", .{ layer, part });
-            if (wm.object.get(names[i]) == null) names[i] = try std.fmt.allocPrint(a, "{s}{s}", .{ model.dsv41_text_prefix, names[i] });
+            if (wm.object.get(names[i]) == null) names[i] = try std.fmt.allocPrint(a, "{s}{s}", .{ weights_load.dsv41_text_prefix, names[i] });
             const f = wm.object.get(names[i]) orelse return error.EngramTableMissing;
             if (f != .string or std.mem.indexOfAny(u8, f.string, "/\\") != null) return error.EngramTableMissing;
             if (file) |prev| if (!std.mem.eql(u8, prev, f.string)) return error.EngramTableSplit;
@@ -351,7 +353,7 @@ pub const Table = struct {
         const fmt = (if (cfg == .object) cfg.object.get("omlx_deepseek_v41") else null) orelse return null;
         const tables = (if (fmt == .object) fmt.object.get("engram_tables") else null) orelse return null;
         if (tables != .object) return null;
-        const name = try std.fmt.allocPrint(a, "{s}layers.{d}.engram.embed", .{ model.dsv41_text_prefix, layer });
+        const name = try std.fmt.allocPrint(a, "{s}layers.{d}.engram.embed", .{ weights_load.dsv41_text_prefix, layer });
         const v = tables.object.get(name) orelse return null;
         const spec = std.json.parseFromValueLeaky(Spec, a, v, .{ .ignore_unknown_fields = true }) catch return error.EngramTableHeader;
         if (spec.bits != null) return null; // a requantized table rides the index arm
@@ -630,8 +632,8 @@ fn openAt(a: std.mem.Allocator, dir_path: []const u8, name: []const u8) !c_int {
 
 const testing = std.testing;
 
-fn releaseConfig() model.ModelConfig {
-    var cfg: model.ModelConfig = .{};
+fn releaseConfig() Config {
+    var cfg: Config = .{};
     cfg.model_type = "deepseek_v41";
     cfg.dsv41_n_engram_layers = 2;
     cfg.dsv41_engram_layers[0] = 1;
@@ -726,7 +728,7 @@ test "dsv41 engram: a table nested under language_model. (oMLX's packs) opens li
     const io = std.Io.Threaded.global_single_threaded.io();
     var td = testing.tmpDir(.{});
     defer td.cleanup();
-    try writeAffineFixture(io, td.dir, model.dsv41_text_prefix);
+    try writeAffineFixture(io, td.dir, weights_load.dsv41_text_prefix);
     var buf: [512]u8 = undefined;
     var t = try Table.open(testing.allocator, buf[0..try td.dir.realPath(io, &buf)], 0, 1, 4, 64);
     defer t.close();

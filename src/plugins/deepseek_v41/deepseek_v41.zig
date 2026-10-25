@@ -13,8 +13,8 @@ const std = @import("std");
 const env = @import("../../env.zig");
 const kernelSource = @import("../../mlx/kernels.zig").source;
 const mlx = @import("../../mlx/ffi.zig");
-const model = @import("../../engines/mlx/model.zig");
-const transformer = @import("../../engines/mlx/transformer.zig");
+const resident = @import("../../sdk/weights/resident.zig");
+const weights_load = @import("../../sdk/weights/load.zig");
 const embedding = @import("../../sdk/blocks/embedding.zig");
 const verify_qmm_nax = @import("../../sdk/blocks/linear/verify_qmm_nax.zig");
 const gather_qmv = @import("../../sdk/blocks/moe/gather_qmv.zig");
@@ -30,7 +30,8 @@ const streamed = @import("../../sdk/weights/streamed.zig");
 
 const A = mlx.mlx_array;
 const S = mlx.mlx_stream;
-const ModelConfig = model.ModelConfig;
+const Config = @import("config.zig").Config;
+const Weights = resident.Weights;
 pub const QuantParams = params.QuantParams;
 const none: A = .{ .ctx = null };
 
@@ -341,7 +342,7 @@ const Rope = struct { fwd: A, inv: A };
 pub const Dsv41Model = struct {
     gpa: std.mem.Allocator,
     s: S,
-    cfg: ModelConfig,
+    cfg: Config,
     act: mlx.mlx_dtype,
     embed: Lin,
     head: Lin,
@@ -533,7 +534,7 @@ pub const Dsv41Model = struct {
 /// CED (the tech report's causal encoder-decoder): the decoder's first layer, when the layout has one. Every layer from
 /// the last KV source on reads ratio-1 rows, so a prefill chunk runs them over its last `sliding_window` rows only.
 /// Engram layers must sit in the encoder and the DSpark targets in the decoder, where the rows they read exist.
-pub fn cedSplit(c: *const ModelConfig) ?usize {
+pub fn cedSplit(c: *const Config) ?usize {
     if (!c.has_sliding_window or c.sliding_window == 0 or c.dsv41_kv_sources == 0) return null;
     const n: usize = c.num_hidden_layers;
     const split: usize = 63 - @clz(c.dsv41_kv_sources);
@@ -594,7 +595,7 @@ const Trace = struct {
     }
 };
 
-fn getW(w: *const model.Weights, comptime fmt: []const u8, args: anytype) !A {
+fn getW(w: *const Weights, comptime fmt: []const u8, args: anytype) !A {
     var buf: NameBuf = undefined;
     const name = std.fmt.bufPrint(&buf, fmt, args) catch return error.NameTooLong;
     return w.get(name) orelse {
@@ -603,13 +604,13 @@ fn getW(w: *const model.Weights, comptime fmt: []const u8, args: anytype) !A {
     };
 }
 
-fn getOpt(w: *const model.Weights, comptime fmt: []const u8, args: anytype) ?A {
+fn getOpt(w: *const Weights, comptime fmt: []const u8, args: anytype) ?A {
     var buf: NameBuf = undefined;
     const name = std.fmt.bufPrint(&buf, fmt, args) catch return null;
     return w.get(name);
 }
 
-fn getLin(w: *const model.Weights, in_dim: usize, comptime base: []const u8, args: anytype) !Lin {
+fn getLin(w: *const Weights, in_dim: usize, comptime base: []const u8, args: anytype) !Lin {
     const wt = try getW(w, base ++ ".weight", args);
     const sc = getOpt(w, base ++ ".scales", args) orelse return .{ .w = wt };
     const bi = getOpt(w, base ++ ".biases", args) orelse none;
@@ -655,7 +656,7 @@ fn exactMxfp8(s: S, w: A) !?[2]A {
 }
 
 /// `l` (dense) as affine `bits` over groups of `gs`, the dense weight released.
-fn quantizeLin(m: *Dsv41Model, w: *model.Weights, l: Lin, bits: u32, gs: u32) !Lin {
+fn quantizeLin(m: *Dsv41Model, w: *Weights, l: Lin, bits: u32, gs: u32) !Lin {
     var qv = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(qv);
     try mlx.check(mlx.mlx_quantize(&qv, l.w, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(bits)), "affine", none, m.s));
@@ -691,7 +692,7 @@ fn ownReshape(m: *Dsv41Model, x: A, shape: []const c_int) !A {
     return o;
 }
 
-fn loadHc(m: *Dsv41Model, w: *const model.Weights, comptime pfx: []const u8, li: usize, comptime which: []const u8) !Hc {
+fn loadHc(m: *Dsv41Model, w: *const Weights, comptime pfx: []const u8, li: usize, comptime which: []const u8) !Hc {
     const hc = m.cfg.dsv4_hc_mult;
     const scale = try ownCast(m, try getW(w, pfx ++ ".{d}.hc_" ++ which ++ "_scale", .{li}), .float32);
     var ids: [64]i32 = undefined;
@@ -714,7 +715,7 @@ fn loadHc(m: *Dsv41Model, w: *const model.Weights, comptime pfx: []const u8, li:
 /// tensors stacked here.
 /// `a` and `b` (same quantized format) as one array of their rows stacked
 /// along `axis`; the originals released (owned, or the weights map's).
-fn fuseRows(m: *Dsv41Model, w: *model.Weights, a: Lin, b: Lin, axis: c_int) !?Lin {
+fn fuseRows(m: *Dsv41Model, w: *Weights, a: Lin, b: Lin, axis: c_int) !?Lin {
     if (a.s.ctx == null or b.s.ctx == null or a.qp.bits != b.qp.bits or a.qp.group_size != b.qp.group_size or a.qp.mode != b.qp.mode or (a.b.ctx == null) != (b.b.ctx == null)) return null;
     var out: Lin = .{ .w = none, .qp = a.qp };
     inline for (.{ "w", "s", "b" }) |f| {
@@ -738,7 +739,7 @@ fn fuseRows(m: *Dsv41Model, w: *model.Weights, a: Lin, b: Lin, axis: c_int) !?Li
 /// `kv` and `gate` as `Comp.wkv` holds them above ratio 1: rows fused when the
 /// formats agree (affine scales and biases widened to f32; dense rows as
 /// stored, `denseF32x` reads them), else both dequantized to f32 rows.
-fn poolLin(m: *Dsv41Model, w: *model.Weights, kv: Lin, gate: Lin) !Lin {
+fn poolLin(m: *Dsv41Model, w: *Weights, kv: Lin, gate: Lin) !Lin {
     if (try fuseRows(m, w, kv, gate, 0)) |f| {
         var out = f;
         if (f.qp.mode == .affine) inline for (.{ "s", "b" }) |n| if (@field(f, n).ctx != null) {
@@ -784,7 +785,7 @@ fn evalOne(x: A) !A {
 }
 
 /// Free `x` wherever it is held: the model's owned list or the weights map.
-fn release(m: *Dsv41Model, w: *model.Weights, x: A) void {
+fn release(m: *Dsv41Model, w: *Weights, x: A) void {
     if (x.ctx == null) return;
     for (m.owned.items, 0..) |o, i| if (o.ctx == x.ctx) {
         _ = mlx.mlx_array_free(m.owned.swapRemove(i));
@@ -797,7 +798,7 @@ fn release(m: *Dsv41Model, w: *model.Weights, x: A) void {
     };
 }
 
-fn fuseExperts(m: *Dsv41Model, w: *model.Weights, e: Experts) !Experts {
+fn fuseExperts(m: *Dsv41Model, w: *Weights, e: Experts) !Experts {
     const g: Lin = .{ .w = e.gate.w, .s = e.gate.s, .b = e.gate.b, .qp = e.gate.qp };
     const u: Lin = .{ .w = e.up.w, .s = e.up.s, .b = e.up.b, .qp = e.up.qp };
     const f = (try fuseRows(m, w, g, u, 1)) orelse return e;
@@ -816,7 +817,7 @@ fn oneExpert(m: *Dsv41Model, b: Bank) !Bank {
     return out;
 }
 
-fn loadExperts(m: *Dsv41Model, w: *model.Weights, comptime pfx: []const u8, li: usize, n_experts: usize) !Experts {
+fn loadExperts(m: *Dsv41Model, w: *Weights, comptime pfx: []const u8, li: usize, n_experts: usize) !Experts {
     const d = m.cfg.hidden_size;
     const inter = m.cfg.moe_intermediate_size;
     if (getOpt(w, pfx ++ ".{d}.ffn.experts.gate_proj.weight", .{li}) != null) return .{
@@ -870,7 +871,7 @@ fn loadExperts(m: *Dsv41Model, w: *model.Weights, comptime pfx: []const u8, li: 
     return error.MissingWeight;
 }
 
-fn loadLayer(m: *Dsv41Model, w: *model.Weights, comptime pfx: []const u8, li: usize, trunk_li: ?usize) !Layer {
+fn loadLayer(m: *Dsv41Model, w: *Weights, comptime pfx: []const u8, li: usize, trunk_li: ?usize) !Layer {
     const c = &m.cfg;
     const d = c.hidden_size;
     const heads = c.num_attention_heads;
@@ -1202,7 +1203,7 @@ fn latestBit(mask: u64, l: usize) i64 {
 
 /// Whether a pair may cut the trunk before layer `x`: no compressed layer at or past it reads
 /// compressed rows, index picks or candidate blocks made below it.
-pub fn pairCutOk(c: *const ModelConfig, x: usize) bool {
+pub fn pairCutOk(c: anytype, x: usize) bool {
     const n = c.num_hidden_layers;
     if (x == 0 or x == n) return true;
     if (x > n) return false;
@@ -1215,14 +1216,14 @@ pub fn pairCutOk(c: *const ModelConfig, x: usize) bool {
     return true;
 }
 
-fn engramIn(c: *const ModelConfig, lo: usize, hi: usize) bool {
+fn engramIn(c: anytype, lo: usize, hi: usize) bool {
     for (c.dsv41_engram_layers[0..c.dsv41_n_engram_layers]) |l| if (l >= lo and l < hi) return true;
     return false;
 }
 
 /// The worker's layers: the longest valid run holding no Engram layer that stays within its
 /// share of the two Macs' free memory (`mine`, `theirs`, any unit), else the shortest one.
-pub fn pairRange(c: *const ModelConfig, mine: u64, theirs: u64) ?[2]usize {
+pub fn pairRange(c: anytype, mine: u64, theirs: u64) ?[2]usize {
     const n = c.num_hidden_layers;
     const share = @as(f64, @floatFromInt(n)) * @as(f64, @floatFromInt(theirs)) / @as(f64, @floatFromInt(@max(mine + theirs, 1)));
     var best: ?[2]usize = null;
@@ -1244,6 +1245,20 @@ pub fn pairRange(c: *const ModelConfig, mine: u64, theirs: u64) ?[2]usize {
     return best;
 }
 
+/// The pack's tensors as the engine's loader reads a V4.1 pack: the text prefix stripped, a tensor two shards carry
+/// from the shard the index names, the vision tower only on `vision`, the Engram projections kept beside its tables.
+pub fn loadPack(io: std.Io, gpa: std.mem.Allocator, dir: []const u8, vision: bool) !Weights {
+    var w = try weights_load.loadWeightsOpt(io, gpa, dir, .{ .vision = vision, .dsv41 = true, .index_owners = true });
+    errdefer w.deinit();
+    const path = try std.fmt.allocPrintSentinel(gpa, "{s}/engram/engram-residents.safetensors", .{dir}, 0);
+    defer gpa.free(path);
+    std.Io.Dir.accessAbsolute(io, path, .{}) catch return w;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    try weights_load.loadSafetensorsFile(gpa, &w, path, s, .{});
+    return w;
+}
+
 pub const InitOpts = struct {
     /// The activation dtype; tests run f32 against the f32 reference.
     act: mlx.mlx_dtype = .bfloat16,
@@ -1255,9 +1270,11 @@ pub const InitOpts = struct {
     head_8bit: bool = false,
     /// The routed experts stream from the pack's bank (`Dsv41Model.streamed`, bound after the load).
     streamed_experts: bool = false,
+    /// The pack's directory, where the Engram tables are read (a worker reads none).
+    pack_dir: ?[]const u8 = null,
 };
 
-pub fn init(gpa: std.mem.Allocator, cfg: *const ModelConfig, w: *model.Weights, s: S, opts: InitOpts) !*Dsv41Model {
+pub fn init(gpa: std.mem.Allocator, cfg: *const Config, w: *Weights, s: S, opts: InitOpts) !*Dsv41Model {
     const m = try gpa.create(Dsv41Model);
     errdefer gpa.destroy(m);
     const n_layers = cfg.num_hidden_layers;
@@ -1302,7 +1319,6 @@ pub fn init(gpa: std.mem.Allocator, cfg: *const ModelConfig, w: *model.Weights, 
         .moe_act_kernel = try buildKernel("dsv41_moe_act", &MOE_ACT_INS, &.{"out"}, MOE_ACT_SOURCE, ""),
         .moe_combine_kernel = try buildKernel("dsv41_moe_combine", &MOE_COMBINE_INS, &.{"out"}, MOE_COMBINE_SOURCE, ""),
     };
-    m.cfg.pack_dir = null; // borrowed; the caller's config owns it
     m.pair = opts.pair;
     m.streamed_experts = opts.streamed_experts;
     const worker = if (opts.pair) |p| p.worker else false;
@@ -1372,7 +1388,7 @@ pub fn init(gpa: std.mem.Allocator, cfg: *const ModelConfig, w: *model.Weights, 
         m.n_mtp = n_stages;
         m.ds_block = cfg.dsv4_dspark_block_size;
     }
-    if (!worker) if (cfg.pack_dir) |dir| try initEngram(m, w, dir);
+    if (!worker) if (opts.pack_dir) |dir| try initEngram(m, w, dir);
     {
         const k: usize = cfg.num_experts_per_tok;
         var ks: [64]u32 = undefined;
@@ -1436,7 +1452,7 @@ fn collectArrays(gpa: std.mem.Allocator, xs: *std.ArrayList(A), v: anytype) !voi
 /// stay live across layers, and one span at a time adds its gathered
 /// compressed rows, attention scores and an indexer score block, one MoE call its transients.
 /// State is the compressed caches per token plus the windows per layer.
-pub fn prefillBytes(config: *const ModelConfig, seq: u64, chunk: u64, floor: u64) u64 {
+pub fn prefillBytes(config: anytype, kv_per_token: u64, seq: u64, chunk: u64, floor: u64) u64 {
     const c: u64 = @min(chunk, @max(seq, 1));
     const span: u64 = @min(SPAN, c);
     const d: u64 = config.hidden_size;
@@ -1444,7 +1460,7 @@ pub fn prefillBytes(config: *const ModelConfig, seq: u64, chunk: u64, floor: u64
     const topk: u64 = config.dsv4_index_topk;
     const window: u64 = config.sliding_window;
     const cand_block: u64 = @max(config.dsv41_candidate_block_size, 1);
-    const state = seq * config.kvBytesPerToken() + config.num_hidden_layers * (window + 16) * hd * 2;
+    const state = seq * kv_per_token + config.num_hidden_layers * (window + 16) * hd * 2;
     const held = c * (2 * config.dsv4_hc_mult * d * 2 + topk * 4 + seq / cand_block + config.dsv4_n_dspark_target_layers * d * 2);
     // The chunk's query heads and attention heads (roped, gathered by `attnOut`) live for the layer.
     const proj = c * config.num_attention_heads * hd * 2 * 4;
@@ -1456,21 +1472,21 @@ pub fn prefillBytes(config: *const ModelConfig, seq: u64, chunk: u64, floor: u64
 
 /// The DSpark stages load when the pack ships them, unless `--no-mtp` or the model's `mtp` setting turn them off
 /// (`applyModelSettings` folds both into `mtp_override`); V4's `MLX_SERVE_DSV4_DSPARK` turns them on either way.
-pub fn dsparkWanted(cfg: *const ModelConfig) bool {
+pub fn dsparkWanted(cfg: *const Config, pair: ?Pair, mtp: ?bool) bool {
     // On a pair DSpark drafts on the host, from the target layers' rows: they must be its own.
-    if (cfg.dist_dsv41) |p| {
+    if (pair) |p| {
         if (p.worker) return false;
         for (cfg.dsv4_dspark_target_layers[0..cfg.dsv4_n_dspark_target_layers]) |t| if (t >= p.lo and t < p.hi) return false;
     }
     const ds = env.get(.MLX_SERVE_DSV4_DSPARK);
-    return (cfg.mtp_override orelse true) or (ds != null and ds.?[0] != '0');
+    return (mtp orelse true) or (ds != null and ds.?[0] != '0');
 }
 
 /// What a load holds of the pack: its safetensors bytes less the Engram tables it preads and the tensors it
 /// drops (the vision tower on a text load; the DSpark stages when they do not load; a tensor's copy in a shard the
 /// index does not name for it).
-pub fn residentDiskBytes(gpa: std.mem.Allocator, dir: []const u8, cfg: *const ModelConfig, shards: u64) !u64 {
-    var total = shards -| try droppedBytes(gpa, dir, dsparkWanted(cfg), cfg.has_vision);
+pub fn residentDiskBytes(gpa: std.mem.Allocator, dir: []const u8, cfg: *const Config, mtp: ?bool, shards: u64) !u64 {
+    var total = shards -| try droppedBytes(gpa, dir, dsparkWanted(cfg, null, mtp), cfg.has_vision);
     for (cfg.dsv41_engram_layers[0..cfg.dsv41_n_engram_layers], 0..) |l, k| {
         var t = try engram.Table.open(gpa, dir, k, l, cfg.dsv41_engram_rows[k], cfg.dsv41_engram_head_dim);
         defer t.close();
@@ -1507,10 +1523,10 @@ fn droppedBytes(gpa: std.mem.Allocator, dir_path: []const u8, dspark: bool, visi
         var it = h.object.iterator();
         while (it.next()) |e| {
             const key = e.key_ptr.*;
-            const bare = if (std.mem.startsWith(u8, key, model.dsv41_text_prefix)) key[model.dsv41_text_prefix.len..] else key;
+            const bare = if (std.mem.startsWith(u8, key, weights_load.dsv41_text_prefix)) key[weights_load.dsv41_text_prefix.len..] else key;
             const owner = wm.object.get(key);
             const foreign = owner != null and owner.? == .string and !std.mem.eql(u8, owner.?.string, name);
-            if (!foreign and (vision or !model.dsv41VisionKey(bare)) and (dspark or !std.mem.startsWith(u8, bare, "mtp."))) continue;
+            if (!foreign and (vision or !weights_load.dsv41VisionKey(bare)) and (dspark or !std.mem.startsWith(u8, bare, "mtp."))) continue;
             const off = (if (e.value_ptr.* == .object) e.value_ptr.object.get("data_offsets") else null) orelse continue;
             if (off != .array or off.array.items.len != 2 or off.array.items[0] != .integer or off.array.items[1] != .integer) continue;
             total += @intCast(@max(off.array.items[1].integer - off.array.items[0].integer, 0));
@@ -1521,7 +1537,7 @@ fn droppedBytes(gpa: std.mem.Allocator, dir_path: []const u8, dspark: bool, visi
 
 /// Engram for the pack in `dir`: the token map, the hash, and each layer's
 /// table and projections. Without Engram layers in the config this is a no-op.
-fn initEngram(m: *Dsv41Model, w: *const model.Weights, dir: []const u8) !void {
+fn initEngram(m: *Dsv41Model, w: *const Weights, dir: []const u8) !void {
     const c = &m.cfg;
     if (c.dsv41_n_engram_layers == 0) return;
     m.token_map = try engram.loadTokenMap(m.gpa, dir, c.vocab_size, c.dsv41_engram_compressed_vocab);
@@ -4207,9 +4223,10 @@ extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int
 /// to, and reads the switch once, at the process's first matmul: a full-suite
 /// run sets `MLX_ENABLE_TF32=0` itself. The reference is plain f32.
 const Tiny = struct {
-    cfg: ModelConfig,
-    w: model.Weights,
-    fx: model.Weights,
+    cfg: Config,
+    dir: []const u8,
+    w: Weights,
+    fx: Weights,
     m: *Dsv41Model,
 
     fn open(root: []const u8, pack: []const u8, fixture: []const u8) !Tiny {
@@ -4221,22 +4238,21 @@ const Tiny = struct {
         const gpa = testing.allocator;
         const io = std.Io.Threaded.global_single_threaded.io();
         const dir = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ root, pack });
-        defer gpa.free(dir);
-        var cfg = try model.parseConfig(io, gpa, dir);
-        errdefer cfg.deinit(gpa);
-        var w = try model.loadModelWeights(io, gpa, dir, &cfg, false);
+        errdefer gpa.free(dir);
+        const cfg = try testConfig(io, dir);
+        var w = try loadPack(io, gpa, dir, false);
         errdefer w.deinit();
-        var fx = try model.loadWeightsFile(gpa, dir, fixture);
+        var fx = try resident.loadWeightsFile(gpa, dir, fixture);
         errdefer fx.deinit();
-        const m = try init(gpa, &cfg, &w, mlx.gpuStream(), .{ .act = act, .dspark = true });
-        return .{ .cfg = cfg, .w = w, .fx = fx, .m = m };
+        const m = try init(gpa, &cfg, &w, mlx.gpuStream(), .{ .act = act, .dspark = true, .pack_dir = dir });
+        return .{ .cfg = cfg, .dir = dir, .w = w, .fx = fx, .m = m };
     }
 
     fn deinit(self: *Tiny) void {
         self.m.deinit();
         self.fx.deinit();
         self.w.deinit();
-        self.cfg.deinit(testing.allocator);
+        testing.allocator.free(self.dir);
     }
 
     fn host(self: *const Tiny, name: []const u8) ![]f32 {
@@ -4750,7 +4766,7 @@ test "dsv41 fixture: bf16 activations stay within bf16 noise before routing can 
 test "dsv41 fixture: the QAT round-trips are bit-exact with the reference's, midpoints included (DSV41_TINY)" {
     const root = std.mem.span(std.c.getenv("DSV41_TINY") orelse return error.SkipZigTest);
     const gpa = testing.allocator;
-    var fx = try model.loadWeightsFile(gpa, root, "qat.safetensors");
+    var fx = try resident.loadWeightsFile(gpa, root, "qat.safetensors");
     defer fx.deinit();
     var m: Dsv41Model = undefined;
     m.qat_off = false;
@@ -4782,11 +4798,10 @@ test "dsv41 perplexity: non-overlapping windows of a token corpus through extend
     const max_win = if (std.c.getenv("DSV41_PPL_WINDOWS")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else std.math.maxInt(usize);
     const gpa = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    var cfg = try model.parseConfig(io, gpa, dir);
-    defer cfg.deinit(gpa);
-    var w = try model.loadModelWeights(io, gpa, dir, &cfg, false);
+    const cfg = try testConfig(io, dir);
+    var w = try loadPack(io, gpa, dir, false);
     defer w.deinit();
-    const m = try init(gpa, &cfg, &w, mlx.gpuStream(), .{ .head_8bit = std.c.getenv("DSV41_PPL_HEAD8") != null });
+    const m = try init(gpa, &cfg, &w, mlx.gpuStream(), .{ .pack_dir = dir, .head_8bit = std.c.getenv("DSV41_PPL_HEAD8") != null });
     defer m.deinit();
     var tok = try @import("../../sdk/tokenizer/tokenizer.zig").loadTokenizer(io, gpa, dir);
     defer tok.deinit();
@@ -4831,7 +4846,7 @@ const FfnFixture = struct {
     ly: Layer,
     dq: [4]A, // f32 dequantized: routed gate+up, routed down, shared gate+up, shared down
 
-    fn init(gpa: std.mem.Allocator, E: c_int, d: c_int, inter: c_int, bits: u32, shared_mode: model.QuantMode) !*FfnFixture {
+    fn init(gpa: std.mem.Allocator, E: c_int, d: c_int, inter: c_int, bits: u32, shared_mode: params.QuantMode) !*FfnFixture {
         const f = try gpa.create(FfnFixture);
         errdefer gpa.destroy(f);
         f.sc = Scope.init(gpa, mlx.gpuStream());
@@ -4852,7 +4867,7 @@ const FfnFixture = struct {
         var q: [4]Lin = undefined;
         for (shapes, 0..) |sh, j| {
             const b: u32 = if (j < 2) bits else 8;
-            const mode: model.QuantMode = if (j < 2) .affine else shared_mode;
+            const mode: params.QuantMode = if (j < 2) .affine else shared_mode;
             const gs: u32 = if (mode == .mxfp8) 32 else 64;
             var w = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(w);
@@ -4900,7 +4915,7 @@ test "dsv41 ffn decode: the two kernels are no further from f32 truth than the c
     const k = 6;
     const d = 512;
     const inter = 384;
-    for ([_]u32{ 2, 3, 4, 8 }) |bits| for ([_]model.QuantMode{ .affine, .mxfp8 }) |smode| {
+    for ([_]u32{ 2, 3, 4, 8 }) |bits| for ([_]params.QuantMode{ .affine, .mxfp8 }) |smode| {
         const f = try FfnFixture.init(gpa, 16, d, inter, bits, smode);
         defer f.deinit(gpa);
         const sc = &f.sc;
@@ -5038,7 +5053,7 @@ test "dsv41 bench: one-token FFN as a dependent chain, composed vs kernels (DSV4
     const inter = 2304;
     const k = 6;
     const wb = [2]u32{ if (spec.len >= 2) spec[0] - '0' else 2, if (spec.len >= 2) spec[1] - '0' else 3 };
-    const smode: model.QuantMode = if (std.mem.endsWith(u8, spec, "m")) .mxfp8 else .affine;
+    const smode: params.QuantMode = if (std.mem.endsWith(u8, spec, "m")) .mxfp8 else .affine;
     const f = try FfnFixture.init(gpa, E, d, inter, wb[0], smode);
     defer f.deinit(gpa);
     if (wb[1] != wb[0]) {
@@ -5715,11 +5730,10 @@ test "dsv41 decode step: serial one-token steps as the server pipelines them (DS
     const ctx = if (std.c.getenv("DSV41_STEP_CTX")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 1024;
     const gpa = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    var cfg = try model.parseConfig(io, gpa, dir);
-    defer cfg.deinit(gpa);
-    var w = try model.loadModelWeights(io, gpa, dir, &cfg, false);
+    const cfg = try testConfig(io, dir);
+    var w = try loadPack(io, gpa, dir, false);
     defer w.deinit();
-    const m = try init(gpa, &cfg, &w, mlx.gpuStream(), .{ .head_8bit = true });
+    const m = try init(gpa, &cfg, &w, mlx.gpuStream(), .{ .pack_dir = dir, .head_8bit = true });
     defer m.deinit();
     const prompt = try gpa.alloc(u32, ctx);
     defer gpa.free(prompt);
@@ -5765,11 +5779,10 @@ test "dsv41 DSpark round: draft, verify and finish timed apart, greedy (DSV41_RO
     const ctx = if (std.c.getenv("DSV41_STEP_CTX")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 1024;
     const gpa = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    var cfg = try model.parseConfig(io, gpa, dir);
-    defer cfg.deinit(gpa);
-    var w = try model.loadModelWeights(io, gpa, dir, &cfg, false);
+    const cfg = try testConfig(io, dir);
+    var w = try loadPack(io, gpa, dir, false);
     defer w.deinit();
-    const m = try init(gpa, &cfg, &w, mlx.gpuStream(), .{ .head_8bit = true, .dspark = true });
+    const m = try init(gpa, &cfg, &w, mlx.gpuStream(), .{ .pack_dir = dir, .head_8bit = true, .dspark = true });
     defer m.deinit();
     const prompt = try gpa.alloc(u32, ctx);
     defer gpa.free(prompt);
@@ -5833,11 +5846,10 @@ test "dsv41 verify width: time of a verify block per draft count (DSV41_VERIFY_R
     const ctx = if (std.c.getenv("DSV41_STEP_CTX")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 2048;
     const gpa = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    var cfg = try model.parseConfig(io, gpa, dir);
-    defer cfg.deinit(gpa);
-    var w = try model.loadModelWeights(io, gpa, dir, &cfg, false);
+    const cfg = try testConfig(io, dir);
+    var w = try loadPack(io, gpa, dir, false);
     defer w.deinit();
-    const m = try init(gpa, &cfg, &w, mlx.gpuStream(), .{ .head_8bit = true, .dspark = true });
+    const m = try init(gpa, &cfg, &w, mlx.gpuStream(), .{ .pack_dir = dir, .head_8bit = true, .dspark = true });
     defer m.deinit();
     const prompt = try gpa.alloc(u32, ctx);
     defer gpa.free(prompt);
@@ -5950,7 +5962,7 @@ test "dsv41 image token: without image rows it is text, as in the reference's te
 }
 
 test "dsv41 CED split:the decoder starts at the last KV source when everything after it reads its ratio-1 rows" {
-    var c: ModelConfig = .{ .model_type = "deepseek_v41", .num_hidden_layers = 40, .sliding_window = 128 };
+    var c: Config = .{ .model_type = "deepseek_v41", .num_hidden_layers = 40, .sliding_window = 128 };
     for (0..40) |l| c.dsv4_compress_ratios[l] = if (l < 2) 0 else if (l < 20) 2 else 1;
     c.dsv41_kv_sources = (1 << 2) | (1 << 8) | (1 << 14) | (1 << 20);
     c.dsv41_engram_layers[0..2].* = .{ 1, 14 };
@@ -5971,7 +5983,7 @@ test "dsv41 CED split:the decoder starts at the last KV source when everything a
     c.has_sliding_window = false;
     try testing.expectEqual(@as(?usize, null), cedSplit(&c));
     // The tiny fixture's layout.
-    var t: ModelConfig = .{ .model_type = "deepseek_v41", .num_hidden_layers = 8, .sliding_window = 8 };
+    var t: Config = .{ .model_type = "deepseek_v41", .num_hidden_layers = 8, .sliding_window = 8 };
     t.dsv4_compress_ratios[0..8].* = .{ 0, 0, 2, 2, 2, 1, 1, 1 };
     t.dsv41_kv_sources = (1 << 2) | (1 << 5);
     t.dsv41_engram_layers[0..2].* = .{ 1, 2 };
@@ -6230,7 +6242,7 @@ test "dsv41 per-expert packs: banks stacked at load serve as the stacked pack, t
     const io = std.Io.Threaded.global_single_threaded.io();
     const dir = try std.fmt.allocPrint(gpa, "{s}/pipe", .{root});
     defer gpa.free(dir);
-    var w = try model.loadModelWeights(io, gpa, dir, &t.cfg, false);
+    var w = try loadPack(io, gpa, dir, false);
     defer w.deinit();
     var banks: std.ArrayList([]const u8) = .empty;
     defer banks.deinit(gpa);
@@ -6256,7 +6268,7 @@ test "dsv41 per-expert packs: banks stacked at load serve as the stacked pack, t
     }
     for (banks.items) |key| w.remove(key);
 
-    const m = try init(gpa, &t.cfg, &w, s, .{ .act = .float32, .dspark = true });
+    const m = try init(gpa, &t.cfg, &w, s, .{ .act = .float32, .dspark = true, .pack_dir = t.dir });
     defer m.deinit();
     const pl = try prefill(m, gpa, ids, null);
     defer _ = mlx.mlx_array_free(pl);
@@ -6269,7 +6281,7 @@ test "dsv41 per-expert packs: banks stacked at load serve as the stacked pack, t
 
 test "dsv41 oMLX layouts: each linear's mode, bits and group come off its own geometry" {
     const s = mlx.gpuStream();
-    const Case = struct { w: []const c_int, sc: []const c_int, fp: bool, in: u32, bits: u32, group: u32, mode: model.QuantMode };
+    const Case = struct { w: []const c_int, sc: []const c_int, fp: bool, in: u32, bits: u32, group: u32, mode: params.QuantMode };
     // Jundot oQ3e: 3-bit experts, 6-bit wo_b, the Engram projection in mxfp8, the DSpark experts in mxfp4.
     const cases = [_]Case{
         .{ .w = &.{ 384, 2304, 480 }, .sc = &.{ 384, 2304, 80 }, .fp = false, .in = 5120, .bits = 3, .group = 64, .mode = .affine },
@@ -6342,25 +6354,23 @@ test "dsv41 pair: DSpark on the host drafts what the whole model drafts, rollbac
     var c = t.cfg;
     c.dsv4_dspark_target_layers[0..3].* = .{ 2, 3, 4 };
     const pair: Pair = .{ .lo = 5, .hi = 8, .worker = false };
-    var cp = c;
-    cp.dist_dsv41 = pair;
-    try testing.expect(dsparkWanted(&cp));
+    try testing.expect(dsparkWanted(&c, pair, null));
     // A load moves what it repacks (DSpark experts, fused gate/up) out of its weight map: each model loads its own.
     const io = std.Io.Threaded.global_single_threaded.io();
     const dir = try std.fmt.allocPrint(gpa, "{s}/repack", .{root});
     defer gpa.free(dir);
-    var w_whole = try model.loadModelWeights(io, gpa, dir, &c, false);
+    var w_whole = try loadPack(io, gpa, dir, false);
     defer w_whole.deinit();
-    var w_host = try model.loadModelWeights(io, gpa, dir, &c, false);
+    var w_host = try loadPack(io, gpa, dir, false);
     defer w_host.deinit();
-    const whole = try init(gpa, &c, &w_whole, mlx.gpuStream(), .{ .act = .float32, .dspark = true });
+    const whole = try init(gpa, &c, &w_whole, mlx.gpuStream(), .{ .act = .float32, .dspark = true, .pack_dir = t.dir });
     defer whole.deinit();
     try testing.expect(whole.n_mtp > 0);
-    const host = try init(gpa, &c, &w_host, mlx.gpuStream(), .{ .act = .float32, .dspark = true, .pair = pair });
+    const host = try init(gpa, &c, &w_host, mlx.gpuStream(), .{ .act = .float32, .dspark = true, .pair = pair, .pack_dir = t.dir });
     defer host.deinit();
     var wp = pair;
     wp.worker = true;
-    var w_worker = try model.loadModelWeights(io, gpa, dir, &c, false);
+    var w_worker = try loadPack(io, gpa, dir, false);
     defer w_worker.deinit();
     const worker = try init(gpa, &c, &w_worker, mlx.gpuStream(), .{ .act = .float32, .pair = wp });
     defer worker.deinit();
@@ -6404,7 +6414,7 @@ test "dsv41 pair: DSpark on the host drafts what the whole model drafts, rollbac
 }
 
 test "dsv41 pair cuts: valid only where no layer past the cut reads what a layer below it made" {
-    var c: ModelConfig = .{ .model_type = "deepseek_v41", .num_hidden_layers = 8 };
+    var c: Config = .{ .model_type = "deepseek_v41", .num_hidden_layers = 8 };
     c.dsv4_compress_ratios[0..8].* = .{ 0, 0, 2, 2, 2, 1, 1, 1 };
     c.dsv41_kv_sources = (1 << 2) | (1 << 5);
     c.dsv41_index_sources = (1 << 2) | (1 << 5) | (1 << 7);
@@ -6425,11 +6435,11 @@ test "dsv41 pair: a host and a worker split at a valid cut give the unsplit mode
     const io = std.Io.Threaded.global_single_threaded.io();
     const dir = try std.fmt.allocPrint(gpa, "{s}/repack", .{root});
     defer gpa.free(dir);
-    var w_host = try model.loadModelWeights(io, gpa, dir, &t.cfg, false);
+    var w_host = try loadPack(io, gpa, dir, false);
     defer w_host.deinit();
-    var w_worker = try model.loadModelWeights(io, gpa, dir, &t.cfg, false);
+    var w_worker = try loadPack(io, gpa, dir, false);
     defer w_worker.deinit();
-    const host = try init(gpa, &t.cfg, &w_host, mlx.gpuStream(), .{ .act = .float32, .pair = .{ .lo = 5, .hi = 8, .worker = false } });
+    const host = try init(gpa, &t.cfg, &w_host, mlx.gpuStream(), .{ .act = .float32, .pair = .{ .lo = 5, .hi = 8, .worker = false }, .pack_dir = t.dir });
     defer host.deinit();
     const worker = try init(gpa, &t.cfg, &w_worker, mlx.gpuStream(), .{ .act = .float32, .pair = .{ .lo = 5, .hi = 8, .worker = true } });
     defer worker.deinit();
@@ -6496,4 +6506,8 @@ test "dsv41 clampedSwiglu: the SDK clamped SwiGLU in f32 gives the bytes the plu
         const gb = @as([*]const u8, @ptrCast(mlx.mlx_array_data_bfloat16(got).?))[0 .. 2 * 64 * 96];
         try std.testing.expectEqual(want, std.hash.Wyhash.hash(0, gb));
     }
+}
+
+fn testConfig(io: std.Io, dir: []const u8) !Config {
+    return @import("../../sdk/testing/pack_config.zig").packConfig(@import("config.zig"), io, dir);
 }

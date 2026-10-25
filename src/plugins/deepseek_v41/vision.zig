@@ -18,12 +18,10 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
-const ModelConfig = model_mod.ModelConfig;
-const Weights = model_mod.Weights;
+const Weights = @import("../../sdk/weights/resident.zig").Weights;
+const weights_load = @import("../../sdk/weights/load.zig");
 const qwen_vision = @import("../../sdk/vision/qwen_vision.zig");
 const glm_vision = @import("../glm5_next/vision.zig");
-const transformer = @import("../../engines/mlx/transformer.zig");
 const params = @import("../../sdk/quant/params.zig");
 const log = @import("../../sdk/util/log.zig");
 
@@ -196,7 +194,7 @@ pub const Dsv41Vision = struct {
     image_end: mlx.mlx_array,
     image_newline: mlx.mlx_array,
 
-    pub fn init(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !Dsv41Vision {
+    pub fn init(allocator: std.mem.Allocator, config: anytype, weights: *const Weights) !Dsv41Vision {
         const ctx = NameCtx{ .weights = weights };
         if (ctx.get("vision.patch_embed.proj.weight", .{}) == null) {
             log.warn("MISSING DEEPSEEK VISION WEIGHT: vision.patch_embed.proj.weight\n", .{});
@@ -567,7 +565,7 @@ fn fixtureEnv() ?[]const u8 {
 test "dsv41 vision: preprocessing equals the reference processor's patches" {
     const fix_path = fixtureEnv() orelse return error.SkipZigTest;
     const a = testing.allocator;
-    var fx = try model_mod.loadWeightsSingleFile(a, fix_path);
+    var fx = try weights_load.loadWeightsSingleFile(a, fix_path);
     defer fx.deinit();
     for ([_][]const u8{ "house", "noise", "wide" }) |case| {
         var kb: [64]u8 = undefined;
@@ -602,11 +600,10 @@ test "dsv41 vision: tower, aligner and span match the reference" {
     const raw_model = std.c.getenv("DSV41_VISION_MODEL") orelse return error.SkipZigTest;
     const model_dir = std.mem.sliceTo(raw_model, 0);
     const a = testing.allocator;
-    var config = try model_mod.parseConfig(testing.io, a, model_dir);
-    defer config.deinit(a);
-    var weights = try model_mod.loadWeightsWithVision(testing.io, a, model_dir);
+    const config = try @import("../../sdk/testing/pack_config.zig").packConfig(@import("config.zig"), testing.io, model_dir);
+    var weights = try weights_load.loadWeightsWithVision(testing.io, a, model_dir);
     defer weights.deinit();
-    var fx = try model_mod.loadWeightsSingleFile(a, fix_path);
+    var fx = try weights_load.loadWeightsSingleFile(a, fix_path);
     defer fx.deinit();
     var dv = try Dsv41Vision.init(a, config, &weights);
     defer dv.deinit();

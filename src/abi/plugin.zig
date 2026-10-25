@@ -341,6 +341,8 @@ pub const LoadCtx = extern struct {
     /// GPU bytes a streamed expert bank may fill (with what is resident): the GPU ceiling less one prompt's bill at
     /// 16K + 1K and the wired margin; 0 = none.
     stream_room: u64 = 0,
+    /// A two-Mac pair's layers on the other Mac (DeepSeek-V4.1's worker run); `count` 0 = no pair.
+    pair_remote: LayerSpan = .{},
 };
 
 pub const Mode = enum(u8) { prefill, decode, verify, batched_rows };

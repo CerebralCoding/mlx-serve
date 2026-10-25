@@ -149,7 +149,7 @@ const Bank = struct {
 const Numerics = struct { act: mlx.mlx_dtype, qat: bool, head_8bit: bool, streamed_experts: bool = false };
 
 const Resident = struct {
-    cfg: model.ModelConfig,
+    cfg: @import("config.zig").Config,
     w: model.Weights,
     s: mlx.mlx_stream,
     m: *dsv41.Dsv41Model,
@@ -158,13 +158,12 @@ const Resident = struct {
         const gpa = testing.allocator;
         const r = try gpa.create(Resident);
         errdefer gpa.destroy(r);
-        r.cfg = try model.parseConfig(testing.io, gpa, dir);
-        errdefer r.cfg.deinit(gpa);
-        r.w = try model.loadModelWeights(testing.io, gpa, dir, &r.cfg, false);
+        r.cfg = try @import("../../sdk/testing/pack_config.zig").packConfig(@import("config.zig"), testing.io, dir);
+        r.w = try dsv41.loadPack(testing.io, gpa, dir, false);
         errdefer r.w.deinit();
         r.s = mlx.gpuStream();
         errdefer _ = mlx.mlx_stream_free(r.s);
-        r.m = try dsv41.init(gpa, &r.cfg, &r.w, r.s, .{ .act = opts.act, .head_8bit = opts.head_8bit, .streamed_experts = opts.streamed_experts });
+        r.m = try dsv41.init(gpa, &r.cfg, &r.w, r.s, .{ .act = opts.act, .head_8bit = opts.head_8bit, .streamed_experts = opts.streamed_experts, .pack_dir = dir });
         r.m.qat_off = !opts.qat;
         return r;
     }
@@ -173,7 +172,6 @@ const Resident = struct {
         r.m.deinit();
         _ = mlx.mlx_stream_free(r.s);
         r.w.deinit();
-        r.cfg.deinit(testing.allocator);
         testing.allocator.destroy(r);
     }
 

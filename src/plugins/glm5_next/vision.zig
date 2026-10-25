@@ -14,12 +14,10 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
-const ModelConfig = model_mod.ModelConfig;
-const Weights = model_mod.Weights;
+const Weights = @import("../../sdk/weights/resident.zig").Weights;
+const weights_load = @import("../../sdk/weights/load.zig");
+const scalarOf = @import("../../mlx/array.zig").scalarOf;
 const qwen_vision = @import("../../sdk/vision/qwen_vision.zig");
-const transformer = @import("../../engines/mlx/transformer.zig");
-const weights_mod = @import("../../engines/mlx/load/weights.zig");
 const activations = @import("../../sdk/blocks/mlp/activations.zig");
 const fused_activations = @import("../../sdk/blocks/mlp/fused_activations.zig");
 const params_mod = @import("../../sdk/quant/params.zig");
@@ -188,7 +186,7 @@ pub const GlmVision = struct {
     m_up: Lin,
     m_down: Lin,
 
-    pub fn init(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !GlmVision {
+    pub fn init(allocator: std.mem.Allocator, config: anytype, weights: *const Weights) !GlmVision {
         const s = mlx.gpuStream();
         const prefix = qwen_vision.resolveVisionPrefix(weights) orelse {
             log.warn("MISSING GLM VISION WEIGHT: vision_tower.patch_embed.proj.weight\n", .{});
@@ -501,11 +499,11 @@ pub fn rope2d(x: mlx.mlx_array, cos: mlx.mlx_array, sin: mlx.mlx_array, s: mlx.m
 /// Exact `gelu`: `x * (1 + erf(x / sqrt(2))) / 2`.
 pub fn geluErf(x: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     const dt = mlx.mlx_array_dtype(x);
-    const inv_sqrt2 = try weights_mod.scalarOf(0.7071067811865476, dt, s);
+    const inv_sqrt2 = try scalarOf(0.7071067811865476, dt, s);
     defer _ = mlx.mlx_array_free(inv_sqrt2);
-    const one = try weights_mod.scalarOf(1.0, dt, s);
+    const one = try scalarOf(1.0, dt, s);
     defer _ = mlx.mlx_array_free(one);
-    const half = try weights_mod.scalarOf(0.5, dt, s);
+    const half = try scalarOf(0.5, dt, s);
     defer _ = mlx.mlx_array_free(half);
     var t = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(t);
@@ -612,7 +610,7 @@ fn fixtureEnv() ?[]const u8 {
 test "glm vision: preprocessing equals the reference processor's pixel_values" {
     const fix_path = fixtureEnv() orelse return error.SkipZigTest;
     const a = testing.allocator;
-    var fx = try model_mod.loadWeightsSingleFile(a, fix_path);
+    var fx = try weights_load.loadWeightsSingleFile(a, fix_path);
     defer fx.deinit();
     for ([_][]const u8{ "house", "noise", "wide" }) |case| {
         var kb: [64]u8 = undefined;
@@ -650,11 +648,10 @@ test "glm vision: tower and merger match the reference" {
     const model_dir = std.mem.sliceTo(raw_model, 0);
     const a = testing.allocator;
 
-    var config = try model_mod.parseConfig(testing.io, a, model_dir);
-    defer config.deinit(a);
-    var weights = try model_mod.loadWeightsWithVision(testing.io, a, model_dir);
+    const config = try @import("../../sdk/testing/pack_config.zig").packConfig(@import("config.zig"), testing.io, model_dir);
+    var weights = try weights_load.loadWeightsWithVision(testing.io, a, model_dir);
     defer weights.deinit();
-    var fx = try model_mod.loadWeightsSingleFile(a, fix_path);
+    var fx = try weights_load.loadWeightsSingleFile(a, fix_path);
     defer fx.deinit();
     var gv = try GlmVision.init(a, config, &weights);
     defer gv.deinit();

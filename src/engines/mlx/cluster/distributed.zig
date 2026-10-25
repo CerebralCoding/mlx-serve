@@ -865,7 +865,8 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
         return err;
     };
     defer w.deinit();
-    const m = dsv41_mod.init(allocator, config, &w, mlx.gpuStream(), .{ .pair = config.dist_dsv41 }) catch |err| {
+    const binding = config.plugin orelse return error.NotPluginServed;
+    const m = dsv41_mod.init(allocator, @import("../../../plugins/deepseek_v41/config.zig").of(&binding.parsed), &w, mlx.gpuStream(), .{ .pair = config.dist_dsv41 }) catch |err| {
         log.err("[dist] worker load failed: {s}\n", .{@errorName(err)});
         sendMsg(link, .{ MAGIC, LOAD_FAILED, 0, 0, 0, 0, 0, 0 }, 0) catch {};
         return err;

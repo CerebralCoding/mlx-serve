@@ -45,7 +45,13 @@ const kvBytesPerTokenAtBits = @import("bills.zig").kvBytesPerTokenAtBits;
 const WarmPrefix = @import("bills.zig").WarmPrefix;
 const prefillMemoryNeeded = @import("bills.zig").prefillMemoryNeeded;
 const dsv4PrefillMemoryNeeded = @import("../../../plugins/deepseek_v4/bill.zig").dsv4PrefillMemoryNeeded;
-const dsv41PrefillMemoryNeeded = @import("../../../plugins/deepseek_v41/bill.zig").dsv41PrefillMemoryNeeded;
+const dsv41_mod = @import("../../../plugins/deepseek_v41/deepseek_v41.zig");
+const PREFILL_RUNTIME_FLOOR_BYTES = @import("bills.zig").PREFILL_RUNTIME_FLOOR_BYTES;
+
+/// DeepSeek-V4.1's prompt pass (`deepseek_v41.prefillBytes`) over the engine's config.
+pub fn dsv41PrefillMemoryNeeded(config: *const model_mod.ModelConfig, seq: u64, chunk: u64) u64 {
+    return dsv41_mod.prefillBytes(config, config.kvBytesPerToken(), seq, chunk, PREFILL_RUNTIME_FLOOR_BYTES);
+}
 const prefillStreamBytesPerToken = @import("bills.zig").prefillStreamBytesPerToken;
 const prefillDequantWeightBytes = @import("bills.zig").prefillDequantWeightBytes;
 const prefillFfnWidth = @import("bills.zig").prefillFfnWidth;
