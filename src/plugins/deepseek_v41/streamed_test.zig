@@ -318,7 +318,8 @@ test "deepseek_v41 streamed exl3: a served EXL3 pack (its prompt in wide calls, 
     const want = try a.alloc(f32, (1 + decode) * vocab);
     {
         const s = mlx.gpuStream();
-        const p = try oracle.Served.open(io, testing.allocator, dir, s);
+        // A box without the free memory for the bank's slot rows refuses the load (16 GB).
+        const p = oracle.Served.open(io, testing.allocator, dir, s) catch |e| return if (e == error.InsufficientMemory) error.SkipZigTest else e;
         defer p.close(testing.allocator);
         try testing.expectEqualStrings("deepseek_v41", p.implName());
         var row = try oracle.forwardIds(&p.xfm, a, prompt, s);

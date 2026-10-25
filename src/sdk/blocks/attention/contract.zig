@@ -22,6 +22,7 @@ const kernelSource = @import("../../../mlx/kernels.zig").source;
 const kv_view = @import("kv_view.zig");
 const qsa_score = @import("kv_quant_attn.zig");
 const fused_activations = @import("../mlp/fused_activations.zig");
+const device = @import("../../../mlx/device.zig");
 
 const spec = kc.spec;
 const metal = kc.metal;
@@ -2719,6 +2720,8 @@ test "kernel contract attention: each declared launch is the shipped wrapper's, 
     inline for (.{ .{ Gate, gate_registrations.len }, .{ A256, a256_registrations.len }, .{ RowPart, row_registrations.len }, .{ RowMerge, 1 }, .{ Qkv, qkv_registrations.len }, .{ NaxAttn, nax_registrations.len }, .{ Lane, lane_registrations.len } }) |fam| {
         for (set.kernels.items[at..][0..fam[1]]) |k| {
             const t: *fam[0] = @ptrCast(@alignCast(k.ctx));
+            // The NAX wrappers decline on a GPU without NAX.
+            if (fam[0] == NaxAttn and !device.naxAvailable()) continue;
             for (k.spec.served, 0..) |shape, si| {
                 // The int8 entry's second served shape is its known compile failure (both launches fail there).
                 if (fam[0] == NaxAttn and t.cfg.q8 and si > 0) continue;

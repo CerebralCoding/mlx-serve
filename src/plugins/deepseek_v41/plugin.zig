@@ -111,6 +111,7 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         out.* = switch (@as(anyerror, e)) {
             error.OutOfMemory => Verdict.refuse(.failed, "deepseek_v41: out of memory"),
             error.MissingWeight => Verdict.refuse(.failed, "deepseek_v41: a weight is missing"),
+            error.StreamedRowsDoNotFit => Verdict.refuse(.too_large, "deepseek_v41: the streamed bank's rows do not fit the free memory"),
             error.StreamedWeightsUnsupported => Verdict.refuse(.unsupported, "deepseek_v41: a streamed (experts.bin) pack needs the macOS build's expert streamer"),
             else => Verdict.refuse(.failed, "deepseek_v41: the pack does not load"),
         };

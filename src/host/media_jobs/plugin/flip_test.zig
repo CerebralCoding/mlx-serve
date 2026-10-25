@@ -49,6 +49,10 @@ const Pack = struct {
     }
 };
 
+/// Every golden was recorded on one machine; computed values (and a RAM-sized context) differ on another, where a
+/// differing record is reported, not failed, as proof tapes do with greedy runs.
+const recorded_on = "applegpu_g17d";
+
 /// Records of `== <key> <len> <sha256 hex>\n`, each followed by its bytes and a newline when they are at most
 /// 2 KiB. Bytes are compared normalized: the pack's temp path reads `<pack>`, a row's `created` time is zeroed.
 const Golden = struct {
@@ -56,6 +60,11 @@ const Golden = struct {
     pack: []const u8,
 
     fn check(self: Golden, key: []const u8, bytes: []const u8) !void {
+        return self.compare(key, bytes, true);
+    }
+
+    /// `off_device`: a differing record off the recording machine is reported, not failed.
+    fn compare(self: Golden, key: []const u8, bytes: []const u8, off_device: bool) !void {
         const got = try self.norm(bytes);
         defer testing.allocator.free(got);
         var h: [32]u8 = undefined;
@@ -72,8 +81,15 @@ const Golden = struct {
             const stored = if (len <= 2048) self.text[eol + 1 ..][0..len] else null;
             pos = eol + 1 + if (stored != null) len + 1 else 0;
             if (!std.mem.eql(u8, head[0..sp1], key)) continue;
+            const same = len == got.len and std.mem.eql(u8, head[sp2 + 1 ..], hex);
+            var dbuf: [64]u8 = undefined;
+            const here = @import("../../../sdk/testing/tape.zig").deviceName(&dbuf);
+            if (!same and off_device and !std.mem.eql(u8, here, recorded_on)) {
+                std.debug.print("golden '{s}' differs on {s} (recorded on {s}): not compared\n", .{ key, here, recorded_on });
+                return;
+            }
             if (stored) |want| try testing.expectEqualStrings(want, got);
-            if (len != got.len or !std.mem.eql(u8, head[sp2 + 1 ..], hex)) {
+            if (!same) {
                 std.debug.print("golden '{s}': want {d} bytes {s}, got {d} bytes {s}\n", .{ key, len, head[sp2 + 1 ..], got.len, hex });
                 return error.GoldenMismatch;
             }
@@ -165,7 +181,7 @@ test "flip: stable_audio3 answers its legacy arm's bytes" {
     // Control: the golden sees the audio (another seed differs from the recorded bytes).
     const other = try capture(testing.allocator, pluginRoute, .{ testing.allocator, "{\"prompt\":\"rain\",\"duration_seconds\":1,\"steps\":2,\"seed\":4}", f.pe, gen.GenRoute.sound });
     defer testing.allocator.free(other);
-    try testing.expectError(error.GoldenMismatch, f.g.check("sound 0", other));
+    try testing.expectError(error.GoldenMismatch, f.g.compare("sound 0", other, false));
 }
 
 test "flip: kokoro answers its legacy arm's bytes" {

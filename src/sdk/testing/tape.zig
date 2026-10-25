@@ -127,13 +127,14 @@ pub const Tape = struct {
         const len = std.mem.readInt(u64, (try t.take(8))[0..8], .little);
         const want = try t.take(@intCast(len));
         try testing.expectEqual(dt, mlx.mlx_array_dtype(got));
+        // Off its device a speculative run accepts other drafts, so its token array may differ in length too.
+        if (!t.same_device and tokens) return;
         try testing.expectEqualSlices(c_int, sh[0..nd], mlx.getShape(got));
         if (t.same_device) {
             const bytes = try bytesOf(a, got);
             defer a.free(bytes);
             return testing.expectEqualSlices(u8, want, bytes);
         }
-        if (tokens) return;
         const w = mlx.mlx_array_new_data(want.ptr, &sh, @intCast(nd), dt);
         defer _ = mlx.mlx_array_free(w);
         const wf = try floatsOf(a, w);

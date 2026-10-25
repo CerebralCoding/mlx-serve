@@ -126,7 +126,7 @@ test "sharded: kernel contract gates 1-4: every registered kernel passes, every 
     for (set.kernels.items, 0..) |k, i| if (i % sh.n == sh.k) try mine.append(a, k);
     var t: gates.Tally = .{};
     try gates.runAll(a, mine.items, 0xc0de, &t);
-    std.debug.print("SUMMARY kernel contract: {d}/{d} kernels pass gates 1-4, {d} known findings, {d}/{d} controls red\n", .{ t.passed, t.kernels, t.known, t.caught, t.controls });
+    std.debug.print("SUMMARY kernel contract: {d}/{d} kernels pass gates 1-4, {d} known findings, {d}/{d} controls red, {d} need NAX\n", .{ t.passed, t.kernels, t.known, t.caught, t.controls, t.skipped });
     try std.testing.expectEqual(@as(usize, 0), t.problems());
 }
 

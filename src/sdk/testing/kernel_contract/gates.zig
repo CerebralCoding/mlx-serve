@@ -315,6 +315,8 @@ pub const Tally = struct {
     caught: usize = 0,
     missed: usize = 0,
     known: usize = 0,
+    /// Kernels this GPU cannot run (`error.NaxOnly` from `prepare`).
+    skipped: usize = 0,
 
     pub fn problems(t: Tally) usize {
         return t.failed + t.missed;
@@ -330,6 +332,11 @@ pub fn runAll(a: std.mem.Allocator, kernels: []const Kernel, seed: u64, t: *Tall
             if (g == .limits) continue; // gate 5's controls are checked by `limits.zig` with no device
             t.controls += 1;
             const v = one(a, g, k, s) catch |err| blk: {
+                if (err == error.NaxOnly) {
+                    t.controls -= 1;
+                    t.skipped += 1;
+                    continue;
+                }
                 if (!quiet) std.debug.print("CONTROL ERROR {s}: {t} at {t}, so it proves nothing\n", .{ k.spec.name, err, g });
                 break :blk .na;
             };
@@ -342,10 +349,10 @@ pub fn runAll(a: std.mem.Allocator, kernels: []const Kernel, seed: u64, t: *Tall
             }
             continue;
         }
-        t.kernels += 1;
         var bad = false;
-        for ([_]Gate{ .nonfinite, .repeat, .shapes, .sums }) |g| {
+        const skip = for ([_]Gate{ .nonfinite, .repeat, .shapes, .sums }) |g| {
             const v = one(a, g, k, s) catch |err| blk: {
+                if (err == error.NaxOnly) break true;
                 if (!quiet) std.debug.print("FAIL {t} {s}: {t}\n", .{ g, k.spec.name, err });
                 break :blk .fail;
             };
@@ -357,7 +364,13 @@ pub fn runAll(a: std.mem.Allocator, kernels: []const Kernel, seed: u64, t: *Tall
                 bad = true;
                 if (!quiet) std.debug.print("FAIL {t} {s}: passes now; drop its known finding\n", .{ g, k.spec.name });
             } else if (v == .fail) bad = true;
+        } else false;
+        if (skip) {
+            t.skipped += 1;
+            if (!quiet) std.debug.print("SKIP {s}: needs NAX\n", .{k.spec.name});
+            continue;
         }
+        t.kernels += 1;
         if (bad) t.failed += 1 else t.passed += 1;
     }
 }
