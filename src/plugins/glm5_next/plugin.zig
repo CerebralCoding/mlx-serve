@@ -17,12 +17,7 @@ const trunk = @import("trunk.zig");
 const bill_mod = @import("bill.zig");
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "glm5_next",
-    .kind = .model,
-    .claims = &config.model_types,
-    .gate_models = &.{"ddalcu/GLM-5.3-Flash-MLX-Serve-iQ-MLX-5.1bpw"},
-};
+pub const plugin = config.plugin;
 
 pub const table = abi.ModelTable{
     .name = abi.Str.of(plugin.name),

@@ -26,12 +26,7 @@ const distributed = @import("../../engines/mlx/cluster/distributed.zig");
 const lmHeadMxfp8On = @import("../../sdk/quant/mxfp8.zig").lmHeadMxfp8On;
 pub const config = @import("config.zig");
 
-pub const plugin = sdk.Plugin{
-    .name = "qwen4_exp",
-    .kind = .model,
-    .claims = &config.model_types,
-    .gate_models = &.{"ddalcu/Qwen3.8-Flash-Next-MLX-Serve-iQ-MLX-4.7bpw"},
-};
+pub const plugin = config.plugin;
 
 pub const table = abi.ModelTable{
     .name = abi.Str.of(plugin.name),
