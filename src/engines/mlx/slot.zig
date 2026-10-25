@@ -475,6 +475,12 @@ pub const Slot = struct {
             self.early_first = null;
             if (e == t and lp == null) return;
         }
+        // A request with a stream reads it there alone: the event carries the token and a copy of its logprob.
+        if (self.sink != null) {
+            self.emitToken(t, lp);
+            if (lp) |entry| self.allocator.free(entry.top_logprobs);
+            return;
+        }
         self.out_mu.lockUncancelable(self.io);
         defer self.out_mu.unlock(self.io);
         if (lp) |entry| {
@@ -493,7 +499,6 @@ pub const Slot = struct {
         };
         self.out_cond.broadcast(self.io);
         self.out_event.set(self.io);
-        self.emitToken(t, lp);
     }
 
     /// Connection thread: copy logprob entries produced since `cursor` into

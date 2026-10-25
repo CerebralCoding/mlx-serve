@@ -50,6 +50,11 @@ const server_mod = @import("host/http/server.zig");
 const gen_mod = @import("host/media_jobs/gen.zig");
 pub const log = @import("sdk/util/log.zig");
 
+comptime {
+    // One compile unit: the MLX engine's table is exported from here.
+    _ = @import("engines/mlx/api.zig");
+}
+
 /// Returns the engine version string (NUL-terminated, static lifetime).
 export fn mlxserve_version() [*:0]const u8 {
     return std.fmt.comptimePrint("{s}", .{build_options.version});
