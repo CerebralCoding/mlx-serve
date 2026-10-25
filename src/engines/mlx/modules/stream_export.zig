@@ -5,6 +5,7 @@ const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const ModelConfig = @import("../../../sdk/config/model.zig").ModelConfig;
 const glue = @import("stream_glue.zig");
+const local = @import("../../../sdk/util/io_util.zig").local;
 const host = @import("stream_table.zig");
 
 const table: host.Table = .{
@@ -42,12 +43,12 @@ fn ofConst(m: *const host.Model) *const glue.Model {
 }
 
 fn loadBytes(gpa: std.mem.Allocator, io: std.Io, config: *const ModelConfig, out: *u64) ?[]const u8 {
-    out.* = glue.loadBytes(gpa, io, config) catch |e| return @errorName(e);
+    out.* = glue.loadBytes(gpa, local(io), config) catch |e| return @errorName(e);
     return null;
 }
 
 fn open(gpa: std.mem.Allocator, io: std.Io, s: mlx.mlx_stream, config: *const ModelConfig, out: *?*host.Model) ?[]const u8 {
-    out.* = @ptrCast(glue.open(gpa, io, s, config) catch |e| return @errorName(e));
+    out.* = @ptrCast(glue.open(gpa, local(io), s, config) catch |e| return @errorName(e));
     return null;
 }
 

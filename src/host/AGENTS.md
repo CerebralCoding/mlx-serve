@@ -25,6 +25,7 @@ With `tools`, tokens buffer for detection (all tag families + raw JSON); thinkin
 The MLX engine boundary:
 - **The host reaches the MLX engine only through `host/engines/mlx.zig`** (a table the engine exports, `engines/mlx/api.zig`): no `@import` of `src/engines/`, and the engine's objects held on the host (`abi/mlx_handles.zig`) are stored and null-checked, never opened; a fact the host needs is a table call (`mlx.facts`). Under `-Dunits` the host unit sees those handles opaque, so a reach-in fails the build.
 - **An error crosses the table by NAME** (`sdk/util/err_name.zig`): every compile unit numbers its own error set. A new error a handler switches on joins `err_name.Known`.
+- **An `Io` handed into another unit is rebuilt there** (`io_util.local`, at the engine table, the module calls and the stream table): its vtable returns the numbers of the unit that built it, so the host's `FileNotFound` read as `HostUnreachable` and qwen3_asr failed to load.
 - **State two units touch is `Shared`** (`sdk/util/shared.zig`), the host owns it and lists it in `src/shared_all.zig`; a plain `pub var` the engine reads splits into two copies under `-Dunits` (`zig build units-check` names them). A plugin is told apart by its table's NAME, never its address: each unit holds its own copy of a table.
 
 Reasoning, budgets, agents:

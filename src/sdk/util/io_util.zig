@@ -7,6 +7,15 @@
 
 const std = @import("std");
 
+/// `io` over this unit's own vtable. Each compile unit numbers Zig errors on its own and an `Io` returns the numbers of
+/// the unit that built its vtable, so an `Io` handed in by another unit must be rebuilt before its errors are compared
+/// or named (the host's `FileNotFound` read here as `HostUnreachable`). Every `Io` the host hands out is a `Threaded`.
+pub fn local(io: std.Io) std.Io {
+    if (comptime !@hasDecl(@import("root"), "mlx_serve_unit")) return io;
+    const t: *std.Io.Threaded = @ptrCast(@alignCast(io.userdata.?));
+    return t.io();
+}
+
 /// Seconds since the Unix epoch (wall-clock).
 pub fn nowSecs(io: std.Io) i64 {
     return std.Io.Timestamp.now(io, .real).toSeconds();

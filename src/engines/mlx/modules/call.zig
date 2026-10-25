@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const err_name = @import("../../../sdk/util/err_name.zig");
+const io_util = @import("../../../sdk/util/io_util.zig");
 const split = @import("split.zig");
 
 pub const fns = struct {
@@ -73,14 +74,17 @@ pub fn exportAll() void {
 fn Export(comptime name: []const u8) type {
     return struct {
         fn run(a: *const anyopaque, o: *anyopaque, e: *[]const u8) callconv(.c) bool {
-            const args: *const std.meta.ArgsTuple(Fn(name)) = @ptrCast(@alignCast(a));
+            var args = @as(*const std.meta.ArgsTuple(Fn(name)), @ptrCast(@alignCast(a))).*;
+            inline for (0..args.len) |i| if (@TypeOf(args[i]) == std.Io) {
+                args[i] = io_util.local(args[i]);
+            };
             const out: *Payload(name) = @ptrCast(@alignCast(o));
             if (comptime @typeInfo(Ret(name)) == .error_union) {
-                out.* = @call(.auto, @field(fns, name), args.*) catch |x| {
+                out.* = @call(.auto, @field(fns, name), args) catch |x| {
                     e.* = @errorName(x);
                     return false;
                 };
-            } else out.* = @call(.auto, @field(fns, name), args.*);
+            } else out.* = @call(.auto, @field(fns, name), args);
             return true;
         }
     };

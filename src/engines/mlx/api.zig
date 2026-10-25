@@ -2,6 +2,7 @@
 //! `mlx_serve_mlx_api`. Every call that can fail returns its error's name (null = success).
 
 const std = @import("std");
+const local = @import("../../sdk/util/io_util.zig").local;
 const mlx = @import("../../mlx/ffi.zig");
 const host = @import("../../host/engines/mlx.zig");
 const params = @import("../../host/gpu_thread/params.zig");
@@ -50,7 +51,7 @@ pub const table: host.Api = .{
     .model_props = configure_mod.modelProps,
     .model_props_json = configure_mod.modelPropsJson,
     .cluster_json = configure_mod.clusterJson,
-    .plugin_stub = @import("plugin/config.zig").stubOf,
+    .plugin_stub = pluginStub,
     .gauges = configure_mod.gauges,
     .run_offline = @import("offline.zig").run,
     .cluster_worker = clusterWorker,
@@ -69,18 +70,22 @@ comptime {
     @export(&addr, .{ .name = "mlx_serve_mlx_api" });
 }
 
+fn pluginStub(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, raw_json: []const u8) ?@import("plugin/config.zig").Stub {
+    return @import("plugin/config.zig").stubOf(local(io), a, model_dir, raw_json);
+}
+
 fn clusterWorker(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) ?[]const u8 {
-    @import("modules/call.zig").call("cluster_worker", .{ io, gpa, args }) catch |e| return @errorName(e);
+    @import("modules/call.zig").call("cluster_worker", .{ local(io), gpa, args }) catch |e| return @errorName(e);
     return null;
 }
 
 fn clusterProbe(io: std.Io, args: []const []const u8) ?[]const u8 {
-    distributed.cmdProbe(io, args) catch |e| return @errorName(e);
+    distributed.cmdProbe(local(io), args) catch |e| return @errorName(e);
     return null;
 }
 
 fn clusterConnect(io: std.Io, gpa: std.mem.Allocator, coordinator: []const u8, device: []const u8, mode: u8, model: []const u8, split: ?u32) ?[]const u8 {
-    distributed.connect(io, gpa, .{ .rank = 0, .coordinator = coordinator, .device = device }, @enumFromInt(mode), model, split) catch |e| return @errorName(e);
+    distributed.connect(local(io), gpa, .{ .rank = 0, .coordinator = coordinator, .device = device }, @enumFromInt(mode), model, split) catch |e| return @errorName(e);
     return null;
 }
 
@@ -89,7 +94,7 @@ fn setGenYield(on: bool) void {
 }
 
 fn start(gpa: std.mem.Allocator, io: std.Io, p: *const params.LoadParams, max_concurrent: u32, out: *?*Scheduler) ?[]const u8 {
-    out.* = scheduler.init(gpa, io, p.*, max_concurrent) catch |e| return @errorName(e);
+    out.* = scheduler.init(gpa, local(io), p.*, max_concurrent) catch |e| return @errorName(e);
     return null;
 }
 
