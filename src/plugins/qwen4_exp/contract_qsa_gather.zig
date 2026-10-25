@@ -11,6 +11,7 @@ const mlx = @import("../../mlx/ffi.zig");
 const kc = @import("../../sdk/testing/kernel_contract/root.zig");
 const host = @import("../../sdk/testing/kernel_contract/host.zig");
 const gather = @import("qsa/gather.zig");
+const device = @import("../../mlx/device.zig");
 
 const spec = kc.spec;
 const metal = kc.metal;
@@ -427,6 +428,7 @@ pub fn register(set: *kc.Set) !void {
             .out = .bf16,
             .served = if (nax) nax_served else served,
             .known = if (nax) inf_nan else null,
+            .nax = nax,
         }, null);
     }
 }
@@ -437,7 +439,7 @@ test "kernel contract qwen4_exp: the declared gathered-attention launches are th
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const a = std.testing.allocator;
     inline for (.{ false, true }) |nax| {
-        if (nax and !gather.qsaNaxEnabled()) return error.SkipZigTest;
+        if (nax and !(gather.qsaNaxEnabled() and device.naxAvailable())) return error.SkipZigTest;
         var k = Gather.init(a, nax);
         defer k.deinit();
         for (if (nax) nax_served else served) |shape| {

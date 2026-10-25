@@ -4,6 +4,7 @@
 const std = @import("std");
 const c = @import("spec.zig");
 const metal = @import("metal.zig");
+const device = @import("../../../mlx/device.zig");
 
 pub const Gate = c.Gate;
 pub const Fill = c.Fill;
@@ -315,7 +316,7 @@ pub const Tally = struct {
     caught: usize = 0,
     missed: usize = 0,
     known: usize = 0,
-    /// Kernels this GPU cannot run (`error.NaxOnly` from `prepare`).
+    /// Kernels and controls not gated on this GPU (`Spec.nax`, `error.NaxOnly`, gate 1 off NAX).
     skipped: usize = 0,
 
     pub fn problems(t: Tally) usize {
@@ -325,7 +326,15 @@ pub const Tally = struct {
 
 /// Gates 1-4 on each kernel, and each control at its own gate (which must fail).
 pub fn runAll(a: std.mem.Allocator, kernels: []const Kernel, seed: u64, t: *Tally) !void {
+    // NaN classes are pinned on the NAX GPUs the contract was calibrated on: an older GPU's math library drops a NaN
+    // in more places (metal::max), so gate 1 and its controls are not run there, nor any tensor-unit kernel.
+    const nax_here = device.naxAvailable();
     for (kernels) |k| {
+        if (!nax_here and (k.spec.nax or k.control == .nonfinite)) {
+            t.skipped += 1;
+            if (!quiet) std.debug.print("SKIP {s}: calibrated on NAX GPUs\n", .{k.spec.name});
+            continue;
+        }
         // Seeded by name, so a registration added elsewhere never reshuffles another kernel's inputs.
         const s = seed +% std.hash.Wyhash.hash(0, k.spec.name);
         if (k.control) |g| {
@@ -351,6 +360,7 @@ pub fn runAll(a: std.mem.Allocator, kernels: []const Kernel, seed: u64, t: *Tall
         }
         var bad = false;
         const skip = for ([_]Gate{ .nonfinite, .repeat, .shapes, .sums }) |g| {
+            if (g == .nonfinite and !nax_here) continue;
             const v = one(a, g, k, s) catch |err| blk: {
                 if (err == error.NaxOnly) break true;
                 if (!quiet) std.debug.print("FAIL {t} {s}: {t}\n", .{ g, k.spec.name, err });

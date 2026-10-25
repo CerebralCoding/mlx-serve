@@ -1889,11 +1889,21 @@ pub fn register(set: *kc.Set) !void {
     inline for (lane_registrations, &lane_launches) |r, *l| {
         if (r[0].kind == .prefill) l.header = try lane_qmm.prefillHeader();
         const tiles: [3]spec.Tile = if (r[0].kind == .prefill) .{ .{}, .{}, .{} } else .{ .{ .size = 16, .step = 1, .min = 1 }, .{}, .{} };
-        try set.add(Lane, .init(a, l, r[0]), affineSpec(laneName(r[0]), .bf16, r[1], tiles, if (r[0].kind == .prefill) "MLX quantized_matmul (its NAX qmm, K unsplit)" else null), null);
+        var sp = affineSpec(laneName(r[0]), .bf16, r[1], tiles, if (r[0].kind == .prefill) "MLX quantized_matmul (its NAX qmm, K unsplit)" else null);
+        sp.nax = r[0].kind == .prefill;
+        try set.add(Lane, .init(a, l, r[0]), sp, null);
     }
-    inline for (.{ .{ "nax2_qmm_m16 f16 (2-bit, group 128)", .float16 }, .{ "nax2_qmm_m16 bf16 (2-bit, group 128)", .bfloat16 } }) |r| try set.add(Nax2, .init(a, r[1]), affineSpec(r[0], host.elemOf(r[1]), &nax2_served, .{ .{ .size = 16, .step = 1, .min = 6 }, .{ .size = 64, .step = 32, .min = 32 }, .{} }, null), null);
+    inline for (.{ .{ "nax2_qmm_m16 f16 (2-bit, group 128)", .float16 }, .{ "nax2_qmm_m16 bf16 (2-bit, group 128)", .bfloat16 } }) |r| {
+        var sp = affineSpec(r[0], host.elemOf(r[1]), &nax2_served, .{ .{ .size = 16, .step = 1, .min = 6 }, .{ .size = 64, .step = 32, .min = 32 }, .{} }, null);
+        sp.nax = true;
+        try set.add(Nax2, .init(a, r[1]), sp, null);
+    }
     // f16 only: the route runs on Hadamard packs, whose activations are f16 (`ModelConfig.actDtype`).
-    inline for (.{ .{ "msv_qmm_int8_prefill f16", .float16, false }, .{ "msv_qmm_int8_prefill f16 (ternary)", .float16, true } }) |r| try set.add(Int8, .init(a, r[1], r[2]), affineSpec(r[0], host.elemOf(r[1]), &int8_served, .{ .{}, .{ .size = 128, .step = 32, .min = 32 }, .{} }, null), null);
+    inline for (.{ .{ "msv_qmm_int8_prefill f16", .float16, false }, .{ "msv_qmm_int8_prefill f16 (ternary)", .float16, true } }) |r| {
+        var sp = affineSpec(r[0], host.elemOf(r[1]), &int8_served, .{ .{}, .{ .size = 128, .step = 32, .min = 32 }, .{} }, null);
+        sp.nax = true;
+        try set.add(Int8, .init(a, r[1], r[2]), sp, null);
+    }
     try set.add(Router, .init(a), affineSpec("msv_rowqmv_router bf16", .bf16, comptime &.{ shp(1, 128, 2688), shp(16, 128, 2688) }, .{ .{ .size = 8, .step = 1, .min = 1 }, .{}, .{} }, null), null);
     try set.add(Iq, .init(a, false), iqSpec("msv_int8_quant f16", 128), null);
     try set.add(Iq, .init(a, true), iqSpec("msv_int8_rotate_quant f16", 1024), null);

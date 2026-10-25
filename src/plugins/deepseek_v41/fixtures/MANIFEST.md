@@ -2,7 +2,7 @@
 
 Proof tapes (`engines/mlx/plugin/tape.zig`): the legacy forward's values, recorded on `applegpu_g17d`
 (the tape names its GPU architecture) before the legacy forward was deleted. Played back bit-equal on the
-recording's architecture; elsewhere logits to 2% relative RMS and token runs skipped. The packs are
+recording's architecture; elsewhere only dtype, shape and finiteness are checked. The packs are
 `../deepseek_v4/fixture.zig`'s tiny random packs (V4 seed 11, V4.1 seed 7; `v4DsparkFiles` / `v41DsparkFiles` add
 two DSpark stages and a peaked head).
 

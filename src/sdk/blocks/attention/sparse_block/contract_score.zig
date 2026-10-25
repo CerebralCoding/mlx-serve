@@ -164,6 +164,7 @@ const relu_drops_nan: spec.Known = .{ .gate = .nonfinite, .finding = "relu runs 
 pub fn register(set: *kc.Set) !void {
     try set.add(Score, .init(set.a), .{
         .name = "qsa_score f32 (4 heads, relu, summed; NAX)",
+        .nax = true,
         .accum = .f32,
         .depth = depth,
         .out = .f32,

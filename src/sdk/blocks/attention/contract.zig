@@ -2667,6 +2667,7 @@ const q8_scales_known = spec.Known{ .gate = .shapes, .finding = "msv_nax_attn_25
 fn naxSpec(comptime name: []const u8, cfg: NaxCfg, served: []const Shape) spec.Spec {
     return .{
         .name = name,
+        .nax = true,
         .accum = .f32,
         .depth = host.depthOne,
         .out = if (NaxAttn.last(cfg.phase)) host.elemOf(cfg.dt) else .f32,
@@ -2703,7 +2704,11 @@ pub fn register(set: *kc.Set) !void {
     try set.add(RowMerge, .init(a, &row_merge_launch), winSpec("msv_row_attn_merge", .bf16, qk(&.{ .{ 6, 1, 3 }, .{ 24, 8, 6 }, .{ 6, 16, 5 } }), 0), null);
     inline for (qkv_registrations) |r| try set.add(Qkv, .init(a, r[3], r[1]), qkvSpec(r[0], r[1], r[2]), null);
     inline for (nax_registrations) |r| try set.add(NaxAttn, .init(a, r[3], r[1]), naxSpec(r[0], r[1], r[2]), null);
-    inline for (lane_registrations) |r| try set.add(Lane, .init(a, r[1], r[2], r[3], r[4]), winSpec(r[0], if (r[2] == .merge) .bf16 else .f32, r[5], if (r[2] == .merge) 0 else LANE_CK), null);
+    inline for (lane_registrations) |r| {
+        var sp = winSpec(r[0], if (r[2] == .merge) .bf16 else .f32, r[5], if (r[2] == .merge) 0 else LANE_CK);
+        sp.nax = r[2] != .merge;
+        try set.add(Lane, .init(a, r[1], r[2], r[3], r[4]), sp, null);
+    }
 }
 
 // ── tests ──

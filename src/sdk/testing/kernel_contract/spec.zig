@@ -119,6 +119,8 @@ pub const Spec = struct {
     served: []const Shape,
     sums: Sums = .{},
     known: ?Known = null,
+    /// It runs on the tensor units: the engine calls it only where `naxAvailable()`, so elsewhere it is not gated.
+    nax: bool = false,
 };
 
 /// One output of a kernel whose outputs differ in type (`Spec.outs`).
