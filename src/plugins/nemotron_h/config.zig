@@ -107,7 +107,7 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
     if (json.object(json.field(root, "quantization_config"))) |qc| if (json.field(qc, "quant_method") != null)
         return unsupported("a quantization_config block");
     var c = readConfig(root, cfg) catch |e| return switch (e) {
-        error.Unsupported => unsupported("a shape this plugin does not serve"),
+        error.Unsupported => unsupported("a shape or quantization mode this plugin does not serve"),
         error.Invalid => invalid("a config value out of range"),
     };
 
