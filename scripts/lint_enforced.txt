@@ -2,3 +2,4 @@
 # P5 turns rules on one by one; every other rule is report-only.
 pin-unmatched
 source-scan-test
+history-comment
