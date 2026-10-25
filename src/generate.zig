@@ -128,8 +128,8 @@ pub const SpecDisableReason = enum {
     none,
     acceptance,
     max_ctx,
-    /// A thinking budget closed the thought through a plain forward; the spec
-    /// state is not resynced, the answer decodes regular.
+    /// A thinking budget closed the thought through a plain forward; a spec mode
+    /// other than MTP is not resynced, the answer decodes regular.
     think_bound,
     /// A forced tool-call opener went through a plain forward (`ToolForce`).
     tool_choice,
@@ -8601,6 +8601,27 @@ pub const Generator = struct {
         if (out.logits.ctx != null) _ = mlx.mlx_array_free(out.logits);
         if (out.hidden_next.ctx != null) _ = mlx.mlx_array_free(out.hidden_next);
         if (out.rerank_x.ctx != null) _ = mlx.mlx_array_free(out.rerank_x);
+    }
+
+    /// A forced commit (`commitForcedTokens`) ran plain through the trunk, so the head's history
+    /// has a hole. Re-seed a qwen4 head (its positions refuse a gap) and take the serial exit
+    /// ramp back to MTP. False = not an MTP slot that may resume: the caller disables spec.
+    pub fn mtpResumeAfterForced(self: *Generator, allocator: std.mem.Allocator) !bool {
+        if (self.mtp == null or self.mtp_cache == null or !self.mtpAdaptiveHeadMayResume()) return false;
+        try self.mtpDetachHead(allocator, false);
+        switch (self.mtp_cache.?) {
+            .qwen4 => |r| {
+                if (self.mtp_hist_stash) |*st| st.deinit();
+                self.mtp_hist_stash = null;
+                r.t.qwen4MtpActivate(r.st);
+                try r.t.qwen4MtpReset();
+            },
+            else => {},
+        }
+        self.spec_disabled_runtime = false;
+        self.spec_disable_reason = .none;
+        self.mtp_serial_exit = .drain;
+        return true;
     }
 
     fn mtpSerialOneToken(allocator: std.mem.Allocator, tok: u32) !DrafterStepResult {

@@ -9301,8 +9301,8 @@ fn loopGuardTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
 }
 
 /// A thinking budget at its limit: commit the early-stop line and the closer
-/// through the model this tick, and decode the answer regular from here on
-/// (`spec_disable_reason = .think_bound`). True = the slot's tick is spent.
+/// through the model this tick; an MTP slot ramps back to speculating, any other
+/// spec mode decodes regular (`spec_disable_reason = .think_bound`). True = the slot's tick is spent.
 fn thinkBoundTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
     const tb = gen.sampling.think_bound orelse return false;
     tb.observe(gen.generated_ids.items);
@@ -9352,14 +9352,11 @@ fn commitForcedTick(sch: *Scheduler, slot: *Slot, gen: *Generator, forced: []con
         finishSlot(sch, slot, gen.finish_reason);
         return false;
     }
-    gen.spec_disabled_runtime = true;
-    gen.spec_disable_reason = reason;
+    if (!try gen.mtpResumeAfterForced(slot.allocator)) {
+        gen.spec_disabled_runtime = true;
+        gen.spec_disable_reason = reason;
+    }
     return true;
-}
-
-fn thinkBoundFired(gen: *const Generator) bool {
-    const tb = gen.sampling.think_bound orelse return false;
-    return tb.fired;
 }
 
 fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
@@ -9411,7 +9408,7 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
     // disabled branch is also where the mid-request RE-ENABLE check lives
     // (bypassing it pinned PLD off for the rest of the request even when the
     // generated tail turned echo-heavy).
-    const tick_mode: SpecTickMode = if ((Planner.enabled() and slot.planner_force_plain) or thinkBoundFired(gen)) .regular else specTickMode(
+    const tick_mode: SpecTickMode = if (Planner.enabled() and slot.planner_force_plain) .regular else specTickMode(
         slot.enable_mtp,
         gen.mtp != null,
         slot.enable_drafter,
