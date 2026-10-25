@@ -12,8 +12,8 @@ const attn256 = @import("../../../sdk/blocks/attention/attn256.zig");
 
 /// `--prefill-chunk` for an embedded engine's u32 chunk (ds4): 0 = the engine's default.
 pub fn explicitPrefillChunkU32() u32 {
-    if (!generate_mod.prefill_chunk_explicit) return 0;
-    return std.math.cast(u32, generate_mod.prefill_chunk_override) orelse std.math.maxInt(u32);
+    if (!generate_mod.prefillCli().explicit) return 0;
+    return std.math.cast(u32, generate_mod.prefillCli().override) orelse std.math.maxInt(u32);
 }
 
 /// THIS model's greedy tail: its `mtp_greedy_tail` outranks `--mtp-greedy-tail`.
@@ -165,13 +165,13 @@ pub fn effectivePrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, slid
     // the widest chunk whose one-off transient reserve still leaves this box a
     // real KV budget. It NARROWS, never raises, and an explicit
     // `--prefill-chunk` outranks it — the operator asked for a width.
-    const launch: usize = if (head_dim == 0 and !generate_mod.prefill_chunk_explicit) WIDE_PREFILL_CHUNK else generate_mod.prefill_chunk_override;
-    const base: usize = if (generate_mod.prefill_chunk_explicit)
+    const launch: usize = if (head_dim == 0 and !generate_mod.prefillCli().explicit) WIDE_PREFILL_CHUNK else generate_mod.prefillCli().override;
+    const base: usize = if (generate_mod.prefillCli().explicit)
         launch
     else if (pinned_chunk == 0)
-        @min(launch, generate_mod.machine_prefill_chunk_cap)
+        @min(launch, generate_mod.prefillCli().machine_cap)
     else
-        @min(launch, pinned_chunk, generate_mod.machine_prefill_chunk_cap);
+        @min(launch, pinned_chunk, generate_mod.prefillCli().machine_cap);
     return boundedPrefillChunk(base, head_dim, n_heads, total_ctx, sliding_band_arch, is_moe, long_ctx_gated);
 }
 
@@ -435,14 +435,14 @@ pub fn clearsPoolAtPrefillEnd(config: *const model_mod.ModelConfig) bool {
 
 
 test "decodeShareCapped: the share cap narrows an explicit and an env width" {
-    const saved_override = generate_mod.prefill_chunk_override;
-    const saved_explicit = generate_mod.prefill_chunk_explicit;
+    const saved_override = generate_mod.prefillCli().override;
+    const saved_explicit = generate_mod.prefillCli().explicit;
     defer {
-        generate_mod.prefill_chunk_override = saved_override;
-        generate_mod.prefill_chunk_explicit = saved_explicit;
+        generate_mod.prefillCli().override = saved_override;
+        generate_mod.prefillCli().explicit = saved_explicit;
     }
-    generate_mod.prefill_chunk_override = 8192;
-    generate_mod.prefill_chunk_explicit = true;
+    generate_mod.prefillCli().override = 8192;
+    generate_mod.prefillCli().explicit = true;
     const explicit = effectivePrefillChunk(128, 8, 1024, false, false, false, 2048);
     try std.testing.expectEqual(@as(usize, 8192), explicit);
     try std.testing.expectEqual(@as(usize, 1024), decodeShareCapped(explicit, 1024));
@@ -450,22 +450,22 @@ test "decodeShareCapped: the share cap narrows an explicit and an env width" {
 }
 
 test "effectivePrefillChunk: the machine cap bounds every auto width, an explicit width passes" {
-    const saved_cap = generate_mod.machine_prefill_chunk_cap;
-    const saved_explicit = generate_mod.prefill_chunk_explicit;
-    const saved_override = generate_mod.prefill_chunk_override;
+    const saved_cap = generate_mod.prefillCli().machine_cap;
+    const saved_explicit = generate_mod.prefillCli().explicit;
+    const saved_override = generate_mod.prefillCli().override;
     defer {
-        generate_mod.machine_prefill_chunk_cap = saved_cap;
-        generate_mod.prefill_chunk_explicit = saved_explicit;
-        generate_mod.prefill_chunk_override = saved_override;
+        generate_mod.prefillCli().machine_cap = saved_cap;
+        generate_mod.prefillCli().explicit = saved_explicit;
+        generate_mod.prefillCli().override = saved_override;
     }
-    generate_mod.machine_prefill_chunk_cap = 2048;
-    generate_mod.prefill_chunk_explicit = false;
-    generate_mod.prefill_chunk_override = WIDE_PREFILL_CHUNK;
+    generate_mod.prefillCli().machine_cap = 2048;
+    generate_mod.prefillCli().explicit = false;
+    generate_mod.prefillCli().override = WIDE_PREFILL_CHUNK;
     // A per-request rung (8192) and an unpinned adaptive cap (0) both stop at the machine's cap.
     try std.testing.expectEqual(@as(usize, 2048), effectivePrefillChunk(256, 24, 16384, false, true, true, 8192));
     try std.testing.expectEqual(@as(usize, 2048), effectivePrefillChunk(256, 24, 16384, false, true, true, 0));
-    generate_mod.prefill_chunk_explicit = true;
-    generate_mod.prefill_chunk_override = 8192;
+    generate_mod.prefillCli().explicit = true;
+    generate_mod.prefillCli().override = 8192;
     try std.testing.expectEqual(@as(usize, 8192), effectivePrefillChunk(256, 24, 16384, false, true, true, 8192));
 }
 
@@ -540,7 +540,7 @@ test "a width that changes at every boundary never moves a checkpoint" {
 
 test "every ladder rung the adaptive width can take divides the checkpoint stride" {
     const t = testing;
-    const stride = effectiveSsmCheckpointStride(256, generate_mod.prefill_chunk_override);
+    const stride = effectiveSsmCheckpointStride(256, generate_mod.prefillCli().override);
     try t.expect(stride > 0);
     for ([_]usize{ 8192, 4096, 2048, 1024, PREFILL_CHUNK_FLOOR }) |rung| {
         try t.expect(rung <= stride);
@@ -877,20 +877,20 @@ test "boundedPrefillChunk: MiMo builds no prefill score tensor, so its chunk nev
 }
 
 test "effectivePrefillChunk: an arch with no prefill score tensor defaults to the wide chunk, still under the pin and an explicit width" {
-    const saved = .{ generate_mod.prefill_chunk_override, generate_mod.prefill_chunk_explicit };
+    const saved = .{ generate_mod.prefillCli().override, generate_mod.prefillCli().explicit };
     defer {
-        generate_mod.prefill_chunk_override = saved[0];
-        generate_mod.prefill_chunk_explicit = saved[1];
+        generate_mod.prefillCli().override = saved[0];
+        generate_mod.prefillCli().explicit = saved[1];
     }
-    generate_mod.prefill_chunk_override = 8192;
-    generate_mod.prefill_chunk_explicit = false;
+    generate_mod.prefillCli().override = 8192;
+    generate_mod.prefillCli().explicit = false;
     try testing.expectEqual(WIDE_PREFILL_CHUNK, effectivePrefillChunk(0, 64, 32768, true, true, false, 0));
     try testing.expectEqual(WIDE_PREFILL_CHUNK, effectivePrefillChunk(0, 64, 32768, true, true, false, WIDE_PREFILL_CHUNK));
     try testing.expectEqual(@as(usize, 8192), effectivePrefillChunk(0, 64, 32768, true, true, false, 8192));
     // Every other arch keeps the launch width.
     try testing.expectEqual(@as(usize, 8192), effectivePrefillChunk(128, 32, 32768, false, false, false, WIDE_PREFILL_CHUNK));
-    generate_mod.prefill_chunk_override = 4096;
-    generate_mod.prefill_chunk_explicit = true;
+    generate_mod.prefillCli().override = 4096;
+    generate_mod.prefillCli().explicit = true;
     try testing.expectEqual(@as(usize, 4096), effectivePrefillChunk(0, 64, 32768, true, true, false, WIDE_PREFILL_CHUNK));
 }
 
@@ -1066,16 +1066,16 @@ test "reservedPrefillTokens: every arch reserves its prompt; only qwen4_exp pre-
 }
 
 test "explicitPrefillChunkU32: unset is 0, a flag past u32 clamps instead of overflowing" {
-    const saved = .{ generate_mod.prefill_chunk_explicit, generate_mod.prefill_chunk_override };
+    const saved = .{ generate_mod.prefillCli().explicit, generate_mod.prefillCli().override };
     defer {
-        generate_mod.prefill_chunk_explicit = saved[0];
-        generate_mod.prefill_chunk_override = saved[1];
+        generate_mod.prefillCli().explicit = saved[0];
+        generate_mod.prefillCli().override = saved[1];
     }
-    generate_mod.prefill_chunk_explicit = false;
+    generate_mod.prefillCli().explicit = false;
     try std.testing.expectEqual(@as(u32, 0), explicitPrefillChunkU32());
-    generate_mod.prefill_chunk_explicit = true;
-    generate_mod.prefill_chunk_override = 256;
+    generate_mod.prefillCli().explicit = true;
+    generate_mod.prefillCli().override = 256;
     try std.testing.expectEqual(@as(u32, 256), explicitPrefillChunkU32());
-    generate_mod.prefill_chunk_override = 5_000_000_000;
+    generate_mod.prefillCli().override = 5_000_000_000;
     try std.testing.expectEqual(std.math.maxInt(u32), explicitPrefillChunkU32());
 }

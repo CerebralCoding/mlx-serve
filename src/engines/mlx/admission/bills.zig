@@ -373,7 +373,7 @@ pub fn retainedSsmCheckpointBytes(config: *const model_mod.ModelConfig, seq: u64
     if (per_cp == 0 or http_server.launch().ssm_checkpoint_stride == 0) return 0;
     const stride: u64 = generate_mod.effectiveSsmCheckpointStride(
         http_server.launch().ssm_checkpoint_stride,
-        @max(@as(usize, @intCast(chunk)), generate_mod.prefill_chunk_override),
+        @max(@as(usize, @intCast(chunk)), generate_mod.prefillCli().override),
     );
     if (stride == 0) return 0;
     // Stride-aligned capture positions in `(matched, seq]` plus the always-on end-of-prompt

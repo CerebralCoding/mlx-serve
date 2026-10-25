@@ -148,8 +148,8 @@ pub fn resolvePrefillChunk(
 /// The width `--prefill-chunk` asked for, or 0. The bill must let it outrank the pin as the
 /// forward does: `--prefill-chunk 4096` used to run against a 512-token reserve.
 pub fn explicitPrefillChunk() u32 {
-    if (!generate_mod.prefill_chunk_explicit) return 0;
-    const raw: usize = @min(generate_mod.prefill_chunk_override, @as(usize, std.math.maxInt(u32)));
+    if (!generate_mod.prefillCli().explicit) return 0;
+    const raw: usize = @min(generate_mod.prefillCli().override, @as(usize, std.math.maxInt(u32)));
     return @intCast(raw);
 }
 
@@ -220,10 +220,10 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
         // primary or on-demand load) — a narrowed prefill otherwise reads as an
         // unexplained slowdown. mlx-stream takes GLM-5.3's whole prompt in one
         // forward and chunks it itself.
-        if (config.pinned_prefill_chunk < generate_mod.prefill_chunk_override and
-            !generate_mod.prefill_chunk_explicit and !config.glm_stream)
+        if (config.pinned_prefill_chunk < generate_mod.prefillCli().override and
+            !generate_mod.prefillCli().explicit and !config.glm_stream)
         {
-            log.info("Prefill chunk: {d} tokens (memory-sized down from {d}; --prefill-chunk overrides)\n", .{ config.pinned_prefill_chunk, generate_mod.prefill_chunk_override });
+            log.info("Prefill chunk: {d} tokens (memory-sized down from {d}; --prefill-chunk overrides)\n", .{ config.pinned_prefill_chunk, generate_mod.prefillCli().override });
         }
     }
     return config.pinned_prefill_chunk;
@@ -639,9 +639,9 @@ test "the SSD-first budget bills the FLOOR reserve, at the deployed pack's live 
     cfg.pinned_context = 0;
     per_request_chunk_override = true;
     defer per_request_chunk_override = null;
-    const orig_explicit = generate_mod.prefill_chunk_explicit;
-    defer generate_mod.prefill_chunk_explicit = orig_explicit;
-    generate_mod.prefill_chunk_explicit = false;
+    const orig_explicit = generate_mod.prefillCli().explicit;
+    defer generate_mod.prefillCli().explicit = orig_explicit;
+    generate_mod.prefillCli().explicit = false;
 
     // The pure chunk resolver: `pinPrefillChunk` reads live memory.
     const chunk: u32 = @intCast(generate_mod.effectivePrefillChunk(
@@ -914,11 +914,11 @@ test "clampReserveWidth: the load-time reserve is a promise to the FIRST request
     }
 
     // An explicit --prefill-chunk is billed as-is.
-    generate_mod.prefill_chunk_override = 4096;
-    generate_mod.prefill_chunk_explicit = true;
+    generate_mod.prefillCli().override = 4096;
+    generate_mod.prefillCli().explicit = true;
     const pinned = planHotCache(&cfg, kv_bits, weights + 43_000 * MiB, weights, ctx_tokens, 0, 10 * GiB, explicitPrefillChunk());
-    generate_mod.prefill_chunk_override = 8192;
-    generate_mod.prefill_chunk_explicit = false;
+    generate_mod.prefillCli().override = 8192;
+    generate_mod.prefillCli().explicit = false;
     try t.expectEqual(@as(u32, 4096), pinned.reserve_chunk);
     try t.expectEqual(prefillTransientReserve(&cfg, kv_bits, 4096), pinned.reserve);
 
@@ -979,9 +979,9 @@ test "chooseRequestPrefillChunk: the machine's chunk cap bounds the per-request 
     const t = std.testing;
     sparse_score.qsa_score_fused_override = false;
     defer sparse_score.qsa_score_fused_override = null;
-    const saved = generate_mod.machine_prefill_chunk_cap;
-    defer generate_mod.machine_prefill_chunk_cap = saved;
-    generate_mod.machine_prefill_chunk_cap = autoPrefillChunkCap(true);
+    const saved = generate_mod.prefillCli().machine_cap;
+    defer generate_mod.prefillCli().machine_cap = saved;
+    generate_mod.prefillCli().machine_cap = autoPrefillChunkCap(true);
     const cfg = qwen4RequestTestConfig();
     const available: u64 = 28_909 << 20;
     try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&cfg, 10_406, 2048, 8, available, cfg.pinned_prefill_chunk, 0, .{}));
@@ -1182,11 +1182,11 @@ test "admission tries the ladder DOWN before refusing: a prompt that fits only a
     per_request_chunk_override = null;
 
     // An explicit `--prefill-chunk` keeps the refusal: the operator chose the width.
-    generate_mod.prefill_chunk_override = 4096;
-    generate_mod.prefill_chunk_explicit = true;
+    generate_mod.prefillCli().override = 4096;
+    generate_mod.prefillCli().explicit = true;
     defer {
-        generate_mod.prefill_chunk_override = 8192;
-        generate_mod.prefill_chunk_explicit = false;
+        generate_mod.prefillCli().override = 8192;
+        generate_mod.prefillCli().explicit = false;
     }
     const forced = chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, available, pin, explicitPrefillChunk(), .{});
     try t.expectEqual(@as(u32, 4096), forced);
@@ -1667,11 +1667,11 @@ test "adaptivePrefillChunkEnabled: the arch, both kill switches, and any pinned 
     adaptive_chunk_override = null;
 
     // An operator who pinned a width pinned every forward.
-    generate_mod.prefill_chunk_override = 4096;
-    generate_mod.prefill_chunk_explicit = true;
+    generate_mod.prefillCli().override = 4096;
+    generate_mod.prefillCli().explicit = true;
     defer {
-        generate_mod.prefill_chunk_override = 8192;
-        generate_mod.prefill_chunk_explicit = false;
+        generate_mod.prefillCli().override = 8192;
+        generate_mod.prefillCli().explicit = false;
     }
     try t.expect(!adaptivePrefillChunkEnabled(&cfg));
 }

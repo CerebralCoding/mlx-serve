@@ -40,8 +40,10 @@ pub const table: host.Api = .{
     .run_generation = runGeneration,
     .compute_embeddings = computeEmbeddings,
     .encode_vision = encodeVision,
+    .timestamp_classes = timestampClasses,
     .batches_decode = verdict.configBatchesDecode,
     .facts = facts,
+    .draft_stages = request_policy.dsv4DraftStages,
     .supports_video = supportsVideo,
     .pair_fields = pairFields,
     .settings = configure_mod.settings,
@@ -133,6 +135,12 @@ fn encodeVision(sch: *Scheduler, req: *requests.VisionEncodeRequest, out: *mlx.m
     return null;
 }
 
+fn timestampClasses(gpa: std.mem.Allocator, lm: *LoadedModel, ids: []const u32, rows: mlx.mlx_array, timestamp_token: u32, out: *[]u32) ?[]const u8 {
+    const xfm = lm.transformer orelse return "NotLoaded";
+    out.* = @import("../../plugins/qwen3_asr/forced_align.zig").timestampClasses(gpa, xfm, ids, rows, timestamp_token) catch |e| return @errorName(e);
+    return null;
+}
+
 fn pairFields(gpa: std.mem.Allocator) ?[]u8 {
     return distributed.pairFields(gpa) catch null;
 }
@@ -147,7 +155,6 @@ fn supportsVideo(lm: *const LoadedModel) bool {
 fn facts(lm: *const LoadedModel, out: *host.Facts) void {
     out.* = .{
         .has_mtp = lm.mtp != null,
-        .draft_stages = request_policy.dsv4DraftStages(lm),
         .has_transformer = lm.transformer != null,
         .module_owned = if (lm.transformer) |t| t.ownsModuleDecodeState() else false,
         .images = if (lm.vision_encoder) |ve| ve.supportsImages() else false,

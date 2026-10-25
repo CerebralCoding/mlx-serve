@@ -240,7 +240,7 @@ pub fn initWithOptions(
     // 255K ctx otherwise). nextChunkEnd already shortens a chunk to land
     // on stride boundaries, so a capped chunk stays compatible.
     const ssm_cp_stride: usize = if (want_ssm_cp)
-        effectiveSsmCheckpointStride(@intCast(options.ssm_checkpoint_stride), @max(PREFILL_CHUNK, generate_mod.prefill_chunk_override))
+        effectiveSsmCheckpointStride(@intCast(options.ssm_checkpoint_stride), @max(PREFILL_CHUNK, generate_mod.prefillCli().override))
     else
         0;
     // Absolute KV position of `prompt_ids[0]`. Warm-path callers (the

@@ -98,24 +98,26 @@ pub const MAX_TOP_LOGPROBS = @import("sampling/logprobs.zig").MAX_TOP_LOGPROBS;
 pub const promptLogprobs = @import("sampling/logprobs.zig").promptLogprobs;
 
 
-/// Module-level overrides for prefill behavior. Defaults match the original
-/// hardcoded values; main.zig may overwrite these from CLI flags before
-/// `serve()` runs. Per-request reads happen on the same thread that did the
-/// CLI parse, so no atomicity needed.
-pub var prefill_chunk_override: usize = 8192;
+/// The launch's prefill chunk settings, set once from the CLI before `serve()` runs (`configure.apply`); one copy for
+/// every compile unit, since a plugin unit sizes chunks too (`Shared`).
+pub const PrefillCli = struct {
+    /// The chunk width: `--prefill-chunk`, else the default.
+    override: usize = 8192,
+    /// Set by `--prefill-chunk`. An operator-chosen width outranks the per-model chunk the memory sizer pins
+    /// (`ModelConfig.pinned_prefill_chunk`); without this flag the default 8192 is indistinguishable from a request.
+    explicit: bool = false,
+    /// The widest chunk this machine runs without `--prefill-chunk` (`autoPrefillChunkCap`). Every auto width obeys
+    /// it, the per-request and adaptive rungs included.
+    machine_cap: usize = std.math.maxInt(usize),
+};
+pub const prefillCli_shared = @import("../../sdk/util/shared.zig").Shared(PrefillCli, "prefill_cli", .{});
+pub inline fn prefillCli() *PrefillCli {
+    return prefillCli_shared.get();
+}
 /// Default chunk of an arch that builds no prefill score tensor (score width 0):
 /// only its MoE gather transient grows with the chunk, and the guard bills that.
 pub const WIDE_PREFILL_CHUNK: usize = 16384;
 
-/// Set by `--prefill-chunk` in main.zig. An operator-chosen width outranks the
-/// per-model chunk the memory sizer pins (`ModelConfig.pinned_prefill_chunk`);
-/// without this flag the default 8192 is indistinguishable from a request.
-/// Same set-once-at-CLI-parse contract as `prefill_chunk_override`.
-pub var prefill_chunk_explicit: bool = false;
-
-/// The widest chunk this machine runs without `--prefill-chunk` (`server.autoPrefillChunkCap`),
-/// set once by main.zig. Every auto width obeys it, the per-request and adaptive rungs included.
-pub var machine_prefill_chunk_cap: usize = std.math.maxInt(usize);
 pub var prefill_trace_force: bool = false;
 
 /// Set once by the serve CLI before request construction. Direct callers may
@@ -126,7 +128,7 @@ pub var mtp_acceptance_default: mtp_acceptance.Mode = .exact;
 pub var mtp_greedy_tail_default: bool = false;
 
 /// MTP prefill-history window (`--mtp-history-window`; 0 = full history).
-/// Same set-once-at-CLI-parse contract as `prefill_chunk_override`.
+/// Same set-once-at-CLI-parse contract as `PrefillCli`.
 /// DEFAULT 0 (full): the A/B gate failed for windowing — at 64K ctx on the
 /// stock Qwen3.6-27B head, window 8192 cost 14 acceptance points (68.2% ->
 /// 54.0%) and 4.2 decode tok/s for ZERO prefill benefit (184.7 vs 185.1

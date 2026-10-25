@@ -17,10 +17,10 @@ const mlx_stream = if (@import("build_options").mlx_stream) @import("modules/str
 
 pub fn settings(out: *host.Settings) void {
     out.* = .{
-        .prefill_chunk = generate_mod.prefill_chunk_override,
+        .prefill_chunk = generate_mod.prefillCli().override,
         .max_mtp_ctx = generate_mod.max_mtp_ctx,
         .prefill_decode_share = prefill_interleave.prefillDecodeShare(),
-        .mtp_head_kv_quant = @import("transformer.zig").Transformer.mtp_head_kv_quant_flag,
+        .mtp_head_kv_quant = @import("transformer.zig").cli().mtp_head_kv_quant,
         .explicit_prefill_chunk = generate_mod.explicitPrefillChunkU32(),
     };
 }
@@ -87,12 +87,12 @@ pub fn apply(f: *const host.Flags) void {
     generate_mod.max_mtp_ctx = f.max_mtp_ctx;
     generate_mod.mtp_history_window_override = f.mtp_history_window;
     if (f.prefill_chunk) |w| {
-        generate_mod.prefill_chunk_override = w;
-        generate_mod.prefill_chunk_explicit = true;
+        generate_mod.prefillCli().override = w;
+        generate_mod.prefillCli().explicit = true;
     }
     generate_mod.prefill_trace_force = f.prefill_trace;
-    generate_mod.machine_prefill_chunk_cap = @import("admission/prefill_chunk.zig").autoPrefillChunkCap(@import("../../mlx/ffi.zig").cudaAvailable());
+    generate_mod.prefillCli().machine_cap = @import("admission/prefill_chunk.zig").autoPrefillChunkCap(@import("../../mlx/ffi.zig").cudaAvailable());
     scheduler_mod.prefill_decode_share = f.prefill_decode_share;
-    @import("transformer.zig").Transformer.mtp_head_kv_quant_flag = f.mtp_head_kv_quant;
+    @import("transformer.zig").cli().mtp_head_kv_quant = f.mtp_head_kv_quant;
     generate_mod.mtp_acceptance_default = f.mtp_acceptance;
 }

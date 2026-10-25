@@ -142,7 +142,7 @@ pub const DflashConfig = struct {
 /// Does this config.json declare the DFlash contract? ALL THREE fields must
 /// be present — `model_type` (`*_assistant`) is only the discovery-level
 /// "this is a drafter" signal, never the DFlash detection.
-pub const isDflashConfigJson = contract.isDflashConfigJson;
+pub const isDflashConfigJson = dflash_contract.isDflashConfigJson;
 
 /// The object holding the DFlash contract triple: DFlash2 checkpoints nest it
 /// under `dflash_config`, v1 assistants declare it at the root. Null when
@@ -151,9 +151,9 @@ pub const isDflashConfigJson = contract.isDflashConfigJson;
 /// splits the triple across both (`block_size` at the root, the rest under
 /// `dflash_config`), so neither object alone answers the question and a
 /// nested-only reader silently classifies the sidecar as "not a drafter".
-const contract = @import("../../../../sdk/spec/dflash_contract.zig");
-const Contract = contract.Contract;
-const dflashContractObject = contract.object;
+const dflash_contract = @import("../../../../sdk/spec/dflash_contract.zig");
+const Contract = dflash_contract.Contract;
+const dflashContractObject = dflash_contract.object;
 
 /// The width a DFlash sidecar at `dir` is quantized to at load: 0 when it is
 /// not one, ships packed already (`quantization` in its config) or loads dense.

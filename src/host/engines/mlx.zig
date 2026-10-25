@@ -47,9 +47,13 @@ pub const Api = struct {
     run_generation: *const fn (*Scheduler, *requests.GenRequest) Err,
     compute_embeddings: *const fn (*Scheduler, *requests.EmbedRequest, *[][]f32) Err,
     encode_vision: *const fn (*Scheduler, *requests.VisionEncodeRequest, *mlx.mlx_array) Err,
+    /// Qwen3-ForcedAligner: the 80 ms step each `<timestamp>` in `ids` lands on, run on the inference thread.
+    timestamp_classes: *const fn (std.mem.Allocator, *LoadedModel, []const u32, mlx.mlx_array, u32, *[]u32) Err,
     // ── what the host reports
     batches_decode: *const fn (*const ModelConfig) bool,
     facts: *const fn (*const LoadedModel, *Facts) void,
+    /// DeepSeek-V4/V4.1 with DSpark draft stages loaded: MTP-capable without a head.
+    draft_stages: *const fn (*const LoadedModel) bool,
     supports_video: *const fn (*const LoadedModel) bool,
     pair_fields: *const fn (std.mem.Allocator) ?[]u8,
     settings: *const fn (*Settings) void,
@@ -96,8 +100,6 @@ pub const PluginStub = struct { shell: abi_plugin.Shell, caps: abi_plugin.Caps }
 /// What the host reads about a loaded MLX model.
 pub const Facts = struct {
     has_mtp: bool = false,
-    /// DeepSeek-V4 draft stages: MTP-capable without a head.
-    draft_stages: bool = false,
     has_transformer: bool = false,
     /// The model keeps per-request decode state outside the KV cache (no prompt logprobs, no prefix reuse).
     module_owned: bool = false,
@@ -205,6 +207,12 @@ pub fn computeEmbeddings(sch: *Scheduler, req: *requests.EmbedRequest) ![][]f32 
 pub fn encodeVision(sch: *Scheduler, req: *requests.VisionEncodeRequest) !mlx.mlx_array {
     var out: mlx.mlx_array = .{ .ctx = null };
     try err_name.check(api().encode_vision(sch, req, &out));
+    return out;
+}
+
+pub fn timestampClasses(gpa: std.mem.Allocator, lm: *LoadedModel, ids: []const u32, rows: mlx.mlx_array, timestamp_token: u32) ![]u32 {
+    var out: []u32 = &.{};
+    try err_name.check(api().timestamp_classes(gpa, lm, ids, rows, timestamp_token, &out));
     return out;
 }
 

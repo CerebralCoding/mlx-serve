@@ -262,11 +262,11 @@ test "an explicit --prefill-chunk is the chunk that gets BILLED" {
     // Squeezed so the machine sizer would step below the flag.
     const ceiling: u64 = weights + 6 * GiB;
 
-    generate_mod.prefill_chunk_override = 4096;
-    generate_mod.prefill_chunk_explicit = true;
+    generate_mod.prefillCli().override = 4096;
+    generate_mod.prefillCli().explicit = true;
     defer {
-        generate_mod.prefill_chunk_override = 8192;
-        generate_mod.prefill_chunk_explicit = false;
+        generate_mod.prefillCli().override = 8192;
+        generate_mod.prefillCli().explicit = false;
     }
     try t.expectEqual(@as(u32, 4096), explicitPrefillChunk());
     const sized = resolvePrefillChunk(&cfg, kv_bits, ceiling, weights, 0, 0);
@@ -710,11 +710,11 @@ test "resolvePrefillChunk: the sizer and the guard bill the chunk that was pinne
         unpinned_prefill_chunk,
     ));
     // An explicit --prefill-chunk outranks the pin in BOTH directions.
-    generate_mod.prefill_chunk_override = 2048;
-    generate_mod.prefill_chunk_explicit = true;
+    generate_mod.prefillCli().override = 2048;
+    generate_mod.prefillCli().explicit = true;
     defer {
-        generate_mod.prefill_chunk_override = 8192;
-        generate_mod.prefill_chunk_explicit = false;
+        generate_mod.prefillCli().override = 8192;
+        generate_mod.prefillCli().explicit = false;
     }
     try t.expectEqual(@as(usize, 2048), generate_mod.effectivePrefillChunk(
         cfg.prefillScoreHeadDim(),
@@ -1606,9 +1606,9 @@ test "a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's
     const matched: u64 = 364_478;
     const chunk: u64 = 512;
     // The stride follows the uncapped base chunk (`prefill_chunk_override`), not the adaptive width.
-    const saved_override = generate_mod.prefill_chunk_override;
-    defer generate_mod.prefill_chunk_override = saved_override;
-    generate_mod.prefill_chunk_override = 8192;
+    const saved_override = generate_mod.prefillCli().override;
+    defer generate_mod.prefillCli().override = saved_override;
+    generate_mod.prefillCli().override = 8192;
     const stride: u64 = 8192;
     try t.expectEqual(stride, generate_mod.effectiveSsmCheckpointStride(http_server.launch().ssm_checkpoint_stride, 8192));
 

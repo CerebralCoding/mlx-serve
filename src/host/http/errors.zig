@@ -330,7 +330,7 @@ pub fn sendEnsureLoadedError(allocator: std.mem.Allocator, stream: *Conn, sched:
         // instead of a hung connection.
         else => {
             // An error the engine named without this unit knowing it arrives as `EngineFailed`, its name kept aside.
-            const name = if (err == error.EngineFailed) err_name.last else @errorName(err);
+            const name = if (err == error.EngineFailed) err_name.last() else @errorName(err);
             log.warn("  -> 500 ({s}) while loading {s}\n", .{ name, id });
             const msg = std.fmt.allocPrint(allocator, "Failed to load model: {s}", .{name}) catch {
                 try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", "Failed to load model", 500);

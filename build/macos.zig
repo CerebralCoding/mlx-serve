@@ -186,9 +186,9 @@ pub fn addServer(g: *const Graph, plugin_names: []const []const u8) void {
     });
     // `-Dunits`: each plugin is an object of its own, compiled in parallel with the host and linked in.
     const units_step = b.step("units", "Compile every unit (-Dunits: host, engine, plugin groups) without linking");
-    // Plugin units compile their own copy of the globals they reach: scripts/unit_globals.py fails on one the host
-    // sets or reads that is not `Shared` (names survive in a Debug build only).
-    const units_check = b.step("units-check", "Check the plugin units hold no unshared host state (-Dunits, Debug)");
+    // Every unit compiles its own copy of the globals it reaches: scripts/unit_globals.py fails on one in a plugin unit
+    // or in both the host and the engine that is not `Shared` (names survive in a Debug build only).
+    const units_check = b.step("units-check", "Check no unit holds a copy of another's state (-Dunits, Debug)");
     const check_run = b.addSystemCommand(&.{ "python3", "scripts/unit_globals.py" });
     check_run.has_side_effects = true;
     if (g.units) units_check.dependOn(&check_run.step) else for ([_]*std.Build.Step{ units_step, units_check }) |s| s.dependOn(&b.addFail("pass -Dunits=true").step);
@@ -199,6 +199,7 @@ pub fn addServer(g: *const Graph, plugin_names: []const []const u8) void {
         const host_obj = b.addObject(.{ .name = "host", .root_module = unitModule(g, unit_includes, "src/host_unit.zig") });
         mod.addObject(host_obj);
         units_step.dependOn(&b.addInstallFile(host_obj.getEmittedBin(), "units/host.o").step);
+        check_run.addFileArg(host_obj.getEmittedBin());
         // The MLX engine: the host reaches it only through its exported table (`host/engines/mlx.zig`).
         const engine_obj = b.addObject(.{ .name = "engine-mlx", .root_module = unitModule(g, unit_includes, "src/engine_unit.zig") });
         mod.addObject(engine_obj);

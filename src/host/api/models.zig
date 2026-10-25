@@ -183,14 +183,14 @@ pub fn renderModelEntry(
             chat_config.chat_template.len,
             entry.engineBacked(),
         );
-        const facts = mlx_engine.facts(entry);
-        const has_vision = facts.images;
-        const has_audio = facts.audio;
+        const mf = mlx_engine.facts(entry);
+        const has_vision = mf.images;
+        const has_audio = mf.audio;
         var caps = try readyCapsJson(allocator, .{
             .has_chat = has_chat,
             .has_vision = has_vision,
             .has_audio = has_audio,
-            .has_transcription = config.forced_aligner == null and facts.hears,
+            .has_transcription = config.forced_aligner == null and mf.hears,
             .has_alignment = config.forced_aligner != null,
             .has_reasoning = has_chat and model_discovery.templateSupportsThinking(chat_config.chat_template),
             .has_embedding = config.hasEmbeddingCapability(),
@@ -209,7 +209,7 @@ pub fn renderModelEntry(
         defer mods.deinit(allocator);
         try mods.appendSlice(allocator, "[\"text\"");
         if (has_vision) try mods.appendSlice(allocator, ",\"image\"");
-        if (facts.video) try mods.appendSlice(allocator, ",\"video\"");
+        if (mf.video) try mods.appendSlice(allocator, ",\"video\"");
         if (has_audio) try mods.appendSlice(allocator, ",\"audio\"");
         try mods.append(allocator, ']');
 

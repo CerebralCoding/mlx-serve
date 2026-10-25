@@ -78,17 +78,17 @@ const GlmBillGlobals = struct {
     chunk: usize,
 
     fn pin() GlmBillGlobals {
-        const saved: GlmBillGlobals = .{ .stride = http_server.launch().ssm_checkpoint_stride, .max = http_server.launch().ssm_checkpoint_max, .chunk = generate_mod.prefill_chunk_override };
+        const saved: GlmBillGlobals = .{ .stride = http_server.launch().ssm_checkpoint_stride, .max = http_server.launch().ssm_checkpoint_max, .chunk = generate_mod.prefillCli().override };
         http_server.launch().ssm_checkpoint_stride = 256;
         http_server.launch().ssm_checkpoint_max = 16;
-        generate_mod.prefill_chunk_override = 0;
+        generate_mod.prefillCli().override = 0;
         return saved;
     }
 
     fn restore(self: GlmBillGlobals) void {
         http_server.launch().ssm_checkpoint_stride = self.stride;
         http_server.launch().ssm_checkpoint_max = self.max;
-        generate_mod.prefill_chunk_override = self.chunk;
+        generate_mod.prefillCli().override = self.chunk;
     }
 };
 
@@ -189,7 +189,7 @@ test "GLM bill: covers the measured peaks without doubling them" {
         .{ .seq = 66_015, .kv_bits = 8, .chunk = 512, .launch = 512, .peak = 4_400_000_000 },
         .{ .seq = 124_681, .kv_bits = 8, .chunk = 512, .launch = 512, .peak = 5_170_000_000 },
     }) |p| {
-        generate_mod.prefill_chunk_override = p.launch;
+        generate_mod.prefillCli().override = p.launch;
         const bill = prefillNeededAtChunk(&glm, p.seq, 64, p.kv_bits, p.chunk, .{});
         try t.expect(bill >= p.peak);
         // Long prompts are where a refusal costs: there the bill stays within 1.6x.

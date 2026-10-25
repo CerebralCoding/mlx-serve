@@ -125,7 +125,7 @@ pub fn mtpAllowedByDefault(mtp_forced: bool, metal: bool, cuda: bool) bool {
 
 /// Does this model serve DeepSeek-V4 or V4.1 with DSpark draft stages loaded?
 pub fn dsv4DraftStages(lm: *LoadedModel) bool {
-    return mlx_engine.facts(lm).draft_stages;
+    return mlx_engine.api().draft_stages(lm);
 }
 
 /// Can this model run an MTP-flagged request speculatively? Either a qwen

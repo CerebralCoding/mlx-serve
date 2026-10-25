@@ -30,6 +30,8 @@ pub const glm = struct {
 /// the host's glue binds each arch by its own entry: `glm`).
 pub const archs = .{@import("plugins/glm_moe_dsa/arch.zig")};
 pub const sdk = @import("sdk");
+/// The module's `Shared` state, whose storage the host unit owns (`src/shared_all.zig`).
+pub const shared_state = .{ @import("sdk/weights/streamed/sdk_ext/expert.zig").expertState_shared, sdk.memory.memoryState_shared };
 /// The expert bank source a resident trunk streams its routed experts from (`sdk/weights/streamed.zig` `Streamed`).
 pub const bank_source = @import("sdk/weights/streamed/bank_source.zig");
 /// A standard MLX pack's routed experts streamed for the resident trunk as downloaded (`Streamed.openPack`).

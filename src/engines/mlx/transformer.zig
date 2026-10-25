@@ -323,6 +323,8 @@ pub var qsa_attn_kernel_override: ?bool = null;
 const CliState = struct {
     /// `--lm-head-mxfp8` / `--no-lm-head-mxfp8`; null = the default below.
     lm_head_mxfp8_cli: ?bool = null,
+    /// `--mtp-head-kv-quant`.
+    mtp_head_kv_quant: bool = false,
 };
 pub const cli_shared = @import("../../sdk/util/shared.zig").Shared(CliState, "transformer_cli", .{});
 pub inline fn cli() *CliState {
@@ -917,11 +919,10 @@ pub const Transformer = struct {
     /// stays dense bf16 (the head is a lossy draft and short prompts dequantize under the
     /// fused-kernel floor). Set once at parse; the override is a test seam.
     pub var mtp_head_kv_quant_override: ?bool = null;
-    pub var mtp_head_kv_quant_flag: bool = false;
 
     pub fn mtpHeadKvQuantEnabled() bool {
         if (mtp_head_kv_quant_override) |v| return v;
-        return mtp_head_kv_quant_flag;
+        return cli().mtp_head_kv_quant;
     }
 
     /// The qwen4_exp head's KV scheme: dense unless `--mtp-head-kv-quant`, then the trunk's. Fixed at load, so a

@@ -84,8 +84,8 @@ src/sdk/blocks/attention/kv_quant_attn_test.zig	fn composedStridedCase(	composed
 # Load.
 src/engines/mlx/load.zig	effectivePrefillChunk(	the ANE build resolves its tile through effectivePrefillChunk, never the bare pin
 src/engines/mlx/load.zig	qwen4BuildDraftRerank()	the qwen4 coarse rerank head is built at load, gated on mtp_enabled
-src/host/gpu_thread/*.zig	doLoadOnInferenceThread(sch, params)	the boot load goes through the one Transformer construction site
-src/host/gpu_thread/*.zig	doLoadOnInferenceThread(sch, req)	the cold load goes through the one Transformer construction site
+src/engines/mlx/runtime/*.zig	doLoadOnInferenceThread(sch, params)	the boot load goes through the one Transformer construction site
+src/engines/mlx/runtime/*.zig	doLoadOnInferenceThread(sch, req)	the cold load goes through the one Transformer construction site
 # Prefill, scheduler, spec wiring.
 src/engines/mlx/prefill.zig	dflash_restored = null	runPrefill clears restored spec-cache ownership before Generator.initWithOptions adopts it
 src/engines/mlx/prefill.zig	mtp_restored = null	runPrefill clears restored spec-cache ownership before Generator.initWithOptions adopts it

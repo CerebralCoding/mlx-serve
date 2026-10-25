@@ -44,7 +44,7 @@ pub fn build(b: *std.Build) void {
     const units = b.option(bool, "units", "Compile the host, the engine and each plugin group as their own units, in parallel") orelse
         (builtin.os.tag == .macos);
     // A plugin registers by its folder: the scan writes src/plugins/registry.zig, every graph compiles it.
-    const plugin_names = plugins.generate(b, units);
+    const plugin_names = plugins.generate(b);
 
     // `lint`, `lint-test`, `unit-closure`.
     lint.add(b);

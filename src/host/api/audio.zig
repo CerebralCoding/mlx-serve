@@ -327,7 +327,7 @@ const AlignJob = struct {
 fn alignJobRun(ctx: *anyopaque) void {
     const job: *AlignJob = @ptrCast(@alignCast(ctx));
     defer _ = mlx.mlx_array_free(job.rows);
-    job.classes = forced_align_mod.timestampClasses(job.allocator, job.lm.transformer.?, job.ids, job.rows, job.timestamp_token) catch |err| {
+    job.classes = mlx_engine.timestampClasses(job.allocator, job.lm, job.ids, job.rows, job.timestamp_token) catch |err| {
         log.err("  alignment failed: {s}\n", .{@errorName(err)});
         return;
     };

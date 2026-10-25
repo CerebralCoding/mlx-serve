@@ -207,7 +207,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     if (kv_quant_config.scheme != .off) {
         try xfm_ptr.cache.reinit(params.config.num_hidden_layers, kv_quant_config);
     }
-    Transformer.mtp_head_kv_quant_flag = params.mtp_head_kv_quant;
+    transformer_mod.cli().mtp_head_kv_quant = params.mtp_head_kv_quant;
     if (xfm_ptr.qwen4Trunk()) |t| try t.qwen4MtpApplyKvQuant(Transformer.qwen4MtpHeadKvConfig(kv_quant_config));
 
     // Wire model weights into GPU memory (prevents paging, matches mlx-lm).
@@ -672,7 +672,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                     "(measured a loss on M5 Max, PR #223); MLX_SERVE_ANE_FORCE=1 overrides\n",
                 .{},
             );
-        } else if (params.ane_chunk_resolver) |resolve| {
+        } else if (sch.ane_chunk_resolver) |resolve| {
             const pinned = resolve(@constCast(params.config));
             // The forward's chunk is the pinned width run through the SAME
             // per-request policy every prefill applies (effectivePrefillChunk:
@@ -694,7 +694,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 cfg.longCtxGated(),
                 pinned,
             ));
-            xfm_ptr.buildAnePrefill(sch.io, chunk, ane_mod.splitShare(), params.ane_headroom_resolver);
+            xfm_ptr.buildAnePrefill(sch.io, chunk, ane_mod.splitShare(), sch.ane_headroom_resolver);
         } else {
             log.warn("[ane] --ane-prefill: no prefill-chunk resolver on this load path — disabled\n", .{});
         }

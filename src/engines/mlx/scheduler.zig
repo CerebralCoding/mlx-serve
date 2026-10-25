@@ -1187,9 +1187,9 @@ test "company: a slot on an engine beside MLX never batches, so it does not coun
     var ane: Slot = undefined;
     try sch.offloaded.append(testing.allocator, &ane);
     sch.in_flight = 1;
-    try testing.expect(!hasCompany(sch));
+    try testing.expect(!hasCompany(&sch));
     sch.in_flight = 2;
-    try testing.expect(hasCompany(sch));
+    try testing.expect(hasCompany(&sch));
 }
 
 test "cancelAllInFlight: a request being prefilled at a chunk boundary is cancelled too" {
@@ -1208,6 +1208,6 @@ test "cancelAllInFlight: a request being prefilled at a chunk boundary is cancel
     slot.out_cond = .init;
     slot.out_event = .unset;
     sch.boundary_slot = &slot;
-    cancelAllInFlight(sch);
+    cancelAllInFlight(&sch);
     try testing.expect(slot.cancelled.load(.acquire));
 }

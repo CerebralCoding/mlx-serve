@@ -3,6 +3,8 @@
 //! those exports (`sdk/util/shared.zig`). A new `Shared` goes on this list.
 
 comptime {
+    _ = @import("sdk/util/err_name.zig").last_tls;
+    if (@import("build_options").mlx_stream) _ = @import("mlx_stream").shared_state;
     _ = @import("host/plugins/loader.zig").process;
     _ = @import("host/http/server.zig").serverState_shared;
     _ = @import("host/http/server.zig").launch_shared;
@@ -26,6 +28,7 @@ comptime {
     _ = @import("sdk/media/progress.zig").GenYield;
     _ = @import("sdk/media/progress.zig").StreamKeepalive;
     _ = @import("engines/mlx/transformer.zig").cli_shared;
+    _ = @import("engines/mlx/generate.zig").prefillCli_shared;
     _ = @import("engines/mlx/cluster/distributed.zig").cluster_shared;
     _ = @import("engines/mlx/diag/profile.zig").profileState_shared;
     _ = @import("engines/mlx/ssm/group.zig").ssmGroup_shared;
