@@ -9,7 +9,7 @@ const SharedThreadLocal = @import("../../sdk/util/shared.zig").SharedThreadLocal
 pub const Refused = ?struct { kind: Kind, cap: []const u8 };
 
 /// Set by the engine on the connection thread that submitted; read by `mapGenerationError` on the same thread.
-const refused_tls = SharedThreadLocal(Refused, "engine_refused", null);
+pub const refused_tls = SharedThreadLocal(Refused, "engine_refused", null);
 
 pub fn refused() *Refused {
     return refused_tls.get();

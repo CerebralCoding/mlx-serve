@@ -195,7 +195,7 @@ const GlueState = struct {
     auto_context: PackValues = .{},
     max_output: PackValues = .{},
 };
-const glueState_shared = @import("../../../sdk/util/shared.zig").Shared(GlueState, "streamed_glue", .{});
+pub const glueState_shared = @import("../../../sdk/util/shared.zig").Shared(GlueState, "streamed_glue", .{});
 inline fn glueState() *GlueState {
     return glueState_shared.get();
 }

@@ -76,12 +76,9 @@ pub const LoadParams = struct {
     ane: bool = false,
     /// Engines on one load of each Neural Engine model (`--ane-slots`): that many requests run at once.
     ane_slots: u32 = 1,
-    /// The server's prefill-chunk pin (`server.pinPrefillChunk`), passed as a
-    /// pointer because the scheduler deliberately has no server.zig import.
-    /// The ANE build compiles fixed-shape tiles against THIS width — resolving
-    /// it any other way would let the tile and the forward's chunk drift.
-    ane_chunk_resolver: ?*const fn (*ModelConfig) u32 = null,
-    ane_headroom_resolver: ?*const fn (*const ModelConfig, u32) u64 = null,
+    /// The Neural Engine build compiles fixed-shape tiles against the server's prefill-chunk pin, and gates on
+    /// its headroom bill (`admission/`); the engine wires both when this is set.
+    ane_resolvers: bool = false,
     /// Whether to also load vision-tower weights. Combined with
     /// `config.has_vision` — false here disables vision regardless of config.
     load_vision: bool = false,
@@ -104,10 +101,9 @@ pub const LoadParams = struct {
     prefix_cache_ram_enabled: bool = true,
     /// Per-model hot prefix cache KV-bytes budget. 0 disables the byte cap.
     prefix_cache_mem_bytes: u64 = 0,
-    /// Clamp the hot-cache byte budget against live post-load headroom
-    /// (`server.prefixCacheMemForLoad`) — a pointer because the scheduler
-    /// deliberately has no server.zig import. Null = no clamp (tests).
-    prefix_cache_mem_resolver: ?*const fn (*ModelConfig, u64, BudgetRevise, *u64) u64 = null,
+    /// Clamp the hot-cache byte budget against live post-load headroom (`admission.prefixCacheMemForLoad`); off
+    /// keeps the raw launch budget (tests).
+    prefix_cache_clamp: bool = false,
     /// SSD tier byte budget for the hot prefix cache (`--prefix-cache-disk`).
     /// 0 disables persistence. Attached per model at load for pure-attention
     /// archs; entries live under `~/.mlx-serve/kv-cache/<fingerprint>`.

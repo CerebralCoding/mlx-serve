@@ -197,7 +197,7 @@ pub fn handleCompletions(
     const prompt_logprobs = echoRequested(root) and logprobs_n > 0;
     if (prompt_logprobs) if (promptLogprobsRejectReason(.{
         .engine_backed = lm.engineBacked(),
-        .module_owned = if (lm.transformer) |t| t.ownsModuleDecodeState() else false,
+        .module_owned = mlx_engine.facts(lm).module_owned,
     })) |reason| {
         log.warn("POST /v1/completions -> 400 (echo logprobs: prefill returns no per-row logits)\n", .{});
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
@@ -407,7 +407,7 @@ fn handleNonStreamingCompletion(
     const use_pld = spec.use_pld;
 
     // Every failure class propagates to the surface's one error arm (`sendGenerationError`), shared with the streaming twin.
-    var result = try nonStreamingViaScheduler(allocator, http_server.global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), null, &.{}, cache_key, .{}, logprobs_n, prompt_logprobs, null, null, stream);
+    var result = try nonStreamingViaScheduler(allocator, http_server.launch().global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), null, &.{}, cache_key, .{}, logprobs_n, prompt_logprobs, null, null, stream);
     _ = &result;
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
@@ -513,7 +513,7 @@ fn handleStreamingCompletion(
     var running: ?mlx_engine.Running = null;
     defer if (running) |r| r.done();
 
-    const sch = http_server.global_scheduler.?;
+    const sch = http_server.launch().global_scheduler.?;
     running = try mlx_engine.Running.submit(sch, .{
         .model = lm,
         .prompt_ids = prompt_ids,

@@ -197,6 +197,11 @@ pub fn addServer(g: *const Graph, plugin_names: []const []const u8) void {
     if (g.units) {
         // The host is an object too, so it compiles beside the units; the exe's root only calls into it.
         mod.addObject(b.addObject(.{ .name = "host", .root_module = unitModule(g, unit_includes, "src/host_unit.zig") }));
+        // The MLX engine: the host reaches it only through its exported table (`host/engines/mlx.zig`).
+        const engine_obj = b.addObject(.{ .name = "engine-mlx", .root_module = unitModule(g, unit_includes, "src/engine_unit.zig") });
+        mod.addObject(engine_obj);
+        units_step.dependOn(&b.addInstallFile(engine_obj.getEmittedBin(), "units/engine-mlx.o").step);
+        check_run.addFileArg(engine_obj.getEmittedBin());
         mod.root_source_file = b.path("src/exe.zig");
         // Plugins dealt round-robin into `unit-groups` objects: each compiles the shared code it reaches once, so fewer
         // groups cost less CPU, more groups more parallelism.

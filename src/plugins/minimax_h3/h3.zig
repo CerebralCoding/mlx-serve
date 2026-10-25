@@ -3583,7 +3583,7 @@ const ResidentsState = struct {
     /// Every engine's cache, so another model's load can ask them all to let go.
     live_residents: [8]?*Resident = @splat(null),
 };
-const residents_shared = @import("../../sdk/util/shared.zig").Shared(ResidentsState, "h3_residents", .{});
+pub const residents_shared = @import("../../sdk/util/shared.zig").Shared(ResidentsState, "h3_residents", .{});
 inline fn residents() *ResidentsState {
     return residents_shared.get();
 }

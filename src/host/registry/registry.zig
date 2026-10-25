@@ -34,7 +34,13 @@ const handles = @import("../../abi/mlx_handles.zig");
 const mlx_engine = @import("../engines/mlx.zig");
 
 /// Bumped every time a model becomes `.ready`; readers compare against the value they last acted on.
-pub var load_generation = std.atomic.Value(u64).init(0);
+pub const Generations = struct { load: std.atomic.Value(u64) = .init(0), last_unload: UnloadMark = .{} };
+/// Load bookkeeping one copy for every compile unit (`Shared`): the generation bumped every time a model becomes
+/// `.ready`, and the last unload.
+pub const generations_shared = @import("../../sdk/util/shared.zig").Shared(Generations, "registry_generations", .{});
+pub inline fn generations() *Generations {
+    return generations_shared.get();
+}
 
 /// How long after an unload its memory may still be reaching the OS.
 pub const UNLOAD_SETTLE_MS: i64 = 10_000;
@@ -55,7 +61,6 @@ pub const UnloadMark = struct {
         self.bytes -|= bytes;
     }
 };
-pub var last_unload: UnloadMark = .{};
 
 pub const monotonicMs = crt.monotonicMs;
 
@@ -1131,10 +1136,10 @@ pub const ModelRegistry = struct {
     /// populated weights/transformer/etc on `entry`; this just updates
     /// the bookkeeping + state field.
     pub fn markReadyLocked(self: *ModelRegistry, entry: *LoadedModel, bytes_resident: u64) void {
-        _ = load_generation.fetchAdd(1, .monotonic);
+        _ = generations().load.fetchAdd(1, .monotonic);
         self.releaseReservationLocked(entry); // pending estimate → actual residency
         entry.bytes_resident = bytes_resident;
-        last_unload.consume(bytes_resident);
+        generations().last_unload.consume(bytes_resident);
         entry.state = .ready;
         entry.error_name = null;
         self.lru_clock += 1;

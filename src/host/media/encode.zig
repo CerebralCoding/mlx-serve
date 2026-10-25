@@ -112,7 +112,7 @@ fn freeKeepMasks(allocator: std.mem.Allocator, keeps: []?[]bool) void {
 /// item's soft tokens concatenated in prompt order; `item_tokens[k]` receives
 /// item k's row count. RADIO video rows are already the EVS keep.
 fn encodeMediaItems(allocator: std.mem.Allocator, lm: *LoadedModel, items: []const MediaItem, mp: MediaPieces, item_tokens: []usize) !EncodedMedia {
-    const sch = http_server.global_scheduler orelse return error.NoScheduler;
+    const sch = http_server.launch().global_scheduler orelse return error.NoScheduler;
     const piece_tokens = try allocator.alloc(usize, mp.pieces.len);
     defer allocator.free(piece_tokens);
     var req = scheduler_mod.VisionEncodeRequest{

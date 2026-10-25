@@ -598,7 +598,7 @@ const ClusterState = struct {
     /// The worker's compute time for its last step (µs), sent over the bell after each one.
     worker_us: std.atomic.Value(u32) = .init(0),
 };
-const cluster_shared = @import("../../../sdk/util/shared.zig").Shared(ClusterState, "cluster_state", .{});
+pub const cluster_shared = @import("../../../sdk/util/shared.zig").Shared(ClusterState, "cluster_state", .{});
 inline fn cluster() *ClusterState {
     return cluster_shared.get();
 }

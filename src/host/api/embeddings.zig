@@ -238,7 +238,7 @@ fn embeddingRows(
         .vision_embeddings = vision,
         .allocator = allocator,
     };
-    return http_server.global_scheduler.?.computeEmbeddings(&req) catch |err| {
+    return http_server.launch().global_scheduler.?.computeEmbeddings(&req) catch |err| {
         if (req.error_name) |e| {
             log.err("  embedding error: {s}\n", .{e});
             allocator.free(e);

@@ -691,17 +691,17 @@ test "SSD-first is gated on a DISK TIER: with --prefix-cache-disk off, qwen4_exp
     const t = std.testing;
     var cfg = qwen4RequestTestConfig();
 
-    const orig_disk = http_server.prefix_cache_disk_bytes;
-    defer http_server.prefix_cache_disk_bytes = orig_disk;
+    const orig_disk = http_server.launch().prefix_cache_disk_bytes;
+    defer http_server.launch().prefix_cache_disk_bytes = orig_disk;
     // `prefixCacheMemForLoad` publishes into a process global; put it back or a later test reads it.
     defer clearResolvedPrefixCacheMem();
     const orig_over = prefix_cache_mod.ssd_first_override;
     defer prefix_cache_mod.ssd_first_override = orig_over;
     prefix_cache_mod.ssd_first_override = true; // the env switch is not what is on trial
     // The budget is a property of the machine; the test's machine is a 128 GB one, not the runner.
-    const orig_ceiling = memory_ceiling.static_ceiling_override;
-    defer memory_ceiling.static_ceiling_override = orig_ceiling;
-    memory_ceiling.static_ceiling_override = 109_395 * (1 << 20);
+    const orig_ceiling = memory_ceiling.overrides().static_ceiling;
+    defer memory_ceiling.overrides().static_ceiling = orig_ceiling;
+    memory_ceiling.overrides().static_ceiling = 109_395 * (1 << 20);
 
     try t.expect(!prefix_cache_mod.ssdFirstActive(&cfg, false, true));
     try t.expect(prefix_cache_mod.ssdFirstActive(&cfg, true, true));
@@ -721,13 +721,13 @@ test "SSD-first is gated on a DISK TIER: with --prefix-cache-disk off, qwen4_exp
     cfg.pinned_context = 0;
     const ask: u64 = 4 * 1024 * 1024 * 1024;
 
-    http_server.prefix_cache_disk_bytes = 0;
+    http_server.launch().prefix_cache_disk_bytes = 0;
     var idle_off: u64 = 12345;
     const ram_arm = prefixCacheMemForLoad(&cfg, ask, .{}, &idle_off);
     try t.expectEqual(@as(u64, 0), idle_off);
     try t.expect(ram_arm <= ask);
 
-    http_server.prefix_cache_disk_bytes = 64 * 1024 * 1024 * 1024;
+    http_server.launch().prefix_cache_disk_bytes = 64 * 1024 * 1024 * 1024;
     var idle_on: u64 = 0;
     const ssd_arm = prefixCacheMemForLoad(&cfg, ask, .{}, &idle_on);
     try t.expect(ssd_arm > ask);
@@ -812,24 +812,24 @@ test "the load-time session bill is billed at the boot's --kv-quant, not bf16" {
     const active: u64 = 69_827 * MiB;
     const chunk: u32 = cfg.pinned_prefill_chunk;
 
-    const saved_kv = http_server.configured_kv_quant;
-    defer http_server.configured_kv_quant = saved_kv;
+    const saved_kv = http_server.launch().configured_kv_quant;
+    defer http_server.launch().configured_kv_quant = saved_kv;
 
     // `--kv-quant 8`, no scheduler yet: the state the load runs in.
-    http_server.configured_kv_quant = transformer_mod.KVQuantConfig.affine(8);
+    http_server.launch().configured_kv_quant = transformer_mod.KVQuantConfig.affine(8);
     try t.expectEqual(@as(u64, 8), defaultKvBits(&cfg));
     try t.expectEqual(
         (13_056 + 2_304) * 786_432 + cfg.qsaRingBytes(),
         ssdFirstSessionKvBytes(&cfg, defaultKvBits(&cfg), ceiling, active, chunk),
     );
 
-    http_server.configured_kv_quant = transformer_mod.KVQuantConfig.dense;
+    http_server.launch().configured_kv_quant = transformer_mod.KVQuantConfig.dense;
     try t.expectEqual(@as(u64, 16), defaultKvBits(&cfg));
     try t.expectEqual(
         (24_576 + 2_304) * 786_432 + cfg.qsaRingBytes(),
         ssdFirstSessionKvBytes(&cfg, defaultKvBits(&cfg), ceiling, active, chunk),
     );
-    http_server.configured_kv_quant = null;
+    http_server.launch().configured_kv_quant = null;
     try t.expectEqual(@as(u64, 16), defaultKvBits(&cfg));
 
     const idle: u64 = 10 * 1024 * MiB;

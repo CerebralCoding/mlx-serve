@@ -370,9 +370,9 @@ pub fn reservedCacheTokens(seq: u64, max_tokens: u64, chunk: u64, ctx: u64) u64 
 /// checkpoints are already resident and merged, never re-allocated).
 pub fn retainedSsmCheckpointBytes(config: *const model_mod.ModelConfig, seq: u64, matched: u64, chunk: u64) u64 {
     const per_cp = config.ssmCheckpointBytes();
-    if (per_cp == 0 or http_server.ssm_checkpoint_stride == 0) return 0;
+    if (per_cp == 0 or http_server.launch().ssm_checkpoint_stride == 0) return 0;
     const stride: u64 = generate_mod.effectiveSsmCheckpointStride(
-        http_server.ssm_checkpoint_stride,
+        http_server.launch().ssm_checkpoint_stride,
         @max(@as(usize, @intCast(chunk)), generate_mod.prefill_chunk_override),
     );
     if (stride == 0) return 0;
@@ -381,7 +381,7 @@ pub fn retainedSsmCheckpointBytes(config: *const model_mod.ModelConfig, seq: u64
     const span: u64 = seq -| @min(matched, seq);
     var n: u64 = seq / stride -| @min(matched, seq) / stride;
     if (span > generate_mod.SSM_SNAPSHOT_BACKOFF) n += 1;
-    if (http_server.ssm_checkpoint_max > 0) n = @min(n, http_server.ssm_checkpoint_max);
+    if (http_server.launch().ssm_checkpoint_max > 0) n = @min(n, http_server.launch().ssm_checkpoint_max);
     return n * per_cp;
 }
 

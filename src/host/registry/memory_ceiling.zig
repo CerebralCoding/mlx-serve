@@ -38,7 +38,7 @@ fn getMetalBufferLimit() u64 {
 /// oversubscribe. Falls back to `getMetalBufferLimit()` when the device query
 /// is unavailable (CI / non-Metal hosts).
 fn getGpuWorkingSetLimit() u64 {
-    if (static_ceiling_override) |v| return v;
+    if (overrides().static_ceiling) |v| return v;
     const max_rec = mlx.maxRecommendedWorkingSet();
     return if (max_rec > 0) max_rec else getMetalBufferLimit();
 }
@@ -100,7 +100,12 @@ pub fn gpuCeilingWithWiredFloor(
 }
 
 /// Test seam: `iogpu.wired_limit_mb` in MB; `null` reads the machine.
-pub var wired_limit_mb_override: ?u64 = null;
+/// The operator's overrides of the machine's memory limits, one copy for every compile unit (`Shared`).
+pub const Overrides = struct { wired_limit_mb: ?u64 = null, static_ceiling: ?u64 = null };
+pub const overrides_shared = @import("../../sdk/util/shared.zig").Shared(Overrides, "memory_overrides", .{});
+pub inline fn overrides() *Overrides {
+    return overrides_shared.get();
+}
 
 var wired_limit_bytes_cached: u64 = 0;
 
@@ -109,7 +114,7 @@ var wired_limit_read: bool = false;
 /// `iogpu.wired_limit_mb` in bytes, read ONCE per process: re-reading it per admission would
 /// let the ceiling move under a live request. 0 when the OID is absent.
 pub fn wiredLimitBytes() u64 {
-    if (wired_limit_mb_override) |mb| return mb *| (1024 * 1024);
+    if (overrides().wired_limit_mb) |mb| return mb *| (1024 * 1024);
     // iogpu.wired_limit_mb is an Apple GPU sysctl; Linux has no wired-limit
     // concept, so the query reads as absent (0), same as a non-Apple-Silicon Mac.
     if (comptime !builtin.os.tag.isDarwin()) return 0;
@@ -151,7 +156,6 @@ pub fn wiredCeilingFloorForRam(config: ?*const model_mod.ModelConfig, total_ram:
 /// Stands in for the machine's working-set limit (Metal's recommended working set
 /// or the wired limit): tests (CI runners have 7 GB) and `applyGpuCeilingEnv`.
 /// Load-time bills price this static term (stable across boots); request-time admission reads live RAM.
-pub var static_ceiling_override: ?u64 = null;
 
 pub fn staticGpuMemoryCeiling() u64 {
     return getGpuWorkingSetLimit();
@@ -163,7 +167,7 @@ pub fn applyGpuCeilingEnv() void {
     const raw = env.get(.MLX_SERVE_GPU_CEILING_MB) orelse return;
     const mb = std.fmt.parseInt(u64, std.mem.sliceTo(raw, 0), 10) catch return;
     if (mb == 0) return;
-    static_ceiling_override = mb << 20;
+    overrides().static_ceiling = mb << 20;
     log.warn("[diag] GPU ceiling forced to {d} MB (MLX_SERVE_GPU_CEILING_MB)\n", .{mb});
 }
 
@@ -196,9 +200,9 @@ test "an explicitly raised iogpu.wired_limit_mb is a FLOOR under the ceiling" {
     const mb: u64 = 1024 * 1024;
     const total_ram: u64 = 131_072 * mb;
     const working_set: u64 = 120_000 * mb;
-    const saved = wired_limit_mb_override;
-    defer wired_limit_mb_override = saved;
-    wired_limit_mb_override = 120_000;
+    const saved = overrides().wired_limit_mb;
+    defer overrides().wired_limit_mb = saved;
+    overrides().wired_limit_mb = 120_000;
 
     try t.expectEqual(@as(u64, 111_808), wiredLimitFloor(120_000 * mb, total_ram, WIRED_LIMIT_MARGIN_BYTES) / mb);
     // The macOS default (75% of RAM) and anything under it declares nothing; and however

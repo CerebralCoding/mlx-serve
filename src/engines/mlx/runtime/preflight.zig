@@ -181,11 +181,11 @@ pub fn availForLoad(io: std.Io, need: u64) u64 {
     if (memInsufficientForLoad(need, avail)) {
         const released = gen_mod.releaseMediaResidency();
         if (released > 0) {
-            model_registry_mod.last_unload.record(model_registry_mod.monotonicMs(), released);
+            model_registry_mod.generations().last_unload.record(model_registry_mod.monotonicMs(), released);
             avail = loadAvail(io);
         }
     }
-    if (!waitForUnload(need, avail, model_registry_mod.last_unload, model_registry_mod.monotonicMs())) return avail;
+    if (!waitForUnload(need, avail, model_registry_mod.generations().last_unload, model_registry_mod.monotonicMs())) return avail;
     return settledAvail(need, avail, io, loadAvail, pauseLoadAvail);
 }
 

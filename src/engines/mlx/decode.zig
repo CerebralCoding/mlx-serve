@@ -97,7 +97,7 @@ pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     var mtp_buf: [MAX_BATCH_GROUP]*Slot = undefined;
     var mtp_n: usize = 0;
     for (active) |s| {
-        const why = sch.batchVerdict(s);
+        const why = @import("scheduler.zig").batchVerdict(sch, s);
         if (why == .ok and batchable_n < batchable_buf.len) {
             batchable_buf[batchable_n] = s;
             batchable_n += 1;

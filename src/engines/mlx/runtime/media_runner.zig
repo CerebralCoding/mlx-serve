@@ -94,7 +94,7 @@ pub fn runGenRequests(sch: *Scheduler, reqs: []*GenRequest) void {
     if (scheduler_mod.gen_yield_enabled) media_progress.genYield().* = &hook;
     // The whole estimated peak, though live memory already holds part of it: the side that
     // cannot OOM.
-    sch.gen_reserve_bytes = if (req.peak_bytes > 0) req.peak_bytes else sch.mediaPeakFor(req.model);
+    sch.gen_reserve_bytes = if (req.peak_bytes > 0) req.peak_bytes else scheduler_mod.mediaPeakFor(sch, req.model);
     defer {
         media_progress.genYield().* = null;
         media_progress.streamKeepalive().* = null;

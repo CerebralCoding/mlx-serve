@@ -202,7 +202,7 @@ const AneState = struct {
     live_int8_bytes: std.atomic.Value(u64) = .init(0),
     live_layers: std.atomic.Value(u64) = .init(0),
 };
-const aneState_shared = @import("../util/shared.zig").Shared(AneState, "ane_offload", .{});
+pub const aneState_shared = @import("../util/shared.zig").Shared(AneState, "ane_offload", .{});
 pub inline fn aneState() *AneState {
     return aneState_shared.get();
 }

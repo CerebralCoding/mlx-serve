@@ -73,13 +73,13 @@ pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: us
     const needed: u64 = prefillNeededAtChunk(config, seq, max_tokens, kv_bits, chunk, warm);
     // Published number, never the pointer: `hot_prefix_cache` is inference-thread state, freed
     // on every model switch. Stale by at most one entry, which is all a hint has to be.
-    const evictable: u64 = if (http_server.global_scheduler) |sch|
+    const evictable: u64 = if (http_server.launch().global_scheduler) |sch|
         sch.resident_hot_cache_bytes.load(.monotonic)
     else
         0;
     // Prompt-aware when the caller has the ids: an entry this prompt could not restore from is
     // genuinely evictable. Still a published snapshot, never the cache pointer.
-    const reclaimable: u64 = if (http_server.global_scheduler) |sch|
+    const reclaimable: u64 = if (http_server.launch().global_scheduler) |sch|
         if (prompt_tokens) |toks|
             scheduler_mod.reclaimableHotCacheBytesFor(sch, toks)
         else
@@ -124,7 +124,7 @@ var admission_logged_generation = std.atomic.Value(u64).init(std.math.maxInt(u64
 
 /// Has a model become resident since the last time this returned true? Consuming, so N racing connection threads produce one line.
 fn firstRequestAfterLoad() bool {
-    const gen = model_registry_mod.load_generation.load(.monotonic);
+    const gen = model_registry_mod.generations().load.load(.monotonic);
     const last = admission_logged_generation.load(.monotonic);
     if (gen == last) return false;
     return admission_logged_generation.cmpxchgStrong(last, gen, .monotonic, .monotonic) == null;
@@ -246,7 +246,7 @@ pub fn admitPrompt(config: *const model_mod.ModelConfig, keep: []const u8, promp
         });
         return true;
     }
-    if (needed > available) if (http_server.global_scheduler) |sch| {
+    if (needed > available) if (http_server.launch().global_scheduler) |sch| {
         const Rebill = struct {
             sch: *scheduler_mod.Scheduler,
             keep: []const u8,
@@ -261,7 +261,7 @@ pub fn admitPrompt(config: *const model_mod.ModelConfig, keep: []const u8, promp
                 return r.bill.fits();
             }
             fn unloadOne(r: *@This()) bool {
-                const id = r.sch.idleModelToUnload(r.keep) orelse return false;
+                const id = scheduler_mod.idleModelToUnload(r.sch, r.keep) orelse return false;
                 log.info("  prompt {d} tokens does not fit — unloading idle model {s} first\n", .{ r.prompt_ids.len, id });
                 r.sch.unloadModelIfIdle(id, 0) catch return false;
                 r.bill.* = prefillAdmissionBill(r.config, r.prompt_ids.len, r.max_tokens, r.kv_override, r.prompt_ids, .{ .mtp_on = r.enable_mtp });

@@ -96,7 +96,7 @@ pub const MAX_BATCH_GROUP = @import("batching/verdict.zig").MAX_BATCH_GROUP;
 pub const BatchVerdict = @import("batching/verdict.zig").BatchVerdict;
 pub const configBatchesDecode = @import("batching/verdict.zig").configBatchesDecode;
 pub const modelBatchable = @import("batching/verdict.zig").modelBatchable;
-const liveDecodingCount = @import("batching/verdict.zig").liveDecodingCount;
+pub const liveDecodingCount = @import("batching/verdict.zig").liveDecodingCount;
 pub const BudgetRevise = @import("cache/budget.zig").BudgetRevise;
 pub const reclaimableHotCacheBytesFor = @import("cache/budget.zig").reclaimableHotCacheBytesFor;
 pub const armShutdownDeadline = @import("cache/budget.zig").armShutdownDeadline;
@@ -262,7 +262,7 @@ pub fn init(
         .prefix_cache_capacity = params.prefix_cache_capacity,
         .prefix_cache_ram_enabled = params.prefix_cache_ram_enabled,
         .prefix_cache_mem_bytes = params.prefix_cache_mem_bytes,
-        .prefix_cache_mem_resolver = params.prefix_cache_mem_resolver,
+        .prefix_cache_mem_resolver = if (params.prefix_cache_clamp) &@import("admission/hot_cache_plan.zig").prefixCacheMemForLoad else null,
         .prefix_cache_disk_bytes = params.prefix_cache_disk_bytes,
         .ssm_checkpoint_stride = params.ssm_checkpoint_stride,
         .ssm_checkpoint_max = params.ssm_checkpoint_max,
@@ -276,8 +276,8 @@ pub fn init(
         .ane_prefill = params.ane_prefill,
         .ane = params.ane,
         .ane_slots = params.ane_slots,
-        .ane_chunk_resolver = params.ane_chunk_resolver,
-        .ane_headroom_resolver = params.ane_headroom_resolver,
+        .ane_chunk_resolver = if (params.ane_resolvers) &@import("admission/prefill_chunk.zig").pinPrefillChunk else null,
+        .ane_headroom_resolver = if (params.ane_resolvers) &@import("admission/bills.zig").aneGateHeadroom else null,
         .no_drafter = params.no_drafter,
         .drafter_dir = params.drafter_dir,
         .primary_model_dir = params.model_dir,
@@ -450,18 +450,6 @@ pub fn deinit(self: *Scheduler) void {
     if (self.load_error_name) |n| self.allocator.free(n);
 
     self.allocator.destroy(self);
-}
-
-/// Decoders a tick would advance now; finished slots linger in `decoding` until the cull.
-pub fn liveDecodingCount(self: *Scheduler) usize {
-    self.queue_mu.lockUncancelable(self.io);
-    defer self.queue_mu.unlock(self.io);
-    var n: usize = 0;
-    for (self.decoding.items) |s| {
-        if (s.cancelled.load(.acquire) or s.finished or s.error_code != null) continue;
-        n += 1;
-    }
-    return n;
 }
 
 /// Another request is queued, prefilling or decoding right now.

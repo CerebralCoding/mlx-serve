@@ -61,7 +61,7 @@ const SinksState = struct {
     /// Flip it locally (see the file-sink test) when a test must assert on logging.
     stderr_enabled: bool = !builtin.is_test,
 };
-const sinks_shared = @import("shared.zig").Shared(SinksState, "log_state", .{});
+pub const sinks_shared = @import("shared.zig").Shared(SinksState, "log_state", .{});
 inline fn sinks() *SinksState {
     return sinks_shared.get();
 }

@@ -327,7 +327,7 @@ pub fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!bool {
         if (gen.ctx.mrope_pos != null) return false;
         pending_pipeline = pending_pipeline or gen.has_pending_logits or gen.has_pending_token;
         pending_draft = pending_draft or gen.mtp_pre_draft != null;
-        const why = sch.batchVerdict(slot);
+        const why = @import("../scheduler.zig").batchVerdict(sch, slot);
         const mtp_row = why == .spec_active and slotMtpGroupable(slot);
         if (why != .ok and !mtp_row) return false;
         has_mtp = has_mtp or mtp_row;

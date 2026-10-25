@@ -173,7 +173,7 @@ const NaxCliState = struct {
     /// Set by `--int8-qk`.
     int8_qk_cli: bool = false,
 };
-const naxCli_shared = @import("../../util/shared.zig").Shared(NaxCliState, "nax_attention_cli", .{});
+pub const naxCli_shared = @import("../../util/shared.zig").Shared(NaxCliState, "nax_attention_cli", .{});
 pub inline fn naxCli() *NaxCliState {
     return naxCli_shared.get();
 }

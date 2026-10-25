@@ -454,8 +454,8 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             else
                 0,
             // The width the admission guard billed for this request; the forward can never run wider.
-            .pinned_prefill_chunk = companyPrefillChunk(req_prefill_chunk, sch.decodingCount()),
-            .decode_share_width_cap = promptLogprobsWidthCap(slot.prompt_logprobs, decodeShareAdmissionCap(sch.liveDecodingCount(), prefillDecodeShare())),
+            .pinned_prefill_chunk = companyPrefillChunk(req_prefill_chunk, scheduler_mod.decodingCount(sch)),
+            .decode_share_width_cap = promptLogprobsWidthCap(slot.prompt_logprobs, decodeShareAdmissionCap(scheduler_mod.liveDecodingCount(sch), prefillDecodeShare())),
             .dflash_ctx_restored = dflash_pass,
             .mtp_cache_restored = mtp_pass,
             // Abandoned-prefill abort: the conn thread sets slot.cancelled

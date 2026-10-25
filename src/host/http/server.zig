@@ -211,7 +211,24 @@ const ServerState = struct {
     /// `--wired-margin-gib` in bytes: what stays unplanned under a raised wired limit.
     wired_limit_margin_bytes: u64 = WIRED_LIMIT_MARGIN_BYTES,
 };
-const serverState_shared = @import("../../sdk/util/shared.zig").Shared(ServerState, "server_config", .{});
+/// The launch settings the engine's admission code reads beside the host, one copy for every compile unit (`Shared`).
+pub const Launch = struct {
+    global_scheduler: ?*Scheduler = null,
+    configured_kv_quant: ?kv_quant_mod.KVQuantConfig = null,
+    prefix_cache_capacity: u32 = 32,
+    prefix_cache_ram_enabled: bool = true,
+    prefix_cache_mem_bytes: u64 = PREFIX_CACHE_MEM_DEFAULT,
+    prefix_cache_mem_explicit: bool = false,
+    prefix_cache_disk_bytes: u64 = 0,
+    ssm_checkpoint_stride: u32 = 256,
+    ssm_checkpoint_max: u32 = 16,
+};
+pub const launch_shared = @import("../../sdk/util/shared.zig").Shared(Launch, "launch", .{});
+pub inline fn launch() *Launch {
+    return launch_shared.get();
+}
+
+pub const serverState_shared = @import("../../sdk/util/shared.zig").Shared(ServerState, "server_config", .{});
 pub inline fn serverState() *ServerState {
     return serverState_shared.get();
 }
@@ -225,18 +242,16 @@ pub fn getTimeoutNs() u64 {
 /// serve mode (set by `serve()`); null only before `serve()` runs. Every
 /// inference request handler routes through this; the scheduler's
 /// inference thread is the single mlx-call site.
-pub var global_scheduler: ?*Scheduler = null;
 
 /// The boot's parsed `--kv-quant`, published by `serve()` before `Scheduler.init` so a
 /// load-time bill sees it (the scheduler does not exist yet during the load; asking it billed
 /// the SSD-first session at bf16, ~8.6 GB of idle allowance lost at 786k).
-pub var configured_kv_quant: ?kv_quant_mod.KVQuantConfig = null;
 
 /// The process-wide kv-quant config at any point: the scheduler's once it exists, the boot's
 /// published value during the load, dense when no flag was given.
 fn configuredKvQuant() kv_quant_mod.KVQuantConfig {
-    if (global_scheduler) |sch| return sch.kv_quant_config;
-    return configured_kv_quant orelse kv_quant_mod.KVQuantConfig.dense;
+    if (launch().global_scheduler) |sch| return sch.kv_quant_config;
+    return launch().configured_kv_quant orelse kv_quant_mod.KVQuantConfig.dense;
 }
 
 /// The width THIS model stores at: its `model-settings.json` override, else the process default.
@@ -264,10 +279,8 @@ pub var global_registry: ?*ModelRegistry = null;
 // turn. The count cap is pure retention metadata; the byte budget
 // (`--prefix-cache-mem`, default 2 GB) is what actually bounds memory,
 // evicting LRU entries by size. 0 disables.
-pub var prefix_cache_capacity: u32 = 32;
 
 /// `--no-prefix-cache-ram` keeps the disk tier eligible without idle RAM retention.
-pub var prefix_cache_ram_enabled: bool = true;
 
 pub const PREFIX_CACHE_MEM_DEFAULT: u64 = 2 * 1024 * 1024 * 1024;
 
@@ -278,10 +291,8 @@ pub const PREFIX_CACHE_MEM_DEFAULT: u64 = 2 * 1024 * 1024 * 1024;
 /// `--prefix-cache-mem <N>{GB,MB}`. 0 disables the byte budget (count cap
 /// from `--prefix-cache-entries` still applies). On qwen4_exp's RAM-first arm an
 /// unset budget grows to one session at the working context (`defaultPrefixCacheAsk`).
-pub var prefix_cache_mem_bytes: u64 = PREFIX_CACHE_MEM_DEFAULT;
 
 /// Set by `--prefix-cache-mem`: an operator's number is used as given, even when it equals the default.
-pub var prefix_cache_mem_explicit = false;
 
 /// SSD tier for the hot prefix cache (`--prefix-cache-disk`). Committed KV
 /// prefixes persist as chunked safetensors under
@@ -293,7 +304,6 @@ pub var prefix_cache_mem_explicit = false;
 /// DEFAULT OFF (`0`): the tier can hold gigabytes of KV on disk, so it's opt-in
 /// — pass `--prefix-cache-disk <n>{KB,MB,GB}` to enable (10 GB is a sensible
 /// value). The Swift app exposes this as a Settings toggle, default off.
-pub var prefix_cache_disk_bytes: u64 = 0;
 
 /// `--shutdown-persist-secs`: on SIGTERM, finish the SSD slices the idle flush has not landed,
 /// for at most this long after the signal. 0 turns it off.
@@ -321,12 +331,10 @@ pub var shutdown_persist_secs: u32 = 45;
 /// The always-on end-of-prompt snapshot preserves append-growth multi-turn
 /// reuse for MoE regardless. Raise this (e.g. 512/1024) to also coarsen the
 /// non-MoE path; set 0 to disable (hybrid models then bypass the hot cache).
-pub var ssm_checkpoint_stride: u32 = 256;
 
 /// Phase 1: cap on the number of checkpoints retained per request. Snapshots
 /// past this drop the oldest (front of list) to keep memory bounded on very
 /// long prompts. 0 = unlimited (rely on the prefix-cache byte budget alone).
-pub var ssm_checkpoint_max: u32 = 16;
 
 /// Iteration 2 (perf-plan Phase 4 #3): LRU capacity of the per-LoadedModel
 /// chat-template tokenize cache. 0 disables (every request re-renders +
@@ -374,8 +382,8 @@ pub fn serve(
     serverState().server_config = cfg;
     // Before `Scheduler.init`: that call is the model load and every load-time bill inside it
     // asks for the KV width.
-    configured_kv_quant = load_params.kv_quant_config;
-    defer configured_kv_quant = null;
+    launch().configured_kv_quant = load_params.kv_quant_config;
+    defer launch().configured_kv_quant = null;
 
     // ── Phase A1: spin up the scheduler. Its inference thread does the
     //    Transformer/vision/drafter load, JIT compile, and warmup before
@@ -396,8 +404,8 @@ pub fn serve(
     var scheduler = try mlx_engine.start(allocator, io, load_params, max_concurrent);
     defer scheduler.deinit();
     startup.stop();
-    global_scheduler = scheduler;
-    defer global_scheduler = null;
+    launch().global_scheduler = scheduler;
+    defer launch().global_scheduler = null;
     mlx_engine.api().install_admission_hooks(true);
     defer mlx_engine.api().install_admission_hooks(false);
 
@@ -453,27 +461,27 @@ pub fn serve(
             " [hybrid: SSM checkpoints]"
         else
             "";
-        if (!prefix_cache_ram_enabled and prefix_cache_disk_bytes > 0) {
+        if (!launch().prefix_cache_ram_enabled and launch().prefix_cache_disk_bytes > 0) {
             log.info("Prefix cache: SSD ONLY (RAM retention disabled, disk cap={d:.1} MB){s}\n", .{
-                @as(f64, @floatFromInt(prefix_cache_disk_bytes)) / (1024.0 * 1024.0),
+                @as(f64, @floatFromInt(launch().prefix_cache_disk_bytes)) / (1024.0 * 1024.0),
                 ssm_note,
             });
         } else if (admission.resolvedPrefixCacheMem() > 0) {
             const cap_mb = @as(f64, @floatFromInt(admission.resolvedPrefixCacheMem())) / (1024.0 * 1024.0);
-            log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap={d:.1} MB){s}\n", .{ prefix_cache_capacity, cap_mb, ssm_note });
+            log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap={d:.1} MB){s}\n", .{ launch().prefix_cache_capacity, cap_mb, ssm_note });
         } else {
-            log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap=unlimited){s}\n", .{ prefix_cache_capacity, ssm_note });
+            log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap=unlimited){s}\n", .{ launch().prefix_cache_capacity, ssm_note });
         }
         if (config.has_hybrid_layers) {
-            log.info("  ssm-checkpoint-stride={d} tokens, max={d}/entry\n", .{ ssm_checkpoint_stride, ssm_checkpoint_max });
+            log.info("  ssm-checkpoint-stride={d} tokens, max={d}/entry\n", .{ launch().ssm_checkpoint_stride, launch().ssm_checkpoint_max });
         }
-    } else if (prefix_cache_capacity > 0) {
-        if (config.has_hybrid_layers and ssm_checkpoint_stride == 0) {
-            log.info("Hot prefix cache: requested capacity={d} but model is hybrid and --ssm-checkpoint-stride is 0 — disabled\n", .{prefix_cache_capacity});
+    } else if (launch().prefix_cache_capacity > 0) {
+        if (config.has_hybrid_layers and launch().ssm_checkpoint_stride == 0) {
+            log.info("Hot prefix cache: requested capacity={d} but model is hybrid and --ssm-checkpoint-stride is 0 — disabled\n", .{launch().prefix_cache_capacity});
         } else if (config.full_attention_interval > 0) {
-            log.info("Hot prefix cache: requested capacity={d} but model uses full-attention-interval — disabled\n", .{prefix_cache_capacity});
+            log.info("Hot prefix cache: requested capacity={d} but model uses full-attention-interval — disabled\n", .{launch().prefix_cache_capacity});
         } else {
-            log.info("Hot prefix cache: requested capacity={d} but disabled by scheduler\n", .{prefix_cache_capacity});
+            log.info("Hot prefix cache: requested capacity={d} but disabled by scheduler\n", .{launch().prefix_cache_capacity});
         }
     }
 
@@ -491,7 +499,7 @@ pub fn serve(
     // at every value so a default-1 boot does not read as "one at a time".
     if (mlx_engine.api().batches_decode(config)) {
         log.info("Concurrency: --max-concurrent={d}, batched decode on\n", .{max_concurrent});
-        if (prefix_cache_capacity > 0 and prefix_cache_capacity < max_concurrent) prefix_cache_capacity = max_concurrent;
+        if (launch().prefix_cache_capacity > 0 and launch().prefix_cache_capacity < max_concurrent) launch().prefix_cache_capacity = max_concurrent;
     } else {
         log.info("Concurrency: --max-concurrent={d}, batched decode off (arch: {s}); concurrent requests interleave serially\n", .{ max_concurrent, config.model_type });
     }
@@ -678,7 +686,7 @@ pub fn serve(
     // The SSD flush's deadline starts here, once. The drain keeps its own bound: cutting it short
     // saves nothing (the join below waits out the inference thread's current chunk anyway) and
     // lets a late `complete()` race the queues `deinit` frees.
-    if (global_scheduler) |sch| {
+    if (launch().global_scheduler) |sch| {
         armShutdownDeadline(&sch.shutdown_deadline_ms, nowMsMonotonic(io), shutdown_persist_secs);
         sch.cancelAllInFlight();
     }

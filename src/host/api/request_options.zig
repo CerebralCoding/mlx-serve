@@ -222,7 +222,7 @@ pub fn requestEnableDrafter(explicit: ?std.json.Value, gemma_loaded: bool, dflas
 pub const RequestSpec = struct { use_mtp: bool, use_drafter: bool, use_pld: bool };
 
 pub fn requestHasCompany() bool {
-    return if (http_server.global_scheduler) |sch| mlx_engine.api().has_company(sch) else false;
+    return if (http_server.launch().global_scheduler) |sch| mlx_engine.api().has_company(sch) else false;
 }
 
 /// The ONE request-level spec dispatch, shared by every surface x stream /

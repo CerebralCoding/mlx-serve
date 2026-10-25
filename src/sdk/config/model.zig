@@ -2315,7 +2315,7 @@ const ModelCliState = struct {
     /// therefore the way to A/B a scaling experiment on identical weights.
     config_overrides: ?[]const u8 = null,
 };
-const modelCli_shared = @import("../util/shared.zig").Shared(ModelCliState, "model_cli", .{});
+pub const modelCli_shared = @import("../util/shared.zig").Shared(ModelCliState, "model_cli", .{});
 inline fn modelCli() *ModelCliState {
     return modelCli_shared.get();
 }

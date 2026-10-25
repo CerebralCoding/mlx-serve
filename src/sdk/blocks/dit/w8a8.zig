@@ -33,7 +33,7 @@ const W8a8State = struct {
     /// `zig build test`, so every other oracle keeps its packed numerics and the tests of this route opt in.
     enabled: bool = false,
 };
-const w8a8State_shared = @import("../../util/shared.zig").Shared(W8a8State, "w8a8", .{});
+pub const w8a8State_shared = @import("../../util/shared.zig").Shared(W8a8State, "w8a8", .{});
 pub inline fn w8a8State() *W8a8State {
     return w8a8State_shared.get();
 }

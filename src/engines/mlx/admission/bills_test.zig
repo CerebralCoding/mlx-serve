@@ -1091,11 +1091,11 @@ test "the 458k prefill's two unbilled terms are billed: retained checkpoints and
     const per_cp = cfg.ssmCheckpointBytes();
     // 36 x (1,572,864 + 61,440) B = 58.83 MB.
     try t.expect(per_cp > 58_000_000 and per_cp < 60_000_000);
-    const saved_cp_max = http_server.ssm_checkpoint_max;
-    http_server.ssm_checkpoint_max = 32;
-    defer http_server.ssm_checkpoint_max = saved_cp_max;
+    const saved_cp_max = http_server.launch().ssm_checkpoint_max;
+    http_server.launch().ssm_checkpoint_max = 32;
+    defer http_server.launch().ssm_checkpoint_max = saved_cp_max;
     const held = retainedSsmCheckpointBytes(&cfg, seq, 0, chunk);
-    try t.expectEqual(@as(u64, http_server.ssm_checkpoint_max) * per_cp, held);
+    try t.expectEqual(@as(u64, http_server.launch().ssm_checkpoint_max) * per_cp, held);
     try t.expect(held > 1_800_000_000);
     // It saturates: 393k holds the same 32 as 458k.
     try t.expectEqual(held, retainedSsmCheckpointBytes(&cfg, 393_216, 0, chunk));
@@ -1480,9 +1480,9 @@ test "prefillRequestTerms: qwen4 MTP head KV is billed when MTP is on and zero w
     const saved_ov = transformer_mod.Transformer.mtp_head_kv_quant_override;
     defer transformer_mod.Transformer.mtp_head_kv_quant_override = saved_ov;
     transformer_mod.Transformer.mtp_head_kv_quant_override = false;
-    const saved_boot = http_server.configured_kv_quant;
-    defer http_server.configured_kv_quant = saved_boot;
-    http_server.configured_kv_quant = transformer_mod.KVQuantConfig.affine(8);
+    const saved_boot = http_server.launch().configured_kv_quant;
+    defer http_server.launch().configured_kv_quant = saved_boot;
+    http_server.launch().configured_kv_quant = transformer_mod.KVQuantConfig.affine(8);
     var cfg = qwen4ExpOomConfig();
     cfg.mtp_override = false;
     try t.expect(!mtpHeadBilled(&cfg));
@@ -1518,9 +1518,9 @@ test "prefillRequestTerms: MTP head KV bills the boot scheme, not a request kv_q
     const saved_ov = transformer_mod.Transformer.mtp_head_kv_quant_override;
     defer transformer_mod.Transformer.mtp_head_kv_quant_override = saved_ov;
     transformer_mod.Transformer.mtp_head_kv_quant_override = true;
-    const saved_boot = http_server.configured_kv_quant;
-    defer http_server.configured_kv_quant = saved_boot;
-    http_server.configured_kv_quant = transformer_mod.KVQuantConfig.affine(8);
+    const saved_boot = http_server.launch().configured_kv_quant;
+    defer http_server.launch().configured_kv_quant = saved_boot;
+    http_server.launch().configured_kv_quant = transformer_mod.KVQuantConfig.affine(8);
     var cfg = qwen4ExpOomConfig();
     cfg.mtp_override = null;
     const seq: u64 = 200_000;
@@ -1543,8 +1543,8 @@ test "prefillAdmissionBill: every arch carries the evict-to-admit credits (#492)
     var sch: scheduler_mod.Scheduler = undefined;
     sch.resident_hot_cache_bytes = .init(9000 * MB);
     sch.reclaimable_hot_cache_bytes = .init(8000 * MB);
-    http_server.global_scheduler = &sch;
-    defer http_server.global_scheduler = null;
+    http_server.launch().global_scheduler = &sch;
+    defer http_server.launch().global_scheduler = null;
     for ([_][]const u8{ "qwen3_5", "qwen3_5_moe", "llama", "gemma4", "qwen4_exp" }) |mt| {
         var cfg = qwen4ExpOomConfig();
         cfg.model_type = mt;
@@ -1576,9 +1576,9 @@ test "a 448k warm append the free-RAM term refused fits under an explicitly rais
     const total_ram: u64 = 131_072 * mb;
     const working_set: u64 = 120_000 * mb;
     const footprint: u64 = 87_722 * mb;
-    const saved = memory_ceiling.wired_limit_mb_override;
-    defer memory_ceiling.wired_limit_mb_override = saved;
-    memory_ceiling.wired_limit_mb_override = 120_000;
+    const saved = memory_ceiling.overrides().wired_limit_mb;
+    defer memory_ceiling.overrides().wired_limit_mb = saved;
+    memory_ceiling.overrides().wired_limit_mb = 120_000;
     var cfg = qwen4ExpLive364kConfig();
     const kv_bits: u64 = 8;
     const seq: u64 = 448_604;
@@ -1610,15 +1610,15 @@ test "a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's
     defer generate_mod.prefill_chunk_override = saved_override;
     generate_mod.prefill_chunk_override = 8192;
     const stride: u64 = 8192;
-    try t.expectEqual(stride, generate_mod.effectiveSsmCheckpointStride(http_server.ssm_checkpoint_stride, 8192));
+    try t.expectEqual(stride, generate_mod.effectiveSsmCheckpointStride(http_server.launch().ssm_checkpoint_stride, 8192));
 
     // Cold: `seq / stride` saturates at --ssm-checkpoint-max as before.
-    try t.expectEqual(@as(u64, http_server.ssm_checkpoint_max) * per_cp, retainedSsmCheckpointBytes(&cfg, seq, 0, chunk));
+    try t.expectEqual(@as(u64, http_server.launch().ssm_checkpoint_max) * per_cp, retainedSsmCheckpointBytes(&cfg, seq, 0, chunk));
     // Warm: a 3,730-token append at stride 8192 crosses no boundary, so the end snapshot is the whole of it.
     try t.expectEqual(@as(u64, 1) * per_cp, retainedSsmCheckpointBytes(&cfg, seq, matched, chunk));
     // A chain extension long enough to fill the ring still bills the cap: the
     // credit is proportional to the SPAN, not a blanket warm discount.
-    try t.expectEqual(@as(u64, http_server.ssm_checkpoint_max) * per_cp, retainedSsmCheckpointBytes(&cfg, seq, 60_000, chunk));
+    try t.expectEqual(@as(u64, http_server.launch().ssm_checkpoint_max) * per_cp, retainedSsmCheckpointBytes(&cfg, seq, 60_000, chunk));
     // A span shorter than the backoff window snapshots nothing.
     try t.expectEqual(@as(u64, 0), retainedSsmCheckpointBytes(&cfg, seq, seq - 4, chunk));
 
@@ -1663,7 +1663,7 @@ test "a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's
     const available: u64 = 10_000 * mb;
     try t.expect(needed < available);
     try t.expectEqual(@as(u64, 9_722), needed / mb);
-    const before = gross - terms.checkpoint_bytes + @as(u64, http_server.ssm_checkpoint_max) * per_cp;
+    const before = gross - terms.checkpoint_bytes + @as(u64, http_server.launch().ssm_checkpoint_max) * per_cp;
     try t.expectEqual(@as(u64, 10_774), (before * 5 / 4 + qsaMaskBytes(&cfg, chunk, seq)) / mb);
     try t.expect((before * 5 / 4 + qsaMaskBytes(&cfg, chunk, seq)) > available);
 }

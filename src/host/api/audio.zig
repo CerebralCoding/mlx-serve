@@ -87,14 +87,14 @@ pub fn handleTranscriptions(allocator: std.mem.Allocator, stream: *Conn, body: [
     var speaker_probs: ?[]f32 = null;
     defer if (speaker_probs) |p| allocator.free(p);
     var diarizer: ?*LoadedModel = null;
-    defer if (diarizer) |m| http_server.global_scheduler.?.release(m);
+    defer if (diarizer) |m| http_server.launch().global_scheduler.?.release(m);
     var speakers: u32 = 0;
     if (form.format == .diarized_json) {
         const id = (findCompanion("nemotron_diarization") orelse {
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "diarized_json needs Nemotron 3 Diarization, which is not on disk or did not load: download " ++ DIARIZER_REPO ++ " beside the ASR model", 400);
             return;
         }).id;
-        diarizer = http_server.global_scheduler.?.ensureLoaded(id) catch |err| blk: {
+        diarizer = http_server.launch().global_scheduler.?.ensureLoaded(id) catch |err| blk: {
             log.warn("  diarizer {s} did not load ({s}): one speaker\n", .{ id, @errorName(err) });
             break :blk null;
         };
@@ -108,7 +108,7 @@ pub fn handleTranscriptions(allocator: std.mem.Allocator, stream: *Conn, body: [
 
     var tl = transcription_mod.Timeline{};
     defer tl.deinit(allocator);
-    defer if (aligner) |al| if (al.lm) |m| http_server.global_scheduler.?.release(m);
+    defer if (aligner) |al| if (al.lm) |m| http_server.launch().global_scheduler.?.release(m);
     var start: usize = 0;
     for (ends) |end| {
         const heard = (try transcribeClip(allocator, stream, lm, form, pcm[start..end])) orelse return;
@@ -118,10 +118,10 @@ pub fn handleTranscriptions(allocator: std.mem.Allocator, stream: *Conn, body: [
         defer if (timed) |*x| x.deinit(allocator);
         if (aligner) |*al| {
             if (t.text.len > 0 and al.languages & transcription_mod.languageBit(t.language orelse "") != 0) {
-                if (al.lm == null) al.lm = http_server.global_scheduler.?.ensureLoaded(al.id) catch |err| blk: {
+                if (al.lm == null) al.lm = http_server.launch().global_scheduler.?.ensureLoaded(al.id) catch |err| blk: {
                     // verbose_json still answers without times; srt and vtt cannot.
                     if (form.format != .verbose_json) {
-                        try sendEnsureLoadedError(allocator, stream, http_server.global_scheduler.?, al.id, err);
+                        try sendEnsureLoadedError(allocator, stream, http_server.launch().global_scheduler.?, al.id, err);
                         return;
                     }
                     log.warn("  aligner {s} did not load ({s}): segments without word times\n", .{ al.id, @errorName(err) });
@@ -201,7 +201,7 @@ fn transcribeClip(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel,
     const enable_thinking = false;
     const spec = false;
     var timer = Stopwatch.init(stream.io);
-    const result = nonStreamingViaScheduler(allocator, http_server.global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, .{ .temperature = form.temperature }, config.eosTokenSlice(), 0, false, enable_thinking, spec, spec, spec, spec, getTimeoutNs(), slot_ve, mm.media, 0, .{}, 0, false, null, null, stream) catch |err| {
+    const result = nonStreamingViaScheduler(allocator, http_server.launch().global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, .{ .temperature = form.temperature }, config.eosTokenSlice(), 0, false, enable_thinking, spec, spec, spec, spec, getTimeoutNs(), slot_ve, mm.media, 0, .{}, 0, false, null, null, stream) catch |err| {
         log.err("  -> {s}\n", .{@errorName(err)});
         sendGenerationError(allocator, stream, err, .openai) catch {};
         return null;
@@ -288,7 +288,7 @@ fn alignPiece(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel, pcm
     mm.embeddings = null;
     var timer = Stopwatch.init(stream.io);
     var req = scheduler_mod.GenRequest{ .ctx = &job, .run = alignJobRun, .model = lm };
-    http_server.global_scheduler.?.runGeneration(&req) catch |err| {
+    http_server.launch().global_scheduler.?.runGeneration(&req) catch |err| {
         _ = mlx.mlx_array_free(job.rows);
         if (err != error.Shutdown) return err;
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", "Server is shutting down", 503);
@@ -339,7 +339,7 @@ fn diarizeClip(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel, pc
     var job = DiarizeJob{ .allocator = allocator, .plugin = lm.media_plugin, .pcm = pcm };
     var timer = Stopwatch.init(stream.io);
     var req = scheduler_mod.GenRequest{ .ctx = &job, .run = diarizeJobRun, .model = lm };
-    http_server.global_scheduler.?.runGeneration(&req) catch |err| {
+    http_server.launch().global_scheduler.?.runGeneration(&req) catch |err| {
         if (err != error.Shutdown) return err;
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", "Server is shutting down", 503);
         return null;

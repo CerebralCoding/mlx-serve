@@ -156,7 +156,7 @@ const WarmState = struct {
     live_warm_bytes: std.atomic.Value(u64) = .init(0),
     live_warm_total: std.atomic.Value(u64) = .init(0),
 };
-const warm_shared = @import("../../sdk/util/shared.zig").Shared(WarmState, "qwen4_warm", .{});
+pub const warm_shared = @import("../../sdk/util/shared.zig").Shared(WarmState, "qwen4_warm", .{});
 pub inline fn warmBytes() *WarmState {
     return warm_shared.get();
 }

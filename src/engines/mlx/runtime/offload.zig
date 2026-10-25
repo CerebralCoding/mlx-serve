@@ -110,6 +110,7 @@ fn onEvent(ctx: *anyopaque, _: u64, ev: *const abi.Event) callconv(.c) abi.Actio
             slot.cached_tokens = ev.cached;
             slot.first_token_ns = @intCast(slot.request_start_ts.untilNow(slot.io, .boot).nanoseconds);
             slot.state = .decoding;
+            slot.emitPrefilled();
         },
         .tokens => {
             const lps = abi.items(abi.Logprob, ev.logprobs);

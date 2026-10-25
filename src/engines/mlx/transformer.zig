@@ -324,7 +324,7 @@ const CliState = struct {
     /// `--lm-head-mxfp8` / `--no-lm-head-mxfp8`; null = the default below.
     lm_head_mxfp8_cli: ?bool = null,
 };
-const cli_shared = @import("../../sdk/util/shared.zig").Shared(CliState, "transformer_cli", .{});
+pub const cli_shared = @import("../../sdk/util/shared.zig").Shared(CliState, "transformer_cli", .{});
 pub inline fn cli() *CliState {
     return cli_shared.get();
 }

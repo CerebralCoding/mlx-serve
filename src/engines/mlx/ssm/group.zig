@@ -29,7 +29,7 @@ pub const SsmMergeKind = packed struct {
 const SsmGroupState = struct {
     ssm_member_gen_src: std.atomic.Value(u64) = .init(1),
 };
-const ssmGroup_shared = @import("../../../sdk/util/shared.zig").Shared(SsmGroupState, "ssm_group", .{});
+pub const ssmGroup_shared = @import("../../../sdk/util/shared.zig").Shared(SsmGroupState, "ssm_group", .{});
 inline fn ssmGroup() *SsmGroupState {
     return ssmGroup_shared.get();
 }

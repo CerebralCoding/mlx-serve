@@ -50,6 +50,10 @@ pub const table: host.Api = .{
     .cluster_json = configure_mod.clusterJson,
     .plugin_stub = @import("plugin/config.zig").stubOf,
     .gauges = configure_mod.gauges,
+    .run_offline = @import("offline.zig").run,
+    .cluster_worker = clusterWorker,
+    .cluster_probe = clusterProbe,
+    .cluster_connect = clusterConnect,
     .configure = configure_mod.apply,
     .install_admission_hooks = @import("admission/admit.zig").installSchedulerHooks,
     .set_gen_yield = setGenYield,
@@ -61,6 +65,21 @@ fn addr() callconv(.c) *const anyopaque {
 
 comptime {
     @export(&addr, .{ .name = "mlx_serve_mlx_api" });
+}
+
+fn clusterWorker(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) ?[]const u8 {
+    distributed.cmdWorker(io, gpa, args) catch |e| return @errorName(e);
+    return null;
+}
+
+fn clusterProbe(io: std.Io, args: []const []const u8) ?[]const u8 {
+    distributed.cmdProbe(io, args) catch |e| return @errorName(e);
+    return null;
+}
+
+fn clusterConnect(io: std.Io, gpa: std.mem.Allocator, coordinator: []const u8, device: []const u8, mode: u8, model: []const u8, split: ?u32) ?[]const u8 {
+    distributed.connect(io, gpa, .{ .rank = 0, .coordinator = coordinator, .device = device }, @enumFromInt(mode), model, split) catch |e| return @errorName(e);
+    return null;
 }
 
 fn setGenYield(on: bool) void {
@@ -130,6 +149,7 @@ fn facts(lm: *const LoadedModel, out: *host.Facts) void {
         .has_mtp = lm.mtp != null,
         .draft_stages = request_policy.dsv4DraftStages(lm),
         .has_transformer = lm.transformer != null,
+        .module_owned = if (lm.transformer) |t| t.ownsModuleDecodeState() else false,
         .images = if (lm.vision_encoder) |ve| ve.supportsImages() else false,
         .audio = if (lm.vision_encoder) |ve| ve.supportsAudio() else false,
         .hears = if (lm.vision_encoder) |ve| ve.qwen_audio != null else false,

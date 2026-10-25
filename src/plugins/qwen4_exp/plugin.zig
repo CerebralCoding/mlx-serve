@@ -49,7 +49,7 @@ pub const table = abi.ModelTable{
 pub fn engineCtx() *?*const ForwardCtx {
     return EngineCtx.get();
 }
-const EngineCtx = @import("../../sdk/util/shared.zig").SharedThreadLocal(?*const ForwardCtx, "qwen4_engine_ctx", null);
+pub const EngineCtx = @import("../../sdk/util/shared.zig").SharedThreadLocal(?*const ForwardCtx, "qwen4_engine_ctx", null);
 
 const Verdict = abi.Verdict;
 const Array = mlx.mlx_array;

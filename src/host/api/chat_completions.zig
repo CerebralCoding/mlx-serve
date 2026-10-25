@@ -1003,7 +1003,7 @@ fn handleNonStreamingGeneration(
         break :blk v;
     };
     // Propagates to `handleChatCompletions`' one error arm, shared with the streaming twin.
-    const result = try nonStreamingViaScheduler(allocator, http_server.global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media, cache_key, mrope, logprobs_n, false, kv_quant_override, kv_attn_explicit, stream);
+    const result = try nonStreamingViaScheduler(allocator, http_server.launch().global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media, cache_key, mrope, logprobs_n, false, kv_quant_override, kv_attn_explicit, stream);
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
     defer if (result.logprobs) |lps| {

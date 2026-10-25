@@ -190,8 +190,8 @@ pub fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .pld = .{ .enable = http_server.serverState().server_config.default_enable_pld, .draft_len = http_server.serverState().server_config.default_pld_draft_len, .key_len = http_server.serverState().server_config.default_pld_key_len },
         .max_concurrent = http_server.max_concurrent,
         .prefix_cache_mem_bytes = resolvedPrefixCacheMem(),
-        .prefix_cache_disk_bytes = http_server.prefix_cache_disk_bytes,
-        .prefix_cache_ram_enabled = http_server.prefix_cache_capacity > 0 and http_server.prefix_cache_ram_enabled,
+        .prefix_cache_disk_bytes = http_server.launch().prefix_cache_disk_bytes,
+        .prefix_cache_ram_enabled = http_server.launch().prefix_cache_capacity > 0 and http_server.launch().prefix_cache_ram_enabled,
         .prefill_decode_share = es.prefill_decode_share,
     };
 }
@@ -296,7 +296,7 @@ pub fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel
     const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s},\"registry_generation\":{d}", .{ engine_json, batching_json, settings_json, cluster_json, registryGeneration() });
     defer allocator.free(extra_json);
 
-    const kv_cache_mem: u64 = if (http_server.global_scheduler) |sch|
+    const kv_cache_mem: u64 = if (http_server.launch().global_scheduler) |sch|
         sch.resident_hot_cache_bytes.load(.monotonic) + sch.resident_live_kv_bytes.load(.monotonic)
     else
         0;

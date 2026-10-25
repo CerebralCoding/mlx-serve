@@ -652,7 +652,7 @@ pub fn handleModelsRescan(allocator: std.mem.Allocator, stream: *Conn) !void {
 /// caller asked for a specific id, not "anything"). Routes through
 /// scheduler.ensureLoaded so eviction/back-pressure kicks in.
 pub fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_body: []const u8) !void {
-    const scheduler = http_server.global_scheduler orelse {
+    const scheduler = http_server.launch().global_scheduler orelse {
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503);
         return;
     };
@@ -802,7 +802,7 @@ fn unloadBodyNamesNoModel(obj: std.json.ObjectMap) bool {
 /// state (the stub stays registered so it can reload). Idempotent. Returns a
 /// small status payload confirming the model is unloaded.
 pub fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_body: []const u8) !void {
-    const scheduler = http_server.global_scheduler orelse {
+    const scheduler = http_server.launch().global_scheduler orelse {
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503);
         return;
     };

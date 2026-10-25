@@ -108,7 +108,7 @@ pub fn handleAnthropicStreaming(
     // Transfer vision ownership into the slot.
     const slot_ve_anth = ve_local;
     ve_local = null;
-    const sch = http_server.global_scheduler.?;
+    const sch = http_server.launch().global_scheduler.?;
     running = try mlx_engine.Running.submit(sch, .{
         .model = lm,
         .prompt_ids = prompt_ids,

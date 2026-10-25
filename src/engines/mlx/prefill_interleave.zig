@@ -468,7 +468,7 @@ pub fn chunkWidthCb(
     const next = pick(cfg, wc.kv_bits, pos, cur, cap, st, chunkWidthStagedBytes(wc));
     // Only a live adaptive width may move; elsewhere the admitted width stands.
     if (!adaptiveChunkWidthFor(cfg)) return next;
-    return decodeShareWidthCap(next, wc.sch.liveDecodingCount(), prefillDecodeShare());
+    return decodeShareWidthCap(next, scheduler_mod.liveDecodingCount(wc.sch), prefillDecodeShare());
 }
 
 /// What the owed-tick loop runs between boundaries: admit what arrived, then tick. Returns the

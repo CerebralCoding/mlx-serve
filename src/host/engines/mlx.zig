@@ -60,10 +60,34 @@ pub const Api = struct {
     /// The serving plugin's stub parse of the pack at a dir (discovery); null when no plugin serves it.
     plugin_stub: *const fn (std.Io, std.mem.Allocator, []const u8, []const u8) ?PluginStub,
     gauges: *const fn (*Gauges) void,
+    /// The Thunderbolt cluster: `mlx-serve dist-worker`, `dist-probe`, and the host side's `--dist` connect
+    /// (`mode` is the cluster's `Mode` tag).
+    cluster_worker: *const fn (std.Io, std.mem.Allocator, []const []const u8) Err,
+    cluster_probe: *const fn (std.Io, []const []const u8) Err,
+    cluster_connect: *const fn (std.Io, std.mem.Allocator, []const u8, []const u8, u8, []const u8, ?u32) Err,
+    /// `--prompt` without `--serve`: one generation on the calling thread.
+    run_offline: *const fn (*const Offline) Err,
     // ── process-wide engine settings, set once from the launch flags
     configure: *const fn (*const Flags) void,
     install_admission_hooks: *const fn (bool) void,
     set_gen_yield: *const fn (bool) void,
+};
+
+/// The offline single-prompt run's inputs.
+pub const Offline = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    config: *ModelConfig,
+    tok: *const @import("../../sdk/tokenizer/tokenizer.zig").Tokenizer,
+    chat_config: *const @import("../chat/chat.zig").ChatConfig,
+    model_dir: []const u8,
+    load_vision: bool,
+    kv_quant: @import("../../sdk/blocks/attention/kv_quant.zig").KVQuantConfig,
+    enable_mtp: bool,
+    prompt: []const u8,
+    temperature: f32,
+    max_tokens: u32,
+    stream: bool,
 };
 
 /// What discovery reads of a served pack: the stub parse's shell and caps.
@@ -75,6 +99,8 @@ pub const Facts = struct {
     /// DeepSeek-V4 draft stages: MTP-capable without a head.
     draft_stages: bool = false,
     has_transformer: bool = false,
+    /// The model keeps per-request decode state outside the KV cache (no prompt logprobs, no prefix reuse).
+    module_owned: bool = false,
     /// The vision tower reads images, audio (any tower), speech (Qwen3-ASR's), video frames.
     images: bool = false,
     audio: bool = false,
@@ -91,6 +117,8 @@ pub const Settings = struct {
     max_mtp_ctx: u32 = 0,
     prefill_decode_share: f32 = 0,
     mtp_head_kv_quant: bool = false,
+    /// `--prefill-chunk` when given, else 0.
+    explicit_prefill_chunk: u32 = 0,
 };
 
 /// Live engine numbers the metrics sampler publishes.
@@ -111,25 +139,25 @@ pub const ModelProps = struct {
     native_block: u32 = 0,
 };
 
-/// The launch flags that shape the engine's own globals.
+/// The launch flags that set the engine's own process-wide settings, applied once (`configure`) before a model loads.
 pub const Flags = struct {
-    prefill_chunk: ?usize = null,
-    prefill_chunk_explicit: bool = false,
-    machine_prefill_chunk_cap: ?usize = null,
-    prefill_trace_force: bool = false,
-    max_mtp_ctx: u32 = 0,
-    mtp_history_window: ?u32 = null,
-    mtp_greedy_tail: ?bool = null,
-    mtp_acceptance_json: []const u8 = "",
-    mtp_head_kv_quant: bool = false,
-    mtp_depth_min: ?u32 = null,
-    mtp_depth_max: ?u32 = null,
-    lm_head_mxfp8: ?bool = null,
-    skip_mem_preflight: bool = false,
     no_vision: bool = false,
-    prefill_decode_share: ?f32 = null,
-    gen_yield: bool = true,
-    sleep_inhibit: ?bool = null,
+    prevent_sleep: bool = true,
+    skip_mem_preflight: bool = false,
+    ple_gpu: bool = false,
+    /// `--mtp-min-depth` / `--mtp-max-depth`; a max of 0 leaves the planner's own cap.
+    mtp_depth_min: u32 = 1,
+    mtp_depth_max: u32 = 0,
+    mtp_greedy_tail: bool = false,
+    max_mtp_ctx: u32 = 0,
+    /// 0 = the full history.
+    mtp_history_window: usize = 0,
+    /// Set by `--prefill-chunk`: the explicit width, which turns machine sizing off.
+    prefill_chunk: ?usize = null,
+    prefill_trace: bool = false,
+    prefill_decode_share: f32 = 0,
+    mtp_head_kv_quant: bool = false,
+    mtp_acceptance: mtp_acceptance.Mode = .exact,
 };
 
 extern fn mlx_serve_mlx_api() callconv(.c) *const anyopaque;

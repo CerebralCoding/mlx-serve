@@ -61,7 +61,7 @@ pub const Yield = struct {
 pub fn genYield() *?*const Yield {
     return GenYield.get();
 }
-const GenYield = shared.SharedThreadLocal(?*const Yield, "gen_yield", null);
+pub const GenYield = shared.SharedThreadLocal(?*const Yield, "gen_yield", null);
 
 /// A streaming job's keepalive: `beat_until` writes a keepalive whenever the stream has been silent, until `done`.
 pub const Keepalive = struct {
@@ -78,7 +78,7 @@ pub const Keepalive = struct {
 pub fn streamKeepalive() *?Keepalive {
     return StreamKeepalive.get();
 }
-const StreamKeepalive = shared.SharedThreadLocal(?Keepalive, "stream_keepalive", null);
+pub const StreamKeepalive = shared.SharedThreadLocal(?Keepalive, "stream_keepalive", null);
 
 fn ReturnOf(comptime func: anytype) type {
     return @typeInfo(@TypeOf(func)).@"fn".return_type.?;

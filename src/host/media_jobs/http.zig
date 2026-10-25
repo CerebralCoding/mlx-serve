@@ -52,7 +52,7 @@ fn genJobRunMany(ctxs: []const *anyopaque) void {
 /// generation runs on the scheduler's inference thread (the sole mlx caller);
 /// the body writes its own response. A wrong-modality target gets a clear 400.
 pub fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: *model_registry_mod.LoadedModel, route: media_mod.GenRoute) !void {
-    const scheduler = http_server.global_scheduler orelse {
+    const scheduler = http_server.launch().global_scheduler orelse {
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503);
         return;
     };

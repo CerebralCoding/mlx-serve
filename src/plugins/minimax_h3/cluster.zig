@@ -222,7 +222,7 @@ const Hooks = struct {
     /// What the last video job did with the worker (`/props` cluster "last_job").
     note_job: ?*const fn (split: [2]u32, line: []const u8) void = null,
 };
-const hooks_shared = @import("../../sdk/util/shared.zig").Shared(Hooks, "h3_cluster", .{});
+pub const hooks_shared = @import("../../sdk/util/shared.zig").Shared(Hooks, "h3_cluster", .{});
 pub inline fn hooks() *Hooks {
     return hooks_shared.get();
 }

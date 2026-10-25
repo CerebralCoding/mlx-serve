@@ -19,7 +19,7 @@ const PleGpuState = struct {
     /// table resident beside the weights, and the host gather faults in only the rows it reads.
     enabled: bool = false,
 };
-const pleGpu_shared = @import("../../sdk/util/shared.zig").Shared(PleGpuState, "ple_gpu", .{});
+pub const pleGpu_shared = @import("../../sdk/util/shared.zig").Shared(PleGpuState, "ple_gpu", .{});
 pub inline fn pleGpu() *PleGpuState {
     return pleGpu_shared.get();
 }

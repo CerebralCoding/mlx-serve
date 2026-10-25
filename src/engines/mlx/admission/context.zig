@@ -225,7 +225,7 @@ pub fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
 /// The cache reserve the context sizer bills. Gated: the ask-independent constant. Ungated:
 /// the raw `--prefix-cache-mem`. Both load-time wrappers must pass the same value.
 pub fn ctxSizingCacheReserve(config: *const model_mod.ModelConfig) u64 {
-    if (http_server.prefix_cache_capacity == 0) return 0;
+    if (http_server.launch().prefix_cache_capacity == 0) return 0;
     return if (config.longCtxGated()) CTX_SIZING_CACHE_RESERVE else legacyPrefixCacheAsk();
 }
 
@@ -486,8 +486,8 @@ test "ctxSizingCacheReserve: the advertised context is unchanged on every other 
     // and an agent CLI budgets against that number for a whole session.
     const t = std.testing;
     const GiB: u64 = 1 << 30;
-    const saved = http_server.prefix_cache_mem_bytes;
-    defer http_server.prefix_cache_mem_bytes = saved;
+    const saved = http_server.launch().prefix_cache_mem_bytes;
+    defer http_server.launch().prefix_cache_mem_bytes = saved;
 
     var q4 = longCtxTestConfig(); // declares qwen4_exp
     var other = longCtxTestConfig();
@@ -495,13 +495,13 @@ test "ctxSizingCacheReserve: the advertised context is unchanged on every other 
     other.legacy.caps.long_ctx = std.mem.eql(u8, other.model_type, "qwen4_exp");
 
     for ([_]u64{ 0, 2 * GiB, 10 * GiB, 60 * GiB }) |ask| {
-        http_server.prefix_cache_mem_bytes = ask;
+        http_server.launch().prefix_cache_mem_bytes = ask;
         try t.expectEqual(CTX_SIZING_CACHE_RESERVE, ctxSizingCacheReserve(&q4));
         try t.expectEqual(ask, ctxSizingCacheReserve(&other));
     }
 
     // At the default ask the two agree: a default boot is unchanged on every arch.
-    http_server.prefix_cache_mem_bytes = CTX_SIZING_CACHE_RESERVE;
+    http_server.launch().prefix_cache_mem_bytes = CTX_SIZING_CACHE_RESERVE;
     try t.expectEqual(ctxSizingCacheReserve(&q4), ctxSizingCacheReserve(&other));
 
     // The reserve really moves the advertised context on the ungated arch.
