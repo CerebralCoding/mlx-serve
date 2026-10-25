@@ -37,10 +37,10 @@ Fix: before a load reads weights, the inference thread unloads IDLE models, olde
 Defect: pi reading page1..3 of a spec mid-task saw page3 only. Flash invented a 5-digit SKU
 (page1 says 4 digits), the 27B said it could not see the images and OCR'd them with tesseract.
 Images in an Anthropic `tool_result` (Claude Code's Read tool) never reached the model at all.
-Cause: since the first vision commit the server encoded only the active turn's media and spliced
-its soft tokens after a user-turn marker it searched for (`userTurnInsertPos`, end-of-prompt
-fallback). Older images were dropped from every request; the Anthropic parser kept only the
-text of a `tool_result`.
+Cause: since the first vision commit the server encoded only the active turn's media and spliced its
+soft tokens after a user-turn marker it searched for (`userTurnInsertPos`, end-of-prompt fallback).
+Older images were dropped from every request; the Anthropic parser kept only the text of a `tool_result`
+(the Responses parser, of a `function_call_output`, until a later fix).
 Fix: the vLLM/llama.cpp design. A message's media serializes as content parts, the model's own
 template renders one placeholder per item where the message sits, and `expandMediaPlaceholders`
 turns the k-th placeholder into item k's run. Every item is encoded, in prompt order; a count or
@@ -51,9 +51,9 @@ tower-less model refuses only the latest user turn's media and leaves a note for
 Accepted cost: every history image is still base64/PNG-decoded and preprocessed each turn to key the
 cache (0.6 s at 24 1920x1200 screenshots, 55k image tokens); the cache skips the tower, not the decode.
 The embedding cache never evicts what the current request used (plain LRU on the history scan hit 0%).
-Guard: `media renders one template placeholder per item` (chat.zig, real Qwen3.8 template),
-the `expandMediaPlaceholders` tests (server.zig), `media spans bound the reusable prefix`
-(prefix_cache.zig), `EmbeddingCache serves a hit and evicts` (vision.zig), `tests/test_multi_image_history.sh`.
+Guard: `media renders one template placeholder per item` (chat.zig, real Qwen3.8 template), the `expandMediaPlaceholders`
+tests (server.zig), `media spans bound the reusable prefix` (prefix_cache.zig), `EmbeddingCache serves a hit and evicts`
+(vision.zig), `parseInput keeps a function_call_output input_image` (responses.zig), `tests/test_multi_image_history.sh`.
 
 ### A bare-string `image_url` vanished from the prompt (2026-10-13)
 

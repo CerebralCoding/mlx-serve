@@ -648,7 +648,7 @@ pub fn parseInput(
                 } else if (std.mem.eql(u8, t, "function_call")) {
                     try appendFunctionCallInputItem(allocator, &pi, obj, namespace_aliases);
                 } else if (std.mem.eql(u8, t, "function_call_output")) {
-                    try appendFunctionCallOutputItem(allocator, &pi, obj);
+                    try appendFunctionCallOutputItem(allocator, &pi, obj, image_decoder, vp);
                 } else if (std.mem.eql(u8, t, "reasoning")) {
                     // Drop on input — model regenerates its own reasoning.
                     continue;
@@ -694,6 +694,47 @@ fn appendTextParts(
     }
 }
 
+/// Decode the `input_image` parts of a content array; the returned slice is owned by `pi`.
+fn appendImageParts(
+    allocator: std.mem.Allocator,
+    pi: *ParsedInput,
+    parts: []const std.json.Value,
+    image_decoder: ?ImageUrlDecoder,
+    vp: chat_mod.VisionPreproc,
+) !?[]chat_mod.ImageData {
+    var image_list = std.ArrayList(chat_mod.ImageData).empty;
+    errdefer {
+        for (image_list.items) |img| allocator.free(img.pixels);
+        image_list.deinit(allocator);
+    }
+    for (parts) |part| {
+        if (part != .object) continue;
+        const pt_val = part.object.get("type") orelse continue;
+        if (pt_val != .string) continue;
+        if (!std.mem.eql(u8, pt_val.string, "input_image")) continue;
+        const url_val = part.object.get("image_url") orelse continue;
+        const url = switch (url_val) {
+            .string => |s| s,
+            .object => |io| if (io.get("url")) |u| (if (u == .string) u.string else continue) else continue,
+            else => continue,
+        };
+        if (image_decoder) |dec| if (!dec(allocator, &image_list, url, vp)) {
+            pi.image_decode_failed = true;
+        };
+    }
+    if (image_list.items.len == 0) {
+        image_list.deinit(allocator);
+        return null;
+    }
+    const owned = try image_list.toOwnedSlice(allocator);
+    errdefer {
+        for (owned) |img| allocator.free(img.pixels);
+        allocator.free(owned);
+    }
+    try pi.owned_images.append(allocator, owned);
+    return owned;
+}
+
 fn appendMessageItem(
     allocator: std.mem.Allocator,
     pi: *ParsedInput,
@@ -714,39 +755,13 @@ fn appendMessageItem(
         .array => |arr| {
             var text_parts = std.ArrayList(u8).empty;
             defer text_parts.deinit(allocator);
-            var image_list = std.ArrayList(chat_mod.ImageData).empty;
-            errdefer {
-                for (image_list.items) |img| allocator.free(img.pixels);
-                image_list.deinit(allocator);
-            }
             try appendTextParts(allocator, &text_parts, arr.items);
-            for (arr.items) |part| {
-                if (part != .object) continue;
-                const pt_val = part.object.get("type") orelse continue;
-                if (pt_val != .string) continue;
-                if (!std.mem.eql(u8, pt_val.string, "input_image")) continue;
-                const url_val = part.object.get("image_url") orelse continue;
-                const url = switch (url_val) {
-                    .string => |s| s,
-                    .object => |io| if (io.get("url")) |u| (if (u == .string) u.string else continue) else continue,
-                    else => continue,
-                };
-                if (image_decoder) |dec| if (!dec(allocator, &image_list, url, vp)) {
-                    pi.image_decode_failed = true;
-                };
-            }
             if (text_parts.items.len > 0) {
                 const owned = try allocator.dupe(u8, text_parts.items);
                 try pi.owned_strings.append(allocator, owned);
                 content = owned;
             }
-            if (image_list.items.len > 0) {
-                const owned = try image_list.toOwnedSlice(allocator);
-                try pi.owned_images.append(allocator, owned);
-                images = owned;
-            } else {
-                image_list.deinit(allocator);
-            }
+            images = try appendImageParts(allocator, pi, arr.items, image_decoder, vp);
         },
         else => {},
     }
@@ -793,15 +808,18 @@ fn appendFunctionCallOutputItem(
     allocator: std.mem.Allocator,
     pi: *ParsedInput,
     obj: std.json.ObjectMap,
+    image_decoder: ?ImageUrlDecoder,
+    vp: chat_mod.VisionPreproc,
 ) !void {
     const call_id = if (obj.get("call_id")) |v| (if (v == .string) v.string else "") else "";
     const output_val = obj.get("output");
     var output: []const u8 = "";
+    var images: ?[]chat_mod.ImageData = null;
     if (output_val) |v| {
         switch (v) {
             .string => |s| output = s,
             // Codex echoes `output` as an array of content parts; join its text
-            // parts in order the same way message content is joined.
+            // parts and decode its images the way message content is.
             .array => |arr| {
                 var parts = std.ArrayList(u8).empty;
                 defer parts.deinit(allocator);
@@ -811,6 +829,7 @@ fn appendFunctionCallOutputItem(
                     try pi.owned_strings.append(allocator, owned);
                     output = owned;
                 }
+                images = try appendImageParts(allocator, pi, arr.items, image_decoder, vp);
             },
             else => {},
         }
@@ -819,6 +838,7 @@ fn appendFunctionCallOutputItem(
         .role = "tool",
         .content = output,
         .tool_call_id = call_id,
+        .images = images,
     });
 }
 
@@ -1506,6 +1526,60 @@ test "parseInput reads a developer item as the system turn" {
 
 fn testRejectingDecoder(_: std.mem.Allocator, _: *std.ArrayList(chat_mod.ImageData), _: []const u8, _: chat_mod.VisionPreproc) bool {
     return false;
+}
+
+fn testAcceptingDecoder(allocator: std.mem.Allocator, list: *std.ArrayList(chat_mod.ImageData), _: []const u8, _: chat_mod.VisionPreproc) bool {
+    const px = allocator.alloc(u8, 4) catch return false;
+    list.append(allocator, .{ .pixels = px, .width = 1, .height = 1 }) catch {
+        allocator.free(px);
+        return false;
+    };
+    return true;
+}
+
+test "parseInput keeps a function_call_output input_image" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\[{"type":"function_call_output","call_id":"call_1","output":[{"type":"input_text","text":"Read image file [image/png]"},{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]}]
+    , .{});
+    defer parsed.deinit();
+    var pi = try parseInput(allocator, parsed.value, null, null, null, testAcceptingDecoder, .{});
+    defer pi.deinit();
+    try std.testing.expect(!pi.image_decode_failed);
+    try std.testing.expectEqual(@as(usize, 1), pi.messages.items.len);
+    const m = pi.messages.items[0];
+    try std.testing.expectEqualStrings("tool", m.role);
+    try std.testing.expectEqualStrings("call_1", m.tool_call_id.?);
+    try std.testing.expectEqualStrings("Read image file [image/png]", m.content);
+    try std.testing.expect(m.images != null);
+    try std.testing.expectEqual(@as(usize, 1), m.images.?.len);
+}
+
+test "parseInput keeps a user message input_image" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\[{"role":"user","content":[{"type":"input_text","text":"what is this"},{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]}]
+    , .{});
+    defer parsed.deinit();
+    var pi = try parseInput(allocator, parsed.value, null, null, null, testAcceptingDecoder, .{});
+    defer pi.deinit();
+    try std.testing.expect(!pi.image_decode_failed);
+    try std.testing.expectEqual(@as(usize, 1), pi.messages.items.len);
+    try std.testing.expectEqualStrings("user", pi.messages.items[0].role);
+    try std.testing.expectEqualStrings("what is this", pi.messages.items[0].content);
+    try std.testing.expectEqual(@as(usize, 1), pi.messages.items[0].images.?.len);
+}
+
+test "parseInput records a function_call_output image the decoder could not read" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\[{"type":"function_call_output","call_id":"call_1","output":[{"type":"input_image","image_url":"http://example.invalid/x.png"}]}]
+    , .{});
+    defer parsed.deinit();
+    var pi = try parseInput(allocator, parsed.value, null, null, null, testRejectingDecoder, .{});
+    defer pi.deinit();
+    try std.testing.expect(pi.image_decode_failed);
+    try std.testing.expectEqual(@as(usize, 1), pi.messages.items.len);
 }
 
 test "parseInput records an input_image the decoder could not read" {
