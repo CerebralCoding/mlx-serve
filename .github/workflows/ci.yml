@@ -92,7 +92,7 @@ jobs:
           key: zig-cache-${{ hashFiles('scripts/fetch-zig.sh', 'build.zig', 'build.zig.zon') }}-${{ steps.mlxpin.outputs.submodules }}-${{ steps.mlxpin.outputs.xcode }}
 
       - name: Build mlx-serve (Zig, ReleaseFast)
-        run: zig build -Doptimize=ReleaseFast
+        run: zig build -Doptimize=ReleaseFast -Dstrip
 
       - name: Build vz-agent guest binary
         run: zig build vz-agent
