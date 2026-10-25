@@ -1,23 +1,23 @@
 //! Media-gen jobs on the inference thread, and chat yielding between their steps.
 
 const std = @import("std");
-const mlx = @import("../../mlx/ffi.zig");
-const gen_sse = @import("sse.zig");
-const media_progress = @import("../../sdk/media/progress.zig");
-const model_registry_mod = @import("../registry/registry.zig");
-const log = @import("../../sdk/util/log.zig");
-const io_util = @import("../../sdk/util/io_util.zig");
-const status = @import("../status.zig");
+const mlx = @import("../../../mlx/ffi.zig");
+const gen_sse = @import("../../../host/media_jobs/sse.zig");
+const media_progress = @import("../../../sdk/media/progress.zig");
+const model_registry_mod = @import("../../../host/registry/registry.zig");
+const log = @import("../../../sdk/util/log.zig");
+const io_util = @import("../../../sdk/util/io_util.zig");
+const status = @import("../../../host/status.zig");
 const testing = std.testing;
 
-const decodeShareBudgetNs = @import("../../engines/mlx/prefill_interleave.zig").decodeShareBudgetNs;
-const invalidateDecodeClocks = @import("../../engines/mlx/prefill_interleave.zig").invalidateDecodeClocks;
-const Scheduler = @import("../../engines/mlx/scheduler.zig").Scheduler;
-const ChatPassResult = @import("../../engines/mlx/step.zig").ChatPassResult;
-const chatPass = @import("../../engines/mlx/step.zig").chatPass;
-const GenRequest = @import("../gpu_thread/requests.zig").GenRequest;
-const MAX_MERGED_WEIGHT = @import("../gpu_thread/requests.zig").MAX_MERGED_WEIGHT;
-const scheduler_mod = @import("../../engines/mlx/scheduler.zig");
+const decodeShareBudgetNs = @import("../prefill_interleave.zig").decodeShareBudgetNs;
+const invalidateDecodeClocks = @import("../prefill_interleave.zig").invalidateDecodeClocks;
+const Scheduler = @import("../scheduler.zig").Scheduler;
+const ChatPassResult = @import("../step.zig").ChatPassResult;
+const chatPass = @import("../step.zig").chatPass;
+const GenRequest = @import("../../../host/gpu_thread/requests.zig").GenRequest;
+const MAX_MERGED_WEIGHT = @import("../../../host/gpu_thread/requests.zig").MAX_MERGED_WEIGHT;
+const scheduler_mod = @import("../scheduler.zig");
 
 /// Chat's share of wall time while a media job runs: equal, so neither side starves.
 const GEN_CHAT_SHARE: f32 = 0.5;
@@ -94,7 +94,7 @@ pub fn runGenRequests(sch: *Scheduler, reqs: []*GenRequest) void {
     if (scheduler_mod.gen_yield_enabled) media_progress.genYield().* = &hook;
     // The whole estimated peak, though live memory already holds part of it: the side that
     // cannot OOM.
-    sch.gen_reserve_bytes = if (req.peak_bytes > 0) req.peak_bytes else sch.mediaPeakFor(req.model);
+    sch.gen_reserve_bytes = if (req.peak_bytes > 0) req.peak_bytes else scheduler_mod.mediaPeakFor(sch, req.model);
     defer {
         media_progress.genYield().* = null;
         media_progress.streamKeepalive().* = null;
@@ -156,7 +156,7 @@ pub fn runGenRequests(sch: *Scheduler, reqs: []*GenRequest) void {
 fn runGenJobs(reqs: []*GenRequest) void {
     const had_error = mlx.errorPending();
     defer mlx.dropLatchedErrorUnless(had_error);
-    defer @import("../../sdk/blocks/dit/w8a8.zig").dropMemo(); // the last activation (and its int8 copy) would stay pinned until the next job
+    defer @import("../../../sdk/blocks/dit/w8a8.zig").dropMemo(); // the last activation (and its int8 copy) would stay pinned until the next job
     const req = reqs[0];
     if (reqs.len == 1) req.run(req.ctx) else {
         var ctxs: [MAX_MERGED_WEIGHT]*anyopaque = undefined;

@@ -22,6 +22,11 @@ With `tools`, tokens buffer for detection (all tag families + raw JSON); thinkin
 
 ## Rules
 
+The MLX engine boundary:
+- **The host reaches the MLX engine only through `host/engines/mlx.zig`** (a table the engine exports, `engines/mlx/api.zig`): no `@import` of `src/engines/`, and the engine's objects held on the host (`abi/mlx_handles.zig`) are stored and null-checked, never opened; a fact the host needs is a table call (`mlx.facts`). Under `-Dunits` the host unit sees those handles opaque, so a reach-in fails the build.
+- **An error crosses the table by NAME** (`sdk/util/err_name.zig`): every compile unit numbers its own error set. A new error a handler switches on joins `err_name.Known`.
+- **State both units touch is `Shared`** (`sdk/util/shared.zig`), the host owns it and lists it in `src/shared_all.zig`; a plain `pub var` the engine reads splits into two copies under `-Dunits` (`zig build units-check` names them).
+
 Reasoning, budgets, agents:
 - **A reasoning budget is enforced at DECODE** (`armThinkBound` → `think_bound`, `thinkBoundTick`): early-stop line + atomic closer committed as ONE forward (`commitForcedTokens`); bare-`<think>` family only; all three surfaces (`reasoning_budget_tokens`). Guard: `tests/test_reasoning_budget_stream.sh`.
 - **Effort budgets are pi's ladder** (`responses.effortBudget`): minimal 1024, low 2048, medium 8192, high/xhigh uncapped; the word maps to a budget only where the bound can arm (`effortWordOnly`).

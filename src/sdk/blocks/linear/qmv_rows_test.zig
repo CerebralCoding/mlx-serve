@@ -11,7 +11,7 @@ const attn256MaxDiff = @import("../attention/attn256.zig").attn256MaxDiff;
 const attn256RandBf16 = @import("../attention/attn256.zig").attn256RandBf16;
 const moeRowsSliceRow = @import("../moe/gather_qmv_rows.zig").moeRowsSliceRow;
 const msvQmvRows = qmv_rows.msvQmvRows;
-const ModelConfig = @import("../../../engines/mlx/model.zig").ModelConfig;
+const ModelConfig = @import("../../config/model.zig").ModelConfig;
 
 test "firstRowExactMiss: 4, 6 and 8-bit trunk projections are inside the row kernels, 3-bit is not; vision and mtp never count" {
     const Q = struct {

@@ -8,7 +8,7 @@ const common = @import("../../../abi/common.zig");
 const sdk_plugin = @import("../../../sdk/plugin.zig");
 const registry = @import("../../../plugins/registry.zig");
 const served = @import("served.zig");
-const model = @import("../model.zig");
+const model = @import("../../../sdk/config/model.zig");
 const log = @import("../../../sdk/util/log.zig");
 const FsPackDir = @import("../../../host/registry/pack_dir.zig").FsPackDir;
 const intree = @import("intree.zig");
@@ -153,7 +153,7 @@ pub fn resolve(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, raw_json
 }
 
 /// What discovery reads of a served pack: the stub parse's shell and caps.
-pub const Stub = struct { shell: abi.Shell, caps: abi.Caps };
+pub const Stub = @import("../../../host/engines/mlx.zig").PluginStub;
 
 /// The plugin's stub parse of the pack at `model_dir`; null when no plugin serves it.
 pub fn stubOf(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, raw_json: []const u8) ?Stub {

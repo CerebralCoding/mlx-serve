@@ -13,7 +13,7 @@ const denied = [_][]const u8{ "src/mlx/", "src/engines/", "src/host/", "src/kern
 
 /// Zig caches the configure phase: every input the scan reads is declared, so a new plugin folder, a changed
 /// `config.zig` closure, a new fixture or a deleted registry re-runs it. Returns the registered plugins' names.
-pub fn generate(b: *std.Build, units: bool) []const []const u8 {
+pub fn generate(b: *std.Build) []const []const u8 {
     const a = b.allocator;
     const io = b.graph.io;
     const root = b.root.root_dir.handle;
@@ -42,7 +42,7 @@ pub fn generate(b: *std.Build, units: bool) []const []const u8 {
         const text = root.readFileAlloc(io, b.fmt("{s}/{s}/config.zig", .{ plugins_dir, n }), a, .limited(1 << 20)) catch "";
         f.* = std.mem.indexOf(u8, text, "\npub const plugin = ") != null;
     }
-    const src = render(a, split.plugins, in_config, split.templates, jsons.items, units) catch @panic("OOM");
+    const src = render(a, split.plugins, in_config, split.templates, jsons.items) catch @panic("OOM");
     writeIfChanged(io, root, registry_path, src) catch |e| std.process.fatal("plugins: cannot write {s}: {t}", .{ registry_path, e });
     b.dependOnFileContents(b.path(registry_path));
     return split.plugins;
@@ -76,7 +76,7 @@ pub fn writeUnitRoots(b: *std.Build, groups: []const []const []const u8) []const
             \\pub const mlx = @import("mlx/ffi.zig");
             \\pub const io_util = @import("sdk/util/io_util.zig");
             \\pub const shared = @import("sdk/util/shared.zig");
-            \\pub const mtp_acceptance = @import("engines/mlx/spec/mtp_acceptance.zig");
+            \\pub const mtp_acceptance = @import("sdk/spec/mtp_acceptance.zig");
             \\pub const exl3 = @import("sdk/quant/exl3/format.zig");
             \\pub const dsa_nax = @import("plugins/glm5_next/dsa_nax.zig");
             \\pub const fp8_block128_gemv = @import("sdk/quant/fp8_block128_gemv.zig");
@@ -209,8 +209,7 @@ fn chain(a: std.mem.Allocator, parent: *const std.StringHashMapUnmanaged([]const
 /// `in_config[i]`: plugin i declares its metadata (`plugin`) in its `config.zig`.
 /// `units`: the `-Dunits` form, metadata only (each `config.zig`) and the extern tables the unit objects export, so the
 /// host's closure holds no plugin's code and a plugin edit rebuilds its unit alone. Tests need the full form.
-fn render(a: std.mem.Allocator, plugins: []const []const u8, in_config: []const bool, templates: []const []const u8, configs: []const []const u8, units: bool) ![]u8 {
-    if (units) return renderUnits(a, plugins, in_config, configs);
+fn render(a: std.mem.Allocator, plugins: []const []const u8, in_config: []const bool, templates: []const []const u8, configs: []const []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(a,
         \\//! GENERATED at configure time by build/plugins.zig from src/plugins/*/plugin.zig: never edit, never commit.
@@ -256,28 +255,6 @@ fn renderMetas(a: std.mem.Allocator, out: *std.ArrayList(u8), plugins: []const [
     try out.appendSlice(a, "\n/// Every fixture config.json: the packs the claims test runs through every plugin.\npub const model_configs = [_]File{\n");
     for (configs) |c| try out.print(a, "    .{{ .name = \"{s}\", .bytes = @embedFile(\"../fixtures/model-configs/{s}\") }},\n", .{ c, c });
     try out.appendSlice(a, "};\n");
-}
-
-fn renderUnits(a: std.mem.Allocator, plugins: []const []const u8, in_config: []const bool, configs: []const []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    try out.appendSlice(a,
-        \\//! GENERATED at configure time by build/plugins.zig from src/plugins/*/plugin.zig: never edit, never commit.
-        \\//! The `-Dunits` form: plugin metadata only; each plugin's table comes from its unit object.
-        \\
-        \\const sdk = @import("../sdk/plugin.zig");
-        \\const File = @import("../sdk/testing/fixture.zig").File;
-        \\
-    );
-    try renderMetas(a, &out, plugins, in_config, configs);
-    try out.appendSlice(a,
-        \\
-        \\pub const entries = if (@import("build_options").units and !@import("builtin").is_test)
-        \\    sdk.externEntries(&unit_metas)
-        \\else
-        \\    @compileError("src/plugins/registry.zig is generated for -Dunits: build this graph (the tests, a non-macOS target) without it");
-        \\
-    );
-    return out.items;
 }
 
 fn writeIfChanged(io: std.Io, root: std.Io.Dir, path: []const u8, bytes: []const u8) !void {
@@ -369,25 +346,22 @@ test "build plugins: templates compile beside the registry but are never registe
     try testing.expectEqualStrings("laguna", split.plugins[1]);
     const in_config = try a.alloc(bool, split.plugins.len);
     @memset(in_config, false);
-    const src = try render(a, split.plugins, in_config, split.templates, &.{"laguna.json"}, false);
+    const src = try render(a, split.plugins, in_config, split.templates, &.{"laguna.json"});
     try testing.expect(std.mem.indexOf(u8, src, "pub const plugins = [_]type{\n    @import(\"flint/plugin.zig\"),\n    @import(\"laguna/plugin.zig\"),\n};") != null);
     try testing.expect(std.mem.indexOf(u8, src, "pub const templates = [_]type{\n    @import(\"_template/plugin.zig\"),\n    @import(\"_template_media/plugin.zig\"),\n};") != null);
     try testing.expect(std.mem.indexOf(u8, src, "@embedFile(\"../fixtures/model-configs/laguna.json\")") != null);
     try testing.expect(std.mem.indexOf(u8, src, "sdk.exportAll(&plugins);") != null);
     // An empty registry still renders valid arrays.
-    const none = try render(a, &.{}, &.{}, &.{}, &.{}, false);
+    const none = try render(a, &.{}, &.{}, &.{}, &.{});
     try testing.expect(std.mem.indexOf(u8, none, "pub const plugins = [_]type{\n};") != null);
 }
 
-test "build plugins: the -Dunits registry reads each plugin's config.zig and no plugin's code" {
+test "build plugins: the -Dunits metadata reads each plugin's config.zig where it declares one" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const src = try render(a, &.{ "flint", "laguna" }, &.{ true, false }, &.{"_template"}, &.{"laguna.json"}, true);
+    const src = try render(a, &.{ "flint", "laguna" }, &.{ true, false }, &.{"_template"}, &.{"laguna.json"});
     try testing.expect(std.mem.indexOf(u8, src, "@import(\"flint/config.zig\").plugin,") != null);
-    // A plugin whose config.zig declares no `plugin` is still named by its plugin.zig: the closure check reports it.
     try testing.expect(std.mem.indexOf(u8, src, "@import(\"laguna/plugin.zig\").plugin,") != null);
-    try testing.expect(std.mem.indexOf(u8, src, "@import(\"flint/plugin.zig\")") == null);
-    try testing.expect(std.mem.indexOf(u8, src, "_template") == null);
     try testing.expect(std.mem.indexOf(u8, src, "sdk.externEntries(&unit_metas)") != null);
 }

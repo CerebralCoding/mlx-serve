@@ -116,7 +116,7 @@ test "llama plugin: the served config of Qwen2 and Mistral packs equals the lega
 }
 
 test "llama plugin: a launch override the forward reads (rope_theta, the context) is bit-equal to the legacy forward under it" {
-    const model = @import("../../engines/mlx/model.zig");
+    const model = @import("../../sdk/config/model.zig");
     model.setConfigOverrides("{\"rope_theta\":12345.0,\"max_position_embeddings\":8192}");
     defer model.setConfigOverrides(null);
     var p = fixture.Pack.init(0x0e2c);

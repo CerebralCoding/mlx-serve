@@ -1189,7 +1189,7 @@ const ClusterHooksState = struct {
     /// the same rollback anchors. Set by distributed.zig.
     pair_exchange: ?*const fn (x: A, pre: A, p0: usize, snap: bool, verify: bool) anyerror![2]A = null,
 };
-const clusterHooks_shared = @import("../../sdk/util/shared.zig").Shared(ClusterHooksState, "dsv41_cluster", .{});
+pub const clusterHooks_shared = @import("../../sdk/util/shared.zig").Shared(ClusterHooksState, "dsv41_cluster", .{});
 pub inline fn clusterHooks() *ClusterHooksState {
     return clusterHooks_shared.get();
 }

@@ -4,29 +4,26 @@ const std = @import("std");
 const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const decode_attn_quant_mod = @import("../../sdk/blocks/attention/decode_attn_quant.zig");
-const generate_mod = @import("../../engines/mlx/generate.zig");
-const mtp_acceptance_mod = @import("../../engines/mlx/spec/mtp_acceptance.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
-const mlx_stream = if (@import("build_options").mlx_stream) @import("../../engines/mlx/modules/stream_glue.zig") else @import("../../engines/mlx/modules/stream_stub.zig");
-const scheduler_mod = @import("../../engines/mlx/scheduler.zig");
+const mtp_acceptance_mod = @import("../../sdk/spec/mtp_acceptance.zig");
+const model_mod = @import("../../sdk/config/model.zig");
+const scheduler_mod = @import("../gpu_thread/scheduler.zig");
+const mlx_engine = @import("../engines/mlx.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const metrics = @import("../status.zig");
-const ane_mod = @import("../../sdk/ane/offload.zig");
-const qwen4_mod = @import("../../plugins/qwen4_exp/qwen4_exp.zig");
 const LoadedModel = model_registry_mod.LoadedModel;
 const build_options = @import("build_options");
 const testing = std.testing;
 const http_server = @import("../http/server.zig");
 
 const Conn = @import("../http/conn.zig").Conn;
-const KvAttnMode = @import("../../engines/mlx/request_options.zig").KvAttnMode;
-const defaultEnableMtp = @import("../../engines/mlx/request_options.zig").defaultEnableMtp;
-const dsv4DraftStages = @import("../../engines/mlx/request_options.zig").dsv4DraftStages;
+const KvAttnMode = @import("request_options.zig").KvAttnMode;
+const defaultEnableMtp = @import("request_options.zig").defaultEnableMtp;
+const dsv4DraftStages = @import("request_options.zig").dsv4DraftStages;
 const configuredKvQuantFor = @import("../http/server.zig").configuredKvQuantFor;
-const resolvedPrefixCacheMem = @import("../../engines/mlx/admission/hot_cache_plan.zig").resolvedPrefixCacheMem;
-const PldDefaults = @import("../../engines/mlx/request_options.zig").PldDefaults;
-const getEffectiveContextLength = @import("../../engines/mlx/admission/context.zig").getEffectiveContextLength;
-const computeMaxSafeContext = @import("../../engines/mlx/admission/context.zig").computeMaxSafeContext;
+const resolvedPrefixCacheMem = @import("admission.zig").resolvedPrefixCacheMem;
+const PldDefaults = @import("request_options.zig").PldDefaults;
+const getEffectiveContextLength = @import("admission.zig").getEffectiveContextLength;
+const computeMaxSafeContext = @import("admission.zig").computeMaxSafeContext;
 const sendResponse = @import("../http/respond.zig").sendResponse;
 
 /// Pure body-builder for `GET /props`. Split out from `handleProps` so it
@@ -87,7 +84,7 @@ pub fn batchVerdictFor(entry: *const LoadedModel) scheduler_mod.BatchVerdict {
     // An engine beside MLX batches its own requests where it says so (llama.cpp's sequences).
     if (entry.engine) |e| return if (e.caps().batches) .ok else .embedded_engine;
     const cfg = entry.config orelse return .arch;
-    return if (scheduler_mod.configBatchesDecode(cfg)) .ok else .arch;
+    return if (mlx_engine.api().batches_decode(cfg)) .ok else .arch;
 }
 
 /// The /props "batching" object: whether the loaded model rides the batched
@@ -101,7 +98,7 @@ fn batchingPropsJson(allocator: std.mem.Allocator, why: scheduler_mod.BatchVerdi
 }
 
 /// The /props "ngram_warm" object; absent when no table is warming.
-fn ngramWarmPropsJson(allocator: std.mem.Allocator, bytes: u64, total: u64) ![]u8 {
+pub fn ngramWarmPropsJson(allocator: std.mem.Allocator, bytes: u64, total: u64) ![]u8 {
     if (total == 0) return allocator.dupe(u8, "");
     return std.fmt.allocPrint(allocator, ",\"ngram_warm\":{{\"bytes\":{d},\"total\":{d}}}", .{ bytes, total });
 }
@@ -169,32 +166,33 @@ fn engineIs(lm: *const LoadedModel, kind: PropsEngine) bool {
 pub fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
     const config = lm.config.?;
     const kv = configuredKvQuantFor(config);
-    const native = if (lm.transformer) |x| x.mlx_stream_ext else null;
+    const mp = mlx_engine.modelProps(lm);
+    const es = mlx_engine.settings();
     return .{
         .engine = "mlx",
         .kv_quant = if (engineIs(lm, .llama)) @tagName(http_server.llama_settings.kv_quant) else if (kv.isQuant()) (if (kv.bits == 4) "4" else "8") else "off",
         .kv_attn_mode = http_server.serverState().server_config.kv_attn_mode,
-        .decode_attn_quant = decode_attn_quant_mod.decodeAttnQuantEnabled() and (if (lm.transformer) |x| x.dense_attn_proj else false),
-        .prefill_chunk = generate_mod.prefill_chunk_override,
-        .mtp_loaded = lm.mtp != null or (if (lm.transformer) |x| x.dsparkStages() > 0 else false),
+        .decode_attn_quant = mp.decode_attn_quant,
+        .prefill_chunk = es.prefill_chunk,
+        .mtp_loaded = mp.mtp_loaded,
         .mtp_default_on = defaultEnableMtp(lm.mtp != null, dsv4DraftStages(lm)),
-        .mtp_acceptance = config.mtpAcceptance(generate_mod.mtp_acceptance_default),
-        .mtp_greedy_tail = generate_mod.mtpGreedyTailFor(config.mtp_greedy_tail_override),
+        .mtp_acceptance = mp.mtp_acceptance,
+        .mtp_greedy_tail = mp.mtp_greedy_tail,
         .mtp_depth = lm.mtp_depth,
         .mtp_adaptive = true,
-        .native_speculation = if (native) |m| .{
-            .lane = mlx_stream.laneName(m),
-            .block_size = mlx_stream.blockSize(m),
+        .native_speculation = if (mp.native_lane.len > 0) .{
+            .lane = mp.native_lane,
+            .block_size = mp.native_block,
             .sampled = true,
         } else null,
-        .max_mtp_ctx = generate_mod.max_mtp_ctx,
+        .max_mtp_ctx = es.max_mtp_ctx,
         .drafter = if (lm.dflash != null) "dflash" else if (lm.drafter != null) "assistant" else "none",
         .pld = .{ .enable = http_server.serverState().server_config.default_enable_pld, .draft_len = http_server.serverState().server_config.default_pld_draft_len, .key_len = http_server.serverState().server_config.default_pld_key_len },
         .max_concurrent = http_server.max_concurrent,
         .prefix_cache_mem_bytes = resolvedPrefixCacheMem(),
-        .prefix_cache_disk_bytes = http_server.prefix_cache_disk_bytes,
-        .prefix_cache_ram_enabled = http_server.prefix_cache_capacity > 0 and http_server.prefix_cache_ram_enabled,
-        .prefill_decode_share = scheduler_mod.prefillDecodeShare(),
+        .prefix_cache_disk_bytes = http_server.launch().prefix_cache_disk_bytes,
+        .prefix_cache_ram_enabled = http_server.launch().prefix_cache_capacity > 0 and http_server.launch().prefix_cache_ram_enabled,
+        .prefill_decode_share = es.prefill_decode_share,
     };
 }
 
@@ -236,9 +234,9 @@ pub fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 
 /// proof that both dies were addressed — a silently ignored affinity hint
 /// looks identical from here, so the counters pair with the out-of-process
 /// `macpow --dump | grep ANE0_` check, never replace it.
-const AneUnitStat = struct { instance: i64, evals: u64, eval_failures: u64 };
+pub const AneUnitStat = struct { instance: i64, evals: u64, eval_failures: u64 };
 
-fn anePropsJson(allocator: std.mem.Allocator, mode_name: []const u8, mlp_layers: usize, gdn_layers: usize, rows: u32, chunk_rows: u32, share: f32, int8_bytes: u64, units: []const AneUnitStat) ![]u8 {
+pub fn anePropsJson(allocator: std.mem.Allocator, mode_name: []const u8, mlp_layers: usize, gdn_layers: usize, rows: u32, chunk_rows: u32, share: f32, int8_bytes: u64, units: []const AneUnitStat) ![]u8 {
     var evals: u64 = 0;
     var eval_failures: u64 = 0;
     for (units) |u| {
@@ -286,37 +284,19 @@ pub fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel
     // "Free RAM" line stays in lockstep with what gates a load.
     const available_mem = metrics.getAvailableMemBytes();
 
-    // ANE prefill engine state (A8) — absent when the offload is off.
-    const ane_json = blk: {
-        if (lm.transformer) |x| {
-            if (x.ane_prefill) |eng| {
-                var stats: [ane_mod.MAX_UNITS]AneUnitStat = undefined;
-                for (eng.units, 0..) |*u, i| stats[i] = .{
-                    .instance = u.instance,
-                    .evals = u.evals_ok.load(.monotonic),
-                    .eval_failures = u.evals_failed.load(.monotonic),
-                };
-                break :blk try anePropsJson(allocator, "channel", eng.coveredLayers(), eng.coveredGdnLayers(), eng.rows, eng.chunk_rows, eng.share, eng.int8_bytes, stats[0..eng.units.len]);
-            }
-        }
-        break :blk try allocator.dupe(u8, "");
-    };
-    defer allocator.free(ane_json);
-
-    // qwen4 n-gram table warm (F8) — the two module-level atomics are zero
-    // whenever no table is warming, so the object is absent off qwen4_exp.
-    const ngram_json = try ngramWarmPropsJson(allocator, qwen4_mod.warmBytes().live_warm_bytes.load(.acquire), qwen4_mod.warmBytes().live_warm_total.load(.acquire));
-    defer allocator.free(ngram_json);
+    // The engine's own fragments: Neural Engine prefill state, the n-gram table warm, then the cluster.
+    const engine_json = mlx_engine.api().model_props_json(lm, allocator) orelse return error.OutOfMemory;
+    defer allocator.free(engine_json);
     const batching_json = try batchingPropsJson(allocator, batchVerdictFor(lm));
     defer allocator.free(batching_json);
     const settings_json = try settingsPropsJson(allocator, propsSettingsFor(lm));
     defer allocator.free(settings_json);
-    const cluster_json = try @import("../../engines/mlx/cluster/distributed.zig").propsJson(allocator);
+    const cluster_json = mlx_engine.api().cluster_json(allocator) orelse return error.OutOfMemory;
     defer allocator.free(cluster_json);
-    const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s},\"registry_generation\":{d}", .{ ane_json, ngram_json, batching_json, settings_json, cluster_json, registryGeneration() });
+    const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s},\"registry_generation\":{d}", .{ engine_json, batching_json, settings_json, cluster_json, registryGeneration() });
     defer allocator.free(extra_json);
 
-    const kv_cache_mem: u64 = if (http_server.global_scheduler) |sch|
+    const kv_cache_mem: u64 = if (http_server.launch().global_scheduler) |sch|
         sch.resident_hot_cache_bytes.load(.monotonic) + sch.resident_live_kv_bytes.load(.monotonic)
     else
         0;
@@ -352,7 +332,7 @@ pub fn handlePropsNoModel(allocator: std.mem.Allocator, stream: *Conn) !void {
     _ = mlx.mlx_get_active_memory(&active_mem);
     _ = mlx.mlx_get_peak_memory(&peak_mem);
     const available_mem = metrics.getAvailableMemBytes();
-    const cluster_json = try @import("../../engines/mlx/cluster/distributed.zig").propsJson(allocator);
+    const cluster_json = mlx_engine.api().cluster_json(allocator) orelse return error.OutOfMemory;
     defer allocator.free(cluster_json);
     const body = try std.fmt.allocPrint(allocator,
         \\{{"total_slots":1,"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":0,"weights_bytes":{d}}},"batching":{{"supported":false,"reason":"no_model","max_group":{d}}}{s},"registry_generation":{d}}}

@@ -4,11 +4,12 @@ const std = @import("std");
 const transformer_mod = @import("../transformer.zig");
 const sparse_score = @import("../../../sdk/blocks/attention/sparse_block/score.zig");
 const generate_mod = @import("../generate.zig");
-const model_mod = @import("../model.zig");
+const model_mod = @import("../../../sdk/config/model.zig");
 const prefix_cache_mod = @import("../cache/prefix_cache.zig");
 const scheduler_mod = @import("../scheduler.zig");
 const ane_mod = @import("../../../sdk/ane/offload.zig");
 const http_server = @import("../../../host/http/server.zig");
+const memory_ceiling = @import("../../../host/registry/memory_ceiling.zig");
 
 const resolvedPrefixCacheMem = @import("hot_cache_plan.zig").resolvedPrefixCacheMem;
 const omittedMaxTokensDefault = @import("../../../host/api/sampling.zig").omittedMaxTokensDefault;
@@ -38,7 +39,6 @@ const prefillStreamBytesPerToken = @import("bills.zig").prefillStreamBytesPerTok
 const prefillStreamBytesPerTokenOn = @import("bills.zig").prefillStreamBytesPerTokenOn;
 const prefillDequantWeightBytes = @import("bills.zig").prefillDequantWeightBytes;
 const prefillFfnWidth = @import("bills.zig").prefillFfnWidth;
-const mlxMemoryGuardApplies = @import("bills.zig").mlxMemoryGuardApplies;
 const statePerTokenBilled = @import("bills.zig").statePerTokenBilled;
 const reservedCacheTokens = @import("bills.zig").reservedCacheTokens;
 const retainedSsmCheckpointBytes = @import("bills.zig").retainedSsmCheckpointBytes;
@@ -262,11 +262,11 @@ test "an explicit --prefill-chunk is the chunk that gets BILLED" {
     // Squeezed so the machine sizer would step below the flag.
     const ceiling: u64 = weights + 6 * GiB;
 
-    generate_mod.prefill_chunk_override = 4096;
-    generate_mod.prefill_chunk_explicit = true;
+    generate_mod.prefillCli().override = 4096;
+    generate_mod.prefillCli().explicit = true;
     defer {
-        generate_mod.prefill_chunk_override = 8192;
-        generate_mod.prefill_chunk_explicit = false;
+        generate_mod.prefillCli().override = 8192;
+        generate_mod.prefillCli().explicit = false;
     }
     try t.expectEqual(@as(u32, 4096), explicitPrefillChunk());
     const sized = resolvePrefillChunk(&cfg, kv_bits, ceiling, weights, 0, 0);
@@ -478,15 +478,6 @@ test "auto-context never sizes past the ceiling as weights grow" {
     }
     // Squeezed to nothing it floors rather than reporting a context that cannot exist.
     try t.expectEqual(@as(u32, 1024), safeContextForBudget(ceiling, ceiling, reserve, per_tok, 262144));
-}
-
-test "mlxMemoryGuardApplies: engine-backed models (ds4/llama/ANE) skip the MLX-prefill memory guard" {
-    const t = std.testing;
-    // MLX model — the guard applies (real per-token working set).
-    try t.expect(mlxMemoryGuardApplies(false));
-    // ds4's stub config advertises 56 heads / 61 layers, so the guard would project ~25 GB for an
-    // 8.6K-token prompt and 400-reject a request ds4 serves fine; no engine-backed model prefills in MLX.
-    try t.expect(!mlxMemoryGuardApplies(true));
 }
 
 test "slotFixedKvBytes: a MiMo slot bills its sliding rings once, at keep + one chunk of rows" {
@@ -719,11 +710,11 @@ test "resolvePrefillChunk: the sizer and the guard bill the chunk that was pinne
         unpinned_prefill_chunk,
     ));
     // An explicit --prefill-chunk outranks the pin in BOTH directions.
-    generate_mod.prefill_chunk_override = 2048;
-    generate_mod.prefill_chunk_explicit = true;
+    generate_mod.prefillCli().override = 2048;
+    generate_mod.prefillCli().explicit = true;
     defer {
-        generate_mod.prefill_chunk_override = 8192;
-        generate_mod.prefill_chunk_explicit = false;
+        generate_mod.prefillCli().override = 8192;
+        generate_mod.prefillCli().explicit = false;
     }
     try t.expectEqual(@as(usize, 2048), generate_mod.effectivePrefillChunk(
         cfg.prefillScoreHeadDim(),
@@ -1100,11 +1091,11 @@ test "the 458k prefill's two unbilled terms are billed: retained checkpoints and
     const per_cp = cfg.ssmCheckpointBytes();
     // 36 x (1,572,864 + 61,440) B = 58.83 MB.
     try t.expect(per_cp > 58_000_000 and per_cp < 60_000_000);
-    const saved_cp_max = http_server.ssm_checkpoint_max;
-    http_server.ssm_checkpoint_max = 32;
-    defer http_server.ssm_checkpoint_max = saved_cp_max;
+    const saved_cp_max = http_server.launch().ssm_checkpoint_max;
+    http_server.launch().ssm_checkpoint_max = 32;
+    defer http_server.launch().ssm_checkpoint_max = saved_cp_max;
     const held = retainedSsmCheckpointBytes(&cfg, seq, 0, chunk);
-    try t.expectEqual(@as(u64, http_server.ssm_checkpoint_max) * per_cp, held);
+    try t.expectEqual(@as(u64, http_server.launch().ssm_checkpoint_max) * per_cp, held);
     try t.expect(held > 1_800_000_000);
     // It saturates: 393k holds the same 32 as 458k.
     try t.expectEqual(held, retainedSsmCheckpointBytes(&cfg, 393_216, 0, chunk));
@@ -1489,9 +1480,9 @@ test "prefillRequestTerms: qwen4 MTP head KV is billed when MTP is on and zero w
     const saved_ov = transformer_mod.Transformer.mtp_head_kv_quant_override;
     defer transformer_mod.Transformer.mtp_head_kv_quant_override = saved_ov;
     transformer_mod.Transformer.mtp_head_kv_quant_override = false;
-    const saved_boot = http_server.configured_kv_quant;
-    defer http_server.configured_kv_quant = saved_boot;
-    http_server.configured_kv_quant = transformer_mod.KVQuantConfig.affine(8);
+    const saved_boot = http_server.launch().configured_kv_quant;
+    defer http_server.launch().configured_kv_quant = saved_boot;
+    http_server.launch().configured_kv_quant = transformer_mod.KVQuantConfig.affine(8);
     var cfg = qwen4ExpOomConfig();
     cfg.mtp_override = false;
     try t.expect(!mtpHeadBilled(&cfg));
@@ -1527,9 +1518,9 @@ test "prefillRequestTerms: MTP head KV bills the boot scheme, not a request kv_q
     const saved_ov = transformer_mod.Transformer.mtp_head_kv_quant_override;
     defer transformer_mod.Transformer.mtp_head_kv_quant_override = saved_ov;
     transformer_mod.Transformer.mtp_head_kv_quant_override = true;
-    const saved_boot = http_server.configured_kv_quant;
-    defer http_server.configured_kv_quant = saved_boot;
-    http_server.configured_kv_quant = transformer_mod.KVQuantConfig.affine(8);
+    const saved_boot = http_server.launch().configured_kv_quant;
+    defer http_server.launch().configured_kv_quant = saved_boot;
+    http_server.launch().configured_kv_quant = transformer_mod.KVQuantConfig.affine(8);
     var cfg = qwen4ExpOomConfig();
     cfg.mtp_override = null;
     const seq: u64 = 200_000;
@@ -1552,8 +1543,8 @@ test "prefillAdmissionBill: every arch carries the evict-to-admit credits (#492)
     var sch: scheduler_mod.Scheduler = undefined;
     sch.resident_hot_cache_bytes = .init(9000 * MB);
     sch.reclaimable_hot_cache_bytes = .init(8000 * MB);
-    http_server.global_scheduler = &sch;
-    defer http_server.global_scheduler = null;
+    http_server.launch().global_scheduler = &sch;
+    defer http_server.launch().global_scheduler = null;
     for ([_][]const u8{ "qwen3_5", "qwen3_5_moe", "llama", "gemma4", "qwen4_exp" }) |mt| {
         var cfg = qwen4ExpOomConfig();
         cfg.model_type = mt;
@@ -1577,6 +1568,30 @@ pub fn qwen4ExpLive364kConfig() model_mod.ModelConfig {
     return cfg;
 }
 
+test "a 448k warm append the free-RAM term refused fits under an explicitly raised wired limit" {
+    const t = std.testing;
+    sparse_score.qsa_score_fused_override = false;
+    defer sparse_score.qsa_score_fused_override = null;
+    const mb: u64 = 1024 * 1024;
+    const total_ram: u64 = 131_072 * mb;
+    const working_set: u64 = 120_000 * mb;
+    const footprint: u64 = 87_722 * mb;
+    const saved = memory_ceiling.overrides().wired_limit_mb;
+    defer memory_ceiling.overrides().wired_limit_mb = saved;
+    memory_ceiling.overrides().wired_limit_mb = 120_000;
+    var cfg = qwen4ExpLive364kConfig();
+    const kv_bits: u64 = 8;
+    const seq: u64 = 448_604;
+    const max_tokens: u32 = @intCast(getEffectiveContextLength(&cfg) - seq);
+    const shared = WarmPrefix{ .matched_tokens = 448_531, .capacity_tokens = 448_531, .will_donate = false };
+    const needed = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, 512, shared);
+    try t.expectEqual(@as(u64, 11_388), needed / mb);
+    try t.expect(needed > memory_ceiling.gpuCeilingWithWiredFloor(working_set, footprint, 10_000 * mb, 0) -| footprint);
+    const lifted = memory_ceiling.gpuCeilingWithWiredFloor(working_set, footprint, 12_934 * mb, memory_ceiling.wiredCeilingFloorForRam(&cfg, total_ram));
+    try t.expectEqual(@as(u64, 24_086), (lifted -| footprint) / mb);
+    try t.expect(needed <= lifted -| footprint);
+}
+
 test "a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's" {
     // Turn B: prompt 368,208, restored 364,478 by move, refused by 290 MB at width 512. 1,795 MB
     // of the bill was 32 SSM checkpoints; a warm prefill forwards a 3,730-token tail and captures
@@ -1591,19 +1606,19 @@ test "a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's
     const matched: u64 = 364_478;
     const chunk: u64 = 512;
     // The stride follows the uncapped base chunk (`prefill_chunk_override`), not the adaptive width.
-    const saved_override = generate_mod.prefill_chunk_override;
-    defer generate_mod.prefill_chunk_override = saved_override;
-    generate_mod.prefill_chunk_override = 8192;
+    const saved_override = generate_mod.prefillCli().override;
+    defer generate_mod.prefillCli().override = saved_override;
+    generate_mod.prefillCli().override = 8192;
     const stride: u64 = 8192;
-    try t.expectEqual(stride, generate_mod.effectiveSsmCheckpointStride(http_server.ssm_checkpoint_stride, 8192));
+    try t.expectEqual(stride, generate_mod.effectiveSsmCheckpointStride(http_server.launch().ssm_checkpoint_stride, 8192));
 
     // Cold: `seq / stride` saturates at --ssm-checkpoint-max as before.
-    try t.expectEqual(@as(u64, http_server.ssm_checkpoint_max) * per_cp, retainedSsmCheckpointBytes(&cfg, seq, 0, chunk));
+    try t.expectEqual(@as(u64, http_server.launch().ssm_checkpoint_max) * per_cp, retainedSsmCheckpointBytes(&cfg, seq, 0, chunk));
     // Warm: a 3,730-token append at stride 8192 crosses no boundary, so the end snapshot is the whole of it.
     try t.expectEqual(@as(u64, 1) * per_cp, retainedSsmCheckpointBytes(&cfg, seq, matched, chunk));
     // A chain extension long enough to fill the ring still bills the cap: the
     // credit is proportional to the SPAN, not a blanket warm discount.
-    try t.expectEqual(@as(u64, http_server.ssm_checkpoint_max) * per_cp, retainedSsmCheckpointBytes(&cfg, seq, 60_000, chunk));
+    try t.expectEqual(@as(u64, http_server.launch().ssm_checkpoint_max) * per_cp, retainedSsmCheckpointBytes(&cfg, seq, 60_000, chunk));
     // A span shorter than the backoff window snapshots nothing.
     try t.expectEqual(@as(u64, 0), retainedSsmCheckpointBytes(&cfg, seq, seq - 4, chunk));
 
@@ -1648,7 +1663,7 @@ test "a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's
     const available: u64 = 10_000 * mb;
     try t.expect(needed < available);
     try t.expectEqual(@as(u64, 9_722), needed / mb);
-    const before = gross - terms.checkpoint_bytes + @as(u64, http_server.ssm_checkpoint_max) * per_cp;
+    const before = gross - terms.checkpoint_bytes + @as(u64, http_server.launch().ssm_checkpoint_max) * per_cp;
     try t.expectEqual(@as(u64, 10_774), (before * 5 / 4 + qsaMaskBytes(&cfg, chunk, seq)) / mb);
     try t.expect((before * 5 / 4 + qsaMaskBytes(&cfg, chunk, seq)) > available);
 }

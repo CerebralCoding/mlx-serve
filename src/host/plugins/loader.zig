@@ -230,7 +230,7 @@ fn replaced(name: []const u8, outside: []const sdk_plugin.Entry) bool {
 
 const State = struct { set: Set = .{}, builtins: []const sdk_plugin.Entry = &.{} };
 /// Set once at startup, before any server thread; read-only after.
-const process = @import("../../sdk/util/shared.zig").Shared(State, "outside_plugins", .{});
+pub const process = @import("../../sdk/util/shared.zig").Shared(State, "outside_plugins", .{});
 
 /// The outside plugins this process loaded.
 pub fn loaded() []const Plugin {

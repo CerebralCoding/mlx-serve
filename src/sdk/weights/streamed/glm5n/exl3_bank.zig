@@ -15,7 +15,7 @@ const mlx = sdk.mlx;
 const sdk_ext = @import("../sdk_ext.zig");
 const quant = sdk_ext.quant;
 const expert_bank = @import("../expert/bank.zig");
-const xq = @import("../../../../sdk/quant/exl3/stream/quant.zig");
+const xq = @import("../../../quant/exl3/stream/quant.zig");
 const kernels = @import("exl3_kernels.zig");
 const Module = @This();
 

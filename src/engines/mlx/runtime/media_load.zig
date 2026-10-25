@@ -1,19 +1,19 @@
 //! Media-gen model load on the inference thread.
 
-const mlx = @import("../../mlx/ffi.zig");
-const gen_mod = @import("gen.zig");
-const log = @import("../../sdk/util/log.zig");
-const served = @import("plugin/served.zig");
-const plugin_engine = @import("plugin/engine.zig");
+const mlx = @import("../../../mlx/ffi.zig");
+const gen_mod = @import("../../../host/media_jobs/gen.zig");
+const log = @import("../../../sdk/util/log.zig");
+const served = @import("../../../host/media_jobs/plugin/served.zig");
+const plugin_engine = @import("../../../host/media_jobs/plugin/engine.zig");
 
-const publishHotCacheResidency = @import("../../engines/mlx/cache/budget.zig").publishHotCacheResidency;
-const Scheduler = @import("../../engines/mlx/scheduler.zig").Scheduler;
-const mediaBill = @import("../registry/preflight.zig").mediaBill;
-const genLoadResidentBytes = @import("../registry/preflight.zig").genLoadResidentBytes;
-const availForLoad = @import("../registry/preflight.zig").availForLoad;
-const memInsufficientForLoad = @import("../registry/preflight.zig").memInsufficientForLoad;
-const loadRequirementBytes = @import("../registry/preflight.zig").loadRequirementBytes;
-const scheduler_mod = @import("../../engines/mlx/scheduler.zig");
+const publishHotCacheResidency = scheduler_mod.publishHotCacheResidency;
+const Scheduler = @import("../scheduler.zig").Scheduler;
+const mediaBill = @import("preflight.zig").mediaBill;
+const genLoadResidentBytes = @import("preflight.zig").genLoadResidentBytes;
+const availForLoad = @import("preflight.zig").availForLoad;
+const memInsufficientForLoad = @import("preflight.zig").memInsufficientForLoad;
+const loadRequirementBytes = @import("preflight.zig").loadRequirementBytes;
+const scheduler_mod = @import("../scheduler.zig");
 
 /// Media-gen load on the inference thread. Mirrors `doLoadDs4OnInferenceThread`:
 /// build the modality engine (its mlx ops bind to this thread's GPU stream from

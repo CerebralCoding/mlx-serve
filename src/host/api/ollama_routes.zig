@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const env = @import("../../env.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
+const model_mod = @import("../../sdk/config/model.zig");
 const log = @import("../../sdk/util/log.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const model_discovery = @import("../registry/discovery.zig");
@@ -15,12 +15,13 @@ const build_options = @import("build_options");
 const nowMs = io_util.nowMs;
 const testing = std.testing;
 const http_server = @import("../http/server.zig");
+const mlx_engine = @import("../engines/mlx.zig");
 const request_model = @import("request_model.zig");
 
 const Conn = @import("../http/conn.zig").Conn;
 const isRoute = @import("../http/router.zig").isRoute;
 const resolveRequestModelId = @import("request_model.zig").resolveRequestModelId;
-const getEffectiveContextLength = @import("../../engines/mlx/admission/context.zig").getEffectiveContextLength;
+const getEffectiveContextLength = @import("admission.zig").getEffectiveContextLength;
 const handleEmbeddings = @import("embeddings.zig").handleEmbeddings;
 const handleChatCompletions = @import("chat_completions.zig").handleChatCompletions;
 const handleCompletions = @import("completions.zig").handleCompletions;
@@ -260,7 +261,7 @@ fn handleOllamaShow(allocator: std.mem.Allocator, stream: *Conn, body: []const u
                 .template = template,
                 .has_chat = has_chat,
                 .has_tools = has_chat,
-                .has_vision = (if (e.vision_encoder) |ve| ve.supportsImages() else false) or sm.has_vision,
+                .has_vision = mlx_engine.facts(e).images or sm.has_vision,
                 .has_thinking = has_chat and (model_discovery.templateSupportsThinking(template) or sm.has_thinking),
                 .has_embedding = has_embedding,
             });

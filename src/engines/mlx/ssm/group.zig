@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const ModelConfig = @import("../model.zig").ModelConfig;
+const ModelConfig = @import("../../../sdk/config/model.zig").ModelConfig;
 const materializedOwnedCopy = @import("../../../mlx/array.zig").materializedOwnedCopy;
 const ssmFreeQsaState = @import("../../../plugins/qwen4_exp/qsa/history.zig").ssmFreeQsaState;
 const attn256MaxDiff = @import("../../../sdk/blocks/attention/attn256.zig").attn256MaxDiff;
@@ -29,7 +29,7 @@ pub const SsmMergeKind = packed struct {
 const SsmGroupState = struct {
     ssm_member_gen_src: std.atomic.Value(u64) = .init(1),
 };
-const ssmGroup_shared = @import("../../../sdk/util/shared.zig").Shared(SsmGroupState, "ssm_group", .{});
+pub const ssmGroup_shared = @import("../../../sdk/util/shared.zig").Shared(SsmGroupState, "ssm_group", .{});
 inline fn ssmGroup() *SsmGroupState {
     return ssmGroup_shared.get();
 }

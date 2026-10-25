@@ -1,5 +1,9 @@
 const depth_bounds = @import("engines/mlx/spec/mtp_depth_bounds.zig");
 const std = @import("std");
+const mlx_engine = @import("host/engines/mlx.zig");
+const KVQuantConfig = @import("sdk/blocks/attention/kv_quant.zig").KVQuantConfig;
+const LoadParams = @import("host/gpu_thread/params.zig").LoadParams;
+const err_name = @import("sdk/util/err_name.zig");
 pub const env = @import("env.zig");
 const crt = @import("sdk/util/crt.zig");
 const build_options = @import("build_options");
@@ -8,13 +12,9 @@ pub const mlx = @import("mlx/ffi.zig");
 pub const io_util = @import("sdk/util/io_util.zig");
 pub const shared = @import("sdk/util/shared.zig");
 const mlx_gguf = @import("sdk/quant/gguf/claim.zig");
-const model_mod = @import("engines/mlx/model.zig");
+const model_mod = @import("sdk/config/model.zig");
 const tokenizer_mod = @import("sdk/tokenizer/tokenizer.zig");
-const transformer_mod = @import("engines/mlx/transformer.zig");
-const plugin_driver = @import("engines/mlx/plugin/driver.zig");
-const round_cost_mod = @import("engines/mlx/spec/round_cost.zig");
-const generate_mod = @import("engines/mlx/generate.zig");
-pub const mtp_acceptance = @import("engines/mlx/spec/mtp_acceptance.zig");
+pub const mtp_acceptance = @import("sdk/spec/mtp_acceptance.zig");
 /// The EXL3 quant format, for the plugins that reach it through their host root (`mlx_host`).
 pub const exl3 = @import("sdk/quant/exl3/format.zig");
 pub const dsa_nax = @import("plugins/glm5_next/dsa_nax.zig");
@@ -22,20 +22,21 @@ pub const fp8_block128_gemv = @import("sdk/quant/fp8_block128_gemv.zig");
 comptime {
     // The plugins' host surface: plugin_host.zig's list, every name re-exported here.
     @import("plugin_host_check.zig").reexports(@This());
+    // One compile unit: the engine's table is exported from here (under `-Dunits`, from `src/engine_unit.zig`).
+    if (!build_options.units) _ = @import("engines/mlx/api.zig");
 }
 const model_discovery = @import("host/registry/discovery.zig");
 const gguf_meta = @import("sdk/quant/gguf/engine_pick.zig");
 const model_registry_mod = @import("host/registry/registry.zig");
 const drafter_mod = @import("plugins/gemma4/assistant_drafter.zig");
-const mtp_graft = @import("plugins/prism_hadamard_qwen35/mtp_graft.zig");
 const mtp_mod = @import("sdk/spec/mtp/mtp.zig");
 const chat_mod = @import("host/chat/chat.zig");
 const server_mod = @import("host/http/server.zig");
+const effectiveSsmCheckpointStride = @import("engines/mlx/admission/hot_cache_plan.zig").effectiveSsmCheckpointStride;
 const scheduler_mod = @import("engines/mlx/scheduler.zig");
 const ane_lm = @import("engines/ane/lm.zig");
 const status = @import("host/status.zig");
 const model_settings_mod = @import("host/registry/model_settings.zig");
-const vision_mod = @import("engines/mlx/vision_encoder.zig");
 const engines_served = @import("host/engines/served.zig");
 const engines_prompt = @import("host/engines/prompt.zig");
 const abi_engine = @import("abi/engine.zig");
@@ -60,7 +61,6 @@ comptime {
 const launch_mod = @import("host/launch/launch.zig");
 pub const log = @import("sdk/util/log.zig");
 const metrics_mod = @import("host/metrics/metrics.zig");
-const sleep_inhibit_mod = @import("host/gpu_thread/sleep_inhibit.zig");
 const version_mod = @import("version.zig");
 const ane_mod = @import("sdk/ane/offload.zig");
 const ple_gpu = @import("plugins/qwen4_exp/ple_gpu.zig");
@@ -626,10 +626,10 @@ pub fn main(init: std.process.Init) !void {
             arg_start = 2;
             use_default_models_root = true;
         } else if (std.mem.eql(u8, cmd, "worker")) {
-            @import("engines/mlx/cluster/distributed.zig").cmdWorker(io, allocator, args[2..]) catch std.process.exit(1);
+            if (mlx_engine.api().cluster_worker(io, allocator, args[2..]) != null) std.process.exit(1);
             return;
         } else if (std.mem.eql(u8, cmd, "dist-probe")) {
-            @import("engines/mlx/cluster/distributed.zig").cmdProbe(io, args[2..]) catch std.process.exit(1);
+            if (mlx_engine.api().cluster_probe(io, args[2..]) != null) std.process.exit(1);
             return;
         } else if (std.mem.eql(u8, cmd, "plugin")) {
             @import("host/plugins/cli.zig").cmdPlugin(allocator, io, args[2..]) catch std.process.exit(1);
@@ -662,6 +662,8 @@ pub fn main(init: std.process.Init) !void {
     var serve_mode = false;
     var no_plugins = false; // --no-plugins: outside plugins stay unloaded whatever plugins.json says
     var stream_mode = false;
+    // The engine's own launch settings, applied once after parsing (`mlx_engine.Flags`).
+    var engine_flags: mlx_engine.Flags = .{};
     var prompt: ?[]const u8 = null;
     var max_tokens: u32 = 100;
     var temperature: f32 = 0.0;
@@ -698,7 +700,7 @@ pub fn main(init: std.process.Init) !void {
     // Default ON in serve mode — small boot-time cost, big cold-prefill win.
     // --no-warmup-eager opts out for benchmarking / minimal-footprint deployments.
     var warmup_eager: bool = true;
-    var kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.dense;
+    var kv_quant_config: KVQuantConfig = KVQuantConfig.dense;
     // Phase 2 (Plan ricky): fused attention reads K/V triples directly via
     // mlx_quantized_matmul instead of dequantizing through DenseKVView.
     // Off by default — only the `.affine` cache scheme has a fused path.
@@ -711,7 +713,7 @@ pub fn main(init: std.process.Init) !void {
     var max_resident_mem_explicit: bool = false;
     var idle_evict_secs: ?u32 = null;
     var metrics_enabled = false;
-    @import("sdk/blocks/dit/w8a8.zig").w8a8State().enabled = @import("sdk/blocks/dit/w8a8.zig").defaultOn(transformer_mod.naxAvailable(), ane_mod.totalMemBytes());
+    @import("sdk/blocks/dit/w8a8.zig").w8a8State().enabled = @import("sdk/blocks/dit/w8a8.zig").defaultOn(@import("mlx/device.zig").naxAvailable(), ane_mod.totalMemBytes());
     // GGUF engine routing override. null → auto (decided by gguf_meta on
     // file inspection); set explicitly via --engine to force ds4 or llama.
     var engine_override: ?gguf_meta.Engine = null;
@@ -732,7 +734,7 @@ pub fn main(init: std.process.Init) !void {
                 .app = VERSION ++ " (" ++ @tagName(@import("builtin").mode) ++ ")",
                 .mlx = std.mem.span(mlx.mlx_string_data(mlx_ver)),
                 .mlx_c = build_options.mlx_c_version,
-                .nax = transformer_mod.naxStatus(),
+                .nax = @import("mlx/device.zig").naxStatus(),
                 .ggml = ggmlEngineVersion(),
                 .ggml_commit = ggmlEngineCommit(),
                 .llama_tag = build_options.llama_tag,
@@ -830,11 +832,11 @@ pub fn main(init: std.process.Init) !void {
             no_vision = true;
             // Module global so on-demand /v1/load-model cold loads honor the
             // flag too (they used to hardcode vision from config.has_vision).
-            scheduler_mod.no_vision_global = true;
+            engine_flags.no_vision = true;
         } else if (std.mem.eql(u8, args[i], "--no-prevent-sleep")) {
-            sleep_inhibit_mod.setEnabled(false);
+            engine_flags.prevent_sleep = false;
         } else if (std.mem.eql(u8, args[i], "--skip-mem-preflight")) {
-            scheduler_mod.skip_mem_preflight = true;
+            engine_flags.skip_mem_preflight = true;
         } else if (std.mem.eql(u8, args[i], "--no-safety")) {
             // Retired image content filter; accepted as a no-op.
         } else if (std.mem.eql(u8, args[i], "--pld")) {
@@ -903,7 +905,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--mtp-head-kv-quant")) {
             mtp_head_kv_quant = true;
         } else if (std.mem.eql(u8, args[i], "--ple-gpu")) {
-            ple_gpu.pleGpu().enabled = true;
+            engine_flags.ple_gpu = true;
         } else if (std.mem.eql(u8, args[i], "--ane-prefill")) {
             // ANE prefill-MLP offload (perf-plan-aug-17 P5): opt-in, lossy
             // by design (int8 fp16 datapath). Eligibility + machine gates
@@ -963,7 +965,7 @@ pub fn main(init: std.process.Init) !void {
                 log.err("{s}: expected an integer in 1..{d}; got '{s}'\n", .{ args[i - 1], mtp_mod.MAX_DEPTH, text });
                 std.process.exit(1);
             };
-            if (is_min) depth_bounds.active.min = n else depth_bounds.active.max = n;
+            if (is_min) engine_flags.mtp_depth_min = n else engine_flags.mtp_depth_max = n;
         } else if (std.mem.eql(u8, args[i], "--mtp-typical") and i + 1 < args.len) {
             i += 1;
             mtp_typical_raw = args[i];
@@ -971,16 +973,16 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             mtp_tokenv3_raw = args[i];
         } else if (std.mem.eql(u8, args[i], "--mtp-greedy-tail")) {
-            generate_mod.mtp_greedy_tail_default = true;
+            engine_flags.mtp_greedy_tail = true;
         } else if (std.mem.eql(u8, args[i], "--max-mtp-ctx") and i + 1 < args.len) {
             i += 1;
-            generate_mod.max_mtp_ctx = try std.fmt.parseInt(u32, args[i], 10);
+            engine_flags.max_mtp_ctx = try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--mtp-history-window") and i + 1 < args.len) {
             i += 1;
             // 0 = full history; otherwise the last-N-token window applied
             // above mtp.HISTORY_WINDOW_THRESHOLD (set-once module override,
             // same contract as --prefill-chunk).
-            generate_mod.mtp_history_window_override = try std.fmt.parseInt(usize, args[i], 10);
+            engine_flags.mtp_history_window = try std.fmt.parseInt(usize, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--reasoning-budget") and i + 1 < args.len) {
             i += 1;
             reasoning_budget = try std.fmt.parseInt(i32, args[i], 10);
@@ -1003,36 +1005,33 @@ pub fn main(init: std.process.Init) !void {
             // earns it — a typo'd value keeps the defaults (flag-absent
             // behavior), never a silent 8192 that also switches sizing off.
             if (std.fmt.parseInt(usize, args[i], 10)) |v| {
-                if (v > 0) {
-                    generate_mod.prefill_chunk_override = v;
-                    generate_mod.prefill_chunk_explicit = true;
-                }
+                if (v > 0) engine_flags.prefill_chunk = v;
             } else |_| {}
         } else if (std.mem.eql(u8, args[i], "--prefill-trace")) {
-            generate_mod.prefill_trace_force = true;
+            engine_flags.prefill_trace = true;
         } else if (std.mem.eql(u8, args[i], "--no-prefix-cache-ram")) {
-            server_mod.prefix_cache_ram_enabled = false;
+            server_mod.launch().prefix_cache_ram_enabled = false;
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-entries") and i + 1 < args.len) {
             i += 1;
-            server_mod.prefix_cache_capacity = std.fmt.parseInt(u32, args[i], 10) catch 1;
+            server_mod.launch().prefix_cache_capacity = std.fmt.parseInt(u32, args[i], 10) catch 1;
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-mem") and i + 1 < args.len) {
             // Wave 1.B — KV-bytes budget for the hot prefix cache. Accepts
             // bare numbers (bytes), a suffix of `MB`/`GB`/`KB` (case-
             // insensitive), or `0`/`off` to disable the byte budget entirely
             // (count cap from --prefix-cache-entries still applies).
             i += 1;
-            server_mod.prefix_cache_mem_bytes = parseSizeArg(args[i]) catch {
+            server_mod.launch().prefix_cache_mem_bytes = parseSizeArg(args[i]) catch {
                 log.err("--prefix-cache-mem: expected '<n>{{MB,GB,KB}}' or '0'/'off'; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
-            server_mod.prefix_cache_mem_explicit = true;
+            server_mod.launch().prefix_cache_mem_explicit = true;
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-disk") and i + 1 < args.len) {
             // SSD tier for the hot prefix cache: previously-seen prefixes are
             // persisted as chunked safetensors and restored across restarts
             // and RAM evictions instead of recomputed. Byte budget with the
             // same size grammar as --prefix-cache-mem; `0`/`off` disables.
             i += 1;
-            server_mod.prefix_cache_disk_bytes = parseSizeArg(args[i]) catch {
+            server_mod.launch().prefix_cache_disk_bytes = parseSizeArg(args[i]) catch {
                 log.err("--prefix-cache-disk: expected '<n>{{MB,GB,KB}}' or '0'/'off'; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
@@ -1063,10 +1062,10 @@ pub fn main(init: std.process.Init) !void {
             // architectures. 0 disables (legacy behavior: hybrid bypasses the
             // hot prefix cache); default 128.
             i += 1;
-            server_mod.ssm_checkpoint_stride = std.fmt.parseInt(u32, args[i], 10) catch 128;
+            server_mod.launch().ssm_checkpoint_stride = std.fmt.parseInt(u32, args[i], 10) catch 128;
         } else if (std.mem.eql(u8, args[i], "--ssm-checkpoint-max") and i + 1 < args.len) {
             i += 1;
-            server_mod.ssm_checkpoint_max = std.fmt.parseInt(u32, args[i], 10) catch 16;
+            server_mod.launch().ssm_checkpoint_max = std.fmt.parseInt(u32, args[i], 10) catch 16;
         } else if (std.mem.eql(u8, args[i], "--os-reserve-gib") and i + 1 < args.len) {
             i += 1;
             @import("sdk/util/system.zig").os_reserve_override = status.parseOsReserveGib(args[i]) catch {
@@ -1144,11 +1143,11 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--kv-quant") and i + 1 < args.len) {
             i += 1;
             if (std.mem.eql(u8, args[i], "off") or std.mem.eql(u8, args[i], "0")) {
-                kv_quant_config = transformer_mod.KVQuantConfig.dense;
+                kv_quant_config = KVQuantConfig.dense;
             } else if (std.mem.eql(u8, args[i], "4")) {
-                kv_quant_config = transformer_mod.KVQuantConfig.affine(4);
+                kv_quant_config = KVQuantConfig.affine(4);
             } else if (std.mem.eql(u8, args[i], "8")) {
-                kv_quant_config = transformer_mod.KVQuantConfig.affine(8);
+                kv_quant_config = KVQuantConfig.affine(8);
             } else {
                 log.err("--kv-quant: expected one of {{off, 4, 8}}; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
@@ -1196,27 +1195,27 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     if (!server_mod.mtpAllowedByDefault(mtp_forced, mlx.metalKernelsAvailable(), mlx.cudaAvailable())) enable_mtp = false;
-    generate_mod.machine_prefill_chunk_cap = server_mod.autoPrefillChunkCap(mlx.cudaAvailable());
 
     // One value for the three media seams (they run under gen.zig with no
     // server config in reach); the env stays the benching override.
     ane_mod.aneState().media_offload = ane_media;
 
-    scheduler_mod.prefill_decode_share = scheduler_mod.resolveDecodeShare(decode_share_flag) catch {
+    engine_flags.prefill_decode_share = scheduler_mod.resolveDecodeShare(decode_share_flag) catch {
         log.err("--prefill-decode-share: expected a number >= 0 (above 0.9 clamps to 0.9), got '{s}'\n", .{decode_share_flag.?});
         std.process.exit(1);
     };
 
-    transformer_mod.Transformer.mtp_head_kv_quant_flag = mtp_head_kv_quant;
-    generate_mod.mtp_acceptance_default = mtp_acceptance.parse(mtp_typical_raw, mtp_tokenv3_raw) catch |err| {
+    engine_flags.mtp_head_kv_quant = mtp_head_kv_quant;
+    engine_flags.mtp_acceptance = mtp_acceptance.parse(mtp_typical_raw, mtp_tokenv3_raw) catch |err| {
         log.err("MTP acceptance settings: {s} (--mtp-typical needs d > 0; --mtp-tokenv3 needs 0 <= a <= 1; choose one)\n", .{@errorName(err)});
         std.process.exit(1);
     };
 
-    depth_bounds.validate(depth_bounds.active) catch {
-        log.err("--mtp-min-depth {d} is above --mtp-max-depth {d}\n", .{ depth_bounds.active.min, depth_bounds.active.max });
+    depth_bounds.validate(.{ .min = engine_flags.mtp_depth_min, .max = engine_flags.mtp_depth_max }) catch {
+        log.err("--mtp-min-depth {d} is above --mtp-max-depth {d}\n", .{ engine_flags.mtp_depth_min, engine_flags.mtp_depth_max });
         std.process.exit(1);
     };
+    mlx_engine.api().configure(&engine_flags);
 
     // Subcommand plumbing: `run <model>` supplies the model dir + serve
     // mode; `run`/`serve` default the discovery root to ~/.mlx-serve/models
@@ -1423,7 +1422,7 @@ pub fn main(init: std.process.Init) !void {
             ctx_size,
             if (enable_pld) "on" else "off",
             no_vision,
-            sleep_inhibit_mod.isEnabled(),
+            engine_flags.prevent_sleep,
         });
     }
     switch (kv_quant_config.scheme) {
@@ -1460,7 +1459,7 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         };
         log.info("[dist] cluster host at {s}: the worker can join any time\n", .{coordinator});
-        try @import("engines/mlx/cluster/distributed.zig").connect(io, allocator, .{ .rank = 0, .coordinator = coordinator, .device = device }, mode, group_model, dist_split);
+        try err_name.check(mlx_engine.api().cluster_connect(io, allocator, coordinator, device, @intFromEnum(mode), group_model, dist_split));
     }
 
     if (serve_mode) {
@@ -1474,7 +1473,7 @@ pub fn main(init: std.process.Init) !void {
             try runHeadlessServe(io, allocator, discovery_for_registry, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs, kv_quant_config, cli_pld, .{
                 .no_drafter = no_drafter,
                 .mtp_enabled = enable_mtp,
-                .mtp_depth = depth_bounds.active.max,
+                .mtp_depth = engine_flags.mtp_depth_max,
                 .draft_block_size = draft_block_size,
                 .draft_block_size_explicit = draft_block_size_explicit,
             });
@@ -1633,7 +1632,7 @@ pub fn main(init: std.process.Init) !void {
             chat_config_owned_by_registry = true;
         };
 
-        const params = scheduler_mod.LoadParams{
+        const params = LoadParams{
             .registry = registry,
             .entry = entry,
             .config = config,
@@ -1645,24 +1644,23 @@ pub fn main(init: std.process.Init) !void {
             .no_drafter = no_drafter,
             .mtp_enabled = enable_mtp,
             .mtp_head_kv_quant = mtp_head_kv_quant,
-            .mtp_depth = depth_bounds.active.max,
+            .mtp_depth = engine_flags.mtp_depth_max,
             .ane_prefill = ane_prefill,
             .ane = ane_serve,
             .ane_slots = ane_slots,
-            .ane_chunk_resolver = server_mod.pinPrefillChunk,
-            .ane_headroom_resolver = server_mod.aneGateHeadroom,
+            .ane_resolvers = true,
             .load_vision = load_vision,
             .warmup_eager = warmup_eager,
             .draft_block_size = draft_block_size,
             .draft_block_size_explicit = draft_block_size_explicit,
             .kv_quant_config = kv_quant_config,
-            .prefix_cache_capacity = server_mod.prefix_cache_capacity,
-            .prefix_cache_ram_enabled = server_mod.prefix_cache_ram_enabled,
-            .prefix_cache_mem_bytes = server_mod.prefix_cache_mem_bytes,
-            .prefix_cache_mem_resolver = server_mod.prefixCacheMemForLoad,
-            .prefix_cache_disk_bytes = server_mod.prefix_cache_disk_bytes,
-            .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity, server_mod.prefix_cache_ram_enabled, server_mod.prefix_cache_disk_bytes),
-            .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
+            .prefix_cache_capacity = server_mod.launch().prefix_cache_capacity,
+            .prefix_cache_ram_enabled = server_mod.launch().prefix_cache_ram_enabled,
+            .prefix_cache_mem_bytes = server_mod.launch().prefix_cache_mem_bytes,
+            .prefix_cache_clamp = true,
+            .prefix_cache_disk_bytes = server_mod.launch().prefix_cache_disk_bytes,
+            .ssm_checkpoint_stride = effectiveSsmCheckpointStride(server_mod.launch().ssm_checkpoint_stride, server_mod.launch().prefix_cache_capacity, server_mod.launch().prefix_cache_ram_enabled, server_mod.launch().prefix_cache_disk_bytes),
+            .ssm_checkpoint_max = server_mod.launch().ssm_checkpoint_max,
             .tokenize_cache_entries = server_mod.tokenize_cache_entries,
             .llama = server_mod.llama_settings,
             .ds4_mtp = ds4_mtp,
@@ -1683,150 +1681,22 @@ pub fn main(init: std.process.Init) !void {
             .kv_attn_mode = kv_attn_mode,
         });
     } else {
-        // ── Offline single-prompt mode. mlx ops run on this thread, no
-        //    scheduler. The same load path as pre-A1.
-        log.info("Loading weights...\n", .{});
-        // A served model loads through its plugin, as the serve path does (`engines/mlx/load.zig`).
-        const served = config.plugin != null;
-        if (!served and !config.mlxStream()) return error.PluginDeclinedNoLegacy;
-        var weights = if (served) model_mod.Weights.init(allocator) else try model_mod.loadModelWeights(io, allocator, model_dir, config, load_vision);
-        defer weights.deinit();
-        if (!served) {
-            model_mod.resolveWeightPrefix(config, &weights);
-            try model_mod.narrowHadamardPackTables(config, &weights, mlx.gpuStream());
-        }
-
-        var xfm = if (served)
-            try plugin_driver.loadWith(io, allocator, config, model_dir, mlx.gpuStream(), if (load_vision) &weights else null)
-        else
-            try transformer_mod.Transformer.init(io, allocator, config.*);
-        defer xfm.deinit();
-
-        xfm.round_cost.layout = round_cost_mod.layoutFor(config);
-
-        // Reserved-token suppression, same derivation as the serve path.
-        generate_mod.installSuppressMask(&xfm, tok, chat_config.chat_template, config.eosTokenSlice());
-
-        // Honor --kv-quant in offline mode too. The serve path threads this
-        // through Slot caches via the scheduler; here we swap the
-        // Transformer's own legacy cache to match.
-        if (kv_quant_config.scheme != .off) {
-            try xfm.cache.reinit(config.num_hidden_layers, kv_quant_config);
-        }
-        if (xfm.qwen4Trunk()) |t| try t.qwen4MtpApplyKvQuant(transformer_mod.Transformer.qwen4MtpHeadKvConfig(kv_quant_config));
-
-        // JIT-compile + wire memory limits (policy: mlx.applyWiredPolicy).
-        {
-            const wired = mlx.applyWiredPolicy();
-            if (wired.target) |t| log.debug("[wired] mode={s} limit={d} MB\n", .{ @tagName(wired.mode), t / (1024 * 1024) });
-        }
-        if (config.hidden_act == .gelu_approx) {
-            xfm.compileGelu();
-            xfm.compileGeglu();
-        }
-        if (xfm.moe_layers != null) {
-            xfm.compileMoeRouting();
-        }
-        if (config.linear_num_key_heads > 0) {
-            xfm.compileGdnGate();
-        }
-        log.info("Model ready.\n", .{});
-
-        // Qwen native MTP head — auto-load when the model ships one (sidecar
-        // file or in-checkpoint tensors in the trunk shards).
-        var mtp_head: ?mtp_mod.MtpModel = null;
-        defer if (mtp_head) |*h| h.deinit();
-        if (enable_mtp and !served) mtp_graft.ensure(allocator, io, model_dir, config);
-        // A served model's head is its plugin's (`SpecHooks.head`), served by the scheduler path only.
-        if (served and enable_mtp) log.info("[mtp] offline mode runs a served model without its MTP head\n", .{});
-        if (!served and enable_mtp and mtp_mod.hasMtpHead(io, allocator, model_dir)) {
-            // A failed load (e.g. a sidecar layout we can't bind yet) only
-            // disables the head — mirrors the serve path's graceful degrade.
-            if (mtp_mod.loadMtp(io, allocator, xfm.s, model_dir)) |loaded| {
-                mtp_head = loaded;
-                mtp_head.?.bind(&xfm) catch |err| {
-                    log.warn("[mtp] sidecar incompatible with target ({any}) — disabled\n", .{err});
-                    mtp_head.?.deinit();
-                    mtp_head = null;
-                };
-            } else |err| {
-                log.warn("[mtp] failed to load sidecar ({any}) — disabled\n", .{err});
-            }
-        }
-
-        const user_prompt = prompt.?; // offline mode only runs with --prompt
-        const messages = [_]chat_mod.Message{
-            .{ .role = "user", .content = user_prompt },
-        };
-
-        const prompt_ids = try chat_mod.formatChat(allocator, tok, &messages, chat_config, null, null, false, null, false);
-        defer allocator.free(prompt_ids);
-
-        // Reset peak memory before generation
-        _ = mlx.mlx_reset_peak_memory();
-
-        const eos_slice = config.eosTokenSlice();
-        const sampling = generate_mod.SamplingParams{ .temperature = temperature };
-
-        var stdout_buf: [16 * 1024]u8 = undefined;
-        var stdout_w_state = std.Io.File.stdout().writer(io, &stdout_buf);
-        const stdout_w = &stdout_w_state.interface;
-        defer stdout_w.flush() catch {};
-
-        if (stream_mode) {
-            // Streaming: print tokens as they're generated
-            const prefill_start = std.Io.Timestamp.now(io, .awake);
-            var gen = try generate_mod.Generator.init(io, allocator, &xfm, tok, prompt_ids, max_tokens, sampling, eos_slice);
-            defer gen.deinit(allocator);
-
-            const prefill_ns: u64 = @intCast(prefill_start.untilNow(io, .awake).nanoseconds);
-            const prefill_tps: f64 = if (prefill_ns > 0)
-                @as(f64, @floatFromInt(prompt_ids.len)) * @as(f64, @floatFromInt(std.time.ns_per_s)) / @as(f64, @floatFromInt(prefill_ns))
-            else
-                0.0;
-
-            try stdout_w.writeAll("==========\n");
-            const decode_start = std.Io.Timestamp.now(io, .awake);
-            var completion_tokens: u32 = 0;
-            while (try gen.next(allocator)) |token_id| {
-                const ids = [_]u32{token_id};
-                const piece = try tok.decode(allocator, &ids, completion_tokens == 0);
-                defer allocator.free(piece);
-                if (piece.len > 0) {
-                    try stdout_w.writeAll(piece);
-                    try stdout_w.flush();
-                }
-                completion_tokens += 1;
-            }
-            const decode_ns: u64 = @intCast(decode_start.untilNow(io, .awake).nanoseconds);
-            const decode_tps: f64 = if (decode_ns > 0)
-                @as(f64, @floatFromInt(completion_tokens)) * @as(f64, @floatFromInt(std.time.ns_per_s)) / @as(f64, @floatFromInt(decode_ns))
-            else
-                0.0;
-
-            try stdout_w.writeAll("\n==========\n");
-            try stdout_w.print("Prompt: {d} tokens, {d:.3} tokens-per-sec\n", .{ prompt_ids.len, prefill_tps });
-            try stdout_w.print("Generation: {d} tokens, {d:.3} tokens-per-sec\n", .{ completion_tokens, decode_tps });
-        } else {
-            // Non-streaming: generate all tokens then print
-            const result = if (mtp_head) |*h|
-                try generate_mod.generateMtp(io, allocator, &xfm, h, tok, prompt_ids, max_tokens, sampling, eos_slice, 0, depth_bounds.active.max, null)
-            else
-                try generate_mod.generate(io, allocator, &xfm, tok, prompt_ids, max_tokens, sampling, eos_slice, 0, 0);
-            defer allocator.free(result.text);
-            defer allocator.free(result.token_ids);
-
-            try stdout_w.writeAll("==========\n");
-            try stdout_w.writeAll(result.text);
-            try stdout_w.writeAll("\n==========\n");
-            try stdout_w.print("Prompt: {d} tokens, {d:.3} tokens-per-sec\n", .{ result.prompt_tokens, result.prefill_tps });
-            try stdout_w.print("Generation: {d} tokens, {d:.3} tokens-per-sec\n", .{ result.completion_tokens, result.decode_tps });
-        }
-
-        var peak_mem: usize = 0;
-        _ = mlx.mlx_get_peak_memory(&peak_mem);
-        const peak_gb = @as(f64, @floatFromInt(peak_mem)) / (1024.0 * 1024.0 * 1024.0);
-        try stdout_w.print("Peak memory: {d:.3} GB\n", .{peak_gb});
+        // Offline single-prompt mode: mlx ops run on this thread, no scheduler.
+        try err_name.check(mlx_engine.api().run_offline(&.{
+            .io = io,
+            .allocator = allocator,
+            .config = config,
+            .tok = tok,
+            .chat_config = chat_config,
+            .model_dir = model_dir,
+            .load_vision = load_vision,
+            .kv_quant = kv_quant_config,
+            .enable_mtp = enable_mtp,
+            .prompt = prompt.?,
+            .temperature = temperature,
+            .max_tokens = max_tokens,
+            .stream = stream_mode,
+        }));
     }
 }
 
@@ -1921,7 +1791,7 @@ fn runGenServe(
         config_owned_by_registry = true;
     };
 
-    const params = scheduler_mod.LoadParams{
+    const params = LoadParams{
         .registry = registry,
         .entry = entry,
         .config = stub.config,
@@ -1933,7 +1803,7 @@ fn runGenServe(
         .warmup_eager = false,
         .draft_block_size = 0,
         .draft_block_size_explicit = false,
-        .kv_quant_config = transformer_mod.KVQuantConfig.dense,
+        .kv_quant_config = KVQuantConfig.dense,
         .prefix_cache_capacity = 0,
         .prefix_cache_mem_bytes = 0,
         .tokenize_cache_entries = 0,
@@ -1942,8 +1812,7 @@ fn runGenServe(
         .ane_prefill = ane_prefill,
         .ane = ane_serve,
         .ane_slots = ane_slots,
-        .ane_chunk_resolver = server_mod.pinPrefillChunk,
-        .ane_headroom_resolver = server_mod.aneGateHeadroom,
+        .ane_resolvers = true,
         .metrics = server_mod.g_metrics,
     };
 
@@ -1993,7 +1862,7 @@ fn runHeadlessServe(
     max_resident_mem: u64,
     max_resident_mem_explicit: bool,
     idle_evict_secs: ?u32,
-    kv_quant_config: transformer_mod.KVQuantConfig,
+    kv_quant_config: KVQuantConfig,
     pld: server_mod.PldDefaults,
     spec: SpecLoadFlags,
 ) !void {
@@ -2049,7 +1918,7 @@ fn runHeadlessServe(
         break :blk &placeholder;
     };
 
-    const params = scheduler_mod.LoadParams{
+    const params = LoadParams{
         .registry = registry,
         .entry = carrier,
         .config = stub.config,
@@ -2066,7 +1935,7 @@ fn runHeadlessServe(
         .draft_block_size = spec.draft_block_size,
         .draft_block_size_explicit = spec.draft_block_size_explicit,
         .kv_quant_config = kv_quant_config,
-        .mtp_head_kv_quant = transformer_mod.Transformer.mtp_head_kv_quant_flag,
+        .mtp_head_kv_quant = mlx_engine.settings().mtp_head_kv_quant,
         // Seed the scheduler's prefix-cache config from the server globals so
         // on-demand (headless/discover-mode) loads get the SAME hot prefix
         // cache as a `--model` startup load. Previously hardcoded to 0, which
@@ -2074,13 +1943,13 @@ fn runHeadlessServe(
         // `ensureLoaded` skipped `HotPrefixCache` init → cross-turn KV reuse
         // was silently dead for the entire headless serving mode (the default
         // `serve` path). Mirrors the LoadParams built in `main()`.
-        .prefix_cache_capacity = server_mod.prefix_cache_capacity,
-        .prefix_cache_ram_enabled = server_mod.prefix_cache_ram_enabled,
-        .prefix_cache_mem_bytes = server_mod.prefix_cache_mem_bytes,
-        .prefix_cache_mem_resolver = server_mod.prefixCacheMemForLoad,
-        .prefix_cache_disk_bytes = server_mod.prefix_cache_disk_bytes,
-        .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity, server_mod.prefix_cache_ram_enabled, server_mod.prefix_cache_disk_bytes),
-        .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
+        .prefix_cache_capacity = server_mod.launch().prefix_cache_capacity,
+        .prefix_cache_ram_enabled = server_mod.launch().prefix_cache_ram_enabled,
+        .prefix_cache_mem_bytes = server_mod.launch().prefix_cache_mem_bytes,
+        .prefix_cache_clamp = true,
+        .prefix_cache_disk_bytes = server_mod.launch().prefix_cache_disk_bytes,
+        .ssm_checkpoint_stride = effectiveSsmCheckpointStride(server_mod.launch().ssm_checkpoint_stride, server_mod.launch().prefix_cache_capacity, server_mod.launch().prefix_cache_ram_enabled, server_mod.launch().prefix_cache_disk_bytes),
+        .ssm_checkpoint_max = server_mod.launch().ssm_checkpoint_max,
         .tokenize_cache_entries = server_mod.tokenize_cache_entries,
         // ds4 spec flags must survive headless/on-demand GGUF loads (the
         // runHeadlessServe flag-eater class): the app always boots headless
@@ -2091,8 +1960,7 @@ fn runHeadlessServe(
         .ane_prefill = ane_prefill,
         .ane = ane_serve,
         .ane_slots = ane_slots,
-        .ane_chunk_resolver = server_mod.pinPrefillChunk,
-        .ane_headroom_resolver = server_mod.aneGateHeadroom,
+        .ane_resolvers = true,
         .metrics = server_mod.g_metrics,
     };
 
@@ -2129,7 +1997,7 @@ fn parseLlamaInt(raw: []const u8, flag: []const u8, lo: u32, hi: u32) u32 {
 }
 
 /// GGUF serve mode on ds4 or llama.cpp: a stub entry (the engine owns the real tokenizer and template) handed to
-/// `Scheduler.init`, whose startup load opens the engine (`host/engines/load.zig`).
+/// `Scheduler.init`, whose startup load opens the engine (`engines/mlx/runtime/engine_load.zig`).
 fn runGgufServe(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -2197,7 +2065,7 @@ fn runGgufServe(
     // ds4's process-wide flock makes >1 in-flight session per process untested; clamp serial.
     if (engine == .ds4) server_mod.max_concurrent = 1;
 
-    const params = scheduler_mod.LoadParams{
+    const params = LoadParams{
         .registry = registry,
         .entry = entry,
         .config = stub.config,
@@ -2210,7 +2078,7 @@ fn runGgufServe(
         .warmup_eager = false,
         .draft_block_size = 0,
         .draft_block_size_explicit = false,
-        .kv_quant_config = transformer_mod.KVQuantConfig.dense,
+        .kv_quant_config = KVQuantConfig.dense,
         .prefix_cache_capacity = 0,
         .prefix_cache_mem_bytes = 0,
         .tokenize_cache_entries = server_mod.tokenize_cache_entries,
@@ -2259,7 +2127,7 @@ fn runGgufOffline(
     log.info("[{s}] model: {s}\n", .{ @tagName(kind), gguf_path });
 
     const settings = if (engine == .ds4)
-        try std.json.Stringify.valueAlloc(allocator, ds4_load.Flags{ .mtp = ds4_mtp, .dspark = ds4_dspark, .ssd_streaming = ds4_ssd_streaming, .prefill_chunk = generate_mod.explicitPrefillChunkU32() }, .{})
+        try std.json.Stringify.valueAlloc(allocator, ds4_load.Flags{ .mtp = ds4_mtp, .dspark = ds4_dspark, .ssd_streaming = ds4_ssd_streaming, .prefill_chunk = mlx_engine.settings().explicit_prefill_chunk }, .{})
     else
         try std.json.Stringify.valueAlloc(allocator, llama_load.Settings{ .seqs = 1, .mtp_drafts = 0 }, .{});
     defer allocator.free(settings);

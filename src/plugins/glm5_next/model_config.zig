@@ -3,7 +3,7 @@
 //! against the engine's own parse (both plugins).
 
 const std = @import("std");
-const model = @import("../../engines/mlx/model.zig");
+const model = @import("../../sdk/config/model.zig");
 const exl3 = @import("../../sdk/quant/exl3/format.zig");
 const Config = @import("config.zig").Config;
 

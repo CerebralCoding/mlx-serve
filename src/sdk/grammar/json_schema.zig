@@ -19,7 +19,7 @@
 //! property name, and compiled regex in one shot.
 
 const std = @import("std");
-const regex = @import("../../../host/tokenizer/regex.zig");
+const regex = @import("../tokenizer/regex.zig");
 
 pub const Kind = enum {
     any,

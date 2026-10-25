@@ -5,8 +5,8 @@ const plugin_settle = @import("../plugin/settle.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
 const log = @import("../../../sdk/util/log.zig");
-const token_mask = @import("../grammar/token_mask.zig");
-const rp_mod = @import("../../../host/chat/reasoning/protocol.zig");
+const token_mask = @import("../../../sdk/grammar/token_mask.zig");
+const rp_mod = @import("../../../sdk/grammar/protocol.zig");
 const io_util = @import("../../../sdk/util/io_util.zig");
 const Transformer = transformer_mod.Transformer;
 const ForwardCtx = transformer_mod.ForwardCtx;
@@ -15,7 +15,7 @@ const Generator = @import("generator.zig").Generator;
 const applyGrammarMask = @import("../sampling/sampler.zig").applyGrammarMask;
 const computeLogprobs = @import("../sampling/logprobs.zig").computeLogprobs;
 const sampleToken = @import("../sampling/sampler.zig").sampleToken;
-const tokenStops = @import("stops.zig").tokenStops;
+const tokenStops = @import("../../../sdk/request/stops.zig").tokenStops;
 
 
 /// Returns the next token ID, or null when generation is finished.

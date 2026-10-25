@@ -20,7 +20,7 @@ const qsaTestAppendPool = @import("../../../plugins/qwen4_exp/qsa/history.zig").
 const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
-const model_mod = @import("../model.zig");
+const model_mod = @import("../../../sdk/config/model.zig");
 const kv_quant = @import("kv_quant.zig");
 const kv_disk_cache = @import("ssd/disk_tier.zig");
 const io_util = @import("../../../sdk/util/io_util.zig");
@@ -2964,11 +2964,7 @@ pub const HotPrefixCache = struct {
     /// One resident entry, reduced to what a connection thread may know about it (it may never
     /// dereference `hot_prefix_cache`). `fingerprint` hashes the first `DIGEST_PREFIX_TOKENS`
     /// ids, the restore floor; a shorter entry can never be pinned and gets no digest.
-    pub const EntryDigest = struct {
-        fingerprint: u64,
-        len: u32,
-        kv_bytes: u64,
-    };
+    pub const EntryDigest = @import("../../../host/gpu_thread/scheduler.zig").HotCacheDigest;
 
     pub const DIGEST_PREFIX_TOKENS: usize = MIN_CANCELLED_COMMIT_TOKENS;
 

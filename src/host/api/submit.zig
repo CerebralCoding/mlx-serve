@@ -2,20 +2,21 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const kv_quant = @import("../../engines/mlx/cache/kv_quant.zig");
+const kv_quant = @import("../../sdk/blocks/attention/kv_quant.zig");
 const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
-const generate_mod = @import("../../engines/mlx/generate.zig");
+const request_mod = @import("../../sdk/request/request.zig");
 const log = @import("../../sdk/util/log.zig");
-const prefix_cache_mod = @import("../../engines/mlx/cache/prefix_cache.zig");
-const scheduler_mod = @import("../../engines/mlx/scheduler.zig");
+const MediaSpan = @import("../../sdk/kv/media_span.zig").MediaSpan;
+const Scheduler = @import("../gpu_thread/scheduler.zig").Scheduler;
+const mlx_engine = @import("../engines/mlx.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;
 const LoadedModel = model_registry_mod.LoadedModel;
 const http_server = @import("../http/server.zig");
 
 const Conn = @import("../http/conn.zig").Conn;
-const resolveKvAttnFused = @import("../../engines/mlx/request_options.zig").resolveKvAttnFused;
-const mtpCapable = @import("../../engines/mlx/request_options.zig").mtpCapable;
+const resolveKvAttnFused = @import("request_options.zig").resolveKvAttnFused;
+const mtpCapable = @import("request_options.zig").mtpCapable;
 const decodeTokens = @import("tokenize.zig").decodeTokens;
 const loopTrimmedIds = @import("../chat/tools/pipeline.zig").loopTrimmedIds;
 const slotFailure = @import("../http/errors.zig").slotFailure;
@@ -32,13 +33,13 @@ const MropeData = @import("../media/encode.zig").MropeData;
 /// its own `defer` doesn't double-free.
 pub fn nonStreamingViaScheduler(
     allocator: std.mem.Allocator,
-    sch: *scheduler_mod.Scheduler,
+    sch: *Scheduler,
     lm: *LoadedModel,
     tok: *const Tokenizer,
     prompt_ids: []const u32,
     full_prompt: []const u32,
     max_tokens: u32,
-    sampling: generate_mod.SamplingParams,
+    sampling: request_mod.SamplingParams,
     eos_token_ids: []const u32,
     cached_tokens: u32,
     has_tools: bool,
@@ -49,7 +50,7 @@ pub fn nonStreamingViaScheduler(
     allow_batch_mtp: bool,
     timeout_ns: u64,
     vision_embeddings: ?mlx.mlx_array,
-    media: []const prefix_cache_mod.MediaSpan,
+    media: []const MediaSpan,
     cache_key: u64,
     mrope: MropeData,
     logprobs_n: u32,
@@ -62,8 +63,8 @@ pub fn nonStreamingViaScheduler(
     /// wait — a vanished client cancels the slot (aborting its prefill)
     /// instead of grinding out a ghost generation nobody will read.
     conn: ?*Conn,
-) !generate_mod.GenerationResult {
-    var slot = try sch.submit(.{
+) !request_mod.GenerationResult {
+    const running = try mlx_engine.Running.submit(sch, .{
         .model = lm,
         .prompt_ids = prompt_ids,
         .full_prompt = full_prompt,
@@ -97,7 +98,8 @@ pub fn nonStreamingViaScheduler(
         .prompt_logprobs = prompt_logprobs,
         .kv_quant_config = kv_quant_override,
     });
-    defer sch.complete(slot);
+    defer running.done();
+    const slot = running.stream;
 
     var output_ids = std.ArrayList(u32).empty;
     defer output_ids.deinit(allocator);
@@ -136,8 +138,8 @@ pub fn nonStreamingViaScheduler(
     // The scheduler measures prefill_ns / decode_ns per-slot directly. Pull
     // those instead of the old single-wall-clock approximation, which
     // double-counted total time into both phases.
-    const prefill_tps = generate_mod.prefillTokensPerSec(slot.prompt_tokens, slot.cached_tokens, slot.prefill_ns);
-    const decode_tps = generate_mod.tokensPerSec(slot.completion_tokens, slot.decode_ns);
+    const prefill_tps = request_mod.prefillTokensPerSec(slot.prompt_tokens, slot.cached_tokens, slot.prefill_ns);
+    const decode_tps = request_mod.tokensPerSec(slot.completion_tokens, slot.decode_ns);
 
     const strip_leading = tok.tok_type == .sentencepiece_bpe and (sampling.constraint == null or sampling.constraint.?.proto == null);
     // A loop cut is a truncation, and the degenerate span is the part the
@@ -173,11 +175,11 @@ pub fn nonStreamingViaScheduler(
     // Phase A5: take ownership of the slot's accumulated logprobs. After
     // `toOwnedSlice` the slot's list is empty, so `Slot.deinit` doesn't try
     // to free what we just transferred to the caller.
-    const logprobs_slice: ?[]generate_mod.LogprobResult = if (slot.logprobs_buf.items.len > 0)
+    const logprobs_slice: ?[]request_mod.LogprobResult = if (slot.logprobs_buf.items.len > 0)
         slot.logprobs_buf.toOwnedSlice(slot.allocator) catch null
     else
         null;
-    const prompt_logprobs_slice: ?[]generate_mod.LogprobResult = if (slot.prompt_logprobs_buf.items.len > 0)
+    const prompt_logprobs_slice: ?[]request_mod.LogprobResult = if (slot.prompt_logprobs_buf.items.len > 0)
         slot.prompt_logprobs_buf.toOwnedSlice(slot.allocator) catch null
     else
         null;

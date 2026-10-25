@@ -7,7 +7,7 @@ const cache_mod = @import("../kv/cache.zig");
 const prefill_dq_gemm = @import("../../../sdk/blocks/linear/prefill_dq_gemm.zig");
 const verify_qmm_nax = @import("../../../sdk/blocks/linear/verify_qmm_nax.zig");
 const generate_mod = @import("../generate.zig");
-const model_mod = @import("../model.zig");
+const model_mod = @import("../../../sdk/config/model.zig");
 const http_server = @import("../../../host/http/server.zig");
 
 const getEffectiveContextLength = @import("context.zig").getEffectiveContextLength;
@@ -78,17 +78,17 @@ const GlmBillGlobals = struct {
     chunk: usize,
 
     fn pin() GlmBillGlobals {
-        const saved: GlmBillGlobals = .{ .stride = http_server.ssm_checkpoint_stride, .max = http_server.ssm_checkpoint_max, .chunk = generate_mod.prefill_chunk_override };
-        http_server.ssm_checkpoint_stride = 256;
-        http_server.ssm_checkpoint_max = 16;
-        generate_mod.prefill_chunk_override = 0;
+        const saved: GlmBillGlobals = .{ .stride = http_server.launch().ssm_checkpoint_stride, .max = http_server.launch().ssm_checkpoint_max, .chunk = generate_mod.prefillCli().override };
+        http_server.launch().ssm_checkpoint_stride = 256;
+        http_server.launch().ssm_checkpoint_max = 16;
+        generate_mod.prefillCli().override = 0;
         return saved;
     }
 
     fn restore(self: GlmBillGlobals) void {
-        http_server.ssm_checkpoint_stride = self.stride;
-        http_server.ssm_checkpoint_max = self.max;
-        generate_mod.prefill_chunk_override = self.chunk;
+        http_server.launch().ssm_checkpoint_stride = self.stride;
+        http_server.launch().ssm_checkpoint_max = self.max;
+        generate_mod.prefillCli().override = self.chunk;
     }
 };
 
@@ -100,7 +100,7 @@ test "GLM bill: f32 checkpoints and the live state are billed" {
     // 34 KDA layers x (f32 state 64x128x128 + conv 3 x (2x64x128 + 64x128) x 2).
     try t.expectEqual(@as(u64, 147_619_840), glm.ssmCheckpointBytes());
     const with = glm5PrefillMemoryNeeded(&glm, 100_000, 64, 8, 4096, .{});
-    http_server.ssm_checkpoint_stride = 0;
+    http_server.launch().ssm_checkpoint_stride = 0;
     const without = glm5PrefillMemoryNeeded(&glm, 100_000, 64, 8, 4096, .{});
     // Effective stride max(256, 4096): 100000/4096 + 1 snapshot, capped at 16.
     try t.expectEqual(16 * glm.ssmCheckpointBytes() * 5 / 4, with - without);
@@ -164,7 +164,7 @@ test "GLM bill: warm credit requires donation and never erases checkpoints" {
     const warm_bill = prefillNeededAtChunk(&glm, 66000, 12288, 8, 512, warm);
     const shared_bill = prefillNeededAtChunk(&glm, 66000, 12288, 8, 512, shared);
     try t.expectEqual(@as(u64, 65000 * 8976 * 5 / 4), shared_bill - warm_bill);
-    http_server.ssm_checkpoint_stride = 0;
+    http_server.launch().ssm_checkpoint_stride = 0;
     try t.expect(prefillNeededAtChunk(&glm, 66000, 12288, 8, 512, warm) < warm_bill);
 }
 
@@ -189,7 +189,7 @@ test "GLM bill: covers the measured peaks without doubling them" {
         .{ .seq = 66_015, .kv_bits = 8, .chunk = 512, .launch = 512, .peak = 4_400_000_000 },
         .{ .seq = 124_681, .kv_bits = 8, .chunk = 512, .launch = 512, .peak = 5_170_000_000 },
     }) |p| {
-        generate_mod.prefill_chunk_override = p.launch;
+        generate_mod.prefillCli().override = p.launch;
         const bill = prefillNeededAtChunk(&glm, p.seq, 64, p.kv_bits, p.chunk, .{});
         try t.expect(bill >= p.peak);
         // Long prompts are where a refusal costs: there the bill stays within 1.6x.

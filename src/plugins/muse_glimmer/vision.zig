@@ -9,7 +9,7 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
+const model_mod = @import("../../sdk/config/model.zig");
 const ModelConfig = model_mod.ModelConfig;
 const Weights = model_mod.Weights;
 const qwen_vision = @import("../../sdk/vision/qwen_vision.zig");

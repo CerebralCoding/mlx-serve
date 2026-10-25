@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const ModelConfig = @import("../model.zig").ModelConfig;
+const ModelConfig = @import("../../../sdk/config/model.zig").ModelConfig;
 const KVCache = @import("../kv/cache.zig").KVCache;
 const bf16Scalar = @import("../load/weights.zig").bf16Scalar;
 const Transformer = @import("../transformer.zig").Transformer;

@@ -2,15 +2,15 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const kv_quant = @import("../../engines/mlx/cache/kv_quant.zig");
+const kv_quant = @import("../../sdk/blocks/attention/kv_quant.zig");
 const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
-const generate_mod = @import("../../engines/mlx/generate.zig");
+const request_mod = @import("../../sdk/request/request.zig");
 const chat_mod = @import("../chat/chat.zig");
-const rp_mod = @import("../chat/reasoning/protocol.zig");
+const rp_mod = @import("../../sdk/grammar/protocol.zig");
 const log = @import("../../sdk/util/log.zig");
 const responses_mod = @import("responses/model.zig");
-const pld_index = @import("../../engines/mlx/spec/pld_index.zig");
-const prefix_cache_mod = @import("../../engines/mlx/cache/prefix_cache.zig");
+const pld_index = @import("../../sdk/spec/pld_index.zig");
+const MediaSpan = @import("../../sdk/kv/media_span.zig").MediaSpan;
 const model_registry_mod = @import("../registry/registry.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;
 const LoadedModel = model_registry_mod.LoadedModel;
@@ -21,15 +21,15 @@ const Stopwatch = io_util.Stopwatch;
 const http_server = @import("../http/server.zig");
 
 const Conn = @import("../http/conn.zig").Conn;
-const spec_gate_threshold = @import("../../engines/mlx/request_options.zig").spec_gate_threshold;
-const parseKvAttnExplicit = @import("../../engines/mlx/request_options.zig").parseKvAttnExplicit;
+const spec_gate_threshold = @import("request_options.zig").spec_gate_threshold;
+const parseKvAttnExplicit = @import("request_options.zig").parseKvAttnExplicit;
 const resolveSampling = @import("sampling.zig").resolveSampling;
 const generationMaxTokens = @import("sampling.zig").generationMaxTokens;
 const requestProfile = @import("sampling.zig").requestProfile;
-const defaultEnableMtp = @import("../../engines/mlx/request_options.zig").defaultEnableMtp;
-const dsv4DraftStages = @import("../../engines/mlx/request_options.zig").dsv4DraftStages;
-const mtpCapable = @import("../../engines/mlx/request_options.zig").mtpCapable;
-const admitMtpForCtx = @import("../../engines/mlx/request_options.zig").admitMtpForCtx;
+const defaultEnableMtp = @import("request_options.zig").defaultEnableMtp;
+const dsv4DraftStages = @import("request_options.zig").dsv4DraftStages;
+const mtpCapable = @import("request_options.zig").mtpCapable;
+const admitMtpForCtx = @import("request_options.zig").admitMtpForCtx;
 const getTimeoutNs = @import("../http/server.zig").getTimeoutNs;
 const messageReasoningFromObj = @import("../chat/reasoning/request.zig").messageReasoningFromObj;
 const promptOpensThink = @import("../chat/reasoning/request.zig").promptOpensThink;
@@ -48,10 +48,10 @@ const toolCallFinishReason = @import("../chat/tools/pipeline.zig").toolCallFinis
 const shouldParseToolCalls = @import("../chat/tools/pipeline.zig").shouldParseToolCalls;
 const finishDetailsField = @import("../chat/tools/pipeline.zig").finishDetailsField;
 const parseToolCallsForRequest = @import("../chat/tools/pipeline.zig").parseToolCallsForRequest;
-const getEffectiveContextLength = @import("../../engines/mlx/admission/context.zig").getEffectiveContextLength;
+const getEffectiveContextLength = @import("admission.zig").getEffectiveContextLength;
 const logStreamError = @import("../http/errors.zig").logStreamError;
 const sendGenerationError = @import("../http/errors.zig").sendGenerationError;
-const checkAttentionMemory = @import("../../engines/mlx/admission/admit.zig").checkAttentionMemory;
+const checkAttentionMemory = @import("admission.zig").checkAttentionMemory;
 const clampMaxTokens = @import("sampling.zig").clampMaxTokens;
 const mediaRejectReason = @import("media_gate.zig").mediaRejectReason;
 const dropMedia = @import("media_gate.zig").dropMedia;
@@ -70,13 +70,13 @@ const joinedTextParts = @import("request_text.zig").joinedTextParts;
 const requestCacheKey = @import("request_text.zig").requestCacheKey;
 const echoModelName = @import("request_text.zig").echoModelName;
 const nChoicesRejectReason = @import("completions.zig").nChoicesRejectReason;
-const requestPld = @import("../../engines/mlx/request_options.zig").requestPld;
+const requestPld = @import("request_options.zig").requestPld;
 const answerStopCut = @import("../chat/stops.zig").answerStopCut;
 const visibleToolPreamble = @import("../chat/stops.zig").visibleToolPreamble;
 const nonStreamingViaScheduler = @import("submit.zig").nonStreamingViaScheduler;
-const requestEnableDrafter = @import("../../engines/mlx/request_options.zig").requestEnableDrafter;
-const requestHasCompany = @import("../../engines/mlx/request_options.zig").requestHasCompany;
-const requestSpecModes = @import("../../engines/mlx/request_options.zig").requestSpecModes;
+const requestEnableDrafter = @import("request_options.zig").requestEnableDrafter;
+const requestHasCompany = @import("request_options.zig").requestHasCompany;
+const requestSpecModes = @import("request_options.zig").requestSpecModes;
 const handleStreamingGeneration = @import("chat_stream.zig").handleStreamingGeneration;
 const StreamLogprobs = @import("logprobs.zig").StreamLogprobs;
 const sendSSEChunk = @import("../http/sse.zig").sendSSEChunk;
@@ -360,7 +360,7 @@ pub fn handleChatCompletions(
         // logprobs=true without top_logprobs defaults to 0 (just the chosen token's logprob)
         const tlp = root.get("top_logprobs") orelse break :blk 1;
         break :blk switch (tlp) {
-            .integer => |i| @intCast(@min(@max(i, 0), generate_mod.MAX_TOP_LOGPROBS)),
+            .integer => |i| @intCast(@min(@max(i, 0), request_mod.MAX_TOP_LOGPROBS)),
             else => 1,
         };
     };
@@ -778,7 +778,7 @@ pub fn handleChatCompletions(
     // but different vision embeddings, so prefix matching would reuse stale features.
     const eos_slice = requestEosSlice(config, root);
 
-    var sampling = generate_mod.SamplingParams{
+    var sampling = request_mod.SamplingParams{
         .temperature = temperature,
         .top_p = top_p,
         .top_k = top_k,
@@ -792,7 +792,7 @@ pub fn handleChatCompletions(
     // Build grammar-constrained sampling state if a JSON schema was supplied.
     // Lifetime is scoped to this request — the SchemaConstraint must NOT be
     // moved (the embedded Constraint holds pointers into it).
-    var sc: generate_mod.SchemaConstraint = undefined;
+    var sc: request_mod.SchemaConstraint = undefined;
     var sc_init = false;
     defer if (sc_init) sc.deinit();
 
@@ -924,7 +924,7 @@ pub fn emitConstrainedResponses(a: std.mem.Allocator, stream: *Conn, seq: *u64, 
     }
 }
 
-pub fn splitConstrainedResponse(allocator: std.mem.Allocator, routed: *?rp_mod.Delivery, sampling: generate_mod.SamplingParams, text: []const u8, payload_byte: ?usize, keep_markup: bool, opened: bool) !chat_mod.ThinkSplit {
+pub fn splitConstrainedResponse(allocator: std.mem.Allocator, routed: *?rp_mod.Delivery, sampling: request_mod.SamplingParams, text: []const u8, payload_byte: ?usize, keep_markup: bool, opened: bool) !chat_mod.ThinkSplit {
     if (sampling.constraint) |c| {
         if (c.proto) |p| {
             routed.* = rp_mod.Delivery.init(p);
@@ -946,7 +946,7 @@ fn handleNonStreamingGeneration(
     tok: *const Tokenizer,
     prompt_ids: []const u32,
     max_tokens: u32,
-    sampling: generate_mod.SamplingParams,
+    sampling: request_mod.SamplingParams,
     eos_token_ids: []const u32,
     stop_sequences: []const []const u8,
     model_name: []const u8,
@@ -965,7 +965,7 @@ fn handleNonStreamingGeneration(
     enable_mtp: bool,
     allow_batch_mtp: bool,
     vision_embeddings: ?mlx.mlx_array,
-    media: []const prefix_cache_mod.MediaSpan,
+    media: []const MediaSpan,
     cache_key: u64,
     mrope: MropeData,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
@@ -1003,7 +1003,7 @@ fn handleNonStreamingGeneration(
         break :blk v;
     };
     // Propagates to `handleChatCompletions`' one error arm, shared with the streaming twin.
-    const result = try nonStreamingViaScheduler(allocator, http_server.global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media, cache_key, mrope, logprobs_n, false, kv_quant_override, kv_attn_explicit, stream);
+    const result = try nonStreamingViaScheduler(allocator, http_server.launch().global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media, cache_key, mrope, logprobs_n, false, kv_quant_override, kv_attn_explicit, stream);
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
     defer if (result.logprobs) |lps| {

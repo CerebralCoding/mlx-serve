@@ -16,8 +16,13 @@ const log = @import("../../sdk/util/log.zig");
 
 /// The llama shim's log sink: llama.cpp's warnings and errors stay visible, the rest
 /// (the loader's metadata dump, backend probing) is debug.
-export fn mlx_llama_log(warn: bool, text: [*:0]const u8) void {
+fn mlx_llama_log(warn: bool, text: [*:0]const u8) callconv(.c) void {
     if (warn) log.warn("{s}", .{std.mem.span(text)}) else log.debug("{s}", .{std.mem.span(text)});
+}
+
+comptime {
+    // One definition per binary: under `-Dunits` the engine unit compiles this file too, and the host exports it.
+    if (!@hasDecl(@import("root"), "mlx_serve_unit")) @export(&mlx_llama_log, .{ .name = "mlx_llama_log" });
 }
 
 pub const Error = error{

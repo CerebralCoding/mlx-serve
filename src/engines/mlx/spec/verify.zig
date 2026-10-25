@@ -6,7 +6,7 @@ const testing = std.testing;
 const Constraint = @import("../grammar/constraint.zig").Constraint;
 const SamplingParams = @import("../sampling/params.zig").SamplingParams;
 const scalarLike = @import("../sampling/params.zig").scalarLike;
-const tokenStops = @import("../generate/stops.zig").tokenStops;
+const tokenStops = @import("../../../sdk/request/stops.zig").tokenStops;
 
 
 /// A greedy spec-verify argmax whose entries are COMMITTED as next tokens.

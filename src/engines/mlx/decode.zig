@@ -34,7 +34,7 @@ const SpecTickMode = @import("spec/wiring.zig").SpecTickMode;
 const specTickMode = @import("spec/wiring.zig").specTickMode;
 const plannerOutputClock = @import("spec/wiring.zig").plannerOutputClock;
 const publishSpeculativeBlock = @import("spec/wiring.zig").publishSpeculativeBlock;
-const loopGuardTick = @import("../../host/chat/loop_stop.zig").loopGuardTick;
+const loopGuardTick = @import("loop_stop.zig").loopGuardTick;
 
 var kv_skew_split_logged: bool = false; // one-shot log guard
 
@@ -97,7 +97,7 @@ pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     var mtp_buf: [MAX_BATCH_GROUP]*Slot = undefined;
     var mtp_n: usize = 0;
     for (active) |s| {
-        const why = sch.batchVerdict(s);
+        const why = @import("scheduler.zig").batchVerdict(sch, s);
         if (why == .ok and batchable_n < batchable_buf.len) {
             batchable_buf[batchable_n] = s;
             batchable_n += 1;

@@ -5,7 +5,7 @@ const scalarOf = @import("../../../mlx/array.zig").scalarOf;
 const Transformer = @import("../transformer.zig").Transformer;
 const constTableAs = @import("../../../mlx/dtype.zig").constTableAs;
 const mrope = @import("../../../sdk/vision/mrope.zig");
-const ModelConfig = @import("../model.zig").ModelConfig;
+const ModelConfig = @import("../../../sdk/config/model.zig").ModelConfig;
 
 /// Does this trunk rotate with a YaRN-scaled rope? The DECISION comes from
 /// the config — every Transformer has one, including the hand-built fixtures

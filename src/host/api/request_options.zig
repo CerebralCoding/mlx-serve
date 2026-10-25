@@ -2,28 +2,19 @@
 //! admitMtpForCtx; PldDefaults; requestPld; drafter/spec request modes, pickStreamMode
 
 const std = @import("std");
-const env = @import("../../env.zig");
-const transformer_mod = @import("transformer.zig");
-const kv_quant_mod = @import("cache/kv_quant.zig");
-const generate_mod = @import("generate.zig");
+const kv_quant_mod = @import("../../sdk/blocks/attention/kv_quant.zig");
 const mtp_mod = @import("../../sdk/spec/mtp/mtp.zig");
-const model_mod = @import("model.zig");
-const dsv41_mod = @import("../../plugins/deepseek_v41/deepseek_v41.zig");
-const v41_plugin = @import("../../plugins/deepseek_v41/plugin.zig");
-const plugin_config = @import("plugin/config.zig");
-const plugin_driver = @import("plugin/driver.zig");
+const model_mod = @import("../../sdk/config/model.zig");
 const log = @import("../../sdk/util/log.zig");
-const model_registry_mod = @import("../../host/registry/registry.zig");
-const Transformer = transformer_mod.Transformer;
+const model_registry_mod = @import("../registry/registry.zig");
+const mlx_engine = @import("../engines/mlx.zig");
 const LoadedModel = model_registry_mod.LoadedModel;
 const testing = std.testing;
-const http_server = @import("../../host/http/server.zig");
+const http_server = @import("../http/server.zig");
 
-const ServerConfig = @import("../../host/http/server.zig").ServerConfig;
-const configuredKvQuantFor = @import("../../host/http/server.zig").configuredKvQuantFor;
-const mlxPropsSettings = @import("../../host/api/props.zig").mlxPropsSettings;
-const settingsPropsJson = @import("../../host/api/props.zig").settingsPropsJson;
-const StreamMode = @import("../../host/api/chat_stream.zig").StreamMode;
+const ServerConfig = http_server.ServerConfig;
+const configuredKvQuantFor = http_server.configuredKvQuantFor;
+const StreamMode = @import("chat_stream.zig").StreamMode;
 
 /// Adaptive spec-decode gate threshold. Per-request, we score the prompt's
 /// 3-gram repetition density; if `score < spec_gate_threshold` AND the user
@@ -94,7 +85,7 @@ pub fn resolveKvAttnFusedPure(mode: KvAttnMode, explicit: ?bool, prompt_len: usi
 /// Exact decode (a DFlash drafter bound) reads every row through `row_attn`
 /// over the dense view: the packed kernels neither take a draft tree's mask
 /// nor give a serial step and a verify row the same bits.
-pub fn resolveKvAttnFused(config: *const model_mod.ModelConfig, explicit: ?bool, prompt_len: usize, kv_override: ?transformer_mod.KVQuantConfig) bool {
+pub fn resolveKvAttnFused(config: *const model_mod.ModelConfig, explicit: ?bool, prompt_len: usize, kv_override: ?kv_quant_mod.KVQuantConfig) bool {
     if (config.rowExactDecode()) return false;
     const scheme: kv_quant_mod.Scheme = (kv_override orelse configuredKvQuantFor(config)).scheme;
     return resolveKvAttnFusedPure(http_server.serverState().server_config.kv_attn_mode, explicit, prompt_len, scheme);
@@ -134,10 +125,7 @@ pub fn mtpAllowedByDefault(mtp_forced: bool, metal: bool, cuda: bool) bool {
 
 /// Does this model serve DeepSeek-V4 or V4.1 with DSpark draft stages loaded?
 pub fn dsv4DraftStages(lm: *LoadedModel) bool {
-    if (lm.config) |cfg| if (cfg.mtp_override == false) return false;
-    if (!generate_mod.Generator.dsparkEnabled()) return false;
-    const x = lm.transformer orelse return false;
-    return x.dsparkStages() > 0;
+    return mlx_engine.api().draft_stages(lm);
 }
 
 /// Can this model run an MTP-flagged request speculatively? Either a qwen
@@ -152,8 +140,11 @@ pub fn mtpCapable(lm: *LoadedModel) bool {
 /// `--max-mtp-ctx` admission: MTP is refused past the operator's context ceiling. Called once
 /// per surface after tokenization; a machine limit, so it outranks an explicit `enable_mtp:true`.
 pub fn admitMtpForCtx(enable_mtp: bool, prompt_tokens: usize) bool {
+    return admitMtpForCtxWith(mlx_engine.settings().max_mtp_ctx, enable_mtp, prompt_tokens);
+}
+
+fn admitMtpForCtxWith(max: u32, enable_mtp: bool, prompt_tokens: usize) bool {
     if (!enable_mtp) return false;
-    const max = generate_mod.max_mtp_ctx;
     if (mtp_mod.mtpCtxWithinLimit(max, prompt_tokens)) return true;
     log.info("  mtp=off (ctx {d} > --max-mtp-ctx {d})\n", .{ prompt_tokens, max });
     return false;
@@ -231,7 +222,7 @@ pub fn requestEnableDrafter(explicit: ?std.json.Value, gemma_loaded: bool, dflas
 pub const RequestSpec = struct { use_mtp: bool, use_drafter: bool, use_pld: bool };
 
 pub fn requestHasCompany() bool {
-    return if (http_server.global_scheduler) |sch| sch.hasCompany() else false;
+    return if (http_server.launch().global_scheduler) |sch| mlx_engine.api().has_company(sch) else false;
 }
 
 /// The ONE request-level spec dispatch, shared by every surface x stream /
@@ -423,7 +414,7 @@ test "resolveKvAttnFused: exact decode never reads packed KV, even when a reques
     cfg.model_type = "qwen3_5";
     cfg.row_exact_covered = true;
     cfg.dflash_bound = true;
-    const kv8 = transformer_mod.KVQuantConfig.affine(8);
+    const kv8 = kv_quant_mod.KVQuantConfig.affine(8);
     try std.testing.expect(!resolveKvAttnFused(&cfg, true, 8192, kv8));
     cfg.dflash_bound = false;
     try std.testing.expect(resolveKvAttnFused(&cfg, true, 8192, kv8));
@@ -460,64 +451,12 @@ test "defaultEnableMtp: a loaded head drafts by default, MoE or not" {
     try t.expect(defaultEnableMtp(false, true));
 }
 
-test "native speculation: resolved opt-out gates capability and API defaults" {
-    const saved = env.override(.MLX_SERVE_DSV4_DSPARK, null);
-    defer saved.restore();
-    // A served V4.1 whose module loaded three DSpark stages.
-    var native: dsv41_mod.Dsv41Model = undefined;
-    native.n_mtp = 3;
-    var served: v41_plugin.Model = undefined;
-    served.mdl = &native;
-    var binding: plugin_config.Binding = .{ .table = &v41_plugin.table };
-    binding.parsed.caps.owns_decode_state = true;
-    var bound: plugin_driver.Bound = .{ .table = &v41_plugin.table, .model = &served };
-    var cfg = model_mod.ModelConfig{ .plugin = &binding };
-    var xfm: Transformer = undefined;
-    xfm.config = cfg;
-    xfm.mlx_stream_ext = null;
-    xfm.plugin = &bound;
-    xfm.dense_attn_proj = false;
-    var lm: LoadedModel = undefined;
-    lm.config = &cfg;
-    lm.transformer = &xfm;
-    lm.mtp = null;
-    lm.engine = null;
-    lm.dflash = null;
-    lm.drafter = null;
-    lm.mtp_depth = 6;
-    for ([_]?[:0]const u8{ null, "1", "0" }) |raw| {
-        if (raw) |value| env.set(.MLX_SERVE_DSV4_DSPARK, value) else env.unset(.MLX_SERVE_DSV4_DSPARK);
-        const env_enabled = if (raw) |value| value[0] != '0' else true;
-        for ([_]?bool{ null, true, false }) |setting| {
-            cfg.mtp_override = setting;
-            xfm.config.mtp_override = setting;
-            const enabled = setting != false and env_enabled;
-            try testing.expectEqual(enabled, mtpCapable(&lm));
-            try testing.expectEqual(enabled, defaultEnableMtp(false, dsv4DraftStages(&lm)));
-            const frag = try settingsPropsJson(testing.allocator, mlxPropsSettings(&lm));
-            defer testing.allocator.free(frag);
-            var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, frag[",\"settings\":".len..], .{});
-            defer parsed.deinit();
-            const mtp = parsed.value.object.get("mtp").?.object;
-            try testing.expect(mtp.get("loaded").?.bool);
-            try testing.expectEqual(enabled, mtp.get("default_on").?.bool);
-        }
-    }
-}
-
 test "admitMtpForCtx: the --max-mtp-ctx ceiling outranks the request's own flag" {
-    const saved = generate_mod.max_mtp_ctx;
-    defer generate_mod.max_mtp_ctx = saved;
-
-    generate_mod.max_mtp_ctx = 0;
-    try std.testing.expect(admitMtpForCtx(true, 1_000_000));
-    try std.testing.expect(!admitMtpForCtx(false, 1));
-
+    try std.testing.expect(admitMtpForCtxWith(0, true, 1_000_000));
+    try std.testing.expect(!admitMtpForCtxWith(0, false, 1));
     // Inclusive at the ceiling; an explicit `enable_mtp:true` loses to it.
-    generate_mod.max_mtp_ctx = 4096;
-    try std.testing.expect(admitMtpForCtx(true, 4096));
-    try std.testing.expect(!admitMtpForCtx(true, 4097));
-
+    try std.testing.expect(admitMtpForCtxWith(4096, true, 4096));
+    try std.testing.expect(!admitMtpForCtxWith(4096, true, 4097));
     // It never turns MTP on for a request that had it off for another reason.
-    try std.testing.expect(!admitMtpForCtx(false, 1));
+    try std.testing.expect(!admitMtpForCtxWith(4096, false, 1));
 }

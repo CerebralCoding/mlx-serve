@@ -2,17 +2,17 @@
 
 const std = @import("std");
 const env = @import("../../env.zig");
-const generate_mod = @import("../../engines/mlx/generate.zig");
+const generate_mod = @import("generate.zig");
 const log = @import("../../sdk/util/log.zig");
 const Generator = generate_mod.Generator;
 const testing = std.testing;
 
-const finishSlot = @import("../../engines/mlx/finish.zig").finishSlot;
-const thinkBoundTick = @import("../../engines/mlx/logit_features.zig").thinkBoundTick;
-const toolForceTick = @import("../../engines/mlx/logit_features.zig").toolForceTick;
-const commitForcedTick = @import("../../engines/mlx/logit_features.zig").commitForcedTick;
-const Scheduler = @import("../../engines/mlx/scheduler.zig").Scheduler;
-const Slot = @import("../../engines/mlx/slot.zig").Slot;
+const finishSlot = @import("finish.zig").finishSlot;
+const thinkBoundTick = @import("logit_features.zig").thinkBoundTick;
+const toolForceTick = @import("logit_features.zig").toolForceTick;
+const commitForcedTick = @import("logit_features.zig").commitForcedTick;
+const Scheduler = @import("scheduler.zig").Scheduler;
+const Slot = @import("slot.zig").Slot;
 
 /// Phase A6: finalize a slot. Commits to hot prefix cache (if applicable)
 /// before signaling completion. The order matters: commit first while the

@@ -1,12 +1,13 @@
 //! A request slot: per-request state the inference thread drives and the connection thread drains.
 
 const std = @import("std");
+const abi = @import("../../abi/engine.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const transformer_mod = @import("transformer.zig");
 const generate_mod = @import("generate.zig");
-const rp_mod = @import("../../host/chat/reasoning/protocol.zig");
+const rp_mod = @import("../../sdk/grammar/protocol.zig");
 const drafter_mod = @import("../../plugins/gemma4/assistant_drafter.zig");
-const model_mod = @import("model.zig");
+const model_mod = @import("../../sdk/config/model.zig");
 const prefix_cache_mod = @import("cache/prefix_cache.zig");
 const metrics_mod = @import("../../host/metrics/metrics.zig");
 const model_registry_mod = @import("../../host/registry/registry.zig");
@@ -133,6 +134,10 @@ pub const Slot = struct {
 
     // ── State + output channel. ──
     state: SlotState,
+    /// The host's stream (`SubmitParams.sink`): every token and the terminator also go out as `abi.Event`s.
+    sink: ?abi.Sink = null,
+    /// A constraint span published before the token that carries it rides that token's event.
+    sink_constraint: ?[2]u32 = null,
 
     out_mu: std.Io.Mutex,
     out_cond: std.Io.Condition,
@@ -323,7 +328,7 @@ pub const Slot = struct {
             .drafter_block_size = params.drafter_block_size,
             .enable_mtp = params.enable_mtp,
             .allow_batch_mtp = params.allow_batch_mtp,
-            .mtp = params.mtp,
+            .mtp = if (params.mtp) |m| m.* else null,
             .mtp_depth = params.mtp_depth,
             .pld_draft_len = params.pld_draft_len,
             .pld_key_len = params.pld_key_len,
@@ -331,6 +336,7 @@ pub const Slot = struct {
             .cached_tokens = params.cached_tokens,
             .logprobs_n = params.logprobs_n,
             .state = .pending_prefill,
+            .sink = params.sink,
             .out_mu = .init,
             .out_cond = .init,
             .out_event = .unset,
@@ -385,6 +391,8 @@ pub const Slot = struct {
     /// finished/errored it AND the connection thread has consumed the final
     /// `done`/`err` from `waitNext`).
     pub fn deinit(self: *Slot) void {
+        // A slot freed before its terminator (a cancel pulled into cleanup) still tells its stream it is done.
+        if (self.sink != null) self.emitFinished(.cancelled, null);
         if (self.model.transformer) |xfm| if (xfm.qwen4Trunk()) |t| t.markQsaPooledRopeStale();
         if (self.legacy_gen) |*gen| {
             gen.deinit(self.allocator);
@@ -432,6 +440,7 @@ pub const Slot = struct {
     pub fn publishConstraintSpan(self: *Slot, token_index: u32, byte_offset: u32) void {
         self.constraint_payload_offset.store(byte_offset, .release);
         self.constraint_payload_at.store(token_index, .release);
+        if (self.sink != null) self.sink_constraint = .{ token_index, byte_offset };
     }
 
     /// Connection thread: where the constrained payload begins relative to
@@ -465,6 +474,12 @@ pub const Slot = struct {
         if (self.early_first) |e| {
             self.early_first = null;
             if (e == t and lp == null) return;
+        }
+        // A request with a stream reads it there alone: the event carries the token and a copy of its logprob.
+        if (self.sink != null) {
+            self.emitToken(t, lp);
+            if (lp) |entry| self.allocator.free(entry.top_logprobs);
+            return;
         }
         self.out_mu.lockUncancelable(self.io);
         defer self.out_mu.unlock(self.io);
@@ -520,6 +535,7 @@ pub const Slot = struct {
         self.finish_reason = reason;
         self.out_cond.broadcast(self.io);
         self.out_event.set(self.io);
+        self.emitFinished(if (std.mem.eql(u8, reason, "length")) .length else if (std.mem.eql(u8, reason, "cancelled")) .cancelled else .stop, null);
     }
 
     /// Inference thread: signal error. `name` is borrowed; we dupe so the
@@ -553,6 +569,58 @@ pub const Slot = struct {
         self.state = .errored;
         self.out_cond.broadcast(self.io);
         self.out_event.set(self.io);
+        self.emitFinished(.failed, name);
+    }
+
+    /// The prefill is done: the prompt's counts and its logprobs go out before its first token.
+    pub fn emitPrefilled(self: *Slot) void {
+        const sk = self.sink orelse return;
+        var lps: std.ArrayList(abi.Logprob) = .empty;
+        defer lps.deinit(self.allocator);
+        var tops: std.ArrayList(abi.Bias) = .empty;
+        defer tops.deinit(self.allocator);
+        for (self.prompt_logprobs_buf.items) |lp| tops.appendSlice(self.allocator, @ptrCast(lp.top_logprobs)) catch {};
+        var at: usize = 0;
+        for (self.prompt_logprobs_buf.items) |lp| {
+            lps.append(self.allocator, .{ .token = 0, .logprob = lp.token_logprob, .top = abi.span(abi.Bias, tops.items[at..][0..lp.top_logprobs.len]) }) catch {};
+            at += lp.top_logprobs.len;
+        }
+        const ev: abi.Event = .{ .kind = .prefilled, .cached = self.cached_tokens, .prompt_tokens = self.prompt_tokens, .prompt_logprobs = abi.span(abi.Logprob, lps.items) };
+        if (sk.event(sk.ctx, @intFromPtr(self), &ev) == .stop) self.cancelled.store(true, .release);
+    }
+
+    fn emitToken(self: *Slot, t: u32, lp: ?generate_mod.LogprobResult) void {
+        const sk = self.sink orelse return;
+        const one = [1]u32{t};
+        var entry: [1]abi.Logprob = undefined;
+        if (lp) |e| entry[0] = .{ .token = t, .logprob = e.token_logprob, .top = abi.span(abi.Bias, @ptrCast(e.top_logprobs)) };
+        const span = self.sink_constraint;
+        self.sink_constraint = null;
+        const ev: abi.Event = .{
+            .kind = .tokens,
+            .tokens = abi.span(u32, &one),
+            .logprobs = if (lp != null) abi.span(abi.Logprob, &entry) else .{},
+            .constraint_at = if (span) |c| c[0] else std.math.maxInt(u32),
+            .constraint_offset = if (span) |c| c[1] else 0,
+        };
+        if (sk.event(sk.ctx, @intFromPtr(self), &ev) == .stop) self.cancelled.store(true, .release);
+    }
+
+    fn emitFinished(self: *Slot, reason: @FieldType(abi.Event, "reason"), failure: ?[]const u8) void {
+        const sk = self.sink orelse return;
+        self.sink = null;
+        const st: abi.Stats = .{ .prefill_ns = self.prefill_ns, .decode_ns = self.decode_ns };
+        const ev: abi.Event = .{
+            .kind = .finished,
+            .reason = reason,
+            .stats = &st,
+            .verdict = if (failure) |name| .{ .code = .failed, .why = abi.Str.of(name) } else .{},
+            .finish_details = if (self.finish_details) |d| abi.Str.of(d) else .{},
+            .loop_trim_start = if (self.loop_trim_start) |i| i else std.math.maxInt(u64),
+            .refused_needed = if (self.refused_bill) |b| b[0] else 0,
+            .refused_available = if (self.refused_bill) |b| b[1] else 0,
+        };
+        _ = sk.event(sk.ctx, @intFromPtr(self), &ev);
     }
 
     /// Connection thread: block until the next token, completion, or error.

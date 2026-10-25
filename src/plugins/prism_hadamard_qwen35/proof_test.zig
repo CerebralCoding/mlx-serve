@@ -145,7 +145,7 @@ test "prism served: steps, rollbacks and the lookup loop equal the legacy shell"
     try served.expectSolo(&p);
 }
 
-fn int8Prefill(c: *@import("../../engines/mlx/model.zig").ModelConfig) void {
+fn int8Prefill(c: *@import("../../sdk/config/model.zig").ModelConfig) void {
     c.int8_prefill_override = true;
 }
 

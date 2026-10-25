@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const chat_mod = @import("../chat/chat.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
+const model_mod = @import("../../sdk/config/model.zig");
 const qwen_vision = @import("../../sdk/vision/qwen_vision.zig");
 const radio_vision = @import("../../plugins/nemotron_h/radio_vision.zig");
 const log = @import("../../sdk/util/log.zig");

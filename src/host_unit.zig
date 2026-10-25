@@ -19,7 +19,12 @@ pub const plugin_profile = main_mod.plugin_profile;
 
 comptime {
     @export(&hostMain, .{ .name = "mlx_serve_host_main" });
+    // The host owns every `Shared`'s storage; the engine and plugin units link to it.
+    _ = @import("shared_all.zig");
 }
+
+/// Marks the host unit: the MLX engine's objects are opaque here (`abi/mlx_handles.zig`), reached through its table.
+pub const mlx_serve_host_unit = true;
 
 fn hostMain(argc: c_int, argv: [*][*:0]u8, envp: [*:null]?[*:0]u8) callconv(.c) u8 {
     var env_count: usize = 0;

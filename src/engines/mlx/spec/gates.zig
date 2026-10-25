@@ -1,8 +1,8 @@
 //! Runtime spec gates: warmups, per-draft rate, DFlash and yield gates, re-enable, yielding to company.
 const std = @import("std");
-const model_mod = @import("../model.zig");
+const model_mod = @import("../../../sdk/config/model.zig");
 const log = @import("../../../sdk/util/log.zig");
-const pld_index = @import("pld_index.zig");
+const pld_index = @import("../../../sdk/spec/pld_index.zig");
 const testing = std.testing;
 const Generator = @import("../generate/generator.zig").Generator;
 

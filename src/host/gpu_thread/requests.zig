@@ -1,9 +1,10 @@
 //! Load, media-gen and unload work items posted to the inference thread, and media-job merging.
 
 const std = @import("std");
-const kv_quant = @import("../../engines/mlx/cache/kv_quant.zig");
+const mlx = @import("../../mlx/ffi.zig");
+const kv_quant = @import("../../sdk/blocks/attention/kv_quant.zig");
 const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
+const model_mod = @import("../../sdk/config/model.zig");
 const chat_mod = @import("../chat/chat.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const ModelConfig = model_mod.ModelConfig;
@@ -12,9 +13,8 @@ const ChatConfig = chat_mod.ChatConfig;
 const LoadedModel = model_registry_mod.LoadedModel;
 const testing = std.testing;
 
-const BudgetRevise = @import("../../engines/mlx/cache/budget.zig").BudgetRevise;
-const LlamaSettings = @import("../../engines/mlx/scheduler/params.zig").LlamaSettings;
-const GgufRoute = @import("thread.zig").GgufRoute;
+const LlamaSettings = @import("../../sdk/quant/gguf/llama_settings.zig").Settings;
+const GgufRoute = @import("../../sdk/quant/gguf/engine_pick.zig").Route;
 
 /// Plan 05 Phase D: cold-load work item. Posted by `Scheduler.ensureLoaded`
 /// when a request targets an `.unloaded` (or freshly-evicted) entry; the
@@ -82,7 +82,6 @@ pub const LoadRequest = struct {
     prefix_cache_capacity: u32 = 1,
     prefix_cache_ram_enabled: bool = true,
     prefix_cache_mem_bytes: u64 = 0,
-    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64 = null,
     /// SSD tier byte budget (mirrors `LoadParams.prefix_cache_disk_bytes`).
     prefix_cache_disk_bytes: u64 = 0,
     /// Phase 1 (perf-plan): SSM/conv state snapshot stride during prefill.
@@ -258,3 +257,97 @@ test "takeMergeable: merges the contiguous run of same-model decision jobs withi
     try q.append(a, &r[1]);
     try testing.expectEqual(@as(usize, 1), takeMergeable(&q, &batch, 1));
 }
+
+/// Phase A4: pixel data for a single image, decoded by the connection
+/// thread (CPU only — stb_image / libwebp). The inference thread wraps this
+/// in an `mlx_array` via `mlx_array_new_data` and runs the vision encoder.
+pub const VisionImagePixels = struct {
+    /// Raw bytes holding float32 pixel data. Gemma: CHW (3 × H × W × 4). Qwen3-VL:
+    /// merge-order pixel_values (N × C·tps·ps·ps × 4). Borrowed; must outlive the
+    /// encodeVision call (which blocks until completion).
+    pixels: []const u8,
+    width: u32,
+    height: u32,
+    /// Qwen3-VL only: full patch grid (0 ⇒ Gemma CHW). Selects QwenVision.
+    grid_h: u32 = 0,
+    grid_w: u32 = 0,
+};
+
+/// Qwen3-VL video: pre-patchified pixel_values for ALL `grid_t` temporal-patch
+/// groups, concatenated (see `qwen_vision.buildPixelValuesVideo`). Borrowed;
+/// must outlive the encodeVision call.
+pub const VisionVideoPixels = struct {
+    pixels: []const u8,
+    grid_t: u32,
+    grid_h: u32,
+    grid_w: u32,
+};
+
+/// One encoder input. `audio` is raw float32-LE 16 kHz mono PCM, framed into
+/// `audio_samples_per_token` tokens by the unified audio embedder.
+pub const VisionItem = union(enum) {
+    image: VisionImagePixels,
+    video: VisionVideoPixels,
+    audio: []const u8,
+};
+
+/// Phase A4: vision-encode work item. Conn thread fills `images` (raw pixel
+/// data, CPU-only) and calls `Scheduler.encodeVision`, which posts the
+/// request and blocks until the inference thread fills `result` and signals
+/// `done`. Ownership of `result` transfers to the caller on success — pass
+/// to `scheduler.submit(.{ .vision_embeddings = arr, ... })` and the slot's
+/// `deinit` will free it.
+pub const VisionEncodeRequest = struct {
+    /// Plan 05 Phase D: target model whose `vision_encoder` services this
+    /// request. The conn thread holds a refcount (via `ensureLoaded`) for
+    /// the duration of the call.
+    model: *LoadedModel,
+    /// Encoder inputs in prompt order. Borrowed; must outlive the call.
+    items: []const VisionItem,
+    /// Each item's pixel/PCM hash, parallel to `items`: the encoder cache key.
+    item_keys: []const u64,
+    /// Output: soft tokens each item produced, parallel to `items`. Caller-owned.
+    item_tokens: []usize,
+    /// Output: every item's soft tokens, concatenated along the token axis in
+    /// prompt order (the splice scatters them positionally). Ownership
+    /// transfers to the caller.
+    result: ?mlx.mlx_array = null,
+    /// Output: error name on failure. Owned by `allocator`; caller frees.
+    error_name: ?[]const u8 = null,
+    /// RADIO video only, parallel to `items`. A mask is the full pre-EVS row
+    /// count (true = keep). Null entries are not video. Owned by `allocator`
+    /// on success; the caller frees each mask and the array.
+    item_keep: ?[]?[]bool = null,
+    /// Done flag (under done_mu). Caller's wait-loop drains the cond when
+    /// this flips true.
+    done: bool = false,
+    allocator: std.mem.Allocator,
+    done_mu: std.Io.Mutex = .init,
+    done_cond: std.Io.Condition = .init,
+};
+
+/// Phase: embedding work item for encoder-only models. Conn thread fills
+/// `token_seqs` and calls `Scheduler.computeEmbeddings`; the inference
+/// thread services the request via `generate.computeEmbeddingsBatch` — one
+/// padded, key-masked GPU forward per EMBED_MAX_BATCH chunk — and writes
+/// the float vectors into `results` (caller frees). Mirrors the
+/// VisionEncodeRequest pattern.
+pub const EmbedRequest = struct {
+    /// Plan 05 Phase D: target model whose `transformer` services this
+    /// request. The conn thread holds a refcount for the duration.
+    model: *LoadedModel,
+    /// Tokenized inputs, one slice per text. Borrowed; must outlive the call.
+    token_seqs: []const []const u32,
+    /// The soft-token rows [1, n, hidden] of the ONE prompt's images and video, in prompt order. The request
+    /// owns them: the inference thread frees them when the forward is done.
+    vision_embeddings: ?mlx.mlx_array = null,
+    /// Output: one pooled L2-normalized embedding per input on success.
+    /// Rows + outer slice owned by `allocator`; caller frees.
+    results: ?[][]f32 = null,
+    /// Output: error name on failure. Owned by `allocator`; caller frees.
+    error_name: ?[]const u8 = null,
+    done: bool = false,
+    allocator: std.mem.Allocator,
+    done_mu: std.Io.Mutex = .init,
+    done_cond: std.Io.Condition = .init,
+};

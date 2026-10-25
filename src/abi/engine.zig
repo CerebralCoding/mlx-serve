@@ -182,6 +182,14 @@ pub const Event = extern struct {
     reason: enum(u8) { stop, length, cancelled, failed } = .stop, // finished
     stats: ?*const Stats = null, // finished
     verdict: Verdict = .{}, // finished(failed): the named error
+    prompt_tokens: u32 = 0, // prefilled: the prompt as the engine counted it
+    prompt_logprobs: Span(Logprob) = .{}, // prefilled: the prompt's own logprobs when asked for
+    constraint_at: u32 = std.math.maxInt(u32), // tokens: the token index where a constrained payload begins
+    constraint_offset: u32 = 0, // tokens: its byte offset inside that token
+    finish_details: Str = .{}, // finished: a static cause beside the reason (`repetition_loop`)
+    loop_trim_start: u64 = std.math.maxInt(u64), // finished: where a loop-stopped span begins in the generated tokens
+    refused_needed: u64 = 0, // finished(failed): bytes the engine's admission needed ...
+    refused_available: u64 = 0, // ... and had, when it refused the prefill
 };
 
 /// Runs on the engine's thread; returns at once. `stop` ends the request as `finished(stop)` after this round:
@@ -225,12 +233,61 @@ pub const Engine = extern struct {
     token_bytes: ?*const fn (e: *anyopaque, token: u32) callconv(.c) Str, // engine-owned, stable
     chat_template: ?*const fn (e: *anyopaque) callconv(.c) Str,
     render: ?*const fn (e: *anyopaque, chat_json: Str, out: [*]u32, cap: usize) callconv(.c) usize,
+
+    // ── a host_gpu_thread engine's memory side
+    admission: ?*const Admission = null,
 };
 
 pub const no_token: u32 = 0xffff_ffff;
 
 /// Each engine exports exactly this symbol.
 pub const entry_symbol = "mlx_serve_engine_v1";
+
+/// What an engine on the host's GPU thread prices against memory: the context it advertises and whether a prompt fits.
+/// `model` is the engine's own per-model object (ours: its `ModelConfig`).
+pub const Admission = extern struct {
+    size: u32 = @sizeOf(Admission),
+    context: *const fn (model: *const anyopaque) callconv(.c) u32, // prompt + reply, as advertised
+    pin_context: *const fn (model: *anyopaque, announce: bool) callconv(.c) u32, // freezes it; `announce` logs how
+    max_safe_context: *const fn (model: *const anyopaque) callconv(.c) u32, // the largest that fits now, no headroom
+    cache_budget: *const fn () callconv(.c) u64, // the resolved prefix-cache byte budget; 0 = none
+    /// true admits; false refuses, `out` holding what was compared. `keep` names the model no idle unload may take;
+    /// `kv_bits`: 0 dense, 4 or 8, `kv_configured` = the model's own scheme.
+    admit: *const fn (model: *const anyopaque, keep: Str, prompt: Span(u32), max_tokens: u32, kv_bits: u8, mtp: bool, media_bytes: u64, out: *Bill) callconv(.c) bool,
+};
+
+pub const kv_configured: u8 = 0xff;
+
+/// A prompt's memory bill and the headroom it was compared against, in bytes.
+pub const Bill = extern struct {
+    size: u32 = @sizeOf(Bill),
+    needed: u64 = 0,
+    available: u64 = 0,
+    /// Bytes the hot prefix cache is holding. Reported in a refusal, never credited (see `reclaimable`).
+    evictable: u64 = 0,
+    /// The part of `evictable` an eviction can prove it will return: residency minus the
+    /// largest entry (a restore pins at most one).
+    reclaimable: u64 = 0,
+    /// The prefill width this bill was taken at, so a refusal can name it.
+    chunk: u64 = 0,
+
+    pub fn fits(self: Bill) bool {
+        return self.needed <= self.available;
+    }
+
+    /// The one credit the decision and both sentences read: `reclaimable`, never `evictable`
+    /// (a refusal once quoted the slot's own checked-out prefix as "evicted").
+    pub fn evictionCredit(self: Bill) u64 {
+        return self.reclaimable;
+    }
+
+    /// Fits once the cache has given back what it provably can. Credits `reclaimable`, not
+    /// `evictable`: a 383k prompt was admitted on one entry it then restored from and refused
+    /// after the eviction pass returned nothing.
+    pub fn fitsAfterEviction(self: Bill) bool {
+        return self.needed <= self.available +| self.evictionCredit();
+    }
+};
 
 // ── helpers (Zig side only; nothing here crosses the interface)
 
@@ -311,15 +368,17 @@ test "engine abi: extern layouts are pinned (64-bit)" {
     try expectLayout(Request, 208, .{ .size = 0, .prompt = 8, .media = 24, .max_tokens = 40, .sampling = 48, .eos = 104, .logprobs = 120, .grammar = 128, .think = 136, .tool_gate = 144, .cache = 152, .background = 176, .options_json = 184, .no_drafts = 200, .prompt_logprobs = 201 });
     try expectLayout(Logprob, 24, .{ .token = 0, .logprob = 4, .top = 8 });
     try expectLayout(Stats, 80, .{ .size = 0, .rounds = 8, .drafted = 16, .accepted = 24, .prefill_ns = 32, .decode_ns = 40, .spec_mode = 48, .telemetry_json = 64 });
-    try expectLayout(Event, 88, .{ .size = 0, .kind = 4, .cached = 8, .tokens = 16, .logprobs = 32, .reason = 48, .stats = 56, .verdict = 64 });
+    try expectLayout(Event, 160, .{ .size = 0, .kind = 4, .cached = 8, .tokens = 16, .logprobs = 32, .reason = 48, .stats = 56, .verdict = 64, .prompt_tokens = 88, .prompt_logprobs = 96, .constraint_at = 112, .constraint_offset = 116, .finish_details = 120, .loop_trim_start = 136, .refused_needed = 144, .refused_available = 152 });
     try expectLayout(Sink, 16, .{ .ctx = 0, .event = 8 });
     try expectLayout(Status, 32, .{ .size = 0, .running = 4, .waiting = 8, .decode_tps = 16, .prefill_tps = 24 });
     try expectLayout(Memory, 32, .{ .size = 0, .active = 8, .cache = 16, .peak = 24 });
-    try expectLayout(Engine, 152, .{ .size = 0, .version = 4, .probe = 8, .load_bytes = 16, .open = 24, .close = 32, .submit = 40, .cancel = 48, .step = 56, .status = 64, .memory = 72, .report_json = 80, .trim = 88, .media_rows = 96, .embed = 104, .decide = 112, .tokenize = 120, .token_bytes = 128, .chat_template = 136, .render = 144 });
+    try expectLayout(Admission, 48, .{ .size = 0, .context = 8, .pin_context = 16, .max_safe_context = 24, .cache_budget = 32, .admit = 40 });
+    try expectLayout(Bill, 48, .{ .size = 0, .needed = 8, .available = 16, .evictable = 24, .reclaimable = 32, .chunk = 40 });
+    try expectLayout(Engine, 160, .{ .size = 0, .version = 4, .probe = 8, .load_bytes = 16, .open = 24, .close = 32, .submit = 40, .cancel = 48, .step = 56, .status = 64, .memory = 72, .report_json = 80, .trim = 88, .media_rows = 96, .embed = 104, .decide = 112, .tokenize = 120, .token_bytes = 128, .chat_template = 136, .render = 144, .admission = 152 });
 }
 
 test "engine abi: every struct carrying `size` has it first, as a u32 defaulting to its own size" {
-    inline for (.{ Host, Open, Info, Grammar, Think, ToolGate, Request, Stats, Event, Status, Memory, Engine }) |T| {
+    inline for (.{ Host, Open, Info, Grammar, Think, ToolGate, Request, Stats, Event, Status, Memory, Engine, Admission, Bill }) |T| {
         try testing.expectEqual(@as(usize, 0), @offsetOf(T, "size"));
         try testing.expectEqual(u32, @FieldType(T, "size"));
         const d = @typeInfo(T).@"struct".field_attrs[0].defaultValue(u32) orelse return error.NoSizeDefault;

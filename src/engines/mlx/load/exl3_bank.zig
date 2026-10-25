@@ -1,7 +1,7 @@
 //! The legacy engine's EXL3 bank check: a loaded `MoeMlpWeights` against its config, through the EXL3 format.
 
 const exl3 = @import("../../../sdk/quant/exl3/format.zig");
-const ModelConfig = @import("../model.zig").ModelConfig;
+const ModelConfig = @import("../../../sdk/config/model.zig").ModelConfig;
 const MoeMlpWeights = @import("../../../sdk/blocks/moe/weights.zig").MoeMlpWeights;
 
 /// An EXL3 bank's suh/svh bind optionally beside the affine names, so their absence, a trellis the kernels cannot

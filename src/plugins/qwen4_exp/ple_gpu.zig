@@ -19,7 +19,7 @@ const PleGpuState = struct {
     /// table resident beside the weights, and the host gather faults in only the rows it reads.
     enabled: bool = false,
 };
-const pleGpu_shared = @import("../../sdk/util/shared.zig").Shared(PleGpuState, "ple_gpu", .{});
+pub const pleGpu_shared = @import("../../sdk/util/shared.zig").Shared(PleGpuState, "ple_gpu", .{});
 pub inline fn pleGpu() *PleGpuState {
     return pleGpu_shared.get();
 }
@@ -585,7 +585,7 @@ test "ple gpu wrap: the mapping outlives the table until MLX drops its last refe
 test "ple gpu: the real ngram table embeds bit-identical to the CPU gather past 4 GB offsets (QWEN4_TEST_MODEL)" {
     const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const model_mod = @import("../../engines/mlx/model.zig");
+    const model_mod = @import("../../sdk/config/model.zig");
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     const config = try model_mod.parseConfig(io, a, std.mem.span(model_dir));

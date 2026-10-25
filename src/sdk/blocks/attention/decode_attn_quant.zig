@@ -60,7 +60,7 @@ const CliState = struct {
     /// (headless included) sees one value.
     decode_attn_quant_flag: ?bool = null,
 };
-const cli_shared = @import("../../util/shared.zig").Shared(CliState, "decode_attn_quant_cli", .{});
+pub const cli_shared = @import("../../util/shared.zig").Shared(CliState, "decode_attn_quant_cli", .{});
 pub inline fn cli() *CliState {
     return cli_shared.get();
 }

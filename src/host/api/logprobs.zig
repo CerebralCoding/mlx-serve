@@ -2,8 +2,8 @@
 
 const std = @import("std");
 const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
-const generate_mod = @import("../../engines/mlx/generate.zig");
-const scheduler_mod = @import("../../engines/mlx/scheduler.zig");
+const request_mod = @import("../../sdk/request/request.zig");
+const Stream = @import("../engines/stream.zig").Stream;
 const Tokenizer = tokenizer_mod.Tokenizer;
 
 const jsonEscape = @import("format.zig").jsonEscape;
@@ -17,14 +17,14 @@ const jsonEscape = @import("format.zig").jsonEscape;
 /// shipped EXACTLY once: a delta cannot be retracted, so a re-send is as wrong
 /// as a drop.
 ///
-/// Entries are BORROWED from the slot, which owns each `top_logprobs`
-/// allocation and frees it in `Slot.deinit`. Nothing here frees them.
+/// Entries are BORROWED from the stream, which owns each `top_logprobs`
+/// allocation and frees it when it is released. Nothing here frees them.
 pub const StreamLogprobs = struct {
     allocator: std.mem.Allocator,
     tok: *const Tokenizer,
-    slot: ?*scheduler_mod.Slot,
+    stream: ?*Stream,
     enabled: bool,
-    /// High-water mark in the slot's buffer (what we have copied out).
+    /// High-water mark in the stream's buffer (what we have copied out).
     cursor: usize = 0,
     /// How many entries have already ridden a chunk.
     emitted: usize = 0,
@@ -41,7 +41,7 @@ pub const StreamLogprobs = struct {
     /// stream's own buffering, not a hold, so its token still counts.
     bytes_sent: usize = 0,
     carry: usize = 0,
-    entries: std.ArrayList(generate_mod.LogprobResult) = .empty,
+    entries: std.ArrayList(request_mod.LogprobResult) = .empty,
     /// The last rendered JSON, owned here and freed on the next drain — the
     /// caller passes it straight into a chunk and never sees the lifetime.
     rendered: ?[]const u8 = null,
@@ -124,8 +124,8 @@ pub const StreamLogprobs = struct {
             self.allocator.free(r);
             self.rendered = null;
         }
-        const slot = self.slot orelse return null;
-        self.cursor = try slot.copyLogprobsFrom(self.allocator, self.cursor, &self.entries);
+        const src = self.stream orelse return null;
+        self.cursor = try src.copyLogprobsFrom(self.allocator, self.cursor, &self.entries);
         // An id with no entry yet (or the reverse) is a partially published
         // token — hold it for the next chunk rather than shipping a half pair;
         // so is one whose bytes a stop-string hold has not released.
@@ -160,7 +160,7 @@ fn formatTokenLogprob(
     tok: *const Tokenizer,
     token_id: u32,
     logprob: f32,
-    top_logprobs: []const generate_mod.TokenLogprob,
+    top_logprobs: []const request_mod.TokenLogprob,
 ) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
@@ -235,7 +235,7 @@ pub fn formatCompletionsLogprobs(
     allocator: std.mem.Allocator,
     tok: *const Tokenizer,
     token_ids: []const u32,
-    logprobs: []const generate_mod.LogprobResult,
+    logprobs: []const request_mod.LogprobResult,
     /// Echo: the first token has no logprob (`null`), so `logprobs[i]` belongs to token i + 1.
     null_first: bool,
     offset_base: *usize,
@@ -356,7 +356,7 @@ pub fn formatLogprobsObject(
     allocator: std.mem.Allocator,
     tok: *const Tokenizer,
     token_ids: []const u32,
-    logprobs: []const generate_mod.LogprobResult,
+    logprobs: []const request_mod.LogprobResult,
 ) ![]const u8 {
     var content_buf = std.ArrayList(u8).empty;
     defer content_buf.deinit(allocator);
@@ -399,9 +399,9 @@ test "formatCompletionsLogprobs: an echoed prompt's first token carries null, th
     try tok.id_to_token.put(3, " is");
 
     const token_ids = [_]u32{ 1, 2, 3 };
-    var t1 = [_]generate_mod.TokenLogprob{.{ .token_id = 2, .logprob = -0.5 }};
-    var t2 = [_]generate_mod.TokenLogprob{.{ .token_id = 3, .logprob = -1.0 }};
-    const lps = [_]generate_mod.LogprobResult{
+    var t1 = [_]request_mod.TokenLogprob{.{ .token_id = 2, .logprob = -0.5 }};
+    var t2 = [_]request_mod.TokenLogprob{.{ .token_id = 3, .logprob = -1.0 }};
+    const lps = [_]request_mod.LogprobResult{
         .{ .token_logprob = -0.5, .top_logprobs = &t1 },
         .{ .token_logprob = -1.0, .top_logprobs = &t2 },
     };
@@ -441,13 +441,13 @@ test "formatCompletionsLogprobs: legacy shape, byte-aligned offsets, escaped tok
     try tok.id_to_token.put(4, "a\x01\"b");
 
     const token_ids = [_]u32{ 1, 2, 3 };
-    var t0 = [_]generate_mod.TokenLogprob{
+    var t0 = [_]request_mod.TokenLogprob{
         .{ .token_id = 1, .logprob = -0.25 },
         .{ .token_id = 4, .logprob = -3.5 },
     };
-    var t1 = [_]generate_mod.TokenLogprob{.{ .token_id = 2, .logprob = -0.5 }};
-    var t2 = [_]generate_mod.TokenLogprob{.{ .token_id = 3, .logprob = -1.0 }};
-    const lps = [_]generate_mod.LogprobResult{
+    var t1 = [_]request_mod.TokenLogprob{.{ .token_id = 2, .logprob = -0.5 }};
+    var t2 = [_]request_mod.TokenLogprob{.{ .token_id = 3, .logprob = -1.0 }};
+    const lps = [_]request_mod.LogprobResult{
         .{ .token_logprob = -0.25, .top_logprobs = &t0 },
         .{ .token_logprob = -0.5, .top_logprobs = &t1 },
         .{ .token_logprob = -1.0, .top_logprobs = &t2 },
@@ -516,7 +516,7 @@ test "logprobs token strings are valid UTF-8 — a split multi-byte token can't 
     try tok.id_to_token.put(3, "B");
     try tok.id_to_token.put(4, "CD");
 
-    var t0 = [_]generate_mod.TokenLogprob{
+    var t0 = [_]request_mod.TokenLogprob{
         .{ .token_id = 1, .logprob = -0.1 },
         .{ .token_id = 2, .logprob = -9.0 },
         .{ .token_id = 3, .logprob = -9.5 },
@@ -544,11 +544,11 @@ test "logprobs token strings are valid UTF-8 — a split multi-byte token can't 
     // candidate here: two would both render as U+FFFD and collide into a single
     // key. That collision is OpenAI's own shape reproduced faithfully, not a
     // defect this test should pin away.
-    var comp_top = [_]generate_mod.TokenLogprob{
+    var comp_top = [_]request_mod.TokenLogprob{
         .{ .token_id = 1, .logprob = -0.1 },
         .{ .token_id = 2, .logprob = -9.0 },
     };
-    const comp_lps = [_]generate_mod.LogprobResult{.{ .token_logprob = -0.1, .top_logprobs = &comp_top }};
+    const comp_lps = [_]request_mod.LogprobResult{.{ .token_logprob = -0.1, .top_logprobs = &comp_top }};
     var tbase: usize = 0;
     const comp_json = try formatCompletionsLogprobs(allocator, &tok, &token_ids, &comp_lps, false, &tbase);
     defer allocator.free(comp_json);
@@ -561,7 +561,7 @@ test "logprobs token strings are valid UTF-8 — a split multi-byte token can't 
 
     // Valid UTF-8 is untouched, including multi-byte that arrives whole.
     try tok.id_to_token.put(5, "é€");
-    const clean = try formatTokenLogprob(allocator, &tok, 5, -1.0, &[_]generate_mod.TokenLogprob{});
+    const clean = try formatTokenLogprob(allocator, &tok, 5, -1.0, &[_]request_mod.TokenLogprob{});
     defer allocator.free(clean);
     const clean_parsed = try std.json.parseFromSlice(std.json.Value, allocator, clean, .{});
     defer clean_parsed.deinit();

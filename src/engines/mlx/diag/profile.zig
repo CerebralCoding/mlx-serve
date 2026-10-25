@@ -56,7 +56,7 @@ const ProfileState = struct {
     decode_prof: DecodeProf = .{},
     decode_prof_enabled: ?bool = null,
 };
-const profileState_shared = @import("../../../sdk/util/shared.zig").Shared(ProfileState, "decode_profile", .{});
+pub const profileState_shared = @import("../../../sdk/util/shared.zig").Shared(ProfileState, "decode_profile", .{});
 pub inline fn profileState() *ProfileState {
     return profileState_shared.get();
 }

@@ -12,7 +12,7 @@ const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const tokenizer = @import("../../sdk/tokenizer/tokenizer.zig");
 const transformer_mod = @import("../../engines/mlx/transformer.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
+const model_mod = @import("../../sdk/config/model.zig");
 const qwen_audio = @import("audio_tower.zig");
 const Scope = @import("../../mlx/scope.zig").Scope;
 

@@ -10,12 +10,12 @@ const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const DrafterModel = drafter_mod.DrafterModel;
 const generate_mod = @import("../generate.zig");
-const GenerationResult = @import("result.zig").GenerationResult;
+const GenerationResult = @import("../../../sdk/request/result.zig").GenerationResult;
 const Generator = @import("generator.zig").Generator;
 const LogprobResult = @import("../sampling/logprobs.zig").LogprobResult;
 const MtpHeadRef = @import("../spec/mtp_head_ref.zig").MtpHeadRef;
 const SamplingParams = @import("../sampling/params.zig").SamplingParams;
-const isEosId = @import("stops.zig").isEosId;
+const isEosId = @import("../../../sdk/request/stops.zig").isEosId;
 
 
 /// Convenience: generate all tokens at once (non-streaming).

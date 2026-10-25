@@ -8,7 +8,7 @@ const mlx = @import("../../../mlx/ffi.zig");
 const crt = @import("../../../sdk/util/crt.zig");
 const io_util = @import("../../../sdk/util/io_util.zig");
 const log = @import("../../../sdk/util/log.zig");
-const model_mod = @import("../model.zig");
+const model_mod = @import("../../../sdk/config/model.zig");
 const status = @import("../../../host/status.zig");
 const Qwen4Trunk = @import("../../../plugins/qwen4_exp/trunk.zig").Trunk;
 const ForwardCtx = @import("../forward_ctx.zig").ForwardCtx;
@@ -598,7 +598,7 @@ const ClusterState = struct {
     /// The worker's compute time for its last step (µs), sent over the bell after each one.
     worker_us: std.atomic.Value(u32) = .init(0),
 };
-const cluster_shared = @import("../../../sdk/util/shared.zig").Shared(ClusterState, "cluster_state", .{});
+pub const cluster_shared = @import("../../../sdk/util/shared.zig").Shared(ClusterState, "cluster_state", .{});
 inline fn cluster() *ClusterState {
     return cluster_shared.get();
 }

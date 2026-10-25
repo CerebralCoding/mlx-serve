@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const model_mod = @import("../model.zig");
+const model_mod = @import("../../../sdk/config/model.zig");
 const log = @import("../../../sdk/util/log.zig");
 const prefix_cache_mod = @import("../cache/prefix_cache.zig");
 const scheduler_mod = @import("../scheduler.zig");
@@ -32,7 +32,7 @@ const retainedSsmCheckpointBytes = @import("bills.zig").retainedSsmCheckpointByt
 const sessionBytesPerToken = @import("bills.zig").sessionBytesPerToken;
 const perRequestPrefillChunkEnabled = @import("prefill_chunk.zig").perRequestPrefillChunkEnabled;
 
-pub const PREFIX_CACHE_MEM_DEFAULT: u64 = 2 * 1024 * 1024 * 1024;
+const PREFIX_CACHE_MEM_DEFAULT = http_server.PREFIX_CACHE_MEM_DEFAULT;
 
 /// The hot-cache ask when nobody named one: one session at the working context, never under
 /// 2 GB. Below one session the cache keeps only a prefix of the longest conversations, the
@@ -59,9 +59,9 @@ var hot_cache_mem_resolved = std.atomic.Value(u64).init(HOT_CACHE_MEM_UNRESOLVED
 
 /// The hot-cache byte budget every post-load reserve must bill: the clamp's answer once loaded, the raw ask before.
 pub fn resolvedPrefixCacheMem() u64 {
-    if (http_server.prefix_cache_capacity == 0 or !http_server.prefix_cache_ram_enabled) return 0;
+    if (http_server.launch().prefix_cache_capacity == 0 or !http_server.launch().prefix_cache_ram_enabled) return 0;
     const v = hot_cache_mem_resolved.load(.monotonic);
-    return if (v != HOT_CACHE_MEM_UNRESOLVED) v else http_server.prefix_cache_mem_bytes;
+    return if (v != HOT_CACHE_MEM_UNRESOLVED) v else http_server.launch().prefix_cache_mem_bytes;
 }
 
 /// Publish the clamp's answer (inference thread, end of a load); `clearResolvedPrefixCacheMem`
@@ -233,7 +233,7 @@ fn ssdFirstBudgetForLoad(
     quiet: bool,
 ) ?u64 {
     // The predicate, shared with the spill site: without a disk tier the mode's floor would be RAM the server cannot use.
-    if (http_server.prefix_cache_capacity == 0 or !prefix_cache_mod.ssdFirstActive(config, http_server.prefix_cache_disk_bytes > 0, http_server.prefix_cache_ram_enabled)) return null;
+    if (http_server.launch().prefix_cache_capacity == 0 or !prefix_cache_mod.ssdFirstActive(config, http_server.launch().prefix_cache_disk_bytes > 0, http_server.launch().prefix_cache_ram_enabled)) return null;
     const budget = ssdFirstPrefixCacheMem(
         requested,
         ceiling,
@@ -280,8 +280,8 @@ fn ungatedHotCacheAsk(config: *const model_mod.ModelConfig, requested: u64, expl
 }
 
 pub fn legacyPrefixCacheAsk() u64 {
-    if (http_server.prefix_cache_capacity == 0) return 0;
-    return http_server.prefix_cache_mem_bytes; // legacy_ask_read
+    if (http_server.launch().prefix_cache_capacity == 0) return 0;
+    return http_server.launch().prefix_cache_mem_bytes; // legacy_ask_read
 }
 
 /// The context the RAM-first clamp bills, through the one shared pure resolver.
@@ -315,7 +315,7 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
         // `statePerTokenBilled` is 0 off qwen4_exp.
         const ctx_kv: u64 = (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config)) *|
             getEffectiveContextLength(config) +| slotFixedKvBytes(config, kv_bits, chunk);
-        const ask = ungatedHotCacheAsk(config, requested, http_server.prefix_cache_mem_explicit, kv_bits, getEffectiveContextLength(config), chunk);
+        const ask = ungatedHotCacheAsk(config, requested, http_server.launch().prefix_cache_mem_explicit, kv_bits, getEffectiveContextLength(config), chunk);
         const clamped = clampedPrefixCacheMem(
             ask,
             currentGpuMemoryCeiling(config, active_mem),
@@ -348,7 +348,7 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
     const pinned: u32 = pinPrefillChunk(config);
     // Not `getEffectiveContextLength`: still a placeholder on an auto boot.
     const ctx_tokens = ramFirstContextForLoad(config, kv_bits, active_mem, pinned);
-    const ask = defaultPrefixCacheAsk(requested, http_server.prefix_cache_mem_explicit, oneSessionEntryBytes(config, kv_bits, ctx_tokens, pinned));
+    const ask = defaultPrefixCacheAsk(requested, http_server.launch().prefix_cache_mem_explicit, oneSessionEntryBytes(config, kv_bits, ctx_tokens, pinned));
     // Static ceiling, not the live one: the budget must be reproducible boot to boot.
     const plan = planHotCache(
         config,
@@ -411,7 +411,7 @@ test "prefix cache default capacity covers interleaved agent flows" {
     // interleaved request evicted the long system-prompt prefix and forced a
     // full re-prefill per turn. The byte budget (prefix_cache_mem_bytes)
     // still bounds memory.
-    try testing.expect(http_server.prefix_cache_capacity >= 4);
+    try testing.expect(http_server.launch().prefix_cache_capacity >= 4);
     try testing.expect(resolvedPrefixCacheMem() > 0);
 }
 
@@ -500,25 +500,25 @@ test "the published hot-cache budget is retired when the cache is dropped" {
     try t.expectEqual(@as(u64, 4096), resolvedPrefixCacheMem());
     clearResolvedPrefixCacheMem();
     // Back to the ask, the honest pre-load answer.
-    try t.expectEqual(http_server.prefix_cache_mem_bytes, resolvedPrefixCacheMem());
+    try t.expectEqual(http_server.launch().prefix_cache_mem_bytes, resolvedPrefixCacheMem());
 
     // A resolved zero is a real budget (`--prefix-cache-mem 0` under SSD-first); the sentinel is maxInt.
     publishResolvedPrefixCacheMem(0);
     try t.expectEqual(@as(u64, 0), resolvedPrefixCacheMem());
     clearResolvedPrefixCacheMem();
-    try t.expectEqual(http_server.prefix_cache_mem_bytes, resolvedPrefixCacheMem());
+    try t.expectEqual(http_server.launch().prefix_cache_mem_bytes, resolvedPrefixCacheMem());
 }
 
 test "resolvedPrefixCacheMem: RAM-off bills zero despite a configured disk tier" {
-    const capacity = http_server.prefix_cache_capacity;
-    const ram = http_server.prefix_cache_ram_enabled;
-    defer http_server.prefix_cache_capacity = capacity;
-    defer http_server.prefix_cache_ram_enabled = ram;
-    http_server.prefix_cache_capacity = 8;
-    http_server.prefix_cache_ram_enabled = false;
+    const capacity = http_server.launch().prefix_cache_capacity;
+    const ram = http_server.launch().prefix_cache_ram_enabled;
+    defer http_server.launch().prefix_cache_capacity = capacity;
+    defer http_server.launch().prefix_cache_ram_enabled = ram;
+    http_server.launch().prefix_cache_capacity = 8;
+    http_server.launch().prefix_cache_ram_enabled = false;
     try testing.expectEqual(@as(u64, 0), resolvedPrefixCacheMem());
-    http_server.prefix_cache_ram_enabled = true;
-    http_server.prefix_cache_capacity = 0;
+    http_server.launch().prefix_cache_ram_enabled = true;
+    http_server.launch().prefix_cache_capacity = 0;
     try testing.expectEqual(@as(u64, 0), resolvedPrefixCacheMem());
 }
 
@@ -562,10 +562,10 @@ test "oneSessionEntryBytes: a cached session is billed with its SSM checkpoints"
 }
 
 test "disabled prefix cache: sizing releases the cache reserve on every arch" {
-    const saved_capacity = http_server.prefix_cache_capacity;
-    const saved_ask = http_server.prefix_cache_mem_bytes;
-    defer http_server.prefix_cache_capacity = saved_capacity;
-    defer http_server.prefix_cache_mem_bytes = saved_ask;
+    const saved_capacity = http_server.launch().prefix_cache_capacity;
+    const saved_ask = http_server.launch().prefix_cache_mem_bytes;
+    defer http_server.launch().prefix_cache_capacity = saved_capacity;
+    defer http_server.launch().prefix_cache_mem_bytes = saved_ask;
 
     var gated = longCtxTestConfig();
     var other = longCtxTestConfig();
@@ -573,17 +573,17 @@ test "disabled prefix cache: sizing releases the cache reserve on every arch" {
     other.legacy.caps.long_ctx = std.mem.eql(u8, other.model_type, "qwen4_exp");
     const configs = [_]*model_mod.ModelConfig{ &gated, &other };
     for ([_]u64{ 0, 2 << 30, 60 << 30 }) |ask| {
-        http_server.prefix_cache_mem_bytes = ask;
-        http_server.prefix_cache_capacity = 0;
+        http_server.launch().prefix_cache_mem_bytes = ask;
+        http_server.launch().prefix_cache_capacity = 0;
         for (configs) |cfg| {
             try testing.expectEqual(@as(u64, 0), ctxSizingCacheReserve(cfg));
         }
         try testing.expectEqual(@as(u64, 0), legacyPrefixCacheAsk());
         try testing.expectEqual(@as(u64, 0), resolvedPrefixCacheMem());
     }
-    http_server.prefix_cache_capacity = 32;
-    http_server.prefix_cache_mem_bytes = 10 << 30;
+    http_server.launch().prefix_cache_capacity = 32;
+    http_server.launch().prefix_cache_mem_bytes = 10 << 30;
     try testing.expectEqual(CTX_SIZING_CACHE_RESERVE, ctxSizingCacheReserve(&gated));
-    try testing.expectEqual(http_server.prefix_cache_mem_bytes, ctxSizingCacheReserve(&other));
-    try testing.expectEqual(http_server.prefix_cache_mem_bytes, legacyPrefixCacheAsk());
+    try testing.expectEqual(http_server.launch().prefix_cache_mem_bytes, ctxSizingCacheReserve(&other));
+    try testing.expectEqual(http_server.launch().prefix_cache_mem_bytes, legacyPrefixCacheAsk());
 }

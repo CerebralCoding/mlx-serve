@@ -1,24 +1,24 @@
 //! Load, eviction and unload requests serviced on the inference thread.
 
 const std = @import("std");
-const mlx = @import("../../mlx/ffi.zig");
-const model_registry_mod = @import("../registry/registry.zig");
-const log = @import("../../sdk/util/log.zig");
-const io_util = @import("../../sdk/util/io_util.zig");
+const mlx = @import("../../../mlx/ffi.zig");
+const model_registry_mod = @import("../../../host/registry/registry.zig");
+const log = @import("../../../sdk/util/log.zig");
+const io_util = @import("../../../sdk/util/io_util.zig");
 const LoadedModel = model_registry_mod.LoadedModel;
 
-const aneWanted = @import("../engines/served.zig").aneWanted;
-const engines_load = @import("../engines/load.zig");
-const moveHotCacheViewOff = @import("../../engines/mlx/cache/budget.zig").moveHotCacheViewOff;
-const publishHotCacheResidency = @import("../../engines/mlx/cache/budget.zig").publishHotCacheResidency;
-const doLoadOnInferenceThread = @import("../../engines/mlx/load.zig").doLoadOnInferenceThread;
-const loadErrorName = @import("../media_jobs/plugin/engine.zig").loadErrorName;
-const Scheduler = @import("../../engines/mlx/scheduler.zig").Scheduler;
-const LoadRequest = @import("requests.zig").LoadRequest;
-const UnloadRequest = @import("requests.zig").UnloadRequest;
-const loadRamRoom = @import("../registry/preflight.zig").loadRamRoom;
-const loadRequirementBytes = @import("../registry/preflight.zig").loadRequirementBytes;
-const scheduler_mod = @import("../../engines/mlx/scheduler.zig");
+const aneWanted = @import("../../../host/engines/served.zig").aneWanted;
+const engines_load = @import("engine_load.zig");
+const moveHotCacheViewOff = scheduler_mod.moveHotCacheViewOff;
+const publishHotCacheResidency = scheduler_mod.publishHotCacheResidency;
+const doLoadOnInferenceThread = @import("../load.zig").doLoadOnInferenceThread;
+const loadErrorName = @import("../../../host/media_jobs/plugin/engine.zig").loadErrorName;
+const Scheduler = @import("../scheduler.zig").Scheduler;
+const LoadRequest = @import("../../../host/gpu_thread/requests.zig").LoadRequest;
+const UnloadRequest = @import("../../../host/gpu_thread/requests.zig").UnloadRequest;
+const loadRamRoom = @import("preflight.zig").loadRamRoom;
+const loadRequirementBytes = @import("preflight.zig").loadRequirementBytes;
+const scheduler_mod = @import("../scheduler.zig");
 
 /// Plan 05 Phase D: service a cold-load work item on the inference thread.
 /// Conn thread has already:

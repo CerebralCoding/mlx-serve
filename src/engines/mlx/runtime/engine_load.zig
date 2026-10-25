@@ -2,26 +2,26 @@
 //! installed on. GGUFs open on the inference thread; a Neural Engine build may run on a thread of its own.
 
 const std = @import("std");
-const abi = @import("../../abi/engine.zig");
-const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
-const tokenize_cache_mod = @import("../tokenizer/cache.zig");
-const generate_mod = @import("../../engines/mlx/generate.zig");
-const dflash_mod = @import("../../engines/mlx/spec/dflash/dflash.zig");
-const log = @import("../../sdk/util/log.zig");
-const served_mod = @import("served.zig");
+const abi = @import("../../../abi/engine.zig");
+const tokenizer_mod = @import("../../../sdk/tokenizer/tokenizer.zig");
+const tokenize_cache_mod = @import("../../../host/tokenizer/cache.zig");
+const generate_mod = @import("../generate.zig");
+const dflash_mod = @import("../spec/dflash/dflash.zig");
+const log = @import("../../../sdk/util/log.zig");
+const served_mod = @import("../../../host/engines/served.zig");
 const Served = served_mod.Served;
 const Kind = served_mod.Kind;
-const GgufRoute = @import("../gpu_thread/thread.zig").GgufRoute;
-const Scheduler = @import("../../engines/mlx/scheduler.zig").Scheduler;
-const scheduler_mod = @import("../../engines/mlx/scheduler.zig");
-const publishHotCacheResidency = @import("../../engines/mlx/cache/budget.zig").publishHotCacheResidency;
-const makeRoomInRam = @import("../gpu_thread/load_requests.zig").makeRoomInRam;
-const drafterFor = @import("../registry/cold_load.zig").drafterFor;
-const availForLoad = @import("../registry/preflight.zig").availForLoad;
-const memInsufficientForLoad = @import("../registry/preflight.zig").memInsufficientForLoad;
-const loadRequirementBytes = @import("../registry/preflight.zig").loadRequirementBytes;
-const ds4_load = @import("../../engines/ds4/load.zig");
-const AneSettings = @import("../../engines/ane/engine.zig").Settings;
+const GgufRoute = @import("thread.zig").GgufRoute;
+const Scheduler = @import("../scheduler.zig").Scheduler;
+const scheduler_mod = @import("../scheduler.zig");
+const publishHotCacheResidency = scheduler_mod.publishHotCacheResidency;
+const makeRoomInRam = @import("load_requests.zig").makeRoomInRam;
+const drafterFor = @import("cold_load.zig").drafterFor;
+const availForLoad = @import("preflight.zig").availForLoad;
+const memInsufficientForLoad = @import("preflight.zig").memInsufficientForLoad;
+const loadRequirementBytes = @import("preflight.zig").loadRequirementBytes;
+const ds4_load = @import("../../ds4/load.zig");
+const AneSettings = @import("../../ane/engine.zig").Settings;
 
 /// A GGUF on ds4 or llama.cpp: open, install, ready. The stub config's context is the one asked for; the engine's
 /// answer replaces it.

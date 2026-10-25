@@ -17,11 +17,11 @@ const log = @import("../../sdk/util/log.zig");
 const gguf_meta = @import("../../sdk/quant/gguf/engine_pick.zig");
 // Only the pure JSON contract predicate is referenced — lazy analysis keeps
 // dflash.zig's mlx FFI out of this filesystem-only module.
-const dflash = @import("../../engines/mlx/spec/dflash/dflash.zig");
+const dflash = @import("../../sdk/spec/dflash_contract.zig");
 const mtp = @import("../../sdk/spec/mtp/mtp.zig");
 const served_media = @import("../media_jobs/plugin/served.zig");
 const modality = @import("modality.zig");
-const served_plugin = @import("../../engines/mlx/plugin/config.zig");
+const mlx_engine = @import("../engines/mlx.zig");
 const outside_plugins = @import("../plugins/loader.zig");
 const pack_dir = @import("pack_dir.zig");
 const FsPackDir = pack_dir.FsPackDir;
@@ -924,7 +924,7 @@ pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_
 }
 
 /// A served pack's facts come from its plugin's stub parse, not this file's reading of config.json.
-fn applyServedStub(meta: *StubMeta, st: served_plugin.Stub) void {
+fn applyServedStub(meta: *StubMeta, st: mlx_engine.PluginStub) void {
     meta.vocab_size = st.shell.vocab_size;
     meta.hidden_size = st.shell.hidden_size;
     meta.num_hidden_layers = st.shell.num_hidden_layers;
@@ -958,7 +958,7 @@ pub fn readStubMeta(io: std.Io, allocator: std.mem.Allocator, abs_path: []const 
 
     const sniff = sniffChatTemplate(io, allocator, dir);
     var meta = parseStubMeta(allocator, bytes, sniff.present);
-    if (served_plugin.stubOf(io, allocator, trimmed, bytes)) |st| applyServedStub(&meta, st);
+    if (mlx_engine.api().plugin_stub(io, allocator, trimmed, bytes)) |st| applyServedStub(&meta, st);
     meta.has_thinking = meta.has_chat and sniff.thinking;
     meta.has_mtp = mtp.dirAdvertisesMtp(io, allocator, dir);
     // A sentence-transformers pooling sidecar marks embedding capability even

@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
-const generate_mod = @import("../../engines/mlx/generate.zig");
+const request_mod = @import("../../sdk/request/request.zig");
 const chat_mod = @import("../chat/chat.zig");
 const log = @import("../../sdk/util/log.zig");
 const responses_mod = @import("responses/model.zig");
@@ -159,8 +159,8 @@ pub fn formatTimingsObject(
     // prompt_per_second reflects compute: divide by the tokens actually run
     // (prompt minus the KV-cache prefix). `cached_n` exposes the reuse so a
     // bench / client can tell a warm hit from a cold prefill.
-    const p_tps = generate_mod.prefillTokensPerSec(prompt_tokens, cached_tokens, prefill_ns);
-    const d_tps = generate_mod.tokensPerSec(completion_tokens, decode_ns);
+    const p_tps = request_mod.prefillTokensPerSec(prompt_tokens, cached_tokens, prefill_ns);
+    const d_tps = request_mod.tokensPerSec(completion_tokens, decode_ns);
     // Always emit `tokenize_ms` (even at 0.0) so clients can rely on the key
     // being present — they can branch on the value, not on presence/absence.
     return try std.fmt.allocPrint(
@@ -184,8 +184,8 @@ pub fn formatPerfBracket(
     prefill_ns: u64,
     decode_ns: u64,
 ) []const u8 {
-    const p_tps = generate_mod.prefillTokensPerSec(prompt_tokens, cached_tokens, prefill_ns);
-    const d_tps = generate_mod.tokensPerSec(completion_tokens, decode_ns);
+    const p_tps = request_mod.prefillTokensPerSec(prompt_tokens, cached_tokens, prefill_ns);
+    const d_tps = request_mod.tokensPerSec(completion_tokens, decode_ns);
     const s = if (cached_tokens > 0)
         std.fmt.bufPrint(buf, "prefill: {d:.1} tok/s ({d} cached / {d} total), decode: {d:.1} tok/s", .{ p_tps, cached_tokens, prompt_tokens, d_tps })
     else

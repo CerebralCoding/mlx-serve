@@ -11,7 +11,7 @@ const std = @import("std");
 const env = @import("../../env.zig");
 const build_options = @import("build_options");
 const abi = @import("../../abi/engine.zig");
-const model_mod = @import("../mlx/model.zig");
+const model_mod = @import("../../sdk/config/model.zig");
 const book_mod = @import("../own_thread/book.zig");
 const logits = @import("../own_thread/logits.zig");
 const lm = @import("lm.zig");
@@ -24,7 +24,7 @@ const io = book_mod.io;
 /// The table the host loads for the Neural Engine.
 pub const table = Adapter(lm, std.heap.smp_allocator).table;
 
-/// What shapes a load, resolved by the host (`host/engines/load.zig`).
+/// What shapes a load, resolved by the host (`engines/mlx/runtime/engine_load.zig`).
 pub const Settings = struct {
     slots: u32 = 1,
     /// The DFlash2 drafter's dir; null decodes one token per call.

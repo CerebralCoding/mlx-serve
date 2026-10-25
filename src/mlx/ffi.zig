@@ -1237,7 +1237,7 @@ const LatchState = struct {
     mlx_error_mtx: os_mutex.Mutex = .{},
     gpu_context_lost: std.atomic.Value(bool) = .init(false),
 };
-const latch_shared = @import("../sdk/util/shared.zig").Shared(LatchState, "mlx_error_latch", .{});
+pub const latch_shared = @import("../sdk/util/shared.zig").Shared(LatchState, "mlx_error_latch", .{});
 inline fn latch() *LatchState {
     return latch_shared.get();
 }

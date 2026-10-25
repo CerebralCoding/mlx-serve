@@ -1,7 +1,7 @@
 //! Hot-cache budgets, residency publishing, SSD flush and shutdown persistence.
 
 const std = @import("std");
-const model_mod = @import("../model.zig");
+const model_mod = @import("../../../sdk/config/model.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const metrics_mod = @import("../../../host/metrics/metrics.zig");
 const model_registry_mod = @import("../../../host/registry/registry.zig");
@@ -14,7 +14,7 @@ const testing = std.testing;
 
 const Scheduler = @import("../scheduler.zig").Scheduler;
 const Slot = @import("../slot.zig").Slot;
-const drainSideQueues = @import("../../../host/gpu_thread/loop.zig").drainSideQueues;
+const drainSideQueues = @import("../runtime/loop.zig").drainSideQueues;
 
 /// Republish the hot cache's residency for the connection thread's admission guard.
 /// Called from the inference thread after a commit, eviction, invalidation or model switch.
@@ -22,7 +22,7 @@ pub const BUDGET_REVISE_WINDOW_NS: u64 = 10 * std.time.ns_per_s;
 
 /// How a budget resolve differs from the load-time one: the cache's own resident bytes
 /// are excluded from the machine read, and the resolver keeps quiet (`setBudget` logs).
-pub const BudgetRevise = struct { exclude_bytes: u64 = 0, quiet: bool = false };
+pub const BudgetRevise = @import("../../../host/gpu_thread/scheduler.zig").BudgetRevise;
 
 /// Re-clamp every resident model's hot-cache budget after residency changed (#364): the
 /// load-time clamp read the machine with the other models on it and was never revisited, so
@@ -41,7 +41,7 @@ pub fn reviseHotCacheBudgets(sch: *Scheduler, grow_only: bool) void {
             const entry = entry_ptr.*;
             if ((entry == sch.current_model) != current_pass) continue;
             if (entry.state != .ready) continue;
-            const hc = if (entry.prefix_cache) |*h| h else continue;
+            const hc = if (entry.prefix_cache) |h| h else continue;
             if (!hc.ram_enabled) continue;
             const config = entry.config orelse continue;
             var idle: u64 = 0;
@@ -76,7 +76,7 @@ fn moduleStateBytes(sch: *Scheduler) u64 {
 /// another resident chat model's, the default's when it has one, or to none.
 pub fn moveHotCacheViewOff(sch: *Scheduler, leaving: *LoadedModel) void {
     const view = sch.hot_prefix_cache orelse return;
-    if (leaving.prefix_cache == null or view != &leaving.prefix_cache.?) return;
+    if (leaving.prefix_cache == null or view != leaving.prefix_cache.?) return;
     sch.hot_prefix_cache = null;
     sch.registry.mutex.lockUncancelable(sch.io);
     defer sch.registry.mutex.unlock(sch.io);
@@ -84,7 +84,7 @@ pub fn moveHotCacheViewOff(sch: *Scheduler, leaving: *LoadedModel) void {
     while (it.next()) |entry_ptr| {
         const entry = entry_ptr.*;
         if (entry == leaving or entry.state != .ready or !ModelRegistry.chatCapable(entry)) continue;
-        const hc = if (entry.prefix_cache) |*h| h else continue;
+        const hc = if (entry.prefix_cache) |h| h else continue;
         sch.hot_prefix_cache = hc;
         if (std.mem.eql(u8, sch.registry.default_id, entry.id)) break;
     }
@@ -111,7 +111,7 @@ fn publishCachedSessions(sch: *Scheduler) void {
         outer: while (it.next()) |entry_ptr| {
             const entry = entry_ptr.*;
             if (entry.state != .ready) continue;
-            const hc = if (entry.prefix_cache) |*h| h else continue;
+            const hc = if (entry.prefix_cache) |h| h else continue;
             for (hc.entries.items) |*e| {
                 if (n == rows.len) break :outer;
                 const len: u32 = @intCast(@min(e.tokens.len, std.math.maxInt(u32)));
@@ -186,7 +186,7 @@ fn diskCaches(sch: *Scheduler, out: []prefix_cache_mod.FlushTarget, owed_only: b
         if (n == out.len) break;
         const entry = entry_ptr.*;
         if (entry.state != .ready) continue;
-        const hc = if (entry.prefix_cache) |*h| h else continue;
+        const hc = if (entry.prefix_cache) |h| h else continue;
         if (hc.disk == null or (owed_only and !hc.disk_dirty)) continue;
         const xf = entry.transformer orelse continue;
         out[n] = .{ .hc = hc, .s = xf.s };
@@ -221,25 +221,9 @@ pub fn persistAtShutdown(sch: *Scheduler) void {
     });
 }
 
-/// Arm the shutdown flush's deadline `secs` after the first call; a later call (a second
-/// SIGTERM) never moves it. 0 seconds leaves it unarmed, which turns the flush off.
-pub fn armShutdownDeadline(slot: *std.atomic.Value(i64), now_ms: i64, secs: u32) void {
-    if (secs == 0) return;
-    _ = slot.cmpxchgStrong(0, now_ms + @as(i64, secs) * 1000, .acq_rel, .acquire);
-}
+pub const armShutdownDeadline = @import("../../../host/http/server.zig").armShutdownDeadline;
 
 // ── tests ──
-
-test "armShutdownDeadline: the first SIGTERM sets the deadline and a second never moves it" {
-    var slot = std.atomic.Value(i64).init(0);
-    armShutdownDeadline(&slot, 5_000, 45);
-    try testing.expectEqual(@as(i64, 50_000), slot.load(.acquire));
-    armShutdownDeadline(&slot, 9_000, 45);
-    try testing.expectEqual(@as(i64, 50_000), slot.load(.acquire));
-    var off = std.atomic.Value(i64).init(0);
-    armShutdownDeadline(&off, 5_000, 0);
-    try testing.expectEqual(@as(i64, 0), off.load(.acquire));
-}
 
 test "a parked inference thread keeps the Mac awake only while Neural Engine requests run" {
     var sch: Scheduler = undefined;
@@ -268,7 +252,7 @@ test "hot-cache view: a model's cache leaving takes the view with it, to the def
     for ([_]*LoadedModel{ a, b, c, tts }) |e| {
         e.config = &chat_cfg;
         e.state = .ready;
-        e.prefix_cache = prefix_cache_mod.HotPrefixCache.init(testing.allocator, 4);
+        e.prefix_cache = try testHotCache();
     }
     tts.config = &tts_cfg;
     reg.default_id = "c";
@@ -277,17 +261,24 @@ test "hot-cache view: a model's cache leaving takes the view with it, to the def
     sch.io = reg.io;
 
     // Another model leaving does not touch the view.
-    sch.hot_prefix_cache = &a.prefix_cache.?;
+    sch.hot_prefix_cache = a.prefix_cache.?;
     moveHotCacheViewOff(&sch, b);
-    try testing.expectEqual(@as(?*prefix_cache_mod.HotPrefixCache, &a.prefix_cache.?), sch.hot_prefix_cache);
+    try testing.expectEqual(@as(?*prefix_cache_mod.HotPrefixCache, a.prefix_cache.?), sch.hot_prefix_cache);
     // The owner leaving hands it to the default chat model, never to a media model.
     moveHotCacheViewOff(&sch, a);
-    try testing.expectEqual(@as(?*prefix_cache_mod.HotPrefixCache, &c.prefix_cache.?), sch.hot_prefix_cache);
+    try testing.expectEqual(@as(?*prefix_cache_mod.HotPrefixCache, c.prefix_cache.?), sch.hot_prefix_cache);
     // With no other chat model resident, the view is dropped, never left on a freed cache.
     b.state = .unloaded;
     a.state = .unloaded;
     moveHotCacheViewOff(&sch, c);
     try testing.expectEqual(@as(?*prefix_cache_mod.HotPrefixCache, null), sch.hot_prefix_cache);
+}
+
+/// A heap cache the registry's teardown frees, as a load allocates one.
+fn testHotCache() !*prefix_cache_mod.HotPrefixCache {
+    const hc = try testing.allocator.create(prefix_cache_mod.HotPrefixCache);
+    hc.* = prefix_cache_mod.HotPrefixCache.init(testing.allocator, 4);
+    return hc;
 }
 
 fn budget200Mb(_: *model_mod.ModelConfig, _: u64, _: BudgetRevise, idle: *u64) u64 {
@@ -304,8 +295,8 @@ test "hot-cache view: a revise that follows an unload raises a budget but never 
     defer m.config = null;
     m.config = &cfg;
     m.state = .ready;
-    m.prefix_cache = prefix_cache_mod.HotPrefixCache.init(testing.allocator, 4);
-    const hc = &m.prefix_cache.?;
+    m.prefix_cache = try testHotCache();
+    const hc = m.prefix_cache.?;
     var sch: Scheduler = undefined;
     sch.registry = reg;
     sch.io = reg.io;

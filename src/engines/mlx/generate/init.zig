@@ -9,7 +9,7 @@ const tokenizer_mod = @import("../../../sdk/tokenizer/tokenizer.zig");
 const log = @import("../../../sdk/util/log.zig");
 const io_util = @import("../../../sdk/util/io_util.zig");
 const mtp_mod = @import("../../../sdk/spec/mtp/mtp.zig");
-const mtp_acceptance = @import("../spec/mtp_acceptance.zig");
+const mtp_acceptance = @import("../../../sdk/spec/mtp_acceptance.zig");
 const round_cost = @import("../spec/round_cost.zig");
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -240,7 +240,7 @@ pub fn initWithOptions(
     // 255K ctx otherwise). nextChunkEnd already shortens a chunk to land
     // on stride boundaries, so a capped chunk stays compatible.
     const ssm_cp_stride: usize = if (want_ssm_cp)
-        effectiveSsmCheckpointStride(@intCast(options.ssm_checkpoint_stride), @max(PREFILL_CHUNK, generate_mod.prefill_chunk_override))
+        effectiveSsmCheckpointStride(@intCast(options.ssm_checkpoint_stride), @max(PREFILL_CHUNK, generate_mod.prefillCli().override))
     else
         0;
     // Absolute KV position of `prompt_ids[0]`. Warm-path callers (the

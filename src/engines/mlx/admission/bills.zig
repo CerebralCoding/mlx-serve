@@ -4,7 +4,7 @@
 const std = @import("std");
 const transformer_mod = @import("../transformer.zig");
 const generate_mod = @import("../generate.zig");
-const model_mod = @import("../model.zig");
+const model_mod = @import("../../../sdk/config/model.zig");
 const ane_mod = @import("../../../sdk/ane/offload.zig");
 const http_server = @import("../../../host/http/server.zig");
 
@@ -157,7 +157,7 @@ pub fn expertBankFillRows(config: *const model_mod.ModelConfig) u32 {
     const manual: u64 = http_server.manualContext(config);
     const ctx: u64 = if (manual > 0) manual else 16_384 + 1_024;
     const chunk: u64 = generate_mod.WIDE_PREFILL_CHUNK;
-    const reserve = @import("../../../host/registry/preflight.zig").modelDiskBytes(io, dir) +| (one - per_row) +|
+    const reserve = @import("../runtime/preflight.zig").modelDiskBytes(io, dir) +| (one - per_row) +|
         sessionBytesPerToken(config, kv_bits) *| ctx +| slotFixedKvBytes(config, kv_bits, chunk) +|
         prefillTransientReserve(config, kv_bits, chunk) +| http_server.serverState().wired_limit_margin_bytes;
     const rows = (http_server.staticGpuMemoryCeiling() -| reserve) / @max(per_row, 1);
@@ -337,21 +337,6 @@ pub fn prefillFfnWidth(config: *const model_mod.ModelConfig) u64 {
     return if (w > 0) w else config.intermediate_size;
 }
 
-/// Whether the MLX-prefill attention-memory preflight applies to a request.
-/// The guard (`checkAttentionMemory`/`prefillMemoryNeeded`) models the MLX
-/// transformer's per-token working set. The embedded ds4 (DeepSeek-V4-Flash)
-/// and llama.cpp engines NEVER take that path — they own their KV *outside*
-/// MLX — so the estimate is pure fiction for them. Their stub `ModelConfig`
-/// still advertises head/layer counts (ds4: 56 heads, 61 layers, hidden 7168),
-/// so without this early-out the guard projected ~25 GB for an 8.6K-token ds4
-/// prompt and 400-rejected it — a prompt the SAME server had just served on the
-/// MLX qwen35 engine one model-switch earlier (live, pi + ds4). Skip
-/// the memory guard whenever an embedded engine will serve; the context-length
-/// guard still bounds the prompt against ds4's own session ctx.
-pub fn mlxMemoryGuardApplies(engine_backed: bool) bool {
-    return !engine_backed;
-}
-
 /// Estimate peak GPU memory for prefill and reject if it would exceed the Metal
 /// working-set ceiling. Exceeding it throws an uncatchable C++ exception on a
 /// Metal completion-handler thread and kills the process, so PREVENTION is the
@@ -385,10 +370,10 @@ pub fn reservedCacheTokens(seq: u64, max_tokens: u64, chunk: u64, ctx: u64) u64 
 /// checkpoints are already resident and merged, never re-allocated).
 pub fn retainedSsmCheckpointBytes(config: *const model_mod.ModelConfig, seq: u64, matched: u64, chunk: u64) u64 {
     const per_cp = config.ssmCheckpointBytes();
-    if (per_cp == 0 or http_server.ssm_checkpoint_stride == 0) return 0;
+    if (per_cp == 0 or http_server.launch().ssm_checkpoint_stride == 0) return 0;
     const stride: u64 = generate_mod.effectiveSsmCheckpointStride(
-        http_server.ssm_checkpoint_stride,
-        @max(@as(usize, @intCast(chunk)), generate_mod.prefill_chunk_override),
+        http_server.launch().ssm_checkpoint_stride,
+        @max(@as(usize, @intCast(chunk)), generate_mod.prefillCli().override),
     );
     if (stride == 0) return 0;
     // Stride-aligned capture positions in `(matched, seq]` plus the always-on end-of-prompt
@@ -396,7 +381,7 @@ pub fn retainedSsmCheckpointBytes(config: *const model_mod.ModelConfig, seq: u64
     const span: u64 = seq -| @min(matched, seq);
     var n: u64 = seq / stride -| @min(matched, seq) / stride;
     if (span > generate_mod.SSM_SNAPSHOT_BACKOFF) n += 1;
-    if (http_server.ssm_checkpoint_max > 0) n = @min(n, http_server.ssm_checkpoint_max);
+    if (http_server.launch().ssm_checkpoint_max > 0) n = @min(n, http_server.launch().ssm_checkpoint_max);
     return n * per_cp;
 }
 

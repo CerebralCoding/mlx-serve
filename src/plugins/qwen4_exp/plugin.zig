@@ -6,7 +6,7 @@ const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 const mlx = @import("../../mlx/ffi.zig");
-const model = @import("../../engines/mlx/model.zig");
+const model = @import("../../sdk/config/model.zig");
 const engine_cache_ops = @import("../../engines/mlx/kv/cache_ops.zig");
 const ForwardCtx = @import("../../engines/mlx/forward_ctx.zig").ForwardCtx;
 const CaptureLayers = @import("../../engines/mlx/forward_ctx.zig").CaptureLayers;
@@ -49,7 +49,7 @@ pub const table = abi.ModelTable{
 pub fn engineCtx() *?*const ForwardCtx {
     return EngineCtx.get();
 }
-const EngineCtx = @import("../../sdk/util/shared.zig").SharedThreadLocal(?*const ForwardCtx, "qwen4_engine_ctx", null);
+pub const EngineCtx = @import("../../sdk/util/shared.zig").SharedThreadLocal(?*const ForwardCtx, "qwen4_engine_ctx", null);
 
 const Verdict = abi.Verdict;
 const Array = mlx.mlx_array;

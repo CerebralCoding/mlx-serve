@@ -109,7 +109,7 @@ const MemoryState = struct {
     /// keeps it current; a plugin's absolute footprint bounds rise by it.
     foreign_bytes: std.atomic.Value(u64) = .init(0),
 };
-const memoryState_shared = @import("mlx_host").shared.Shared(MemoryState, "streamed_memory", .{});
+pub const memoryState_shared = @import("mlx_host").shared.Shared(MemoryState, "streamed_memory", .{});
 inline fn memoryState() *MemoryState {
     return memoryState_shared.get();
 }

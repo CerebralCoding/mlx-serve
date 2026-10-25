@@ -2383,7 +2383,7 @@ test "KV history: positions [a, b) out and back across tiles and padded rows, th
 
 // ── gated: a real pack on the Neural Engine (ANE_TEST_PACK=<MLX pack dir>) ──
 
-const model_mod = @import("../mlx/model.zig");
+const model_mod = @import("../../sdk/config/model.zig");
 
 fn testModel(io: std.Io, slots: u32) !?*Model {
     const dir = env.get(.ANE_TEST_PACK) orelse return null;

@@ -3,12 +3,12 @@
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const chat_mod = @import("../chat/chat.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
+const model_mod = @import("../../sdk/config/model.zig");
 const radio_vision = @import("../../plugins/nemotron_h/radio_vision.zig");
-const vision_mod = @import("../../engines/mlx/vision_encoder.zig");
+const vision_mod = @import("../../abi/mlx_handles.zig");
 const log = @import("../../sdk/util/log.zig");
-const prefix_cache_mod = @import("../../engines/mlx/cache/prefix_cache.zig");
-const scheduler_mod = @import("../../engines/mlx/scheduler.zig");
+const MediaSpan = @import("../../sdk/kv/media_span.zig").MediaSpan;
+const scheduler_mod = @import("../gpu_thread/requests.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const LoadedModel = model_registry_mod.LoadedModel;
 const testing = std.testing;
@@ -112,7 +112,7 @@ fn freeKeepMasks(allocator: std.mem.Allocator, keeps: []?[]bool) void {
 /// item's soft tokens concatenated in prompt order; `item_tokens[k]` receives
 /// item k's row count. RADIO video rows are already the EVS keep.
 fn encodeMediaItems(allocator: std.mem.Allocator, lm: *LoadedModel, items: []const MediaItem, mp: MediaPieces, item_tokens: []usize) !EncodedMedia {
-    const sch = http_server.global_scheduler orelse return error.NoScheduler;
+    const sch = http_server.launch().global_scheduler orelse return error.NoScheduler;
     const piece_tokens = try allocator.alloc(usize, mp.pieces.len);
     defer allocator.free(piece_tokens);
     var req = scheduler_mod.VisionEncodeRequest{
@@ -153,7 +153,7 @@ pub const MropeData = struct {
 /// prefix-cache key and the M-RoPE table. Owns all three until moved out.
 pub const MultimodalPrompt = struct {
     embeddings: ?mlx.mlx_array = null,
-    media: []prefix_cache_mod.MediaSpan = &.{},
+    media: []MediaSpan = &.{},
     mrope: MropeData = .{},
     /// Soft-token rows in `embeddings`.
     rows: usize = 0,
@@ -184,7 +184,7 @@ pub fn prepareMultimodalItems(allocator: std.mem.Allocator, lm: *LoadedModel, co
     if (items.len == 0) return .{};
     var videos: usize = 0;
     for (items) |it| videos += @intFromBool(it == .video);
-    if (videos > 0 and !loadedSupportsVideo(lm, config)) return error.VideoUnsupported;
+    if (videos > 0 and !loadedSupportsVideo(lm)) return error.VideoUnsupported;
     const mt = radioMediaTokens(lm, config);
     if (config.radio_vision and videos > 0 and (mt.video_sentinel == 0 or mt.img_end == 0 or mt.video_sentinel == config.image_token_id)) {
         log.warn("  media: RADIO video needs distinct <img> and </img> special tokens\n", .{});

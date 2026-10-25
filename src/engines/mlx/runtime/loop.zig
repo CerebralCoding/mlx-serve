@@ -1,36 +1,36 @@
 //! The inference loop: work-pending checks, side-queue drains, the main loop.
 
 const std = @import("std");
-const log = @import("../../sdk/util/log.zig");
-const io_util = @import("../../sdk/util/io_util.zig");
-const mlx_stream = if (@import("build_options").mlx_stream) @import("../../engines/mlx/modules/stream_glue.zig") else @import("../../engines/mlx/modules/stream_stub.zig");
+const log = @import("../../../sdk/util/log.zig");
+const io_util = @import("../../../sdk/util/io_util.zig");
+const mlx_stream = if (@import("build_options").mlx_stream) @import("../modules/stream_glue.zig") else @import("../modules/stream_stub.zig");
 const sleep_inhibit = @import("sleep_inhibit.zig");
 const testing = std.testing;
 
-const reviseHotCacheBudgets = @import("../../engines/mlx/cache/budget.zig").reviseHotCacheBudgets;
-const persistAtShutdown = @import("../../engines/mlx/cache/budget.zig").persistAtShutdown;
-const commitSlotIfApplicable = @import("../../engines/mlx/commit.zig").commitSlotIfApplicable;
-const recordSlotCleanup = @import("../../engines/mlx/finish.zig").recordSlotCleanup;
-const doLoadOnInferenceThread = @import("../../engines/mlx/load.zig").doLoadOnInferenceThread;
-const loadErrorName = @import("../media_jobs/plugin/engine.zig").loadErrorName;
-const VisionEncodeRequest = @import("../../engines/mlx/media_encode.zig").VisionEncodeRequest;
-const EmbedRequest = @import("../../engines/mlx/media_encode.zig").EmbedRequest;
-const runVisionEncode = @import("../../engines/mlx/media_encode.zig").runVisionEncode;
-const runEmbedRequest = @import("../../engines/mlx/media_encode.zig").runEmbedRequest;
-const Scheduler = @import("../../engines/mlx/scheduler.zig").Scheduler;
-const Slot = @import("../../engines/mlx/slot.zig").Slot;
-const chatPass = @import("../../engines/mlx/step.zig").chatPass;
+const reviseHotCacheBudgets = @import("../scheduler.zig").reviseHotCacheBudgets;
+const persistAtShutdown = @import("../scheduler.zig").persistAtShutdown;
+const commitSlotIfApplicable = @import("../commit.zig").commitSlotIfApplicable;
+const recordSlotCleanup = @import("../finish.zig").recordSlotCleanup;
+const doLoadOnInferenceThread = @import("../load.zig").doLoadOnInferenceThread;
+const loadErrorName = @import("../../../host/media_jobs/plugin/engine.zig").loadErrorName;
+const VisionEncodeRequest = @import("../media_encode.zig").VisionEncodeRequest;
+const EmbedRequest = @import("../media_encode.zig").EmbedRequest;
+const runVisionEncode = @import("../media_encode.zig").runVisionEncode;
+const runEmbedRequest = @import("../media_encode.zig").runEmbedRequest;
+const Scheduler = @import("../scheduler.zig").Scheduler;
+const Slot = @import("../slot.zig").Slot;
+const chatPass = @import("../step.zig").chatPass;
 const runLoadRequest = @import("load_requests.zig").runLoadRequest;
 const runUnloadRequest = @import("load_requests.zig").runUnloadRequest;
-const LoadRequest = @import("requests.zig").LoadRequest;
-const GenRequest = @import("requests.zig").GenRequest;
-const MAX_MERGED_WEIGHT = @import("requests.zig").MAX_MERGED_WEIGHT;
-const takeMergeable = @import("requests.zig").takeMergeable;
-const UnloadRequest = @import("requests.zig").UnloadRequest;
+const LoadRequest = @import("../../../host/gpu_thread/requests.zig").LoadRequest;
+const GenRequest = @import("../../../host/gpu_thread/requests.zig").GenRequest;
+const MAX_MERGED_WEIGHT = @import("../../../host/gpu_thread/requests.zig").MAX_MERGED_WEIGHT;
+const takeMergeable = @import("../../../host/gpu_thread/requests.zig").takeMergeable;
+const UnloadRequest = @import("../../../host/gpu_thread/requests.zig").UnloadRequest;
 const ThreadCtx = @import("thread.zig").ThreadCtx;
 const signalStarted = @import("thread.zig").signalStarted;
 const recordLoadError = @import("thread.zig").recordLoadError;
-const runGenRequests = @import("../media_jobs/runner.zig").runGenRequests;
+const runGenRequests = @import("media_runner.zig").runGenRequests;
 
 pub fn hasWorkPendingLocked(sch: *const Scheduler) bool {
     return sch.pending.items.len > 0 or
@@ -43,14 +43,7 @@ pub fn hasWorkPendingLocked(sch: *const Scheduler) bool {
         sch.unload_queue.items.len > 0;
 }
 
-/// Poll interval for the idle-eviction sweep, given the configured window.
-///
-/// A quarter of the window, so a model is evicted within ~1.25x the configured
-/// idle time rather than up to 2x it. Floored at a second so `--idle-evict-secs 1`
-/// does not spin, capped at 30s so a long window still costs ~nothing.
-pub fn idleEvictTickMs(window_ms: i64) i64 {
-    return @max(1000, @min(@divTrunc(window_ms, 4), 30_000));
-}
+pub const idleEvictTickMs = @import("../../../host/http/server.zig").idleEvictTickMs;
 
 pub fn inferenceLoop(ctx: ThreadCtx) void {
     const sch = ctx.scheduler;
@@ -206,14 +199,14 @@ pub fn drainSideQueues(sch: *Scheduler) bool {
         // what makes the refcount-sharing snapshot legal here.
         if (s.cancelled.load(.acquire) and !s.finished and s.error_code == null) {
             commitSlotIfApplicable(sch, s);
-            if (s.model.prefix_cache) |*hc| {
+            if (s.model.prefix_cache) |hc| {
                 if (s.model.transformer) |xf| hc.flushPendingDisk(xf.s);
             }
         }
         recordSlotCleanup(sch.metrics, s);
         // Second slot-end path (a decode-phase cancel never reaches finishSlot); the
         // record must not outlive the bytes `s.deinit()` frees.
-        if (s.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(s), "slot cleanup");
+        if (s.model.prefix_cache) |hc| hc.releaseCheckout(@intFromPtr(s), "slot cleanup");
         if (s.model.transformer) |xfm| if (xfm.qwen4Trunk()) |t| t.resetQsaPooledRope();
         s.deinit();
     }
@@ -224,15 +217,4 @@ pub fn drainSideQueues(sch: *Scheduler) bool {
 
 // ── tests ──
 
-test "idleEvictTickMs: sweeps well inside the window without spinning" {
-    // Bar: a quarter of the window, clamped to [1s, 30s] — eviction lands near
-    // the configured time without the sweep becoming a busy loop.
-    try testing.expectEqual(@as(i64, 5_000), idleEvictTickMs(20_000));
-    try testing.expectEqual(@as(i64, 15_000), idleEvictTickMs(60_000));
-    try testing.expectEqual(@as(i64, 30_000), idleEvictTickMs(900_000));
-    try testing.expectEqual(@as(i64, 1000), idleEvictTickMs(1000));
-    try testing.expectEqual(@as(i64, 1000), idleEvictTickMs(2000));
-    try testing.expectEqual(@as(i64, 30_000), idleEvictTickMs(28_800_000));
-    try testing.expect(idleEvictTickMs(0) >= 1000);
-}
 

@@ -40,8 +40,8 @@ pub const panic = std.debug.simple_panic;
 pub const mlx = @import("mlx/ffi.zig");
 pub const io_util = @import("sdk/util/io_util.zig");
 pub const shared = @import("sdk/util/shared.zig");
-pub const mtp_acceptance = @import("engines/mlx/spec/mtp_acceptance.zig");
-const model_mod = @import("engines/mlx/model.zig");
+pub const mtp_acceptance = @import("sdk/spec/mtp_acceptance.zig");
+const model_mod = @import("sdk/config/model.zig");
 const transformer_mod = @import("engines/mlx/transformer.zig");
 const model_discovery = @import("host/registry/discovery.zig");
 const model_registry_mod = @import("host/registry/registry.zig");
@@ -49,6 +49,11 @@ const scheduler_mod = @import("engines/mlx/scheduler.zig");
 const server_mod = @import("host/http/server.zig");
 const gen_mod = @import("host/media_jobs/gen.zig");
 pub const log = @import("sdk/util/log.zig");
+
+comptime {
+    // One compile unit: the MLX engine's table is exported from here.
+    _ = @import("engines/mlx/api.zig");
+}
 
 /// Returns the engine version string (NUL-terminated, static lifetime).
 export fn mlxserve_version() [*:0]const u8 {

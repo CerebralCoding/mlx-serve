@@ -94,3 +94,8 @@ sdk.blocks.qmm.qmv2.cfg_cache
 sdk.blocks.qmm.qmv2.rows_cfg_cache
 sdk.blocks.qmm.qmv_cuda.enabled_cache
 sdk.blocks.qmm.rowqmv.cfg_cache
+
+# the embedded engines open on the inference thread (engine unit, `Served.open`); the host only probes them
+~^engines\.ane\.(dflash\.debug_(alloc|outs)|lm\.build_mu)$
+# a cached sysctl read
+host.registry.memory_ceiling.wired_limit_bytes_cached

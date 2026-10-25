@@ -3,17 +3,17 @@
 const std = @import("std");
 const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
-const kv_quant = @import("../../engines/mlx/cache/kv_quant.zig");
+const kv_quant = @import("../../sdk/blocks/attention/kv_quant.zig");
 const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
-const generate_mod = @import("../../engines/mlx/generate.zig");
+const generate_mod = @import("../../sdk/request/request.zig");
 const chat_mod = @import("../chat/chat.zig");
-const rp_mod = @import("../chat/reasoning/protocol.zig");
+const rp_mod = @import("../../sdk/grammar/protocol.zig");
 const log = @import("../../sdk/util/log.zig");
-const prefix_cache_mod = @import("../../engines/mlx/cache/prefix_cache.zig");
-const scheduler_mod = @import("../../engines/mlx/scheduler.zig");
+const MediaSpan = @import("../../sdk/kv/media_span.zig").MediaSpan;
+const mlx_engine = @import("../engines/mlx.zig");
+const Stream = @import("../engines/stream.zig").Stream;
 const model_registry_mod = @import("../registry/registry.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;
-const Generator = generate_mod.Generator;
 const LoadedModel = model_registry_mod.LoadedModel;
 const io_util = @import("../../sdk/util/io_util.zig");
 const nowMs = io_util.nowMs;
@@ -21,8 +21,8 @@ const testing = std.testing;
 const http_server = @import("../http/server.zig");
 
 const Conn = @import("../http/conn.zig").Conn;
-const resolveKvAttnFused = @import("../../engines/mlx/request_options.zig").resolveKvAttnFused;
-const mtpCapable = @import("../../engines/mlx/request_options.zig").mtpCapable;
+const resolveKvAttnFused = @import("request_options.zig").resolveKvAttnFused;
+const mtpCapable = @import("request_options.zig").mtpCapable;
 const getTimeoutNs = @import("../http/server.zig").getTimeoutNs;
 const decodeTokens = @import("tokenize.zig").decodeTokens;
 const promptOpensThink = @import("../chat/reasoning/request.zig").promptOpensThink;
@@ -36,8 +36,8 @@ const parseToolCallsForRequest = @import("../chat/tools/pipeline.zig").parseTool
 const slotFailure = @import("../http/errors.zig").slotFailure;
 const StopStream = @import("../chat/stops.zig").StopStream;
 const emitConstrainedChat = @import("chat_completions.zig").emitConstrainedChat;
-const requestHasCompany = @import("../../engines/mlx/request_options.zig").requestHasCompany;
-const pickStreamMode = @import("../../engines/mlx/request_options.zig").pickStreamMode;
+const requestHasCompany = @import("request_options.zig").requestHasCompany;
+const pickStreamMode = @import("request_options.zig").pickStreamMode;
 const StreamLogprobs = @import("logprobs.zig").StreamLogprobs;
 const sendSSEChunk = @import("../http/sse.zig").sendSSEChunk;
 const sendSSEUsageChunk = @import("../http/sse.zig").sendSSEUsageChunk;
@@ -69,87 +69,41 @@ const beatStreamKeepalive = @import("../http/sse.zig").beatStreamKeepalive;
 /// Caller must `deinit`.
 pub const StreamMode = enum { regular, pld, drafter, mtp };
 
-/// Source of streamed tokens. Either a legacy Generator (single-slot mlx on
-/// the calling thread) or a Scheduler Slot (mlx on the scheduler's inference
-/// thread, this thread reads via waitNext). `next()` yields one token id at
-/// a time regardless of source. Post-generation stats are surfaced via the
-/// `prompt_tokens` / `completion_tokens` / `finish_reason` fields populated
-/// by `finalize()`.
+/// The streamed tokens of one request, read from its `Stream` one at a time. Post-generation stats are copied in by
+/// `finalize()`.
 pub const StreamingTokenStream = struct {
-    /// Active source. Exactly one of `gen`/`slot` is set per stream.
-    gen: ?*Generator = null,
-    slot: ?*scheduler_mod.Slot = null,
+    stream: *Stream,
     mode: StreamMode,
-    pld_draft_len: u32 = 0,
-    pld_key_len: u32 = 0,
     eos_token_ids: []const u32,
-    /// Pending tokens from a multi-token speculative step (legacy path only).
-    /// Drained one at a time before the next call to nextPld / nextDrafter.
-    pending_buf: std.ArrayList(u32) = .empty,
-    pending_idx: usize = 0,
     finished: bool = false,
 
-    /// Stats populated by `finalize()` after the stream ends. Consumers read
-    /// these instead of touching the underlying gen/slot directly so the same
-    /// post-generation code works for both legacy and scheduler paths.
     prompt_tokens: u32 = 0,
     cached_tokens: u32 = 0,
     completion_tokens: u32 = 0,
     finish_reason: []const u8 = "stop",
-    /// Set only by the degenerate-tail guard (scheduler path). Rides the
-    /// FINAL chunk beside `finish_reason`; the tokens themselves are already
-    /// gone — a delta cannot be retracted, so streaming gets the signal, not
-    /// the trim.
+    /// Set only by the degenerate-tail guard. Rides the FINAL chunk beside `finish_reason`; the tokens themselves
+    /// are already gone: a delta cannot be retracted, so streaming gets the signal, not the trim.
     finish_details: ?[]const u8 = null,
-    /// Wall-clock ns for prefill / decode (scheduler path only; the legacy
-    /// Generator path leaves these at 0, in which case the server omits the
-    /// `timings` block from the usage chunk).
     prefill_ns: u64 = 0,
     decode_ns: u64 = 0,
 
-    fn init(gen: *Generator, mode: StreamMode, pld_draft_len: u32, pld_key_len: u32, eos: []const u32) StreamingTokenStream {
-        return .{
-            .gen = gen,
-            .mode = mode,
-            .pld_draft_len = pld_draft_len,
-            .pld_key_len = pld_key_len,
-            .eos_token_ids = eos,
-        };
+    /// `mode` is recorded for telemetry: the engine already routed PLD/drafter/MTP.
+    pub fn initFromStream(stream: *Stream, mode: StreamMode, eos: []const u32) StreamingTokenStream {
+        return .{ .stream = stream, .mode = mode, .eos_token_ids = eos };
     }
 
-    /// Phase A2-streaming: build a token stream backed by a scheduler Slot.
-    /// `mode` is recorded for telemetry but doesn't drive next()'s dispatch
-    /// (the scheduler's inference thread already routed PLD/drafter inside
-    /// runSingleDecodeTick — this side just drains the resulting token ring).
-    pub fn initFromSlot(slot: *scheduler_mod.Slot, mode: StreamMode, eos: []const u32) StreamingTokenStream {
-        return .{
-            .slot = slot,
-            .mode = mode,
-            .eos_token_ids = eos,
-        };
-    }
+    pub fn deinit(_: *StreamingTokenStream, _: std.mem.Allocator) void {}
 
-    pub fn deinit(self: *StreamingTokenStream, allocator: std.mem.Allocator) void {
-        self.pending_buf.deinit(allocator);
-    }
-
-    /// Snapshot prompt/completion tokens + finish reason from the underlying
-    /// source so callers can read them after the loop exits without having
-    /// to know which source was active. Safe to call multiple times; idempotent.
+    /// Copies the request's numbers out of the stream; idempotent.
     pub fn finalize(self: *StreamingTokenStream) void {
-        if (self.slot) |s| {
-            self.prompt_tokens = s.prompt_tokens;
-            self.cached_tokens = s.cached_tokens;
-            self.completion_tokens = s.completion_tokens;
-            self.finish_reason = s.finish_reason;
-            self.finish_details = s.finish_details;
-            self.prefill_ns = s.prefill_ns;
-            self.decode_ns = s.decode_ns;
-        } else if (self.gen) |g| {
-            self.prompt_tokens = g.prompt_tokens;
-            self.completion_tokens = g.completion_tokens;
-            self.finish_reason = g.finish_reason;
-        }
+        const s = self.stream;
+        self.prompt_tokens = s.prompt_tokens;
+        self.cached_tokens = s.cached_tokens;
+        self.completion_tokens = s.completion_tokens;
+        self.finish_reason = s.finish_reason;
+        self.finish_details = s.finish_details;
+        self.prefill_ns = s.prefill_ns;
+        self.decode_ns = s.decode_ns;
     }
 
     /// The finalized stream as a `GenerationResult`, for surfaces that share
@@ -173,162 +127,18 @@ pub const StreamingTokenStream = struct {
 
     const NextOrIdle = union(enum) { token: u32, done, idle };
 
-    /// `next` with an idle timeout (scheduler path only): returns `.idle`
-    /// after `timeout_ms` with no progress so the caller can poll the peer
-    /// socket and emit SSE keepalives during long prefills. The local-
-    /// generator path computes synchronously and never idles.
-    pub fn nextOrIdle(self: *StreamingTokenStream, allocator: std.mem.Allocator, timeout_ms: i64) !NextOrIdle {
-        if (self.slot) |s| {
-            if (self.finished) return .done;
-            const nr = s.waitNextTimeout(timeout_ms) orelse return .idle;
-            switch (nr) {
-                .token => |t| return .{ .token = t },
-                .done => {
-                    self.finished = true;
-                    return .done;
-                },
-                .err => return slotFailure(s),
-            }
-        }
-        if (try self.next(allocator)) |t| return .{ .token = t };
-        return .done;
-    }
-
-    /// Yield the next decoded token id, or null if generation is complete.
-    /// Mirrors the contract of `Generator.next` for the regular path.
-    fn next(self: *StreamingTokenStream, allocator: std.mem.Allocator) !?u32 {
-        // Scheduler path: drain the slot's output ring one token at a time.
-        // The inference thread already handled regular/PLD/drafter dispatch
-        // via runSingleDecodeTick; we just consume what it pushed.
-        if (self.slot) |s| {
-            if (self.finished) return null;
-            switch (s.waitNext()) {
-                .token => |t| return t,
-                .done => {
-                    self.finished = true;
-                    return null;
-                },
-                .err => return slotFailure(s),
-            }
-        }
-        // Drain any pending tokens from a previous speculative step FIRST,
-        // before honoring `self.finished`. The PLD/drafter branches set
-        // `self.finished = true` mid-batch when an EOS lands at index > 0;
-        // tokens *before* that EOS were pushed to pending_buf and must still
-        // flush before we terminate. Skipping the drain here would silently
-        // truncate the last few output tokens (observed on Gemma 4 drafter
-        // with `print(sum_two(10, 20))` losing its trailing `))`).
-        if (self.pending_idx < self.pending_buf.items.len) {
-            const tok = self.pending_buf.items[self.pending_idx];
-            self.pending_idx += 1;
-            return tok;
-        }
-        // Reset the pending buffer once drained so the speculative path can
-        // refill it.
-        if (self.pending_idx > 0) {
-            self.pending_buf.clearRetainingCapacity();
-            self.pending_idx = 0;
-        }
-
-        if (self.finished) return null;
-
-        const gen = self.gen.?;
-        switch (self.mode) {
-            .regular => return gen.next(allocator),
-            .pld => {
-                const r = (try gen.nextPld(allocator, self.pld_draft_len, self.pld_key_len)) orelse return null;
-                defer allocator.free(r.tokens);
-                if (r.tokens.len == 0) {
-                    self.finished = true;
-                    return null;
-                }
-                // Walk tokens in order, stopping at the first EOS (and not
-                // emitting it) — matches `generatePld`.
-                var first_idx: usize = 0;
-                while (first_idx < r.tokens.len and generate_mod.isEosId(r.tokens[first_idx], self.eos_token_ids)) : (first_idx += 1) {}
-                if (first_idx >= r.tokens.len) {
-                    gen.done = true;
-                    gen.finish_reason = "stop";
-                    self.finished = true;
-                    return null;
-                }
-                const first_tok = r.tokens[first_idx];
-                // Append the remaining (non-EOS-prefixed) tokens to pending,
-                // stopping at the first EOS in the tail.
-                var i: usize = first_idx + 1;
-                while (i < r.tokens.len) : (i += 1) {
-                    if (generate_mod.isEosId(r.tokens[i], self.eos_token_ids)) {
-                        gen.done = true;
-                        gen.finish_reason = "stop";
-                        self.finished = true;
-                        break;
-                    }
-                    try self.pending_buf.append(allocator, r.tokens[i]);
-                }
-                return first_tok;
+    /// The next token, the end, or `.idle` after `timeout_ms` with no progress so the caller can poll the peer
+    /// socket and send SSE keepalives during a long prefill.
+    pub fn nextOrIdle(self: *StreamingTokenStream, _: std.mem.Allocator, timeout_ms: i64) !NextOrIdle {
+        if (self.finished) return .done;
+        const nr = self.stream.waitNextTimeout(timeout_ms) orelse return .idle;
+        switch (nr) {
+            .token => |t| return .{ .token = t },
+            .done => {
+                self.finished = true;
+                return .done;
             },
-            .mtp => {
-                // Mirror the drafter branch — `nextMtp` returns the same
-                // `{tokens, accepted_tokens}` shape.
-                const r = (try gen.nextMtp(allocator)) orelse return null;
-                defer allocator.free(r.tokens);
-                if (r.tokens.len == 0) {
-                    self.finished = true;
-                    return null;
-                }
-                var first_idx: usize = 0;
-                while (first_idx < r.tokens.len and generate_mod.isEosId(r.tokens[first_idx], self.eos_token_ids)) : (first_idx += 1) {}
-                if (first_idx >= r.tokens.len) {
-                    gen.done = true;
-                    gen.finish_reason = "stop";
-                    self.finished = true;
-                    return null;
-                }
-                const first_tok = r.tokens[first_idx];
-                var i: usize = first_idx + 1;
-                while (i < r.tokens.len) : (i += 1) {
-                    if (generate_mod.isEosId(r.tokens[i], self.eos_token_ids)) {
-                        gen.done = true;
-                        gen.finish_reason = "stop";
-                        self.finished = true;
-                        break;
-                    }
-                    try self.pending_buf.append(allocator, r.tokens[i]);
-                }
-                return first_tok;
-            },
-            .drafter => {
-                // Mirror the PLD branch — `nextDrafter` returns the same
-                // `{tokens, accepted_tokens}` shape (full accept yields
-                // `block_size` tokens, partial accept yields `1+j`). Walk the
-                // batch, stop at the first EOS, push the rest into pending.
-                const r = (try gen.nextDrafter(allocator)) orelse return null;
-                defer allocator.free(r.tokens);
-                if (r.tokens.len == 0) {
-                    self.finished = true;
-                    return null;
-                }
-                var first_idx: usize = 0;
-                while (first_idx < r.tokens.len and generate_mod.isEosId(r.tokens[first_idx], self.eos_token_ids)) : (first_idx += 1) {}
-                if (first_idx >= r.tokens.len) {
-                    gen.done = true;
-                    gen.finish_reason = "stop";
-                    self.finished = true;
-                    return null;
-                }
-                const first_tok = r.tokens[first_idx];
-                var i: usize = first_idx + 1;
-                while (i < r.tokens.len) : (i += 1) {
-                    if (generate_mod.isEosId(r.tokens[i], self.eos_token_ids)) {
-                        gen.done = true;
-                        gen.finish_reason = "stop";
-                        self.finished = true;
-                        break;
-                    }
-                    try self.pending_buf.append(allocator, r.tokens[i]);
-                }
-                return first_tok;
-            },
+            .err => return slotFailure(self.stream),
         }
     }
 };
@@ -360,7 +170,7 @@ pub fn handleStreamingGeneration(
     enable_mtp: bool,
     allow_batch_mtp: bool,
     vision_embeddings: ?mlx.mlx_array,
-    media: []const prefix_cache_mod.MediaSpan,
+    media: []const MediaSpan,
     cache_key: u64,
     mrope: MropeData,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
@@ -408,14 +218,14 @@ pub fn handleStreamingGeneration(
     // / PLD / drafter) and pushes generated tokens into the slot's output
     // ring; this thread reads via `slot.waitNext` through the
     // `StreamingTokenStream.initFromSlot` adapter.
-    var slot_handle: ?*scheduler_mod.Slot = null;
-    defer if (slot_handle) |s| http_server.global_scheduler.?.complete(s);
+    var running: ?mlx_engine.Running = null;
+    defer if (running) |r| r.done();
 
     // Transfer vision ownership into the slot.
     const slot_ve_s = ve_local;
     ve_local = null;
-    const sch = http_server.global_scheduler.?;
-    slot_handle = try sch.submit(.{
+    const sch = http_server.launch().global_scheduler.?;
+    running = try mlx_engine.Running.submit(sch, .{
         .model = lm,
         .prompt_ids = prompt_ids,
         .full_prompt = prompt_ids,
@@ -448,7 +258,7 @@ pub fn handleStreamingGeneration(
         .mrope_delta = mrope.delta,
         .kv_quant_config = kv_quant_override,
     });
-    var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_token_ids);
+    var ts = StreamingTokenStream.initFromStream(running.?.stream, stream_mode, eos_token_ids);
     defer ts.deinit(allocator);
 
     // Send SSE headers (no Content-Length — we stream until done)
@@ -461,7 +271,7 @@ pub fn handleStreamingGeneration(
     var lps = StreamLogprobs{
         .allocator = allocator,
         .tok = tok,
-        .slot = slot_handle,
+        .stream = running.?.stream,
         .enabled = logprobs_n > 0,
     };
     defer lps.deinit();
@@ -557,13 +367,13 @@ pub fn handleStreamingGeneration(
                 // keepalive stops clients timing out on stream silence.
                 if (stream.peerClosed()) {
                     log.info("  [cancel] client disconnected while waiting for tokens — cancelling slot\n", .{});
-                    slot_handle.?.cancel();
+                    running.?.stream.cancel();
                     client_gone = true;
                     break;
                 }
                 sendStreamKeepalive(stream) catch {
                     log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
-                    slot_handle.?.cancel();
+                    running.?.stream.cancel();
                     client_gone = true;
                     break;
                 };
@@ -571,7 +381,7 @@ pub fn handleStreamingGeneration(
             },
         };
         if (stream.peerClosed()) {
-            slot_handle.?.cancel();
+            running.?.stream.cancel();
             client_gone = true;
             break;
         }
@@ -581,7 +391,7 @@ pub fn handleStreamingGeneration(
             try lps.note(token_id);
             const strip = tok.tok_type == .sentencepiece_bpe;
             const raw_decoded = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, strip and false);
-            if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
+            if (delivery) |*d| d.noteToken(raw_decoded.len, running.?.stream.constraintPayloadStart());
             // Step 1: prepend carry-over from previous token
             const with_carry = if (utf8_carry_len > 0) cc: {
                 const combined = try allocator.alloc(u8, utf8_carry_len + raw_decoded.len);
@@ -1046,7 +856,7 @@ pub fn handleStreamingGeneration(
         // stream mid-generation.
         beatStreamKeepalive(stream, .sse_comment) catch {
             log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
-            slot_handle.?.cancel();
+            running.?.stream.cancel();
             client_gone = true;
             break;
         };
@@ -1243,7 +1053,7 @@ pub fn handleStreamingGeneration(
 
 test "a streamed turn's result keeps the prompt-cache hit and timings the slot measured" {
     const t = std.testing;
-    const ts: StreamingTokenStream = .{ .mode = .regular, .eos_token_ids = &.{}, .prompt_tokens = 3016, .cached_tokens = 2985, .completion_tokens = 40, .prefill_ns = 90_000_000, .decode_ns = 1_200_000_000 };
+    const ts: StreamingTokenStream = .{ .stream = undefined, .mode = .regular, .eos_token_ids = &.{}, .prompt_tokens = 3016, .cached_tokens = 2985, .completion_tokens = 40, .prefill_ns = 90_000_000, .decode_ns = 1_200_000_000 };
     var text = "ok".*;
     var ids = [_]u32{ 7, 8 };
     const r = ts.generationResult(&text, &ids, "stop", null);

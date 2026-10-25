@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const transformer_mod = @import("../transformer.zig");
-const model_mod = @import("../model.zig");
+const model_mod = @import("../../../sdk/config/model.zig");
 const model_registry_mod = @import("../../../host/registry/registry.zig");
 const log = @import("../../../sdk/util/log.zig");
 const KVCache = transformer_mod.KVCache;
@@ -13,19 +13,9 @@ const SIBLING_MARGIN_BYTES = @import("../scheduler/params.zig").SIBLING_MARGIN_B
 const Slot = @import("../slot.zig").Slot;
 
 /// Slots one batched forward can carry; the tail decodes serial this tick.
-pub const MAX_BATCH_GROUP = 32;
+pub const MAX_BATCH_GROUP = @import("../../../host/gpu_thread/scheduler.zig").MAX_BATCH_GROUP;
 
-pub const BatchVerdict = enum {
-    ok,
-    spec_active,
-    head_release_pending,
-    grammar,
-    logprobs,
-    penalty,
-    embedded_engine,
-    arch,
-    pad_waste,
-};
+pub const BatchVerdict = @import("../../../host/gpu_thread/scheduler.zig").BatchVerdict;
 
 /// Does the loaded model's config batch at all? The arch half of `batchVerdict`,
 /// shared with `/props`, `/v1/models` and the serve-mode startup line.

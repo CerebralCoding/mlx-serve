@@ -1,7 +1,7 @@
 //! GenerationResult and its rates.
 const std = @import("std");
 const testing = std.testing;
-const LogprobResult = @import("../sampling/logprobs.zig").LogprobResult;
+const LogprobResult = @import("logprob.zig").LogprobResult;
 
 
 /// Generation result (for non-streaming use).

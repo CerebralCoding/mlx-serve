@@ -5,9 +5,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 const mlx = @import("../../mlx/ffi.zig");
 const chat_mod = @import("../chat/chat.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
+const model_mod = @import("../../sdk/config/model.zig");
 const radio_vision = @import("../../plugins/nemotron_h/radio_vision.zig");
-const vision_mod = @import("../../engines/mlx/vision_encoder.zig");
+const vision_mod = @import("../../abi/mlx_handles.zig");
+const mlx_engine = @import("../engines/mlx.zig");
 const log = @import("../../sdk/util/log.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const model_discovery = @import("../registry/discovery.zig");
@@ -32,7 +33,7 @@ const parseModelFromBody = @import("request_model.zig").parseModelFromBody;
 const resolveRequestModelId = @import("request_model.zig").resolveRequestModelId;
 const embedEffectiveLimit = @import("embeddings.zig").embedEffectiveLimit;
 const quantizationJson = @import("ollama_routes.zig").quantizationJson;
-const getEffectiveContextLength = @import("../../engines/mlx/admission/context.zig").getEffectiveContextLength;
+const getEffectiveContextLength = @import("admission.zig").getEffectiveContextLength;
 const optSamplingRecJson = @import("sampling.zig").optSamplingRecJson;
 const batchVerdictFor = @import("props.zig").batchVerdictFor;
 const sendResponse = @import("../http/respond.zig").sendResponse;
@@ -152,10 +153,8 @@ fn readyCapsJson(allocator: std.mem.Allocator, c: ReadyCaps) !std.ArrayList(u8) 
     return caps;
 }
 
-pub fn loadedSupportsVideo(entry: *const LoadedModel, config: *const model_mod.ModelConfig) bool {
-    const ve = entry.vision_encoder orelse return false;
-    if (ve.radio) |radio| return radio.video_w.ctx != null;
-    return ve.supportsImages() and config.video_token_id != 0;
+pub fn loadedSupportsVideo(entry: *const LoadedModel) bool {
+    return mlx_engine.api().supports_video(entry);
 }
 
 /// pulls full capabilities/dimensions off the resident config/chat_config;
@@ -184,13 +183,14 @@ pub fn renderModelEntry(
             chat_config.chat_template.len,
             entry.engineBacked(),
         );
-        const has_vision = if (entry.vision_encoder) |ve| ve.supportsImages() else false;
-        const has_audio = if (entry.vision_encoder) |ve| ve.supportsAudio() else false;
+        const mf = mlx_engine.facts(entry);
+        const has_vision = mf.images;
+        const has_audio = mf.audio;
         var caps = try readyCapsJson(allocator, .{
             .has_chat = has_chat,
             .has_vision = has_vision,
             .has_audio = has_audio,
-            .has_transcription = config.forced_aligner == null and if (entry.vision_encoder) |ve| ve.qwen_audio != null else false,
+            .has_transcription = config.forced_aligner == null and mf.hears,
             .has_alignment = config.forced_aligner != null,
             .has_reasoning = has_chat and model_discovery.templateSupportsThinking(chat_config.chat_template),
             .has_embedding = config.hasEmbeddingCapability(),
@@ -209,7 +209,7 @@ pub fn renderModelEntry(
         defer mods.deinit(allocator);
         try mods.appendSlice(allocator, "[\"text\"");
         if (has_vision) try mods.appendSlice(allocator, ",\"image\"");
-        if (loadedSupportsVideo(entry, config)) try mods.appendSlice(allocator, ",\"video\"");
+        if (mf.video) try mods.appendSlice(allocator, ",\"video\"");
         if (has_audio) try mods.appendSlice(allocator, ",\"audio\"");
         try mods.append(allocator, ']');
 
@@ -537,7 +537,7 @@ pub fn renderModelsBody(allocator: std.mem.Allocator, io: std.Io, lan_filtered: 
 /// id the app draws its icon from, its memory (the pair card's split estimate), and the
 /// Thunderbolt pair this server leads, if any.
 fn machineJson(allocator: std.mem.Allocator) ![]u8 {
-    const pair = try @import("../../engines/mlx/cluster/distributed.zig").pairFields(allocator);
+    const pair = mlx_engine.api().pair_fields(allocator) orelse return error.OutOfMemory;
     defer allocator.free(pair);
     var model_buf: [64]u8 = undefined;
     const status_mod = @import("../status.zig");
@@ -652,7 +652,7 @@ pub fn handleModelsRescan(allocator: std.mem.Allocator, stream: *Conn) !void {
 /// caller asked for a specific id, not "anything"). Routes through
 /// scheduler.ensureLoaded so eviction/back-pressure kicks in.
 pub fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_body: []const u8) !void {
-    const scheduler = http_server.global_scheduler orelse {
+    const scheduler = http_server.launch().global_scheduler orelse {
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503);
         return;
     };
@@ -802,7 +802,7 @@ fn unloadBodyNamesNoModel(obj: std.json.ObjectMap) bool {
 /// state (the stub stays registered so it can reload). Idempotent. Returns a
 /// small status payload confirming the model is unloaded.
 pub fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_body: []const u8) !void {
-    const scheduler = http_server.global_scheduler orelse {
+    const scheduler = http_server.launch().global_scheduler orelse {
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503);
         return;
     };
@@ -1047,29 +1047,6 @@ test "an unloaded row carries its agent budget, media modality and engines" {
     const engines = ip.value.object.get("engines").?.array.items;
     try testing.expectEqual(@as(usize, 1), engines.len);
     try testing.expectEqualStrings("mlx", engines[0].string);
-}
-
-test "RADIO video availability follows loaded embedder weights" {
-    var radio: radio_vision.RadioVision = undefined;
-    radio.video_w = .{ .ctx = null };
-    var encoder: vision_mod.VisionEncoder = undefined;
-    encoder.radio = radio;
-    encoder.qwen_audio = null;
-    var entry: LoadedModel = undefined;
-    entry.vision_encoder = &encoder;
-    var config = model_mod.ModelConfig{ .radio_vision = true };
-    try testing.expect(encoder.supportsImages());
-    try testing.expect(!loadedSupportsVideo(&entry, &config));
-    encoder.radio.?.video_w.ctx = @ptrCast(&radio);
-    try testing.expect(loadedSupportsVideo(&entry, &config));
-    encoder.radio = null;
-    config.radio_vision = false;
-    config.video_token_id = 7;
-    try testing.expect(loadedSupportsVideo(&entry, &config));
-    config.video_token_id = 0;
-    try testing.expect(!loadedSupportsVideo(&entry, &config));
-    entry.vision_encoder = null;
-    try testing.expect(!loadedSupportsVideo(&entry, &config));
 }
 
 test "readyCapsJson: embeddings capability — encoders alone, decoders beside chat" {

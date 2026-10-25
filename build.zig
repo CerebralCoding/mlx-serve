@@ -39,10 +39,12 @@ pub fn build(b: *std.Build) void {
     });
     const optimize = b.standardOptimizeOption(.{});
 
-    // `-Dunits`: every plugin compiles as its own object (src/unit.zig) beside the host, in parallel.
-    const units = b.option(bool, "units", "Compile each plugin as its own unit, in parallel") orelse false;
+    // `-Dunits` (the macOS default): the host, the MLX engine and every plugin group compile as their own objects, in
+    // parallel, none of them needing the whole tree's compiler memory. `-Dunits=false` builds one unit.
+    const units = b.option(bool, "units", "Compile the host, the engine and each plugin group as their own units, in parallel") orelse
+        (builtin.os.tag == .macos);
     // A plugin registers by its folder: the scan writes src/plugins/registry.zig, every graph compiles it.
-    const plugin_names = plugins.generate(b, units);
+    const plugin_names = plugins.generate(b);
 
     // `lint`, `lint-test`, `unit-closure`.
     lint.add(b);

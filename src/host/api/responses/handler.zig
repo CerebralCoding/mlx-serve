@@ -1,13 +1,13 @@
 //! extractResponseId, extractCompletedStatus; get/delete/compact, handleResponsesInner
 
 const std = @import("std");
-const generate_mod = @import("../../../engines/mlx/generate.zig");
+const request_mod = @import("../../../sdk/request/request.zig");
 const chat_mod = @import("../../chat/chat.zig");
-const rp_mod = @import("../../chat/reasoning/protocol.zig");
+const rp_mod = @import("../../../sdk/grammar/protocol.zig");
 const log = @import("../../../sdk/util/log.zig");
 const responses_mod = @import("model.zig");
-const pld_index = @import("../../../engines/mlx/spec/pld_index.zig");
-const scheduler_mod = @import("../../../engines/mlx/scheduler.zig");
+const pld_index = @import("../../../sdk/spec/pld_index.zig");
+const mlx_engine = @import("../../engines/mlx.zig");
 const model_registry_mod = @import("../../registry/registry.zig");
 const LoadedModel = model_registry_mod.LoadedModel;
 const io_util = @import("../../../sdk/util/io_util.zig");
@@ -17,16 +17,16 @@ const testing = std.testing;
 const http_server = @import("../../http/server.zig");
 
 const Conn = @import("../../http/conn.zig").Conn;
-const spec_gate_threshold = @import("../../../engines/mlx/request_options.zig").spec_gate_threshold;
-const resolveKvAttnFused = @import("../../../engines/mlx/request_options.zig").resolveKvAttnFused;
-const parseKvAttnExplicit = @import("../../../engines/mlx/request_options.zig").parseKvAttnExplicit;
+const spec_gate_threshold = @import("../request_options.zig").spec_gate_threshold;
+const resolveKvAttnFused = @import("../request_options.zig").resolveKvAttnFused;
+const parseKvAttnExplicit = @import("../request_options.zig").parseKvAttnExplicit;
 const resolveSampling = @import("../sampling.zig").resolveSampling;
 const generationMaxTokens = @import("../sampling.zig").generationMaxTokens;
 const requestProfile = @import("../sampling.zig").requestProfile;
-const defaultEnableMtp = @import("../../../engines/mlx/request_options.zig").defaultEnableMtp;
-const dsv4DraftStages = @import("../../../engines/mlx/request_options.zig").dsv4DraftStages;
-const mtpCapable = @import("../../../engines/mlx/request_options.zig").mtpCapable;
-const admitMtpForCtx = @import("../../../engines/mlx/request_options.zig").admitMtpForCtx;
+const defaultEnableMtp = @import("../request_options.zig").defaultEnableMtp;
+const dsv4DraftStages = @import("../request_options.zig").dsv4DraftStages;
+const mtpCapable = @import("../request_options.zig").mtpCapable;
+const admitMtpForCtx = @import("../request_options.zig").admitMtpForCtx;
 const getTimeoutNs = @import("../../http/server.zig").getTimeoutNs;
 const decodeTokens = @import("../tokenize.zig").decodeTokens;
 const promptOpensThink = @import("../../chat/reasoning/request.zig").promptOpensThink;
@@ -41,9 +41,9 @@ const clampJsonI32 = @import("../sampling.zig").clampJsonI32;
 const shouldParseToolCalls = @import("../../chat/tools/pipeline.zig").shouldParseToolCalls;
 const parseToolCallsForRequest = @import("../../chat/tools/pipeline.zig").parseToolCallsForRequest;
 const getOrInitResponseStore = @import("store.zig").getOrInitResponseStore;
-const getEffectiveContextLength = @import("../../../engines/mlx/admission/context.zig").getEffectiveContextLength;
+const getEffectiveContextLength = @import("../admission.zig").getEffectiveContextLength;
 const sendGenerationError = @import("../../http/errors.zig").sendGenerationError;
-const checkAttentionMemory = @import("../../../engines/mlx/admission/admit.zig").checkAttentionMemory;
+const checkAttentionMemory = @import("../admission.zig").checkAttentionMemory;
 const clampMaxTokens = @import("../sampling.zig").clampMaxTokens;
 const mediaRejectReason = @import("../media_gate.zig").mediaRejectReason;
 const dropMedia = @import("../media_gate.zig").dropMedia;
@@ -57,17 +57,17 @@ const resolveThinking = @import("../../chat/reasoning/request.zig").resolveThink
 const schemaMasksThinking = @import("../../chat/reasoning/request.zig").schemaMasksThinking;
 const requestCacheKey = @import("../request_text.zig").requestCacheKey;
 const echoModelName = @import("../request_text.zig").echoModelName;
-const requestPld = @import("../../../engines/mlx/request_options.zig").requestPld;
+const requestPld = @import("../request_options.zig").requestPld;
 const StopStream = @import("../../chat/stops.zig").StopStream;
 const answerStopCut = @import("../../chat/stops.zig").answerStopCut;
 const nonStreamingViaScheduler = @import("../submit.zig").nonStreamingViaScheduler;
 const emitConstrainedResponses = @import("../chat_completions.zig").emitConstrainedResponses;
 const splitConstrainedResponse = @import("../chat_completions.zig").splitConstrainedResponse;
 const StreamingTokenStream = @import("../chat_stream.zig").StreamingTokenStream;
-const requestEnableDrafter = @import("../../../engines/mlx/request_options.zig").requestEnableDrafter;
-const requestHasCompany = @import("../../../engines/mlx/request_options.zig").requestHasCompany;
-const requestSpecModes = @import("../../../engines/mlx/request_options.zig").requestSpecModes;
-const pickStreamMode = @import("../../../engines/mlx/request_options.zig").pickStreamMode;
+const requestEnableDrafter = @import("../request_options.zig").requestEnableDrafter;
+const requestHasCompany = @import("../request_options.zig").requestHasCompany;
+const requestSpecModes = @import("../request_options.zig").requestSpecModes;
+const pickStreamMode = @import("../request_options.zig").pickStreamMode;
 const sendResponse = @import("../../http/respond.zig").sendResponse;
 const SSE_ALLOW_HEADERS_DEFAULT = @import("../../http/respond.zig").SSE_ALLOW_HEADERS_DEFAULT;
 const sendSseHeaders = @import("../../http/respond.zig").sendSseHeaders;
@@ -701,7 +701,7 @@ fn handleResponsesInner(
     if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, lm, enable_mtp_resp, mm.bytes(config))) return;
 
     // ── sampling ──
-    var sampling = generate_mod.SamplingParams{
+    var sampling = request_mod.SamplingParams{
         .temperature = temperature,
         .top_p = top_p,
         .top_k = top_k,
@@ -711,7 +711,7 @@ fn handleResponsesInner(
         .frequency_penalty = frequency_penalty,
         .seed = seed,
     };
-    var sc: generate_mod.SchemaConstraint = undefined;
+    var sc: request_mod.SchemaConstraint = undefined;
     var sc_init = false;
     defer if (sc_init) sc.deinit();
     if (grammar_schema_val) |sv| {
@@ -887,7 +887,7 @@ fn handleResponsesInner(
         enable_mtp_resp = false;
     }
 
-    var result: generate_mod.GenerationResult = undefined;
+    var result: request_mod.GenerationResult = undefined;
     if (is_stream) {
         // Pick speculative-decoding mode for the streaming Responses path.
         const stream_mode = pickStreamMode(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.shapesLogits(), 0, requestHasCompany());
@@ -895,16 +895,16 @@ fn handleResponsesInner(
         if (stream_mode == .drafter) log.info("  drafter=enabled (streaming responses, block_size={d})\n", .{lm.drafter_block_size});
         if (stream_mode == .mtp) log.info("  mtp=enabled (streaming responses, depth={d})\n", .{lm.mtp_depth});
 
-        var slot_handle: ?*scheduler_mod.Slot = null;
-        defer if (slot_handle) |s| http_server.global_scheduler.?.complete(s);
+        var running: ?mlx_engine.Running = null;
+        defer if (running) |r| r.done();
 
         // Transfer vision ownership into the slot.
         const slot_ve_resp = mm.embeddings;
         mm.embeddings = null;
         const slot_mrope = mm.mrope;
         mm.mrope = .{};
-        const sch = http_server.global_scheduler.?;
-        slot_handle = try sch.submit(.{
+        const sch = http_server.launch().global_scheduler.?;
+        running = try mlx_engine.Running.submit(sch, .{
             .model = lm,
             .prompt_ids = prompt_ids,
             .full_prompt = prompt_ids,
@@ -937,7 +937,7 @@ fn handleResponsesInner(
             .logprobs_n = 0,
             .kv_quant_config = kv_quant_override,
         });
-        var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_slice);
+        var ts = StreamingTokenStream.initFromStream(running.?.stream, stream_mode, eos_slice);
         defer ts.deinit(allocator);
 
         var raw_buf = std.ArrayList(u8).empty;
@@ -983,13 +983,13 @@ fn handleResponsesInner(
                     // keepalive stops clients timing out on stream silence.
                     if (stream.peerClosed()) {
                         log.info("  [cancel] client disconnected while waiting for tokens — cancelling slot\n", .{});
-                        slot_handle.?.cancel();
+                        running.?.stream.cancel();
                         client_gone = true;
                         break;
                     }
                     sendStreamKeepalive(stream) catch {
                         log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
-                        slot_handle.?.cancel();
+                        running.?.stream.cancel();
                         client_gone = true;
                         break;
                     };
@@ -997,7 +997,7 @@ fn handleResponsesInner(
                 },
             };
             if (stream.peerClosed()) {
-                slot_handle.?.cancel();
+                running.?.stream.cancel();
                 client_gone = true;
                 break;
             }
@@ -1005,7 +1005,7 @@ fn handleResponsesInner(
             var token_text = if (next_id) |token_id| blk: {
                 try token_ids_buf.append(allocator, token_id);
                 const raw_decoded = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, false);
-                if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
+                if (delivery) |*d| d.noteToken(raw_decoded.len, running.?.stream.constraintPayloadStart());
                 const with_carry = if (utf8_carry_len > 0) cc: {
                     const combined = try allocator.alloc(u8, utf8_carry_len + raw_decoded.len);
                     @memcpy(combined[0..utf8_carry_len], utf8_carry[0..utf8_carry_len]);
@@ -1046,7 +1046,7 @@ fn handleResponsesInner(
             // a dead server from the client's socket.
             beatStreamKeepalive(stream, .sse_comment) catch {
                 log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
-                slot_handle.?.cancel();
+                running.?.stream.cancel();
                 client_gone = true;
                 break;
             };
@@ -1260,7 +1260,7 @@ fn handleResponsesInner(
         const slot_mrope = mm.mrope;
         mm.mrope = .{};
         // Propagates to `handleResponses`' one error arm, shared with the streaming half.
-        result = try nonStreamingViaScheduler(allocator, http_server.global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve_ns, mm.media, cache_key, slot_mrope, 0, false, kv_quant_override, kv_attn_explicit, stream);
+        result = try nonStreamingViaScheduler(allocator, http_server.launch().global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve_ns, mm.media, cache_key, slot_mrope, 0, false, kv_quant_override, kv_attn_explicit, stream);
     }
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);

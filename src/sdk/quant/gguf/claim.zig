@@ -17,7 +17,7 @@ const ClaimState = struct {
     /// Opt-in (`--mlx-gguf`); `--engine ds4|llama` keeps it off.
     enabled: bool = false,
 };
-const claimState_shared = @import("../../util/shared.zig").Shared(ClaimState, "gguf_claim", .{});
+pub const claimState_shared = @import("../../util/shared.zig").Shared(ClaimState, "gguf_claim", .{});
 pub inline fn claimState() *ClaimState {
     return claimState_shared.get();
 }

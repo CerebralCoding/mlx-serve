@@ -3,14 +3,14 @@
 const std = @import("std");
 const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
-const kv_quant = @import("../../engines/mlx/cache/kv_quant.zig");
+const kv_quant = @import("../../sdk/blocks/attention/kv_quant.zig");
 const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
-const generate_mod = @import("../../engines/mlx/generate.zig");
+const request_mod = @import("../../sdk/request/request.zig");
 const chat_mod = @import("../chat/chat.zig");
-const rp_mod = @import("../chat/reasoning/protocol.zig");
+const rp_mod = @import("../../sdk/grammar/protocol.zig");
 const log = @import("../../sdk/util/log.zig");
-const prefix_cache_mod = @import("../../engines/mlx/cache/prefix_cache.zig");
-const scheduler_mod = @import("../../engines/mlx/scheduler.zig");
+const MediaSpan = @import("../../sdk/kv/media_span.zig").MediaSpan;
+const mlx_engine = @import("../engines/mlx.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;
 const LoadedModel = model_registry_mod.LoadedModel;
@@ -20,8 +20,8 @@ const testing = std.testing;
 const http_server = @import("../http/server.zig");
 
 const Conn = @import("../http/conn.zig").Conn;
-const resolveKvAttnFused = @import("../../engines/mlx/request_options.zig").resolveKvAttnFused;
-const mtpCapable = @import("../../engines/mlx/request_options.zig").mtpCapable;
+const resolveKvAttnFused = @import("request_options.zig").resolveKvAttnFused;
+const mtpCapable = @import("request_options.zig").mtpCapable;
 const getTimeoutNs = @import("../http/server.zig").getTimeoutNs;
 const decodeTokens = @import("tokenize.zig").decodeTokens;
 const promptOpensThink = @import("../chat/reasoning/request.zig").promptOpensThink;
@@ -34,8 +34,8 @@ const parseToolCallsForRequest = @import("../chat/tools/pipeline.zig").parseTool
 const StopStream = @import("../chat/stops.zig").StopStream;
 const emitConstrainedAnthropic = @import("chat_completions.zig").emitConstrainedAnthropic;
 const StreamingTokenStream = @import("chat_stream.zig").StreamingTokenStream;
-const requestHasCompany = @import("../../engines/mlx/request_options.zig").requestHasCompany;
-const pickStreamMode = @import("../../engines/mlx/request_options.zig").pickStreamMode;
+const requestHasCompany = @import("request_options.zig").requestHasCompany;
+const pickStreamMode = @import("request_options.zig").pickStreamMode;
 const SSE_ALLOW_HEADERS_ANTHROPIC = @import("../http/respond.zig").SSE_ALLOW_HEADERS_ANTHROPIC;
 const sendSseHeaders = @import("../http/respond.zig").sendSseHeaders;
 const utf8TrailingIncomplete = @import("format.zig").utf8TrailingIncomplete;
@@ -54,7 +54,7 @@ pub fn handleAnthropicStreaming(
     tok: *const Tokenizer,
     prompt_ids: []const u32,
     max_tokens: u32,
-    sampling: generate_mod.SamplingParams,
+    sampling: request_mod.SamplingParams,
     eos_token_ids: []const u32,
     stop_sequences: []const []const u8,
     model_name: []const u8,
@@ -73,7 +73,7 @@ pub fn handleAnthropicStreaming(
     enable_mtp: bool,
     allow_batch_mtp: bool,
     vision_embeddings: ?mlx.mlx_array,
-    media: []const prefix_cache_mod.MediaSpan,
+    media: []const MediaSpan,
     mrope: MropeData,
     cache_key: u64,
     /// Wave 1.A: per-request KV-quant override.
@@ -102,14 +102,14 @@ pub fn handleAnthropicStreaming(
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
 
-    var slot_handle: ?*scheduler_mod.Slot = null;
-    defer if (slot_handle) |s| http_server.global_scheduler.?.complete(s);
+    var running: ?mlx_engine.Running = null;
+    defer if (running) |r| r.done();
 
     // Transfer vision ownership into the slot.
     const slot_ve_anth = ve_local;
     ve_local = null;
-    const sch = http_server.global_scheduler.?;
-    slot_handle = try sch.submit(.{
+    const sch = http_server.launch().global_scheduler.?;
+    running = try mlx_engine.Running.submit(sch, .{
         .model = lm,
         .prompt_ids = prompt_ids,
         .full_prompt = prompt_ids,
@@ -142,7 +142,7 @@ pub fn handleAnthropicStreaming(
         .mrope_delta = mrope.delta,
         .kv_quant_config = kv_quant_override,
     });
-    var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_token_ids);
+    var ts = StreamingTokenStream.initFromStream(running.?.stream, stream_mode, eos_token_ids);
     defer ts.deinit(allocator);
 
     // SSE headers
@@ -238,13 +238,13 @@ pub fn handleAnthropicStreaming(
                 // keepalive stops clients timing out on stream silence.
                 if (stream.peerClosed()) {
                     log.info("  [cancel] client disconnected while waiting for tokens — cancelling slot\n", .{});
-                    slot_handle.?.cancel();
+                    running.?.stream.cancel();
                     client_gone = true;
                     break;
                 }
                 sendAnthropicEvent(stream, "ping", "{\"type\":\"ping\"}") catch {
                     log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
-                    slot_handle.?.cancel();
+                    running.?.stream.cancel();
                     client_gone = true;
                     break;
                 };
@@ -252,7 +252,7 @@ pub fn handleAnthropicStreaming(
             },
         };
         if (stream.peerClosed()) {
-            slot_handle.?.cancel();
+            running.?.stream.cancel();
             client_gone = true;
             break;
         }
@@ -260,7 +260,7 @@ pub fn handleAnthropicStreaming(
         var token_text = if (next_id) |token_id| blk: {
             const strip = tok.tok_type == .sentencepiece_bpe;
             const raw_decoded = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, strip and false);
-            if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
+            if (delivery) |*d| d.noteToken(raw_decoded.len, running.?.stream.constraintPayloadStart());
             const with_carry = if (utf8_carry_len > 0) cc: {
                 const combined = try allocator.alloc(u8, utf8_carry_len + raw_decoded.len);
                 @memcpy(combined[0..utf8_carry_len], utf8_carry[0..utf8_carry_len]);
@@ -689,7 +689,7 @@ pub fn handleAnthropicStreaming(
         // silence, not off token arrival.
         beatStreamKeepalive(stream, .anthropic_ping) catch {
             log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
-            slot_handle.?.cancel();
+            running.?.stream.cancel();
             client_gone = true;
             break;
         };

@@ -1,21 +1,21 @@
 //! Load preflight: resident and on-disk bills, the eviction gate estimate, available memory.
 
 const std = @import("std");
-const mlx = @import("../../mlx/ffi.zig");
-const ple_gpu = @import("../../plugins/qwen4_exp/ple_gpu.zig");
-const gen_mod = @import("../media_jobs/gen.zig");
-const mtp_mod = @import("../../sdk/spec/mtp/mtp.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
-const plugin_driver = @import("../../engines/mlx/plugin/driver.zig");
-const abi = @import("../../abi/plugin.zig");
-const log = @import("../../sdk/util/log.zig");
-const modelopt_pack = @import("../../sdk/quant/nvfp4/modelopt_pack.zig");
-const model_registry_mod = @import("registry.zig");
-const model_discovery = @import("discovery.zig");
-const mlx_gguf = @import("../../sdk/quant/gguf/claim.zig");
-const status = @import("../status.zig");
-const streamed = @import("../../sdk/weights/streamed.zig");
-const mlx_stream = if (@import("build_options").mlx_stream) @import("../../engines/mlx/modules/stream_glue.zig") else @import("../../engines/mlx/modules/stream_stub.zig");
+const mlx = @import("../../../mlx/ffi.zig");
+const ple_gpu = @import("../../../plugins/qwen4_exp/ple_gpu.zig");
+const gen_mod = @import("../../../host/media_jobs/gen.zig");
+const mtp_mod = @import("../../../sdk/spec/mtp/mtp.zig");
+const model_mod = @import("../../../sdk/config/model.zig");
+const plugin_driver = @import("../plugin/driver.zig");
+const abi = @import("../../../abi/plugin.zig");
+const log = @import("../../../sdk/util/log.zig");
+const modelopt_pack = @import("../../../sdk/quant/nvfp4/modelopt_pack.zig");
+const model_registry_mod = @import("../../../host/registry/registry.zig");
+const model_discovery = @import("../../../host/registry/discovery.zig");
+const mlx_gguf = @import("../../../sdk/quant/gguf/claim.zig");
+const status = @import("../../../host/status.zig");
+const streamed = @import("../../../sdk/weights/streamed.zig");
+const mlx_stream = if (@import("build_options").mlx_stream) @import("../modules/stream_glue.zig") else @import("../modules/stream_stub.zig");
 const testing = std.testing;
 
 /// A load whose own bill exceeds the memory cap is refused whatever else is resident.
@@ -130,7 +130,7 @@ pub fn modelDiskBytes(io: std.Io, model_dir: []const u8) u64 {
 pub fn residentModelDiskBytes(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, config: *const model_mod.ModelConfig) !u64 {
     const shards = try shardResidentBytes(allocator, io, model_dir, config);
     const whole = if (config.modelopt) shards +| modelopt_pack.bankExpansionBytes(model_dir) else shards;
-    return @import("../../engines/mlx/cluster/distributed.zig").hostShare(model_dir, config, whole);
+    return @import("../cluster/distributed.zig").hostShare(model_dir, config, whole);
 }
 
 fn shardResidentBytes(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, config: *const model_mod.ModelConfig) !u64 {
@@ -181,11 +181,11 @@ pub fn availForLoad(io: std.Io, need: u64) u64 {
     if (memInsufficientForLoad(need, avail)) {
         const released = gen_mod.releaseMediaResidency();
         if (released > 0) {
-            model_registry_mod.last_unload.record(model_registry_mod.monotonicMs(), released);
+            model_registry_mod.generations().last_unload.record(model_registry_mod.monotonicMs(), released);
             avail = loadAvail(io);
         }
     }
-    if (!waitForUnload(need, avail, model_registry_mod.last_unload, model_registry_mod.monotonicMs())) return avail;
+    if (!waitForUnload(need, avail, model_registry_mod.generations().last_unload, model_registry_mod.monotonicMs())) return avail;
     return settledAvail(need, avail, io, loadAvail, pauseLoadAvail);
 }
 
@@ -386,7 +386,7 @@ test "residentModelDiskBytes: a served pack is billed by its plugin's resident_b
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir = buf[0..try tmp.dir.realPath(io, &buf)];
     const table: abi.ModelTable = .{ .name = .of("t"), .claims = undefined, .parse = undefined, .free_parsed = undefined, .bill = undefined, .load = undefined, .unload = undefined, .forward = undefined, .cache = undefined, .weights = &.{ .resident_bytes = &T.resident } };
-    var binding: @import("../../engines/mlx/plugin/config.zig").Binding = .{ .table = &table };
+    var binding: @import("../plugin/config.zig").Binding = .{ .table = &table };
     var config: model_mod.ModelConfig = .{ .num_hidden_layers = 2, .hidden_size = 64 };
     try std.testing.expectEqual(@as(u64, 10), try residentModelDiskBytes(std.testing.allocator, io, dir, &config));
     config.plugin = &binding;
@@ -530,7 +530,7 @@ test "the preflight bills an MTP sidecar the index never names, never an in-chec
 test "media bill: CUDA checks the weights against RAM and only the working set against the GPU" {
     const GB: u64 = 1024 * 1024 * 1024;
     // Music3 8-bit: 13 GB of weights + its 6 GB generation buffer.
-    const buffer = @import("../../plugins/music3/config.zig").gen_buffer_bytes;
+    const buffer = @import("../../../plugins/music3/config.zig").gen_buffer_bytes;
     const peak = 13 * GB + buffer;
     const cuda = mediaBill(peak, 13 * GB, true);
     try std.testing.expectEqual(13 * GB, cuda.ram);
@@ -666,10 +666,10 @@ test "memInsufficientForLoad: headroom + unknown-query guards" {
 }
 
 test "availForLoad: only a load that would be refused makes media residency let go" {
-    var held = @import("../../plugins/minimax_h3/h3.zig").Resident.init(std.testing.allocator);
+    var held = @import("../../../plugins/minimax_h3/h3.zig").Resident.init(std.testing.allocator);
     held.bytes = 1000;
-    @import("../../plugins/minimax_h3/h3.zig").registerResident(&held);
-    defer @import("../../plugins/minimax_h3/h3.zig").unregisterResident(&held);
+    @import("../../../plugins/minimax_h3/h3.zig").registerResident(&held);
+    defer @import("../../../plugins/minimax_h3/h3.zig").unregisterResident(&held);
     _ = availForLoad(testing.io, 1); // fits anywhere: the cache stays
     try std.testing.expectEqual(@as(u64, 1000), held.bytes);
     _ = availForLoad(testing.io, 1 << 50); // can never fit: the cache is released before the refusal
@@ -691,8 +691,8 @@ test "residentModelDiskBytes: with stream_experts a pack bills its residents and
     defer td.cleanup();
     var buf: [512]u8 = undefined;
     const dir = buf[0..try td.dir.realPath(io, &buf)];
-    try @import("../../sdk/weights/streamed/mlx_pack_test.zig").writePack(dir);
-    var config: model_mod.ModelConfig = .{ .num_experts = @import("../../sdk/weights/streamed/mlx_pack_test.zig").E, .stream_experts_override = .{ .rows = 2 } };
+    try @import("../../../sdk/weights/streamed/mlx_pack_test.zig").writePack(dir);
+    var config: model_mod.ModelConfig = .{ .num_experts = @import("../../../sdk/weights/streamed/mlx_pack_test.zig").E, .stream_experts_override = .{ .rows = 2 } };
     const b = try streamed.Streamed.packBytes(std.testing.allocator, dir, 2);
     try std.testing.expectEqual(modelDiskBytes(io, dir) - b.experts + b.slots, try residentModelDiskBytes(std.testing.allocator, io, dir, &config));
     config.stream_experts_override = null;

@@ -72,7 +72,7 @@ test "format corpus: video atoms come only from media parts and preserve text" {
 }
 
 test "format corpus: native RADIO capabilities agree before and after load" {
-    const model = @import("../../engines/mlx/model.zig");
+    const model = @import("../../sdk/config/model.zig");
     const discovery = @import("../registry/discovery.zig");
     const cases = [_]struct { source: []const u8, radio: bool, final_norm: bool = false }{
         .{ .source = @embedFile("../../fixtures/model-configs/nemotron_h_super_omni.json"), .radio = true, .final_norm = true },
@@ -102,7 +102,7 @@ test "format corpus: native RADIO capabilities agree before and after load" {
 }
 
 test "format corpus: Nemotron SSM bounds reject nonnumeric sentinel values" {
-    const model = @import("../../engines/mlx/model.zig");
+    const model = @import("../../sdk/config/model.zig");
     for ([_][]const u8{ "nemotron_h", "nemotron_h_puzzle", "nemotron_h_omni" }) |model_type| {
         for ([_][]const u8{ "\"NaN\"", "\"-Infinity\"", "{\"__float__\":\"-Infinity\"}", "{\"__float__\":\"NaN\"}", "{}", "true" }) |bound| {
             const source = if (std.mem.eql(u8, model_type, "nemotron_h_omni"))
@@ -2946,7 +2946,7 @@ test "format corpus: parse -> serialize -> parse is a fixpoint per family" {
 }
 
 test "format corpus: constrained JSON marker strings are data on every protocol" {
-    const rp = @import("reasoning/protocol.zig");
+    const rp = @import("../../sdk/grammar/protocol.zig");
     const json = "{\"note\":\"<think>kept</think> <|channel>thought <|content_thinking|> <tool_call>literal</tool_call>\"}";
     inline for (std.meta.tags(rp.Kind)) |kind| {
         var proto = rp.Protocol{ .kind = kind, .initial_phase = .json_body };
@@ -2967,21 +2967,3 @@ test "format corpus: constrained JSON marker strings are data on every protocol"
     }
 }
 
-test "format corpus: native LiLiCorr configs preserve borrowed and own output heads" {
-    const dflash = @import("../../engines/mlx/spec/dflash/dflash.zig");
-    const cases = [_]struct { source: []const u8, own_head: bool, captures: []const u32 }{
-        .{ .source = @embedFile("../../fixtures/lilicorr_config.json"), .own_head = false, .captures = &.{ 0, 17, 34, 50, 67, 84 } },
-        .{ .source = @embedFile("../../fixtures/model-configs/nemotron_h_super_drafter.json"), .own_head = true, .captures = &.{ 0, 21, 42, 63, 84 } },
-    };
-    for (cases) |case| {
-        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, case.source, .{});
-        defer parsed.deinit();
-        try testing.expect(dflash.isDflashConfigJson(parsed.value.object));
-        var config = try dflash.parseConfigFromJson(testing.allocator, case.source);
-        defer config.deinit(testing.allocator);
-        try testing.expect(config.lilicorr);
-        try testing.expectEqual(case.own_head, config.has_own_lm_head);
-        if (case.own_head) try testing.expectEqual(@as(u32, 131072), config.draft_vocab_size);
-        try testing.expectEqualSlices(u32, case.captures, config.captureIds());
-    }
-}

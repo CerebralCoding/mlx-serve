@@ -1,7 +1,7 @@
 //! computeQwenMrope (Qwen3-VL positions)
 
 const std = @import("std");
-const model_mod = @import("../../engines/mlx/model.zig");
+const model_mod = @import("../../sdk/config/model.zig");
 const mrope_mod = @import("../../sdk/vision/mrope.zig");
 const log = @import("../../sdk/util/log.zig");
 

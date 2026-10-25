@@ -6,17 +6,8 @@ const SamplingParams = @import("params.zig").SamplingParams;
 const sampleToken = @import("sampler.zig").sampleToken;
 
 
-/// Per-token logprob info (OpenAI format).
-pub const TokenLogprob = struct {
-    token_id: u32,
-    logprob: f32,
-};
-
-/// Logprob result for a single generated token.
-pub const LogprobResult = struct {
-    token_logprob: f32, // logprob of the chosen token
-    top_logprobs: []TokenLogprob, // top N alternatives (caller must free)
-};
+pub const TokenLogprob = @import("../../../sdk/request/logprob.zig").TokenLogprob;
+pub const LogprobResult = @import("../../../sdk/request/logprob.zig").LogprobResult;
 
 /// Logprobs for the FIRST generated token, taken from the prefill's
 /// final-position logits — the one distribution the decode loop never sees.
@@ -58,9 +49,7 @@ pub fn firstTokenLogprobs(allocator: std.mem.Allocator, logits: mlx.mlx_array, c
 /// this did — is ambiguous the moment two logits tie, which under the
 /// saturation above is everywhere: rank 1 was measured to be the chosen token
 /// in 0 of 5 positions on a trivial greedy prompt.
-/// Widest `top_logprobs` / `logprobs` a request may ask for. OpenAI stops at 20; a
-/// fidelity probe (KL against a reference distribution) needs the pack's tail too.
-pub const MAX_TOP_LOGPROBS: u32 = 1024;
+pub const MAX_TOP_LOGPROBS = @import("../../../sdk/request/logprob.zig").MAX_TOP_LOGPROBS;
 
 pub fn computeLogprobs(allocator: std.mem.Allocator, logits: mlx.mlx_array, chosen_token: u32, top_n: u32, s: mlx.mlx_stream) !LogprobResult {
     // Every caller passes one position, as [1, V] or [1, 1, V].

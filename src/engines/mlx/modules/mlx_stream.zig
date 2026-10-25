@@ -4,7 +4,7 @@
 const std = @import("std");
 const mlx_stream_mod = if (@import("build_options").mlx_stream) @import("stream_glue.zig") else @import("stream_stub.zig");
 const mlx = @import("../../../mlx/ffi.zig");
-const ModelConfig = @import("../model.zig").ModelConfig;
+const ModelConfig = @import("../../../sdk/config/model.zig").ModelConfig;
 const ForwardCtx = @import("../forward_ctx.zig").ForwardCtx;
 const Transformer = @import("../transformer.zig").Transformer;
 const moduleShell = @import("shell.zig").moduleShell;

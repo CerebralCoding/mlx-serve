@@ -6,7 +6,7 @@ const moe_fp4 = @import("moe_fp4.zig");
 const testing = std.testing;
 const swigluClampLimit = @import("../mlp/activations.zig").swigluClampLimit;
 const moeFp4DecodeEligible = decode.moeFp4DecodeEligible;
-const ModelConfig = @import("../../../engines/mlx/model.zig").ModelConfig;
+const ModelConfig = @import("../../config/model.zig").ModelConfig;
 
 test "moe fp4 decode: expert biases or a clamp no kernel serves keep the composed chain" {
     var cfg: ModelConfig = undefined;

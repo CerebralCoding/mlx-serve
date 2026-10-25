@@ -4,54 +4,36 @@ const crt = @import("../../sdk/util/crt.zig");
 const win_io = @import("../../sdk/util/win_io.zig");
 const builtin = @import("builtin");
 const mlx = @import("../../mlx/ffi.zig");
-const transformer_mod = @import("../../engines/mlx/transformer.zig");
-const kv_quant_mod = @import("../../engines/mlx/cache/kv_quant.zig");
+const kv_quant_mod = @import("../../sdk/blocks/attention/kv_quant.zig");
 const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
-const generate_mod = @import("../../engines/mlx/generate.zig");
 const generation_settings = @import("../api/generation_settings.zig");
 const mtp_mod = @import("../../sdk/spec/mtp/mtp.zig");
-const mtp_acceptance_mod = @import("../../engines/mlx/spec/mtp_acceptance.zig");
-const drafter_mod = @import("../../plugins/gemma4/assistant_drafter.zig");
+const mtp_acceptance_mod = @import("../../sdk/spec/mtp_acceptance.zig");
 const chat_mod = @import("../chat/chat.zig");
-const rp_mod = @import("../chat/reasoning/protocol.zig");
-const token_mask = @import("../../engines/mlx/grammar/token_mask.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
-const dsv4_mod = @import("../../plugins/deepseek_v4/deepseek_v4.zig");
-const dsv41_mod = @import("../../plugins/deepseek_v41/deepseek_v41.zig");
-const mlx_stream = if (@import("build_options").mlx_stream) @import("../../engines/mlx/modules/stream_glue.zig") else @import("../../engines/mlx/modules/stream_stub.zig");
+const rp_mod = @import("../../sdk/grammar/protocol.zig");
+const token_mask = @import("../../sdk/grammar/token_mask.zig");
+const model_mod = @import("../../sdk/config/model.zig");
 const qwen_vision = @import("../../sdk/vision/qwen_vision.zig");
-const muse_vision = @import("../../plugins/muse_glimmer/vision.zig");
-const lfm2_vision = @import("../../plugins/lfm2/vision.zig");
-const glm_vision = @import("../../plugins/glm5_next/vision.zig");
-const dsv41_vision = @import("../../plugins/deepseek_v41/vision.zig");
-const radio_vision = @import("../../plugins/nemotron_h/radio_vision.zig");
-const minicpm_vision = @import("../../plugins/qwen3_5/minicpm_vision.zig");
-const minicpm_canvas = @import("../../plugins/qwen3_5/minicpm_canvas.zig");
 const mrope_mod = @import("../../sdk/vision/mrope.zig");
-const vision_mod = @import("../../engines/mlx/vision_encoder.zig");
 const log = @import("../../sdk/util/log.zig");
 const responses_mod = @import("../api/responses/model.zig");
-const pld_index = @import("../../engines/mlx/spec/pld_index.zig");
-const prefix_cache_mod = @import("../../engines/mlx/cache/prefix_cache.zig");
+const pld_index = @import("../../sdk/spec/pld_index.zig");
 const tokenize_cache_mod = @import("../tokenizer/cache.zig");
-const scheduler_mod = @import("../../engines/mlx/scheduler.zig");
+const Scheduler = @import("../gpu_thread/scheduler.zig").Scheduler;
+const LoadParams = @import("../gpu_thread/params.zig").LoadParams;
+const LlamaSettings = @import("../../sdk/quant/gguf/llama_settings.zig").Settings;
+const mlx_engine = @import("../engines/mlx.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const model_discovery = @import("../registry/discovery.zig");
 const mlx_gguf = @import("../../sdk/quant/gguf/claim.zig");
 const media_mod = @import("../media_jobs/gen.zig");
 const transcription_mod = @import("../api/audio/transcription.zig");
-const forced_align_mod = @import("../../plugins/qwen3_asr/forced_align.zig");
 const stb = @import("stb");
 const webp = @import("webp");
 const metrics = @import("../status.zig");
 const instr = @import("../metrics/metrics.zig");
-const ane_mod = @import("../../sdk/ane/offload.zig");
-const qwen4_mod = @import("../../plugins/qwen4_exp/qwen4_exp.zig");
 
-const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
-const Generator = generate_mod.Generator;
-const VisionEncoder = vision_mod.VisionEncoder;
 const ModelRegistry = model_registry_mod.ModelRegistry;
 const LoadedModel = model_registry_mod.LoadedModel;
 /// Global flag set by signal handler for graceful shutdown.
@@ -154,15 +136,12 @@ const nowMsMonotonic = io_util.nowMsMonotonic;
 const Stopwatch = io_util.Stopwatch;
 const request_model = @import("../api/request_model.zig");
 const sampling = @import("../api/sampling.zig");
+const admission = @import("../api/admission.zig");
 
 pub const Conn = @import("conn.zig").Conn;
-pub const KvAttnMode = @import("../../engines/mlx/request_options.zig").KvAttnMode;
-pub const mtpAllowedByDefault = @import("../../engines/mlx/request_options.zig").mtpAllowedByDefault;
-pub const PREFIX_CACHE_MEM_DEFAULT = @import("../../engines/mlx/admission/hot_cache_plan.zig").PREFIX_CACHE_MEM_DEFAULT;
-pub const resolvedPrefixCacheMem = @import("../../engines/mlx/admission/hot_cache_plan.zig").resolvedPrefixCacheMem;
-pub const clearResolvedPrefixCacheMem = @import("../../engines/mlx/admission/hot_cache_plan.zig").clearResolvedPrefixCacheMem;
-pub const effectiveSsmCheckpointStride = @import("../../engines/mlx/admission/hot_cache_plan.zig").effectiveSsmCheckpointStride;
-pub const PldDefaults = @import("../../engines/mlx/request_options.zig").PldDefaults;
+pub const KvAttnMode = @import("../api/request_options.zig").KvAttnMode;
+pub const mtpAllowedByDefault = @import("../api/request_options.zig").mtpAllowedByDefault;
+pub const PldDefaults = @import("../api/request_options.zig").PldDefaults;
 pub const launchMaxTokensDefault = @import("../api/sampling.zig").launchMaxTokensDefault;
 pub const deinitGlobalResponseStore = @import("../api/responses/store.zig").deinitGlobalResponseStore;
 pub const listenExclusive = @import("listen.zig").listenExclusive;
@@ -171,27 +150,11 @@ pub const parseIp4 = @import("listen.zig").parseIp4;
 pub const StartupResponder = @import("listen.zig").StartupResponder;
 pub const ConnThreadArgs = @import("request.zig").ConnThreadArgs;
 pub const handleConnectionThread = @import("request.zig").handleConnectionThread;
-pub const auto_ctx_safety_pct = @import("../../engines/mlx/admission/context.zig").auto_ctx_safety_pct;
-pub const safeAutoContext = @import("../../engines/mlx/admission/context.zig").safeAutoContext;
-pub const pinAutoContext = @import("../../engines/mlx/admission/context.zig").pinAutoContext;
-pub const getEffectiveContextLength = @import("../../engines/mlx/admission/context.zig").getEffectiveContextLength;
 pub const WIRED_LIMIT_MARGIN_BYTES = @import("../registry/memory_ceiling.zig").WIRED_LIMIT_MARGIN_BYTES;
 pub const parseWiredMarginGib = @import("../registry/memory_ceiling.zig").parseWiredMarginGib;
 pub const applyMlxCacheLimit = @import("../../mlx/state.zig").applyMlxCacheLimit;
 pub const staticGpuMemoryCeiling = @import("../registry/memory_ceiling.zig").staticGpuMemoryCeiling;
 pub const applyGpuCeilingEnv = @import("../registry/memory_ceiling.zig").applyGpuCeilingEnv;
-pub const aneGateHeadroom = @import("../../engines/mlx/admission/bills.zig").aneGateHeadroom;
-pub const autoPrefillChunkCap = @import("../../engines/mlx/admission/prefill_chunk.zig").autoPrefillChunkCap;
-pub const pinPrefillChunk = @import("../../engines/mlx/admission/prefill_chunk.zig").pinPrefillChunk;
-pub const prefixCacheMemForLoad = @import("../../engines/mlx/admission/hot_cache_plan.zig").prefixCacheMemForLoad;
-pub const computeMemoryContext = @import("../../engines/mlx/admission/context.zig").computeMemoryContext;
-pub const requestPrefillChunkNow = @import("../../engines/mlx/admission/prefill_chunk.zig").requestPrefillChunkNow;
-pub const adaptivePrefillChunkEnabled = @import("../../engines/mlx/admission/prefill_chunk.zig").adaptivePrefillChunkEnabled;
-pub const adaptivePrefillWidenStillFits = @import("../../engines/mlx/admission/prefill_chunk.zig").adaptivePrefillWidenStillFits;
-pub const adaptivePrefillWidthNow = @import("../../engines/mlx/admission/prefill_chunk.zig").adaptivePrefillWidthNow;
-pub const prefillFitsNow = @import("../../engines/mlx/admission/admit.zig").prefillFitsNow;
-pub const prefillBillNumbersNow = @import("../../engines/mlx/admission/admit.zig").prefillBillNumbersNow;
-pub const logPrefillRefusal = @import("../../engines/mlx/admission/admit.zig").logPrefillRefusal;
 pub const peerIsLoopback = @import("auth.zig").peerIsLoopback;
 pub const visionPreprocFromConfig = @import("../media/prepare.zig").visionPreprocFromConfig;
 pub const parseImageUrlContent = @import("../media/request_media.zig").parseImageUrlContent;
@@ -248,7 +211,24 @@ const ServerState = struct {
     /// `--wired-margin-gib` in bytes: what stays unplanned under a raised wired limit.
     wired_limit_margin_bytes: u64 = WIRED_LIMIT_MARGIN_BYTES,
 };
-const serverState_shared = @import("../../sdk/util/shared.zig").Shared(ServerState, "server_config", .{});
+/// The launch settings the engine's admission code reads beside the host, one copy for every compile unit (`Shared`).
+pub const Launch = struct {
+    global_scheduler: ?*Scheduler = null,
+    configured_kv_quant: ?kv_quant_mod.KVQuantConfig = null,
+    prefix_cache_capacity: u32 = 32,
+    prefix_cache_ram_enabled: bool = true,
+    prefix_cache_mem_bytes: u64 = PREFIX_CACHE_MEM_DEFAULT,
+    prefix_cache_mem_explicit: bool = false,
+    prefix_cache_disk_bytes: u64 = 0,
+    ssm_checkpoint_stride: u32 = 256,
+    ssm_checkpoint_max: u32 = 16,
+};
+pub const launch_shared = @import("../../sdk/util/shared.zig").Shared(Launch, "launch", .{});
+pub inline fn launch() *Launch {
+    return launch_shared.get();
+}
+
+pub const serverState_shared = @import("../../sdk/util/shared.zig").Shared(ServerState, "server_config", .{});
 pub inline fn serverState() *ServerState {
     return serverState_shared.get();
 }
@@ -262,18 +242,16 @@ pub fn getTimeoutNs() u64 {
 /// serve mode (set by `serve()`); null only before `serve()` runs. Every
 /// inference request handler routes through this; the scheduler's
 /// inference thread is the single mlx-call site.
-pub var global_scheduler: ?*scheduler_mod.Scheduler = null;
 
 /// The boot's parsed `--kv-quant`, published by `serve()` before `Scheduler.init` so a
 /// load-time bill sees it (the scheduler does not exist yet during the load; asking it billed
 /// the SSD-first session at bf16, ~8.6 GB of idle allowance lost at 786k).
-pub var configured_kv_quant: ?kv_quant_mod.KVQuantConfig = null;
 
 /// The process-wide kv-quant config at any point: the scheduler's once it exists, the boot's
 /// published value during the load, dense when no flag was given.
 fn configuredKvQuant() kv_quant_mod.KVQuantConfig {
-    if (global_scheduler) |sch| return sch.kv_quant_config;
-    return configured_kv_quant orelse kv_quant_mod.KVQuantConfig.dense;
+    if (launch().global_scheduler) |sch| return sch.kv_quant_config;
+    return launch().configured_kv_quant orelse kv_quant_mod.KVQuantConfig.dense;
 }
 
 /// The width THIS model stores at: its `model-settings.json` override, else the process default.
@@ -301,10 +279,10 @@ pub var global_registry: ?*ModelRegistry = null;
 // turn. The count cap is pure retention metadata; the byte budget
 // (`--prefix-cache-mem`, default 2 GB) is what actually bounds memory,
 // evicting LRU entries by size. 0 disables.
-pub var prefix_cache_capacity: u32 = 32;
 
 /// `--no-prefix-cache-ram` keeps the disk tier eligible without idle RAM retention.
-pub var prefix_cache_ram_enabled: bool = true;
+
+pub const PREFIX_CACHE_MEM_DEFAULT: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Wave 1.B — hot prefix cache memory budget. The cache evicts LRU entries on
 /// commit until `current_kv_bytes + new_bytes <= prefix_cache_mem_bytes`. The
@@ -313,10 +291,8 @@ pub var prefix_cache_ram_enabled: bool = true;
 /// `--prefix-cache-mem <N>{GB,MB}`. 0 disables the byte budget (count cap
 /// from `--prefix-cache-entries` still applies). On qwen4_exp's RAM-first arm an
 /// unset budget grows to one session at the working context (`defaultPrefixCacheAsk`).
-pub var prefix_cache_mem_bytes: u64 = PREFIX_CACHE_MEM_DEFAULT;
 
 /// Set by `--prefix-cache-mem`: an operator's number is used as given, even when it equals the default.
-pub var prefix_cache_mem_explicit = false;
 
 /// SSD tier for the hot prefix cache (`--prefix-cache-disk`). Committed KV
 /// prefixes persist as chunked safetensors under
@@ -328,7 +304,6 @@ pub var prefix_cache_mem_explicit = false;
 /// DEFAULT OFF (`0`): the tier can hold gigabytes of KV on disk, so it's opt-in
 /// — pass `--prefix-cache-disk <n>{KB,MB,GB}` to enable (10 GB is a sensible
 /// value). The Swift app exposes this as a Settings toggle, default off.
-pub var prefix_cache_disk_bytes: u64 = 0;
 
 /// `--shutdown-persist-secs`: on SIGTERM, finish the SSD slices the idle flush has not landed,
 /// for at most this long after the signal. 0 turns it off.
@@ -356,12 +331,10 @@ pub var shutdown_persist_secs: u32 = 45;
 /// The always-on end-of-prompt snapshot preserves append-growth multi-turn
 /// reuse for MoE regardless. Raise this (e.g. 512/1024) to also coarsen the
 /// non-MoE path; set 0 to disable (hybrid models then bypass the hot cache).
-pub var ssm_checkpoint_stride: u32 = 256;
 
 /// Phase 1: cap on the number of checkpoints retained per request. Snapshots
 /// past this drop the oldest (front of list) to keep memory bounded on very
 /// long prompts. 0 = unlimited (rely on the prefix-cache byte budget alone).
-pub var ssm_checkpoint_max: u32 = 16;
 
 /// Iteration 2 (perf-plan Phase 4 #3): LRU capacity of the per-LoadedModel
 /// chat-template tokenize cache. 0 disables (every request re-renders +
@@ -374,7 +347,7 @@ pub var tokenize_cache_entries: u32 = 4;
 /// Embedded llama.cpp engine settings: `--llama-cache-entries` (sequences per
 /// model), `--llama-kv-quant`, `--llama-ubatch`, `--llama-mtp-drafts`. Read when
 /// a GGUF model loads.
-pub var llama_settings: scheduler_mod.LlamaSettings = .{};
+pub var llama_settings: LlamaSettings = .{};
 
 /// Plan 01 — continuous batching: maximum concurrent in-flight requests sharing
 /// the inference thread's batched-decode pass. Set via `--max-concurrent N`.
@@ -400,7 +373,7 @@ pub fn serve(
     /// caller (main.zig) is responsible only for CPU-side setup (config parse,
     /// tokenizer load, EOS resolution, chat-template load); everything that
     /// touches mlx is done by `Scheduler.init` before this fn proceeds.
-    load_params: scheduler_mod.LoadParams,
+    load_params: LoadParams,
     config: *const model_mod.ModelConfig,
     host: []const u8,
     port: u16,
@@ -409,8 +382,8 @@ pub fn serve(
     serverState().server_config = cfg;
     // Before `Scheduler.init`: that call is the model load and every load-time bill inside it
     // asks for the KV width.
-    configured_kv_quant = load_params.kv_quant_config;
-    defer configured_kv_quant = null;
+    launch().configured_kv_quant = load_params.kv_quant_config;
+    defer launch().configured_kv_quant = null;
 
     // ── Phase A1: spin up the scheduler. Its inference thread does the
     //    Transformer/vision/drafter load, JIT compile, and warmup before
@@ -428,36 +401,13 @@ pub fn serve(
     if (!load_params.no_initial_load) startup.start();
     defer startup.stop();
 
-    var scheduler = try scheduler_mod.Scheduler.init(
-        allocator,
-        io,
-        load_params,
-        max_concurrent,
-    );
+    var scheduler = try mlx_engine.start(allocator, io, load_params, max_concurrent);
     defer scheduler.deinit();
     startup.stop();
-    global_scheduler = scheduler;
-    defer global_scheduler = null;
-    // The inference thread's evict-or-refuse hook (#353); the scheduler has no server import.
-    scheduler_mod.prefill_admission_fits = &prefillFitsNow;
-    defer scheduler_mod.prefill_admission_fits = null;
-    scheduler_mod.prefill_admission_numbers = &prefillBillNumbersNow;
-    defer scheduler_mod.prefill_admission_numbers = null;
-    scheduler_mod.prefill_request_chunk = &requestPrefillChunkNow;
-    defer scheduler_mod.prefill_request_chunk = null;
-    // The published budget is per model; retire it whenever the scheduler drops the cache.
-    scheduler_mod.hot_cache_budget_invalidate = &clearResolvedPrefixCacheMem;
-    defer scheduler_mod.hot_cache_budget_invalidate = null;
-    scheduler_mod.prefill_admission_refused_log = &logPrefillRefusal;
-    defer scheduler_mod.prefill_admission_refused_log = null;
-    // Asked by the prefill loop: the width of the next chunk, re-priced at every boundary.
-    scheduler_mod.prefill_chunk_adapt = &adaptivePrefillWidthNow;
-    defer scheduler_mod.prefill_chunk_adapt = null;
-    scheduler_mod.prefill_chunk_widen_ok = &adaptivePrefillWidenStillFits;
-    defer scheduler_mod.prefill_chunk_widen_ok = null;
-    // Whether the hook above can move anything for a given model (the installs are process-wide, so presence is not a gate).
-    scheduler_mod.prefill_chunk_adaptive_enabled = &adaptivePrefillChunkEnabled;
-    defer scheduler_mod.prefill_chunk_adaptive_enabled = null;
+    launch().global_scheduler = scheduler;
+    defer launch().global_scheduler = null;
+    mlx_engine.api().install_admission_hooks(true);
+    defer mlx_engine.api().install_admission_hooks(false);
 
     // Gauge sampler: samples instantaneous system + queue state every 2 s and
     // writes the metrics gauges. Only runs when --metrics is on. Trivial cost
@@ -511,27 +461,27 @@ pub fn serve(
             " [hybrid: SSM checkpoints]"
         else
             "";
-        if (!prefix_cache_ram_enabled and prefix_cache_disk_bytes > 0) {
+        if (!launch().prefix_cache_ram_enabled and launch().prefix_cache_disk_bytes > 0) {
             log.info("Prefix cache: SSD ONLY (RAM retention disabled, disk cap={d:.1} MB){s}\n", .{
-                @as(f64, @floatFromInt(prefix_cache_disk_bytes)) / (1024.0 * 1024.0),
+                @as(f64, @floatFromInt(launch().prefix_cache_disk_bytes)) / (1024.0 * 1024.0),
                 ssm_note,
             });
-        } else if (resolvedPrefixCacheMem() > 0) {
-            const cap_mb = @as(f64, @floatFromInt(resolvedPrefixCacheMem())) / (1024.0 * 1024.0);
-            log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap={d:.1} MB){s}\n", .{ prefix_cache_capacity, cap_mb, ssm_note });
+        } else if (admission.resolvedPrefixCacheMem() > 0) {
+            const cap_mb = @as(f64, @floatFromInt(admission.resolvedPrefixCacheMem())) / (1024.0 * 1024.0);
+            log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap={d:.1} MB){s}\n", .{ launch().prefix_cache_capacity, cap_mb, ssm_note });
         } else {
-            log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap=unlimited){s}\n", .{ prefix_cache_capacity, ssm_note });
+            log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap=unlimited){s}\n", .{ launch().prefix_cache_capacity, ssm_note });
         }
         if (config.has_hybrid_layers) {
-            log.info("  ssm-checkpoint-stride={d} tokens, max={d}/entry\n", .{ ssm_checkpoint_stride, ssm_checkpoint_max });
+            log.info("  ssm-checkpoint-stride={d} tokens, max={d}/entry\n", .{ launch().ssm_checkpoint_stride, launch().ssm_checkpoint_max });
         }
-    } else if (prefix_cache_capacity > 0) {
-        if (config.has_hybrid_layers and ssm_checkpoint_stride == 0) {
-            log.info("Hot prefix cache: requested capacity={d} but model is hybrid and --ssm-checkpoint-stride is 0 — disabled\n", .{prefix_cache_capacity});
+    } else if (launch().prefix_cache_capacity > 0) {
+        if (config.has_hybrid_layers and launch().ssm_checkpoint_stride == 0) {
+            log.info("Hot prefix cache: requested capacity={d} but model is hybrid and --ssm-checkpoint-stride is 0 — disabled\n", .{launch().prefix_cache_capacity});
         } else if (config.full_attention_interval > 0) {
-            log.info("Hot prefix cache: requested capacity={d} but model uses full-attention-interval — disabled\n", .{prefix_cache_capacity});
+            log.info("Hot prefix cache: requested capacity={d} but model uses full-attention-interval — disabled\n", .{launch().prefix_cache_capacity});
         } else {
-            log.info("Hot prefix cache: requested capacity={d} but disabled by scheduler\n", .{prefix_cache_capacity});
+            log.info("Hot prefix cache: requested capacity={d} but disabled by scheduler\n", .{launch().prefix_cache_capacity});
         }
     }
 
@@ -547,14 +497,16 @@ pub fn serve(
     // `--max-concurrent` sizes the submit queue; requests decode together at
     // any value. Whether they share ONE forward is the model's answer, printed
     // at every value so a default-1 boot does not read as "one at a time".
-    if (scheduler_mod.configBatchesDecode(config)) {
+    if (mlx_engine.api().batches_decode(config)) {
         log.info("Concurrency: --max-concurrent={d}, batched decode on\n", .{max_concurrent});
-        if (prefix_cache_capacity > 0 and prefix_cache_capacity < max_concurrent) prefix_cache_capacity = max_concurrent;
+        if (launch().prefix_cache_capacity > 0 and launch().prefix_cache_capacity < max_concurrent) launch().prefix_cache_capacity = max_concurrent;
     } else {
         log.info("Concurrency: --max-concurrent={d}, batched decode off (arch: {s}); concurrent requests interleave serially\n", .{ max_concurrent, config.model_type });
     }
-    scheduler_mod.gen_yield_enabled = scheduler_mod.genYieldEnabled(mlx.cudaAvailable());
-    if (!scheduler_mod.gen_yield_enabled)
+    // Chat interleaves with media jobs except on CUDA, where a decode inside a job faulted the context.
+    const gen_yield = !mlx.cudaAvailable();
+    mlx_engine.api().set_gen_yield(gen_yield);
+    if (!gen_yield)
         log.info("chat does not interleave with media jobs on CUDA: a chat waits for the running image/audio job\n", .{});
     // Install signal handlers for graceful shutdown (POSIX; on Windows Ctrl+C ends the process).
     if (comptime builtin.os.tag != .windows) {
@@ -611,24 +563,7 @@ pub fn serve(
     // loaded and nothing else has taken RAM. Clients read this number once
     // (pi/opencode bake it into a config file) and budget against it for the
     // whole session, so it must not drift with system load. `--ctx-size` wins.
-    const pinned = pinAutoContext(@constCast(config));
-    if (config.glm_stream) {
-        log.info("Context size: {d} tokens (mlx-stream: the prompts this load billed and the generation past them)\n", .{mlx_stream.contextLength(config)});
-    } else if (manualContext(config) > 0) {
-        log.info("Context size: {d} tokens (manual)\n", .{manualContext(config)});
-    } else if (config.mlxStream()) {
-        log.info("Context size: {d} tokens (the streaming pack's standard request; --ctx-size widens it)\n", .{getEffectiveContextLength(config)});
-    } else {
-        const memory_ctx = computeMemoryContext(config);
-        const memory_allows = safeAutoContext(memory_ctx);
-        const rope_ctx = config.contextCap();
-        if (rope_ctx > 0 and pinned >= rope_ctx) {
-            // The checkpoint's own maximum binds; memory had room to spare.
-            log.info("Context size: {d} tokens (auto: the model's maximum; memory would allow {d}) [pinned]\n", .{ pinned, memory_allows });
-        } else {
-            log.info("Context size: {d} tokens (auto: {d}% of the {d}-token memory ceiling, reserving headroom) [pinned]\n", .{ pinned, auto_ctx_safety_pct, memory_ctx });
-        }
-    }
+    _ = admission.pinAutoContext(@constCast(config), true);
 
     if (serverState().server_config.request_timeout_sec > 0) {
         log.info("Request timeout: {d}s\n", .{serverState().server_config.request_timeout_sec});
@@ -653,11 +588,12 @@ pub fn serve(
     } else if (scheduler.drafter != null and scheduler.dflash == null) {
         log.info("Drafter speculative decoding: ENABLED (block_size={d}; default for new requests)\n", .{scheduler.drafter_block_size});
     }
-    if (transformer_mod.Transformer.mtp_head_kv_quant_flag) {
+    const engine_settings = mlx_engine.settings();
+    if (engine_settings.mtp_head_kv_quant) {
         log.info("MTP head KV: following --kv-quant (--mtp-head-kv-quant)\n", .{});
     }
-    if (generate_mod.max_mtp_ctx != 0) {
-        log.info("MTP context ceiling: {d} tokens (--max-mtp-ctx; requests past it decode serially)\n", .{generate_mod.max_mtp_ctx});
+    if (engine_settings.max_mtp_ctx != 0) {
+        log.info("MTP context ceiling: {d} tokens (--max-mtp-ctx; requests past it decode serially)\n", .{engine_settings.max_mtp_ctx});
     }
     log.info("\nServer listening on http://{s}:{d}\n", .{ host, port });
     if (g_api_key != null) {
@@ -750,8 +686,8 @@ pub fn serve(
     // The SSD flush's deadline starts here, once. The drain keeps its own bound: cutting it short
     // saves nothing (the join below waits out the inference thread's current chunk anyway) and
     // lets a late `complete()` race the queues `deinit` frees.
-    if (global_scheduler) |sch| {
-        scheduler_mod.armShutdownDeadline(&sch.shutdown_deadline_ms, nowMsMonotonic(io), shutdown_persist_secs);
+    if (launch().global_scheduler) |sch| {
+        armShutdownDeadline(&sch.shutdown_deadline_ms, nowMsMonotonic(io), shutdown_persist_secs);
         sch.cancelAllInFlight();
     }
     {
@@ -770,9 +706,25 @@ pub fn serve(
     log.info("\nShutting down gracefully...\n", .{});
 }
 
+/// Arm the shutdown flush's deadline `secs` after the first call; a later call (a second
+/// SIGTERM) never moves it. 0 seconds leaves it unarmed, which turns the flush off.
+pub fn armShutdownDeadline(slot: *std.atomic.Value(i64), now_ms: i64, secs: u32) void {
+    if (secs == 0) return;
+    _ = slot.cmpxchgStrong(0, now_ms + @as(i64, secs) * 1000, .acq_rel, .acquire);
+}
+
+/// Poll interval for the idle-eviction sweep, given the configured window.
+///
+/// A quarter of the window, so a model is evicted within ~1.25x the configured
+/// idle time rather than up to 2x it. Floored at a second so `--idle-evict-secs 1`
+/// does not spin, capped at 30s so a long window still costs ~nothing.
+pub fn idleEvictTickMs(window_ms: i64) i64 {
+    return @max(1000, @min(@divTrunc(window_ms, 4), 30_000));
+}
+
 const GaugeSamplerCtx = struct {
     metrics: *instr.Metrics,
-    scheduler: *scheduler_mod.Scheduler,
+    scheduler: *Scheduler,
     /// Dedicated stop flag — set before joining the thread (LIFO defers ensure
     /// this is written before join() blocks). A separate flag (not
     /// scheduler.shutdown) avoids a LIFO deadlock: scheduler.deinit() (which
@@ -798,10 +750,11 @@ fn sampleGauges(ctx: GaugeSamplerCtx) void {
     ctx.metrics.mlx_cache_bytes.set(@as(u64, mlx_cache));
     // ANE prefill offload totals — published by the engines themselves
     // (ane.publishLive / deinit), so this is a lock-free read.
-    ctx.metrics.ane_int8_bytes.set(ane_mod.aneState().live_int8_bytes.load(.monotonic));
-    ctx.metrics.ane_layers.set(ane_mod.aneState().live_layers.load(.monotonic));
+    const eg = mlx_engine.gauges();
+    ctx.metrics.ane_int8_bytes.set(eg.ane_int8_bytes);
+    ctx.metrics.ane_layers.set(eg.ane_layers);
     // qwen4 n-gram table warm (F8) — same lock-free published-atomic pattern.
-    ctx.metrics.ngram_warm_bytes.set(qwen4_mod.warmBytes().live_warm_bytes.load(.monotonic));
+    ctx.metrics.ngram_warm_bytes.set(eg.ngram_warm_bytes);
 
     // Request queue depth — brief lock to read two scheduler counters only.
     ctx.scheduler.queue_mu.lockUncancelable(ctx.scheduler.io);
@@ -829,7 +782,7 @@ fn sampleGauges(ctx: GaugeSamplerCtx) void {
 }
 
 const IdleEvictCtx = struct {
-    scheduler: *scheduler_mod.Scheduler,
+    scheduler: *Scheduler,
     /// `--idle-evict-secs`, in ms.
     window_ms: i64,
     /// Dedicated stop flag, for the same reason `GaugeSamplerCtx` has one:
@@ -849,7 +802,7 @@ const IdleEvictCtx = struct {
 /// nothing here touches mlx directly.
 fn idleEvictLoop(ctx: IdleEvictCtx) void {
     const sch = ctx.scheduler;
-    const tick_ms = scheduler_mod.idleEvictTickMs(ctx.window_ms);
+    const tick_ms = idleEvictTickMs(ctx.window_ms);
     // Wake every 500 ms to check the stop flag; sweep once per tick interval.
     // `crt.sleepMs` for the same reason as the gauge sampler: a blocking Io timer
     // here could outlive the stop.
@@ -928,13 +881,8 @@ test "llama cache default keeps shared prefixes warm" {
 }
 
 test {
-    _ = @import("../../engines/mlx/admission/admit.zig");
-    _ = @import("../../engines/mlx/admission/bills.zig");
-    _ = @import("../../engines/mlx/admission/bills_test.zig");
-    _ = @import("../../engines/mlx/admission/context.zig");
-    _ = @import("../../engines/mlx/admission/hot_cache_plan.zig");
-    _ = @import("../../engines/mlx/admission/prefill_chunk.zig");
-    _ = @import("../../engines/mlx/request_options.zig");
+    _ = @import("../api/request_options.zig");
+    _ = @import("../api/admission.zig");
     _ = @import("../api/anthropic.zig");
     _ = @import("../api/anthropic_stream.zig");
     _ = @import("../api/audio.zig");
@@ -981,10 +929,32 @@ test {
     _ = @import("../../mlx/state.zig");
     _ = @import("../../plugins/deepseek_v4/bill.zig");
     _ = @import("../../plugins/deepseek_v41/bill.zig");
-    _ = @import("../../engines/mlx/admission/glm5_bill.zig");
     _ = @import("../../plugins/lfm2/media.zig");
     _ = @import("../../plugins/nemotron_h/media.zig");
     _ = @import("../../plugins/qwen3_5/minicpm_media.zig");
     _ = @import("../../plugins/qwen4_exp/bill.zig");
     _ = @import("../media/qwen_mrope.zig");
+}
+
+test "armShutdownDeadline: the first SIGTERM sets the deadline and a second never moves it" {
+    var slot = std.atomic.Value(i64).init(0);
+    armShutdownDeadline(&slot, 5_000, 45);
+    try testing.expectEqual(@as(i64, 50_000), slot.load(.acquire));
+    armShutdownDeadline(&slot, 9_000, 45);
+    try testing.expectEqual(@as(i64, 50_000), slot.load(.acquire));
+    var off = std.atomic.Value(i64).init(0);
+    armShutdownDeadline(&off, 5_000, 0);
+    try testing.expectEqual(@as(i64, 0), off.load(.acquire));
+}
+
+test "idleEvictTickMs: sweeps well inside the window without spinning" {
+    // Bar: a quarter of the window, clamped to [1s, 30s] — eviction lands near
+    // the configured time without the sweep becoming a busy loop.
+    try testing.expectEqual(@as(i64, 5_000), idleEvictTickMs(20_000));
+    try testing.expectEqual(@as(i64, 15_000), idleEvictTickMs(60_000));
+    try testing.expectEqual(@as(i64, 30_000), idleEvictTickMs(900_000));
+    try testing.expectEqual(@as(i64, 1000), idleEvictTickMs(1000));
+    try testing.expectEqual(@as(i64, 1000), idleEvictTickMs(2000));
+    try testing.expectEqual(@as(i64, 30_000), idleEvictTickMs(28_800_000));
+    try testing.expect(idleEvictTickMs(0) >= 1000);
 }

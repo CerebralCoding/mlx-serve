@@ -75,7 +75,7 @@ const MoeStatsState = struct {
     moe_rows_fused_layers: u32 = 0,
     moe_sorted_layers: u32 = 0,
 };
-const moeStats_shared = @import("../../util/shared.zig").Shared(MoeStatsState, "moe_rows_stats", .{});
+pub const moeStats_shared = @import("../../util/shared.zig").Shared(MoeStatsState, "moe_rows_stats", .{});
 const device = @import("../../../mlx/device.zig");
 const gather_qmv_vars = @import("gather_qmv.zig");
 const down_reduce_vars = @import("down_reduce.zig");

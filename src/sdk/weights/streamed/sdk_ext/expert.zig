@@ -46,7 +46,7 @@ const ExpertState = struct {
     /// goes or the load fails. A second is refused by name, never at the pool's start.
     reader_taken: std.atomic.Value(bool) = .init(false),
 };
-const expertState_shared = @import("mlx_host").shared.Shared(ExpertState, "streamed_expert", .{});
+pub const expertState_shared = @import("mlx_host").shared.Shared(ExpertState, "streamed_expert", .{});
 inline fn expertState() *ExpertState {
     return expertState_shared.get();
 }

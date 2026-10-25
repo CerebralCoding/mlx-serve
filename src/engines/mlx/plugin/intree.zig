@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const abi = @import("../../../abi/plugin.zig");
-const model = @import("../model.zig");
+const model = @import("../../../sdk/config/model.zig");
 const Resident = @import("../../../sdk/weights/resident.zig").Resident;
 const Transformer = @import("../transformer.zig").Transformer;
 const ForwardCtx = @import("../forward_ctx.zig").ForwardCtx;

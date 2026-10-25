@@ -1,7 +1,7 @@
 //! Batched MTP verify graphs: exact, accept, typical, TokenV3 and lossy.
 const std = @import("std");
 const mlx = @import("../../../../mlx/ffi.zig");
-const mtp_acceptance = @import("../mtp_acceptance.zig");
+const mtp_acceptance = @import("../../../../sdk/spec/mtp_acceptance.zig");
 const testing = std.testing;
 const Generator = @import("../../generate/generator.zig").Generator;
 const SamplingParams = @import("../../sampling/params.zig").SamplingParams;

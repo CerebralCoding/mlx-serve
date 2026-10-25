@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const chat_mod = @import("../chat/chat.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
+const model_mod = @import("../../sdk/config/model.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const media_mod = @import("../media_jobs/gen.zig");
 const LoadedModel = model_registry_mod.LoadedModel;

@@ -6,7 +6,7 @@ const mlx = @import("../../../mlx/ffi.zig");
 const testing = std.testing;
 const qwen4ReadF32 = @import("../../testing/parity.zig").qwen4ReadF32;
 const kdaGateChain = gate.kdaGateChain;
-const model_mod = @import("../../../engines/mlx/model.zig");
+const model_mod = @import("../../config/model.zig");
 
 test "kdaGateChain is the bounded-sigmoid gate, not a clamped softplus" {
     // g = exp(bound * sigmoid(exp(A_log) * (a + dt_bias))). Two properties

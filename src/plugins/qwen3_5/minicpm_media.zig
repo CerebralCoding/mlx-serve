@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const chat_mod = @import("../../host/chat/chat.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
+const model_mod = @import("../../sdk/config/model.zig");
 const minicpm_vision = @import("minicpm_vision.zig");
 const minicpm_canvas = @import("minicpm_canvas.zig");
 const log = @import("../../sdk/util/log.zig");

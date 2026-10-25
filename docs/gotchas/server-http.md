@@ -397,7 +397,7 @@ when nothing can follow; a zero-count mask is a named bug before degrading. Guar
 Defect: 0.9 tok/s against 54 without `response_format`. Cause: `buildMask` walked all 248k tokens through the grammar
 per step. Fix: `TokenBytes` indexes the vocabulary by first and second byte with a plain-string split, so only tokens
 whose first two bytes are legal are walked (0.1-0.4 ms per mask); the constrained step samples lazily so the graph
-build overlaps the GPU. Guard: the brute-force oracle test in `engines/mlx/grammar/token_mask.zig` + a probe-count
+build overlaps the GPU. Guard: the brute-force oracle test in `sdk/grammar/token_mask.zig` + a probe-count
 bar. Trap: a per-model `"mtp": true` overrides `--no-mtp`; read `[spec-stats]` before calling an arm serial.
 
 ### A loop cut must not say "length"

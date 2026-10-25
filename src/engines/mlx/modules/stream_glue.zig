@@ -14,7 +14,7 @@ const server = @import("../../../host/http/server.zig");
 const status = @import("../../../sdk/util/system.zig");
 const model_settings = @import("../../../host/registry/model_settings.zig");
 const scheduler = @import("../scheduler.zig");
-const ModelConfig = @import("../model.zig").ModelConfig;
+const ModelConfig = @import("../../../sdk/config/model.zig").ModelConfig;
 const plugin = @import("mlx_stream");
 const sdk = plugin.sdk;
 
@@ -195,7 +195,7 @@ const GlueState = struct {
     auto_context: PackValues = .{},
     max_output: PackValues = .{},
 };
-const glueState_shared = @import("../../../sdk/util/shared.zig").Shared(GlueState, "streamed_glue", .{});
+pub const glueState_shared = @import("../../../sdk/util/shared.zig").Shared(GlueState, "streamed_glue", .{});
 inline fn glueState() *GlueState {
     return glueState_shared.get();
 }
