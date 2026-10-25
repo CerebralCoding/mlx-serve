@@ -8,9 +8,9 @@
 //! route's kernels once at the model's instantiation there (`selfcheck`), never inside a request.
 
 const std = @import("std");
-const host_caps = @import("../../../sdk/weights/streamed/host_caps.zig");
+const host_caps = @import("../../sdk/weights/streamed/host_caps.zig");
 const mlx = @import("sdk").mlx;
-const kset = @import("../../../sdk/weights/streamed/sdk_ext/kernel_set.zig");
+const kset = @import("../../sdk/weights/streamed/sdk_ext/kernel_set.zig");
 /// The registry's self-check plan (`sdk_ext.kernels.KernelSet(R)` runs it; the module at its construction).
 pub const selfcheck = @import("trunk_selfcheck.zig");
 
@@ -141,7 +141,7 @@ pub const Refusal = error{
 
 pub const Diag = @import("sdk").Diag;
 
-const refuse = @import("../../../sdk/weights/streamed/sdk_ext/expert/bank_file.zig").refuse;
+const refuse = @import("../../sdk/weights/streamed/sdk_ext/expert/bank_file.zig").refuse;
 
 /// An argument's name and dtype; an argument of dtype "T" takes the launch's template dtype T.
 pub const Arg = struct { name: [:0]const u8, dtype: ?mlx.mlx_dtype };

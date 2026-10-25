@@ -10,9 +10,9 @@ const env = @import("mlx_host").env;
 const mlx = @import("sdk").mlx;
 const log = @import("sdk").log;
 const xk = @import("kernels.zig");
-const kset = @import("../../../../sdk/weights/streamed/sdk_ext/kernel_set.zig");
+const kset = @import("../../../sdk/weights/streamed/sdk_ext/kernel_set.zig");
 const routes = @import("routes.zig");
-const host_caps = @import("../../../../sdk/weights/streamed/host_caps.zig");
+const host_caps = @import("../../../sdk/weights/streamed/host_caps.zig");
 const sushi = if (host_caps.exl3) @import("mlx_host").exl3.sushi else @compileError("glm_moe_dsa: this host exports no exl3 (host_caps): the reference must sit behind host_caps.glm");
 
 const Allocator = std.mem.Allocator;
@@ -473,7 +473,7 @@ fn promptChain(a: Allocator, bound: *const xk.Bound, inst: xk.Instance, numeric:
 // ── Tests (GPU: DSV41_PHASE0B_MLX) ──
 
 const testing = std.testing;
-const ks = @import("../../../../sdk/weights/streamed/sdk_ext.zig").kernels.KernelSet(xk);
+const ks = @import("../../../sdk/weights/streamed/sdk_ext.zig").kernels.KernelSet(xk);
 
 fn gpuSet(a: Allocator, s: mlx.mlx_stream) !*ks.Set {
     var diag: xk.Diag = .{};

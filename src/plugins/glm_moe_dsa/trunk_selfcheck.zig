@@ -6,11 +6,11 @@
 
 const std = @import("std");
 const env = @import("mlx_host").env;
-const host_caps = @import("../../../sdk/weights/streamed/host_caps.zig");
+const host_caps = @import("../../sdk/weights/streamed/host_caps.zig");
 const mlx = @import("sdk").mlx;
 const log = @import("sdk").log;
 const xk = @import("trunk_kernels.zig");
-const kset = @import("../../../sdk/weights/streamed/sdk_ext/kernel_set.zig");
+const kset = @import("../../sdk/weights/streamed/sdk_ext/kernel_set.zig");
 
 const Allocator = std.mem.Allocator;
 const Kernel = xk.Kernel;

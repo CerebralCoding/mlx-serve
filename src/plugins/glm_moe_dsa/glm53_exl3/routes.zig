@@ -14,7 +14,7 @@
 const std = @import("std");
 const mlx = @import("sdk").mlx;
 const xk = @import("kernels.zig");
-const exl3_quant = @import("../../../../sdk/quant/exl3/stream/quant.zig");
+const exl3_quant = @import("../../../sdk/quant/exl3/stream/quant.zig");
 
 const Kernel = xk.Kernel;
 

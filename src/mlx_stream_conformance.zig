@@ -69,7 +69,7 @@ test "mlx-stream conformance: every arch the glue dispatches declines what is no
         try sdk.testing.expectClaims(arch.claims, &near_misses);
         try std.testing.expect(arch.claim_process != null and arch.release_process != null);
     }
-    const glm = comptime sdk.Arch.of(@import("plugins/glm_moe_dsa/stream/plugin.zig"));
+    const glm = comptime sdk.Arch.of(@import("plugins/glm_moe_dsa/arch.zig"));
     try sdk.testing.expectClaims(glm.claims, &.{
         .{ .config = "{\"model_type\":\"glm_moe_dsa\"}", .want = .native },
         .{ .config = @embedFile("sdk/weights/streamed/fixtures/mimo_v2_flash_q4_config.json"), .want = null },

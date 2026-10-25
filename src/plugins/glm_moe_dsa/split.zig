@@ -17,7 +17,7 @@
 //! pins it).
 
 const std = @import("std");
-const host_caps = @import("../../../sdk/weights/streamed/host_caps.zig");
+const host_caps = @import("../../sdk/weights/streamed/host_caps.zig");
 const glm = @import("glm_moe_dsa.zig");
 const bill = @import("bill.zig");
 const k3 = @import("split_k3.zig");

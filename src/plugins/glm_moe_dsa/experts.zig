@@ -16,18 +16,18 @@
 
 const std = @import("std");
 const env = @import("mlx_host").env;
-const host_caps = @import("../../../sdk/weights/streamed/host_caps.zig");
+const host_caps = @import("../../sdk/weights/streamed/host_caps.zig");
 const builtin = @import("builtin");
 const mlx = @import("sdk").mlx;
-const sdk_ext = @import("../../../sdk/weights/streamed/sdk_ext.zig");
+const sdk_ext = @import("../../sdk/weights/streamed/sdk_ext.zig");
 const expert_policy = sdk_ext.expert.policy;
 const expert_event = sdk_ext.expert.event;
-const expert_stream = @import("../../../sdk/weights/streamed/expert/stream.zig");
-const ops = @import("../../../sdk/weights/streamed/ops.zig");
+const expert_stream = @import("../../sdk/weights/streamed/expert/stream.zig");
+const ops = @import("../../sdk/weights/streamed/ops.zig");
 const trunk = @import("trunk_kernels.zig");
 const glm = @import("glm_moe_dsa.zig");
 /// PROFILE builds (`-Dplugin-profile=true`): each decode-lane call's host stamps on the verify's GPU timeline.
-const timeline = @import("../../../sdk/weights/streamed/profile/verify_timeline.zig");
+const timeline = @import("../../sdk/weights/streamed/profile/verify_timeline.zig");
 const pt = @import("prefill_timers.zig");
 
 /// The parts one combine launch reads (`trunk_kernels.max_combine_parts`: Metal binds at most 31 buffers).

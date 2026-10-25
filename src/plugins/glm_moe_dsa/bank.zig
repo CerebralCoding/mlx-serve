@@ -6,9 +6,9 @@
 //! the whole bank by name. The slot arrays bind to MLX's own `gather_qmm` (`sdk_ext.quant.GatherQmm`).
 
 const std = @import("std");
-const host_caps = @import("../../../sdk/weights/streamed/host_caps.zig");
+const host_caps = @import("../../sdk/weights/streamed/host_caps.zig");
 const mlx = @import("sdk").mlx;
-const sdk_ext = @import("../../../sdk/weights/streamed/sdk_ext.zig");
+const sdk_ext = @import("../../sdk/weights/streamed/sdk_ext.zig");
 const expert_io = sdk_ext.expert.io;
 const bank_file = sdk_ext.expert.bank_file;
 const quant = sdk_ext.quant;
@@ -336,7 +336,7 @@ pub const Bank = struct {
 const testing = std.testing;
 
 /// Deterministic, position-dependent bytes (`expert_bank.fillPattern`).
-pub const fillPattern = @import("../../../sdk/weights/streamed/expert/bank.zig").fillPattern;
+pub const fillPattern = @import("../../sdk/weights/streamed/expert/bank.zig").fillPattern;
 
 /// A synthetic bank: `experts.bin` (every record its own pattern) and its manifest, for a config's sparse layers; each
 /// field below perturbs one rule. The geometry is written out here independently of `layerSegments`.

@@ -7,8 +7,8 @@
 //! (`truncateTo`) and appends after it. An append past the cap is refused by name (`BoundedLaneFull`).
 
 const std = @import("std");
-const host_caps = @import("../../../sdk/weights/streamed/host_caps.zig");
-const sdk_ext = @import("../../../sdk/weights/streamed/sdk_ext.zig");
+const host_caps = @import("../../sdk/weights/streamed/host_caps.zig");
+const sdk_ext = @import("../../sdk/weights/streamed/sdk_ext.zig");
 const glm = @import("glm_moe_dsa.zig");
 
 pub fn Cache(comptime G: type) type {
@@ -169,7 +169,7 @@ pub fn Cache(comptime G: type) type {
 /// request page-rounded (16 KiB); from 1 MiB, rounded up to a step of an eighth of its power of two (at least a page),
 /// at most 12.5 % more.
 pub fn sizeClassBytes(bytes: u64) u64 {
-    const page = @import("../../../sdk/weights/streamed/phase_memory.zig").wire_page_bytes;
+    const page = @import("../../sdk/weights/streamed/phase_memory.zig").wire_page_bytes;
     const s_ = if (bytes > page) std.mem.alignForward(u64, bytes, page) else bytes;
     if (s_ < 1 << 20) return s_;
     const top: u64 = @as(u64, 1) << @intCast(std.math.log2_int(u64, s_));

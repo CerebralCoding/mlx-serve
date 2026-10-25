@@ -34,9 +34,9 @@ fn pickRows(rnd: std.Random, out: []u16, rows: usize, k: usize, n_experts: u16) 
 
 // ── tests ──
 
-const bank_mod = @import("../../../../plugins/glm_moe_dsa/stream/bank.zig");
-const exl3 = @import("../../../../plugins/glm_moe_dsa/stream/exl3_bank.zig");
-const glm = @import("../../../../plugins/glm_moe_dsa/stream/glm_moe_dsa.zig");
+const bank_mod = @import("../../../../plugins/glm_moe_dsa/bank.zig");
+const exl3 = @import("../../../../plugins/glm_moe_dsa/exl3_bank.zig");
+const glm = @import("../../../../plugins/glm_moe_dsa/glm_moe_dsa.zig");
 
 test "glm routes: the recorder keeps every decode route as the stream served it, and its file reads back" {
     if (comptime !host_caps.glm) return error.SkipZigTest;

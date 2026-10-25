@@ -13,9 +13,9 @@
 
 const std = @import("std");
 const env = @import("mlx_host").env;
-const host_caps = @import("../../../sdk/weights/streamed/host_caps.zig");
+const host_caps = @import("../../sdk/weights/streamed/host_caps.zig");
 const mlx = @import("sdk").mlx;
-const ops = @import("../../../sdk/weights/streamed/ops.zig");
+const ops = @import("../../sdk/weights/streamed/ops.zig");
 const trunk = @import("trunk_kernels.zig");
 
 const G = ops.MlxOps;

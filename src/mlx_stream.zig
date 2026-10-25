@@ -13,16 +13,16 @@ pub const plugin = sdk.Plugin{
     .macos_only = true,
     // The host registers the arch; the EXL3 quant and the EXL3 expert source are its internals, bound at comptime
     // (sdk_ext.zig).
-    .provides = .{ .arch = @import("plugins/glm_moe_dsa/stream/plugin.zig") },
+    .provides = .{ .arch = @import("plugins/glm_moe_dsa/arch.zig") },
 };
 
 /// What the host's glue calls for the third arch: GLM-5.3's entry points, the context a load bills when the model sets
 /// none (the standard request) and the generation a request may take past it until a parse has read the model's
 /// `max_output` (its default, 128K: the glue reads the arch's `maxOutput` once it has the model's settings).
 pub const glm = struct {
-    pub const arch = @import("plugins/glm_moe_dsa/stream/plugin.zig");
+    pub const arch = @import("plugins/glm_moe_dsa/arch.zig");
     pub const default_context: u64 = @import("sdk/weights/streamed/phase_memory.zig").fill_prompt_tokens;
-    pub const generation_headroom: u64 = @import("plugins/glm_moe_dsa/stream/settings.zig").Config.default_max_output;
+    pub const generation_headroom: u64 = @import("plugins/glm_moe_dsa/settings.zig").Config.default_max_output;
 };
 
 /// What the host's glue calls for the fourth arch: GLM-5.3-Flash (`glm5_next`, the NVFP4 pack): its entry points, the
@@ -36,7 +36,7 @@ pub const glm5_next = struct {
 
 /// Every arch the package serves through the SDK's table (`sdk.Arch.of`), in claim order (the conformance suite's list;
 /// the host's glue binds each arch by its own entry: `glm` and `glm5_next`).
-pub const archs = .{@import("plugins/glm_moe_dsa/stream/plugin.zig")};
+pub const archs = .{@import("plugins/glm_moe_dsa/arch.zig")};
 pub const sdk = @import("sdk");
 /// The expert bank source a resident trunk streams its routed experts from (`sdk/weights/streamed.zig` `Streamed`).
 pub const bank_source = @import("sdk/weights/streamed/bank_source.zig");

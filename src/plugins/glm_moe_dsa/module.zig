@@ -23,11 +23,11 @@
 
 const std = @import("std");
 const env = @import("mlx_host").env;
-const host_caps = @import("../../../sdk/weights/streamed/host_caps.zig");
+const host_caps = @import("../../sdk/weights/streamed/host_caps.zig");
 const mlx = @import("sdk").mlx;
 const sdk = @import("sdk");
 const log = @import("sdk").log;
-const sdk_ext = @import("../../../sdk/weights/streamed/sdk_ext.zig");
+const sdk_ext = @import("../../sdk/weights/streamed/sdk_ext.zig");
 const builtin = @import("builtin");
 const quant = sdk_ext.quant;
 const expert_event = sdk_ext.expert.event;
@@ -50,13 +50,13 @@ const exl3_quant = @import("exl3_quant.zig");
 const glm53_quant = @import("glm53_exl3/quant.zig");
 /// PROFILE builds (`-Dplugin-profile=true`): each draft round's verify on the GPU timeline, its summary at the
 /// request's end (`VERIFY_GPU_TIMELINE`); every other build compiles it out.
-const timeline = @import("../../../sdk/weights/streamed/profile/verify_timeline.zig");
+const timeline = @import("../../sdk/weights/streamed/profile/verify_timeline.zig");
 const prefill_timers = @import("prefill_timers.zig");
-const phase_mem = @import("../../../sdk/weights/streamed/phase_memory.zig");
+const phase_mem = @import("../../sdk/weights/streamed/phase_memory.zig");
 
 const G = graph.G;
 /// The plugin's draw for every row handed to the host (`sdk_ext.sampler`): bound per request by `draft_lane.arm`.
-pub const Sampler = @import("../../../sdk/weights/streamed/sdk_ext.zig").sampler.SamplerOf(G);
+pub const Sampler = @import("../../sdk/weights/streamed/sdk_ext.zig").sampler.SamplerOf(G);
 const Stats = sdk_ext.expert.Stats;
 const LayerCounts = sdk_ext.expert.LayerCounts;
 

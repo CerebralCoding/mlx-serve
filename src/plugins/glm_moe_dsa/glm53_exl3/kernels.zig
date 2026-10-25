@@ -6,9 +6,9 @@
 //! (the load context owns it; the quant self-checks its kernels at accept).
 
 const std = @import("std");
-const host_caps = @import("../../../../sdk/weights/streamed/host_caps.zig");
+const host_caps = @import("../../../sdk/weights/streamed/host_caps.zig");
 const mlx = @import("sdk").mlx;
-const kset = @import("../../../../sdk/weights/streamed/sdk_ext/kernel_set.zig");
+const kset = @import("../../../sdk/weights/streamed/sdk_ext/kernel_set.zig");
 /// The registry's self-check plan (`sdk_ext.kernels.KernelSet(R)` runs it at the quant's accept).
 pub const selfcheck = @import("selfcheck.zig");
 
@@ -18,7 +18,7 @@ const Allocator = std.mem.Allocator;
 /// sha256 of kernels/glm53_exl3/manifest.json (scripts/glm53_exl3_manifest.py prints it): pins every text.
 pub const manifest_sha256 = "e03389a3295242904c6ae3393f4c9bc309351e1e34b66b20d6234d0a34217ca9";
 pub const format = "mlx-stream-glm53-exl3-kernels-v1";
-const dir = "../../../../sdk/quant/exl3/stream/kernels/glm53_exl3/";
+const dir = "../../../sdk/quant/exl3/stream/kernels/glm53_exl3/";
 
 /// The bank these texts decode: EXL3 codebook mcg at sushi's multiplier, window 16, K 3 and 4, four minis per expert.
 pub const bank_codebook = "mcg";
@@ -109,7 +109,7 @@ pub const Refusal = error{
 
 pub const Diag = @import("sdk").Diag;
 
-const refuse = @import("../../../../sdk/weights/streamed/sdk_ext/expert/bank_file.zig").refuse;
+const refuse = @import("../../../sdk/weights/streamed/sdk_ext/expert/bank_file.zig").refuse;
 
 /// An argument's name and dtype; an output of dtype "T" takes the launch's template dtype T.
 pub const Arg = struct { name: [:0]const u8, dtype: ?mlx.mlx_dtype };
@@ -408,8 +408,8 @@ test "glm53 exl3 kernels: the embedded manifest is the pinned one; every kernel 
     try testing.expectEqualSlices(Header, &.{ .glm53_common, .glm53_dec }, reg.get(.glm53_dec_gu).headers);
     // the NAX tiles and the rotation helpers are DeepSeek-V4.1's own texts; the header mlx compiles before a kernel holds
     // every part
-    try testing.expectEqualStrings(@embedFile("../../../../sdk/quant/exl3/stream/kernels/exl3/header_dig_mul1h_k3.metal"), embedded.headers[@backingInt(Header.nax)]);
-    try testing.expectEqualStrings(@embedFile("../../../../sdk/quant/exl3/stream/kernels/exl3/header_dig2_x.metal"), embedded.headers[@backingInt(Header.dig2)]);
+    try testing.expectEqualStrings(@embedFile("../../../sdk/quant/exl3/stream/kernels/exl3/header_dig_mul1h_k3.metal"), embedded.headers[@backingInt(Header.nax)]);
+    try testing.expectEqualStrings(@embedFile("../../../sdk/quant/exl3/stream/kernels/exl3/header_dig2_x.metal"), embedded.headers[@backingInt(Header.dig2)]);
     try testing.expectEqualSlices(Header, &.{.dig2}, reg.get(.glm53_pf_mid).headers);
     try testing.expect(std.mem.indexOf(u8, reg.get(.glm53_pf_gu).header_text, "g53_mcg2") != null and std.mem.indexOf(u8, reg.get(.glm53_pf_gu).header_text, "tile_matmad_nax") != null);
     try testing.expectEqual(Family.prompt, reg.get(.glm53_pf_down).family);

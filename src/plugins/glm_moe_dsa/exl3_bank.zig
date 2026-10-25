@@ -14,14 +14,14 @@
 
 const std = @import("std");
 const mlx = @import("sdk").mlx;
-const sdk_ext = @import("../../../sdk/weights/streamed/sdk_ext.zig");
+const sdk_ext = @import("../../sdk/weights/streamed/sdk_ext.zig");
 const expert_io = sdk_ext.expert.io;
 const bank_file = sdk_ext.expert.bank_file;
 const quant = sdk_ext.quant;
 const glm = @import("glm_moe_dsa.zig");
 const affine = @import("bank.zig");
 const bill_units = @import("bill.zig");
-const host_caps = @import("../../../sdk/weights/streamed/host_caps.zig");
+const host_caps = @import("../../sdk/weights/streamed/host_caps.zig");
 const sushi = if (host_caps.exl3) @import("mlx_host").exl3.sushi else @compileError("glm_moe_dsa: this host exports no exl3 (host_caps): the reference must sit behind host_caps.glm");
 
 pub const format = "mlx-stream-expert-manifest-exl3-v1";

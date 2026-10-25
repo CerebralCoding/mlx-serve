@@ -5,8 +5,8 @@
 //! router logits); the routed experts stream from the affine bank (`bank.zig`), never from these shards.
 
 const std = @import("std");
-const host_caps = @import("../../../sdk/weights/streamed/host_caps.zig");
-const checkpoint = @import("../../../sdk/weights/streamed/checkpoint.zig");
+const host_caps = @import("../../sdk/weights/streamed/host_caps.zig");
+const checkpoint = @import("../../sdk/weights/streamed/checkpoint.zig");
 
 /// The shard headers of a pack (`sdk/weights/streamed/checkpoint.zig`: 8-byte length + JSON, never tensor data).
 pub const Checkpoint = checkpoint.Checkpoint;

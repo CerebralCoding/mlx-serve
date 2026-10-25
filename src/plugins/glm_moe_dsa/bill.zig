@@ -19,16 +19,16 @@
 //!   a routed group) frees its arrays once their consumers ran.
 
 const std = @import("std");
-const host_caps = @import("../../../sdk/weights/streamed/host_caps.zig");
+const host_caps = @import("../../sdk/weights/streamed/host_caps.zig");
 const sdk = @import("sdk");
 const glm = @import("glm_moe_dsa.zig");
 const settings = @import("settings.zig");
 const bank_mod = @import("bank.zig");
 const cache_mod = @import("cache.zig");
-const io_mod = @import("../../../sdk/weights/streamed/sdk_ext.zig").expert.io;
+const io_mod = @import("../../sdk/weights/streamed/sdk_ext.zig").expert.io;
 const mtp_mod = @import("mtp.zig");
 const exl3_bank = @import("exl3_bank.zig");
-const phase_mem = @import("../../../sdk/weights/streamed/phase_memory.zig");
+const phase_mem = @import("../../sdk/weights/streamed/phase_memory.zig");
 const topk_mod = @import("topk.zig");
 const glm53_quant = @import("glm53_exl3/quant.zig");
 const sushi_quant = @import("exl3_quant.zig");

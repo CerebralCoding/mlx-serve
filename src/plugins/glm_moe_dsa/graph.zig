@@ -18,14 +18,14 @@ const std = @import("std");
 const env = @import("mlx_host").env;
 const mlx = @import("sdk").mlx;
 const sdk = @import("sdk");
-const ops = @import("../../../sdk/weights/streamed/ops.zig");
+const ops = @import("../../sdk/weights/streamed/ops.zig");
 const glm = @import("glm_moe_dsa.zig");
 const cache_mod = @import("cache.zig");
 const pt = @import("prefill_timers.zig");
-const expert_policy = @import("../../../sdk/weights/streamed/sdk_ext.zig").expert.policy;
+const expert_policy = @import("../../sdk/weights/streamed/sdk_ext.zig").expert.policy;
 /// The host's DeepSeek sparse attention kernels (the indexer's scores, the latent attention over selected rows): GLM-5.3's
 /// own need of the host surface, not the SDK's.
-const host_caps = @import("../../../sdk/weights/streamed/host_caps.zig");
+const host_caps = @import("../../sdk/weights/streamed/host_caps.zig");
 const dsa = if (host_caps.dsa_nax) @import("mlx_host").dsa_nax else @compileError("glm_moe_dsa: this host exports no dsa_nax (host_caps): the reference must sit behind host_caps.glm");
 const topk_mod = @import("topk.zig");
 const trunk_kernels = @import("trunk_kernels.zig");

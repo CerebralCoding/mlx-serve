@@ -4,13 +4,13 @@
 
 const std = @import("std");
 const sdk = @import("sdk");
-const sdk_ext = @import("../../../sdk/weights/streamed/sdk_ext.zig");
+const sdk_ext = @import("../../sdk/weights/streamed/sdk_ext.zig");
 const glm = @import("glm_moe_dsa.zig");
 const settings = @import("settings.zig");
 const module = @import("module.zig");
 const bill_mod = @import("bill.zig");
 const bank_mod = @import("bank.zig");
-const host_caps = @import("../../../sdk/weights/streamed/host_caps.zig");
+const host_caps = @import("../../sdk/weights/streamed/host_caps.zig");
 
 pub const name = "glm_moe_dsa";
 

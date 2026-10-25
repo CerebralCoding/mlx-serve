@@ -26,10 +26,10 @@ const glm = @import("glm_moe_dsa.zig");
 const graph = @import("graph.zig");
 const cache_mod = @import("cache.zig");
 const settings = @import("settings.zig");
-const acceptance = @import("../../../sdk/weights/streamed/sdk_ext.zig").acceptance;
+const acceptance = @import("../../sdk/weights/streamed/sdk_ext.zig").acceptance;
 const exl3 = @import("exl3_bank.zig");
 const topk_mod = @import("topk.zig");
-const bo = @import("../../../sdk/weights/streamed/build_flags.zig");
+const bo = @import("../../sdk/weights/streamed/build_flags.zig");
 /// The acceptance-by-top-probability histogram (`Counts.decided`, `accepted_by_p`, `ProbLine`) and the per-step
 /// reduction it reads: a diagnostic, in profile builds (`build_flags.glm_mtp_histograms`) and the tests only.
 pub const histograms: bool = bo.glm_mtp_histograms or @import("builtin").is_test;
@@ -179,7 +179,7 @@ pub fn facts(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, c: *const glm.
     return .{ .resident_bytes = resident_bytes, .expert_bytes = expert_bytes };
 }
 
-const host_caps = @import("../../../sdk/weights/streamed/host_caps.zig");
+const host_caps = @import("../../sdk/weights/streamed/host_caps.zig");
 const sushi = if (host_caps.exl3) @import("mlx_host").exl3.sushi else @compileError("glm_moe_dsa: this host exports no exl3 (host_caps): the reference must sit behind host_caps.glm");
 
 // ── the routed experts ──

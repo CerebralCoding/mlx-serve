@@ -18,7 +18,7 @@
 const std = @import("std");
 const env = @import("mlx_host").env;
 const mlx = @import("sdk").mlx;
-const sdk_ext = @import("../../../../sdk/weights/streamed/sdk_ext.zig");
+const sdk_ext = @import("../../../sdk/weights/streamed/sdk_ext.zig");
 const quant = sdk_ext.quant;
 const bank_mod = @import("../exl3_bank.zig");
 const xk = @import("kernels.zig");
@@ -401,7 +401,7 @@ comptime {
 }
 
 const testing = std.testing;
-const host_caps = @import("../../../../sdk/weights/streamed/host_caps.zig");
+const host_caps = @import("../../../sdk/weights/streamed/host_caps.zig");
 const sushi = if (host_caps.exl3) @import("mlx_host").exl3.sushi else @compileError("glm_moe_dsa: this host exports no exl3 (host_caps): the reference must sit behind host_caps.glm");
 
 fn peekOf(a: Allocator, q: []const u8) !quant.BankPeek {

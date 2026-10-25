@@ -71,26 +71,26 @@ comptime {
     _ = @import("sdk/weights/streamed/sdk_ext.zig");
     _ = @import("sdk/weights/streamed/ngram_table.zig");
     _ = @import("sdk/quant/exl3/stream/sushi_parity.zig");
-    _ = @import("plugins/glm_moe_dsa/stream/glm_moe_dsa.zig");
-    _ = @import("plugins/glm_moe_dsa/stream/bank.zig");
-    _ = @import("plugins/glm_moe_dsa/stream/exl3_bank.zig");
-    _ = @import("plugins/glm_moe_dsa/stream/exl3_quant.zig");
-    _ = @import("plugins/glm_moe_dsa/stream/settings.zig");
-    _ = @import("plugins/glm_moe_dsa/stream/bill.zig");
-    _ = @import("plugins/glm_moe_dsa/stream/cache.zig");
-    _ = @import("plugins/glm_moe_dsa/stream/graph.zig");
-    _ = @import("plugins/glm_moe_dsa/stream/experts.zig");
-    _ = @import("plugins/glm_moe_dsa/stream/topk.zig");
-    _ = @import("plugins/glm_moe_dsa/stream/trunk_kernels.zig");
-    _ = @import("plugins/glm_moe_dsa/stream/trunk_selfcheck.zig");
-    _ = @import("plugins/glm_moe_dsa/stream/split.zig");
-    _ = @import("plugins/glm_moe_dsa/stream/module.zig");
-    _ = @import("plugins/glm_moe_dsa/stream/plugin.zig");
-    _ = @import("plugins/glm_moe_dsa/stream/mtp.zig");
-    _ = @import("plugins/glm_moe_dsa/stream/glm53_exl3/kernels.zig");
-    _ = @import("plugins/glm_moe_dsa/stream/glm53_exl3/selfcheck.zig");
-    _ = @import("plugins/glm_moe_dsa/stream/glm53_exl3/routes.zig");
-    _ = @import("plugins/glm_moe_dsa/stream/glm53_exl3/quant.zig");
+    _ = @import("plugins/glm_moe_dsa/glm_moe_dsa.zig");
+    _ = @import("plugins/glm_moe_dsa/bank.zig");
+    _ = @import("plugins/glm_moe_dsa/exl3_bank.zig");
+    _ = @import("plugins/glm_moe_dsa/exl3_quant.zig");
+    _ = @import("plugins/glm_moe_dsa/settings.zig");
+    _ = @import("plugins/glm_moe_dsa/bill.zig");
+    _ = @import("plugins/glm_moe_dsa/cache.zig");
+    _ = @import("plugins/glm_moe_dsa/graph.zig");
+    _ = @import("plugins/glm_moe_dsa/experts.zig");
+    _ = @import("plugins/glm_moe_dsa/topk.zig");
+    _ = @import("plugins/glm_moe_dsa/trunk_kernels.zig");
+    _ = @import("plugins/glm_moe_dsa/trunk_selfcheck.zig");
+    _ = @import("plugins/glm_moe_dsa/split.zig");
+    _ = @import("plugins/glm_moe_dsa/module.zig");
+    _ = @import("plugins/glm_moe_dsa/arch.zig");
+    _ = @import("plugins/glm_moe_dsa/mtp.zig");
+    _ = @import("plugins/glm_moe_dsa/glm53_exl3/kernels.zig");
+    _ = @import("plugins/glm_moe_dsa/glm53_exl3/selfcheck.zig");
+    _ = @import("plugins/glm_moe_dsa/glm53_exl3/routes.zig");
+    _ = @import("plugins/glm_moe_dsa/glm53_exl3/quant.zig");
     // GLM-5.3-Flash (glm5_next) needs the host's DSA kernels: its files build only on a host that exports them.
     // GLM-5.3's refusal on a host without its surface: its own file, compiled only on such a host (the GLM tests above
     // skip there).
