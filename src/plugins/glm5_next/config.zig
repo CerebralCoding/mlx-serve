@@ -14,6 +14,13 @@ pub const model_types = [_][]const u8{ "glm5_next", "glm5_next_text", "glm_moe_d
 
 pub const claims = sdk.claimsByType(&model_types);
 
+pub const plugin = sdk.Plugin{
+    .name = "glm5_next",
+    .kind = .model,
+    .claims = &model_types,
+    .gate_models = &.{"ddalcu/GLM-5.3-Flash-MLX-Serve-iQ-MLX-5.1bpw"},
+};
+
 pub const QuantMode = enum { affine, nvfp4, mxfp4, mxfp8, gguf };
 
 /// The family's config: every field the engine's parse sets for a GLM-5.3-Flash or Ling 3.0 pack.

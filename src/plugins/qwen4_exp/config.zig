@@ -14,6 +14,13 @@ pub const model_types = [_][]const u8{ "qwen4_exp", "qwen4_exp_text" };
 
 pub const claims = sdk.claimsByType(&model_types);
 
+pub const plugin = sdk.Plugin{
+    .name = "qwen4_exp",
+    .kind = .model,
+    .claims = &model_types,
+    .gate_models = &.{"ddalcu/Qwen3.8-Flash-Next-MLX-Serve-iQ-MLX-4.7bpw"},
+};
+
 pub const QuantMode = enum { affine, nvfp4, mxfp4, mxfp8, gguf };
 pub const NormConvention = enum { delta, folded };
 
