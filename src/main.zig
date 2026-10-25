@@ -14,7 +14,7 @@ const transformer_mod = @import("engines/mlx/transformer.zig");
 const plugin_driver = @import("engines/mlx/plugin/driver.zig");
 const round_cost_mod = @import("engines/mlx/spec/round_cost.zig");
 const generate_mod = @import("engines/mlx/generate.zig");
-pub const mtp_acceptance = @import("engines/mlx/spec/mtp_acceptance.zig");
+pub const mtp_acceptance = @import("sdk/spec/mtp_acceptance.zig");
 /// The EXL3 quant format, for the plugins that reach it through their host root (`mlx_host`).
 pub const exl3 = @import("sdk/quant/exl3/format.zig");
 pub const dsa_nax = @import("plugins/glm5_next/dsa_nax.zig");

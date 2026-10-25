@@ -39,7 +39,7 @@ const verifyExpertReuse = @import("../../../sdk/blocks/moe/verify_kernels.zig").
 const verifyIndexedExpertInput = @import("../../../sdk/blocks/moe/verify_kernels.zig").verifyIndexedExpertInput;
 const verifyRoutePack = @import("../../../sdk/blocks/moe/verify_kernels.zig").verifyRoutePack;
 const MoeMlpWeights = @import("../../../sdk/blocks/moe/weights.zig").MoeMlpWeights;
-const transformer = @import("../../../engines/mlx/transformer.zig");
+const transformer = @import("../transformer.zig");
 
 pub fn moeRouterLogits(self: *Transformer, router_x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
     const cfg = &self.config;

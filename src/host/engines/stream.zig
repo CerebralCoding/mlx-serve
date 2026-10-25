@@ -6,7 +6,7 @@
 const std = @import("std");
 const abi = @import("../../abi/engine.zig");
 const logprob = @import("../../sdk/request/logprob.zig");
-const ConstraintSpan = @import("../chat/reasoning/protocol.zig").ConstraintSpan;
+const ConstraintSpan = @import("../../sdk/grammar/protocol.zig").ConstraintSpan;
 
 pub const LogprobResult = logprob.LogprobResult;
 pub const TokenLogprob = logprob.TokenLogprob;

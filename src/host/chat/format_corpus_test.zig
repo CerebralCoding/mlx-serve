@@ -2946,7 +2946,7 @@ test "format corpus: parse -> serialize -> parse is a fixpoint per family" {
 }
 
 test "format corpus: constrained JSON marker strings are data on every protocol" {
-    const rp = @import("reasoning/protocol.zig");
+    const rp = @import("../../sdk/grammar/protocol.zig");
     const json = "{\"note\":\"<think>kept</think> <|channel>thought <|content_thinking|> <tool_call>literal</tool_call>\"}";
     inline for (std.meta.tags(rp.Kind)) |kind| {
         var proto = rp.Protocol{ .kind = kind, .initial_phase = .json_body };

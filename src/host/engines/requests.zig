@@ -7,7 +7,7 @@ const log = @import("../../sdk/util/log.zig");
 const served_mod = @import("served.zig");
 const Served = served_mod.Served;
 const Kind = served_mod.Kind;
-const generate_mod = @import("../../engines/mlx/generate.zig");
+const request_mod = @import("../../sdk/request/request.zig");
 const finish = @import("../../engines/mlx/finish.zig");
 const Slot = @import("../../engines/mlx/slot.zig").Slot;
 const SubmitParams = @import("../../engines/mlx/scheduler/params.zig").SubmitParams;
@@ -30,7 +30,7 @@ fn without(a: abi.Caps, b: abi.Caps) abi.Caps {
     return @bitCast(@as(u64, @bitCast(a)) & ~@as(u64, @bitCast(b)));
 }
 
-fn needs(sampling: generate_mod.SamplingParams, logprobs_n: u32, prompt_logprobs: bool) abi.Caps {
+fn needs(sampling: request_mod.SamplingParams, logprobs_n: u32, prompt_logprobs: bool) abi.Caps {
     return .{
         .penalties = sampling.penalized(),
         .logprobs = logprobs_n > 0,
@@ -154,7 +154,7 @@ fn onEvent(ctx: *anyopaque, _: u64, ev: *const abi.Event) callconv(.c) abi.Actio
 }
 
 /// A logprob entry as the MLX path publishes it; its top list is the slot's to free.
-fn logprob(gpa: std.mem.Allocator, lp: abi.Logprob) ?generate_mod.LogprobResult {
+fn logprob(gpa: std.mem.Allocator, lp: abi.Logprob) ?request_mod.LogprobResult {
     const top = abi.items(abi.Bias, lp.top);
     const out = gpa.alloc(@import("../../engines/mlx/sampling/logprobs.zig").TokenLogprob, top.len) catch return null;
     for (top, out) |b, *o| o.* = .{ .token_id = b.token, .logprob = b.bias };
@@ -206,7 +206,7 @@ fn logSpec(kind: Kind, st: *const abi.Stats) void {
 const testing = std.testing;
 
 test "missingCap: plain sampling is served; a grammar, a penalty, logprobs, a forced tool call or prompt logprobs names its cap" {
-    const plain: generate_mod.SamplingParams = .{ .temperature = 0.7, .top_p = 0.9, .top_k = 20 };
+    const plain: request_mod.SamplingParams = .{ .temperature = 0.7, .top_p = 0.9, .top_k = 20 };
     try testing.expectEqual(@as(u64, 0), @as(u64, @bitCast(needs(plain, 0, false))));
     try testing.expectEqualStrings("penalties", abi.missing(.{}, needs(.{ .repeat_penalty = 1.1 }, 0, false)).?);
     try testing.expectEqualStrings("grammar", abi.missing(.{}, needs(.{ .constraint = @ptrFromInt(8) }, 0, false)).?);
@@ -217,7 +217,7 @@ test "missingCap: plain sampling is served; a grammar, a penalty, logprobs, a fo
 }
 
 test "missingCap: a GGUF engine accepts a grammar and ignores it, as it always has; the Neural Engine refuses it" {
-    const grammar: generate_mod.SamplingParams = .{ .constraint = @ptrFromInt(8) };
+    const grammar: request_mod.SamplingParams = .{ .constraint = @ptrFromInt(8) };
     var s: Served = undefined;
     s.info.caps = .{ .owns_tokenizer = true, .penalties = true, .logprobs = true };
     inline for (.{ .ds4, .llama }) |kind| {

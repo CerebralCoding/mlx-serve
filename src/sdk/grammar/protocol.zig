@@ -6,8 +6,8 @@
 //! Tokenizer indexes and recovery encodings are immutable model-owned data.
 
 const std = @import("std");
-const json_grammar = @import("../../../engines/mlx/grammar/json_grammar.zig");
-const token_mask = @import("../../../engines/mlx/grammar/token_mask.zig");
+const json_grammar = @import("json_grammar.zig");
+const token_mask = @import("token_mask.zig");
 
 /// Bound for a delimiter or a complete assistant channel header.
 pub const MAX_MARKER_BYTES = 128;
@@ -892,7 +892,7 @@ pub const Delivery = struct {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
-const schema_mod = @import("../../../engines/mlx/grammar/json_schema.zig");
+const schema_mod = @import("json_schema.zig");
 
 fn parseSchema(gpa: std.mem.Allocator, src: []const u8) !json_grammar.Schema {
     const v = try std.json.parseFromSlice(std.json.Value, gpa, src, .{});

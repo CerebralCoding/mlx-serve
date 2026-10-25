@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const generate_mod = @import("../../engines/mlx/generate.zig");
+const request_mod = @import("../../sdk/request/request.zig");
 const chat_mod = @import("../chat/chat.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const log = @import("../../sdk/util/log.zig");

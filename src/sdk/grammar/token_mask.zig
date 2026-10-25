@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const grammar_mod = @import("json_grammar.zig");
-const Tokenizer = @import("../../../sdk/tokenizer/tokenizer.zig").Tokenizer;
+const Tokenizer = @import("../tokenizer/tokenizer.zig").Tokenizer;
 
 pub const Grammar = grammar_mod.Grammar;
 

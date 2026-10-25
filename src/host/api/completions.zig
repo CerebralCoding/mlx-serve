@@ -2,9 +2,9 @@
 
 const std = @import("std");
 const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
-const generate_mod = @import("../../engines/mlx/generate.zig");
+const request_mod = @import("../../sdk/request/request.zig");
 const log = @import("../../sdk/util/log.zig");
-const pld_index = @import("../../engines/mlx/spec/pld_index.zig");
+const pld_index = @import("../../sdk/spec/pld_index.zig");
 const scheduler_mod = @import("../../engines/mlx/scheduler.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -190,7 +190,7 @@ pub fn handleCompletions(
     // silently ignored field, which reads to a client as "this model has no
     // opinion" rather than "this server never asked".
     const logprobs_n: u32 = if (root.get("logprobs")) |v| switch (v) {
-        .integer => |i| @intCast(@min(@max(i, 0), generate_mod.MAX_TOP_LOGPROBS)),
+        .integer => |i| @intCast(@min(@max(i, 0), request_mod.MAX_TOP_LOGPROBS)),
         else => 0,
     } else 0;
 
@@ -344,7 +344,7 @@ pub fn handleCompletions(
     }
 
     const eos_slice = requestEosSlice(config, root);
-    const sampling = generate_mod.SamplingParams{
+    const sampling = request_mod.SamplingParams{
         .temperature = temperature,
         .top_p = top_p,
         .top_k = top_k,
@@ -382,7 +382,7 @@ fn handleNonStreamingCompletion(
     tok: *const Tokenizer,
     prompt_ids: []const u32,
     max_tokens: u32,
-    sampling: generate_mod.SamplingParams,
+    sampling: request_mod.SamplingParams,
     eos_token_ids: []const u32,
     stop_sequences: []const []const u8,
     model_name: []const u8,
@@ -411,7 +411,7 @@ fn handleNonStreamingCompletion(
     _ = &result;
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
-    defer for ([_]?[]generate_mod.LogprobResult{ result.logprobs, result.prompt_logprobs }) |maybe| if (maybe) |lps| {
+    defer for ([_]?[]request_mod.LogprobResult{ result.logprobs, result.prompt_logprobs }) |maybe| if (maybe) |lps| {
         for (lps) |*lp| allocator.free(lp.top_logprobs);
         allocator.free(lps);
     };
@@ -456,7 +456,7 @@ fn handleNonStreamingCompletion(
         // Echo: the prompt's tokens lead, its first unscored (OpenAI's `null`).
         const ids = try std.mem.concat(allocator, u32, &.{ prompt_ids, result.token_ids });
         defer allocator.free(ids);
-        const lps = try std.mem.concat(allocator, generate_mod.LogprobResult, &.{ result.prompt_logprobs orelse &.{}, result.logprobs.? });
+        const lps = try std.mem.concat(allocator, request_mod.LogprobResult, &.{ result.prompt_logprobs orelse &.{}, result.logprobs.? });
         defer allocator.free(lps);
         break :blk try formatCompletionsLogprobs(allocator, tok, ids, lps, true, &lp_offset_base);
     } else try formatCompletionsLogprobs(allocator, tok, result.token_ids, result.logprobs.?, false, &lp_offset_base);
@@ -489,7 +489,7 @@ fn handleStreamingCompletion(
     tok: *const Tokenizer,
     prompt_ids: []const u32,
     max_tokens: u32,
-    sampling: generate_mod.SamplingParams,
+    sampling: request_mod.SamplingParams,
     eos_token_ids: []const u32,
     stop_sequences: []const []const u8,
     model_name: []const u8,

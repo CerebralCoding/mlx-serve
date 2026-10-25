@@ -12,3 +12,7 @@ pub const LogprobResult = struct {
     token_logprob: f32,
     top_logprobs: []TokenLogprob,
 };
+
+/// Widest `top_logprobs` / `logprobs` a request may ask for. OpenAI stops at 20; a
+/// fidelity probe (KL against a reference distribution) needs the pack's tail too.
+pub const MAX_TOP_LOGPROBS: u32 = 1024;

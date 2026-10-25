@@ -4,12 +4,12 @@ const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const kv_quant = @import("../../sdk/blocks/attention/kv_quant.zig");
 const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
-const generate_mod = @import("../../engines/mlx/generate.zig");
+const request_mod = @import("../../sdk/request/request.zig");
 const chat_mod = @import("../chat/chat.zig");
-const rp_mod = @import("../chat/reasoning/protocol.zig");
+const rp_mod = @import("../../sdk/grammar/protocol.zig");
 const log = @import("../../sdk/util/log.zig");
 const responses_mod = @import("responses/model.zig");
-const pld_index = @import("../../engines/mlx/spec/pld_index.zig");
+const pld_index = @import("../../sdk/spec/pld_index.zig");
 const MediaSpan = @import("../../sdk/kv/media_span.zig").MediaSpan;
 const model_registry_mod = @import("../registry/registry.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -360,7 +360,7 @@ pub fn handleChatCompletions(
         // logprobs=true without top_logprobs defaults to 0 (just the chosen token's logprob)
         const tlp = root.get("top_logprobs") orelse break :blk 1;
         break :blk switch (tlp) {
-            .integer => |i| @intCast(@min(@max(i, 0), generate_mod.MAX_TOP_LOGPROBS)),
+            .integer => |i| @intCast(@min(@max(i, 0), request_mod.MAX_TOP_LOGPROBS)),
             else => 1,
         };
     };
@@ -778,7 +778,7 @@ pub fn handleChatCompletions(
     // but different vision embeddings, so prefix matching would reuse stale features.
     const eos_slice = requestEosSlice(config, root);
 
-    var sampling = generate_mod.SamplingParams{
+    var sampling = request_mod.SamplingParams{
         .temperature = temperature,
         .top_p = top_p,
         .top_k = top_k,
@@ -792,7 +792,7 @@ pub fn handleChatCompletions(
     // Build grammar-constrained sampling state if a JSON schema was supplied.
     // Lifetime is scoped to this request — the SchemaConstraint must NOT be
     // moved (the embedded Constraint holds pointers into it).
-    var sc: generate_mod.SchemaConstraint = undefined;
+    var sc: request_mod.SchemaConstraint = undefined;
     var sc_init = false;
     defer if (sc_init) sc.deinit();
 
@@ -924,7 +924,7 @@ pub fn emitConstrainedResponses(a: std.mem.Allocator, stream: *Conn, seq: *u64, 
     }
 }
 
-pub fn splitConstrainedResponse(allocator: std.mem.Allocator, routed: *?rp_mod.Delivery, sampling: generate_mod.SamplingParams, text: []const u8, payload_byte: ?usize, keep_markup: bool, opened: bool) !chat_mod.ThinkSplit {
+pub fn splitConstrainedResponse(allocator: std.mem.Allocator, routed: *?rp_mod.Delivery, sampling: request_mod.SamplingParams, text: []const u8, payload_byte: ?usize, keep_markup: bool, opened: bool) !chat_mod.ThinkSplit {
     if (sampling.constraint) |c| {
         if (c.proto) |p| {
             routed.* = rp_mod.Delivery.init(p);
@@ -946,7 +946,7 @@ fn handleNonStreamingGeneration(
     tok: *const Tokenizer,
     prompt_ids: []const u32,
     max_tokens: u32,
-    sampling: generate_mod.SamplingParams,
+    sampling: request_mod.SamplingParams,
     eos_token_ids: []const u32,
     stop_sequences: []const []const u8,
     model_name: []const u8,

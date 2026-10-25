@@ -25,7 +25,7 @@ const mlx = sdk.mlx;
 const mtl = @import("../sdk_ext/metal_launch.zig");
 const kset = @import("../sdk_ext/kernel_set.zig");
 const quant = @import("../sdk_ext.zig").quant;
-const xq = @import("../../../../sdk/quant/exl3/stream/quant.zig");
+const xq = @import("../../../quant/exl3/stream/quant.zig");
 const ops = @import("../ops.zig");
 
 pub const G = ops.MlxOps;
@@ -92,8 +92,8 @@ pub const texts: [n_kernels][:0]const u8 = .{
 };
 /// The DIG-X GEMMs' header (DeepSeek's, reused as it is) and the onepass header (DeepSeek's dig2 helpers + GLM's width
 /// parameter).
-pub const header_gemm: [:0]const u8 = @embedFile("../../../../sdk/quant/exl3/stream/kernels/exl3/header_dig_mul1h_k3.metal");
-pub const header_onepass: [:0]const u8 = @embedFile("../../../../sdk/quant/exl3/stream/kernels/exl3/header_dig2_x.metal") ++ @embedFile(dir ++ "header_glm5n_exl3_dig2.metal");
+pub const header_gemm: [:0]const u8 = @embedFile("../../../quant/exl3/stream/kernels/exl3/header_dig_mul1h_k3.metal");
+pub const header_onepass: [:0]const u8 = @embedFile("../../../quant/exl3/stream/kernels/exl3/header_dig2_x.metal") ++ @embedFile(dir ++ "header_glm5n_exl3_dig2.metal");
 
 /// sha256 of each text as `scripts/glm5next_exl3_kernels_gen.py` writes it (checked once at install and in the tests).
 pub const text_sha256 = [n_kernels]*const [64]u8{

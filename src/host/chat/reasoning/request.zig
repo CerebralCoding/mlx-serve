@@ -3,10 +3,10 @@
 
 const std = @import("std");
 const tokenizer_mod = @import("../../../sdk/tokenizer/tokenizer.zig");
-const generate_mod = @import("../../../engines/mlx/generate.zig");
+const request_mod = @import("../../../sdk/request/request.zig");
 const generation_settings = @import("../../api/generation_settings.zig");
 const chat_mod = @import("../chat.zig");
-const rp_mod = @import("protocol.zig");
+const rp_mod = @import("../../../sdk/grammar/protocol.zig");
 const abi = @import("../../../abi/plugin.zig");
 const ModelConfig = @import("../../../engines/mlx/model.zig").ModelConfig;
 const log = @import("../../../sdk/util/log.zig");
@@ -79,7 +79,7 @@ fn thinkBoundBudget(budget: i32) u32 {
 /// Arm a decode-time thinking bound for this request, or null when it cannot
 /// close a thought (thinking off, markers not atomic). `forced` is
 /// allocated; the caller frees it after generation.
-pub fn armThinkBound(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32, enable_thinking: bool, budget: i32) ?generate_mod.ThinkBound {
+pub fn armThinkBound(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32, enable_thinking: bool, budget: i32) ?request_mod.ThinkBound {
     if (!enable_thinking or lm.transformer == null) return null;
     const closer = promptOpenerMarkerCloser(allocator, lm, tok, prompt_ids) orelse
         atomicTokenId(allocator, tok, chat_mod.BARE_THINK_CLOSER) orelse {
@@ -105,7 +105,7 @@ pub fn armThinkBound(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const
 /// Arm the forced tool-call opener for a `tool_choice` that obliges a call, or
 /// null when the dialect has no opener we can spell or the thought cannot be
 /// tracked. `forced` is allocated; the caller frees it after generation.
-pub fn armToolForce(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32, forced_tool: ?chat_mod.ForcedTool) ?generate_mod.ToolForce {
+pub fn armToolForce(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32, forced_tool: ?chat_mod.ForcedTool) ?request_mod.ToolForce {
     const ft = forced_tool orelse return null;
     // Armed wherever the host's tokenizer is the model's (the Neural Engine too), so an engine that cannot force
     // a call refuses the request by name.

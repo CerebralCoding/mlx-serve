@@ -1,12 +1,12 @@
 //! extractResponseId, extractCompletedStatus; get/delete/compact, handleResponsesInner
 
 const std = @import("std");
-const generate_mod = @import("../../../engines/mlx/generate.zig");
+const request_mod = @import("../../../sdk/request/request.zig");
 const chat_mod = @import("../../chat/chat.zig");
-const rp_mod = @import("../../chat/reasoning/protocol.zig");
+const rp_mod = @import("../../../sdk/grammar/protocol.zig");
 const log = @import("../../../sdk/util/log.zig");
 const responses_mod = @import("model.zig");
-const pld_index = @import("../../../engines/mlx/spec/pld_index.zig");
+const pld_index = @import("../../../sdk/spec/pld_index.zig");
 const scheduler_mod = @import("../../../engines/mlx/scheduler.zig");
 const model_registry_mod = @import("../../registry/registry.zig");
 const LoadedModel = model_registry_mod.LoadedModel;
@@ -701,7 +701,7 @@ fn handleResponsesInner(
     if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, lm, enable_mtp_resp, mm.bytes(config))) return;
 
     // ── sampling ──
-    var sampling = generate_mod.SamplingParams{
+    var sampling = request_mod.SamplingParams{
         .temperature = temperature,
         .top_p = top_p,
         .top_k = top_k,
@@ -711,7 +711,7 @@ fn handleResponsesInner(
         .frequency_penalty = frequency_penalty,
         .seed = seed,
     };
-    var sc: generate_mod.SchemaConstraint = undefined;
+    var sc: request_mod.SchemaConstraint = undefined;
     var sc_init = false;
     defer if (sc_init) sc.deinit();
     if (grammar_schema_val) |sv| {
@@ -887,7 +887,7 @@ fn handleResponsesInner(
         enable_mtp_resp = false;
     }
 
-    var result: generate_mod.GenerationResult = undefined;
+    var result: request_mod.GenerationResult = undefined;
     if (is_stream) {
         // Pick speculative-decoding mode for the streaming Responses path.
         const stream_mode = pickStreamMode(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.shapesLogits(), 0, requestHasCompany());

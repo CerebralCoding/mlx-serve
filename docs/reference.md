@@ -39,7 +39,7 @@ Verbatim deep detail: per-file contracts, subsystem designs, API surfaces. Root 
 | `sdk/mesh/texinpaint.zig` | Texture-atlas inpaint: vertex-graph color propagation (port of the reference `meshVerticeInpaint` "smooth" mode) + iterative-diffusion hole fill (documented NS-inpaint stand-in). Zero MLX; hermetic maximum-principle/determinism tests. |
 | `host/api/responses/model.zig` | OpenAI Responses API: parser, envelope, in-memory `ResponseStore`, compaction blob |
 | `host/http/ws.zig` | RFC 6455 WebSocket framing (server-side, generic over `Conn`) |
-| `engines/mlx/spec/pld_index.zig` | PLD n-gram index (`PldLookup.findMatch`, `ngramRepeatScore`) |
+| `sdk/spec/pld_index.zig` | PLD n-gram index (`PldLookup.findMatch`, `ngramRepeatScore`) |
 | `engines/mlx/cache/ssd/disk_tier.zig` | Persistent prefix tier (`--prefix-cache-disk`, default OFF): chunked safetensors survive RAM eviction and server restart. `--no-prefix-cache-ram` disables only idle RAM retention when disk is enabled (`--prefix-cache-entries 0` disables both tiers); completed prefixes write through continuously and restore directly into the next request's working KV. Hybrid SSM checkpoints persist beside KV chunks and restore both states at one position. Schemes off/affine, B==1. Guard: `tests/test_prefix_cache_disk.sh` + hermetic DiskTier/HotPrefixCache tests. |
 | `plugins/gemma4/assistant_drafter.zig` | Gemma 4 assistant drafter (cross-attention spec-decode) |
 | `sdk/spec/mtp/mtp.zig` | Qwen 3.5/3.6 native MTP head (sidecar spec-decode; self-contained — delete this + `Generator.nextMtp` to remove the feature). MLP is a union: dense SwiGLU OR the 35B-A3B MoE layout (`language_model.mtp.` prefix, mlx-lm `switch_mlp` split experts + shared expert + SEG — forwards through the trunk's `moeMLP`); quant params re-solve PER WEIGHT per call (`transformer.affineParamsFromGeometry` — sidecars mix 5/6-bit gs-128 beside 4-bit gs-64). Prefill history is FULL by default (`--mtp-history-window` opts into last-window capture; the A/B showed windowing costs 14 acceptance points at 64K on the stock head) |
@@ -737,7 +737,7 @@ LOSSY. On by default only with NAX (M5-class GPU, macOS 26.2+) AND 64 GiB of RAM
 
 ## Reasoning with constrained JSON
 
-`src/host/chat/reasoning/protocol.zig` owns format descriptions, incremental recognition,
+`src/sdk/grammar/protocol.zig` owns format descriptions, incremental recognition,
 pre-sample boundary validation, recovery planning, and shared HTTP delivery.
 `host/registry/registry.zig` caches immutable tokenizer indexes; `engines/mlx/generate.zig` owns
 sampling and the hard token cap. See [reasoning-protocols.md](reasoning-protocols.md)

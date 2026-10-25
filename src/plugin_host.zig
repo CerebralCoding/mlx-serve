@@ -8,7 +8,7 @@ pub const io_util = @import("sdk/util/io_util.zig");
 pub const shared = @import("sdk/util/shared.zig");
 /// The process environment (`src/env.zig`): every variable a plugin reads is registered there.
 pub const env = @import("env.zig");
-pub const mtp_acceptance = @import("engines/mlx/spec/mtp_acceptance.zig");
+pub const mtp_acceptance = @import("sdk/spec/mtp_acceptance.zig");
 /// The EXL3 quant format (`src/sdk/quant/exl3/format.zig`): a plugin's EXL3 bank multiplies through it.
 pub const exl3 = @import("sdk/quant/exl3/format.zig");
 pub const dsa_nax = @import("plugins/glm5_next/dsa_nax.zig");

@@ -5,7 +5,7 @@
 pub const mlx = @import("mlx/ffi.zig");
 pub const io_util = @import("sdk/util/io_util.zig");
 pub const shared = @import("sdk/util/shared.zig");
-pub const mtp_acceptance = @import("engines/mlx/spec/mtp_acceptance.zig");
+pub const mtp_acceptance = @import("sdk/spec/mtp_acceptance.zig");
 pub const log = @import("sdk/util/log.zig");
 pub const dsa_nax = @import("plugins/glm5_next/dsa_nax.zig");
 pub const fp8_block128_gemv = @import("sdk/quant/fp8_block128_gemv.zig");
@@ -189,13 +189,13 @@ test {
     _ = @import("sdk/blocks/dit/w8a8.zig");
     _ = @import("sdk/blocks/dit/int8_attn.zig");
     _ = @import("plugins/prism_hadamard_qwen35/mtp_graft.zig");
-    _ = @import("host/tokenizer/regex.zig");
-    _ = @import("engines/mlx/grammar/json_schema.zig");
-    _ = @import("engines/mlx/grammar/json_grammar.zig");
-    _ = @import("engines/mlx/grammar/token_mask.zig");
+    _ = @import("sdk/tokenizer/regex.zig");
+    _ = @import("sdk/grammar/json_schema.zig");
+    _ = @import("sdk/grammar/json_grammar.zig");
+    _ = @import("sdk/grammar/token_mask.zig");
     _ = @import("host/api/responses/model.zig");
     _ = @import("host/http/ws.zig");
-    _ = @import("engines/mlx/spec/pld_index.zig");
+    _ = @import("sdk/spec/pld_index.zig");
     _ = @import("sdk/blocks/attention/kv_quant.zig");
     _ = @import("host/registry/model_settings.zig");
     _ = @import("host/registry/load_progress.zig");

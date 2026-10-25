@@ -17,7 +17,7 @@ const qwen4_exp = @import("../../plugins/qwen4_exp/qwen4_exp.zig");
 const distributed = @import("cluster/distributed.zig");
 const qwen4_ple = @import("../../plugins/qwen4_exp/ple_table.zig");
 const kv_quant_mod = @import("cache/kv_quant.zig");
-const mtp_acceptance_mod = @import("spec/mtp_acceptance.zig");
+const mtp_acceptance_mod = @import("../../sdk/spec/mtp_acceptance.zig");
 const weights_load = @import("../../sdk/weights/load.zig");
 
 pub const HiddenAct = @import("../../sdk/blocks/mlp/activations.zig").HiddenAct;

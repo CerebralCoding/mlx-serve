@@ -4,11 +4,11 @@ const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const kv_quant = @import("../../sdk/blocks/attention/kv_quant.zig");
 const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
-const generate_mod = @import("../../engines/mlx/generate.zig");
+const request_mod = @import("../../sdk/request/request.zig");
 const chat_mod = @import("../chat/chat.zig");
-const rp_mod = @import("../chat/reasoning/protocol.zig");
+const rp_mod = @import("../../sdk/grammar/protocol.zig");
 const log = @import("../../sdk/util/log.zig");
-const pld_index = @import("../../engines/mlx/spec/pld_index.zig");
+const pld_index = @import("../../sdk/spec/pld_index.zig");
 const MediaSpan = @import("../../sdk/kv/media_span.zig").MediaSpan;
 const model_registry_mod = @import("../registry/registry.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -766,7 +766,7 @@ pub fn handleAnthropicMessages(
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
 
     const eos_slice = config.eosTokenSlice();
-    var sampling = generate_mod.SamplingParams{
+    var sampling = request_mod.SamplingParams{
         .temperature = temperature,
         .top_p = top_p,
         .top_k = top_k,
@@ -780,7 +780,7 @@ pub fn handleAnthropicMessages(
     // Grammar-constrained sampling for `output_config.format` json_schema —
     // the chat-completions block, same lifetime rule: the SchemaConstraint
     // must NOT be moved (the embedded Constraint holds pointers into it).
-    var sc: generate_mod.SchemaConstraint = undefined;
+    var sc: request_mod.SchemaConstraint = undefined;
     var sc_init = false;
     defer if (sc_init) sc.deinit();
     if (output_cfg.schema) |sv| {
@@ -847,7 +847,7 @@ fn handleAnthropicNonStreaming(
     tok: *const Tokenizer,
     prompt_ids: []const u32,
     max_tokens: u32,
-    sampling: generate_mod.SamplingParams,
+    sampling: request_mod.SamplingParams,
     eos_token_ids: []const u32,
     stop_sequences: []const []const u8,
     model_name: []const u8,

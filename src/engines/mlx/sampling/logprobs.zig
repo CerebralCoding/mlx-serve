@@ -49,9 +49,7 @@ pub fn firstTokenLogprobs(allocator: std.mem.Allocator, logits: mlx.mlx_array, c
 /// this did — is ambiguous the moment two logits tie, which under the
 /// saturation above is everywhere: rank 1 was measured to be the chosen token
 /// in 0 of 5 positions on a trivial greedy prompt.
-/// Widest `top_logprobs` / `logprobs` a request may ask for. OpenAI stops at 20; a
-/// fidelity probe (KL against a reference distribution) needs the pack's tail too.
-pub const MAX_TOP_LOGPROBS: u32 = 1024;
+pub const MAX_TOP_LOGPROBS = @import("../../../sdk/request/logprob.zig").MAX_TOP_LOGPROBS;
 
 pub fn computeLogprobs(allocator: std.mem.Allocator, logits: mlx.mlx_array, chosen_token: u32, top_n: u32, s: mlx.mlx_stream) !LogprobResult {
     // Every caller passes one position, as [1, V] or [1, 1, V].

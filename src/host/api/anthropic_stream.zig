@@ -5,9 +5,9 @@ const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const kv_quant = @import("../../sdk/blocks/attention/kv_quant.zig");
 const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
-const generate_mod = @import("../../engines/mlx/generate.zig");
+const request_mod = @import("../../sdk/request/request.zig");
 const chat_mod = @import("../chat/chat.zig");
-const rp_mod = @import("../chat/reasoning/protocol.zig");
+const rp_mod = @import("../../sdk/grammar/protocol.zig");
 const log = @import("../../sdk/util/log.zig");
 const MediaSpan = @import("../../sdk/kv/media_span.zig").MediaSpan;
 const scheduler_mod = @import("../../engines/mlx/scheduler.zig");
@@ -54,7 +54,7 @@ pub fn handleAnthropicStreaming(
     tok: *const Tokenizer,
     prompt_ids: []const u32,
     max_tokens: u32,
-    sampling: generate_mod.SamplingParams,
+    sampling: request_mod.SamplingParams,
     eos_token_ids: []const u32,
     stop_sequences: []const []const u8,
     model_name: []const u8,
