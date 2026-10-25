@@ -495,6 +495,13 @@ pub const CacheOps = extern struct {
     /// reference). A merged group keeps `value` whole and splits a row out only when that cache is read alone or
     /// leaves the group.
     set_state_rows: *const fn (caches: [*]const Handle, n: u32, layer: u32, slot: StateSlot, value: Array, s: Stream) callconv(.c) Verdict,
+    /// Each handle is an SDK `cache_ops.Slot` (`sdk/kv/cache_ops.zig`), which an in-tree model may read directly. A
+    /// flag, not the table's address: every compile unit holds its own copy of the table.
+    sdk_slots: bool = false,
+
+    pub fn sdkSlots(self: *const CacheOps) bool {
+        return self.size >= @sizeOf(CacheOps) and self.sdk_slots;
+    }
 };
 
 /// The forward's results: every array is a new reference the host owns. `logits` is [R, vocab] with R the number
@@ -686,7 +693,8 @@ pub const ModelTable = extern struct {
     forward: *const fn (m: *anyopaque, f: *const Forward, out: *ForwardOut) callconv(.c) Verdict,
     /// Settles what `slots` were left owed: `.flush` reads the tokens off the device once for every slot, or takes
     /// `tokens` (one slot's rows, already read); `.discard` drops it (the forward is abandoned).
-    forward_settle: ?*const fn (m: *anyopaque, slots: Span(u32), how: Settle, tokens: Span(u32)) callconv(.c) Verdict = null,
+    /// `tokens` by pointer: a trailing by-value span past the argument registers miscompiles on x86_64 (LLVM byval).
+    forward_settle: ?*const fn (m: *anyopaque, slots: Span(u32), how: Settle, tokens: *const Span(u32)) callconv(.c) Verdict = null,
     /// A slot id the engine handed in `Forward.slots` is gone: per-slot state the plugin keeps for it is freed.
     release_slot: ?*const fn (m: *anyopaque, slot: u32) callconv(.c) void = null,
     cache: *const CacheHooks,

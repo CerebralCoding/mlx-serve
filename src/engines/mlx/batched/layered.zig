@@ -9,6 +9,7 @@ const Transformer = @import("../transformer.zig").Transformer;
 
 pub var per_slot_attn_logged: bool = false;
 var gdn_batched_verify_rows_logged: c_int = 0; // widest row total logged so far
+var gdn_batched_logged: bool = false;
 pub var row_axis_verify_logged: bool = false;
 pub var verify_fail_after_flush: ?usize = null;
 
@@ -26,6 +27,11 @@ pub fn forwardMoeBatchedDecode(
     hidden_rows: ?*?[]mlx.mlx_array,
 ) ![]mlx.mlx_array {
     std.debug.assert(next_tokens.len == ctxs.len);
+    // The guards grep this marker (`tests/test_batched_equivalence.sh`): equal output cannot tell batched from serial.
+    if (!gdn_batched_logged) {
+        gdn_batched_logged = true;
+        log.info("[batched] gdn batched decode engaged (slots={d})\n", .{next_tokens.len});
+    }
     const b = self.plugin orelse return error.BatchedDecodeUnsupported;
     return plugin_driver.forwardBatched(self, b, next_tokens, ctxs, rope_offsets, hidden_rows);
 }

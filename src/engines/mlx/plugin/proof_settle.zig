@@ -48,7 +48,7 @@ fn tForward(m: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv
     return v;
 }
 
-fn tSettle(_: *anyopaque, slots: abi.Span(u32), how: abi.Settle, tokens: abi.Span(u32)) callconv(.c) abi.Verdict {
+fn tSettle(_: *anyopaque, slots: abi.Span(u32), how: abi.Settle, tokens: *const abi.Span(u32)) callconv(.c) abi.Verdict {
     switch (how) {
         .flush => {
             seen.flushes += 1;

@@ -24,7 +24,7 @@ pub fn slotId(b: *Bound, ctx: *ForwardCtx) u32 {
 
 fn call(b: *Bound, ids: []const u32, how: abi.Settle, tokens: []const u32) !void {
     const f = b.table.forward_settle orelse return error.PluginSettleMissing;
-    const v = f(b.model, .of(ids), how, .of(tokens));
+    const v = f(b.model, .of(ids), how, &abi.Span(u32).of(tokens));
     if (!v.isOk()) {
         log.err("[plugin] {s}: settle failed: {s}\n", .{ b.table.name.slice(), v.why.slice() });
         return error.PluginSettleFailed;

@@ -211,8 +211,11 @@ fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
         .stream_room = streamRoom(config),
         .pair_remote = if (config.dist_dsv41) |p| .{ .first = @intCast(p.lo), .count = @intCast(p.hi - p.lo) } else .{},
     }, &why) orelse {
+        if (why.code == .too_large) {
+            log.warn("[plugin] {s}: load refused: {s}\n", .{ b.table.name.slice(), why.why.slice() });
+            return error.InsufficientMemory;
+        }
         log.err("[plugin] {s}: load failed: {s}\n", .{ b.table.name.slice(), why.why.slice() });
-        if (why.code == .too_large) return error.InsufficientMemory;
         return if (std.mem.eql(u8, why.why.slice(), "MissingWeight")) error.MissingWeight else error.PluginLoadFailed;
     };
     errdefer b.table.unload(m);

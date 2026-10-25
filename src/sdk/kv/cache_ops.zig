@@ -49,6 +49,7 @@ pub fn For(comptime E: type) type {
             .set_state = setState,
             .state_rows = Rows.stateRows,
             .set_state_rows = Rows.setStateRows,
+            .sdk_slots = true,
         };
 
         const Rows = @import("../util/state_rows.zig").Rows(state, setState);

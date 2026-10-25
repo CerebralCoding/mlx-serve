@@ -68,6 +68,11 @@ pub const Reader = struct {
     }
 
     /// `<prefix>.<fmt>` in `buf`.
+    /// The format by name: a table's address is the compile unit's own.
+    fn isGguf(r: *const Reader) bool {
+        return std.mem.eql(u8, r.fmt.name.slice(), gguf_format.table.name.slice());
+    }
+
     pub fn name(r: *const Reader, buf: []u8, comptime fmt: []const u8, args: anytype) ![]const u8 {
         return std.fmt.bufPrint(buf, "{s}." ++ fmt, .{r.prefix} ++ args);
     }
@@ -96,7 +101,7 @@ pub const Reader = struct {
     fn weight(r: *Reader, base: []const u8, in_dim: u32) !quant_abi.Weight {
         var w: quant_abi.Weight = .{};
         // A GGUF's float tensors load as bf16 beside its block-quantized ones: one without a sentinel is dense.
-        if (r.fmt == &gguf_format.table) {
+        if (r.isGguf()) {
             var nb: [256]u8 = undefined;
             if (!r.has(try std.fmt.bufPrint(&nb, "{s}.scales", .{base}))) {
                 const raw = r.src.tensor(try std.fmt.bufPrint(&nb, "{s}.weight", .{base}));
@@ -123,7 +128,7 @@ pub const Reader = struct {
 
     /// A GGUF weight's layout is its block type, read by the kernels off the sentinel; never an MLX mode.
     fn modeOf(r: *const Reader, w: *const quant_abi.Weight) QuantMode {
-        return if (r.fmt == &gguf_format.table and w.scales.ctx != null) .gguf else native.modeOf(w);
+        return if (r.isGguf() and w.scales.ctx != null) .gguf else native.modeOf(w);
     }
 
     /// Routed experts stacked under `base` (`[E, out, in]`; dense ones `[E, in, out]`), unowned. A dense bank in a

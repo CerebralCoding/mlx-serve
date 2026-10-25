@@ -107,7 +107,8 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         return null;
     };
     return loadModel(ctx, s) catch |e| {
-        std.log.err("deepseek_v41: load failed: {t}", .{e});
+        // Too little free memory is a refusal the host answers by name, not a fault.
+        if (e == error.StreamedRowsDoNotFit) std.log.warn("deepseek_v41: load refused: {t}", .{e}) else std.log.err("deepseek_v41: load failed: {t}", .{e});
         out.* = switch (@as(anyerror, e)) {
             error.OutOfMemory => Verdict.refuse(.failed, "deepseek_v41: out of memory"),
             error.MissingWeight => Verdict.refuse(.failed, "deepseek_v41: a weight is missing"),

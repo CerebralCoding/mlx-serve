@@ -209,7 +209,7 @@ const SlotCaches = struct { kv: *KVCache, ssm: []SSMCacheEntry, packed_reads: bo
 
 fn slotCaches(m: *Model, f: *const abi.Forward, i: usize) !SlotCaches {
     const pos: u64 = if (f.positions.len > i) f.positions.slice()[i] else 0;
-    if (f.cache_ops == &engine_cache_ops.ops and f.caches.len > i) {
+    if (f.cache_ops != null and f.cache_ops.?.sdkSlots() and f.caches.len > i) {
         const s: *engine_cache_ops.Slot = @ptrCast(@alignCast(f.caches.slice()[i].?));
         if (s.ssm.len != m.cfg.num_hidden_layers) return error.SlotWithoutSsmEntries;
         return .{ .kv = s.kv, .ssm = s.ssm, .packed_reads = s.packed_reads };
@@ -449,7 +449,7 @@ fn concatRows(m: *Model, xs: []const Array) !Array {
 
 /// Settles what `slots` were left owed: the n-gram rows of a deferred leaf (`input`) or the history of the GPU
 /// arm (`history`), from the device or the engine's `tokens`; `.discard` drops it and the spec slot it claimed.
-fn forwardSettle(mp: *anyopaque, slots: abi.Span(u32), how: abi.Settle, tokens: abi.Span(u32)) callconv(.c) Verdict {
+fn forwardSettle(mp: *anyopaque, slots: abi.Span(u32), how: abi.Settle, tokens: *const abi.Span(u32)) callconv(.c) Verdict {
     const m: *Model = @ptrCast(@alignCast(mp));
     settleSlots(m, slots.slice(), how, tokens.slice()) catch |e| return Verdict.named(.failed, @errorName(e));
     return .ok;

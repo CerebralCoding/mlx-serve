@@ -21,13 +21,13 @@ pub const Resident = struct {
 
     /// The formats' view; borrows `self`, which must not move while it is in use.
     pub fn source(self: *const Resident) abi.Source {
-        return .{ .ctx = @constCast(self), .get = get };
+        return .{ .ctx = @constCast(self), .get = get, .resident = true };
     }
 
     /// The whole map behind `src` when it is a resident source, moved out (the source is left empty): an in-tree
     /// model that keeps the loader's map adopts it instead of reading the pack twice. Null for any other source.
     pub fn take(src: *const abi.Source) ?Weights {
-        if (src.get != &get) return null;
+        if (src.size < @sizeOf(abi.Source) or !src.resident) return null;
         const self: *Resident = @ptrCast(@alignCast(src.ctx.?));
         const w = self.weights;
         self.weights = Weights.init(w.allocator);

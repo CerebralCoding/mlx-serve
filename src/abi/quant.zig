@@ -23,6 +23,9 @@ pub const Source = extern struct {
     /// The tensor `name` (the full key, `<base>.weight`) as the source holds it, borrowed for the source's life; an
     /// empty array when the pack has none.
     get: *const fn (ctx: ?*anyopaque, name: Str) callconv(.c) Array,
+    /// `ctx` is an SDK `Resident` whose map an in-tree model may take (`Resident.take`). A flag, not `get`'s address:
+    /// every compile unit holds its own copy of the function.
+    resident: bool = false,
 
     pub fn tensor(self: *const Source, name: []const u8) Array {
         return self.get(self.ctx, Str.of(name));
