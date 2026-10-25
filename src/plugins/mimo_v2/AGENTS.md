@@ -24,7 +24,7 @@ mlx-lm's layout (`tests/convert_mimo_v2.py`, mlx-community's mxfp4-q8 packs).
   `dflash_capture`, `moe`, thinking ON by default (the template thinks unless `enable_thinking: false`).
 - MTP: `mtp_heads` = `num_nextn_predict_layers` (at most 3), `in_checkpoint`, reading the final-normed hidden; the
   pack must ship exactly that many `model.mtp.layers.{k}` (read from the shards the index names for `model.mtp.*`).
-- Streaming packs (`expert_streaming`: mlx-stream's MXFP4 bank, docs/mlx-stream/mimo-pack.md): the routed experts
+- Streaming packs (`expert_streaming`: mlx-stream's MXFP4 bank): the routed experts
   come from `experts.bin` through `sdk/weights/streamed.zig` (`Moe.Weights.streamed`, the trunk's own MoE math), the
   residents from the index (`fp8_block128` q/k/v and dense MLP: the shared Linear's e4m3 arm), the MTP heads from
   `mtp-heads.safetensors`. The engine serves them here (`ModelConfig.expert_bank`): slot rows per routed layer are the

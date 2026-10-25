@@ -124,7 +124,7 @@ plugin's own trunk runs everything else. Its config declares `expert_streaming`;
 `streamed_weights`. Three plugins serve one each:
 
 - `deepseek_v41`: V4.1's EXL3 repack, through the SDK streamer (`sdk/weights/streamed/expert/`).
-- `mimo_v2`: MiMo-V2.6-Flash's MXFP4 pack (`docs/mlx-stream/mimo-pack.md`), through MiMo's streamer
+- `mimo_v2`: MiMo-V2.6-Flash's MXFP4 pack, through MiMo's streamer
   (`sdk/weights/streamed/mimo/`).
 - `glm5_next`: GLM-5.3-Flash's EXL3 K=3 mul1 pack, MiMo's streamer over the GLM-shape EXL3 texts
   (`sdk/weights/streamed/glm5n/`, `glm5n_source.zig`); its `mtp.0` head's NVFP4 experts load resident.

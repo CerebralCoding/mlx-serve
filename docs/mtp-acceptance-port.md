@@ -66,9 +66,3 @@ Vontra Flash-Next 4-bit pack, T=1.0, code and prose at 1K/4K/16K, two seeds,
 A B B A on one binary: typical 0.2 decoded 86.7 tok/s, typical 0.2 plus the tail
 99.4 tok/s (2.96 to 3.36 tokens per round). Greedy output is byte-identical with
 the tail on.
-
-The complete unchanged-control comparison, quality sanity screen, and 1K-1M
-timing and memory charts are in the
-[benchmark record](benchmarks/qwen38-mtp-port/README.md). The high-context cells are
-explicitly statistics-only and should not be read as long-context quality or
-recurrent-state parity evidence.

@@ -166,7 +166,7 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
     return .ok;
 }
 
-/// mlx-stream's MXFP4 expert bank (`experts.bin` beside `expert-manifest.json`, docs/mlx-stream/mimo-pack.md).
+/// mlx-stream's MXFP4 expert bank (`experts.bin` beside `expert-manifest.json`).
 fn isBank(es: ?json.Object) bool {
     const o = es orelse return false;
     const want = [_][2][]const u8{ .{ "family", "mlx-stream" }, .{ "format", "mlx-stream-mxfp4-expert-bank-v1" }, .{ "manifest", "expert-manifest.json" } };

@@ -312,8 +312,8 @@ Absorbed from mlx-stream (commit fcb4011 of our fork ddalcu/mlx-stream), built i
 the macOS server: the streamed packs' archs (`src/plugins/{deepseek_v41,glm5_next,
 glm_moe_dsa,mimo_v2}/stream/`), the DeepSeek-V4.1 EXL3 decoder and its pinned Metal
 kernels (`src/sdk/quant/exl3/stream/`), the SSD expert streamer, its plugin SDK and C
-shims (`src/sdk/weights/streamed/`, `src/mlx_stream*.zig`), its scripts
-(`scripts/mlx_stream/`) and docs (`docs/mlx-stream/`). The DeepSeek-V4.1 streaming
+shims (`src/sdk/weights/streamed/`, `src/mlx_stream*.zig`) and its GLM-5.3 pack
+converters (now `scripts/glm53_pack.py`). The DeepSeek-V4.1 streaming
 runtime it was ported from (the packed expert record and manifest formats, the
 streamed-bank layout and the routed-expert EXL3 Metal kernels) is David Tai's earlier
 Python work, its parity oracle, MIT. It incorporates:
