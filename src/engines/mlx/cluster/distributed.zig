@@ -17,6 +17,7 @@ const SSMCacheEntry = @import("../ssm/entry.zig").SSMCacheEntry;
 const ssmFreeSpecCapture = @import("../ssm/entry.zig").ssmFreeSpecCapture;
 const ssmFreeQsaState = @import("../../../plugins/qwen4_exp/qsa/history.zig").ssmFreeQsaState;
 const h3_split = @import("../../../plugins/minimax_h3/cluster.zig");
+const wire = @import("../../../sdk/util/wire.zig");
 const lan = @import("../../../host/lan/lan.zig");
 const dsv41_mod = @import("../../../plugins/deepseek_v41/deepseek_v41.zig");
 
@@ -258,18 +259,45 @@ fn parseCoordinator(text: []const u8) !Coordinator {
 
 // ── Wire protocol: fixed int32[8] control messages, then any payload tensor ──
 
-pub const MAGIC: i32 = 0x4D4C5853; // "MLXS"
+pub const MAGIC = wire.MAGIC;
 const VERSION: i32 = 5;
-pub const Msg = [8]i32;
+pub const Msg = wire.Msg;
 const OP_FORWARD: i32 = 1;
-pub const OP_STOP: i32 = 2;
+pub const OP_STOP = wire.OP_STOP;
 const OP_MOE: i32 = 3;
-pub const OP_H3_JOB: i32 = 4;
-pub const OP_H3_STEP: i32 = 5;
-pub const OP_H3_END: i32 = 6;
+pub const OP_H3_JOB = wire.OP_H3_JOB;
+pub const OP_H3_STEP = wire.OP_H3_STEP;
+pub const OP_H3_END = wire.OP_H3_END;
 const OP_DSV41: i32 = 7;
-/// The host unloaded the pair's model: the worker frees its part and waits for the next plan.
-pub const OP_RELEASE: i32 = 8;
+pub const OP_RELEASE = wire.OP_RELEASE;
+
+/// `link` as a plugin's split job talks over it (`sdk/util/wire.zig`).
+pub fn wireOf(link: *const Link) wire.Link {
+    return .{ .ctx = link, .vt = &WireOps.vt };
+}
+
+const WireOps = struct {
+    const vt: wire.Link.VTable = .{ .send_op = sendOp_, .recv_op = recvOp_, .send_now = sendNow_, .recv_now = recvNow_, .all_gather = allGather_ };
+
+    fn of(ctx: *const anyopaque) *const Link {
+        return @ptrCast(@alignCast(ctx));
+    }
+    fn sendOp_(ctx: *const anyopaque, m: Msg) anyerror!void {
+        return sendOp(of(ctx), m);
+    }
+    fn recvOp_(ctx: *const anyopaque) anyerror!Msg {
+        return recvOp(of(ctx));
+    }
+    fn sendNow_(ctx: *const anyopaque, x: mlx.mlx_array, dst: u32) anyerror!void {
+        return sendNow(of(ctx), x, dst);
+    }
+    fn recvNow_(ctx: *const anyopaque, shape: []const c_int, dtype: mlx.mlx_dtype, src: u32) anyerror!mlx.mlx_array {
+        return recvNow(of(ctx), shape, dtype, src);
+    }
+    fn allGather_(ctx: *const anyopaque, x: mlx.mlx_array) anyerror!mlx.mlx_array {
+        return of(ctx).allGather(x);
+    }
+};
 
 /// A control message to the other rank of a two-Mac group.
 pub fn sendOp(link: *const Link, m: Msg) !void {
@@ -429,6 +457,8 @@ pub const Peer = struct {
     host_calib_us: u64 = 0,
     worker_calib_us: u64 = 0,
     link_bytes_per_us: f64 = 0,
+    /// `link` as the rows job talks over it (`rowsPair`).
+    split_link: wire.Link = undefined,
 
     pub fn workerName(self: *const Peer) []const u8 {
         return self.worker_name_buf[0..self.worker_name_len];
@@ -630,11 +660,13 @@ fn workerCopyName() []const u8 {
 
 /// What the last video job did with the worker (`/props` cluster "last_job", and its rows
 /// on each Mac, zeros when it ran here alone).
-pub fn noteJob(split: [2]u32, comptime fmt: []const u8, args: anytype) void {
+fn noteJob(split: [2]u32, line: []const u8) void {
     while (!cluster().last_job_mu.tryLock()) std.atomic.spinLoopHint();
     defer cluster().last_job_mu.unlock();
     cluster().last_split = split;
-    cluster().last_job_len = if (std.fmt.bufPrint(&cluster().last_job_buf, fmt, args)) |t| t.len else |_| 0;
+    const n = if (line.len <= cluster().last_job_buf.len) line.len else 0;
+    @memcpy(cluster().last_job_buf[0..n], line[0..n]);
+    cluster().last_job_len = n;
 }
 
 /// Rank 0 at shutdown: releases the worker. A peer that vanishes mid-protocol crashes the
@@ -740,8 +772,22 @@ fn samePath(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, std.mem.span(pa), std.mem.span(pb));
 }
 
+/// `planRows` as a split job reads it (`h3_split.Pair`).
+fn rowsPair(model_dir: []const u8, hidden: i32, blocks: i32) anyerror!h3_split.Pair {
+    const p = try planRows(model_dir, hidden, blocks);
+    p.split_link = wireOf(&p.link);
+    return .{
+        .link = &p.split_link,
+        .host_calib_us = &p.host_calib_us,
+        .link_bytes_per_us = &p.link_bytes_per_us,
+        .exchanges = &p.exchanges,
+        .worker_calib_us = p.worker_calib_us,
+        .worker_free_mib = @as(u64, @intCast(@max(p.worker.avail_mib, 0))) -| p.worker_resident_mib,
+    };
+}
+
 /// Rows mode: the worker told to load the group's video model whole, and ready.
-pub fn planRows(model_dir: []const u8, hidden: i32, blocks: i32) !*Peer {
+fn planRows(model_dir: []const u8, hidden: i32, blocks: i32) !*Peer {
     const p = try join();
     if (!p.planned) {
         p.mode = .rows;
@@ -930,6 +976,7 @@ fn recvBytes(link: *const Link, out: []u8, src: u32) !void {
 pub fn connect(io: std.Io, allocator: std.mem.Allocator, cfg: Config, mode: Mode, model: []const u8, split: ?u32) !void {
     if (comptime builtin.os.tag != .macos) return error.RdmaUnavailable; // a cluster exists only on macOS
     cluster().group = .{ .io = io, .allocator = allocator, .mode = mode, .model = try allocator.dupe(u8, model), .split = split };
+    h3_split.hooks().* = .{ .serves = &serves, .plan_rows = &rowsPair, .note_job = &noteJob };
     const t = try std.Thread.spawn(.{ .stack_size = 1 << 20 }, waitForWorker, .{ io, cfg });
     t.detach();
 }
@@ -1135,7 +1182,8 @@ fn servePlan(io: std.Io, allocator: std.mem.Allocator, link: *const Link, roots:
     };
     defer allocator.free(dir);
     if (pl.mode == .rows) {
-        const released = h3_split.serveWorker(allocator, io, link, dir, pl.hidden, @intCast(pl.span.total)) catch |err| {
+        const wl = wireOf(link);
+        const released = h3_split.serveWorker(allocator, io, &wl, dir, pl.hidden, @intCast(pl.span.total)) catch |err| {
             log.err("[dist] worker load failed: {s}\n", .{@errorName(err)});
             fail.send(link, if (err == error.DistModelMismatch) MISMATCH else LOAD_FAILED);
             return err;

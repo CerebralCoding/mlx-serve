@@ -7,7 +7,7 @@ const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../sdk/util/log.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
-const distributed = @import("../../engines/mlx/cluster/distributed.zig");
+const wire = @import("../../sdk/util/wire.zig");
 const h3 = @import("h3.zig");
 const config = @import("config.zig");
 
@@ -22,7 +22,7 @@ const MIN_GAIN: f64 = 1.15;
 
 /// One job's split: rows `[0, cut)` on rank 0, `[cut, rows)` on rank 1.
 pub const RowSplit = struct {
-    link: *const distributed.Link,
+    link: *const wire.Link,
     rank: u32,
     rows: u32,
     cut: u32,
@@ -76,7 +76,7 @@ pub const RowSplit = struct {
         defer a.free(theirs);
         const te = mlx.getShape(t_emb);
         const half = mlx.getShape(rope.cos)[3];
-        try distributed.sendOp(self.link, .{ distributed.OP_H3_STEP, rows, cut, @intCast(theirs.len), @intFromBool(refresh), te[0], te[1], half });
+        try self.link.sendOp(.{ wire.OP_H3_STEP, rows, cut, @intCast(theirs.len), @intFromBool(refresh), te[0], te[1], half });
         const flat = try a.alloc(i32, theirs.len * 3);
         defer a.free(flat);
         for (theirs, 0..) |r, i| flat[i * 3 ..][0..3].* = .{ @intCast(r.start), @intCast(r.end), @intCast(r.mod_row) };
@@ -88,7 +88,7 @@ pub const RowSplit = struct {
         defer _ = mlx.mlx_array_free(c1);
         const s1 = try sliceAxis(rope.sin, 1, cut, rows, s);
         defer _ = mlx.mlx_array_free(s1);
-        for ([_]mlx.mlx_array{ h1, t_emb, runs_a, c1, s1 }) |x| try distributed.sendNow(self.link, x, 1);
+        for ([_]mlx.mlx_array{ h1, t_emb, runs_a, c1, s1 }) |x| try self.link.sendNow(x, 1);
 
         var m: Mine = .{ .h = try sliceAxis(h, 0, 0, cut, s), .runs = &.{}, .rope = undefined };
         errdefer _ = mlx.mlx_array_free(m.h);
@@ -102,7 +102,7 @@ pub const RowSplit = struct {
     pub fn collectRows(self: *const RowSplit, mine: mlx.mlx_array, s: S) !mlx.mlx_array {
         try mlx.check(mlx.mlx_array_eval(mine));
         const sh = mlx.getShape(mine);
-        const theirs = try distributed.recvNow(self.link, &.{ @intCast(self.count(1)), sh[1] }, mlx.mlx_array_dtype(mine), 1);
+        const theirs = try self.link.recvNow(&.{ @intCast(self.count(1)), sh[1] }, mlx.mlx_array_dtype(mine), 1);
         defer _ = mlx.mlx_array_free(theirs);
         return cat(&.{ mine, theirs }, 0, s);
     }
@@ -183,7 +183,7 @@ pub fn calibrate(model: *const h3.Model, io: std.Io, s: S) !u64 {
 
 /// Bytes per microsecond each way through an all_gather of 16 MB per Mac: both Macs run it
 /// once, right after the worker reports ready.
-pub fn measureLink(link: *const distributed.Link, io: std.Io) !f64 {
+pub fn measureLink(link: *const wire.Link, io: std.Io) !f64 {
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     const n: c_int = 8 << 20;
@@ -202,59 +202,90 @@ pub fn measureLink(link: *const distributed.Link, io: std.Io) !f64 {
     return @as(f64, @floatFromInt(@as(u64, @intCast(n)) * 2)) / @as(f64, @floatFromInt(@max(best, 1)));
 }
 
+/// What a job on this Mac reads and keeps of the engine's pair (`distributed.planRows`).
+pub const Pair = struct {
+    link: *const wire.Link,
+    host_calib_us: *u64,
+    link_bytes_per_us: *f64,
+    exchanges: *u64,
+    worker_calib_us: u64,
+    /// The worker's free memory less what its model holds.
+    worker_free_mib: u64,
+};
+
+/// The engine's cluster, set by `distributed.zig` when this server leads a group.
+const Hooks = struct {
+    /// Whether the group serves the pack at `dir`.
+    serves: ?*const fn (dir: []const u8) bool = null,
+    /// The worker told to load the group's video model whole, and ready.
+    plan_rows: ?*const fn (dir: []const u8, hidden: i32, blocks: i32) anyerror!Pair = null,
+    /// What the last video job did with the worker (`/props` cluster "last_job").
+    note_job: ?*const fn (split: [2]u32, line: []const u8) void = null,
+};
+const hooks_shared = @import("../../sdk/util/shared.zig").Shared(Hooks, "h3_cluster", .{});
+pub inline fn hooks() *Hooks {
+    return hooks_shared.get();
+}
+
+fn noteJob(split: [2]u32, comptime fmt: []const u8, args: anytype) void {
+    var buf: [160]u8 = undefined;
+    if (hooks().note_job) |f| f(split, std.fmt.bufPrint(&buf, fmt, args) catch "");
+}
+
 /// The job this Mac starts with the worker, or null (with the reason in `/props`) when this
 /// job runs here alone.
 pub const Job = struct {
     split: RowSplit,
 
     pub fn end(self: *Job) void {
-        distributed.sendOp(self.split.link, .{ distributed.OP_H3_END, 0, 0, 0, 0, 0, 0, 0 }) catch {};
+        self.split.link.sendOp(.{ wire.OP_H3_END, 0, 0, 0, 0, 0, 0, 0 }) catch {};
     }
 };
 
 pub fn begin(pack_dir: []const u8, io: std.Io, model: *h3.Model, turbo: bool, user_loras: usize, resident: bool, rows: u32, bcast: bool, s: S) !?Job {
-    if (!distributed.serves(pack_dir)) return null;
+    const h = hooks();
+    if (!(if (h.serves) |f| f(pack_dir) else false)) return null;
     const name = std.fs.path.basename(pack_dir);
     if (!resident) return alone("this Mac could not keep {s} loaded between jobs", .{name});
     if (user_loras > 0) return alone("the request's LoRAs live on this Mac only", .{});
-    const p = distributed.planRows(pack_dir, @intCast(model.cfg.hidden_size), @intCast(model.blocks.len)) catch |err| switch (err) {
+    const p = h.plan_rows.?(pack_dir, @intCast(model.cfg.hidden_size), @intCast(model.blocks.len)) catch |err| switch (err) {
         error.DistWorkerNotJoined => return alone("the worker Mac has not joined", .{}),
         error.DistWorkerLoadFailed => return alone("the worker could not load {s}", .{name}),
         else => return err,
     };
-    if (p.host_calib_us == 0) {
-        p.link_bytes_per_us = try measureLink(&p.link, io);
-        p.host_calib_us = try calibrate(model, io, s);
-        log.info("[h3-split] this Mac: {d} us per {d}-row pass, the worker: {d} us; link {d:.1} GB/s each way\n", .{ p.host_calib_us, CALIB_ROWS, p.worker_calib_us, p.link_bytes_per_us / 1000 });
+    if (p.host_calib_us.* == 0) {
+        p.link_bytes_per_us.* = try measureLink(p.link, io);
+        p.host_calib_us.* = try calibrate(model, io, s);
+        log.info("[h3-split] this Mac: {d} us per {d}-row pass, the worker: {d} us; link {d:.1} GB/s each way\n", .{ p.host_calib_us.*, CALIB_ROWS, p.worker_calib_us, p.link_bytes_per_us.* / 1000 });
     }
     // The worker reads every row's keys, so its step needs about what this Mac's would.
     const bcast_row: u64 = if (bcast) @as(u64, model.blocks.len) * model.cfg.hidden_size * 2 else 0;
     const need_mib = config.activationBytes(rows, bcast_row) >> 20;
-    const free_mib = @as(u64, @intCast(@max(p.worker.avail_mib, 0))) -| p.worker_resident_mib;
+    const free_mib = p.worker_free_mib;
     if (need_mib > free_mib) return alone("{d}-row steps need {d} MiB on the worker, which has {d} MiB free", .{ rows, need_mib, free_mib });
     const kv_row: u64 = 2 * @as(u64, model.cfg.num_attention_heads) * model.cfg.attention_head_dim * 2;
     // Diagnostic: diag h3-split-share=<0..1> keeps that share of the rows here, paying or not.
     const forced: ?u32 = if (env.span(.H3_SPLIT_SHARE)) |v| if (std.fmt.parseFloat(f64, v)) |f|
         std.math.clamp(@as(u32, @intFromFloat(@as(f64, @floatFromInt(rows)) * f)), 1, rows - 1)
     else |_| null else null;
-    const cut = forced orelse chooseCut(rows, p.host_calib_us, p.worker_calib_us, p.link_bytes_per_us, kv_row, @intCast(model.blocks.len)) orelse
+    const cut = forced orelse chooseCut(rows, p.host_calib_us.*, p.worker_calib_us, p.link_bytes_per_us.*, kv_row, @intCast(model.blocks.len)) orelse
         return alone("{d} rows: the swap would cost more than the worker saves", .{rows});
-    try distributed.sendOp(&p.link, .{ distributed.OP_H3_JOB, @intFromBool(turbo), @intFromBool(bcast), 0, 0, 0, 0, 0 });
-    distributed.noteJob(.{ cut, rows - cut }, "split {d}/{d} rows", .{ cut, rows - cut });
+    try p.link.sendOp(.{ wire.OP_H3_JOB, @intFromBool(turbo), @intFromBool(bcast), 0, 0, 0, 0, 0 });
+    noteJob(.{ cut, rows - cut }, "split {d}/{d} rows", .{ cut, rows - cut });
     log.info("[h3-split] {d} rows: {d} here, {d} on the worker\n", .{ rows, cut, rows - cut });
-    p.exchanges += 1;
-    return .{ .split = .{ .link = &p.link, .rank = 0, .rows = rows, .cut = cut } };
+    p.exchanges.* += 1;
+    return .{ .split = .{ .link = p.link, .rank = 0, .rows = rows, .cut = cut } };
 }
 
 fn alone(comptime fmt: []const u8, args: anytype) ?Job {
-    distributed.noteJob(.{ 0, 0 }, "alone: " ++ fmt, args);
+    noteJob(.{ 0, 0 }, "alone: " ++ fmt, args);
     log.info("[h3-split] this job runs here alone: " ++ fmt ++ "\n", args);
     return null;
 }
 
 /// The worker's side: loads the whole DiT from `dir`, reports its speed, then runs its rows of
 /// every step until rank 0 stops it.
-pub fn serveWorker(allocator: std.mem.Allocator, io: std.Io, link: *const distributed.Link, dir: []const u8, hidden: i32, blocks: i32) !bool {
+pub fn serveWorker(allocator: std.mem.Allocator, io: std.Io, link: *const wire.Link, dir: []const u8, hidden: i32, blocks: i32) !bool {
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     const dit = try std.fs.path.join(allocator, &.{ dir, "transformer.safetensors" });
@@ -269,7 +300,7 @@ pub fn serveWorker(allocator: std.mem.Allocator, io: std.Io, link: *const distri
     const calib = try calibrate(&model, io, s);
     var active: usize = 0;
     _ = mlx.mlx_get_active_memory(&active);
-    try distributed.sendOp(link, .{ distributed.MAGIC, 0, @intCast(active >> 20), @intCast(calib), 0, 0, 0, 0 });
+    try link.sendOp(.{ wire.MAGIC, 0, @intCast(active >> 20), @intCast(calib), 0, 0, 0, 0 });
     log.info("[dist] worker ready ({d} MiB resident, {d} us per {d}-row pass)\n", .{ active >> 20, calib, CALIB_ROWS });
     _ = try measureLink(link, io);
 
@@ -277,11 +308,11 @@ pub fn serveWorker(allocator: std.mem.Allocator, io: std.Io, link: *const distri
     defer if (bcast) |*b| b.deinit();
     var steps: u64 = 0;
     while (true) {
-        const m = try distributed.recvOp(link);
+        const m = try link.recvOp();
         switch (m[0]) {
-            distributed.OP_STOP => break,
-            distributed.OP_RELEASE => return true,
-            distributed.OP_H3_JOB => {
+            wire.OP_STOP => break,
+            wire.OP_RELEASE => return true,
+            wire.OP_H3_JOB => {
                 const turbo = m[1] != 0;
                 if (turbo != turbo_bound) {
                     const lora = try std.fs.path.join(allocator, &.{ dir, "turbo_lora.safetensors" });
@@ -294,27 +325,27 @@ pub fn serveWorker(allocator: std.mem.Allocator, io: std.Io, link: *const distri
                 if (bcast) |*b| b.deinit();
                 bcast = if (m[2] != 0) try h3.AttnBroadcast.init(allocator, model.blocks.len) else null;
             },
-            distributed.OP_H3_END => {
+            wire.OP_H3_END => {
                 if (bcast) |*b| b.deinit();
                 bcast = null;
                 _ = mlx.mlx_clear_cache();
                 log.info("[dist] worker: video job done after {d} steps\n", .{steps});
                 steps = 0;
             },
-            distributed.OP_H3_STEP => {
+            wire.OP_H3_STEP => {
                 const rows: u32 = @intCast(m[1]);
                 const cut: u32 = @intCast(m[2]);
                 const n1: c_int = @intCast(rows - cut);
                 const dt = model.dtype;
-                var h = try distributed.recvNow(link, &.{ n1, @intCast(model.cfg.hidden_size) }, dt, 0);
+                var h = try link.recvNow(&.{ n1, @intCast(model.cfg.hidden_size) }, dt, 0);
                 defer _ = mlx.mlx_array_free(h);
-                const t_emb = try distributed.recvNow(link, &.{ m[5], m[6] }, dt, 0);
+                const t_emb = try link.recvNow(&.{ m[5], m[6] }, dt, 0);
                 defer _ = mlx.mlx_array_free(t_emb);
-                const runs_a = try distributed.recvNow(link, &.{m[3] * 3}, .int32, 0);
+                const runs_a = try link.recvNow(&.{m[3] * 3}, .int32, 0);
                 defer _ = mlx.mlx_array_free(runs_a);
                 var rope: h3.RopeTables = .{
-                    .cos = try distributed.recvNow(link, &.{ 1, n1, 1, m[7] }, dt, 0),
-                    .sin = try distributed.recvNow(link, &.{ 1, n1, 1, m[7] }, dt, 0),
+                    .cos = try link.recvNow(&.{ 1, n1, 1, m[7] }, dt, 0),
+                    .sin = try link.recvNow(&.{ 1, n1, 1, m[7] }, dt, 0),
                 };
                 defer rope.deinit();
                 const flat = (mlx.mlx_array_data_int32(runs_a) orelse return error.DistBadMessage)[0..@intCast(m[3] * 3)];
@@ -326,7 +357,7 @@ pub fn serveWorker(allocator: std.mem.Allocator, io: std.Io, link: *const distri
                 defer model.split = null;
                 try model.runBlocks(&h, t_emb, .{ .ctx = null }, runs, rope, null, if (bcast) |*b| b else null, m[4] != 0, s);
                 try mlx.check(mlx.mlx_array_eval(h));
-                try distributed.sendNow(link, h, 0);
+                try link.sendNow(h, 0);
                 steps += 1;
             },
             else => return error.DistBadMessage,
