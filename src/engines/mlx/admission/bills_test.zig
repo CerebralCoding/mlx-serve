@@ -9,6 +9,7 @@ const prefix_cache_mod = @import("../cache/prefix_cache.zig");
 const scheduler_mod = @import("../scheduler.zig");
 const ane_mod = @import("../../../sdk/ane/offload.zig");
 const http_server = @import("../../../host/http/server.zig");
+const memory_ceiling = @import("../../../host/registry/memory_ceiling.zig");
 
 const resolvedPrefixCacheMem = @import("hot_cache_plan.zig").resolvedPrefixCacheMem;
 const omittedMaxTokensDefault = @import("../../../host/api/sampling.zig").omittedMaxTokensDefault;
@@ -38,7 +39,6 @@ const prefillStreamBytesPerToken = @import("bills.zig").prefillStreamBytesPerTok
 const prefillStreamBytesPerTokenOn = @import("bills.zig").prefillStreamBytesPerTokenOn;
 const prefillDequantWeightBytes = @import("bills.zig").prefillDequantWeightBytes;
 const prefillFfnWidth = @import("bills.zig").prefillFfnWidth;
-const mlxMemoryGuardApplies = @import("bills.zig").mlxMemoryGuardApplies;
 const statePerTokenBilled = @import("bills.zig").statePerTokenBilled;
 const reservedCacheTokens = @import("bills.zig").reservedCacheTokens;
 const retainedSsmCheckpointBytes = @import("bills.zig").retainedSsmCheckpointBytes;
@@ -478,15 +478,6 @@ test "auto-context never sizes past the ceiling as weights grow" {
     }
     // Squeezed to nothing it floors rather than reporting a context that cannot exist.
     try t.expectEqual(@as(u32, 1024), safeContextForBudget(ceiling, ceiling, reserve, per_tok, 262144));
-}
-
-test "mlxMemoryGuardApplies: engine-backed models (ds4/llama/ANE) skip the MLX-prefill memory guard" {
-    const t = std.testing;
-    // MLX model — the guard applies (real per-token working set).
-    try t.expect(mlxMemoryGuardApplies(false));
-    // ds4's stub config advertises 56 heads / 61 layers, so the guard would project ~25 GB for an
-    // 8.6K-token prompt and 400-reject a request ds4 serves fine; no engine-backed model prefills in MLX.
-    try t.expect(!mlxMemoryGuardApplies(true));
 }
 
 test "slotFixedKvBytes: a MiMo slot bills its sliding rings once, at keep + one chunk of rows" {
@@ -1575,6 +1566,30 @@ pub fn qwen4ExpLive364kConfig() model_mod.ModelConfig {
     cfg.quant_mode = .affine;
     cfg.max_position_embeddings = 1_048_576;
     return cfg;
+}
+
+test "a 448k warm append the free-RAM term refused fits under an explicitly raised wired limit" {
+    const t = std.testing;
+    sparse_score.qsa_score_fused_override = false;
+    defer sparse_score.qsa_score_fused_override = null;
+    const mb: u64 = 1024 * 1024;
+    const total_ram: u64 = 131_072 * mb;
+    const working_set: u64 = 120_000 * mb;
+    const footprint: u64 = 87_722 * mb;
+    const saved = memory_ceiling.wired_limit_mb_override;
+    defer memory_ceiling.wired_limit_mb_override = saved;
+    memory_ceiling.wired_limit_mb_override = 120_000;
+    var cfg = qwen4ExpLive364kConfig();
+    const kv_bits: u64 = 8;
+    const seq: u64 = 448_604;
+    const max_tokens: u32 = @intCast(getEffectiveContextLength(&cfg) - seq);
+    const shared = WarmPrefix{ .matched_tokens = 448_531, .capacity_tokens = 448_531, .will_donate = false };
+    const needed = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, 512, shared);
+    try t.expectEqual(@as(u64, 11_388), needed / mb);
+    try t.expect(needed > memory_ceiling.gpuCeilingWithWiredFloor(working_set, footprint, 10_000 * mb, 0) -| footprint);
+    const lifted = memory_ceiling.gpuCeilingWithWiredFloor(working_set, footprint, 12_934 * mb, memory_ceiling.wiredCeilingFloorForRam(&cfg, total_ram));
+    try t.expectEqual(@as(u64, 24_086), (lifted -| footprint) / mb);
+    try t.expect(needed <= lifted -| footprint);
 }
 
 test "a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's" {

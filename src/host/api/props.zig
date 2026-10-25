@@ -23,10 +23,10 @@ const KvAttnMode = @import("../../engines/mlx/request_options.zig").KvAttnMode;
 const defaultEnableMtp = @import("../../engines/mlx/request_options.zig").defaultEnableMtp;
 const dsv4DraftStages = @import("../../engines/mlx/request_options.zig").dsv4DraftStages;
 const configuredKvQuantFor = @import("../http/server.zig").configuredKvQuantFor;
-const resolvedPrefixCacheMem = @import("../../engines/mlx/admission/hot_cache_plan.zig").resolvedPrefixCacheMem;
+const resolvedPrefixCacheMem = @import("admission.zig").resolvedPrefixCacheMem;
 const PldDefaults = @import("../../engines/mlx/request_options.zig").PldDefaults;
-const getEffectiveContextLength = @import("../../engines/mlx/admission/context.zig").getEffectiveContextLength;
-const computeMaxSafeContext = @import("../../engines/mlx/admission/context.zig").computeMaxSafeContext;
+const getEffectiveContextLength = @import("admission.zig").getEffectiveContextLength;
+const computeMaxSafeContext = @import("admission.zig").computeMaxSafeContext;
 const sendResponse = @import("../http/respond.zig").sendResponse;
 
 /// Pure body-builder for `GET /props`. Split out from `handleProps` so it

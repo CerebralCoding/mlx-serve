@@ -786,7 +786,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         var ssd_idle_mem: u64 = 0;
         const clamped_prefix_mem: u64 = if (!ram_prefix_cache)
             0
-        else if (params.prefix_cache_mem_resolver) |resolve|
+        else if (sch.prefix_cache_mem_resolver) |resolve|
             resolve(params.config, params.prefix_cache_mem_bytes, .{}, &ssd_idle_mem)
         else
             params.prefix_cache_mem_bytes;

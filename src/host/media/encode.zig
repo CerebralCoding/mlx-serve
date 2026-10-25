@@ -7,7 +7,7 @@ const model_mod = @import("../../engines/mlx/model.zig");
 const radio_vision = @import("../../plugins/nemotron_h/radio_vision.zig");
 const vision_mod = @import("../../engines/mlx/vision_encoder.zig");
 const log = @import("../../sdk/util/log.zig");
-const prefix_cache_mod = @import("../../engines/mlx/cache/prefix_cache.zig");
+const MediaSpan = @import("../../sdk/kv/media_span.zig").MediaSpan;
 const scheduler_mod = @import("../../engines/mlx/scheduler.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const LoadedModel = model_registry_mod.LoadedModel;
@@ -153,7 +153,7 @@ pub const MropeData = struct {
 /// prefix-cache key and the M-RoPE table. Owns all three until moved out.
 pub const MultimodalPrompt = struct {
     embeddings: ?mlx.mlx_array = null,
-    media: []prefix_cache_mod.MediaSpan = &.{},
+    media: []MediaSpan = &.{},
     mrope: MropeData = .{},
     /// Soft-token rows in `embeddings`.
     rows: usize = 0,

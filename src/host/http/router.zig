@@ -23,8 +23,8 @@ const handleOllamaEarly = @import("../api/ollama_routes.zig").handleOllamaEarly;
 const handleOllamaChat = @import("../api/ollama_routes.zig").handleOllamaChat;
 const handleOllamaGenerate = @import("../api/ollama_routes.zig").handleOllamaGenerate;
 const handleOllamaEmbed = @import("../api/ollama_routes.zig").handleOllamaEmbed;
-const pinAutoContext = @import("../../engines/mlx/admission/context.zig").pinAutoContext;
-const liveSessions = @import("../../engines/mlx/admission/context.zig").liveSessions;
+const admission = @import("../api/admission.zig");
+const ModelRegistry = @import("../registry/registry.zig").ModelRegistry;
 const TextGenTarget = @import("../api/media_gate.zig").TextGenTarget;
 const textGenRejectReason = @import("../api/media_gate.zig").textGenRejectReason;
 const textGenTargetOf = @import("../api/media_gate.zig").textGenTargetOf;
@@ -550,7 +550,7 @@ pub fn handleConnection(
     // reason the `--model` primary does at startup: the number we advertise is
     // what clients budget against, and each model has its own dims. Idempotent,
     // and a no-op under `--ctx-size`.
-    if (lm.config) |c| _ = pinAutoContext(c);
+    if (lm.config) |c| _ = admission.pinAutoContext(c, false);
 
     // ── Phase C: handlers take `lm` directly and extract their own
     //    locals. handleConnection only needs one decision for every
@@ -727,6 +727,37 @@ fn isTextGenRoute(method: []const u8, path: []const u8) bool {
     }
     // WebSocket upgrade handshake for /v1/responses.
     return std.mem.eql(u8, method, "GET") and isRoute(path, "/v1/responses");
+}
+
+/// Live requests, then every hot-cache entry no live request restored from, each row stamped
+/// with its model's context limit.
+fn liveSessions(registry: *ModelRegistry, buf: *[2 * instr.MAX_SESSIONS]instr.Session) []instr.Session {
+    const sch = http_server.global_scheduler orelse return buf[0..0];
+    sch.queue_mu.lockUncancelable(sch.io);
+    const live = sch.live_session_count;
+    @memcpy(buf[0..live], sch.live_sessions[0..live]);
+    sch.queue_mu.unlock(sch.io);
+
+    var n = live;
+    sch.digest_mu.lockUncancelable(sch.io);
+    for (sch.cached_sessions[0..sch.cached_session_count]) |c| {
+        const in_use = for (buf[0..live]) |l| {
+            if (l.entry_id == c.entry_id and std.mem.eql(u8, l.model(), c.model())) break true;
+        } else false;
+        if (in_use) continue;
+        buf[n] = c;
+        n += 1;
+    }
+    sch.digest_mu.unlock(sch.io);
+
+    registry.mutex.lockUncancelable(registry.io);
+    defer registry.mutex.unlock(registry.io);
+    for (buf[0..n]) |*s| {
+        const entry = registry.peekLocked(s.model()) orelse continue;
+        if (entry.state != .ready) continue;
+        if (entry.config) |cfg| s.context_length = admission.getEffectiveContextLength(cfg);
+    }
+    return buf[0..n];
 }
 
 // ── tests ──

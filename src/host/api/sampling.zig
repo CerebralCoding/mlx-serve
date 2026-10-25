@@ -2,7 +2,7 @@
 //! clamps, requestEosSlice; clampMaxTokens, optSamplingRecJson; repeat penalty, kv_quant override
 
 const std = @import("std");
-const kv_quant_mod = @import("../../engines/mlx/cache/kv_quant.zig");
+const kv_quant_mod = @import("../../sdk/blocks/attention/kv_quant.zig");
 const cache = @import("../../engines/mlx/kv/cache.zig");
 const generation_settings = @import("generation_settings.zig");
 const model_mod = @import("../../engines/mlx/model.zig");

@@ -5,7 +5,7 @@ const win_io = @import("../../sdk/util/win_io.zig");
 const builtin = @import("builtin");
 const mlx = @import("../../mlx/ffi.zig");
 const transformer_mod = @import("../../engines/mlx/transformer.zig");
-const kv_quant_mod = @import("../../engines/mlx/cache/kv_quant.zig");
+const kv_quant_mod = @import("../../sdk/blocks/attention/kv_quant.zig");
 const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
 const generate_mod = @import("../../engines/mlx/generate.zig");
 const generation_settings = @import("../api/generation_settings.zig");
@@ -32,7 +32,6 @@ const vision_mod = @import("../../engines/mlx/vision_encoder.zig");
 const log = @import("../../sdk/util/log.zig");
 const responses_mod = @import("../api/responses/model.zig");
 const pld_index = @import("../../engines/mlx/spec/pld_index.zig");
-const prefix_cache_mod = @import("../../engines/mlx/cache/prefix_cache.zig");
 const tokenize_cache_mod = @import("../tokenizer/cache.zig");
 const scheduler_mod = @import("../../engines/mlx/scheduler.zig");
 const model_registry_mod = @import("../registry/registry.zig");
@@ -154,14 +153,11 @@ const nowMsMonotonic = io_util.nowMsMonotonic;
 const Stopwatch = io_util.Stopwatch;
 const request_model = @import("../api/request_model.zig");
 const sampling = @import("../api/sampling.zig");
+const admission = @import("../api/admission.zig");
 
 pub const Conn = @import("conn.zig").Conn;
 pub const KvAttnMode = @import("../../engines/mlx/request_options.zig").KvAttnMode;
 pub const mtpAllowedByDefault = @import("../../engines/mlx/request_options.zig").mtpAllowedByDefault;
-pub const PREFIX_CACHE_MEM_DEFAULT = @import("../../engines/mlx/admission/hot_cache_plan.zig").PREFIX_CACHE_MEM_DEFAULT;
-pub const resolvedPrefixCacheMem = @import("../../engines/mlx/admission/hot_cache_plan.zig").resolvedPrefixCacheMem;
-pub const clearResolvedPrefixCacheMem = @import("../../engines/mlx/admission/hot_cache_plan.zig").clearResolvedPrefixCacheMem;
-pub const effectiveSsmCheckpointStride = @import("../../engines/mlx/admission/hot_cache_plan.zig").effectiveSsmCheckpointStride;
 pub const PldDefaults = @import("../../engines/mlx/request_options.zig").PldDefaults;
 pub const launchMaxTokensDefault = @import("../api/sampling.zig").launchMaxTokensDefault;
 pub const deinitGlobalResponseStore = @import("../api/responses/store.zig").deinitGlobalResponseStore;
@@ -171,27 +167,11 @@ pub const parseIp4 = @import("listen.zig").parseIp4;
 pub const StartupResponder = @import("listen.zig").StartupResponder;
 pub const ConnThreadArgs = @import("request.zig").ConnThreadArgs;
 pub const handleConnectionThread = @import("request.zig").handleConnectionThread;
-pub const auto_ctx_safety_pct = @import("../../engines/mlx/admission/context.zig").auto_ctx_safety_pct;
-pub const safeAutoContext = @import("../../engines/mlx/admission/context.zig").safeAutoContext;
-pub const pinAutoContext = @import("../../engines/mlx/admission/context.zig").pinAutoContext;
-pub const getEffectiveContextLength = @import("../../engines/mlx/admission/context.zig").getEffectiveContextLength;
 pub const WIRED_LIMIT_MARGIN_BYTES = @import("../registry/memory_ceiling.zig").WIRED_LIMIT_MARGIN_BYTES;
 pub const parseWiredMarginGib = @import("../registry/memory_ceiling.zig").parseWiredMarginGib;
 pub const applyMlxCacheLimit = @import("../../mlx/state.zig").applyMlxCacheLimit;
 pub const staticGpuMemoryCeiling = @import("../registry/memory_ceiling.zig").staticGpuMemoryCeiling;
 pub const applyGpuCeilingEnv = @import("../registry/memory_ceiling.zig").applyGpuCeilingEnv;
-pub const aneGateHeadroom = @import("../../engines/mlx/admission/bills.zig").aneGateHeadroom;
-pub const autoPrefillChunkCap = @import("../../engines/mlx/admission/prefill_chunk.zig").autoPrefillChunkCap;
-pub const pinPrefillChunk = @import("../../engines/mlx/admission/prefill_chunk.zig").pinPrefillChunk;
-pub const prefixCacheMemForLoad = @import("../../engines/mlx/admission/hot_cache_plan.zig").prefixCacheMemForLoad;
-pub const computeMemoryContext = @import("../../engines/mlx/admission/context.zig").computeMemoryContext;
-pub const requestPrefillChunkNow = @import("../../engines/mlx/admission/prefill_chunk.zig").requestPrefillChunkNow;
-pub const adaptivePrefillChunkEnabled = @import("../../engines/mlx/admission/prefill_chunk.zig").adaptivePrefillChunkEnabled;
-pub const adaptivePrefillWidenStillFits = @import("../../engines/mlx/admission/prefill_chunk.zig").adaptivePrefillWidenStillFits;
-pub const adaptivePrefillWidthNow = @import("../../engines/mlx/admission/prefill_chunk.zig").adaptivePrefillWidthNow;
-pub const prefillFitsNow = @import("../../engines/mlx/admission/admit.zig").prefillFitsNow;
-pub const prefillBillNumbersNow = @import("../../engines/mlx/admission/admit.zig").prefillBillNumbersNow;
-pub const logPrefillRefusal = @import("../../engines/mlx/admission/admit.zig").logPrefillRefusal;
 pub const peerIsLoopback = @import("auth.zig").peerIsLoopback;
 pub const visionPreprocFromConfig = @import("../media/prepare.zig").visionPreprocFromConfig;
 pub const parseImageUrlContent = @import("../media/request_media.zig").parseImageUrlContent;
@@ -305,6 +285,8 @@ pub var prefix_cache_capacity: u32 = 32;
 
 /// `--no-prefix-cache-ram` keeps the disk tier eligible without idle RAM retention.
 pub var prefix_cache_ram_enabled: bool = true;
+
+pub const PREFIX_CACHE_MEM_DEFAULT: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Wave 1.B — hot prefix cache memory budget. The cache evicts LRU entries on
 /// commit until `current_kv_bytes + new_bytes <= prefix_cache_mem_bytes`. The
@@ -438,26 +420,8 @@ pub fn serve(
     startup.stop();
     global_scheduler = scheduler;
     defer global_scheduler = null;
-    // The inference thread's evict-or-refuse hook (#353); the scheduler has no server import.
-    scheduler_mod.prefill_admission_fits = &prefillFitsNow;
-    defer scheduler_mod.prefill_admission_fits = null;
-    scheduler_mod.prefill_admission_numbers = &prefillBillNumbersNow;
-    defer scheduler_mod.prefill_admission_numbers = null;
-    scheduler_mod.prefill_request_chunk = &requestPrefillChunkNow;
-    defer scheduler_mod.prefill_request_chunk = null;
-    // The published budget is per model; retire it whenever the scheduler drops the cache.
-    scheduler_mod.hot_cache_budget_invalidate = &clearResolvedPrefixCacheMem;
-    defer scheduler_mod.hot_cache_budget_invalidate = null;
-    scheduler_mod.prefill_admission_refused_log = &logPrefillRefusal;
-    defer scheduler_mod.prefill_admission_refused_log = null;
-    // Asked by the prefill loop: the width of the next chunk, re-priced at every boundary.
-    scheduler_mod.prefill_chunk_adapt = &adaptivePrefillWidthNow;
-    defer scheduler_mod.prefill_chunk_adapt = null;
-    scheduler_mod.prefill_chunk_widen_ok = &adaptivePrefillWidenStillFits;
-    defer scheduler_mod.prefill_chunk_widen_ok = null;
-    // Whether the hook above can move anything for a given model (the installs are process-wide, so presence is not a gate).
-    scheduler_mod.prefill_chunk_adaptive_enabled = &adaptivePrefillChunkEnabled;
-    defer scheduler_mod.prefill_chunk_adaptive_enabled = null;
+    scheduler_mod.installAdmissionHooks(true);
+    defer scheduler_mod.installAdmissionHooks(false);
 
     // Gauge sampler: samples instantaneous system + queue state every 2 s and
     // writes the metrics gauges. Only runs when --metrics is on. Trivial cost
@@ -516,8 +480,8 @@ pub fn serve(
                 @as(f64, @floatFromInt(prefix_cache_disk_bytes)) / (1024.0 * 1024.0),
                 ssm_note,
             });
-        } else if (resolvedPrefixCacheMem() > 0) {
-            const cap_mb = @as(f64, @floatFromInt(resolvedPrefixCacheMem())) / (1024.0 * 1024.0);
+        } else if (admission.resolvedPrefixCacheMem() > 0) {
+            const cap_mb = @as(f64, @floatFromInt(admission.resolvedPrefixCacheMem())) / (1024.0 * 1024.0);
             log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap={d:.1} MB){s}\n", .{ prefix_cache_capacity, cap_mb, ssm_note });
         } else {
             log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap=unlimited){s}\n", .{ prefix_cache_capacity, ssm_note });
@@ -611,24 +575,7 @@ pub fn serve(
     // loaded and nothing else has taken RAM. Clients read this number once
     // (pi/opencode bake it into a config file) and budget against it for the
     // whole session, so it must not drift with system load. `--ctx-size` wins.
-    const pinned = pinAutoContext(@constCast(config));
-    if (config.glm_stream) {
-        log.info("Context size: {d} tokens (mlx-stream: the prompts this load billed and the generation past them)\n", .{mlx_stream.contextLength(config)});
-    } else if (manualContext(config) > 0) {
-        log.info("Context size: {d} tokens (manual)\n", .{manualContext(config)});
-    } else if (config.mlxStream()) {
-        log.info("Context size: {d} tokens (the streaming pack's standard request; --ctx-size widens it)\n", .{getEffectiveContextLength(config)});
-    } else {
-        const memory_ctx = computeMemoryContext(config);
-        const memory_allows = safeAutoContext(memory_ctx);
-        const rope_ctx = config.contextCap();
-        if (rope_ctx > 0 and pinned >= rope_ctx) {
-            // The checkpoint's own maximum binds; memory had room to spare.
-            log.info("Context size: {d} tokens (auto: the model's maximum; memory would allow {d}) [pinned]\n", .{ pinned, memory_allows });
-        } else {
-            log.info("Context size: {d} tokens (auto: {d}% of the {d}-token memory ceiling, reserving headroom) [pinned]\n", .{ pinned, auto_ctx_safety_pct, memory_ctx });
-        }
-    }
+    _ = admission.pinAutoContext(@constCast(config), true);
 
     if (serverState().server_config.request_timeout_sec > 0) {
         log.info("Request timeout: {d}s\n", .{serverState().server_config.request_timeout_sec});
@@ -928,13 +875,8 @@ test "llama cache default keeps shared prefixes warm" {
 }
 
 test {
-    _ = @import("../../engines/mlx/admission/admit.zig");
-    _ = @import("../../engines/mlx/admission/bills.zig");
-    _ = @import("../../engines/mlx/admission/bills_test.zig");
-    _ = @import("../../engines/mlx/admission/context.zig");
-    _ = @import("../../engines/mlx/admission/hot_cache_plan.zig");
-    _ = @import("../../engines/mlx/admission/prefill_chunk.zig");
     _ = @import("../../engines/mlx/request_options.zig");
+    _ = @import("../api/admission.zig");
     _ = @import("../api/anthropic.zig");
     _ = @import("../api/anthropic_stream.zig");
     _ = @import("../api/audio.zig");
@@ -981,7 +923,6 @@ test {
     _ = @import("../../mlx/state.zig");
     _ = @import("../../plugins/deepseek_v4/bill.zig");
     _ = @import("../../plugins/deepseek_v41/bill.zig");
-    _ = @import("../../engines/mlx/admission/glm5_bill.zig");
     _ = @import("../../plugins/lfm2/media.zig");
     _ = @import("../../plugins/nemotron_h/media.zig");
     _ = @import("../../plugins/qwen3_5/minicpm_media.zig");

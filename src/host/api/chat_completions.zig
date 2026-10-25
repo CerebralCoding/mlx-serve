@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const kv_quant = @import("../../engines/mlx/cache/kv_quant.zig");
+const kv_quant = @import("../../sdk/blocks/attention/kv_quant.zig");
 const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
 const generate_mod = @import("../../engines/mlx/generate.zig");
 const chat_mod = @import("../chat/chat.zig");
@@ -10,7 +10,7 @@ const rp_mod = @import("../chat/reasoning/protocol.zig");
 const log = @import("../../sdk/util/log.zig");
 const responses_mod = @import("responses/model.zig");
 const pld_index = @import("../../engines/mlx/spec/pld_index.zig");
-const prefix_cache_mod = @import("../../engines/mlx/cache/prefix_cache.zig");
+const MediaSpan = @import("../../sdk/kv/media_span.zig").MediaSpan;
 const model_registry_mod = @import("../registry/registry.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;
 const LoadedModel = model_registry_mod.LoadedModel;
@@ -48,10 +48,10 @@ const toolCallFinishReason = @import("../chat/tools/pipeline.zig").toolCallFinis
 const shouldParseToolCalls = @import("../chat/tools/pipeline.zig").shouldParseToolCalls;
 const finishDetailsField = @import("../chat/tools/pipeline.zig").finishDetailsField;
 const parseToolCallsForRequest = @import("../chat/tools/pipeline.zig").parseToolCallsForRequest;
-const getEffectiveContextLength = @import("../../engines/mlx/admission/context.zig").getEffectiveContextLength;
+const getEffectiveContextLength = @import("admission.zig").getEffectiveContextLength;
 const logStreamError = @import("../http/errors.zig").logStreamError;
 const sendGenerationError = @import("../http/errors.zig").sendGenerationError;
-const checkAttentionMemory = @import("../../engines/mlx/admission/admit.zig").checkAttentionMemory;
+const checkAttentionMemory = @import("admission.zig").checkAttentionMemory;
 const clampMaxTokens = @import("sampling.zig").clampMaxTokens;
 const mediaRejectReason = @import("media_gate.zig").mediaRejectReason;
 const dropMedia = @import("media_gate.zig").dropMedia;
@@ -965,7 +965,7 @@ fn handleNonStreamingGeneration(
     enable_mtp: bool,
     allow_batch_mtp: bool,
     vision_embeddings: ?mlx.mlx_array,
-    media: []const prefix_cache_mod.MediaSpan,
+    media: []const MediaSpan,
     cache_key: u64,
     mrope: MropeData,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.

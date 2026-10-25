@@ -7,8 +7,8 @@ const mlx_stream = if (@import("build_options").mlx_stream) @import("../../engin
 const sleep_inhibit = @import("sleep_inhibit.zig");
 const testing = std.testing;
 
-const reviseHotCacheBudgets = @import("../../engines/mlx/cache/budget.zig").reviseHotCacheBudgets;
-const persistAtShutdown = @import("../../engines/mlx/cache/budget.zig").persistAtShutdown;
+const reviseHotCacheBudgets = @import("../../engines/mlx/scheduler.zig").reviseHotCacheBudgets;
+const persistAtShutdown = @import("../../engines/mlx/scheduler.zig").persistAtShutdown;
 const commitSlotIfApplicable = @import("../../engines/mlx/commit.zig").commitSlotIfApplicable;
 const recordSlotCleanup = @import("../../engines/mlx/finish.zig").recordSlotCleanup;
 const doLoadOnInferenceThread = @import("../../engines/mlx/load.zig").doLoadOnInferenceThread;

@@ -9,7 +9,7 @@ const testing = std.testing;
 const http_server = @import("server.zig");
 
 const Conn = @import("conn.zig").Conn;
-const AdmissionBill = @import("../../engines/mlx/admission/admit.zig").AdmissionBill;
+const AdmissionBill = @import("../../abi/engine.zig").Bill;
 const PROMPT_LOGPROBS_UNAVAILABLE_MSG = @import("../api/completions.zig").PROMPT_LOGPROBS_UNAVAILABLE_MSG;
 const sendResponse = @import("respond.zig").sendResponse;
 const jsonEscape = @import("../api/format.zig").jsonEscape;

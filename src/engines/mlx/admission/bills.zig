@@ -337,21 +337,6 @@ pub fn prefillFfnWidth(config: *const model_mod.ModelConfig) u64 {
     return if (w > 0) w else config.intermediate_size;
 }
 
-/// Whether the MLX-prefill attention-memory preflight applies to a request.
-/// The guard (`checkAttentionMemory`/`prefillMemoryNeeded`) models the MLX
-/// transformer's per-token working set. The embedded ds4 (DeepSeek-V4-Flash)
-/// and llama.cpp engines NEVER take that path — they own their KV *outside*
-/// MLX — so the estimate is pure fiction for them. Their stub `ModelConfig`
-/// still advertises head/layer counts (ds4: 56 heads, 61 layers, hidden 7168),
-/// so without this early-out the guard projected ~25 GB for an 8.6K-token ds4
-/// prompt and 400-rejected it — a prompt the SAME server had just served on the
-/// MLX qwen35 engine one model-switch earlier (live, pi + ds4). Skip
-/// the memory guard whenever an embedded engine will serve; the context-length
-/// guard still bounds the prompt against ds4's own session ctx.
-pub fn mlxMemoryGuardApplies(engine_backed: bool) bool {
-    return !engine_backed;
-}
-
 /// Estimate peak GPU memory for prefill and reject if it would exceed the Metal
 /// working-set ceiling. Exceeding it throws an uncatchable C++ exception on a
 /// Metal completion-handler thread and kills the process, so PREVENTION is the

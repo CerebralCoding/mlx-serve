@@ -9,8 +9,8 @@ const LoadedModel = model_registry_mod.LoadedModel;
 
 const aneWanted = @import("../engines/served.zig").aneWanted;
 const engines_load = @import("../engines/load.zig");
-const moveHotCacheViewOff = @import("../../engines/mlx/cache/budget.zig").moveHotCacheViewOff;
-const publishHotCacheResidency = @import("../../engines/mlx/cache/budget.zig").publishHotCacheResidency;
+const moveHotCacheViewOff = scheduler_mod.moveHotCacheViewOff;
+const publishHotCacheResidency = scheduler_mod.publishHotCacheResidency;
 const doLoadOnInferenceThread = @import("../../engines/mlx/load.zig").doLoadOnInferenceThread;
 const loadErrorName = @import("../media_jobs/plugin/engine.zig").loadErrorName;
 const Scheduler = @import("../../engines/mlx/scheduler.zig").Scheduler;
