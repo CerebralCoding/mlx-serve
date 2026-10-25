@@ -33,9 +33,10 @@
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../sdk/util/log.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
-const forward_ctx = @import("../../engines/mlx/forward_ctx.zig");
-const plugin_driver = @import("../../engines/mlx/plugin/driver.zig");
+const Weights = @import("../../sdk/weights/resident.zig").Weights;
+const weights_load = @import("../../sdk/weights/load.zig");
+const trunk_mod = @import("../../sdk/bases/trunk.zig");
+const mlx_gguf = @import("../../sdk/quant/gguf/root.zig");
 const params_mod = @import("../../sdk/quant/params.zig");
 const lora_mod = @import("../../sdk/weights/lora.zig");
 const w8a8 = @import("../../sdk/blocks/dit/w8a8.zig");
@@ -1378,7 +1379,7 @@ fn lastDim(x: mlx.mlx_array) u32 {
     return if (sh.len == 0) 0 else @intCast(sh[sh.len - 1]);
 }
 
-fn gGet(w: *const model_mod.Weights, key: []const u8) !mlx.mlx_array {
+fn gGet(w: *const Weights, key: []const u8) !mlx.mlx_array {
     return w.get(key) orelse {
         log.err("[ltx-gemma] MISSING WEIGHT: {s}\n", .{key});
         return error.MissingGemmaWeight;
@@ -1386,7 +1387,7 @@ fn gGet(w: *const model_mod.Weights, key: []const u8) !mlx.mlx_array {
 }
 
 /// Affine-quantized linear; (bits, group_size) solved per weight.
-fn gQLin(w: *const model_mod.Weights, a: std.mem.Allocator, x: mlx.mlx_array, base: []const u8, s: S) !mlx.mlx_array {
+fn gQLin(w: *const Weights, a: std.mem.Allocator, x: mlx.mlx_array, base: []const u8, s: S) !mlx.mlx_array {
     const wk = try std.fmt.allocPrint(a, "{s}.weight", .{base});
     defer a.free(wk);
     const sk = try std.fmt.allocPrint(a, "{s}.scales", .{base});
@@ -1426,7 +1427,7 @@ fn gTranspose(x: mlx.mlx_array, axes: []const c_int, s: S) !mlx.mlx_array {
 }
 
 /// One Gemma-3 decoder layer over [1,T,3840] with a precomputed combined mask.
-fn gLayer(w: *const model_mod.Weights, a: std.mem.Allocator, idx: u32, h: mlx.mlx_array, mask: mlx.mlx_array, base: f32, cfg: GemmaCfg, s: S) !mlx.mlx_array {
+fn gLayer(w: *const Weights, a: std.mem.Allocator, idx: u32, h: mlx.mlx_array, mask: mlx.mlx_array, base: f32, cfg: GemmaCfg, s: S) !mlx.mlx_array {
     const pfx = try std.fmt.allocPrint(a, "language_model.model.layers.{d}", .{idx});
     defer a.free(pfx);
     const T: c_int = mlx.getShape(h)[1];
@@ -1561,13 +1562,16 @@ fn causalPadMask(allocator: std.mem.Allocator, ids: []const i32, pad_id: i32, s:
 ///
 /// Caller owns the returned states and the slice.
 pub fn gemmaCapture4(io: std.Io, allocator: std.mem.Allocator, gemma_dir: []const u8, ids: []const i32, pad_id: i32, s: S) ![]mlx.mlx_array {
-    var config = try model_mod.parseConfig(io, allocator, gemma_dir);
-    defer config.deinit(allocator);
-    if (config.plugin == null) return error.GemmaCaptureUnavailable;
-    var xfm = try plugin_driver.load(io, allocator, &config, gemma_dir, mlx.gpuStream());
-    defer xfm.deinit();
+    var trunk = trunk_mod.Trunk.parse(io, allocator, gemma_dir, &.{ &@import("../gemma4/plugin.zig").table, &@import("../gemma3/plugin.zig").table }, "{}") catch |e|
+        return if (e == error.TrunkUnsupported) error.GemmaCaptureUnavailable else e;
+    var loaded = false;
+    defer trunk.close(loaded);
+    try trunk.load(io, allocator, gemma_dir, mlx.gpuStream(), null);
+    loaded = true;
+    var cache = try trunk_mod.Cache.init(allocator, trunk.parsed.shell.num_hidden_layers);
+    defer cache.deinit();
 
-    const n_layers = config.num_hidden_layers;
+    const n_layers = trunk.parsed.shell.num_hidden_layers;
     var states = try allocator.alloc(mlx.mlx_array, n_layers + 1);
     var done: usize = 0;
     errdefer {
@@ -1586,25 +1590,19 @@ pub fn gemmaCapture4(io: std.Io, allocator: std.mem.Allocator, gemma_dir: []cons
     // states[0] is the embedding output AFTER Gemma's sqrt(hidden) scale —
     // what `output_hidden_states` returns as hidden_states[0], and what the
     // connector's 49-state aggregate projection was trained against.
-    states[0] = try xfm.embedding(ids_arr);
+    states[0] = try trunkEmbedding(&trunk, ids_arr);
     done = 1;
 
     const mask = try causalPadMask(allocator, ids, pad_id, s);
     defer _ = mlx.mlx_array_free(mask);
 
-    for (states[1..]) |*st| st.* = mlx.mlx_array_new();
-    var cl = forward_ctx.CaptureLayers{ .ids = cap_ids, .out = states[1..] };
-    done = states.len;
     {
-        var ctx = xfm.defaultCtx();
-        ctx.capture_layers = &cl;
-        ctx.prefill_mask_add = mask;
         // Only the residual stream is wanted, so the 262K-vocab projection
         // over all 256 prompt rows is pure waste.
-        ctx.skip_lm_head = true;
-        const out = try xfm.forwardWith(&ctx, ids_arr);
+        const out = try trunk.forward(&cache, ids_arr, .{ .capture_layers = cap_ids, .captured = states[1..], .mask_add = mask });
         _ = mlx.mlx_array_free(out);
     }
+    done = states.len;
 
     // A capture left unfilled would have the connector project blank states
     // into a plausible-looking, meaningless prompt — so say so instead.
@@ -1613,10 +1611,58 @@ pub fn gemmaCapture4(io: std.Io, allocator: std.mem.Allocator, gemma_dir: []cons
     }
 
     // The captures are refcount-shared with a LAZY graph whose leaves are the
-    // Transformer's weights, and `xfm.deinit()` runs on the way out — so
-    // realize them here or the frees below pull the inputs out from under it.
+    // trunk's weights, and the trunk closes on the way out — so realize them
+    // here or the frees below pull the inputs out from under it.
     for (states) |st| _ = mlx.mlx_array_eval(st);
     return states;
+}
+
+/// The trunk's embedding rows for `ids` `[1, T]` as the engine's shell embeds them (`Transformer.embedding`):
+/// gathered, dequantized to the activation dtype, times the trunk's embed scale.
+fn trunkEmbedding(t: *const trunk_mod.Trunk, ids: mlx.mlx_array) !mlx.mlx_array {
+    const e = try t.weight(.embed);
+    const w: mlx.mlx_array = .{ .ctx = e.w.ctx };
+    const sc: mlx.mlx_array = .{ .ctx = e.scales.ctx };
+    const bi: mlx.mlx_array = .{ .ctx = e.biases.ctx };
+    const st = t.s;
+    const sh = mlx.getShape(ids);
+    const hidden = t.parsed.shell.hidden_size;
+    const act: mlx.mlx_dtype = if (t.parsed.shell.act_dtype == .f16) .float16 else .bfloat16;
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    try mlx.check(mlx.mlx_reshape(&flat, ids, &[_]c_int{sh[0] * sh[1]}, 1, st));
+    var taken = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(taken);
+    try mlx.check(mlx.mlx_take_axis(&taken, w, flat, 0, st));
+    var emb = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(emb);
+    if (sc.ctx == null) {
+        try mlx.check(mlx.mlx_astype(&emb, taken, .bfloat16, st));
+    } else if (mlx_gguf.kernels.infoOf(w, sc)) |info| {
+        _ = mlx.mlx_array_free(emb);
+        emb = try mlx_gguf.kernels.dequantize(info.ty, taken, act, st);
+    } else {
+        var ts = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ts);
+        try mlx.check(mlx.mlx_take_axis(&ts, sc, flat, 0, st));
+        var tb = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(tb);
+        if (bi.ctx != null) try mlx.check(mlx.mlx_take_axis(&tb, bi, flat, 0, st));
+        const q = t.parsed.shell.quant;
+        const base: params_mod.QuantParams = .{ .bits = q.bits, .group_size = q.group_size, .mode = std.meta.stringToEnum(params_mod.QuantMode, @tagName(q.mode)) orelse .affine };
+        const qp = params_mod.computeQuantParams(base, w, sc, hidden);
+        try mlx.check(mlx.mlx_dequantize(&emb, taken, ts, tb, mlx.mlx_optional_int.some(@intCast(qp.group_size)), mlx.mlx_optional_int.some(@intCast(qp.bits)), qp.mode.cstr(), .{}, .{ .value = act, .has_value = true }, st));
+    }
+    var rows = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&rows, emb, &[_]c_int{ sh[0], sh[1], @intCast(hidden) }, 3, st));
+    const scale = t.parsed.spec.embed_scale;
+    if (scale <= 0) return rows;
+    defer _ = mlx.mlx_array_free(rows);
+    const k = @import("../../mlx/array.zig").bf16Scalar(scale, st);
+    defer _ = mlx.mlx_array_free(k);
+    var scaled = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_multiply(&scaled, rows, k, st));
+    return scaled;
 }
 
 fn addArr(x: mlx.mlx_array, y: mlx.mlx_array, s: S) !mlx.mlx_array {
@@ -1666,7 +1712,7 @@ fn clipResidual(x: mlx.mlx_array, y: mlx.mlx_array, s: S) !mlx.mlx_array {
 pub fn gemmaCapture(io: std.Io, allocator: std.mem.Allocator, gemma_dir: []const u8, ids: []const i32, pad_id: i32, s: S) ![]mlx.mlx_array {
     const cfg = GemmaCfg{};
     const T: c_int = @intCast(ids.len);
-    var w = try model_mod.loadWeights(io, allocator, gemma_dir);
+    var w = try weights_load.loadWeights(io, allocator, gemma_dir);
     defer w.deinit();
 
     // Arena for the per-call key strings.

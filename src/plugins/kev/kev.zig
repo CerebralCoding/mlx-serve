@@ -504,7 +504,7 @@ pub const Engine = struct {
         self.logit_scale = kc.logit_scale;
 
         // Kev's marker keeps the registry's claim off the pack, so the trunk is bound here.
-        self.trunk = Trunk.parse(io, allocator, dir, &qwen3_5.table, "{}") catch |e| return if (e == error.TrunkUnsupported) error.KevUnsupportedBase else e;
+        self.trunk = Trunk.parse(io, allocator, dir, &.{&qwen3_5.table}, "{}") catch |e| return if (e == error.TrunkUnsupported) error.KevUnsupportedBase else e;
         var loaded = false;
         errdefer self.trunk.close(loaded);
         const sh = &self.trunk.parsed.shell;

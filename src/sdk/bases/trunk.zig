@@ -5,6 +5,7 @@
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const abi = @import("../../abi/plugin.zig");
+const common = @import("../../abi/common.zig");
 const quant_abi = @import("../../abi/quant.zig");
 const run = @import("run.zig");
 const kv_cache = @import("../kv/cache.zig");
@@ -26,8 +27,9 @@ pub const Trunk = struct {
     kv_step: bool = true,
     next_slot: u32 = 0,
 
-    /// The pack at `dir` parsed by `table`, `overrides` deep-merged into its config.json first; `load` loads it.
-    pub fn parse(io: std.Io, a: std.mem.Allocator, dir: []const u8, table: *const abi.ModelTable, overrides: []const u8) !Trunk {
+    /// The pack at `dir` parsed by the one of `tables` that claims it (as the registry picks), `overrides`
+    /// deep-merged into its config.json first; `load` loads it.
+    pub fn parse(io: std.Io, a: std.mem.Allocator, dir: []const u8, tables: []const *const abi.ModelTable, overrides: []const u8) !Trunk {
         var fs = try FsPackDir.open(io, dir);
         defer fs.close();
         const pd = fs.packDir();
@@ -37,6 +39,12 @@ pub const Trunk = struct {
         const raw = pd.readFile("config.json", buf, &why) orelse return error.ConfigUnreadable;
         const cfg = try mergeConfigJson(a, raw, overrides);
         defer a.free(cfg);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const model_type = try @import("../plugin.zig").modelTypeOf(arena.allocator(), cfg);
+        var claims: [8]common.Claim = undefined;
+        for (tables, claims[0..tables.len]) |tb, *c| c.* = tb.claims(.of(model_type), .of(cfg), &pd);
+        const table = tables[(common.pick(claims[0..tables.len]) catch return error.TrunkUnsupported) orelse return error.TrunkUnsupported];
         var t: Trunk = .{ .table = table, .s = undefined };
         if (!table.parse(&pd, .of(cfg), .{}, null, false, &t.parsed).isOk()) return error.TrunkUnsupported;
         t.kv_step = t.parsed.cache.ssm_state.entries == 0;

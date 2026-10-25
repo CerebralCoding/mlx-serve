@@ -508,7 +508,7 @@ pub const Engine = struct {
         self.allocator = allocator;
         self.stream = s;
         // The trunk is bound here, never by the LM's served path.
-        self.trunk = kev.Trunk.parse(io, allocator, dir, &lfm2.table, "{}") catch |e| return if (e == error.TrunkUnsupported) error.D1UnsupportedBase else e;
+        self.trunk = kev.Trunk.parse(io, allocator, dir, &.{&lfm2.table}, "{}") catch |e| return if (e == error.TrunkUnsupported) error.D1UnsupportedBase else e;
         var loaded = false;
         errdefer self.trunk.close(loaded);
         if (!std.mem.startsWith(u8, self.trunk.parsed.shell.model_type.slice(), "lfm2")) return error.D1UnsupportedBase;

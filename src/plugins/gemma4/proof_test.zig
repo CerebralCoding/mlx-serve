@@ -560,7 +560,7 @@ test "gemma4 plugin: LTX 2.5's text encoder states over a left-padded prompt rep
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    const tape_mod = @import("../../engines/mlx/plugin/tape.zig");
+    const tape_mod = @import("../../sdk/testing/tape.zig");
     var p = fixture.Pack.init(0x9e53);
     defer p.deinit();
     try writeGemma4(&p, null, 0, 0, true, true);

@@ -236,7 +236,7 @@ const TextEncoder = struct {
         self.allocator = a;
         // The encoder ships no lm_head and only its final hidden state is read.
         const tied = "{\"tie_word_embeddings\":true,\"text_config\":{\"tie_word_embeddings\":true}}";
-        self.trunk = trunk_mod.Trunk.parse(io, a, dir, &qwen3_5.table, tied) catch |e| return if (e == error.TrunkUnsupported) error.MossTextEncoderUnsupported else e;
+        self.trunk = trunk_mod.Trunk.parse(io, a, dir, &.{&qwen3_5.table}, tied) catch |e| return if (e == error.TrunkUnsupported) error.MossTextEncoderUnsupported else e;
         errdefer self.trunk.close(false);
         var raw = try weights_load.loadWeights(io, a, dir);
         defer raw.deinit();
