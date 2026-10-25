@@ -109,6 +109,7 @@ test {
     _ = @import("engines/llama/engine.zig");
     _ = @import("host/engines/served.zig");
     _ = @import("host/engines/requests.zig");
+    _ = @import("host/engines/stream.zig");
     _ = @import("host/engines/prompt.zig");
     _ = @import("host/engines/load.zig");
     _ = @import("host/chat/format_corpus_test.zig");

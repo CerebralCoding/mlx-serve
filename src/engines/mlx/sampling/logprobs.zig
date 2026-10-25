@@ -6,17 +6,8 @@ const SamplingParams = @import("params.zig").SamplingParams;
 const sampleToken = @import("sampler.zig").sampleToken;
 
 
-/// Per-token logprob info (OpenAI format).
-pub const TokenLogprob = struct {
-    token_id: u32,
-    logprob: f32,
-};
-
-/// Logprob result for a single generated token.
-pub const LogprobResult = struct {
-    token_logprob: f32, // logprob of the chosen token
-    top_logprobs: []TokenLogprob, // top N alternatives (caller must free)
-};
+pub const TokenLogprob = @import("../../../sdk/request/logprob.zig").TokenLogprob;
+pub const LogprobResult = @import("../../../sdk/request/logprob.zig").LogprobResult;
 
 /// Logprobs for the FIRST generated token, taken from the prefill's
 /// final-position logits — the one distribution the decode loop never sees.

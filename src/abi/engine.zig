@@ -182,6 +182,14 @@ pub const Event = extern struct {
     reason: enum(u8) { stop, length, cancelled, failed } = .stop, // finished
     stats: ?*const Stats = null, // finished
     verdict: Verdict = .{}, // finished(failed): the named error
+    prompt_tokens: u32 = 0, // prefilled: the prompt as the engine counted it
+    prompt_logprobs: Span(Logprob) = .{}, // prefilled: the prompt's own logprobs when asked for
+    constraint_at: u32 = std.math.maxInt(u32), // tokens: the token index where a constrained payload begins
+    constraint_offset: u32 = 0, // tokens: its byte offset inside that token
+    finish_details: Str = .{}, // finished: a static cause beside the reason (`repetition_loop`)
+    loop_trim_start: u64 = std.math.maxInt(u64), // finished: where a loop-stopped span begins in the generated tokens
+    refused_needed: u64 = 0, // finished(failed): bytes the engine's admission needed ...
+    refused_available: u64 = 0, // ... and had, when it refused the prefill
 };
 
 /// Runs on the engine's thread; returns at once. `stop` ends the request as `finished(stop)` after this round:
