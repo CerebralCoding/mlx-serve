@@ -7,6 +7,7 @@ const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 const generation = @import("../../sdk/config/generation.zig");
 const quant_config = @import("../../sdk/config/quantization_config.zig");
+const json_read = @import("../../sdk/config/json.zig");
 
 pub const plugin = @import("../../sdk/plugin.zig").Plugin{
     .name = "gemma3",
@@ -202,6 +203,11 @@ pub fn readCommon(root: std.json.ObjectMap, cfg: std.json.ObjectMap, c: *Config)
 
 /// The `quantization` block (affine bits the MLX kernels serve, modes MLX knows) into `c.quant`.
 pub fn readQuant(root: std.json.ObjectMap, c: *Config) error{Unsupported}!void {
+    // A `--mlx-gguf` file's rebuilt block: the GGUF format reads each tensor's own block type.
+    if (json_read.ggufQuant(root) catch return error.Unsupported) |g| {
+        c.quant = g;
+        return;
+    }
     const q = field(root, "quantization") orelse return;
     if (q != .object) return error.Unsupported;
     c.quant = .{ .group_size = 64, .mode = .affine };

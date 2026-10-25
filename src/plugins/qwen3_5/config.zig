@@ -363,6 +363,15 @@ test "qwen3_5 config: a Qwen3.6-35B-A3B text pack parses into the shell, its lay
     try testing.expectEqual(abi.ToolDialect.qwen_xml, p.chat.tool_dialect);
 }
 
+test "qwen3_5 config: a --mlx-gguf file's rebuilt config parses with its gguf quant mode" {
+    const gguf_json = try std.mem.replaceOwned(u8, testing.allocator, qwen36_35b, "\"quantization\":{\"group_size\":64,\"bits\":4}", "\"quantization\":{\"group_size\":32,\"bits\":4,\"mode\":\"gguf\"}");
+    defer testing.allocator.free(gguf_json);
+    var p: abi.Parsed = .{};
+    try testing.expect(parseJson(gguf_json, &p).isOk());
+    defer freeParsed(&p);
+    try testing.expectEqual(abi.QuantMode.gguf, p.shell.quant.mode);
+}
+
 test "qwen3_5 config: a Qwen3-VL pack and MiniCPM-V 4.7 declare their placeholders and the M-RoPE spectrum" {
     const vl = try std.mem.replaceOwned(u8, testing.allocator, qwen36_35b, "\"eos_token_id\":248046,", "\"eos_token_id\":248046,\"vision_config\":{\"depth\":27},\"image_token_id\":248056,\"video_token_id\":248057,");
     defer testing.allocator.free(vl);

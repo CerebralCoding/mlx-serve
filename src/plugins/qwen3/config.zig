@@ -135,6 +135,8 @@ pub fn quantization(root: std.json.ObjectMap) error{Unsupported}!abi.Quant {
 
 /// `quantization`; `rotated` (a Hadamard pack) also takes 2-bit group 128, whose rotated arm the plugin carries.
 pub fn quantizationOf(root: std.json.ObjectMap, rotated: bool) error{Unsupported}!abi.Quant {
+    // A `--mlx-gguf` file's rebuilt block: the GGUF format reads each tensor's own block type.
+    if (json_read.ggufQuant(root) catch return error.Unsupported) |g| return g;
     const q = field(root, "quantization") orelse return .{};
     if (q != .object) return error.Unsupported;
     var out: abi.Quant = .{ .bits = std.math.cast(u8, int(field(q.object, "bits")) orelse 0) orelse return error.Unsupported, .group_size = 64, .mode = .affine };
