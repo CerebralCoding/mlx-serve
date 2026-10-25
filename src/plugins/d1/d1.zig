@@ -5,12 +5,13 @@ const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const laya = @import("../laya/laya.zig");
 const kev = @import("../kev/kev.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
 const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
-const transformer_mod = @import("../../engines/mlx/transformer.zig");
-const plugin_config = @import("../../engines/mlx/plugin/config.zig");
-const plugin_driver = @import("../../engines/mlx/plugin/driver.zig");
 const lfm2 = @import("../lfm2/plugin.zig");
+const quant_abi = @import("../../abi/quant.zig");
+const params = @import("../../sdk/quant/params.zig");
+const sushi_pack = @import("../../sdk/quant/exl3/sushi_pack.zig");
+const qmatmulBits = @import("../../sdk/blocks/linear/qmatmul.zig").qmatmulBits;
+const array = @import("../../mlx/array.zig");
 const testing = std.testing;
 
 const A = mlx.mlx_array;
@@ -494,8 +495,9 @@ fn argmax(p: []const f64) usize {
 pub const Engine = struct {
     allocator: std.mem.Allocator,
     stream: S,
-    config: model_mod.ModelConfig,
-    xfm: transformer_mod.Transformer,
+    trunk: kev.Trunk,
+    /// The trunk's LM head (borrowed from the trunk).
+    head: quant_abi.Weight,
     tok: tokenizer_mod.Tokenizer,
 
     /// A dir whose config.json names `modeling_d1.D1Model` (bf16 LFM2.5-VL weights, the card's own layout).
@@ -505,23 +507,44 @@ pub const Engine = struct {
         errdefer allocator.destroy(self);
         self.allocator = allocator;
         self.stream = s;
-        // The legacy parse alone: the trunk's binding is made here (`bindTrunk`), never by the LM's served path.
-        self.config = try model_mod.parseConfigLegacy(io, allocator, dir);
-        errdefer self.config.deinit(allocator);
-        if (!std.mem.startsWith(u8, self.config.model_type, "lfm2")) return error.D1UnsupportedBase;
+        // The trunk is bound here, never by the LM's served path.
+        self.trunk = kev.Trunk.parse(io, allocator, dir, &lfm2.table, "{}") catch |e| return if (e == error.TrunkUnsupported) error.D1UnsupportedBase else e;
+        var loaded = false;
+        errdefer self.trunk.close(loaded);
+        if (!std.mem.startsWith(u8, self.trunk.parsed.shell.model_type.slice(), "lfm2")) return error.D1UnsupportedBase;
         self.tok = try tokenizer_mod.loadTokenizer(io, allocator, dir);
         errdefer self.tok.deinit();
-        self.config.plugin = try plugin_config.bindTable(io, allocator, dir, &lfm2.table) orelse return error.D1UnsupportedBase;
-        // The shell owns its stream: the thread's default GPU stream, as the engine's own load takes.
-        self.xfm = try plugin_driver.load(io, allocator, &self.config, dir, mlx.gpuStream());
+        // The thread's default GPU stream, as the engine's own load takes.
+        try self.trunk.load(io, allocator, dir, mlx.gpuStream(), null);
+        loaded = true;
+        self.head = try self.trunk.weight(.head);
         return self;
     }
 
     pub fn deinit(self: *Engine) void {
-        self.xfm.deinit();
+        self.trunk.close(true);
         self.tok.deinit();
-        self.config.deinit(self.allocator);
         self.allocator.destroy(self);
+    }
+
+    /// `x` through the trunk's LM head as the engine's shell projects a draft row (`lmHeadProject`): a dense head
+    /// through a transposed view, a quantized one at its own per-weight parameters.
+    pub fn headLogits(self: *const Engine, x: A) !A {
+        const s = self.trunk.s;
+        const w: A = .{ .ctx = self.head.w.ctx };
+        const sc: A = .{ .ctx = self.head.scales.ctx };
+        if (sc.ctx == null) {
+            const wt = try array.transposeBf16Weight(w, s);
+            defer free(wt);
+            var out = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_matmul(&out, x, wt, s));
+            return out;
+        }
+        if (sushi_pack.isRowScaledFp8(w, sc)) return sushi_pack.fp8Linear(x, w, sc, s);
+        const q = self.trunk.parsed.shell.quant;
+        const base: params.QuantParams = .{ .bits = q.bits, .group_size = q.group_size, .mode = std.meta.stringToEnum(params.QuantMode, @tagName(q.mode)) orelse .affine };
+        const qp = params.computeQuantParams(base, w, sc, array.lastDim(x));
+        return qmatmulBits(x, w, sc, .{ .ctx = self.head.biases.ctx }, qp.bits, qp.group_size, qp.mode, s);
     }
 
     pub fn parseQuestions(_: *const Engine, a: std.mem.Allocator, questions: std.json.Value, max_questions: usize) !Questions {
@@ -571,7 +594,7 @@ pub const Engine = struct {
         const branches = try a.alloc([]const u32, n);
         defer a.free(branches);
         for (suffixes, branches) |s, *b| b.* = s;
-        try kev.scoreBranches(a, &self.xfm, self.config.num_hidden_layers, prefix_ids, branches, &emit, ReadoutEmit.run);
+        try kev.scoreBranches(a, &self.trunk, prefix_ids, branches, &emit, ReadoutEmit.run);
 
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(a);
@@ -592,7 +615,7 @@ pub const Engine = struct {
         defer free(index);
         const last = try laya.take(h, index, 1, s);
         defer free(last);
-        const logits = try self.xfm.lmHeadForDraft(last);
+        const logits = try self.headLogits(last);
         defer free(logits);
         const f32_logits = try laya.astype(logits, .float32, s);
         defer free(f32_logits);

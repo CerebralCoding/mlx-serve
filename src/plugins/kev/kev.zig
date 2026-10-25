@@ -5,16 +5,12 @@ const std = @import("std");
 const laya = @import("../laya/laya.zig");
 const log = @import("../../sdk/util/log.zig");
 const mlx = @import("../../mlx/ffi.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
 const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
-const transformer_mod = @import("../../engines/mlx/transformer.zig");
-const plugin_config = @import("../../engines/mlx/plugin/config.zig");
-const plugin_driver = @import("../../engines/mlx/plugin/driver.zig");
 const qwen3_5 = @import("../qwen3_5/plugin.zig");
-const forward_ctx = @import("../../engines/mlx/forward_ctx.zig");
-const cache_mod = @import("../../engines/mlx/kv/cache.zig");
-const entry = @import("../../engines/mlx/ssm/entry.zig");
-const history = @import("../qwen4_exp/qsa/history.zig");
+const trunk_mod = @import("../../sdk/bases/trunk.zig");
+const Weights = @import("../../sdk/weights/resident.zig").Weights;
+const loadWeightsSingleFile = @import("../../sdk/weights/load.zig").loadWeightsSingleFile;
+pub const Trunk = trunk_mod.Trunk;
 
 const S = mlx.mlx_stream;
 const A = mlx.mlx_array;
@@ -433,60 +429,32 @@ pub fn appendAnswers(a: std.mem.Allocator, out: *std.ArrayList(u8), qs: []const 
 /// `[1, L, H]`, evaluated; the helper frees it once `emit` returns. Shared by Kev and D1 (`d1.zig`).
 pub fn scoreBranches(
     a: std.mem.Allocator,
-    xfm: *transformer_mod.Transformer,
-    layers: u32,
+    trunk: *Trunk,
     state_ids: []const u32,
     branches: []const []const u32,
     ctx: anytype,
     comptime emit: fn (@TypeOf(ctx), usize, A) anyerror!void,
 ) !void {
-    var cache = try cache_mod.KVCache.init(a, layers);
+    var cache = try trunk_mod.Cache.init(a, trunk.parsed.shell.num_hidden_layers);
     defer cache.deinit();
-    const entries = try a.alloc(entry.SSMCacheEntry, layers);
-    for (entries) |*e| e.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
-    defer {
-        for (entries) |*e| {
-            free(e.conv_state);
-            free(e.ssm_state);
-            history.ssmFreeQsaState(e);
-        }
-        a.free(entries);
-    }
-    var offset: usize = 0;
-    var fwd = xfm.defaultCtx();
-    fwd.cache = &cache;
-    fwd.moe_seq_offset = &offset;
-    fwd.ssm_entries = entries;
-    fwd.capture_hidden = null;
-    fwd.skip_lm_head = true;
-
-    const h_state = try forwardIds(xfm, &fwd, state_ids);
+    const h_state = try forwardIds(trunk, &cache, state_ids);
     free(h_state);
-    var kv_snap = try cache.snapshot();
-    defer kv_snap.deinit();
-    const ssm_snaps = try a.alloc(entry.SSMCacheEntrySnapshot, entries.len);
-    for (entries, ssm_snaps) |*e, *sn| sn.* = entry.ssmSnapshot(e);
-    defer {
-        for (ssm_snaps) |*sn| entry.ssmSnapshotDeinit(sn);
-        a.free(ssm_snaps);
-    }
-    const state_offset = offset;
-
+    var snap = try cache.snapshot();
+    defer snap.deinit();
     for (branches, 0..) |ids, i| {
-        try cache.restore(&kv_snap);
-        for (entries, ssm_snaps) |*e, *sn| try entry.ssmRestore(e, sn);
-        offset = state_offset;
-        const h = try forwardIds(xfm, &fwd, ids);
+        try cache.restore(&snap);
+        const h = try forwardIds(trunk, &cache, ids);
         defer free(h);
         try emit(ctx, i, h);
     }
 }
 
-fn forwardIds(xfm: *transformer_mod.Transformer, ctx: *forward_ctx.ForwardCtx, ids: []const u32) !A {
+/// The final-norm hidden `[1, L, H]` of `ids` after what `cache` holds, evaluated.
+pub fn forwardIds(trunk: *Trunk, cache: *trunk_mod.Cache, ids: []const u32) !A {
     const shape = [_]c_int{ 1, @intCast(ids.len) };
     const arr = mlx.mlx_array_new_data(ids.ptr, &shape, 2, .uint32);
     defer free(arr);
-    const h = try xfm.forwardWith(ctx, arr);
+    const h = try trunk.forward(cache, arr, .{});
     errdefer free(h);
     try mlx.check(mlx.mlx_array_eval(h));
     return h;
@@ -513,10 +481,9 @@ const Branch = struct {
 pub const Engine = struct {
     allocator: std.mem.Allocator,
     stream: S,
-    config: model_mod.ModelConfig,
-    xfm: transformer_mod.Transformer,
+    trunk: Trunk,
     tok: tokenizer_mod.Tokenizer,
-    head_weights: model_mod.Weights,
+    head_weights: Weights,
     q_w_t: A,
     k_w_t: A,
     head_dim: usize,
@@ -536,39 +503,40 @@ pub const Engine = struct {
         self.head_dim = kc.head_dim;
         self.logit_scale = kc.logit_scale;
 
-        // The legacy parse alone: kev's marker keeps the registry's claim off the pack, so the trunk is bound here.
-        self.config = try model_mod.parseConfigLegacy(io, allocator, dir);
-        errdefer self.config.deinit(allocator);
+        // Kev's marker keeps the registry's claim off the pack, so the trunk is bound here.
+        self.trunk = Trunk.parse(io, allocator, dir, &qwen3_5.table, "{}") catch |e| return if (e == error.TrunkUnsupported) error.KevUnsupportedBase else e;
+        var loaded = false;
+        errdefer self.trunk.close(loaded);
+        const sh = &self.trunk.parsed.shell;
         // The branch restore below snapshots exactly the Qwen3.5 caches (KV + GatedDeltaNet).
-        if (!std.mem.startsWith(u8, self.config.model_type, "qwen3_5")) return error.KevUnsupportedBase;
+        if (!std.mem.startsWith(u8, sh.model_type.slice(), "qwen3_5")) return error.KevUnsupportedBase;
 
         self.tok = try tokenizer_mod.loadTokenizer(io, allocator, dir);
         errdefer self.tok.deinit();
-        if (self.tok.definedVocabSize() > self.config.vocab_size) return error.KevVocabMismatch;
-        self.delims = try resolveDelims(&self.tok, self.config.vocab_size);
+        if (self.tok.definedVocabSize() > sh.vocab_size) return error.KevVocabMismatch;
+        self.delims = try resolveDelims(&self.tok, sh.vocab_size);
 
         const head_path = try std.fmt.allocPrint(allocator, "{s}/kev_head.safetensors", .{dir});
         defer allocator.free(head_path);
-        self.head_weights = try model_mod.loadWeightsSingleFile(allocator, head_path);
+        self.head_weights = try loadWeightsSingleFile(allocator, head_path);
         errdefer self.head_weights.deinit();
-        try checkHead(&self.head_weights, kc.head_dim, self.config.hidden_size);
+        try checkHead(&self.head_weights, kc.head_dim, sh.hidden_size);
         self.q_w_t = try laya.transposeAxes(self.head_weights.get("q.weight").?, &.{ 1, 0 }, s);
         errdefer free(self.q_w_t);
         self.k_w_t = try laya.transposeAxes(self.head_weights.get("k.weight").?, &.{ 1, 0 }, s);
         errdefer free(self.k_w_t);
 
-        self.config.plugin = try plugin_config.bindTable(io, allocator, dir, &qwen3_5.table) orelse return error.KevUnsupportedBase;
-        self.xfm = try plugin_driver.load(io, allocator, &self.config, dir, mlx.gpuStream());
+        try self.trunk.load(io, allocator, dir, mlx.gpuStream(), null);
+        loaded = true;
         return self;
     }
 
     pub fn deinit(self: *Engine) void {
-        self.xfm.deinit();
+        self.trunk.close(true);
         free(self.q_w_t);
         free(self.k_w_t);
         self.head_weights.deinit();
         self.tok.deinit();
-        self.config.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 
@@ -665,7 +633,7 @@ pub const Engine = struct {
             for (probs[0..emit.done]) |p| a.free(p);
             a.free(probs);
         }
-        try scoreBranches(a, &self.xfm, self.config.num_hidden_layers, state_ids.items, ids, &emit, ScoreEmit.run);
+        try scoreBranches(a, &self.trunk, state_ids.items, ids, &emit, ScoreEmit.run);
         return probs;
     }
 
@@ -686,7 +654,7 @@ pub const Engine = struct {
     /// kev.model.PointerHead on one branch: z_i = k(h_close_i) · q(h_decide) / sqrt(P) / T, softmax in f32.
     fn headProbs(self: *Engine, a: std.mem.Allocator, h: A, b: *const Branch, s: S) ![]f64 {
         const k = b.closes.len;
-        const hidden: c_int = @intCast(self.config.hidden_size);
+        const hidden: c_int = @intCast(self.trunk.parsed.shell.hidden_size);
         const rows_idx = try a.alloc(i32, k + 1);
         defer a.free(rows_idx);
         rows_idx[0] = @intCast(b.decide);
@@ -803,7 +771,7 @@ fn resolveDelims(tok: *const tokenizer_mod.Tokenizer, vocab: u32) !Delims {
 }
 
 /// Shapes, dtype and finiteness of the pointer head, read on the host before any MLX op uses it.
-fn checkHead(w: *const model_mod.Weights, head_dim: usize, hidden: u32) !void {
+fn checkHead(w: *const Weights, head_dim: usize, hidden: u32) !void {
     const specs = [_]struct { name: []const u8, rows: usize, cols: ?usize }{
         .{ .name = "q.weight", .rows = head_dim, .cols = hidden },
         .{ .name = "k.weight", .rows = head_dim, .cols = hidden },
@@ -1089,7 +1057,7 @@ test "kev: oracle against kev's MLX backend (KEV_TEST_MODEL + KEV_FIXTURES)" {
         const has_hidden = !std.mem.eql(u8, name, "wide"); // the one case dumped without hidden rows (size)
         if (!has_hidden) {} else if (readNpyF32(a, hidden_name)) |want_h| {
             defer a.free(want_h);
-            const hsz: usize = engine.config.hidden_size;
+            const hsz: usize = engine.trunk.parsed.shell.hidden_size;
             const rows_n: usize = want_h.len / hsz;
             const shape = [_]c_int{ @intCast(rows_n), @intCast(hsz) };
             const kev_rows = mlx.mlx_array_new_data(want_h.ptr, &shape, 2, .float32);
@@ -1152,26 +1120,9 @@ fn rowReadouts(engine: *Engine, a: std.mem.Allocator, state_ids: []const u32, b:
     const s = engine.stream;
     const row = try std.mem.concat(a, u32, &.{ state_ids, b.ids });
     defer a.free(row);
-    var cache = try cache_mod.KVCache.init(a, engine.config.num_hidden_layers);
+    var cache = try trunk_mod.Cache.init(a, engine.trunk.parsed.shell.num_hidden_layers);
     defer cache.deinit();
-    const entries = try a.alloc(entry.SSMCacheEntry, engine.config.num_hidden_layers);
-    for (entries) |*e| e.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
-    defer {
-        for (entries) |*e| {
-            free(e.conv_state);
-            free(e.ssm_state);
-            history.ssmFreeQsaState(e);
-        }
-        a.free(entries);
-    }
-    var offset: usize = 0;
-    var ctx = engine.xfm.defaultCtx();
-    ctx.cache = &cache;
-    ctx.moe_seq_offset = &offset;
-    ctx.ssm_entries = entries;
-    ctx.capture_hidden = null;
-    ctx.skip_lm_head = true;
-    const h = try forwardIds(&engine.xfm, &ctx, row);
+    const h = try forwardIds(&engine.trunk, &cache, row);
     defer free(h);
     const idx_host = try a.alloc(i32, b.closes.len + 1);
     defer a.free(idx_host);
@@ -1180,7 +1131,7 @@ fn rowReadouts(engine: *Engine, a: std.mem.Allocator, state_ids: []const u32, b:
     const idx_shape = [_]c_int{@intCast(idx_host.len)};
     const idx = mlx.mlx_array_new_data(idx_host.ptr, &idx_shape, 1, .int32);
     defer free(idx);
-    const flat = try reshape(h, &[_]c_int{ -1, @intCast(engine.config.hidden_size) }, s);
+    const flat = try reshape(h, &[_]c_int{ -1, @intCast(engine.trunk.parsed.shell.hidden_size) }, s);
     defer free(flat);
     const picked = try take(flat, idx, 0, s);
     defer free(picked);

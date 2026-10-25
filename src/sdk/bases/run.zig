@@ -12,6 +12,7 @@ const Graph = ops.Graph;
 const Ctx = block.Ctx;
 const spliceVisionRows = @import("../vision/splice.zig").spliceVisionRows;
 const row_exact = @import("blocks/row_exact.zig");
+const prefillHeadDimFused = @import("../blocks/attention/attn256.zig").prefillHeadDimFused;
 
 /// One forward's arguments.
 pub const Run = struct {
@@ -235,6 +236,48 @@ fn run(comptime Base: type, m: *Model(Base), f: *const abi.Forward, out: *abi.Fo
 pub const PREFILL_EVAL_MIN_SEQ: c_int = 32;
 
 pub const RECURRENCE_EVAL_INTERVAL: usize = 32;
+
+pub const EVAL_EVERY_N_LAYERS: u32 = 48;
+/// One value for the prefill loops AND the admission bill: at most `cadence + 1`
+/// linear layers hold a chunk-wide stream between cadence points.
+pub const PREFILL_EVAL_CADENCE_DEFAULT: u32 = 4;
+
+/// Per-layer prefill transient (bytes) above which the layer loop eval()s
+/// after EVERY layer instead of the coarse default cadence. Between eval
+/// points ~3 layers' transients coexist under MLX lazy eval, so a
+/// multi-GB transient triples; eval-per-layer bounds peak to ~1 layer.
+/// Two transients count (both scale with total_kv, so short prompts keep
+/// the coarse cadence and pay nothing):
+///   - the composed-SDPA score tensor [heads, chunk, total_kv] — only for
+///     head_dims no fused kernel covers (prefillHeadDimFused: <= 128 via
+///     MLX, 256 via msv_attn_p256; unfused only via the kill switch or an
+///     exotic dim);
+///   - the dense-fp16 rebuild of a quantized KV cache (denseView runs
+///     per layer under --kv-quant, over the FULL cache).
+/// Budget calibrated LIVE on gemma-4-26B-A4B-qat-4bit (M4 Max):
+/// eval-per-layer costs ~4.5% prefill at a 5K prompt (845 MB scores —
+/// below this budget, coarse cadence kept) and ~0% at 102K (3.4 GB
+/// scores — flips to per-layer, peak 51.6 -> 27.0 GB, prefill +14%).
+/// 2 GiB puts the flip at ~8K tokens on 16-head/256-hd geometry, where
+/// the ~3% sync cost buys a 13.7 -> 4.3 GB transient bound — the margin
+/// that keeps a 32 GB Mac serving a 26B alive.
+pub const PREFILL_EVAL_TRANSIENT_BUDGET: u64 = 2 << 30;
+
+/// Pure cadence pick for the prefill layer loops (standard/MoE/hybrid).
+pub fn prefillEvalCadence(
+    default_cadence: u32,
+    score_head_dim: u32,
+    head_dim: u32,
+    n_heads: u32,
+    kv_heads: u32,
+    chunk_len: u64,
+    total_kv: u64,
+    kv_dequant: bool,
+) u32 {
+    const scores: u64 = if (score_head_dim > 0 and !prefillHeadDimFused(score_head_dim)) @as(u64, n_heads) * chunk_len * total_kv * 2 else 0;
+    const dequant: u64 = if (kv_dequant) 2 * total_kv * @as(u64, kv_heads) * @as(u64, head_dim) * 2 else 0;
+    return if (scores + dequant > PREFILL_EVAL_TRANSIENT_BUDGET) 1 else default_cadence;
+}
 
 /// A trailing remainder smaller than this merges into the preceding chunk
 /// instead of becoming its own chunk. Chat-templated prompts routinely land a

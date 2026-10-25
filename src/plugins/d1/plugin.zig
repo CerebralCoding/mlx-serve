@@ -117,9 +117,8 @@ test "d1 plugin: the served LFM2 trunk scores branches bit-equal to the engine's
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     const mlx = @import("../../mlx/ffi.zig");
-    const transformer_mod = @import("../../engines/mlx/transformer.zig");
     const kev = @import("../kev/kev.zig");
-    const Tape = @import("../../engines/mlx/plugin/tape.zig").Tape;
+    const Tape = @import("../../sdk/testing/tape.zig").Tape;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -133,14 +132,14 @@ test "d1 plugin: the served LFM2 trunk scores branches bit-equal to the engine's
     const state = [_]u32{ 256, 257, 72, 101, 108, 108, 111, 10, 83, 58, 32, 120 };
     const branches = [_][]const u32{ &.{ 81, 58, 32, 65 }, &.{ 81, 58, 32, 66, 67 }, &.{ 258, 10 } };
     const Collect = struct {
-        xfm: *transformer_mod.Transformer,
+        eng: *d1.Engine,
         out: [branches.len]mlx.mlx_array = undefined,
         fn run(self: *@This(), i: usize, h: mlx.mlx_array) !void {
             const sh = mlx.getShape(h);
             var last = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(last);
-            try mlx.check(mlx.mlx_slice(&last, h, &[_]c_int{ 0, sh[1] - 1, 0 }, 3, &[_]c_int{ 1, sh[1], sh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, self.xfm.s));
-            self.out[i] = try self.xfm.lmHeadForDraft(last);
+            try mlx.check(mlx.mlx_slice(&last, h, &[_]c_int{ 0, sh[1] - 1, 0 }, 3, &[_]c_int{ 1, sh[1], sh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, self.eng.trunk.s));
+            self.out[i] = try self.eng.headLogits(last);
             try mlx.check(mlx.mlx_array_eval(self.out[i]));
         }
     };
@@ -148,8 +147,8 @@ test "d1 plugin: the served LFM2 trunk scores branches bit-equal to the engine's
     defer _ = mlx.mlx_stream_free(s);
     const eng = try d1.Engine.load(io, a, dir, s);
     defer eng.deinit();
-    var got: Collect = .{ .xfm = &eng.xfm };
-    try kev.scoreBranches(a, &eng.xfm, eng.config.num_hidden_layers, &state, &branches, &got, Collect.run);
+    var got: Collect = .{ .eng = eng };
+    try kev.scoreBranches(a, &eng.trunk, &state, &branches, &got, Collect.run);
     defer for (got.out) |x| {
         _ = mlx.mlx_array_free(x);
     };

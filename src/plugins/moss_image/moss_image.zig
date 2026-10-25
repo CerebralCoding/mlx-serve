@@ -23,15 +23,10 @@ const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../sdk/util/log.zig");
 const sse = @import("../../sdk/media/progress.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
+const weights_load = @import("../../sdk/weights/load.zig");
 const tok_mod = @import("../../sdk/tokenizer/tokenizer.zig");
-const transformer_mod = @import("../../engines/mlx/transformer.zig");
-const plugin_config = @import("../../engines/mlx/plugin/config.zig");
-const plugin_driver = @import("../../engines/mlx/plugin/driver.zig");
 const qwen3_5 = @import("../qwen3_5/plugin.zig");
-const cache_mod = @import("../../engines/mlx/kv/cache.zig");
-const entry = @import("../../engines/mlx/ssm/entry.zig");
-const history = @import("../qwen4_exp/qsa/history.zig");
+const trunk_mod = @import("../../sdk/bases/trunk.zig");
 const scope_mod = @import("../../mlx/scope.zig");
 const ops = @import("../../mlx/ops.zig");
 const lora_mod = @import("../../sdk/weights/lora.zig");
@@ -42,7 +37,7 @@ const resnet_blk = @import("../../sdk/blocks/vae/resnet.zig");
 const conv_blk = @import("../../sdk/blocks/vae/conv.zig");
 const flow_match = @import("../../sdk/blocks/schedulers/flow_match.zig");
 
-const Weights = model_mod.Weights;
+const Weights = @import("../../sdk/weights/resident.zig").Weights;
 const Scope = scope_mod.Scope;
 const Graph = ops.Graph;
 const S = mlx.mlx_stream;
@@ -233,57 +228,34 @@ fn sanitizeTextEncoder(a: std.mem.Allocator, src: *Weights, s: S) !Weights {
 
 const TextEncoder = struct {
     allocator: std.mem.Allocator,
-    config: model_mod.ModelConfig,
-    xfm: transformer_mod.Transformer,
+    trunk: trunk_mod.Trunk,
 
     fn load(self: *TextEncoder, io: std.Io, a: std.mem.Allocator, model_dir: []const u8, s: S) !void {
         const dir = try std.fmt.allocPrint(a, "{s}/text_encoder", .{model_dir});
         defer a.free(dir);
         self.allocator = a;
-        self.config = try model_mod.parseConfigLegacy(io, a, dir);
-        errdefer self.config.deinit(a);
         // The encoder ships no lm_head and only its final hidden state is read.
         const tied = "{\"tie_word_embeddings\":true,\"text_config\":{\"tie_word_embeddings\":true}}";
-        self.config.tie_word_embeddings = true;
-        self.config.plugin = try plugin_config.bindTableWith(io, a, dir, &qwen3_5.table, tied) orelse return error.MossTextEncoderUnsupported;
-        var raw = try model_mod.loadWeights(io, a, dir);
+        self.trunk = trunk_mod.Trunk.parse(io, a, dir, &qwen3_5.table, tied) catch |e| return if (e == error.TrunkUnsupported) error.MossTextEncoderUnsupported else e;
+        errdefer self.trunk.close(false);
+        var raw = try weights_load.loadWeights(io, a, dir);
         defer raw.deinit();
-        self.xfm = try plugin_driver.loadMap(io, a, &self.config, dir, mlx.gpuStream(), try sanitizeTextEncoder(a, &raw, s));
+        try self.trunk.load(io, a, dir, mlx.gpuStream(), try sanitizeTextEncoder(a, &raw, s));
     }
 
     fn deinit(self: *TextEncoder) void {
-        self.xfm.deinit();
-        self.config.deinit(self.allocator);
+        self.trunk.close(true);
     }
 
     /// `last_hidden_state` [1, T, hidden] for one unpadded prompt (evaluated; caller frees).
     /// Every call runs on its own KV cache and GatedDeltaNet state.
     fn encode(self: *TextEncoder, ids: []const u32) !A {
-        const a = self.allocator;
-        const layers = self.config.num_hidden_layers;
-        var cache = try cache_mod.KVCache.init(a, layers);
+        var cache = try trunk_mod.Cache.init(self.allocator, self.trunk.parsed.shell.num_hidden_layers);
         defer cache.deinit();
-        const entries = try a.alloc(entry.SSMCacheEntry, layers);
-        for (entries) |*e| e.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
-        defer {
-            for (entries) |*e| {
-                _ = mlx.mlx_array_free(e.conv_state);
-                _ = mlx.mlx_array_free(e.ssm_state);
-                history.ssmFreeQsaState(e);
-            }
-            a.free(entries);
-        }
-        var offset: usize = 0;
-        var ctx = self.xfm.defaultCtx();
-        ctx.cache = &cache;
-        ctx.moe_seq_offset = &offset;
-        ctx.ssm_entries = entries;
-        ctx.capture_hidden = null;
-        ctx.skip_lm_head = true;
         const shape = [_]c_int{ 1, @intCast(ids.len) };
         const arr = mlx.mlx_array_new_data(ids.ptr, &shape, 2, .uint32);
         defer _ = mlx.mlx_array_free(arr);
-        const out = try self.xfm.forwardWith(&ctx, arr);
+        const out = try self.trunk.forward(&cache, arr, .{});
         errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_array_eval(out));
         return out;
@@ -507,7 +479,7 @@ pub const Dit = struct {
         self.allocator = a;
         self.s = s;
         self.cfg = cfg;
-        self.w = try model_mod.loadWeights(io, a, dir);
+        self.w = try weights_load.loadWeights(io, a, dir);
         errdefer self.w.deinit();
         const w = &self.w;
         const d = cfg.dim;
@@ -682,7 +654,7 @@ const Vae = struct {
         self.allocator = a;
         self.s = s;
         self.owned = .empty;
-        self.w = try model_mod.loadWeights(io, a, dir);
+        self.w = try weights_load.loadWeights(io, a, dir);
         errdefer self.deinit();
         const eps_bn: f32 = blk: {
             const path = try std.fmt.allocPrint(a, "{s}/config.json", .{dir});
@@ -875,7 +847,7 @@ pub const Engine = struct {
         // Resident now, so a request's memory check reads them in live memory.
         try scope_mod.evalAll(&self.dit.w);
         log.info("[image] MOSS-Image ready (DiT {d}x{d}, {d} heads, shift {d:.1}, text encoder {d} layers)\n", .{
-            self.cfg.layers, self.cfg.dim, self.cfg.heads, self.cfg.shift, self.te.xfm.config.num_hidden_layers,
+            self.cfg.layers, self.cfg.dim, self.cfg.heads, self.cfg.shift, self.te.trunk.parsed.shell.num_hidden_layers,
         });
         return self;
     }
@@ -1065,7 +1037,7 @@ const Fixture = struct {
     fn open(a: std.mem.Allocator) !Fixture {
         const model = std.mem.span(std.c.getenv("MOSS_IMAGE_TEST_MODEL") orelse return error.SkipZigTest);
         const path = std.mem.span(std.c.getenv("MOSS_IMAGE_FIXTURE") orelse return error.SkipZigTest);
-        return .{ .w = try model_mod.loadWeightsSingleFile(a, path), .model = model };
+        return .{ .w = try weights_load.loadWeightsSingleFile(a, path), .model = model };
     }
 };
 
@@ -1174,7 +1146,7 @@ test "MOSS-Image: text encoder, DiT, VAE and the whole pipeline match the refere
 test "MOSS-Image: the text encoder's served trunk is bit-equal to the engine's own trunk" {
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    const tape_mod = @import("../../engines/mlx/plugin/tape.zig");
+    const tape_mod = @import("../../sdk/testing/tape.zig");
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();

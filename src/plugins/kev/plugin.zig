@@ -99,7 +99,7 @@ test "kev plugin: the served qwen3_5 trunk scores branches bit-equal to the engi
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     const mlx = @import("../../mlx/ffi.zig");
-    const tape_mod = @import("../../engines/mlx/plugin/tape.zig");
+    const tape_mod = @import("../../sdk/testing/tape.zig");
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -124,7 +124,7 @@ test "kev plugin: the served qwen3_5 trunk scores branches bit-equal to the engi
     const eng = try kev.Engine.load(io, a, dir, s);
     defer eng.deinit();
     var got: Collect = .{};
-    try kev.scoreBranches(a, &eng.xfm, eng.config.num_hidden_layers, &state, &branches, &got, Collect.run);
+    try kev.scoreBranches(a, &eng.trunk, &state, &branches, &got, Collect.run);
     defer for (got.out) |x| {
         _ = mlx.mlx_array_free(x);
     };
