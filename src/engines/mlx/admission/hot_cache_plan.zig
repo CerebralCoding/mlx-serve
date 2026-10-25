@@ -32,7 +32,7 @@ const retainedSsmCheckpointBytes = @import("bills.zig").retainedSsmCheckpointByt
 const sessionBytesPerToken = @import("bills.zig").sessionBytesPerToken;
 const perRequestPrefillChunkEnabled = @import("prefill_chunk.zig").perRequestPrefillChunkEnabled;
 
-pub const PREFIX_CACHE_MEM_DEFAULT: u64 = 2 * 1024 * 1024 * 1024;
+const PREFIX_CACHE_MEM_DEFAULT = http_server.PREFIX_CACHE_MEM_DEFAULT;
 
 /// The hot-cache ask when nobody named one: one session at the working context, never under
 /// 2 GB. Below one session the cache keeps only a prefix of the longest conversations, the

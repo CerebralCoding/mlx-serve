@@ -24,6 +24,9 @@ pub fn table(kind: Kind) ?*const abi.Engine {
     };
 }
 
+/// MLX's memory side: the host's GPU thread serves MLX models itself, so this is the table it prices them through.
+pub const mlx_admission: *const abi.Admission = &@import("../../engines/mlx/engine_admission.zig").table;
+
 /// How a refusal names the engine.
 pub fn displayName(kind: Kind) []const u8 {
     return switch (kind) {

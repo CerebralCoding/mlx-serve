@@ -1,16 +1,14 @@
-//! auto context, liveSessions, getEffectiveContextLength; contextForBudget, computeMaxSafeContext;
+//! auto context, getEffectiveContextLength; contextForBudget, computeMaxSafeContext;
 //! computeMemoryContext, ctxSizingCacheReserve
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
+const log = @import("../../../sdk/util/log.zig");
 const generate_mod = @import("../generate.zig");
 const model_mod = @import("../model.zig");
 const mlx_stream = if (@import("build_options").mlx_stream) @import("../modules/stream_glue.zig") else @import("../modules/stream_stub.zig");
-const model_registry_mod = @import("../../../host/registry/registry.zig");
 const metrics = @import("../../../host/status.zig");
 const system_vars = @import("../../../sdk/util/system.zig");
-const instr = @import("../../../host/metrics/metrics.zig");
-const ModelRegistry = model_registry_mod.ModelRegistry;
 const testing = std.testing;
 const http_server = @import("../../../host/http/server.zig");
 
@@ -96,35 +94,25 @@ pub fn pinAutoContext(config: *model_mod.ModelConfig) u32 {
     return config.pinned_context;
 }
 
-/// Live requests, then every hot-cache entry no live request restored from, each row stamped
-/// with its model's context limit.
-pub fn liveSessions(registry: *ModelRegistry, buf: *[2 * instr.MAX_SESSIONS]instr.Session) []instr.Session {
-    const sch = http_server.global_scheduler orelse return buf[0..0];
-    sch.queue_mu.lockUncancelable(sch.io);
-    const live = sch.live_session_count;
-    @memcpy(buf[0..live], sch.live_sessions[0..live]);
-    sch.queue_mu.unlock(sch.io);
-
-    var n = live;
-    sch.digest_mu.lockUncancelable(sch.io);
-    for (sch.cached_sessions[0..sch.cached_session_count]) |c| {
-        const in_use = for (buf[0..live]) |l| {
-            if (l.entry_id == c.entry_id and std.mem.eql(u8, l.model(), c.model())) break true;
-        } else false;
-        if (in_use) continue;
-        buf[n] = c;
-        n += 1;
+/// The startup line for a context `pinAutoContext` just froze: where the number came from.
+pub fn logPinnedContext(config: *const model_mod.ModelConfig, pinned: u32) void {
+    if (config.glm_stream) {
+        log.info("Context size: {d} tokens (mlx-stream: the prompts this load billed and the generation past them)\n", .{mlx_stream.contextLength(config)});
+    } else if (manualContext(config) > 0) {
+        log.info("Context size: {d} tokens (manual)\n", .{manualContext(config)});
+    } else if (config.mlxStream()) {
+        log.info("Context size: {d} tokens (the streaming pack's standard request; --ctx-size widens it)\n", .{getEffectiveContextLength(config)});
+    } else {
+        const memory_ctx = computeMemoryContext(config);
+        const memory_allows = safeAutoContext(memory_ctx);
+        const rope_ctx = config.contextCap();
+        if (rope_ctx > 0 and pinned >= rope_ctx) {
+            // The checkpoint's own maximum binds; memory had room to spare.
+            log.info("Context size: {d} tokens (auto: the model's maximum; memory would allow {d}) [pinned]\n", .{ pinned, memory_allows });
+        } else {
+            log.info("Context size: {d} tokens (auto: {d}% of the {d}-token memory ceiling, reserving headroom) [pinned]\n", .{ pinned, auto_ctx_safety_pct, memory_ctx });
+        }
     }
-    sch.digest_mu.unlock(sch.io);
-
-    registry.mutex.lockUncancelable(registry.io);
-    defer registry.mutex.unlock(registry.io);
-    for (buf[0..n]) |*s| {
-        const entry = registry.peekLocked(s.model()) orelse continue;
-        if (entry.state != .ready) continue;
-        if (entry.config) |cfg| s.context_length = getEffectiveContextLength(cfg);
-    }
-    return buf[0..n];
 }
 
 pub fn getEffectiveContextLength(config: *const model_mod.ModelConfig) u32 {

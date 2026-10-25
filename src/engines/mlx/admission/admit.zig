@@ -1,7 +1,6 @@
-//! AdmissionBill, fitAfterUnloadingIdle; prefillAdmissionBill, verdict/log, checkAttentionMemory
+//! AdmissionBill, fitAfterUnloadingIdle; prefillAdmissionBill, verdict/log, the scheduler hooks, admitPrompt
 
 const std = @import("std");
-const builtin = @import("builtin");
 const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
 const generate_mod = @import("../generate.zig");
@@ -9,56 +8,26 @@ const model_mod = @import("../model.zig");
 const log = @import("../../../sdk/util/log.zig");
 const scheduler_mod = @import("../scheduler.zig");
 const model_registry_mod = @import("../../../host/registry/registry.zig");
-const metrics = @import("../../../host/status.zig");
-const LoadedModel = model_registry_mod.LoadedModel;
 const http_server = @import("../../../host/http/server.zig");
 
-const Conn = @import("../../../host/http/conn.zig").Conn;
 const configuredKvQuantFor = @import("../../../host/http/server.zig").configuredKvQuantFor;
 const currentGpuMemoryCeiling = @import("../../../host/registry/memory_ceiling.zig").currentGpuMemoryCeiling;
 const explicitPrefillChunk = @import("prefill_chunk.zig").explicitPrefillChunk;
 const qsaScoreFusedOffGuard = @import("bills_test.zig").qsaScoreFusedOffGuard;
 const WarmPrefix = @import("bills.zig").WarmPrefix;
-const mlxMemoryGuardApplies = @import("bills.zig").mlxMemoryGuardApplies;
-const memoryRefusalMessage = @import("../../../host/http/errors.zig").memoryRefusalMessage;
 const prefillNeededAtChunk = @import("prefill_chunk.zig").prefillNeededAtChunk;
 const perRequestPrefillChunkEnabled = @import("prefill_chunk.zig").perRequestPrefillChunkEnabled;
 const chooseRequestPrefillChunk = @import("prefill_chunk.zig").chooseRequestPrefillChunk;
-const countRejected = @import("../../../host/http/errors.zig").countRejected;
-const sendErrorResponse = @import("../../../host/http/errors.zig").sendErrorResponse;
-const sendAnthropicError = @import("../../../host/api/anthropic.zig").sendAnthropicError;
+const requestPrefillChunkNow = @import("prefill_chunk.zig").requestPrefillChunkNow;
+const adaptivePrefillWidthNow = @import("prefill_chunk.zig").adaptivePrefillWidthNow;
+const adaptivePrefillWidenStillFits = @import("prefill_chunk.zig").adaptivePrefillWidenStillFits;
+const adaptivePrefillChunkEnabled = @import("prefill_chunk.zig").adaptivePrefillChunkEnabled;
+const clearResolvedPrefixCacheMem = @import("hot_cache_plan.zig").clearResolvedPrefixCacheMem;
 const qwen4ExpOomConfig = @import("bills_test.zig").qwen4ExpOomConfig;
 
 /// The admission bill and the headroom it is compared against, so the connection thread's
 /// guard and the inference thread's evict-or-refuse decision cannot compute them differently.
-pub const AdmissionBill = struct {
-    needed: u64 = 0,
-    available: u64 = 0,
-    /// Bytes the hot prefix cache is holding. Reported in a refusal, never credited (see `reclaimable`).
-    evictable: u64 = 0,
-    /// The part of `evictable` an eviction can prove it will return: residency minus the
-    /// largest entry (a restore pins at most one).
-    reclaimable: u64 = 0,
-    /// The prefill width this bill was taken at, so a refusal can name it.
-    chunk: u64 = 0,
-
-    pub fn fits(self: AdmissionBill) bool {
-        return self.needed <= self.available;
-    }
-
-    /// The one credit the decision and both sentences read: `reclaimable`, never `evictable`
-    /// (a refusal once quoted the slot's own checked-out prefix as "evicted").
-    pub fn evictionCredit(self: AdmissionBill) u64 {
-        return self.reclaimable;
-    }
-
-    /// Fits once the cache has given back what it provably can. Credits `reclaimable`, not
-    /// `evictable`: a 383k prompt was admitted on one entry it then restored from and refused
-    /// after the eviction pass returned nothing.
-    pub fn fitsAfterEviction(self: AdmissionBill) bool {
-        return self.needed <= self.available +| self.evictionCredit();
-    }
-};
+pub const AdmissionBill = @import("../../../abi/engine.zig").Bill;
 
 /// Unloads idle resident models, least recently used first, until `fits` holds; false when
 /// nothing idle is left. An idle model is memory its next request reloads.
@@ -232,9 +201,26 @@ pub fn logPrefillRefusal(config: *const model_mod.ModelConfig, prompt_len: usize
     return .{ bill.needed, bill.available };
 }
 
-pub fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids: []const u32, max_tokens: u32, config: *const model_mod.ModelConfig, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig, lm: *const LoadedModel, enable_mtp: bool, media_bytes: u64) !bool {
+/// The scheduler's admission and prefill-width hooks, live while the server runs (`on`); unit tests leave them null.
+pub fn installSchedulerHooks(on: bool) void {
+    scheduler_mod.prefill_admission_fits = if (on) &prefillFitsNow else null;
+    scheduler_mod.prefill_admission_numbers = if (on) &prefillBillNumbersNow else null;
+    scheduler_mod.prefill_request_chunk = if (on) &requestPrefillChunkNow else null;
+    // The published budget is per model; retire it whenever the scheduler drops the cache.
+    scheduler_mod.hot_cache_budget_invalidate = if (on) &clearResolvedPrefixCacheMem else null;
+    scheduler_mod.prefill_admission_refused_log = if (on) &logPrefillRefusal else null;
+    // Asked by the prefill loop: the width of the next chunk, re-priced at every boundary.
+    scheduler_mod.prefill_chunk_adapt = if (on) &adaptivePrefillWidthNow else null;
+    scheduler_mod.prefill_chunk_widen_ok = if (on) &adaptivePrefillWidenStillFits else null;
+    // Whether the hook above can move anything for a given model (process-wide, so presence is not a gate).
+    scheduler_mod.prefill_chunk_adaptive_enabled = if (on) &adaptivePrefillChunkEnabled else null;
+}
+
+/// The connection thread's guard: true admits (outright, once the hot cache gives back what it
+/// can, or deferred to the warm bill); false refuses, `out` holding the bill it compared after
+/// unloading every idle model but `keep`.
+pub fn admitPrompt(config: *const model_mod.ModelConfig, keep: []const u8, prompt_ids: []const u32, max_tokens: u32, kv_override: ?transformer_mod.KVQuantConfig, enable_mtp: bool, media_bytes: u64, out: *AdmissionBill) bool {
     const prompt_len: usize = prompt_ids.len;
-    if (!mlxMemoryGuardApplies(lm.engineBacked())) return true;
     if (config.num_attention_heads == 0) return true; // unknown architecture, skip check
     // The connection thread has no slot and no cache: it bills cold and defers a warm prompt.
     var bill = prefillAdmissionBill(config, prompt_len, max_tokens, kv_override, prompt_ids, .{ .mtp_on = enable_mtp });
@@ -283,43 +269,17 @@ pub fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_
                 return true;
             }
         };
-        var rebill = Rebill{ .sch = sch, .keep = lm.id, .bill = &bill, .config = config, .prompt_ids = prompt_ids, .max_tokens = max_tokens, .kv_override = kv_override, .enable_mtp = enable_mtp, .media_bytes = media_bytes };
+        var rebill = Rebill{ .sch = sch, .keep = keep, .bill = &bill, .config = config, .prompt_ids = prompt_ids, .max_tokens = max_tokens, .kv_override = kv_override, .enable_mtp = enable_mtp, .media_bytes = media_bytes };
         if (fitAfterUnloadingIdle(&rebill, Rebill.fits, Rebill.unloadOne)) return true;
     };
     if (bill.needed > bill.available) {
         const needed_mb = bill.needed / (1024 * 1024);
         const avail_mb = bill.available / (1024 * 1024);
         log.warn("  prompt {d} tokens needs ~{d}MB (KV+working+margin) at prefill chunk {d}, ~{d}MB available + ~{d}MB reclaimable of ~{d}MB resident hot cache — rejecting\n", .{ prompt_len, needed_mb, bill.chunk, avail_mb, bill.evictionCredit() / (1024 * 1024), bill.evictable / (1024 * 1024) });
-        // A refusal quotes the numbers it compared, hot cache included; everything the cache holds
-        // is evictable here by construction (the withheld case took the deferral arm).
-        const msg = try memoryRefusalMessage(allocator, prompt_len, needed_mb, avail_mb, bill);
-        defer allocator.free(msg);
-        countRejected();
-        if (is_anthropic) {
-            try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
-        } else {
-            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
-        }
+        out.* = bill;
         return false;
     }
     return true;
-}
-
-pub extern "c" fn sysctlbyname(name: [*:0]const u8, oldp: ?*anyopaque, oldlenp: ?*usize, newp: ?*const anyopaque, newlen: usize) c_int;
-
-/// Get the max buffer allocation limit (~75% of system unified memory).
-/// `hw.memsize` on Darwin; on Linux there is no unified-memory sysctl, so the
-/// same 75%-of-physical-RAM heuristic runs against /proc/meminfo.
-pub fn getMetalBufferLimit() u64 {
-    var mem: u64 = 0;
-    if (comptime builtin.os.tag.isDarwin()) {
-        var len: usize = @sizeOf(u64);
-        _ = sysctlbyname("hw.memsize", @ptrCast(&mem), &len, null, 0);
-    } else {
-        mem = metrics.getTotalMemBytes();
-    }
-    if (mem == 0) return 8 * 1024 * 1024 * 1024; // fallback 8GB
-    return mem * 75 / 100;
 }
 
 // ── tests ──

@@ -6,7 +6,7 @@ const log = @import("../../sdk/util/log.zig");
 const served = @import("plugin/served.zig");
 const plugin_engine = @import("plugin/engine.zig");
 
-const publishHotCacheResidency = @import("../../engines/mlx/cache/budget.zig").publishHotCacheResidency;
+const publishHotCacheResidency = scheduler_mod.publishHotCacheResidency;
 const Scheduler = @import("../../engines/mlx/scheduler.zig").Scheduler;
 const mediaBill = @import("../registry/preflight.zig").mediaBill;
 const genLoadResidentBytes = @import("../registry/preflight.zig").genLoadResidentBytes;

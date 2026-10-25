@@ -117,6 +117,14 @@ test {
     _ = @import("engines/mlx/spec/mtp_replay_test.zig");
     _ = @import("engines/mlx/spec/mtp_lookup.zig");
     _ = @import("host/http/server.zig");
+    _ = @import("engines/mlx/admission/admit.zig");
+    _ = @import("engines/mlx/admission/bills.zig");
+    _ = @import("engines/mlx/admission/bills_test.zig");
+    _ = @import("engines/mlx/admission/context.zig");
+    _ = @import("engines/mlx/admission/glm5_bill.zig");
+    _ = @import("engines/mlx/admission/hot_cache_plan.zig");
+    _ = @import("engines/mlx/admission/prefill_chunk.zig");
+    _ = @import("sdk/kv/media_span.zig");
     _ = @import("host/api/generation_settings.zig");
     _ = @import("engines/mlx/model.zig");
     _ = @import("engines/mlx/generate.zig");

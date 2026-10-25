@@ -4,7 +4,7 @@ const std = @import("std");
 const chat_mod = @import("../chat/chat.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const radio_vision = @import("../../plugins/nemotron_h/radio_vision.zig");
-const prefix_cache_mod = @import("../../engines/mlx/cache/prefix_cache.zig");
+const MediaSpan = @import("../../sdk/kv/media_span.zig").MediaSpan;
 const testing = std.testing;
 
 const appendRadioVideoRun = @import("../../plugins/nemotron_h/media.zig").appendRadioVideoRun;
@@ -74,7 +74,7 @@ pub fn placeholdersMatch(prompt_ids: []const u32, items: []const MediaItem, conf
     return placeholdersMatchOf(prompt_ids, items, .{ .config = config });
 }
 
-const ExpandedPrompt = struct { ids: []u32, media: []prefix_cache_mod.MediaSpan };
+const ExpandedPrompt = struct { ids: []u32, media: []MediaSpan };
 
 /// Replace the k-th rendered placeholder with item k's soft-token run;
 /// `media[k].start` is the run's first soft-token row.
@@ -104,7 +104,7 @@ pub fn expandMedia(
     if (!placeholdersMatchOf(prompt_ids, items, mt)) return error.MediaPlaceholderMismatch;
     var ids = std.ArrayList(u32).empty;
     errdefer ids.deinit(allocator);
-    const media = try allocator.alloc(prefix_cache_mod.MediaSpan, items.len);
+    const media = try allocator.alloc(MediaSpan, items.len);
     errdefer allocator.free(media);
     var k: usize = 0;
     var images_before: usize = 0;

@@ -5,7 +5,7 @@
 //! logged and treated as empty: a settings typo must never stop a load.
 const std = @import("std");
 const env = @import("../../env.zig");
-const kv_quant = @import("../../engines/mlx/cache/kv_quant.zig");
+const kv_quant = @import("../../sdk/blocks/attention/kv_quant.zig");
 const log = @import("../../sdk/util/log.zig");
 const mtp_acceptance = @import("../../engines/mlx/spec/mtp_acceptance.zig");
 const generation = @import("../api/generation_settings.zig");

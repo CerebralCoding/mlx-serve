@@ -4,7 +4,6 @@ const std = @import("std");
 const env = @import("../../env.zig");
 const builtin = @import("builtin");
 const mlx = @import("../../mlx/ffi.zig");
-const sparse_score = @import("../../sdk/blocks/attention/sparse_block/score.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const log = @import("../../sdk/util/log.zig");
 const metrics = @import("../status.zig");
@@ -12,12 +11,22 @@ const ane_mod = @import("../../sdk/ane/offload.zig");
 const testing = std.testing;
 const http_server = @import("../http/server.zig");
 
-const getEffectiveContextLength = @import("../../engines/mlx/admission/context.zig").getEffectiveContextLength;
-const WarmPrefix = @import("../../engines/mlx/admission/bills.zig").WarmPrefix;
-const prefillNeededAtChunk = @import("../../engines/mlx/admission/prefill_chunk.zig").prefillNeededAtChunk;
-const sysctlbyname = @import("../../engines/mlx/admission/admit.zig").sysctlbyname;
-const getMetalBufferLimit = @import("../../engines/mlx/admission/admit.zig").getMetalBufferLimit;
-const qwen4ExpLive364kConfig = @import("../../engines/mlx/admission/bills_test.zig").qwen4ExpLive364kConfig;
+extern "c" fn sysctlbyname(name: [*:0]const u8, oldp: ?*anyopaque, oldlenp: ?*usize, newp: ?*const anyopaque, newlen: usize) c_int;
+
+/// Get the max buffer allocation limit (~75% of system unified memory).
+/// `hw.memsize` on Darwin; on Linux there is no unified-memory sysctl, so the
+/// same 75%-of-physical-RAM heuristic runs against /proc/meminfo.
+fn getMetalBufferLimit() u64 {
+    var mem: u64 = 0;
+    if (comptime builtin.os.tag.isDarwin()) {
+        var len: usize = @sizeOf(u64);
+        _ = sysctlbyname("hw.memsize", @ptrCast(&mem), &len, null, 0);
+    } else {
+        mem = metrics.getTotalMemBytes();
+    }
+    if (mem == 0) return 8 * 1024 * 1024 * 1024; // fallback 8GB
+    return mem * 75 / 100;
+}
 
 /// Metal's recommended max working-set size for the default device — the real
 /// ceiling whose breach throws `[METAL] … Insufficient Memory` from the
@@ -124,7 +133,7 @@ fn wiredCeilingFloorFor(config: ?*const model_mod.ModelConfig) u64 {
 }
 
 /// PURE: the floor for a machine with `total_ram` bytes; the wrapper above reads the machine.
-fn wiredCeilingFloorForRam(config: ?*const model_mod.ModelConfig, total_ram: u64) u64 {
+pub fn wiredCeilingFloorForRam(config: ?*const model_mod.ModelConfig, total_ram: u64) u64 {
     const c = config orelse return 0;
     if (!c.longCtxGated()) return 0;
     const floor = wiredLimitFloor(wiredLimitBytes(), total_ram, http_server.serverState().wired_limit_margin_bytes);
@@ -184,8 +193,6 @@ test "an explicitly raised iogpu.wired_limit_mb is a FLOOR under the ceiling" {
     // Bar: a raised sysctl lifts the free-RAM term and nothing else; every other arch and the
     // default sysctl keep the old expression byte for byte.
     const t = std.testing;
-    sparse_score.qsa_score_fused_override = false;
-    defer sparse_score.qsa_score_fused_override = null;
     const mb: u64 = 1024 * 1024;
     const total_ram: u64 = 131_072 * mb;
     const working_set: u64 = 120_000 * mb;
@@ -208,7 +215,8 @@ test "an explicitly raised iogpu.wired_limit_mb is a FLOOR under the ceiling" {
     try t.expectEqual(@as(u64, 90_000) * mb - WIRED_LIMIT_MARGIN_BYTES, wiredLimitFloor(90_000 * mb, box96, WIRED_LIMIT_MARGIN_BYTES));
 
     // Gated: every other arch takes floor 0, which is `physicalMemoryCeiling` exactly.
-    var cfg = qwen4ExpLive364kConfig();
+    var cfg: model_mod.ModelConfig = .{ .model_type = "qwen4_exp" };
+    cfg.legacy.caps.long_ctx = true;
     try t.expect(wiredCeilingFloorForRam(&cfg, total_ram) > 0);
     try t.expectEqual(@as(u64, 0), wiredCeilingFloorForRam(null, total_ram));
     for ([_][]const u8{ "qwen3_5_moe", "gemma3", "llama", "deepseek_v4", "bailing_hybrid" }) |mt| {
@@ -226,17 +234,6 @@ test "an explicitly raised iogpu.wired_limit_mb is a FLOOR under the ceiling" {
         );
     }
 
-    // A 448k warm append that the free-RAM term refused fits under the floor.
-    const kv_bits: u64 = 8;
-    const seq: u64 = 448_604;
-    const max_tokens: u32 = @intCast(getEffectiveContextLength(&cfg) - seq);
-    const shared = WarmPrefix{ .matched_tokens = 448_531, .capacity_tokens = 448_531, .will_donate = false };
-    const needed = prefillNeededAtChunk(&cfg, seq, max_tokens, kv_bits, 512, shared);
-    try t.expectEqual(@as(u64, 11_388), needed / mb);
-    try t.expect(needed > gpuCeilingWithWiredFloor(working_set, footprint, 10_000 * mb, 0) -| footprint);
-    const lifted = gpuCeilingWithWiredFloor(working_set, footprint, 12_934 * mb, wiredCeilingFloorForRam(&cfg, total_ram));
-    try t.expectEqual(@as(u64, 24_086), (lifted -| footprint) / mb);
-    try t.expect(needed <= lifted -| footprint);
 }
 
 test "parseWiredMarginGib accepts 2..32 and names a bad value" {

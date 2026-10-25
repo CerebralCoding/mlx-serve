@@ -2,11 +2,11 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const kv_quant = @import("../../engines/mlx/cache/kv_quant.zig");
+const kv_quant = @import("../../sdk/blocks/attention/kv_quant.zig");
 const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
 const generate_mod = @import("../../engines/mlx/generate.zig");
 const log = @import("../../sdk/util/log.zig");
-const prefix_cache_mod = @import("../../engines/mlx/cache/prefix_cache.zig");
+const MediaSpan = @import("../../sdk/kv/media_span.zig").MediaSpan;
 const scheduler_mod = @import("../../engines/mlx/scheduler.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -49,7 +49,7 @@ pub fn nonStreamingViaScheduler(
     allow_batch_mtp: bool,
     timeout_ns: u64,
     vision_embeddings: ?mlx.mlx_array,
-    media: []const prefix_cache_mod.MediaSpan,
+    media: []const MediaSpan,
     cache_key: u64,
     mrope: MropeData,
     logprobs_n: u32,

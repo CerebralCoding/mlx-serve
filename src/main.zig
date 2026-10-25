@@ -31,6 +31,11 @@ const mtp_graft = @import("plugins/prism_hadamard_qwen35/mtp_graft.zig");
 const mtp_mod = @import("sdk/spec/mtp/mtp.zig");
 const chat_mod = @import("host/chat/chat.zig");
 const server_mod = @import("host/http/server.zig");
+const autoPrefillChunkCap = @import("engines/mlx/admission/prefill_chunk.zig").autoPrefillChunkCap;
+const pinPrefillChunk = @import("engines/mlx/admission/prefill_chunk.zig").pinPrefillChunk;
+const aneGateHeadroom = @import("engines/mlx/admission/bills.zig").aneGateHeadroom;
+const prefixCacheMemForLoad = @import("engines/mlx/admission/hot_cache_plan.zig").prefixCacheMemForLoad;
+const effectiveSsmCheckpointStride = @import("engines/mlx/admission/hot_cache_plan.zig").effectiveSsmCheckpointStride;
 const scheduler_mod = @import("engines/mlx/scheduler.zig");
 const ane_lm = @import("engines/ane/lm.zig");
 const status = @import("host/status.zig");
@@ -1196,7 +1201,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     if (!server_mod.mtpAllowedByDefault(mtp_forced, mlx.metalKernelsAvailable(), mlx.cudaAvailable())) enable_mtp = false;
-    generate_mod.machine_prefill_chunk_cap = server_mod.autoPrefillChunkCap(mlx.cudaAvailable());
+    generate_mod.machine_prefill_chunk_cap = autoPrefillChunkCap(mlx.cudaAvailable());
 
     // One value for the three media seams (they run under gen.zig with no
     // server config in reach); the env stays the benching override.
@@ -1649,8 +1654,8 @@ pub fn main(init: std.process.Init) !void {
             .ane_prefill = ane_prefill,
             .ane = ane_serve,
             .ane_slots = ane_slots,
-            .ane_chunk_resolver = server_mod.pinPrefillChunk,
-            .ane_headroom_resolver = server_mod.aneGateHeadroom,
+            .ane_chunk_resolver = pinPrefillChunk,
+            .ane_headroom_resolver = aneGateHeadroom,
             .load_vision = load_vision,
             .warmup_eager = warmup_eager,
             .draft_block_size = draft_block_size,
@@ -1659,9 +1664,9 @@ pub fn main(init: std.process.Init) !void {
             .prefix_cache_capacity = server_mod.prefix_cache_capacity,
             .prefix_cache_ram_enabled = server_mod.prefix_cache_ram_enabled,
             .prefix_cache_mem_bytes = server_mod.prefix_cache_mem_bytes,
-            .prefix_cache_mem_resolver = server_mod.prefixCacheMemForLoad,
+            .prefix_cache_mem_resolver = prefixCacheMemForLoad,
             .prefix_cache_disk_bytes = server_mod.prefix_cache_disk_bytes,
-            .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity, server_mod.prefix_cache_ram_enabled, server_mod.prefix_cache_disk_bytes),
+            .ssm_checkpoint_stride = effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity, server_mod.prefix_cache_ram_enabled, server_mod.prefix_cache_disk_bytes),
             .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
             .tokenize_cache_entries = server_mod.tokenize_cache_entries,
             .llama = server_mod.llama_settings,
@@ -1942,8 +1947,8 @@ fn runGenServe(
         .ane_prefill = ane_prefill,
         .ane = ane_serve,
         .ane_slots = ane_slots,
-        .ane_chunk_resolver = server_mod.pinPrefillChunk,
-        .ane_headroom_resolver = server_mod.aneGateHeadroom,
+        .ane_chunk_resolver = pinPrefillChunk,
+        .ane_headroom_resolver = aneGateHeadroom,
         .metrics = server_mod.g_metrics,
     };
 
@@ -2077,9 +2082,9 @@ fn runHeadlessServe(
         .prefix_cache_capacity = server_mod.prefix_cache_capacity,
         .prefix_cache_ram_enabled = server_mod.prefix_cache_ram_enabled,
         .prefix_cache_mem_bytes = server_mod.prefix_cache_mem_bytes,
-        .prefix_cache_mem_resolver = server_mod.prefixCacheMemForLoad,
+        .prefix_cache_mem_resolver = prefixCacheMemForLoad,
         .prefix_cache_disk_bytes = server_mod.prefix_cache_disk_bytes,
-        .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity, server_mod.prefix_cache_ram_enabled, server_mod.prefix_cache_disk_bytes),
+        .ssm_checkpoint_stride = effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity, server_mod.prefix_cache_ram_enabled, server_mod.prefix_cache_disk_bytes),
         .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
         .tokenize_cache_entries = server_mod.tokenize_cache_entries,
         // ds4 spec flags must survive headless/on-demand GGUF loads (the
@@ -2091,8 +2096,8 @@ fn runHeadlessServe(
         .ane_prefill = ane_prefill,
         .ane = ane_serve,
         .ane_slots = ane_slots,
-        .ane_chunk_resolver = server_mod.pinPrefillChunk,
-        .ane_headroom_resolver = server_mod.aneGateHeadroom,
+        .ane_chunk_resolver = pinPrefillChunk,
+        .ane_headroom_resolver = aneGateHeadroom,
         .metrics = server_mod.g_metrics,
     };
 

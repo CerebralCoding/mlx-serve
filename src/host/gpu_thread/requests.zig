@@ -1,7 +1,7 @@
 //! Load, media-gen and unload work items posted to the inference thread, and media-job merging.
 
 const std = @import("std");
-const kv_quant = @import("../../engines/mlx/cache/kv_quant.zig");
+const kv_quant = @import("../../sdk/blocks/attention/kv_quant.zig");
 const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const chat_mod = @import("../chat/chat.zig");
@@ -12,7 +12,6 @@ const ChatConfig = chat_mod.ChatConfig;
 const LoadedModel = model_registry_mod.LoadedModel;
 const testing = std.testing;
 
-const BudgetRevise = @import("../../engines/mlx/cache/budget.zig").BudgetRevise;
 const LlamaSettings = @import("../../engines/mlx/scheduler/params.zig").LlamaSettings;
 const GgufRoute = @import("thread.zig").GgufRoute;
 
@@ -82,7 +81,6 @@ pub const LoadRequest = struct {
     prefix_cache_capacity: u32 = 1,
     prefix_cache_ram_enabled: bool = true,
     prefix_cache_mem_bytes: u64 = 0,
-    prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64 = null,
     /// SSD tier byte budget (mirrors `LoadParams.prefix_cache_disk_bytes`).
     prefix_cache_disk_bytes: u64 = 0,
     /// Phase 1 (perf-plan): SSM/conv state snapshot stride during prefill.
