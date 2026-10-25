@@ -127,7 +127,6 @@ src/plugins/qwen4_exp/qsa/*.zig	seq_len >= FUSED256_MIN_Q_LEN	the QSA prefill ga
 src/plugins/qwen4_exp/qsa/indexer.zig	yarnScaleRotated	the QSA indexer's scalar rope arm applies the YaRN mscale
 src/plugins/qwen4_exp/qsa/indexer.zig	!deliberately NOT applied	the QSA indexer never skips the YaRN mscale
 src/engines/mlx/methods/yarn.zig	constTableAs(self.yarn_mscale.?,	the YaRN mscale table reaches a multiply only through constTableAs
-src/engines/mlx/forward/*.zig	applyVisionEmbeddingsWith	every generative forward arm splices vision rows
 src/plugins/glm5_next/table_forward.zig	spliceVisionRows(	the GLM-5.3 table forward splices vision rows on prompt chunks
 src/plugins/qwen4_exp/forward.zig	applyVisionEmbeddingsWith	every generative forward arm splices vision rows
 src/sdk/bases/run.zig	spliceVisionRows(	the plugin bases splice vision rows on prompt chunks

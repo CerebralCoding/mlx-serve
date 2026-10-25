@@ -92,7 +92,13 @@ pub const Graph = struct {
             .host = host,
             .version = version,
             .units = units,
-            .exe_mod = shared.engineModule(b, target, optimize, host, "src/main.zig"),
+            .exe_mod = blk: {
+                const m = shared.engineModule(b, target, optimize, host, "src/main.zig");
+                // CI and release pass -Dstrip: debug info is most of the ReleaseFast compile's peak memory, which
+                // otherwise outgrows a GitHub macOS runner's 7 GB. A stripped binary's crash traces lose Zig names.
+                m.strip = b.option(bool, "strip", "Omit debug info and Zig symbols from the mlx-serve executable");
+                break :blk m;
+            },
             .test_mod = shared.engineModule(b, target, optimize, host, "src/tests.zig"),
         };
     }

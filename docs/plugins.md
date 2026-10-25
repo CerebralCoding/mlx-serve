@@ -115,48 +115,26 @@ mlx-stream reads the same format with its own decoder and kernels, pinned to Dee
 (`src/sdk/quant/exl3/stream/`). The two do not share kernels: each serves a different arch, and its kernels are tuned
 to it. mlx-stream's GLM-5.3 reaches sushi's decode through the format (`mlx_host.exl3`).
 
-## Example: mlx-stream (arch seam)
+## Example: streamed experts (weight seam)
 
-[mlx-stream](https://github.com/davidtai/mlx-stream) (absorbed from our fork `ddalcu/mlx-stream`, module `mlx_stream`) serves
-DeepSeek-V4.1's EXL3 streaming repack (`experts.bin` beside the trunk) and, as its second arch, MiMo-V2.6-Flash's
-prepared MXFP4 pack (the release's experts in `experts.bin`, its config declaring `expert_streaming`) and, as its third,
-GLM-5.3 (`glm_moe_dsa`, the trunk beside an `experts.bin` bank). It owns the model: the arch, its Metal
-kernels, its EXL3, the SSD expert streamer (lookahead reads, event gates), DSpark with typical acceptance, the prefix
-resume of one conversation, its weight loading past the page cache and its memory bill. Its archs live in
-`src/plugins/<model>/stream/`, its EXL3 lanes in `src/sdk/quant/exl3/stream/`, its streamer and shims in
-`src/sdk/weights/streamed/`, its roots in `src/mlx_stream*.zig`. Its `sdk` module (`src/sdk/weights/streamed/sdk/`)
-holds the arch contract's types. MLX-format V4.1 packs stay in-tree (`src/plugins/deepseek_v41/deepseek_v41.zig`).
+A streaming pack keeps its routed experts in `experts.bin` and reads them from the SSD into per-layer slot rows; the
+plugin's own trunk runs everything else. Its config declares `expert_streaming`; `parseConfig` sets
+`ModelConfig.expert_bank`, the plugin opens the bank at load and binds it behind `Moe.Weights.streamed`
+(`sdk/weights/streamed.zig`: a `Routed` with the bank's math, `settle`, `phase` and read-ahead), and its caps say
+`streamed_weights`. Three plugins serve one each:
 
-- **Dispatch.** `parseConfig` marks a `deepseek_v41` directory with `experts.bin` (`ModelConfig.dsv41_stream`), a
-  `mimo_v2` config that declares `expert_streaming` (`ModelConfig.mimo_stream`) and a `glm_moe_dsa` directory with
-  `experts.bin` (`ModelConfig.glm_stream`; without the bank it is refused by name, `GlmMoeDsaNeedsExpertBank`: no
-  in-tree arch serves it); `ModelConfig.mlxStream()` is any of them, and `loadModelWeights` loads nothing for it. The
-  glue holds one arch per model (`plugin.arch` for V4.1, `plugin.mimo.arch` for MiMo, `plugin.glm.arch` for GLM-5.3)
-  and leaves out at comptime the entry points an arch does not declare.
-- **Glue** (`src/engines/mlx/modules/stream_glue.zig`):
-  - settings (GLM-5.3): after the parse, the arch's `applySettings` receives the model's `model-settings.json` entry
-    (`.null` without one), then the manual context (`ctx_size`, else `--ctx-size`), which wins;
-  - `loadBytes`: the preflight's bill, from the GPU ceiling, the wired margin and the memory in use before the load
-    (sampled first, as the plugin's admission fills rows on top of it);
-  - `open` / `close`: the plugin loads its weights and builds the module;
-  - `begin`: a request's start, what the module's kept state resumes (never the whole prompt) and the shape its
-    prompt pass bills; a prompt past the billed context is `PrefillDoesNotFit` (a 400);
-  - `forward`: the prompt pass, then the decode handover once and the steps;
-  - `arm` / `round`: the DSpark lane, on requests with nothing shaping the logits. `arm` takes the request's
-    `SamplingParams` (temperature, top_p, top_k, min_p, a seed even when the request sent none) and every `round`
-    passes them: greedy requests at the lane's typical acceptance, sampled ones by the plugin's exact speculative
-    sampling;
-  - `end`: the request's end on the inference thread, before its terminator (the arch's `requestEnd`, GLM-5.3's);
-  - `contextLength`: the billed prompts plus the generation past them, which the host advertises (GLM-5.3: its
-    arch's `maxOutput` with the model's settings, as the pack's last parse read it).
-- **Host arms.** `Transformer.mlx_stream_ext` (init, forward, deinit; the generator hands it the whole prompt in one
-  forward, `prefillsWholePrompt`; no host warm-up), the scheduler's bill and `begin`, the generator's lane, the
-  server's context and prompt bill. GLM-5.3's module closes on the inference thread at shutdown (it synchronizes its
-  stream as it frees), and the hot prefix cache stays off for it.
-- **Build.** In-tree: two modules (`sdk`, `mlx_stream`), its C sources against the staged MLX, its suite in
-  `zig build test` (`zig build mlx-stream-test`), its conformance suite (a CPU-lane binary of its
-  own, which checks the plugin against the linked MLX) as `zig build mlx-stream-conformance`. macOS only; the
-  Linux and iOS graphs build `src/engines/mlx/modules/stream_stub.zig`, which refuses these packs by name.
+- `deepseek_v41`: V4.1's EXL3 repack, through the SDK streamer (`sdk/weights/streamed/expert/`).
+- `mimo_v2`: MiMo-V2.6-Flash's MXFP4 pack (`docs/mlx-stream/mimo-pack.md`), through MiMo's streamer
+  (`sdk/weights/streamed/mimo/`).
+- `glm5_next`: GLM-5.3-Flash's EXL3 K=3 mul1 pack, MiMo's streamer over the GLM-shape EXL3 texts
+  (`sdk/weights/streamed/glm5n/`, `glm5n_source.zig`); its `mtp.0` head's NVFP4 experts load resident.
+
+The slot rows a layer keeps come from free memory at load (the plugin's bill), and the load bills the residents plus
+those rows. GLM-5.3 (`glm_moe_dsa`, `plugins/glm_moe_dsa/`) is the one arch still behind the engine's arch seam
+(`engines/mlx/modules/stream_glue.zig`: `open`, `begin`, `forward`, `arm`/`round` for DSpark, `end`,
+`contextLength`), reached once per prompt or step. All of it builds as the `mlx_stream` module (macOS only; the
+Linux and iOS graphs build `stream_stub.zig`, which refuses these packs by name); tests: `zig build mlx-stream-test`,
+`zig build mlx-stream-conformance`.
 
 ## Rules for plugin code
 
