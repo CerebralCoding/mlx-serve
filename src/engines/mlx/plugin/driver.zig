@@ -35,6 +35,8 @@ const settle = @import("settle.zig");
 const rht = @import("../../../sdk/quant/hadamard/rht.zig");
 const hadamard = @import("../../../sdk/quant/hadamard/format.zig");
 const intree = @import("intree.zig");
+const group = @import("../ssm/group.zig");
+const entry_mod = @import("../ssm/entry.zig");
 
 const Transformer = transformer_mod.Transformer;
 const ModelConfig = model.ModelConfig;
@@ -564,6 +566,11 @@ pub fn forwardBatched(xfm: *Transformer, b: *Bound, next_tokens: []const u32, ct
         positions[i] = ropePosition(c, rope_offsets[i], false);
         slot_ids[i] = settle.slotId(b, c);
     }
+    const mg = try bindMerged(xfm, ctxs);
+    defer if (mg) |m| m.deinit(xfm);
+    if (mg) |m| for (slots[0..n]) |*sl| {
+        sl.merged = m.merged;
+    };
     const f: abi.Forward = .{
         .mode = .batched_rows,
         .want_hidden = hidden_rows != null,
@@ -583,6 +590,7 @@ pub fn forwardBatched(xfm: *Transformer, b: *Bound, next_tokens: []const u32, ct
         log.err("[plugin] {s}: batched forward failed: {s}\n", .{ b.table.name.slice(), v.why.slice() });
         return error.PluginForwardFailed;
     }
+    if (mg) |m| try m.finish(xfm, ctxs, false);
     settleTick(xfm, ctxs, f.defer_host, out.owed) catch |e| {
         freeOut(&out, &.{});
         return e;
@@ -618,6 +626,11 @@ pub fn forwardBatchedVerify(xfm: *Transformer, b: *Bound, token_arr: Array, ctxs
         positions[i] = ropePosition(c, rope_offsets[i], false);
         slot_ids[i] = settle.slotId(b, c);
     }
+    const mg = try bindMerged(xfm, ctxs);
+    defer if (mg) |m| m.deinit(xfm);
+    if (mg) |m| for (slots[0..n]) |*sl| {
+        sl.merged = m.merged;
+    };
     const f: abi.Forward = .{
         .mode = .batched_rows,
         .logits = .all_rows,
@@ -639,6 +652,7 @@ pub fn forwardBatchedVerify(xfm: *Transformer, b: *Bound, token_arr: Array, ctxs
         log.err("[plugin] {s}: batched verify failed: {s}\n", .{ b.table.name.slice(), v.why.slice() });
         return error.PluginForwardFailed;
     }
+    if (mg) |m| try m.finish(xfm, ctxs, true);
     settleTick(xfm, ctxs, f.defer_host, out.owed) catch |e| {
         freeOut(&out, &.{});
         return e;
@@ -654,6 +668,60 @@ pub fn forwardBatchedVerify(xfm: *Transformer, b: *Bound, token_arr: Array, ctxs
     var shaped = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_reshape(&shaped, logits, &[_]c_int{ nc, width, -1 }, 3, xfm.s));
     return shaped;
+}
+
+/// A batched tick on a GDN-cadence trunk keeps its slots' recurrent state merged across ticks (`PersistentSsmGroup`,
+/// as the legacy batched rows did): concatenating and splitting every layer's state each tick cost Qwen3.5-0.8B a
+/// quarter of its 4-way throughput. qwen4_exp keeps its own group; one slot reads its own entries.
+const Merged = struct {
+    merged: []SSMCacheEntry,
+    kinds: []group.SsmMergeKind,
+    owned: bool,
+    stable: bool,
+    persist: bool,
+
+    /// After the tick: a verify's captures go to each slot (its rollback reads them), then the group's rows are bound
+    /// to the slots, or (not persisting) split back.
+    fn finish(m: Merged, xfm: *Transformer, ctxs: []const *ForwardCtx, captured: bool) !void {
+        if (!m.persist) return group.ssmSplitAll(xfm.s, m.merged, ctxs, m.kinds);
+        if (captured) for (m.merged, 0..) |*e, li| {
+            if (!m.kinds[li].linear) continue;
+            for (ctxs, 0..) |c, i| try entry_mod.splitSpecCaptures(xfm.s, e, &c.ssm_entries.?[li], i);
+        };
+        if (!m.stable) group.ssmBindSlotRefs(&xfm.ssm_group, ctxs);
+    }
+
+    fn deinit(m: Merged, xfm: *Transformer) void {
+        for (m.merged) |*e| entry_mod.ssmFreeSpecCapture(e);
+        if (m.owned) {
+            for (m.merged) |*e| group.ssmFreeMergedLayer(e);
+            xfm.allocator.free(m.merged);
+        }
+        xfm.allocator.free(m.kinds);
+    }
+};
+
+fn bindMerged(xfm: *Transformer, ctxs: []const *ForwardCtx) !?Merged {
+    const cfg = &xfm.config;
+    const merges = if (xfm.config.plugin) |pb| pb.parsed.caps.merged_state else false;
+    if (!merges or cfg.full_attention_interval == 0) return null;
+    // One slot reads its own entries: a row the group still holds goes back first.
+    if (ctxs.len < 2) {
+        for (ctxs) |c| try xfm.ssmGroupRelease(c);
+        return null;
+    }
+    for (ctxs) |c| {
+        const e = c.ssm_entries orelse return null;
+        if (e.len != cfg.num_hidden_layers) return null;
+    }
+    const persist = xfm.persistent_group_state_override orelse true;
+    xfm.ssm_group.allocator = xfm.allocator;
+    const stable = persist and xfm.ssm_group.live and xfm.ssm_group.matches(ctxs);
+    const kinds = try xfm.allocator.alloc(group.SsmMergeKind, cfg.num_hidden_layers);
+    errdefer xfm.allocator.free(kinds);
+    for (kinds, 0..) |*k, l| k.* = .{ .linear = cfg.isLinearLayer(@intCast(l)) };
+    const bound = try group.ssmBindTickState(xfm.allocator, xfm.s, &xfm.ssm_group, ctxs, kinds, persist);
+    return .{ .merged = bound.merged, .kinds = kinds, .owned = bound.owned, .stable = stable, .persist = persist };
 }
 
 /// A batched tick settles what its slots were left owed before it returns, in one call (the legacy tick's one sync).

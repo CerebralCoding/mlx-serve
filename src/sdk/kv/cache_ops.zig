@@ -32,6 +32,9 @@ pub fn For(comptime E: type) type {
             batched_append: bool = true,
             /// The request's `ForwardCtx.kv_attn_fused`, handed to attention on every view.
             packed_reads: bool = false,
+            /// Set on every slot of a batched tick whose engine keeps the batch's recurrent state merged across ticks
+            /// (one entry per layer, rows in slot order): `state_rows` / `set_state_rows` read and write it whole.
+            merged: []E = &.{},
 
             pub fn handle(self: *Slot) abi.Handle {
                 return @ptrCast(self);
@@ -47,8 +50,8 @@ pub fn For(comptime E: type) type {
             .append_rows = appendRows,
             .state = state,
             .set_state = setState,
-            .state_rows = Rows.stateRows,
-            .set_state_rows = Rows.setStateRows,
+            .state_rows = stateRows,
+            .set_state_rows = setStateRows,
             .sdk_slots = true,
         };
 
@@ -130,28 +133,8 @@ pub fn For(comptime E: type) type {
             return .ok;
         }
 
-        fn state(h: abi.Handle, layer: u32, which: abi.StateSlot) callconv(.c) abi.Array {
-            const sl = slotOf(h);
-            if (layer >= sl.ssm.len) return .{};
-            const e = &sl.ssm[layer];
-            if (!e.initialized) return .{};
-            return ab(switch (which) {
-                .conv => e.conv_state,
-                .ssm => e.ssm_state,
-                .conv_input => e.spec_conv_input,
-                .state_seq => e.spec_state_seq,
-                .state_in => e.spec_state_in,
-                .prework_k => e.spec_prework.k,
-                .prework_v => e.spec_prework.v,
-                .prework_gb => e.spec_prework.gb,
-            });
-        }
-
-        fn setState(h: abi.Handle, layer: u32, which: abi.StateSlot, value: abi.Array) callconv(.c) abi.Verdict {
-            const sl = slotOf(h);
-            if (layer >= sl.ssm.len) return abi.Verdict.refuse(.unsupported, "layer has no recurrent state");
-            const e = &sl.ssm[layer];
-            const dst = switch (which) {
+        fn field(e: *E, which: abi.StateSlot) *mlx.mlx_array {
+            return switch (which) {
                 .conv => &e.conv_state,
                 .ssm => &e.ssm_state,
                 .conv_input => &e.spec_conv_input,
@@ -161,6 +144,18 @@ pub fn For(comptime E: type) type {
                 .prework_v => &e.spec_prework.v,
                 .prework_gb => &e.spec_prework.gb,
             };
+        }
+
+        fn state(h: abi.Handle, layer: u32, which: abi.StateSlot) callconv(.c) abi.Array {
+            const sl = slotOf(h);
+            if (layer >= sl.ssm.len) return .{};
+            const e = &sl.ssm[layer];
+            if (!e.initialized) return .{};
+            return ab(field(e, which).*);
+        }
+
+        fn put(e: *E, which: abi.StateSlot, value: abi.Array) void {
+            const dst = field(e, which);
             var r: mlx.mlx_array = .{ .ctx = null };
             if (value.ctx != null) {
                 r = mlx.mlx_array_new();
@@ -169,6 +164,31 @@ pub fn For(comptime E: type) type {
             if (dst.ctx != null) _ = mlx.mlx_array_free(dst.*);
             dst.* = r;
             if (which == .conv or which == .ssm) e.initialized = true;
+        }
+
+        fn setState(h: abi.Handle, layer: u32, which: abi.StateSlot, value: abi.Array) callconv(.c) abi.Verdict {
+            const sl = slotOf(h);
+            if (layer >= sl.ssm.len) return abi.Verdict.refuse(.unsupported, "layer has no recurrent state");
+            put(&sl.ssm[layer], which, value);
+            return .ok;
+        }
+
+        /// The merged entry's array whole (a new reference) when the batch is merged, else the rows concatenated.
+        fn stateRows(caches: [*]const abi.Handle, n: u32, layer: u32, which: abi.StateSlot, s: abi.Stream) callconv(.c) abi.Array {
+            const sl = slotOf(caches[0]);
+            if (layer >= sl.merged.len) return Rows.stateRows(caches, n, layer, which, s);
+            const e = &sl.merged[layer];
+            const a = field(e, which).*;
+            if (!e.initialized or a.ctx == null) return .{};
+            var r = mlx.mlx_array_new();
+            _ = mlx.mlx_array_set(&r, a);
+            return .{ .ctx = r.ctx };
+        }
+
+        fn setStateRows(caches: [*]const abi.Handle, n: u32, layer: u32, which: abi.StateSlot, value: abi.Array, s: abi.Stream) callconv(.c) abi.Verdict {
+            const sl = slotOf(caches[0]);
+            if (layer >= sl.merged.len) return Rows.setStateRows(caches, n, layer, which, value, s);
+            put(&sl.merged[layer], which, value);
             return .ok;
         }
     };

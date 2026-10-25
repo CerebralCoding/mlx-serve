@@ -124,7 +124,10 @@ pub const Caps = packed struct(u64) {
     dflash_policy: bool = false,
     /// A rejected draft rolls back by truncating the KV cache (an attention trunk): no snapshot, no re-forward.
     verify_truncates: bool = false,
-    _: u36 = 0,
+    /// A batch's recurrent state is read and written only through `CacheOps.state_rows` / `set_state_rows`, so the
+    /// engine may keep it merged across batched ticks instead of re-stacking every layer each tick.
+    merged_state: bool = false,
+    _: u35 = 0,
 };
 
 pub const ThinkingDefault = enum(u8) { unset, off, on, on_with_tools };
