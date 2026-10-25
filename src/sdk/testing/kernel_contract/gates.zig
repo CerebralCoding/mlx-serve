@@ -327,7 +327,8 @@ pub const Tally = struct {
 /// Gates 1-4 on each kernel, and each control at its own gate (which must fail).
 pub fn runAll(a: std.mem.Allocator, kernels: []const Kernel, seed: u64, t: *Tally) !void {
     // NaN classes are pinned on the NAX GPUs the contract was calibrated on: an older GPU's math library drops a NaN
-    // in more places (metal::max), so gate 1 and its controls are not run there, nor any tensor-unit kernel.
+    // in more places (metal::max), so there gate 1 is reported, not counted, and its controls and the tensor-unit
+    // kernels are not run.
     const nax_here = device.naxAvailable();
     for (kernels) |k| {
         if (!nax_here and (k.spec.nax or k.control == .nonfinite)) {
@@ -360,12 +361,16 @@ pub fn runAll(a: std.mem.Allocator, kernels: []const Kernel, seed: u64, t: *Tall
         }
         var bad = false;
         const skip = for ([_]Gate{ .nonfinite, .repeat, .shapes, .sums }) |g| {
-            if (g == .nonfinite and !nax_here) continue;
             const v = one(a, g, k, s) catch |err| blk: {
                 if (err == error.NaxOnly) break true;
                 if (!quiet) std.debug.print("FAIL {t} {s}: {t}\n", .{ g, k.spec.name, err });
                 break :blk .fail;
             };
+            if (g == .nonfinite and !nax_here) {
+                // `say` printed the verdict; a NaN class this GPU family differs in is a finding, not a failure.
+                if (v == .fail and !quiet) std.debug.print("OFF-NAX nonfinite {s}: differs from the NAX GPUs' classes\n", .{k.spec.name});
+                continue;
+            }
             const known = if (k.spec.known) |kn| kn.gate == g else false;
             if (known and v == .fail) {
                 t.known += 1;
