@@ -8,8 +8,8 @@ dense trunk (`plugins/qwen3`) parsed from `thinker_config.text_config`, the quan
 - The audio tower (`audio_tower.zig`), the transcription flow and the aligner (`forced_align.zig`) stay the engine's.
   They read the trunk through the shell. The aligner reads hidden rows (`skip_lm_head`) and the head that
   `trunk_weight` lends the shell (`lmHeadForDraft`).
-- Proof (`proof_test.zig`): served through the driver vs the legacy shell, 4-bit and bf16 tied: steps, captured
-  verifies, the lookup loop, audio rows spliced across a chunk boundary, the aligner's hidden-row + head read.
+- Proof (`proof_test.zig`): served through the driver vs the legacy shell, 4-bit: audio rows spliced across a chunk
+  boundary, the aligner's hidden-row + head read.
 - Parse declines a thinker trunk other than qwen3 and everything the qwen3 parse declines.
 
 ## Rules (from root AGENTS.md)

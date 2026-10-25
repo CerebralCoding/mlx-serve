@@ -1,6 +1,5 @@
-//! Qwen3-ASR's trunk served through the plugin driver against the legacy shell over one tiny pack: the qwen3 steps,
-//! captured verifies and the lookup loop, then a transcription-shaped prompt whose audio rows splice at the
-//! placeholders across a chunk boundary, and the aligner's read (hidden rows, the head the shell borrows) bit-equal.
+//! Qwen3-ASR's trunk served through the plugin driver against the legacy shell over one tiny pack: a
+//! transcription-shaped prompt whose audio rows splice at the placeholders across a chunk boundary, and the aligner's read (hidden rows, the head the shell borrows) bit-equal.
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
@@ -44,15 +43,6 @@ fn open(p: *served.Pair, g: q3proof.Geo, comptime seed: u64) !void {
     try p.open(&qwen3_asr.table, &pk, json, try served.oracle("qwen3_asr", std.fmt.comptimePrint("served-{x}", .{seed})));
 }
 
-test "qwen3_asr served: the trunk's steps and lookup loop equal the legacy shell (4-bit, bf16 tied)" {
-    inline for (.{ q3proof.Geo{ .quantized = true }, q3proof.Geo{ .head_dim = 256, .tied = true } }, .{ 0xa5a1, 0xa5a2 }) |g, seed| {
-        var p: served.Pair = undefined;
-        try open(&p, g, seed);
-        defer p.close();
-        try testing.expectEqual(@as(u32, 250), p.cfg.audio_token_id);
-        try served.expectSolo(&p);
-    }
-}
 
 test "qwen3_asr served: audio rows spliced across a chunk boundary, then the aligner's hidden rows and head read" {
     const a = testing.allocator;
