@@ -122,7 +122,7 @@ test "msv_qmv_rows is mlx_equal per row to stock M=1 qmv at every head shape, wi
 
 test "row kernel declines a CPU stream" {
     const s = mlx.gpuStream();
-    var fx = try @import("../../spec/mtp/mtp.zig").RerankFixture.init(s, 512, 2560, 4, 64, 11);
+    var fx = try @import("../../../engines/mlx/spec/mtp_test.zig").RerankFixture.init(s, 512, 2560, 4, 64, 11);
     defer fx.deinit();
     var prng = std.Random.DefaultPrng.init(12);
     const x = try attn256RandBf16(prng.random(), &.{ 2, 2560 }, s);
@@ -138,7 +138,7 @@ test "row kernel declines a CPU stream" {
 
 test "row kernel declines scales and biases with another dtype" {
     const s = mlx.gpuStream();
-    var fx = try @import("../../spec/mtp/mtp.zig").RerankFixture.init(s, 512, 2560, 4, 64, 11);
+    var fx = try @import("../../../engines/mlx/spec/mtp_test.zig").RerankFixture.init(s, 512, 2560, 4, 64, 11);
     defer fx.deinit();
     var prng = std.Random.DefaultPrng.init(12);
     const x = try attn256RandBf16(prng.random(), &.{ 2, 2560 }, s);
@@ -160,7 +160,7 @@ test "row kernel declines scales and biases with another dtype" {
 
 test "row kernel cache reuses alternating full-shape configurations" {
     const s = mlx.gpuStream();
-    var fx = try @import("../../spec/mtp/mtp.zig").RerankFixture.init(s, 512, 2560, 8, 64, 11);
+    var fx = try @import("../../../engines/mlx/spec/mtp_test.zig").RerankFixture.init(s, 512, 2560, 8, 64, 11);
     defer fx.deinit();
     var prng = std.Random.DefaultPrng.init(12);
     const before = qmv_rows.msv_qmv_rows_cfgs.builds;

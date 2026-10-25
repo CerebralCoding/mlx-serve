@@ -85,10 +85,7 @@ pub const SSMCacheEntry = struct {
     member_gen: u64 = 0,
 };
 
-pub fn arrayBytes(arr: mlx.mlx_array) u64 {
-    if (arr.ctx == null) return 0;
-    return @as(u64, mlx.mlx_array_size(arr)) * @as(u64, mlx.mlx_array_itemsize(arr));
-}
+pub const arrayBytes = @import("../../../sdk/kv/cache.zig").arrayBytes;
 
 pub fn qsaRawKeyBytes(e: *const SSMCacheEntry) u64 {
     return arrayBytes(if (e.qsa_key_buf.ctx != null) e.qsa_key_buf else e.aux_state);

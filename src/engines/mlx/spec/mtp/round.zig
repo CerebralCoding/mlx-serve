@@ -844,7 +844,7 @@ test "qwen4: the coarse rerank head is READY before any draft has run" {
     if (mlx.noGpuBackend()) return;
     const s = mlx.gpuStream();
 
-    var fx = try mtp_mod.RerankFixture.init(s, mtp_mod.TOP32_MIN_ROWS + 96, 256, 8, 64, 0xC0DE);
+    var fx = try @import("../mtp_test.zig").RerankFixture.init(s, mtp_mod.TOP32_MIN_ROWS + 96, 256, 8, 64, 0xC0DE);
     defer fx.deinit();
     var t: Qwen4Trunk = undefined;
     t.config = fx.xfm.config;
