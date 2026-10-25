@@ -1,5 +1,5 @@
-//! The streaming packs' glue as a compile unit (`src/stream_unit.zig`): `stream_glue.zig` behind the table the engine
-//! calls (`stream_table.zig`), exported as `mlx_serve_stream_api`.
+//! The streaming packs' glue in the module archs' unit (`src/modules_unit.zig`): `stream_glue.zig` behind the table the
+//! engine calls (`stream_table.zig`), exported as `mlx_serve_stream_api`.
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");

@@ -10,6 +10,7 @@ const muse_vision = @import("../../plugins/muse_glimmer/vision.zig");
 const lfm2_vision = @import("../../plugins/lfm2/vision.zig");
 const glm_vision = @import("../../plugins/glm5_next/vision.zig");
 const dsv41_vision = @import("../../plugins/deepseek_v41/vision.zig");
+const modules = @import("modules/call.zig");
 const minicpm_vision = @import("../../plugins/qwen3_5/minicpm_vision.zig");
 const qwen_audio = @import("../../plugins/qwen3_asr/audio_tower.zig");
 const radio_vision = @import("../../plugins/nemotron_h/radio_vision.zig");
@@ -33,6 +34,11 @@ const LinearWeight = struct {
 };
 
 // ── Vision Layer Weights ──
+
+/// DeepSeek-V4.1's tower (`modules.call`, the module archs' unit under `-Dunits`).
+pub fn initDsv41Tower(allocator: std.mem.Allocator, config: *const ModelConfig, weights: *const Weights) !dsv41_vision.Dsv41Vision {
+    return dsv41_vision.Dsv41Vision.init(allocator, config.*, weights);
+}
 
 const VisionLayerWeights = struct {
     input_layernorm: mlx.mlx_array,
@@ -224,7 +230,7 @@ pub const VisionEncoder = struct {
         if (config.minicpm_vision) return initMiniCpm(allocator, config, weights);
         if (config.dsv41_vision) {
             var enc = patchGridShell(allocator, config);
-            enc.dsv41 = dsv41_vision.Dsv41Vision.init(allocator, config, weights) catch |e| {
+            enc.dsv41 = modules.call("dsv41_vision_init", .{ allocator, &config, weights }) catch |e| {
                 enc.deinit();
                 return e;
             };
@@ -365,7 +371,7 @@ pub const VisionEncoder = struct {
         if (self.lfm2) |*l| l.deinit();
         if (self.glm) |*g| g.deinit();
         if (self.minicpm) |*m| m.deinit();
-        if (self.dsv41) |*d| d.deinit();
+        if (self.dsv41) |*d| modules.call("dsv41_vision_deinit", .{d});
         if (self.qwen_audio) |*q| q.deinit();
         if (self.radio) |*r| r.deinit();
         self.allocator.free(self.layers);
@@ -537,7 +543,7 @@ pub const VisionEncoder = struct {
         if (self.lfm2) |*lv| return lv.forward(patches, grid_h, grid_w);
         if (self.glm) |*gv| return gv.forward(patches, grid_h, grid_w);
         if (self.minicpm) |*mv| return mv.forward(patches, grid_h, grid_w);
-        if (self.dsv41) |*dv| return dv.forward(patches, grid_h, grid_w);
+        if (self.dsv41) |*dv| return modules.call("dsv41_vision_forward", .{ dv, patches, grid_h, grid_w });
         return error.NoPatchGridEncoder;
     }
 

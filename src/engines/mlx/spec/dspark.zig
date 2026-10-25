@@ -16,6 +16,7 @@ const testing = std.testing;
 const Constraint = @import("../grammar/constraint.zig").Constraint;
 const DrafterStepResult = @import("drafter.zig").DrafterStepResult;
 const Generator = @import("../generate/generator.zig").Generator;
+const modules = @import("../modules/call.zig");
 const SamplingParams = @import("../sampling/params.zig").SamplingParams;
 const capAcceptedForTokenBudget = @import("verify.zig").capAcceptedForTokenBudget;
 const dsparkCopyLen = @import("verify.zig").dsparkCopyLen;
@@ -100,6 +101,11 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
         const r = try mlx_stream.round(m, allocator, self.next_token_id, cap);
         return self.commitDsparkRound(allocator, .{ .tokens = r.tokens, .accepted = r.accepted, .next_token = r.next_token }, mlx_stream.position(m));
     }
+    return modules.call("dspark_round", .{ self, allocator });
+}
+
+/// One DSpark round on the DeepSeek-V4/V4.1 module itself (`modules.call`).
+pub fn moduleRound(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
     if (intree.dsv41(self.xfm)) |mdl| {
         if (try self.dsparkCopyStep(allocator, mdl)) |res| return res;
         return self.dsparkPolicyStep(allocator, mdl);

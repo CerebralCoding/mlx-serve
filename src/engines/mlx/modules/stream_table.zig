@@ -1,6 +1,6 @@
-//! The streaming packs' glue (`stream_glue.zig`) seen from the engine under `-Dunits`, where it is a compile unit of its
-//! own (`src/stream_unit.zig`, exporting `mlx_serve_stream_api`): the stub's surface, called through one table. Errors
-//! cross by name (`sdk/util/err_name.zig`).
+//! The streaming packs' glue (`stream_glue.zig`) seen from the engine under `-Dunits`, where it compiles in the module
+//! archs' unit (`src/modules_unit.zig`, exporting `mlx_serve_stream_api`): the stub's surface, called through one
+//! table. Errors cross by name (`sdk/util/err_name.zig`).
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");

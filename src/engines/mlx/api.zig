@@ -70,7 +70,7 @@ comptime {
 }
 
 fn clusterWorker(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) ?[]const u8 {
-    distributed.cmdWorker(io, gpa, args) catch |e| return @errorName(e);
+    @import("modules/call.zig").call("cluster_worker", .{ io, gpa, args }) catch |e| return @errorName(e);
     return null;
 }
 

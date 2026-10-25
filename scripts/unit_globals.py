@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """The units' duplicated state (-Dunits). Every unit object compiles its own copy of the globals its code reaches.
-The host and the MLX engine each own their state; a plugin unit owns none, and a global both of them hold must be
-`Shared` (src/sdk/util/shared.zig). This lists the internal data symbols of each object, threadlocals included (a
-Debug build keeps their names) and fails on one in a plugin unit or in both owners that scripts/unit_globals_ok.txt
+The host, the MLX engine and the module archs' unit each own their state; a plugin unit owns none, and a global two
+of them hold must be `Shared` (src/sdk/util/shared.zig). This lists the internal data symbols of each object, threadlocals included (a
+Debug build keeps their names) and fails on one in a plugin unit or in two owners that scripts/unit_globals_ok.txt
 does not allow, by pattern (`~regex`) or by name.
 
   python3 scripts/unit_globals.py <unit .o file or dir>...      (zig build units-check -Dunits=true runs this)
@@ -29,7 +29,7 @@ def duplicated(nm_out, pats, names):
             if sym in names or any(p.search(sym) for p in pats): continue
         yield sym
 
-OWNERS = ('host', 'engine-mlx')
+OWNERS = ('host', 'engine-mlx', 'engine-modules')
 
 def main(argv):
     objs = []

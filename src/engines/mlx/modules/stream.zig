@@ -1,10 +1,10 @@
-//! The streaming packs' glue as the engine sees it: mlx-stream compiled in (`stream_glue.zig`), its own compile unit
-//! under `-Dunits` (`stream_table.zig`), or absent (`stream_stub.zig`, Linux and iOS).
+//! The streaming packs' glue as the engine sees it: mlx-stream compiled in (`stream_glue.zig`), in the module archs'
+//! compile unit under `-Dunits` (`stream_table.zig`), or absent (`stream_stub.zig`, Linux and iOS).
 
 const build_options = @import("build_options");
 const impl = if (!build_options.mlx_stream)
     @import("stream_stub.zig")
-else if (build_options.units and !@import("builtin").is_test and @hasDecl(@import("root"), "mlx_serve_unit"))
+else if (@import("split.zig").active)
     @import("stream_table.zig")
 else
     @import("stream_glue.zig");

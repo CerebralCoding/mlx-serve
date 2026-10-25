@@ -99,3 +99,7 @@ sdk.blocks.qmm.rowqmv.cfg_cache
 ~^engines\.ane\.(dflash\.debug_(alloc|outs)|lm\.build_mu)$
 # a cached sysctl read
 host.registry.memory_ceiling.wired_limit_bytes_cached
+# kernel caches named apart from the patterns above (each unit builds its own once)
+sdk.spec.mtp.mtp.top32_final_cached
+sdk.spec.mtp.mtp.top32_partial_cached
+sdk.blocks.linear.verify_projection.verify_wide_configs

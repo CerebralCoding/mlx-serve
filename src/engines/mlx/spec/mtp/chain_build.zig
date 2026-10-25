@@ -1,5 +1,6 @@
 //! Building and dispatching MTP draft chains (solo, batched, lanes).
 const std = @import("std");
+const modules = @import("../../modules/call.zig");
 const Qwen4MtpBatchRow = @import("../../../../plugins/qwen4_exp/mtp.zig").Qwen4MtpBatchRow;
 const mlx = @import("../../../../mlx/ffi.zig");
 const transformer_mod = @import("../../transformer.zig");
@@ -508,7 +509,7 @@ pub fn mtpChainBuildBatchedActive(gens: []const *Generator, chains: []MtpPreDraf
                 .pos_offset = mtpBatchHeadPosition(st.pos_base, st.seq_offset),
             };
         }
-        const outs = try xfm.qwen4MtpForwardBatched(rows[0..n], project, to);
+        const outs = try modules.call("qwen4_mtp_forward_batched", .{ xfm, rows[0..n], project, to });
         defer {
             for (outs) |out| {
                 if (out.logits.ctx != null) _ = mlx.mlx_array_free(out.logits);
@@ -532,7 +533,7 @@ pub fn mtpChainBuildBatchedActive(gens: []const *Generator, chains: []MtpPreDraf
             if (any_sampled) {
                 try mtpGroupSampledDrafts(gens, chains, stacked_x, i);
             } else {
-                const ids = try xfm.qwen4DraftSelectBatched(stacked_x, gens[0].sampling.suppress_mask);
+                const ids = try modules.call("qwen4_draft_select_batched", .{ xfm, stacked_x, gens[0].sampling.suppress_mask });
                 defer _ = mlx.mlx_array_free(ids);
                 for (chains, 0..) |*c, k| {
                     const k_c: c_int = @intCast(k);

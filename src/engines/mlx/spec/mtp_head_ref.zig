@@ -1,5 +1,6 @@
 //! References to the MTP head and its cache across the sidecar, in-checkpoint and module-owned heads.
 const std = @import("std");
+const modules = @import("../modules/call.zig");
 const Qwen4Mtp = @import("../../../plugins/qwen4_exp/mtp.zig");
 const Qwen4Trunk = @import("../../../plugins/qwen4_exp/trunk.zig").Trunk;
 const env = @import("../../../env.zig");
@@ -74,7 +75,7 @@ pub const MtpHeadRef = union(enum) {
             .mixed => .mixed_last_row,
             .none => .none,
         };
-        const out = try t.qwen4MtpForward(hidden, id_arr, rope_offset + 1, mrope_ctx, project);
+        const out = try modules.call("qwen4_mtp_forward", .{ t, hidden, id_arr, rope_offset + 1, mrope_ctx, project });
         return .{ .logits = out.logits, .hidden_next = out.stream, .rerank_x = out.mixed };
     }
 
@@ -117,7 +118,7 @@ pub const MtpHeadRef = union(enum) {
             .mixed => .mixed_last_row,
             .none => .none,
         };
-        const out = try t.qwen4MtpForwardPlaced(hidden, id_arr, place, project);
+        const out = try modules.call("qwen4_mtp_forward_placed", .{ t, hidden, id_arr, place, project });
         return .{ .logits = out.logits, .hidden_next = out.stream, .rerank_x = out.mixed };
     }
 
@@ -183,7 +184,7 @@ pub const MtpHeadRef = union(enum) {
     ) !mlx.mlx_array {
         return switch (self) {
             .qwen => |h| h.draftSelect(target, x, suppress_mask),
-            .qwen4 => |t| t.qwen4DraftSelect(x, suppress_mask),
+            .qwen4 => |t| modules.call("qwen4_draft_select", .{ t, x, suppress_mask }),
             .plugin => |h| h.draftSelect(target, x, suppress_mask),
         };
     }
@@ -199,7 +200,7 @@ pub const MtpHeadRef = union(enum) {
     ) !?mtp_mod.Shortlist {
         return switch (self) {
             .qwen => |h| h.draftShortlist(target, x, suppress_mask),
-            .qwen4 => |t| t.qwen4DraftShortlist(x, suppress_mask),
+            .qwen4 => |t| modules.call("qwen4_draft_shortlist", .{ t, x, suppress_mask }),
             .plugin => |h| h.draftShortlist(target, x, suppress_mask),
         };
     }
@@ -246,7 +247,7 @@ pub const MtpHeadRef = union(enum) {
     pub fn draftSelectBatched(self: MtpHeadRef, target: *Transformer, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array) !mlx.mlx_array {
         return switch (self) {
             .qwen => |h| h.draftSelectBatched(target, x, suppress_mask),
-            .qwen4 => |t| t.qwen4DraftSelectBatched(x, suppress_mask),
+            .qwen4 => |t| modules.call("qwen4_draft_select_batched", .{ t, x, suppress_mask }),
             .plugin => mtp_mod.fullReadoutArgmax(target.s, target, x, suppress_mask),
         };
     }
@@ -255,7 +256,7 @@ pub const MtpHeadRef = union(enum) {
     pub fn draftShortlistsBatched(self: MtpHeadRef, target: *Transformer, x: mlx.mlx_array, suppress_mask: ?mlx.mlx_array, out: []mtp_mod.Shortlist) !bool {
         return switch (self) {
             .qwen => |h| h.draftShortlistsBatched(target, x, suppress_mask, out),
-            .qwen4 => |t| t.qwen4DraftShortlistsBatched(x, suppress_mask, out),
+            .qwen4 => |t| modules.call("qwen4_draft_shortlists_batched", .{ t, x, suppress_mask, out }),
             .plugin => mtp_mod.exactShortlistsBatched(target.s, target, x, suppress_mask, out),
         };
     }

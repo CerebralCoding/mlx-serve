@@ -1,6 +1,7 @@
 //! MLX model load on the inference thread.
 
 const std = @import("std");
+const modules = @import("modules/call.zig");
 const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const transformer_mod = @import("transformer.zig");
@@ -654,7 +655,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // drafts, so it never pays. One-shot, so the draft path's ask stays a
     // pure read; if this ever does not run, that ask still builds.
     if (mtp_ptr == null and mtp_enabled) if (xfm_ptr.qwen4Trunk()) |t| {
-        _ = t.qwen4BuildDraftRerank();
+        _ = modules.call("qwen4_build_draft_rerank", .{t});
     };
 
     // ANE prefill-MLP offload (`--ane-prefill`, perf-plan-aug-17 P5): built
@@ -713,7 +714,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         log.info("Warmup complete ({d} ms).\n", .{warmup_ns / std.time.ns_per_ms});
         if (mtp_enabled) if (xfm_ptr.qwen4Trunk()) |t| if (t.qwen4_mtp != null) {
             const cap = generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile);
-            t.warmupSpecVerify(cap, params.kv_quant_config) catch |err| {
+            modules.call("qwen4_warmup_spec_verify", .{ t, cap, params.kv_quant_config }) catch |err| {
                 log.warn("[spec-warmup] failed ({s}); the first round at each width pays its kernel compile inside the round.\n", .{@errorName(err)});
             };
         };

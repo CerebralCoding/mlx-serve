@@ -2,6 +2,7 @@
 //! Owns VerifyLaps, VerifyRollback, forwardRowAxisVerify, verifyLaps, takeJoinedVerifyLogits, expectRowsByteEqual, and 9 more.
 
 const std = @import("std");
+const modules = @import("../modules/call.zig");
 const env = @import("../../../env.zig");
 const distributed_mod = @import("../cluster/distributed.zig");
 const mlx = @import("../../../mlx/ffi.zig");
@@ -132,7 +133,7 @@ pub fn forwardRowAxisVerify(
     // settled first.
     if (token_rows.len > 1) if (intree.inner(self)) |t| {
         try self.flushDeferredPleGroup(ctxs);
-        return t.forwardRowAxisVerify(token_rows, ctxs, out_logits, out_last, out_all, row_ns, rollback_out);
+        return modules.call("qwen4_row_axis_verify", .{ t, token_rows, ctxs, out_logits, out_last, out_all, row_ns, rollback_out });
     };
     const outer_group_rows = verify_projection.verify_group_rows;
     verify_projection.verify_group_rows = token_rows.len;
