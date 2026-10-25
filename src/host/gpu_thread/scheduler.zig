@@ -190,7 +190,7 @@ pub const Scheduler = struct {
     queue_cond: std.Io.Condition,
     pending: std.ArrayList(*Slot),
     decoding: std.ArrayList(*Slot),
-    /// Slots an engine beside MLX runs on its own threads (`host/engines/requests.zig`), off the inference thread.
+    /// Slots an engine beside MLX runs on its own threads (`engines/mlx/runtime/offload.zig`), off the inference thread.
     offloaded: std.ArrayList(*Slot) = .empty,
     /// Cold Neural Engine builds running on their own threads (`aneBuildThread`).
     ane_builds: std.atomic.Value(u32) = .init(0),

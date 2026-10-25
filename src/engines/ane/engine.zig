@@ -24,7 +24,7 @@ const io = book_mod.io;
 /// The table the host loads for the Neural Engine.
 pub const table = Adapter(lm, std.heap.smp_allocator).table;
 
-/// What shapes a load, resolved by the host (`host/engines/load.zig`).
+/// What shapes a load, resolved by the host (`engines/mlx/runtime/engine_load.zig`).
 pub const Settings = struct {
     slots: u32 = 1,
     /// The DFlash2 drafter's dir; null decodes one token per call.

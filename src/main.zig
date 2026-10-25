@@ -40,7 +40,7 @@ const model_settings_mod = @import("host/registry/model_settings.zig");
 const engines_served = @import("host/engines/served.zig");
 const engines_prompt = @import("host/engines/prompt.zig");
 const abi_engine = @import("abi/engine.zig");
-const cpu_state_mod = @import("engines/mlx/runtime/cpu_state.zig");
+const cpu_state_mod = @import("host/registry/cpu_state.zig");
 const ds4_load = @import("engines/ds4/load.zig");
 const llama_load = @import("engines/llama/load.zig");
 const llama_policy = @import("engines/llama/policy.zig");
@@ -1997,7 +1997,7 @@ fn parseLlamaInt(raw: []const u8, flag: []const u8, lo: u32, hi: u32) u32 {
 }
 
 /// GGUF serve mode on ds4 or llama.cpp: a stub entry (the engine owns the real tokenizer and template) handed to
-/// `Scheduler.init`, whose startup load opens the engine (`host/engines/load.zig`).
+/// `Scheduler.init`, whose startup load opens the engine (`engines/mlx/runtime/engine_load.zig`).
 fn runGgufServe(
     io: std.Io,
     allocator: std.mem.Allocator,

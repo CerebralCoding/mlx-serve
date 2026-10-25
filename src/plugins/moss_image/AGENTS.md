@@ -40,5 +40,5 @@ layers), FLUX.2's small VAE decoder in f32. Port of the release's `pipeline_moss
 
 ## Known issues
 
-- `moss_image.zig` still imports the engine (`engines/mlx/model.zig`, `transformer.zig`) for weight loading and
+- `moss_image.zig` still imports the engine (`sdk/config/model.zig`, `transformer.zig`) for weight loading and
   the Qwen3.5 encoder forward (lint `media-plugin-imports-engine`) until the qwen3_5 plugin exports its blocks.

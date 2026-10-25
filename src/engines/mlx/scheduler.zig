@@ -131,9 +131,9 @@ const ThreadCtx = @import("runtime/thread.zig").ThreadCtx;
 pub const genYieldEnabled = @import("runtime/media_runner.zig").genYieldEnabled;
 pub const coldLoadDrafterDir = @import("runtime/cold_load.zig").coldLoadDrafterDir;
 pub const coldLoadVision = @import("runtime/cold_load.zig").coldLoadVision;
-const preloadCpuState = @import("runtime/cpu_state.zig").preloadCpuState;
-const freeCpuState = @import("runtime/cpu_state.zig").freeCpuState;
-pub const applyModelSettings = @import("runtime/model_settings_apply.zig").applyModelSettings;
+const preloadCpuState = @import("../../host/registry/cpu_state.zig").preloadCpuState;
+const freeCpuState = @import("../../host/registry/cpu_state.zig").freeCpuState;
+pub const applyModelSettings = @import("../../host/registry/model_settings_apply.zig").applyModelSettings;
 const loadExceedsMemCap = @import("runtime/preflight.zig").loadExceedsMemCap;
 pub const gateEstimateBytes = @import("runtime/preflight.zig").gateEstimateBytes;
 const mlxActiveBytes = @import("runtime/preflight.zig").mlxActiveBytes;
@@ -169,8 +169,8 @@ test {
     _ = @import("runtime/media_load.zig");
     _ = @import("runtime/media_runner.zig");
     _ = @import("runtime/cold_load.zig");
-    _ = @import("runtime/cpu_state.zig");
-    _ = @import("runtime/model_settings_apply.zig");
+    _ = @import("../../host/registry/cpu_state.zig");
+    _ = @import("../../host/registry/model_settings_apply.zig");
     _ = @import("runtime/preflight.zig");
 }
 

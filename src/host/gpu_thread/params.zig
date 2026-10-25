@@ -127,7 +127,7 @@ pub const LoadParams = struct {
     /// Embedded llama.cpp engine settings (`--llama-*`), applied when a GGUF
     /// model's context is created at load.
     llama: LlamaSettings = .{},
-    /// A GGUF and the engine that serves it (`host/engines/load.zig`) instead of the MLX safetensors path.
+    /// A GGUF and the engine that serves it (`engines/mlx/runtime/engine_load.zig`) instead of the MLX safetensors path.
     /// `config`/`tok`/`chat_config` are stubs (the engine owns the real tokenizer + chat template); they still move
     /// onto the entry so server-side reads of `lm.config.?` keep working.
     gguf: ?GgufRoute = null,

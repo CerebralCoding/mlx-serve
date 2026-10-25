@@ -23,7 +23,7 @@ src/engines/mlx/*.zig	sleep_inhibit.setActive(holdsSleepWhileParked(sch));	the i
 src/engines/mlx/scheduler.zig	coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path)	the cold-load LoadRequest re-applies the retained launch settings
 src/engines/mlx/load.zig	clamped_prefix_mem,	HotPrefixCache.initWithMem takes the clamped budget, never the raw launch flag
 src/engines/mlx/load.zig	loadRequirementBytes(weights_bytes))) / gb	a preflight refusal quotes the requirement it compared
-src/host/media_jobs/load.zig	loadRequirementBytes(bill.ram))) / gb	a preflight refusal quotes the requirement it compared
+src/engines/mlx/runtime/media_load.zig	loadRequirementBytes(bill.ram))) / gb	a preflight refusal quotes the requirement it compared
 src/sdk/bases/hybrid.zig	DtypeTrace.begin(	every forward path arms a dtype trace
 src/sdk/bases/encoder.zig	DtypeTrace.begin(	every forward path arms a dtype trace
 src/sdk/bases/decoder.zig	DtypeTrace.begin(	every forward path arms a dtype trace
