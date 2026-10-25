@@ -3,7 +3,7 @@
 const std = @import("std");
 const log = @import("../../../sdk/util/log.zig");
 const io_util = @import("../../../sdk/util/io_util.zig");
-const mlx_stream = if (@import("build_options").mlx_stream) @import("../modules/stream_glue.zig") else @import("../modules/stream_stub.zig");
+const mlx_stream = @import("../modules/stream.zig");
 const sleep_inhibit = @import("sleep_inhibit.zig");
 const testing = std.testing;
 

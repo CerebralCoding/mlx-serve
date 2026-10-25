@@ -15,7 +15,7 @@ const model_discovery = @import("../../../host/registry/discovery.zig");
 const mlx_gguf = @import("../../../sdk/quant/gguf/claim.zig");
 const status = @import("../../../host/status.zig");
 const streamed = @import("../../../sdk/weights/streamed.zig");
-const mlx_stream = if (@import("build_options").mlx_stream) @import("../modules/stream_glue.zig") else @import("../modules/stream_stub.zig");
+const mlx_stream = @import("../modules/stream.zig");
 const testing = std.testing;
 
 /// A load whose own bill exceeds the memory cap is refused whatever else is resident.

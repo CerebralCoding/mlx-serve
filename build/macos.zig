@@ -201,10 +201,13 @@ pub fn addServer(g: *const Graph, plugin_names: []const []const u8) void {
         units_step.dependOn(&b.addInstallFile(host_obj.getEmittedBin(), "units/host.o").step);
         check_run.addFileArg(host_obj.getEmittedBin());
         // The MLX engine: the host reaches it only through its exported table (`host/engines/mlx.zig`).
-        const engine_obj = b.addObject(.{ .name = "engine-mlx", .root_module = unitModule(g, unit_includes, "src/engine_unit.zig") });
-        mod.addObject(engine_obj);
-        units_step.dependOn(&b.addInstallFile(engine_obj.getEmittedBin(), "units/engine-mlx.o").step);
-        check_run.addFileArg(engine_obj.getEmittedBin());
+        // The MLX engine, and the streaming packs' glue it calls through a table (`engines/mlx/modules/stream_table.zig`).
+        for ([_][2][]const u8{ .{ "engine-mlx", "src/engine_unit.zig" }, .{ "engine-stream", "src/stream_unit.zig" } }) |u| {
+            const obj = b.addObject(.{ .name = u[0], .root_module = unitModule(g, unit_includes, u[1]) });
+            mod.addObject(obj);
+            units_step.dependOn(&b.addInstallFile(obj.getEmittedBin(), b.fmt("units/{s}.o", .{u[0]})).step);
+            check_run.addFileArg(obj.getEmittedBin());
+        }
         mod.root_source_file = b.path("src/exe.zig");
         // Plugins dealt round-robin into `unit-groups` objects: each compiles the shared code it reaches once, so fewer
         // groups cost less CPU, more groups more parallelism.

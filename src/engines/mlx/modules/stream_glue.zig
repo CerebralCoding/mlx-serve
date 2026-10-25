@@ -13,7 +13,7 @@ const log = @import("../../../sdk/util/log.zig");
 const server = @import("../../../host/http/server.zig");
 const status = @import("../../../sdk/util/system.zig");
 const model_settings = @import("../../../host/registry/model_settings.zig");
-const scheduler = @import("../scheduler.zig");
+const preflight = @import("../runtime/preflight.zig");
 const ModelConfig = @import("../../../sdk/config/model.zig").ModelConfig;
 const plugin = @import("mlx_stream");
 const sdk = plugin.sdk;
@@ -99,7 +99,7 @@ fn resolveContext(comptime k: Kind, gpa: std.mem.Allocator, io: std.Io, config: 
             const c = parse(k, self.gpa, self.io, self.config, &f, rung) catch return std.math.maxInt(u64);
             defer A.freeConfig(self.gpa, c);
             const bytes = A.loadBytes(self.gpa, self.io, c, &f, self.ceiling) catch return std.math.maxInt(u64);
-            return scheduler.loadRequirementBytes(bytes);
+            return preflight.loadRequirementBytes(bytes);
         }
     };
     const chosen = largestFitting(avail, &auto_context_rungs, Bills{ .gpa = gpa, .io = io, .config = config, .ceiling = ceiling }) orelse Side(k).default_context;
