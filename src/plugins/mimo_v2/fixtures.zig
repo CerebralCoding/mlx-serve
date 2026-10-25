@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
+const model_mod = @import("../../sdk/config/model.zig");
 const ForwardCtx = @import("../../engines/mlx/forward_ctx.zig").ForwardCtx;
 const KVCache = @import("../../engines/mlx/kv/cache.zig").KVCache;
 const testing = @import("../../engines/mlx/kv/cache.zig").testing;

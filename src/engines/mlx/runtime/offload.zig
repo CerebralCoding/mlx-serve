@@ -2,18 +2,16 @@
 //! the slot from the engine's thread (`Sink.event`), as the inference thread writes an MLX slot.
 
 const std = @import("std");
-const abi = @import("../../abi/engine.zig");
-const log = @import("../../sdk/util/log.zig");
-const served_mod = @import("served.zig");
+const abi = @import("../../../abi/engine.zig");
+const log = @import("../../../sdk/util/log.zig");
+const served_mod = @import("../../../host/engines/served.zig");
 const Served = served_mod.Served;
 const Kind = served_mod.Kind;
-const request_mod = @import("../../sdk/request/request.zig");
-const finish = @import("../../engines/mlx/finish.zig");
-const Slot = @import("../../engines/mlx/slot.zig").Slot;
-const SubmitParams = @import("../../engines/mlx/scheduler/params.zig").SubmitParams;
-
-/// The engine and the feature of the refusal this connection thread last met, read by `mapGenerationError`.
-pub threadlocal var refused: ?struct { kind: Kind, cap: []const u8 } = null;
+const refusal = @import("../../../host/engines/refusal.zig");
+const request_mod = @import("../../../sdk/request/request.zig");
+const finish = @import("../finish.zig");
+const Slot = @import("../slot.zig").Slot;
+const SubmitParams = @import("../scheduler/params.zig").SubmitParams;
 
 /// What the request asks that the engine does not declare (`abi.Caps` field name), or null when it serves it.
 pub fn missingCap(s: *const Served, p: SubmitParams) ?[]const u8 {
@@ -39,29 +37,6 @@ fn needs(sampling: request_mod.SamplingParams, logprobs_n: u32, prompt_logprobs:
         .tool_gate = sampling.tool_force != null,
         .prompt_logprobs = prompt_logprobs,
     };
-}
-
-/// The 400 for `refused`: the engine, the feature, the fix.
-pub fn refusalMessage(buf: []u8) []const u8 {
-    const r = refused orelse return "This model's engine does not serve this request.";
-    refused = null;
-    const fix = if (r.kind == .ane) "Use a GPU model for that." else "Use an MLX model for that.";
-    return std.fmt.bufPrint(buf, "This model runs on {s}, which does not serve {s}. {s}", .{ served_mod.displayName(r.kind), feature(r.cap), fix }) catch
-        "This model's engine does not serve this request.";
-}
-
-fn feature(cap: []const u8) []const u8 {
-    const names = .{
-        .{ "penalties", "repetition, frequency or presence penalties" },
-        .{ "logit_bias", "logit_bias" },
-        .{ "logprobs", "logprobs" },
-        .{ "grammar", "structured output (response_format, grammars)" },
-        .{ "think_budget", "a reasoning budget" },
-        .{ "tool_gate", "forced tool calls (tool_choice)" },
-        .{ "prompt_logprobs", "prompt logprobs" },
-    };
-    inline for (names) |n| if (std.mem.eql(u8, cap, n[0])) return n[1];
-    return cap;
 }
 
 /// The omitted `min_p` per engine: ds4's sampler has always drawn with 0.05.
@@ -156,7 +131,7 @@ fn onEvent(ctx: *anyopaque, _: u64, ev: *const abi.Event) callconv(.c) abi.Actio
 /// A logprob entry as the MLX path publishes it; its top list is the slot's to free.
 fn logprob(gpa: std.mem.Allocator, lp: abi.Logprob) ?request_mod.LogprobResult {
     const top = abi.items(abi.Bias, lp.top);
-    const out = gpa.alloc(@import("../../engines/mlx/sampling/logprobs.zig").TokenLogprob, top.len) catch return null;
+    const out = gpa.alloc(@import("../sampling/logprobs.zig").TokenLogprob, top.len) catch return null;
     for (top, out) |b, *o| o.* = .{ .token_id = b.token, .logprob = b.bias };
     return .{ .token_logprob = lp.logprob, .top_logprobs = out };
 }
@@ -231,15 +206,6 @@ test "missingCap: a GGUF engine accepts a grammar and ignores it, as it always h
     try testing.expect(missingCap(&s, .{ .prompt_ids = &.{1}, .sampling = .{ .presence_penalty = 0.5, .frequency_penalty = 0.2 }, .eos_token_ids = &.{}, .max_tokens = 1, .logprobs_n = 2, .model = undefined }) == null);
 }
 
-test "refusalMessage: names the engine, the feature and the fix, once" {
-    var buf: [320]u8 = undefined;
-    refused = .{ .kind = .ane, .cap = "tool_gate" };
-    try testing.expectEqualStrings("This model runs on the Neural Engine, which does not serve forced tool calls (tool_choice). Use a GPU model for that.", refusalMessage(&buf));
-    try testing.expect(refused == null);
-    refused = .{ .kind = .llama, .cap = "penalties" };
-    try testing.expectEqualStrings("This model runs on the embedded llama.cpp engine (GGUF), which does not serve repetition, frequency or presence penalties. Use an MLX model for that.", refusalMessage(&buf));
-}
-
 test "defaultMinP: ds4 keeps its own 0.05 floor; the others draw without one" {
     try testing.expectEqual(@as(f32, 0.05), defaultMinP(.ds4));
     try testing.expectEqual(@as(f32, 0), defaultMinP(.llama));
@@ -247,14 +213,14 @@ test "defaultMinP: ds4 keeps its own 0.05 floor; the others draw without one" {
 }
 
 test "submit: the engine's events land in the slot from its thread — prefilled, the tokens, then the terminator" {
-    const fake = @import("../../testing/fake_engine.zig");
-    const ModelConfig = @import("../../engines/mlx/model.zig").ModelConfig;
-    const LoadedModel = @import("../registry/registry.zig").LoadedModel;
+    const fake = @import("../../../testing/fake_engine.zig");
+    const ModelConfig = @import("../../../sdk/config/model.zig").ModelConfig;
+    const LoadedModel = @import("../../../host/registry/registry.zig").LoadedModel;
     const Quiet = struct {
         fn log(_: *anyopaque, _: u8, _: abi.Str) callconv(.c) void {}
         fn wake(_: *anyopaque) callconv(.c) void {}
     };
-    var progress: @import("../registry/load_progress.zig").Progress = .{};
+    var progress: @import("../../../host/registry/load_progress.zig").Progress = .{};
     var gauges: served_mod.Gauges = .{};
     var s: Served = .{ .gpa = testing.allocator, .kind = .llama, .table = &fake.own_thread, .handle = undefined, .info = undefined, .host = undefined, .progress = &progress, .gauges = &gauges, .metrics = null };
     s.host = .{ .ctx = &s, .log = Quiet.log, .wake = Quiet.wake };

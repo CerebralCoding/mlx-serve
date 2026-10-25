@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const generate_mod = @import("../generate.zig");
-const model_mod = @import("../model.zig");
+const model_mod = @import("../../../sdk/config/model.zig");
 const log = @import("../../../sdk/util/log.zig");
 const ModelConfig = model_mod.ModelConfig;
 const Generator = generate_mod.Generator;

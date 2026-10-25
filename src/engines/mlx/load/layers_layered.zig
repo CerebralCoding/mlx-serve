@@ -3,11 +3,11 @@
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const model_mod = @import("../model.zig");
+const model_mod = @import("../../../sdk/config/model.zig");
 const log = @import("../../../sdk/util/log.zig");
-const ModelConfig = @import("../model.zig").ModelConfig;
+const ModelConfig = @import("../../../sdk/config/model.zig").ModelConfig;
 const moe_affine4 = @import("../../../sdk/blocks/moe/moe_affine4.zig");
-const Weights = @import("../model.zig").Weights;
+const Weights = @import("../../../sdk/config/model.zig").Weights;
 const concatRows = @import("../../../mlx/array.zig").concatRows;
 const materializedOwnedCopy = @import("../../../mlx/array.zig").materializedOwnedCopy;
 const naxAvailable = @import("../../../mlx/device.zig").naxAvailable;

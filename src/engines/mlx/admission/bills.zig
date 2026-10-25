@@ -4,7 +4,7 @@
 const std = @import("std");
 const transformer_mod = @import("../transformer.zig");
 const generate_mod = @import("../generate.zig");
-const model_mod = @import("../model.zig");
+const model_mod = @import("../../../sdk/config/model.zig");
 const ane_mod = @import("../../../sdk/ane/offload.zig");
 const http_server = @import("../../../host/http/server.zig");
 
@@ -157,7 +157,7 @@ pub fn expertBankFillRows(config: *const model_mod.ModelConfig) u32 {
     const manual: u64 = http_server.manualContext(config);
     const ctx: u64 = if (manual > 0) manual else 16_384 + 1_024;
     const chunk: u64 = generate_mod.WIDE_PREFILL_CHUNK;
-    const reserve = @import("../../../host/registry/preflight.zig").modelDiskBytes(io, dir) +| (one - per_row) +|
+    const reserve = @import("../runtime/preflight.zig").modelDiskBytes(io, dir) +| (one - per_row) +|
         sessionBytesPerToken(config, kv_bits) *| ctx +| slotFixedKvBytes(config, kv_bits, chunk) +|
         prefillTransientReserve(config, kv_bits, chunk) +| http_server.serverState().wired_limit_margin_bytes;
     const rows = (http_server.staticGpuMemoryCeiling() -| reserve) / @max(per_row, 1);

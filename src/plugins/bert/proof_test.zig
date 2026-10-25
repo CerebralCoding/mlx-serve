@@ -133,7 +133,7 @@ test "bert served: a pack whose folder name picks the pooling serves under the l
     const root = buf[0..try tmp.dir.realPath(io, &buf)];
     var pbuf: [600]u8 = undefined;
     const dir = try std.fmt.bufPrint(&pbuf, "{s}/bge-small-en", .{root});
-    var cfg = try @import("../../engines/mlx/model.zig").parseConfig(io, testing.allocator, dir);
+    var cfg = try @import("../../sdk/config/model.zig").parseConfig(io, testing.allocator, dir);
     defer cfg.deinit(testing.allocator);
     try testing.expect(cfg.plugin != null);
     try testing.expectEqual(.cls, cfg.pooling_mode.?);

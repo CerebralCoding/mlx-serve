@@ -1,10 +1,10 @@
 //! Inference-thread start-up context and load-error plumbing.
 
 const std = @import("std");
-const gguf_meta = @import("../../sdk/quant/gguf/engine_pick.zig");
+const gguf_meta = @import("../../../sdk/quant/gguf/engine_pick.zig");
 
-const Scheduler = @import("../../engines/mlx/scheduler.zig").Scheduler;
-const LoadParams = @import("../../engines/mlx/scheduler/params.zig").LoadParams;
+const Scheduler = @import("../scheduler.zig").Scheduler;
+const LoadParams = @import("../scheduler/params.zig").LoadParams;
 
 pub const ThreadCtx = struct {
     scheduler: *Scheduler,
@@ -28,10 +28,4 @@ pub fn recordLoadError(sch: *Scheduler, err_name: []const u8) void {
     sch.load_failed.store(true, .release);
 }
 
-/// Routing decision for a GGUF entry resolved at preload time: the actual
-/// `.gguf` file (owned by the conn thread, freed after the load completes —
-/// the engines dupe/copy what they keep) and which embedded engine serves it.
-pub const GgufRoute = struct {
-    path: []const u8,
-    engine: gguf_meta.Engine,
-};
+pub const GgufRoute = gguf_meta.Route;

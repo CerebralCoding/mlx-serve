@@ -5,7 +5,7 @@ const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
 const request_mod = @import("../../sdk/request/request.zig");
 const log = @import("../../sdk/util/log.zig");
 const pld_index = @import("../../sdk/spec/pld_index.zig");
-const scheduler_mod = @import("../../engines/mlx/scheduler.zig");
+const mlx_engine = @import("../engines/mlx.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;
 const LoadedModel = model_registry_mod.LoadedModel;
@@ -16,15 +16,15 @@ const Stopwatch = io_util.Stopwatch;
 const http_server = @import("../http/server.zig");
 
 const Conn = @import("../http/conn.zig").Conn;
-const spec_gate_threshold = @import("../../engines/mlx/request_options.zig").spec_gate_threshold;
-const resolveKvAttnFused = @import("../../engines/mlx/request_options.zig").resolveKvAttnFused;
+const spec_gate_threshold = @import("request_options.zig").spec_gate_threshold;
+const resolveKvAttnFused = @import("request_options.zig").resolveKvAttnFused;
 const resolveSampling = @import("sampling.zig").resolveSampling;
 const generationMaxTokens = @import("sampling.zig").generationMaxTokens;
 const requestProfile = @import("sampling.zig").requestProfile;
-const defaultEnableMtp = @import("../../engines/mlx/request_options.zig").defaultEnableMtp;
-const dsv4DraftStages = @import("../../engines/mlx/request_options.zig").dsv4DraftStages;
-const mtpCapable = @import("../../engines/mlx/request_options.zig").mtpCapable;
-const admitMtpForCtx = @import("../../engines/mlx/request_options.zig").admitMtpForCtx;
+const defaultEnableMtp = @import("request_options.zig").defaultEnableMtp;
+const dsv4DraftStages = @import("request_options.zig").dsv4DraftStages;
+const mtpCapable = @import("request_options.zig").mtpCapable;
+const admitMtpForCtx = @import("request_options.zig").admitMtpForCtx;
 const getTimeoutNs = @import("../http/server.zig").getTimeoutNs;
 const decodeTokens = @import("tokenize.zig").decodeTokens;
 const omittedMaxTokensDefault = @import("sampling.zig").omittedMaxTokensDefault;
@@ -44,14 +44,14 @@ const encodeText = @import("tokenize.zig").encodeText;
 const jsonEscapeOrEmpty = @import("tokenize.zig").jsonEscapeOrEmpty;
 const requestCacheKey = @import("request_text.zig").requestCacheKey;
 const echoModelName = @import("request_text.zig").echoModelName;
-const requestPld = @import("../../engines/mlx/request_options.zig").requestPld;
+const requestPld = @import("request_options.zig").requestPld;
 const StopStream = @import("../chat/stops.zig").StopStream;
 const nonStreamingViaScheduler = @import("submit.zig").nonStreamingViaScheduler;
 const StreamingTokenStream = @import("chat_stream.zig").StreamingTokenStream;
-const requestEnableDrafter = @import("../../engines/mlx/request_options.zig").requestEnableDrafter;
-const requestHasCompany = @import("../../engines/mlx/request_options.zig").requestHasCompany;
-const requestSpecModes = @import("../../engines/mlx/request_options.zig").requestSpecModes;
-const pickStreamMode = @import("../../engines/mlx/request_options.zig").pickStreamMode;
+const requestEnableDrafter = @import("request_options.zig").requestEnableDrafter;
+const requestHasCompany = @import("request_options.zig").requestHasCompany;
+const requestSpecModes = @import("request_options.zig").requestSpecModes;
+const pickStreamMode = @import("request_options.zig").pickStreamMode;
 const StreamLogprobs = @import("logprobs.zig").StreamLogprobs;
 const sendResponse = @import("../http/respond.zig").sendResponse;
 const SSE_ALLOW_HEADERS_DEFAULT = @import("../http/respond.zig").SSE_ALLOW_HEADERS_DEFAULT;
@@ -510,11 +510,11 @@ fn handleStreamingCompletion(
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
 
-    var slot_handle: ?*scheduler_mod.Slot = null;
-    defer if (slot_handle) |s| http_server.global_scheduler.?.complete(s);
+    var running: ?mlx_engine.Running = null;
+    defer if (running) |r| r.done();
 
     const sch = http_server.global_scheduler.?;
-    slot_handle = try sch.submit(.{
+    running = try mlx_engine.Running.submit(sch, .{
         .model = lm,
         .prompt_ids = prompt_ids,
         .full_prompt = prompt_ids,
@@ -541,7 +541,7 @@ fn handleStreamingCompletion(
         .cache_key = cache_key,
         .client = stream.client,
     });
-    var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_token_ids);
+    var ts = StreamingTokenStream.initFromStream(running.?.stream, stream_mode, eos_token_ids);
 
     // Legacy completions carries logprobs as four parallel arrays whose
     // `text_offset` indexes the whole completion, so the collector renders
@@ -549,7 +549,7 @@ fn handleStreamingCompletion(
     var lps = StreamLogprobs{
         .allocator = allocator,
         .tok = tok,
-        .slot = slot_handle,
+        .stream = running.?.stream,
         .enabled = logprobs_n > 0,
         .legacy = true,
     };
@@ -581,13 +581,13 @@ fn handleStreamingCompletion(
                 // keepalive stops clients timing out on stream silence.
                 if (stream.peerClosed()) {
                     log.info("  [cancel] client disconnected while waiting for tokens — cancelling slot\n", .{});
-                    slot_handle.?.cancel();
+                    running.?.stream.cancel();
                     client_gone = true;
                     break;
                 }
                 sendStreamKeepalive(stream) catch {
                     log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
-                    slot_handle.?.cancel();
+                    running.?.stream.cancel();
                     client_gone = true;
                     break;
                 };
@@ -595,7 +595,7 @@ fn handleStreamingCompletion(
             },
         };
         if (stream.peerClosed()) {
-            slot_handle.?.cancel();
+            running.?.stream.cancel();
             client_gone = true;
             break;
         }

@@ -3,7 +3,7 @@
 const std = @import("std");
 const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
 const request_mod = @import("../../sdk/request/request.zig");
-const scheduler_mod = @import("../../engines/mlx/scheduler.zig");
+const Stream = @import("../engines/stream.zig").Stream;
 const Tokenizer = tokenizer_mod.Tokenizer;
 
 const jsonEscape = @import("format.zig").jsonEscape;
@@ -17,14 +17,14 @@ const jsonEscape = @import("format.zig").jsonEscape;
 /// shipped EXACTLY once: a delta cannot be retracted, so a re-send is as wrong
 /// as a drop.
 ///
-/// Entries are BORROWED from the slot, which owns each `top_logprobs`
-/// allocation and frees it in `Slot.deinit`. Nothing here frees them.
+/// Entries are BORROWED from the stream, which owns each `top_logprobs`
+/// allocation and frees it when it is released. Nothing here frees them.
 pub const StreamLogprobs = struct {
     allocator: std.mem.Allocator,
     tok: *const Tokenizer,
-    slot: ?*scheduler_mod.Slot,
+    stream: ?*Stream,
     enabled: bool,
-    /// High-water mark in the slot's buffer (what we have copied out).
+    /// High-water mark in the stream's buffer (what we have copied out).
     cursor: usize = 0,
     /// How many entries have already ridden a chunk.
     emitted: usize = 0,
@@ -124,8 +124,8 @@ pub const StreamLogprobs = struct {
             self.allocator.free(r);
             self.rendered = null;
         }
-        const slot = self.slot orelse return null;
-        self.cursor = try slot.copyLogprobsFrom(self.allocator, self.cursor, &self.entries);
+        const src = self.stream orelse return null;
+        self.cursor = try src.copyLogprobsFrom(self.allocator, self.cursor, &self.entries);
         // An id with no entry yet (or the reverse) is a partially published
         // token — hold it for the next chunk rather than shipping a half pair;
         // so is one whose bytes a stop-string hold has not released.

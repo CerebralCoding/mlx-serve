@@ -32,6 +32,13 @@ const std = @import("std");
 
 pub const Engine = enum { ds4, llama };
 
+/// Routing decision for a GGUF entry resolved at preload time: the actual `.gguf` file (owned by the connection
+/// thread, freed after the load completes; the engines copy what they keep) and which embedded engine serves it.
+pub const Route = struct {
+    path: []const u8,
+    engine: Engine,
+};
+
 pub const Info = struct {
     /// Owned dupe of `general.architecture` value; null if the key was
     /// absent or not a string.

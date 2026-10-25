@@ -6,7 +6,7 @@ const abi = @import("../../abi/plugin.zig");
 const gather_mod = @import("qsa/gather.zig");
 const score_mod = @import("../../sdk/blocks/attention/sparse_block/score.zig");
 const attn256 = @import("../../sdk/blocks/attention/attn256.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
+const model_mod = @import("../../sdk/config/model.zig");
 const qconfig = @import("config.zig");
 const toModelConfig = @import("model_config.zig").toModelConfig;
 

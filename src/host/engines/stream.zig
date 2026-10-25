@@ -1,7 +1,7 @@
 //! A request's output as the connection thread drains it: the tokens, the logprobs, the terminator and the request's
 //! numbers. Every engine fills it through `Sink.event` (`onEvent`) from its own thread or the GPU thread; the
-//! connection thread reads it. It outlives the engine's own per-request state: the engine is done with it once it has
-//! delivered `finished` (`pending` drops to zero).
+//! connection thread reads it. Two owners hold it: the connection thread and, from submit to `finished`, the engine;
+//! the last to let go frees it (`release`).
 
 const std = @import("std");
 const abi = @import("../../abi/engine.zig");
@@ -44,12 +44,14 @@ pub const Stream = struct {
     /// Where the degenerate span begins in the generated tokens; a non-streamed reply is cut there.
     loop_trim_start: ?usize = null,
     cancelled: std.atomic.Value(bool) = .init(false),
-    /// Held from submit to the engine's `finished`: the stream may not be freed before (`waitDone`).
-    pending: std.atomic.Value(u32) = .init(0),
+    /// Owners: the connection thread, plus the engine from submit to its `finished` (`engineHolds`).
+    refs: std.atomic.Value(u32) = .init(1),
     /// Reasoning-protocol payload boundary, published before the token that carries it.
     constraint_payload_at: std.atomic.Value(u32) = .init(std.math.maxInt(u32)),
     constraint_payload_offset: std.atomic.Value(u32) = .init(0),
 
+    /// The whole prompt's length as submitted: a refusal before prefill quotes it.
+    prompt_len: usize = 0,
     prompt_tokens: u32 = 0,
     completion_tokens: u32 = 0,
     cached_tokens: u32 = 0,
@@ -74,9 +76,17 @@ pub const Stream = struct {
         return s;
     }
 
-    /// Frees the stream once the engine has delivered its terminator.
-    pub fn destroy(self: *Stream) void {
-        self.waitDone();
+    /// The engine takes its hold before it is handed the sink; its `finished` lets go.
+    pub fn engineHolds(self: *Stream) void {
+        _ = self.refs.fetchAdd(1, .acq_rel);
+    }
+
+    /// Lets go of one hold; the last frees the stream.
+    pub fn release(self: *Stream) void {
+        if (self.refs.fetchSub(1, .acq_rel) == 1) self.free();
+    }
+
+    fn free(self: *Stream) void {
         if (self.error_code) |code| self.allocator.free(code);
         for (self.logprobs_buf.items) |*lp| self.allocator.free(lp.top_logprobs);
         self.logprobs_buf.deinit(self.allocator);
@@ -84,11 +94,6 @@ pub const Stream = struct {
         self.prompt_logprobs_buf.deinit(self.allocator);
         self.out_buf.deinit(self.allocator);
         self.allocator.destroy(self);
-    }
-
-    /// Waits until the engine no longer writes this stream.
-    pub fn waitDone(self: *Stream) void {
-        while (self.pending.load(.acquire) != 0) self.io.sleep(.fromMilliseconds(1), .awake) catch {};
     }
 
     /// The sink an engine fills this stream through.
@@ -255,7 +260,7 @@ pub fn onEvent(ctx: *anyopaque, _: u64, ev: *const abi.Event) callconv(.c) abi.A
             for (abi.items(u32, ev.tokens), 0..) |t, i| s.pushTokenWithLogprob(t, if (i < lps.len) fromEvent(s.allocator, lps[i]) else null);
         },
         .finished => {
-            defer _ = s.pending.fetchSub(1, .release);
+            defer s.release();
             if (ev.stats) |st| {
                 s.prefill_ns = st.prefill_ns;
                 s.decode_ns = st.decode_ns;
@@ -300,8 +305,8 @@ fn send(s: *Stream, ev: abi.Event) abi.Action {
 
 test "stream: prefilled, tokens with their logprobs, then finished reach the reader in order" {
     const s = try Stream.create(testing.allocator, testing.io);
-    defer s.destroy();
-    s.pending.store(1, .release);
+    defer s.release();
+    s.engineHolds();
     _ = send(s, .{ .kind = .prefilled, .prompt_tokens = 7, .cached = 3 });
     var top = [_]abi.Bias{.{ .token = 9, .bias = -0.5 }};
     const lps = [_]abi.Logprob{ .{ .token = 4, .logprob = -0.1, .top = abi.span(abi.Bias, &top) }, .{ .token = 5, .logprob = -0.2, .top = .{} } };
@@ -318,20 +323,20 @@ test "stream: prefilled, tokens with their logprobs, then finished reach the rea
     try testing.expectEqual(@as(u64, 22), s.decode_ns);
     try testing.expectEqual(@as(usize, 2), s.logprobs_buf.items.len);
     try testing.expectEqual(@as(u32, 9), s.logprobs_buf.items[0].top_logprobs[0].token_id);
-    try testing.expectEqual(@as(u32, 0), s.pending.load(.acquire));
+    try testing.expectEqual(@as(u32, 1), s.refs.load(.acquire));
 }
 
 test "stream: a failed finish carries its name, the refused bill and the loop cut; a cancel reads as done" {
     const s = try Stream.create(testing.allocator, testing.io);
-    defer s.destroy();
-    s.pending.store(1, .release);
+    defer s.release();
+    s.engineHolds();
     _ = send(s, .{ .kind = .finished, .reason = .failed, .verdict = .{ .code = .failed, .why = abi.Str.of("PrefillDoesNotFit") }, .refused_needed = 10, .refused_available = 4 });
     try testing.expectEqual(NextResult.err, s.waitNext());
     try testing.expect(s.errorNameIs("PrefillDoesNotFit"));
     try testing.expectEqual([2]u64{ 10, 4 }, s.refused_bill.?);
 
     const c = try Stream.create(testing.allocator, testing.io);
-    defer c.destroy();
+    defer c.release();
     c.cancel();
     try testing.expectEqual(NextResult.done, c.waitNext());
     try testing.expectEqual(abi.Action.stop, send(c, .{ .kind = .tokens }));
@@ -339,8 +344,8 @@ test "stream: a failed finish carries its name, the refused bill and the loop cu
 
 test "stream: a constraint span is visible with the token that carries it; the loop details ride the finish" {
     const s = try Stream.create(testing.allocator, testing.io);
-    defer s.destroy();
-    s.pending.store(1, .release);
+    defer s.release();
+    s.engineHolds();
     _ = send(s, .{ .kind = .tokens, .tokens = abi.span(u32, &.{ 1, 2 }), .constraint_at = 1, .constraint_offset = 3 });
     try testing.expectEqual(ConstraintSpan{ .token_index = 1, .byte_offset = 3 }, s.constraintPayloadStart().?);
     _ = send(s, .{ .kind = .finished, .finish_details = abi.Str.of("repetition_loop"), .loop_trim_start = 1 });

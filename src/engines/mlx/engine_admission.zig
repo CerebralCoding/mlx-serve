@@ -2,7 +2,7 @@
 //! the model's `ModelConfig`.
 
 const abi = @import("../../abi/engine.zig");
-const ModelConfig = @import("model.zig").ModelConfig;
+const ModelConfig = @import("../../sdk/config/model.zig").ModelConfig;
 const KVQuantConfig = @import("../../sdk/blocks/attention/kv_quant.zig").KVQuantConfig;
 const context = @import("admission/context.zig");
 const admit_mod = @import("admission/admit.zig");

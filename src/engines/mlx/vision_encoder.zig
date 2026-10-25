@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const model_mod = @import("model.zig");
+const model_mod = @import("../../sdk/config/model.zig");
 const log = @import("../../sdk/util/log.zig");
 const qwen_vision = @import("../../sdk/vision/qwen_vision.zig");
 const muse_vision = @import("../../plugins/muse_glimmer/vision.zig");

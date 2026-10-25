@@ -33,7 +33,7 @@ const Scheduler = @import("../scheduler.zig").Scheduler;
 const Slot = @import("../slot.zig").Slot;
 const specTickMode = @import("wiring.zig").specTickMode;
 const publishSpeculativeBlock = @import("wiring.zig").publishSpeculativeBlock;
-const loopGuardTick = @import("../../../host/chat/loop_stop.zig").loopGuardTick;
+const loopGuardTick = @import("../loop_stop.zig").loopGuardTick;
 
 /// Per-slot follow-up to a batched forward: `record` moves the id ledger, `publish` samples and streams.
 const BatchedTickAction = struct { record: bool, publish: bool };

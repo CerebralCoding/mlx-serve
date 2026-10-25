@@ -1,26 +1,26 @@
 const std = @import("std");
-const fp8_grid = @import("../../sdk/quant/fp8_block128_gemv.zig");
+const fp8_grid = @import("../quant/fp8_block128_gemv.zig");
 const env = @import("../../env.zig");
 const builtin = @import("builtin");
 const mlx = @import("../../mlx/ffi.zig");
-const log = @import("../../sdk/util/log.zig");
-const plugin_config = @import("plugin/config.zig");
+const log = @import("../util/log.zig");
+const plugin_config = @import("../../engines/mlx/plugin/config.zig");
 const abi = @import("../../abi/plugin.zig");
-const mlx_gguf = @import("../../sdk/quant/gguf/claim.zig");
-const exl3 = @import("../../sdk/quant/exl3/format.zig");
-const sushi_pack = @import("load/sushi_adapt.zig");
-const modelopt_pack = @import("../../sdk/quant/nvfp4/modelopt_pack.zig");
+const mlx_gguf = @import("../quant/gguf/claim.zig");
+const exl3 = @import("../quant/exl3/format.zig");
+const sushi_pack = @import("../../engines/mlx/load/sushi_adapt.zig");
+const modelopt_pack = @import("../quant/nvfp4/modelopt_pack.zig");
 const model_discovery = @import("../../host/registry/discovery.zig");
-const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
+const tokenizer_mod = @import("../tokenizer/tokenizer.zig");
 const transcription = @import("../../host/api/audio/transcription.zig");
 const qwen4_exp = @import("../../plugins/qwen4_exp/qwen4_exp.zig");
-const distributed = @import("cluster/distributed.zig");
+const distributed = @import("../../engines/mlx/cluster/distributed.zig");
 const qwen4_ple = @import("../../plugins/qwen4_exp/ple_table.zig");
-const kv_quant_mod = @import("cache/kv_quant.zig");
-const mtp_acceptance_mod = @import("../../sdk/spec/mtp_acceptance.zig");
-const weights_load = @import("../../sdk/weights/load.zig");
+const kv_quant_mod = @import("../blocks/attention/kv_quant.zig");
+const mtp_acceptance_mod = @import("../spec/mtp_acceptance.zig");
+const weights_load = @import("../weights/load.zig");
 
-pub const HiddenAct = @import("../../sdk/blocks/mlp/activations.zig").HiddenAct;
+pub const HiddenAct = @import("../blocks/mlp/activations.zig").HiddenAct;
 
 /// Upper bound on a vision tower's per-layer type table (muse ships 50).
 pub const MAX_VISION_LAYERS = 64;
@@ -31,7 +31,7 @@ pub const MUSE_MAX_IMAGE_TOKENS = 4096;
 /// Default fraction of RADIO video tokens removed by EVS.
 pub const RADIO_VIDEO_PRUNING_RATE_DEFAULT: f64 = 0.7;
 
-pub const QuantMode = @import("../../sdk/quant/params.zig").QuantMode;
+pub const QuantMode = @import("../quant/params.zig").QuantMode;
 
 pub const LayerBlockType = enum { attention, gated_conv, mamba2, mlp, moe };
 
@@ -115,7 +115,7 @@ pub fn poolingFromDirName(dir_basename: []const u8, model_type: []const u8) ?Poo
 
 pub const Qwen4NormConvention = enum { delta, folded };
 
-pub const Llama3Rope = @import("../../sdk/blocks/rope/rope.zig").Llama3Rope;
+pub const Llama3Rope = @import("../blocks/rope/rope.zig").Llama3Rope;
 
 /// `thinker_config.audio_config` of a Qwen3-ASR pack (mlx-audio's `AudioEncoderConfig`).
 pub const QwenAudioConfig = struct {
@@ -544,7 +544,7 @@ pub const ModelConfig = struct {
     /// The model's `ane` setting: serve it on the Neural Engine; null follows `--ane`.
     ane_override: ?bool = null,
     /// The model's `stream_experts` setting: its routed experts read from the pack into slot rows; null = resident.
-    stream_experts_override: ?@import("../../sdk/weights/streamed.zig").Setting = null,
+    stream_experts_override: ?@import("../weights/streamed.zig").Setting = null,
     /// Dense context K/V a loaded DFlash drafter keeps per trunk token, per request. Stamped at load.
     drafter_ctx_bytes_per_token: u64 = 0,
     /// `drafter` setting: null or "auto" = the in-dir probe, "off", or a path. Owned.
@@ -1098,7 +1098,7 @@ pub const ModelConfig = struct {
         if (self.indexer_budget == 0 or self.indexer_head_dim == 0) return 0;
         const n = @as(u64, self.attnCacheLayerCount());
         const hd = @as(u64, self.indexer_head_dim);
-        const rows = @as(u64, @intCast(@import("transformer.zig").QSA_RING_ROWS));
+        const rows = @as(u64, @intCast(@import("../../engines/mlx/transformer.zig").QSA_RING_ROWS));
         return n * rows * hd * 2;
     }
 
@@ -1106,7 +1106,7 @@ pub const ModelConfig = struct {
     /// (`SSMCacheEntry.qsa_score_bank`). Never in an entry. Zero without an indexer.
     pub fn qsaScoreBankBytesPerToken(self: *const ModelConfig) u64 {
         if (self.indexer_budget == 0 or self.indexer_head_dim == 0) return 0;
-        if (@import("../../sdk/blocks/attention/sparse_block/score.zig").qsaScoreFusedActiveFor(1, @intCast(self.indexer_n_heads), @intCast(self.indexer_head_dim))) return 0;
+        if (@import("../blocks/attention/sparse_block/score.zig").qsaScoreFusedActiveFor(1, @intCast(self.indexer_n_heads), @intCast(self.indexer_head_dim))) return 0;
         const n = @as(u64, self.attnCacheLayerCount());
         const hd = @as(u64, self.indexer_head_dim);
         const ratio = @max(@as(u64, self.indexer_compress_ratio), 1);
@@ -2315,7 +2315,7 @@ const ModelCliState = struct {
     /// therefore the way to A/B a scaling experiment on identical weights.
     config_overrides: ?[]const u8 = null,
 };
-const modelCli_shared = @import("../../sdk/util/shared.zig").Shared(ModelCliState, "model_cli", .{});
+const modelCli_shared = @import("../util/shared.zig").Shared(ModelCliState, "model_cli", .{});
 inline fn modelCli() *ModelCliState {
     return modelCli_shared.get();
 }
@@ -2328,7 +2328,7 @@ pub fn getConfigOverrides() ?[]const u8 {
     return modelCli().config_overrides;
 }
 
-pub const mergeConfigJson = @import("../../sdk/config/merge.zig").mergeConfigJson;
+pub const mergeConfigJson = @import("merge.zig").mergeConfigJson;
 
 /// EmbeddingGemma 2's context window as its model card states it. Kept in sync with
 /// `model_discovery.parseStubMeta`, which cannot import this file.
@@ -4740,7 +4740,7 @@ fn jsonFloat(v: std.json.Value) !f32 {
     return f;
 }
 
-pub const Weights = @import("../../sdk/weights/resident.zig").Weights;
+pub const Weights = @import("../weights/resident.zig").Weights;
 
 /// The generic nestings a text trunk ships under: flat, mlx-community's
 /// re-nest, and meta's VL original (Muse-Glimmer). `parseConfigFromJson`
@@ -4916,7 +4916,7 @@ fn shardExperts(weights: *Weights, sh: distributed.Shard, banks_sliced: bool) !v
         var view = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(view);
         try mlx.check(mlx.mlx_slice(&view, kv.value_ptr.*, &start, shape.len, &stop, shape.len, &strides, shape.len, s));
-        const owned = try @import("transformer.zig").materializedOwnedCopy(s, view);
+        const owned = try @import("../../engines/mlx/transformer.zig").materializedOwnedCopy(s, view);
         _ = mlx.mlx_array_free(kv.value_ptr.*);
         kv.value_ptr.* = owned;
     }
@@ -4997,7 +4997,7 @@ const narrow1dEnabled = weights_load.narrow1dEnabled;
 
 pub const reportF16Narrowing = weights_load.reportF16Narrowing;
 
-pub const loadWeightsFile = @import("../../sdk/weights/resident.zig").loadWeightsFile;
+pub const loadWeightsFile = @import("../weights/resident.zig").loadWeightsFile;
 
 pub const loadSafetensorsFile = weights_load.loadSafetensorsFile;
 
@@ -9371,7 +9371,7 @@ test "parseConfigFromJson: qwen4_exp (Qwen3.8-Flash-Next) reads the hyper-connec
     try testing.expect(c.isLinearLayer(0) and !c.isLinearLayer(3));
     try testing.expectEqual(@as(u32, 12), c.attnCacheLayerCount());
     try testing.expectEqual(@as(u64, 12 * 128 * 2 / 4), c.qsaHistoryBytesPerToken());
-    try testing.expectEqual(@as(u64, 12 * @as(u64, @intCast(@import("transformer.zig").QSA_RING_ROWS)) * 128 * 2), c.qsaRingBytes());
+    try testing.expectEqual(@as(u64, 12 * @as(u64, @intCast(@import("../../engines/mlx/transformer.zig").QSA_RING_ROWS)) * 128 * 2), c.qsaRingBytes());
     try testing.expect(c.attn_output_gate and c.kda_sigmoid_out_gate and !c.has_final_norm and !c.norm_has_offset);
     try testing.expect(c.isMoe() and c.longCtxGated());
     try testing.expectEqual(@as(f32, 0.25), c.partial_rotary_factor);

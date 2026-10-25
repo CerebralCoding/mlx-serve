@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const abi = @import("../../abi/engine.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
+const model_mod = @import("../../sdk/config/model.zig");
 const KVQuantConfig = @import("../../sdk/blocks/attention/kv_quant.zig").KVQuantConfig;
 const LoadedModel = @import("../registry/registry.zig").LoadedModel;
 const Conn = @import("../http/conn.zig").Conn;
@@ -11,25 +11,29 @@ const errors = @import("../http/errors.zig");
 const sendAnthropicError = @import("anthropic.zig").sendAnthropicError;
 
 const ModelConfig = model_mod.ModelConfig;
-const table = @import("../engines/served.zig").mlx_admission;
+const mlx_engine = @import("../engines/mlx.zig");
+
+fn table() *const @import("../../abi/engine.zig").Admission {
+    return mlx_engine.api().admission;
+}
 
 pub fn getEffectiveContextLength(config: *const ModelConfig) u32 {
-    return table.context(config);
+    return table().context(config);
 }
 
 /// The largest context that fits right now, before the advertised one's headroom (`/props`).
 pub fn computeMaxSafeContext(config: *const ModelConfig) u32 {
-    return table.max_safe_context(config);
+    return table().max_safe_context(config);
 }
 
 /// Freezes the model's auto-context; `announce` logs where it came from.
 pub fn pinAutoContext(config: *ModelConfig, announce: bool) u32 {
-    return table.pin_context(config, announce);
+    return table().pin_context(config, announce);
 }
 
 /// The hot prefix cache's resolved byte budget; 0 = none.
 pub fn resolvedPrefixCacheMem() u64 {
-    return table.cache_budget();
+    return table().cache_budget();
 }
 
 /// Whether the MLX-prefill attention-memory preflight applies to a request.
@@ -51,7 +55,7 @@ pub fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_
     if (!mlxMemoryGuardApplies(lm.engineBacked())) return true;
     const kv_bits: u8 = if (kv_override) |kv| (if (kv.isQuant()) kv.bits else 0) else abi.kv_configured;
     var bill: abi.Bill = .{};
-    if (table.admit(config, .of(lm.id), .of(prompt_ids), max_tokens, kv_bits, enable_mtp, media_bytes, &bill)) return true;
+    if (table().admit(config, .of(lm.id), .of(prompt_ids), max_tokens, kv_bits, enable_mtp, media_bytes, &bill)) return true;
     // A refusal quotes the numbers it compared, hot cache included; everything the cache holds
     // is evictable here by construction (the withheld case took the deferral arm).
     const msg = try errors.memoryRefusalMessage(allocator, prompt_ids.len, bill.needed / (1024 * 1024), bill.available / (1024 * 1024), bill);

@@ -330,7 +330,7 @@ pub inline fn cli() *CliState {
 }
 
 
-const model_mod = @import("model.zig");
+const model_mod = @import("../../sdk/config/model.zig");
 const log = @import("../../sdk/util/log.zig");
 const io_util_mod = @import("../../sdk/util/io_util.zig");
 const round_cost_mod = @import("spec/round_cost.zig");

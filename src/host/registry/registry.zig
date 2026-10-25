@@ -18,14 +18,9 @@
 
 const std = @import("std");
 const crt = @import("../../sdk/util/crt.zig");
-const distributed = @import("../../engines/mlx/cluster/distributed.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
-const transformer_mod = @import("../../engines/mlx/transformer.zig");
+const model_mod = @import("../../sdk/config/model.zig");
 const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
 const chat_mod = @import("../chat/chat.zig");
-const vision_mod = @import("../../engines/mlx/vision_encoder.zig");
-const drafter_mod = @import("../../plugins/gemma4/assistant_drafter.zig");
-const prefix_cache_mod = @import("../../engines/mlx/cache/prefix_cache.zig");
 const tokenize_cache_mod = @import("../tokenizer/cache.zig");
 const token_mask_mod = @import("../../sdk/grammar/token_mask.zig");
 const rp_mod = @import("../../sdk/grammar/protocol.zig");
@@ -34,9 +29,9 @@ const io_util = @import("../../sdk/util/io_util.zig");
 const load_progress = @import("load_progress.zig");
 const Served = @import("../engines/served.zig").Served;
 const gen_mod = @import("../media_jobs/gen.zig");
-const generate_mod = @import("../../engines/mlx/generate.zig");
 const log = @import("../../sdk/util/log.zig");
-const mlx_stream = if (@import("build_options").mlx_stream) @import("../../engines/mlx/modules/stream_glue.zig") else @import("../../engines/mlx/modules/stream_stub.zig");
+const handles = @import("../../abi/mlx_handles.zig");
+const mlx_engine = @import("../engines/mlx.zig");
 
 /// Bumped every time a model becomes `.ready`; readers compare against the value they last acted on.
 pub var load_generation = std.atomic.Value(u64).init(0);
@@ -64,18 +59,16 @@ pub var last_unload: UnloadMark = .{};
 
 pub const monotonicMs = crt.monotonicMs;
 
-const Transformer = transformer_mod.Transformer;
+const Transformer = handles.Transformer;
 const Weights = model_mod.Weights;
 const ModelConfig = model_mod.ModelConfig;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const ChatConfig = chat_mod.ChatConfig;
-const VisionEncoder = vision_mod.VisionEncoder;
-const DrafterModel = drafter_mod.DrafterModel;
-const dflash_mod = @import("../../engines/mlx/spec/dflash/dflash.zig");
-const DflashModel = dflash_mod.DflashModel;
+const VisionEncoder = handles.VisionEncoder;
+const DrafterModel = handles.DrafterModel;
+const DflashModel = handles.DflashModel;
 const mtp_mod = @import("../../sdk/spec/mtp/mtp.zig");
-const MtpModel = mtp_mod.MtpModel;
-const HotPrefixCache = prefix_cache_mod.HotPrefixCache;
+const HotPrefixCache = handles.HotPrefixCache;
 const TokenizeCache = tokenize_cache_mod.TokenizeCache;
 
 /// Lifecycle of an entry. State transitions are guarded by `ModelRegistry.mutex`;
@@ -205,13 +198,13 @@ pub const LoadedModel = struct {
     /// The model's MTP head, when it has one: a Qwen sidecar / in-checkpoint
     /// head auto-loaded from the model dir, or an arch whose head is part of
     /// its own trunk. Null when neither is present.
-    mtp: ?generate_mod.MtpHeadRef = null,
+    mtp: ?*handles.MtpHeadRef = null,
     /// Default draft depth for MTP rounds (CLI `--mtp-max-depth`).
     mtp_depth: u32 = mtp_mod.DEFAULT_DEPTH,
     /// Per-model hot prefix cache — plan 05 drops the module-global hot
     /// cache. `model_id`-keyed isolation falls out of "one cache per
     /// LoadedModel" by construction.
-    prefix_cache: ?HotPrefixCache,
+    prefix_cache: ?*HotPrefixCache,
     /// Phase 1 (perf-plan): SSM/conv state snapshot stride during prefill,
     /// in tokens. 0 = disabled (hybrid models bypass the hot prefix cache,
     /// preserving legacy behavior). Non-zero enables multi-turn warm reuse
@@ -366,7 +359,7 @@ pub const LoadedModel = struct {
         return e.kind == .ds4 or e.kind == .llama;
     }
 
-    fn closeEngine(self: *LoadedModel) void {
+    pub fn closeEngine(self: *LoadedModel) void {
         self.session_claims = 0;
         const e = self.engine orelse return;
         e.close();
@@ -387,48 +380,7 @@ pub const LoadedModel = struct {
             self.media_plugin = null;
         }
         self.gen_busy = false;
-        if (self.mtp) |h| {
-            // The Qwen sidecar and the GLM head are separately allocated; an
-            // in-trunk head would be owned by the Transformer and freed with
-            // it — destroying it here would double-free the whole model.
-            switch (h) {
-                .qwen => |q| {
-                    q.deinit();
-                    self.allocator.destroy(q);
-                },
-                .qwen4 => {}, // in-trunk head, owned by the Transformer
-                .plugin => |m| {
-                    m.deinit();
-                    self.allocator.destroy(m);
-                },
-            }
-            self.mtp = null;
-        }
-        if (self.drafter) |d| {
-            d.deinit();
-            self.allocator.destroy(d);
-            self.drafter = null;
-        }
-        if (self.dflash) |d| {
-            d.deinit();
-            self.allocator.destroy(d);
-            self.dflash = null;
-        }
-        if (self.vision_encoder) |v| {
-            v.deinit();
-            self.allocator.destroy(v);
-            self.vision_encoder = null;
-        }
-        if (self.transformer) |x| {
-            x.deinit();
-            self.allocator.destroy(x);
-            self.transformer = null;
-        }
-        if (self.weights) |w| {
-            w.deinit();
-            self.allocator.destroy(w);
-            self.weights = null;
-        }
+        mlx_engine.api().free_model_state(self);
         if (self.token_bytes) |*tb| {
             // Decoded from `tokenizer`'s vocabulary — same lifetime, freed
             // first so the table never outlives the ids it describes.
@@ -454,10 +406,6 @@ pub const LoadedModel = struct {
             c.deinit(self.allocator);
             self.allocator.destroy(c);
             self.config = null;
-        }
-        if (self.prefix_cache) |*hc| {
-            hc.deinit();
-            self.prefix_cache = null;
         }
         if (self.tokenize_cache) |*tc| {
             tc.deinit();
@@ -485,6 +433,12 @@ pub const LoadedModel = struct {
     /// serialises this against `grammarTokenBytes` and the tokenize cache is
     /// the REFCOUNT, not their own mutexes — a reload cannot begin until every
     /// borrower has released.
+    /// Free only the MLX-allocating state, leaving CPU-only fields (config/tokenizer/chat_config) and the
+    /// discovery stub intact: eviction keeps the entry `.unloaded` for later listing and reload. Inference thread.
+    pub fn unloadResident(self: *LoadedModel) void {
+        mlx_engine.api().unload_resident(self);
+    }
+
     pub fn releaseRetainedCpuState(self: *LoadedModel) void {
         // The reader contract is only sound while one of these holds: the entry
         // is mid-reload, or it has never published CPU state at all (the boot
@@ -518,84 +472,6 @@ pub const LoadedModel = struct {
         }
     }
 
-    /// Free only the mlx-allocating state (weights/transformer/vision/
-    /// drafter/prefix_cache), leaving CPU-only fields (config/tokenizer/
-    /// chat_config) AND the discovery stub (id/path/bytes_on_disk) intact.
-    /// Used by eviction so the registry keeps the entry around as
-    /// `.unloaded` for later listing/reload, AND by `Scheduler.deinit` so
-    /// mlx frees happen on the inference thread.
-    pub fn unloadResident(self: *LoadedModel) void {
-        // A Thunderbolt pair's model unloads on both Macs; its next load plans again.
-        if (distributed.serves(self.path)) distributed.release();
-        self.closeEngine();
-        if (self.media_plugin) |e| {
-            e.deinit();
-            self.media_plugin = null;
-        }
-        self.gen_busy = false;
-        if (self.mtp) |h| {
-            // The Qwen sidecar and the GLM head are separately allocated; an
-            // in-trunk head would be owned by the Transformer and freed with
-            // it — destroying it here would double-free the whole model.
-            switch (h) {
-                .qwen => |q| {
-                    q.deinit();
-                    self.allocator.destroy(q);
-                },
-                .qwen4 => {}, // in-trunk head, owned by the Transformer
-                .plugin => |m| {
-                    m.deinit();
-                    self.allocator.destroy(m);
-                },
-            }
-            self.mtp = null;
-        }
-        if (self.drafter) |d| {
-            d.deinit();
-            self.allocator.destroy(d);
-            self.drafter = null;
-        }
-        if (self.dflash) |d| {
-            d.deinit();
-            self.allocator.destroy(d);
-            self.dflash = null;
-        }
-        if (self.vision_encoder) |v| {
-            v.deinit();
-            self.allocator.destroy(v);
-            self.vision_encoder = null;
-        }
-        if (self.transformer) |x| {
-            x.deinit();
-            self.allocator.destroy(x);
-            self.transformer = null;
-        }
-        if (self.weights) |w| {
-            w.deinit();
-            self.allocator.destroy(w);
-            self.weights = null;
-        }
-        if (self.prefix_cache) |*hc| {
-            hc.deinit();
-            self.prefix_cache = null;
-        }
-        if (self.drafter_path.len > 0) {
-            self.allocator.free(self.drafter_path);
-            self.drafter_path = "";
-        }
-        self.drafter_block_size = 0;
-        if (self.bytes_resident > 0) last_unload.record(monotonicMs(), self.bytes_resident);
-        self.bytes_resident = 0;
-        // The prefill-chunk pin was resolved from LIVE memory at load, so it
-        // can be stale-narrow (pinned while a since-evicted model was
-        // resident). Widening a RESIDENT model's pin would let a prefill run
-        // wider than a bill the guard already issued, so the re-resolve rides
-        // the reload: clear it here and the next load's `server.pinPrefillChunk`
-        // re-pins from then-current memory. `pinned_context` stays — clients
-        // budget against it for the whole session.
-        if (self.config) |c| c.pinned_prefill_chunk = 0;
-        self.state = .unloaded;
-    }
 };
 
 /// Snapshot of a single entry, returned by `ModelRegistry.snapshot` for
@@ -1116,7 +992,7 @@ pub const ModelRegistry = struct {
         } else {
             self.current_resident_bytes = 0;
         }
-        mlx_stream.setForeignBytes(self.streamForeignBytesLocked());
+        mlx_engine.api().set_foreign_bytes(self.streamForeignBytesLocked());
     }
 
     /// A stream pack whose plugin module reads the process's foreign-bytes value (`mlx_stream.setForeignBytes`):
@@ -1209,7 +1085,7 @@ pub const ModelRegistry = struct {
             if (entry.refcount.load(.acquire) != 0) continue;
             if (std.mem.eql(u8, entry.id, exclude_id)) continue;
             if (slot_only and !takesSlot(entry)) continue;
-            if (distributed.holds(entry.path)) continue;
+            if (mlx_engine.api().holds_pair(entry.path)) continue;
             if (entry.last_used_ns < best_used) {
                 best_used = entry.last_used_ns;
                 best = entry;
@@ -1224,7 +1100,7 @@ pub const ModelRegistry = struct {
     pub fn idleEvictable(entry: *LoadedModel, now_ms: i64, window_ms: i64) bool {
         if (entry.state != .ready) return false;
         if (entry.refcount.load(.acquire) != 0) return false;
-        if (distributed.holds(entry.path)) return false;
+        if (mlx_engine.api().holds_pair(entry.path)) return false;
         // `now_ms - used` and not `used < deadline`: the boot clock's epoch
         // is arbitrary, so the subtraction is the only meaningful form.
         return now_ms - entry.last_used_ms.load(.acquire) >= window_ms;
@@ -1268,7 +1144,7 @@ pub const ModelRegistry = struct {
         // tick, undoing an explicit /v1/load-model the moment it finished.
         entry.last_used_ms.store(io_util.nowMsMonotonic(self.io), .release);
         self.current_resident_bytes += bytes_resident;
-        mlx_stream.setForeignBytes(self.streamForeignBytesLocked());
+        mlx_engine.api().set_foreign_bytes(self.streamForeignBytesLocked());
         // Headless default promotion: a server started without --model has no
         // default, so requests addressing the "mlx-serve" alias (the app's
         // chat/avatar surfaces, Claude Code) 503 with no_model even after the
@@ -1385,7 +1261,7 @@ pub const ModelRegistry = struct {
     }
 
     fn liveBytesFreed(v: *const LoadedModel) u64 {
-        return v.bytes_resident +| if (v.prefix_cache) |*hc| hc.residentBytes() else 0;
+        return v.bytes_resident +| mlx_engine.api().hot_cache_bytes(v);
     }
 
     /// Idle models a load needing `need` bytes of RAM unloads with `room` free, oldest first: as few
@@ -1402,7 +1278,7 @@ pub const ModelRegistry = struct {
             const e = entry_ptr.*;
             if (e.state != .ready or e.refcount.load(.acquire) != 0 or std.mem.eql(u8, e.id, exclude_id)) continue;
             if (e.servesGguf() or n_idle == idle.len) continue;
-            if (distributed.holds(e.path)) continue;
+            if (mlx_engine.api().holds_pair(e.path)) continue;
             idle[n_idle] = e;
             n_idle += 1;
             reachable +|= e.bytes_resident;
@@ -2211,8 +2087,10 @@ test "planEvictions: an idle victim's prefix cache counts as freed live memory (
     var reg = try ModelRegistry.init(testing.allocator, io, null, 1, 100, null);
     defer reg.deinit();
     const a = try makeReadyStub(reg, "a", 40);
-    a.prefix_cache = HotPrefixCache.init(testing.allocator, 4);
-    a.prefix_cache.?.current_kv_bytes = 50;
+    const hc = try testing.allocator.create(HotPrefixCache);
+    hc.* = HotPrefixCache.init(testing.allocator, 4);
+    hc.current_kv_bytes = 50;
+    a.prefix_cache = hc;
     const b = try beginLoad(reg, "b", 50);
 
     reg.mutex.lockUncancelable(io);

@@ -1,9 +1,9 @@
 //! Stamps per-model settings onto a config at every load site.
 
 const std = @import("std");
-const model_mod = @import("../../engines/mlx/model.zig");
-const chat_mod = @import("../chat/chat.zig");
-const model_settings = @import("model_settings.zig");
+const model_mod = @import("../../../sdk/config/model.zig");
+const chat_mod = @import("../../../host/chat/chat.zig");
+const model_settings = @import("../../../host/registry/model_settings.zig");
 const ModelConfig = model_mod.ModelConfig;
 const ChatConfig = chat_mod.ChatConfig;
 const testing = std.testing;

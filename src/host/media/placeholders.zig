@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const chat_mod = @import("../chat/chat.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
+const model_mod = @import("../../sdk/config/model.zig");
 const radio_vision = @import("../../plugins/nemotron_h/radio_vision.zig");
 const MediaSpan = @import("../../sdk/kv/media_span.zig").MediaSpan;
 const testing = std.testing;

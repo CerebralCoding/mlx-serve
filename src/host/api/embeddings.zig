@@ -2,11 +2,9 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const transformer_mod = @import("../../engines/mlx/transformer.zig");
-const generate_mod = @import("../../engines/mlx/generate.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
+const model_mod = @import("../../sdk/config/model.zig");
 const log = @import("../../sdk/util/log.zig");
-const scheduler_mod = @import("../../engines/mlx/scheduler.zig");
+const scheduler_mod = @import("../gpu_thread/requests.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const LoadedModel = model_registry_mod.LoadedModel;
 const testing = std.testing;
@@ -85,10 +83,10 @@ pub fn handleEmbeddings(
 ) !void {
     // Engine-backed (GGUF/ds4) models have no MLX transformer and both embed
     // paths forward through it: refuse by name before anything is queued.
-    const xfm = lm.transformer orelse {
+    if (lm.transformer == null) {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "This model runs on an embedded engine (GGUF); embeddings are not supported. Load an MLX embedding model instead.", null);
         return;
-    };
+    }
     const tok = lm.tokenizer.?;
     const config = lm.config.?;
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
@@ -188,7 +186,7 @@ pub fn handleEmbeddings(
         }
     }
 
-    const embeddings = (try embeddingRows(allocator, stream, lm, xfm, seqs.items, null)) orelse return;
+    const embeddings = (try embeddingRows(allocator, stream, lm, seqs.items, null)) orelse return;
     defer {
         for (embeddings) |e| allocator.free(e);
         allocator.free(embeddings);
@@ -225,41 +223,28 @@ fn embeddingLimitReject(buf: []u8, config: *const model_mod.ModelConfig, index: 
     return embedOverflowMessage(buf, index, tokens, limit);
 }
 
-/// Phase A: route through scheduler when available so the encoder forward pass runs on the inference thread
-/// (mlx 0.31.2 thread-local streams). Falls back to a direct call only in the offline path where no scheduler
-/// exists. `computeEmbeddingsBatch` resets the KV cache before every sub-batch on both paths. `vision` (one
-/// prompt's soft tokens) passes to the request, whose inference-thread side frees it. Null after the 500.
+/// The encoder forward runs on the GPU thread (the one MLX caller); every sub-batch resets the KV cache. `vision` (one
+/// prompt's soft tokens) passes to the request, whose GPU-thread side frees it. Null after the 500.
 fn embeddingRows(
     allocator: std.mem.Allocator,
     stream: *Conn,
     lm: *LoadedModel,
-    xfm: *transformer_mod.Transformer,
     seqs: []const []const u32,
     vision: ?mlx.mlx_array,
 ) !?[][]f32 {
-    if (http_server.global_scheduler) |sch| {
-        var req = scheduler_mod.EmbedRequest{
-            .model = lm,
-            .token_seqs = seqs,
-            .vision_embeddings = vision,
-            .allocator = allocator,
-        };
-        return sch.computeEmbeddings(&req) catch |err| {
-            if (req.error_name) |e| {
-                log.err("  embedding error: {s}\n", .{e});
-                allocator.free(e);
-            } else {
-                log.err("  embedding error: {}\n", .{err});
-            }
-            try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "Failed to compute embedding", null);
-            return null;
-        };
-    }
-    defer if (vision) |v| {
-        _ = mlx.mlx_array_free(v);
+    var req = scheduler_mod.EmbedRequest{
+        .model = lm,
+        .token_seqs = seqs,
+        .vision_embeddings = vision,
+        .allocator = allocator,
     };
-    return generate_mod.computeEmbeddingsBatchWith(allocator, xfm, seqs, vision) catch |err| {
-        log.err("  embedding error: {}\n", .{err});
+    return http_server.global_scheduler.?.computeEmbeddings(&req) catch |err| {
+        if (req.error_name) |e| {
+            log.err("  embedding error: {s}\n", .{e});
+            allocator.free(e);
+        } else {
+            log.err("  embedding error: {}\n", .{err});
+        }
         try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "Failed to compute embedding", null);
         return null;
     };
@@ -338,7 +323,6 @@ fn handleMessagesEmbedding(
     req_dims: ?usize,
     model_name: []const u8,
 ) !void {
-    const xfm = lm.transformer.?;
     const config = lm.config.?;
     if (messages_val != .array or messages_val.array.items.len == 0) {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'messages' must be a non-empty array", null);
@@ -389,7 +373,7 @@ fn handleMessagesEmbedding(
     // The request owns the soft tokens from here on: its inference-thread side frees them.
     const vision = mm.embeddings;
     mm.embeddings = null;
-    const embeddings = (try embeddingRows(allocator, stream, lm, xfm, &seqs, vision)) orelse return;
+    const embeddings = (try embeddingRows(allocator, stream, lm, &seqs, vision)) orelse return;
     defer {
         for (embeddings) |e| allocator.free(e);
         allocator.free(embeddings);

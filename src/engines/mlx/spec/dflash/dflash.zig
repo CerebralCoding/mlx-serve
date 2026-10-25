@@ -31,7 +31,7 @@ const env = @import("../../../../env.zig");
 const kernelSource = @import("../../../../mlx/kernels.zig").source;
 const mlx = @import("../../../../mlx/ffi.zig");
 const log = @import("../../../../sdk/util/log.zig");
-const model_mod = @import("../../model.zig");
+const model_mod = @import("../../../../sdk/config/model.zig");
 const transformer_mod = @import("../../transformer.zig");
 const plugin_driver = @import("../../plugin/driver.zig");
 // The chunked row requantizer + its packed-triple handle are shared with the
@@ -142,9 +142,7 @@ pub const DflashConfig = struct {
 /// Does this config.json declare the DFlash contract? ALL THREE fields must
 /// be present — `model_type` (`*_assistant`) is only the discovery-level
 /// "this is a drafter" signal, never the DFlash detection.
-pub fn isDflashConfigJson(root: std.json.ObjectMap) bool {
-    return dflashContractObject(root) != null;
-}
+pub const isDflashConfigJson = contract.isDflashConfigJson;
 
 /// The object holding the DFlash contract triple: DFlash2 checkpoints nest it
 /// under `dflash_config`, v1 assistants declare it at the root. Null when
@@ -153,31 +151,9 @@ pub fn isDflashConfigJson(root: std.json.ObjectMap) bool {
 /// splits the triple across both (`block_size` at the root, the rest under
 /// `dflash_config`), so neither object alone answers the question and a
 /// nested-only reader silently classifies the sidecar as "not a drafter".
-const Contract = struct {
-    nested: ?std.json.ObjectMap,
-    root: std.json.ObjectMap,
-
-    fn get(self: Contract, key: []const u8) ?std.json.Value {
-        if (self.nested) |n| {
-            if (n.get(key)) |v| return v;
-        }
-        return self.root.get(key);
-    }
-};
-
-fn dflashContractObject(root: std.json.ObjectMap) ?Contract {
-    const nested: ?std.json.ObjectMap = blk: {
-        if (root.get("dflash_config")) |dc| {
-            if (dc == .object) break :blk dc.object;
-        }
-        break :blk null;
-    };
-    const c = Contract{ .nested = nested, .root = root };
-    if (c.get("block_size") == null) return null;
-    if (c.get("mask_token_id") == null) return null;
-    if (c.get("target_layer_ids") == null) return null;
-    return c;
-}
+const contract = @import("../../../../sdk/spec/dflash_contract.zig");
+const Contract = contract.Contract;
+const dflashContractObject = contract.object;
 
 /// The width a DFlash sidecar at `dir` is quantized to at load: 0 when it is
 /// not one, ships packed already (`quantization` in its config) or loads dense.
@@ -4878,4 +4854,22 @@ test "dflash2: a quantized selector codebook is refused at load, not at the firs
     try TinyFix.writeAssistant2(io, tmp.dir, dir_path, s, true);
 
     try testing.expectError(error.InvalidDflashCodebook, loadDflashQuant(io, allocator, s, dir_path, 0));
+}
+
+test "dflash: native LiLiCorr configs preserve borrowed and own output heads" {
+    const cases = [_]struct { source: []const u8, own_head: bool, captures: []const u32 }{
+        .{ .source = @embedFile("../../../../fixtures/lilicorr_config.json"), .own_head = false, .captures = &.{ 0, 17, 34, 50, 67, 84 } },
+        .{ .source = @embedFile("../../../../fixtures/model-configs/nemotron_h_super_drafter.json"), .own_head = true, .captures = &.{ 0, 21, 42, 63, 84 } },
+    };
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, case.source, .{});
+        defer parsed.deinit();
+        try testing.expect(isDflashConfigJson(parsed.value.object));
+        var config = try parseConfigFromJson(testing.allocator, case.source);
+        defer config.deinit(testing.allocator);
+        try testing.expect(config.lilicorr);
+        try testing.expectEqual(case.own_head, config.has_own_lm_head);
+        if (case.own_head) try testing.expectEqual(@as(u32, 131072), config.draft_vocab_size);
+        try testing.expectEqualSlices(u32, case.captures, config.captureIds());
+    }
 }

@@ -9,7 +9,7 @@ const std = @import("std");
 const env = @import("../../env.zig");
 const crt = @import("../../sdk/util/crt.zig");
 const build_options = @import("build_options");
-const model_mod = @import("../../engines/mlx/model.zig");
+const model_mod = @import("../../sdk/config/model.zig");
 const mtp_mod = @import("../../sdk/spec/mtp/source.zig");
 const log = @import("../../sdk/util/log.zig");
 

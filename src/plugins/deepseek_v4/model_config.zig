@@ -2,7 +2,7 @@
 //! the same names one to one plus the family's constants. Pinned field for field against the engine's own parse.
 
 const std = @import("std");
-const model = @import("../../engines/mlx/model.zig");
+const model = @import("../../sdk/config/model.zig");
 const Config = @import("config.zig").Config;
 
 /// `dir` becomes the config's owned `pack_dir` (V4.1 opens its Engram tables there); `ModelConfig.deinit` frees it.

@@ -2,14 +2,13 @@
 
 const std = @import("std");
 const chat_mod = @import("../chat/chat.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
+const model_mod = @import("../../sdk/config/model.zig");
 const qwen_vision = @import("../../sdk/vision/qwen_vision.zig");
 const muse_vision = @import("../../plugins/muse_glimmer/vision.zig");
 const lfm2_vision = @import("../../plugins/lfm2/vision.zig");
 const glm_vision = @import("../../plugins/glm5_next/vision.zig");
 const dsv41_vision = @import("../../plugins/deepseek_v41/vision.zig");
 const radio_vision = @import("../../plugins/nemotron_h/radio_vision.zig");
-const vision_mod = @import("../../engines/mlx/vision_encoder.zig");
 const log = @import("../../sdk/util/log.zig");
 const stb = @import("stb");
 const webp = @import("webp");

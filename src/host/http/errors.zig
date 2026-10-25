@@ -3,7 +3,10 @@
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../sdk/util/log.zig");
-const scheduler_mod = @import("../../engines/mlx/scheduler.zig");
+const Scheduler = @import("../gpu_thread/scheduler.zig").Scheduler;
+const Stream = @import("../engines/stream.zig").Stream;
+const mlx_engine = @import("../engines/mlx.zig");
+const err_name = @import("../../sdk/util/err_name.zig");
 const instr = @import("../metrics/metrics.zig");
 const testing = std.testing;
 const http_server = @import("server.zig");
@@ -16,14 +19,14 @@ const jsonEscape = @import("../api/format.zig").jsonEscape;
 const sendAnthropicError = @import("../api/anthropic.zig").sendAnthropicError;
 const sendAnthropicEvent = @import("../api/anthropic.zig").sendAnthropicEvent;
 const sendResponsesEvent = @import("../api/responses/events.zig").sendResponsesEvent;
-const engine_requests = @import("../engines/requests.zig");
+const engine_requests = @import("../engines/refusal.zig");
 
 /// A slot that errored reports why: the MLX error latch's `error.OutOfMemory` is a memory
 /// failure the operator can act on. One helper for the three slot-drain sites.
-pub fn slotFailure(slot: *scheduler_mod.Slot) anyerror {
+pub fn slotFailure(slot: *Stream) anyerror {
     // A pre-prefill admission refusal is not an abandoned generation: the client gets a 400.
     if (slot.errorNameIs("PrefillDoesNotFit")) {
-        prefill_refusal = if (slot.refused_bill) |bill| .{ .tokens = slot.full_prompt.len, .needed = bill[0], .available = bill[1] } else null;
+        prefill_refusal = if (slot.refused_bill) |bill| .{ .tokens = slot.prompt_len, .needed = bill[0], .available = bill[1] } else null;
         return error.PrefillDoesNotFit;
     }
     if (slot.errorNameIs("PromptLogprobsUnavailable")) return error.PromptLogprobsUnavailable;
@@ -309,7 +312,7 @@ pub const insufficient_free_memory_message =
     "Close other apps or models and retry (the server log names the peak estimate and available memory), or pass --skip-mem-preflight to override.";
 
 /// The response for a failed `Scheduler.ensureLoaded(id)`.
-pub fn sendEnsureLoadedError(allocator: std.mem.Allocator, stream: *Conn, sched: *scheduler_mod.Scheduler, id: []const u8, err: anyerror) !void {
+pub fn sendEnsureLoadedError(allocator: std.mem.Allocator, stream: *Conn, sched: *Scheduler, id: []const u8, err: anyerror) !void {
     switch (err) {
         error.UnknownModelId => try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "Unknown model id", 404),
         error.NotLoaded => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "model_not_loaded", "Requested model is not currently loaded", 503),
@@ -326,8 +329,10 @@ pub fn sendEnsureLoadedError(allocator: std.mem.Allocator, stream: *Conn, sched:
         // 500 with the error name so the client gets a clean failure
         // instead of a hung connection.
         else => {
-            log.warn("  -> 500 ({s}) while loading {s}\n", .{ @errorName(err), id });
-            const msg = std.fmt.allocPrint(allocator, "Failed to load model: {s}", .{@errorName(err)}) catch {
+            // An error the engine named without this unit knowing it arrives as `EngineFailed`, its name kept aside.
+            const name = if (err == error.EngineFailed) err_name.last else @errorName(err);
+            log.warn("  -> 500 ({s}) while loading {s}\n", .{ name, id });
+            const msg = std.fmt.allocPrint(allocator, "Failed to load model: {s}", .{name}) catch {
                 try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", "Failed to load model", 500);
                 return;
             };
@@ -340,8 +345,8 @@ pub fn sendEnsureLoadedError(allocator: std.mem.Allocator, stream: *Conn, sched:
 /// #144: `error.LoadFailed` used to surface as a bare "Model load failed" for
 /// every on-demand load failure — the inference thread's error name was
 /// dropped at the thread boundary. The registry keeps it; echo it.
-fn sendLoadFailedResponse(allocator: std.mem.Allocator, stream: *Conn, sched: *scheduler_mod.Scheduler, id: []const u8) !void {
-    if (sched.loadErrorName(allocator, id)) |name| {
+fn sendLoadFailedResponse(allocator: std.mem.Allocator, stream: *Conn, sched: *Scheduler, id: []const u8) !void {
+    if (mlx_engine.api().load_error_name(sched, allocator, id)) |name| {
         defer allocator.free(name);
         if (std.fmt.allocPrint(allocator, "Model load failed: {s}", .{name}) catch null) |msg| {
             defer allocator.free(msg);
@@ -502,7 +507,7 @@ test "a streaming fault answers with the SAME mapped error a non-streaming one d
     }
     {
         // What a model's engine cannot honor is the request's shape, not a fault, and the message names it.
-        engine_requests.refused = .{ .kind = .ane, .cap = "logprobs" };
+        engine_requests.refused().* = .{ .kind = .ane, .cap = "logprobs" };
         const w = mapGenerationError(error.EngineUnsupported, &buf);
         try t.expectEqual(@as(u32, 400), w.code);
         try t.expectEqualStrings("invalid_request_error", w.anthropic_type);

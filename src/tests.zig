@@ -108,10 +108,10 @@ test {
     _ = @import("host/chat/chat.zig");
     _ = @import("engines/llama/engine.zig");
     _ = @import("host/engines/served.zig");
-    _ = @import("host/engines/requests.zig");
+    _ = @import("engines/mlx/runtime/offload.zig");
     _ = @import("host/engines/stream.zig");
     _ = @import("host/engines/prompt.zig");
-    _ = @import("host/engines/load.zig");
+    _ = @import("engines/mlx/runtime/engine_load.zig");
     _ = @import("host/chat/format_corpus_test.zig");
     _ = @import("host/chat/tool_traffic_replay_test.zig");
     _ = @import("engines/mlx/spec/mtp_replay_test.zig");
@@ -126,7 +126,7 @@ test {
     _ = @import("engines/mlx/admission/prefill_chunk.zig");
     _ = @import("sdk/kv/media_span.zig");
     _ = @import("host/api/generation_settings.zig");
-    _ = @import("engines/mlx/model.zig");
+    _ = @import("sdk/config/model.zig");
     _ = @import("engines/mlx/generate.zig");
     _ = @import("engines/mlx/transformer.zig");
     _ = @import("engines/mlx/vision_encoder.zig");
@@ -230,7 +230,7 @@ test {
     _ = @import("engines/mlx/cache/restore_dump.zig");
     _ = @import("host/metrics/metrics.zig");
     _ = @import("sdk/util/system.zig");
-    _ = @import("host/gpu_thread/sleep_inhibit.zig");
+    _ = @import("engines/mlx/runtime/sleep_inhibit.zig");
     _ = @import("engines/mlx/cache/ssd/disk_tier.zig");
     _ = @import("engines/mlx/cache/ssd/writer.zig");
     _ = @import("host/registry/discovery.zig");

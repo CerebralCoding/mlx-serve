@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const model_mod = @import("../model.zig");
+const model_mod = @import("../../../sdk/config/model.zig");
 const Weights = @import("../../../sdk/weights/resident.zig").Weights;
 const ModelConfig = model_mod.ModelConfig;
 const adaptMimoHeads = @import("../../../sdk/quant/exl3/sushi_pack.zig").adaptMimoHeads;

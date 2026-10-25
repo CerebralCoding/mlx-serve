@@ -554,7 +554,7 @@ fn writeHistogramJson(w: *std.Io.Writer, name: []const u8, hist: anytype, scale:
 /// Safe to add from any thread; use load() to snapshot.
 /// Label per `scheduler.BatchVerdict` tag; `.ok` is not a serial reason and renders nothing.
 pub const SERIAL_REASONS = blk: {
-    const V = @import("../../engines/mlx/scheduler.zig").BatchVerdict;
+    const V = @import("../gpu_thread/scheduler.zig").BatchVerdict;
     const fields = @typeInfo(V).@"enum".field_names;
     var names: [fields.len][]const u8 = undefined;
     for (fields, 0..) |f, i| names[i] = if (std.mem.eql(u8, f, "ok")) "" else f;
@@ -972,7 +972,7 @@ test "ngram_warm_bytes is a zero-when-off gauge on both surfaces" {
 test "decode_serial_total carries one labelled series per serial reason, never ok" {
     const testing = std.testing;
     var m = Metrics.init();
-    m.decode_serial_total[@intFromEnum(@import("../../engines/mlx/scheduler.zig").BatchVerdict.spec_active)].add(3);
+    m.decode_serial_total[@intFromEnum(@import("../gpu_thread/scheduler.zig").BatchVerdict.spec_active)].add(3);
     m.batched_group_size.set(2);
 
     var buf: [64 * 1024]u8 = undefined;

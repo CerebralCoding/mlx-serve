@@ -3,9 +3,9 @@
 
 const std = @import("std");
 const kv_quant_mod = @import("../../sdk/blocks/attention/kv_quant.zig");
-const cache = @import("../../engines/mlx/kv/cache.zig");
+const cache = @import("../../sdk/kv/cache.zig");
 const generation_settings = @import("generation_settings.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
+const model_mod = @import("../../sdk/config/model.zig");
 const log = @import("../../sdk/util/log.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const LoadedModel = model_registry_mod.LoadedModel;

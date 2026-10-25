@@ -3,7 +3,7 @@
 const std = @import("std");
 const testing = std.testing;
 
-const scheduler_mod = @import("../../engines/mlx/scheduler.zig");
+const scheduler_mod = @import("../scheduler.zig");
 
 /// Which drafter directory a COLD load should use.
 ///

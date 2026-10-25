@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const model = @import("../../engines/mlx/model.zig");
+const model = @import("../../sdk/config/model.zig");
 const qwen4_mod = @import("qwen4_exp.zig");
 const mtp = @import("mtp.zig");
 const distributed_mod = @import("../../engines/mlx/cluster/distributed.zig");

@@ -2,7 +2,7 @@
 //! it: the same names one to one plus the arch's constants. Pinned field for field against the engine's own parse.
 
 const std = @import("std");
-const model = @import("../../engines/mlx/model.zig");
+const model = @import("../../sdk/config/model.zig");
 const exl3 = @import("../../sdk/quant/exl3/format.zig");
 const qwen4_exp = @import("qwen4_exp.zig");
 const Config = @import("config.zig").Config;

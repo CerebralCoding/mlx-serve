@@ -4,9 +4,9 @@ const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const request_mod = @import("../../sdk/request/request.zig");
 const chat_mod = @import("../chat/chat.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
+const model_mod = @import("../../sdk/config/model.zig");
 const log = @import("../../sdk/util/log.zig");
-const scheduler_mod = @import("../../engines/mlx/scheduler.zig");
+const scheduler_mod = @import("../gpu_thread/requests.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const transcription_mod = @import("audio/transcription.zig");
 const forced_align_mod = @import("../../plugins/qwen3_asr/forced_align.zig");
@@ -16,6 +16,7 @@ const plugin_http = @import("../media_jobs/plugin/http.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
 const Stopwatch = io_util.Stopwatch;
 const http_server = @import("../http/server.zig");
+const mlx_engine = @import("../engines/mlx.zig");
 
 const Conn = @import("../http/conn.zig").Conn;
 const getTimeoutNs = @import("../http/server.zig").getTimeoutNs;
@@ -57,7 +58,7 @@ const DIARIZER_REPO = "mlx-community/Nemotron-3-Diarization-8bit";
 /// piece in a language the aligner lacks is one segment. diarized_json labels
 /// each word with the speaker Nemotron 3 Diarization hears over the whole clip.
 pub fn handleTranscriptions(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, content_type: []const u8, lm: *LoadedModel) !void {
-    const hears = if (lm.vision_encoder) |ve| ve.qwen_audio != null else false;
+    const hears = mlx_engine.facts(lm).hears;
     if (!hears) {
         log.warn("POST /v1/audio/transcriptions -> 400 (no audio tower)\n", .{});
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "This model does not transcribe audio: target a Qwen3-ASR model (and do not run it with --no-vision, which drops its audio tower)", 400);

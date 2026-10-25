@@ -7,7 +7,7 @@ const transformer_mod = @import("transformer.zig");
 const generate_mod = @import("generate.zig");
 const rp_mod = @import("../../sdk/grammar/protocol.zig");
 const drafter_mod = @import("../../plugins/gemma4/assistant_drafter.zig");
-const model_mod = @import("model.zig");
+const model_mod = @import("../../sdk/config/model.zig");
 const prefix_cache_mod = @import("cache/prefix_cache.zig");
 const metrics_mod = @import("../../host/metrics/metrics.zig");
 const model_registry_mod = @import("../../host/registry/registry.zig");
@@ -328,7 +328,7 @@ pub const Slot = struct {
             .drafter_block_size = params.drafter_block_size,
             .enable_mtp = params.enable_mtp,
             .allow_batch_mtp = params.allow_batch_mtp,
-            .mtp = params.mtp,
+            .mtp = if (params.mtp) |m| m.* else null,
             .mtp_depth = params.mtp_depth,
             .pld_draft_len = params.pld_draft_len,
             .pld_key_len = params.pld_key_len,
@@ -391,6 +391,8 @@ pub const Slot = struct {
     /// finished/errored it AND the connection thread has consumed the final
     /// `done`/`err` from `waitNext`).
     pub fn deinit(self: *Slot) void {
+        // A slot freed before its terminator (a cancel pulled into cleanup) still tells its stream it is done.
+        if (self.sink != null) self.emitFinished(.cancelled, null);
         if (self.model.transformer) |xfm| if (xfm.qwen4Trunk()) |t| t.markQsaPooledRopeStale();
         if (self.legacy_gen) |*gen| {
             gen.deinit(self.allocator);

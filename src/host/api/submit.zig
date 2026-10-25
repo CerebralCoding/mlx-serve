@@ -7,15 +7,16 @@ const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
 const request_mod = @import("../../sdk/request/request.zig");
 const log = @import("../../sdk/util/log.zig");
 const MediaSpan = @import("../../sdk/kv/media_span.zig").MediaSpan;
-const scheduler_mod = @import("../../engines/mlx/scheduler.zig");
+const Scheduler = @import("../gpu_thread/scheduler.zig").Scheduler;
+const mlx_engine = @import("../engines/mlx.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;
 const LoadedModel = model_registry_mod.LoadedModel;
 const http_server = @import("../http/server.zig");
 
 const Conn = @import("../http/conn.zig").Conn;
-const resolveKvAttnFused = @import("../../engines/mlx/request_options.zig").resolveKvAttnFused;
-const mtpCapable = @import("../../engines/mlx/request_options.zig").mtpCapable;
+const resolveKvAttnFused = @import("request_options.zig").resolveKvAttnFused;
+const mtpCapable = @import("request_options.zig").mtpCapable;
 const decodeTokens = @import("tokenize.zig").decodeTokens;
 const loopTrimmedIds = @import("../chat/tools/pipeline.zig").loopTrimmedIds;
 const slotFailure = @import("../http/errors.zig").slotFailure;
@@ -32,7 +33,7 @@ const MropeData = @import("../media/encode.zig").MropeData;
 /// its own `defer` doesn't double-free.
 pub fn nonStreamingViaScheduler(
     allocator: std.mem.Allocator,
-    sch: *scheduler_mod.Scheduler,
+    sch: *Scheduler,
     lm: *LoadedModel,
     tok: *const Tokenizer,
     prompt_ids: []const u32,
@@ -63,7 +64,7 @@ pub fn nonStreamingViaScheduler(
     /// instead of grinding out a ghost generation nobody will read.
     conn: ?*Conn,
 ) !request_mod.GenerationResult {
-    var slot = try sch.submit(.{
+    const running = try mlx_engine.Running.submit(sch, .{
         .model = lm,
         .prompt_ids = prompt_ids,
         .full_prompt = full_prompt,
@@ -97,7 +98,8 @@ pub fn nonStreamingViaScheduler(
         .prompt_logprobs = prompt_logprobs,
         .kv_quant_config = kv_quant_override,
     });
-    defer sch.complete(slot);
+    defer running.done();
+    const slot = running.stream;
 
     var output_ids = std.ArrayList(u32).empty;
     defer output_ids.deinit(allocator);

@@ -33,7 +33,7 @@ pub fn quantizeHeadMxfp8(weights: *Weights, key: []const u8, w: mlx.mlx_array, s
 
 // ── tests ──
 
-const model_mod = @import("../../engines/mlx/model.zig");
+const model_mod = @import("../config/model.zig");
 const plugin_driver = @import("../../engines/mlx/plugin/driver.zig");
 
 // Bar: the default is on only where measured (Flash Next, quantized pack, integrated CUDA); a flag beats it, a model setting beats both.

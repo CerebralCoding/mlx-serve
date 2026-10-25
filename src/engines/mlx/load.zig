@@ -10,7 +10,7 @@ const drafter_mod = @import("../../plugins/gemma4/assistant_drafter.zig");
 const mtp_graft = @import("../../plugins/prism_hadamard_qwen35/mtp_graft.zig");
 const mtp_mod = @import("../../sdk/spec/mtp/mtp.zig");
 const ane_mod = @import("../../sdk/ane/offload.zig");
-const model_mod = @import("model.zig");
+const model_mod = @import("../../sdk/config/model.zig");
 const vision_mod = @import("vision_encoder.zig");
 const prefix_cache_mod = @import("cache/prefix_cache.zig");
 const kv_disk_cache = @import("cache/ssd/disk_tier.zig");
@@ -33,23 +33,23 @@ const ModelRegistry = model_registry_mod.ModelRegistry;
 const testing = std.testing;
 
 const engines_served = @import("../../host/engines/served.zig");
-const engines_load = @import("../../host/engines/load.zig");
+const engines_load = @import("runtime/engine_load.zig");
 const publishHotCacheResidency = @import("cache/budget.zig").publishHotCacheResidency;
 const Scheduler = @import("scheduler.zig").Scheduler;
-const logWiredPolicy = @import("../../host/gpu_thread/load_requests.zig").logWiredPolicy;
-const makeRoomInRam = @import("../../host/gpu_thread/load_requests.zig").makeRoomInRam;
-const doLoadGenOnInferenceThread = @import("../../host/media_jobs/load.zig").doLoadGenOnInferenceThread;
-const drafterFor = @import("../../host/registry/cold_load.zig").drafterFor;
-const pleTableBill = @import("../../host/registry/preflight.zig").pleTableBill;
-const modelDiskBytes = @import("../../host/registry/preflight.zig").modelDiskBytes;
-const residentModelDiskBytes = @import("../../host/registry/preflight.zig").residentModelDiskBytes;
-const residentGateBytes = @import("../../host/registry/preflight.zig").residentGateBytes;
-const committedTextBytes = @import("../../host/registry/preflight.zig").committedTextBytes;
-const availForLoad = @import("../../host/registry/preflight.zig").availForLoad;
-const mtpSidecarDiskBytes = @import("../../host/registry/preflight.zig").mtpSidecarDiskBytes;
-const drafterResidentBytes = @import("../../host/registry/preflight.zig").drafterResidentBytes;
-const preflightVerdict = @import("../../host/registry/preflight.zig").preflightVerdict;
-const loadRequirementBytes = @import("../../host/registry/preflight.zig").loadRequirementBytes;
+const logWiredPolicy = @import("runtime/load_requests.zig").logWiredPolicy;
+const makeRoomInRam = @import("runtime/load_requests.zig").makeRoomInRam;
+const doLoadGenOnInferenceThread = @import("runtime/media_load.zig").doLoadGenOnInferenceThread;
+const drafterFor = @import("runtime/cold_load.zig").drafterFor;
+const pleTableBill = @import("runtime/preflight.zig").pleTableBill;
+const modelDiskBytes = @import("runtime/preflight.zig").modelDiskBytes;
+const residentModelDiskBytes = @import("runtime/preflight.zig").residentModelDiskBytes;
+const residentGateBytes = @import("runtime/preflight.zig").residentGateBytes;
+const committedTextBytes = @import("runtime/preflight.zig").committedTextBytes;
+const availForLoad = @import("runtime/preflight.zig").availForLoad;
+const mtpSidecarDiskBytes = @import("runtime/preflight.zig").mtpSidecarDiskBytes;
+const drafterResidentBytes = @import("runtime/preflight.zig").drafterResidentBytes;
+const preflightVerdict = @import("runtime/preflight.zig").preflightVerdict;
+const loadRequirementBytes = @import("runtime/preflight.zig").loadRequirementBytes;
 const scheduler_mod = @import("scheduler.zig");
 
 /// Phase A1 → Plan 05: do the full model load on the inference thread.
@@ -738,7 +738,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     entry.dflash = dflash_ptr;
     if (entry.config) |c| c.drafter_ctx_bytes_per_token = if (dflash_ptr) |d| dflash_mod.ctxBytesPerToken(&d.config) else 0;
     entry.drafter_block_size = sch.drafter_block_size;
-    entry.mtp = if (mtp_ptr) |h|
+    const head_ref: ?generate_mod.MtpHeadRef = if (mtp_ptr) |h|
         generate_mod.MtpHeadRef{ .qwen = h }
     else if (plugin_mtp) |h|
         generate_mod.MtpHeadRef{ .plugin = h }
@@ -746,6 +746,11 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         generate_mod.MtpHeadRef{ .qwen4 = xfm_ptr.qwen4Trunk().? }
     else
         null;
+    entry.mtp = if (head_ref) |r| blk: {
+        const p = try sch.allocator.create(generate_mod.MtpHeadRef);
+        p.* = r;
+        break :blk p;
+    } else null;
     // Resolve the auto (0) cap here so every downstream reader of
     // `lm.mtp_depth` (server log lines, slot params) sees the real value.
     const mtp_depth_cfg = params.config.mtpDepth(params.mtp_depth);
@@ -790,11 +795,13 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             resolve(params.config, params.prefix_cache_mem_bytes, .{}, &ssd_idle_mem)
         else
             params.prefix_cache_mem_bytes;
-        entry.prefix_cache = prefix_cache_mod.HotPrefixCache.initWithMem(
+        const new_hc = try sch.allocator.create(prefix_cache_mod.HotPrefixCache);
+        new_hc.* = prefix_cache_mod.HotPrefixCache.initWithMem(
             sch.allocator,
             if (ram_prefix_cache) params.prefix_cache_capacity else 0,
             clamped_prefix_mem,
         );
+        entry.prefix_cache = new_hc;
         entry.prefix_cache.?.qsa_history_required = params.config.indexer_budget != 0;
         // Checkpoint-retention arch gate, mirrored once: `HotPrefixCache`/`DiskTier` never
         // see a ModelConfig. The ungated value names the previous behaviour at each site.
@@ -890,7 +897,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     sch.drafter = drafter_ptr;
     sch.dflash = dflash_ptr;
     // The connection thread bills chat against the view, so a model that cannot chat never takes it.
-    if (entry.prefix_cache) |*hc| {
+    if (entry.prefix_cache) |hc| {
         if (ModelRegistry.chatCapable(entry)) sch.hot_prefix_cache = hc;
     }
     publishHotCacheResidency(sch);

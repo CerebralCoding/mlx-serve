@@ -7,7 +7,7 @@ const cache_mod = @import("../kv/cache.zig");
 const prefill_dq_gemm = @import("../../../sdk/blocks/linear/prefill_dq_gemm.zig");
 const verify_qmm_nax = @import("../../../sdk/blocks/linear/verify_qmm_nax.zig");
 const generate_mod = @import("../generate.zig");
-const model_mod = @import("../model.zig");
+const model_mod = @import("../../../sdk/config/model.zig");
 const http_server = @import("../../../host/http/server.zig");
 
 const getEffectiveContextLength = @import("context.zig").getEffectiveContextLength;

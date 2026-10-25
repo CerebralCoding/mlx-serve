@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const ModelConfig = @import("../model.zig").ModelConfig;
+const ModelConfig = @import("../../../sdk/config/model.zig").ModelConfig;
 const mixedNaxShapeEnabled = @import("../../../sdk/blocks/linear/verify_qmm.zig").mixedNaxShapeEnabled;
 const verifyQmmEnabled = @import("../../../sdk/blocks/linear/verify_qmm.zig").verifyQmmEnabled;
 const naxMinMForBits = @import("../../../sdk/blocks/linear/verify_qmm_nax.zig").naxMinMForBits;

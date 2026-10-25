@@ -34,7 +34,7 @@ const SpecTickMode = @import("spec/wiring.zig").SpecTickMode;
 const specTickMode = @import("spec/wiring.zig").specTickMode;
 const plannerOutputClock = @import("spec/wiring.zig").plannerOutputClock;
 const publishSpeculativeBlock = @import("spec/wiring.zig").publishSpeculativeBlock;
-const loopGuardTick = @import("../../host/chat/loop_stop.zig").loopGuardTick;
+const loopGuardTick = @import("loop_stop.zig").loopGuardTick;
 
 var kv_skew_split_logged: bool = false; // one-shot log guard
 

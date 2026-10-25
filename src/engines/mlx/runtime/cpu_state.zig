@@ -1,20 +1,20 @@
 //! CPU-side load state (config, tokenizer, chat config) built off the inference thread.
 
 const std = @import("std");
-const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
-const gen_mod = @import("../media_jobs/gen.zig");
-const model_mod = @import("../../engines/mlx/model.zig");
-const chat_mod = @import("../chat/chat.zig");
-const model_discovery = @import("discovery.zig");
-const gguf_meta = @import("../../sdk/quant/gguf/engine_pick.zig");
-const mlx_gguf = @import("../../sdk/quant/gguf/claim.zig");
-const log = @import("../../sdk/util/log.zig");
+const tokenizer_mod = @import("../../../sdk/tokenizer/tokenizer.zig");
+const gen_mod = @import("../../../host/media_jobs/gen.zig");
+const model_mod = @import("../../../sdk/config/model.zig");
+const chat_mod = @import("../../../host/chat/chat.zig");
+const model_discovery = @import("../../../host/registry/discovery.zig");
+const gguf_meta = @import("../../../sdk/quant/gguf/engine_pick.zig");
+const mlx_gguf = @import("../../../sdk/quant/gguf/claim.zig");
+const log = @import("../../../sdk/util/log.zig");
 const ModelConfig = model_mod.ModelConfig;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const ChatConfig = chat_mod.ChatConfig;
 
-const GgufRoute = @import("../gpu_thread/thread.zig").GgufRoute;
-const served = @import("../engines/served.zig");
+const GgufRoute = @import("thread.zig").GgufRoute;
+const served = @import("../../../host/engines/served.zig");
 
 /// Plan 05 Phase D: pre-loaded CPU state bundle. Built by the conn thread
 /// (CPU only — file I/O + parse, no mlx) ahead of posting a LoadRequest.

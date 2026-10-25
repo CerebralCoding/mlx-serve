@@ -11,7 +11,7 @@ test "real GGUF: stands in for a model dir, and --engine turns it off (a real GG
     const model = std.mem.span(env.get(.MLX_SERVE_GGUF_TEST_MODEL) orelse return error.SkipZigTest);
     const io = std.testing.io;
     const allocator = std.testing.allocator;
-    const model_mod = @import("../../../engines/mlx/model.zig");
+    const model_mod = @import("../../config/model.zig");
     const tokenizer_mod = @import("../../tokenizer/tokenizer.zig");
     const prev = claimState().enabled;
     defer claimState().enabled = prev;

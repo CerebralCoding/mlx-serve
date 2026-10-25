@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const log = @import("../../sdk/util/log.zig");
-const scheduler_mod = @import("../../engines/mlx/scheduler.zig");
+const scheduler_mod = @import("../gpu_thread/requests.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const media_mod = @import("gen.zig");
 const plugin_http = @import("plugin/http.zig");

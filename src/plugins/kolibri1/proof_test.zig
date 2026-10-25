@@ -111,7 +111,7 @@ test "kolibri1 plugin: a pack the plugin declines is refused by name (no legacy 
 }
 
 test "kolibri1 plugin: under a launch override it serves through the plugin, the override in the engine config and its parse" {
-    const model = @import("../../engines/mlx/model.zig");
+    const model = @import("../../sdk/config/model.zig");
     model.setConfigOverrides("{\"rms_norm_eps\":3e-5,\"max_position_embeddings\":8192}");
     defer model.setConfigOverrides(null);
     var cfg = try both.servedUnderOverrides(configJson(true));

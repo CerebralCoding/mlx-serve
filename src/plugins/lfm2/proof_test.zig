@@ -10,7 +10,7 @@ const fixture = @import("../../sdk/bases/proof/fixture.zig");
 const proof = @import("proof.zig");
 const both = @import("../../engines/mlx/plugin/both.zig");
 const driver = @import("../../engines/mlx/plugin/driver.zig");
-const model = @import("../../engines/mlx/model.zig");
+const model = @import("../../sdk/config/model.zig");
 const lfm2 = @import("plugin.zig");
 const config = @import("config.zig");
 

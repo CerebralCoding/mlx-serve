@@ -6,7 +6,7 @@ const prefix_cache_mod = @import("cache/prefix_cache.zig");
 const metrics_mod = @import("../../host/metrics/metrics.zig");
 const log = @import("../../sdk/util/log.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
-const sleep_inhibit = @import("../../host/gpu_thread/sleep_inhibit.zig");
+const sleep_inhibit = @import("runtime/sleep_inhibit.zig");
 const testing = std.testing;
 
 const slotHoldsForMemory = @import("admission/pending.zig").slotHoldsForMemory;
@@ -30,8 +30,8 @@ const Scheduler = @import("scheduler.zig").Scheduler;
 const promiseMaterialized = @import("scheduler/params.zig").promiseMaterialized;
 const Slot = @import("slot.zig").Slot;
 const publishFirstToken = @import("spec/wiring.zig").publishFirstToken;
-const hasWorkPendingLocked = @import("../../host/gpu_thread/loop.zig").hasWorkPendingLocked;
-const drainSideQueues = @import("../../host/gpu_thread/loop.zig").drainSideQueues;
+const hasWorkPendingLocked = @import("runtime/loop.zig").hasWorkPendingLocked;
+const drainSideQueues = @import("runtime/loop.zig").drainSideQueues;
 
 const ChatPassMode = enum { main, yield };
 pub const ChatPassResult = enum { shutdown, idle, ran };
@@ -72,7 +72,7 @@ pub fn prefillAdmitted(sch: *Scheduler, slot: *Slot) AdmitOutcome {
             }
             if (err == error.BoundaryTailTooLarge) return .tail_too_large;
             if (err == error.QsaHistoryGap and !qsa_gap_retried) {
-                if (slot.model.prefix_cache) |*hc| _ = prefix_cache_mod.HotPrefixCache.dropQsaGapEntry(hc);
+                if (slot.model.prefix_cache) |hc| _ = prefix_cache_mod.HotPrefixCache.dropQsaGapEntry(hc);
                 emptySlotCache(slot);
                 if (slot.legacy_gen) |*g| {
                     g.deinit(slot.allocator);
@@ -91,6 +91,7 @@ pub fn prefillAdmitted(sch: *Scheduler, slot: *Slot) AdmitOutcome {
     }
     if (slot.state == .errored or slot.cancelled.load(.acquire)) return .errored;
     slot.prefill_ns = prefill_sw.read() -| slot.prefill_interleaved_ns;
+    slot.emitPrefilled();
     publishFirstToken(slot);
     if (slot.prefill_interleaved_ns > 0) log.debug("[interleave] prefill {d} ms, hosted decode {d} ms\n", .{
         slot.prefill_ns / std.time.ns_per_ms, slot.prefill_interleaved_ns / std.time.ns_per_ms,

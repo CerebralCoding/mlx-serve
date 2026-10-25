@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const Weights = @import("../../engines/mlx/model.zig").Weights;
+const Weights = @import("../../sdk/config/model.zig").Weights;
 const getLayerWeight = @import("../../engines/mlx/load/weights.zig").getLayerWeight;
 const groupedNormView = @import("../../engines/mlx/load/weights.zig").groupedNormView;
 const scaleTriple = @import("../../engines/mlx/load/weights.zig").scaleTriple;

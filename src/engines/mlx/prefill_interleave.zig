@@ -5,7 +5,7 @@ const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const transformer_mod = @import("transformer.zig");
 const generate_mod = @import("generate.zig");
-const model_mod = @import("model.zig");
+const model_mod = @import("../../sdk/config/model.zig");
 const prefix_cache_mod = @import("cache/prefix_cache.zig");
 const log = @import("../../sdk/util/log.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
@@ -212,7 +212,7 @@ pub fn orderByTail(tails: []const usize, order: []usize) void {
 /// Undo a hot-cache restore the slot has not started on: hand the checkout back and empty the
 /// slot's cache, so the request can wait in `pending` and restore again when its turn comes.
 pub fn resetRestoredSlot(slot: *Slot) void {
-    if (slot.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(slot), "tail over the boundary limit");
+    if (slot.model.prefix_cache) |hc| hc.releaseCheckout(@intFromPtr(slot), "tail over the boundary limit");
     emptySlotCache(slot);
     slot.restored_entry = 0;
 }
@@ -312,7 +312,7 @@ fn admitSmallAtBoundary(ic: *InterleaveCtx, share: f32, budget: *BoundaryBudget)
 pub fn slotUncachedTail(slot: *Slot) usize {
     const total = slot.full_prompt.len;
     if (slot.skip_prefix_cache or slot.media.len > 0) return total;
-    const hc = if (slot.model.prefix_cache) |*p| p else return total;
+    const hc = if (slot.model.prefix_cache) |p| p else return total;
     return total - @min(total, hc.peekMatchedTokens(slot.full_prompt, slot.has_tools, slot.cache.config, slot.ssm_entries != null));
 }
 
@@ -346,7 +346,7 @@ pub fn interleaveTicksFor(chunk_ns: u64, tick_ns: u64) u32 {
 pub fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []const transformer_mod.SSMCheckpoint) void {
     const wc: *WriteThroughCtx = @ptrCast(@alignCast(opaque_ctx));
     const slot = wc.slot;
-    const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return;
+    const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |p| p else return;
     if (!hc.ssd_first) return;
     const d = if (hc.disk) |*dd| dd else return;
     if (d.writer == null) return;
@@ -412,7 +412,7 @@ fn writeThroughEnabled() bool {
 /// The one gate for the write-through: SSD-first + a live writer + a disk tier + a new span
 /// worth at least one chunk.
 pub fn writeThroughArmed(slot: *Slot, new_span: usize) bool {
-    const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return false;
+    const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |p| p else return false;
     if (!writeThroughEnabled()) {
         if (hc.ssd_first and !write_through_off_logged.swap(true, .monotonic)) {
             log.info("  [disk-cache] prefill write-through disabled by MLX_SERVE_SSD_WRITE_THROUGH=0 — the end-of-request commit persists every turn\n", .{});

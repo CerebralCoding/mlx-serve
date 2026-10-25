@@ -5,7 +5,7 @@ const mlx = @import("../../mlx/ffi.zig");
 const transformer_mod = @import("transformer.zig");
 const generate_mod = @import("generate.zig");
 const gen_mod = @import("../../host/media_jobs/gen.zig");
-const model_mod = @import("model.zig");
+const model_mod = @import("../../sdk/config/model.zig");
 const prefix_cache_mod = @import("cache/prefix_cache.zig");
 const restore_dump = @import("cache/restore_dump.zig");
 const kv_disk_cache = @import("cache/ssd/disk_tier.zig");
@@ -167,7 +167,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         slot.cache.step = resumed;
         log.info("[dsv41] resumed {d} of {d} prompt tokens\n", .{ resumed, slot.full_prompt.len });
     }
-    if (slot.model.prefix_cache) |*hc| {
+    if (slot.model.prefix_cache) |hc| {
         {
             // Only build a restore target when this request will actually
             // draft — a non-dflash turn leaves the payload in the entry for
@@ -315,7 +315,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 fits = Probe.call(&probe);
             };
             // A shared restore is billed a whole second copy; taking the entry over moves it instead.
-            if (!fits and !hot_checked_out and hot_matched > 0) if (slot.model.prefix_cache) |*hc| {
+            if (!fits and !hot_checked_out and hot_matched > 0) if (slot.model.prefix_cache) |hc| {
                 if (hc.checkoutRestored(@intFromPtr(slot), slot.full_prompt.len)) {
                     hot_checked_out = true;
                     probe.warm_will_donate = true;
@@ -329,7 +329,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 }
                 // Per-model, off the slot: `sch.hot_prefix_cache` is whichever model loaded last.
                 // Captured by pointer: a `|hc|` capture would evict from a stack copy.
-                const report = if (slot.model.prefix_cache) |*hc|
+                const report = if (slot.model.prefix_cache) |hc|
                     // Never evict the entry this request restored from: its buffers are shared.
                     hc.evictLruToAdmit(slot.full_prompt.len, &probe, Probe.call, true)
                 else
@@ -384,7 +384,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         .sch = sch,
         .cfg = slot.model.config,
         .kv_bits = if (slot.cache.config.scheme == .off) 16 else slot.cache.config.bits,
-        .hc = if (slot.model.prefix_cache) |*p| p else null,
+        .hc = if (slot.model.prefix_cache) |p| p else null,
     };
 
     // Ownership of the restored spec caches transfers AT THE CALL:
@@ -400,7 +400,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // Restore by move, the transfer: the last point at which nothing has written to `slot.cache`.
     // Everything above can still refuse and `releaseCheckout` then hands the entry back whole;
     // nothing between here and `initWithOptions` may fail.
-    if (slot.model.prefix_cache) |*hc| hc.donateCheckout(@intFromPtr(slot));
+    if (slot.model.prefix_cache) |hc| hc.donateCheckout(@intFromPtr(slot));
     const graphs_were = mlx.setCudaGraphs(mlx.prefillKeepsCudaGraphs());
     defer _ = mlx.setCudaGraphs(graphs_were);
     var gen = try Generator.initWithOptions(
