@@ -27,14 +27,14 @@ const std = @import("std");
 const env = @import("../../env.zig");
 const kernelSource = @import("../../mlx/kernels.zig").source;
 const mlx = @import("../../mlx/ffi.zig");
-const model = @import("../../engines/mlx/model.zig");
-const transformer = @import("../../engines/mlx/transformer.zig");
+const Weights = @import("../../sdk/weights/resident.zig").Weights;
+const weights_load = @import("../../sdk/weights/load.zig");
 const decode_attn_quant = @import("../../sdk/blocks/attention/decode_attn_quant.zig");
 const params_mod = @import("../../sdk/quant/params.zig");
 const log = @import("../../sdk/util/log.zig");
 const clampedSwiGLU = @import("../../sdk/blocks/mlp/activations.zig").clampedSwiGLU;
 
-const ModelConfig = model.ModelConfig;
+const Config = @import("config.zig").Config;
 const QuantParams = params_mod.QuantParams;
 
 /// Quantized linear: non-owning handles into the Weights map + solved params.
@@ -149,7 +149,7 @@ pub const Dsv4Weights = struct {
 
 const NameBuf = [192]u8;
 
-fn getReq(w: *const model.Weights, buf: *NameBuf, comptime fmt: []const u8, args: anytype) !mlx.mlx_array {
+fn getReq(w: *const Weights, buf: *NameBuf, comptime fmt: []const u8, args: anytype) !mlx.mlx_array {
     const name = std.fmt.bufPrint(buf, fmt, args) catch return error.NameTooLong;
     return w.get(name) orelse {
         log.err("dsv4 MISSING WEIGHT: {s}\n", .{name});
@@ -157,16 +157,21 @@ fn getReq(w: *const model.Weights, buf: *NameBuf, comptime fmt: []const u8, args
     };
 }
 
+/// The config's quantization as the solver reads it.
+pub fn quantOf(cfg: *const Config) QuantParams {
+    return .{ .bits = cfg.quant_bits, .group_size = cfg.quant_group_size, .mode = std.meta.stringToEnum(params_mod.QuantMode, @tagName(cfg.quant_mode)).? };
+}
+
 /// Load a quantized triple `<base>.{weight,scales,biases}` and solve its
 /// quant params from geometry (mixed-mix checkpoints resolve per weight).
-fn getQ(cfg: *const ModelConfig, w: *const model.Weights, buf: *NameBuf, in_dim: u32, comptime base: []const u8, args: anytype) !Q {
+fn getQ(cfg: *const Config, w: *const Weights, buf: *NameBuf, in_dim: u32, comptime base: []const u8, args: anytype) !Q {
     const wt = try getReq(w, buf, base ++ ".weight", args);
     const sc = try getReq(w, buf, base ++ ".scales", args);
     const bs = try getReq(w, buf, base ++ ".biases", args);
-    return .{ .w = wt, .s = sc, .b = bs, .qp = params_mod.computeQuantParams(.of(cfg), wt, sc, in_dim) };
+    return .{ .w = wt, .s = sc, .b = bs, .qp = params_mod.computeQuantParams(quantOf(cfg), wt, sc, in_dim) };
 }
 
-fn getCompressor(w: *const model.Weights, buf: *NameBuf, comptime pfx: []const u8, args: anytype) !CompressorW {
+fn getCompressor(w: *const Weights, buf: *NameBuf, comptime pfx: []const u8, args: anytype) !CompressorW {
     return .{
         .wkv = try getReq(w, buf, pfx ++ ".wkv.weight", args),
         .wgate = try getReq(w, buf, pfx ++ ".wgate.weight", args),
@@ -177,7 +182,7 @@ fn getCompressor(w: *const model.Weights, buf: *NameBuf, comptime pfx: []const u
 
 /// One trunk-shaped layer under `pfx ++ ".{d}"` — the trunk uses "layers",
 /// DSpark stages use "mtp" (ratio 0, never hash-routed, otherwise identical).
-fn loadDsv4Layer(cfg: *const ModelConfig, w: *const model.Weights, buf: *NameBuf, li: usize, comptime pfx: []const u8, ratio: u8, is_hash: bool) !Dsv4Layer {
+fn loadDsv4Layer(cfg: *const Config, w: *const Weights, buf: *NameBuf, li: usize, comptime pfx: []const u8, ratio: u8, is_hash: bool) !Dsv4Layer {
     const hidden = cfg.hidden_size;
     const q_lora = cfg.dsv4_q_lora_rank;
     const moe_inter = cfg.moe_intermediate_size;
@@ -227,13 +232,13 @@ fn loadDsv4Layer(cfg: *const ModelConfig, w: *const model.Weights, buf: *NameBuf
 /// 3 shipped stages), gated on dspark_block_size. A config that declares
 /// DSpark whose mtp.* weights are missing is a hard MissingWeight load error
 /// — only our converter's layout is supported, and it always ships them.
-fn dsparkStageCount(cfg: *const ModelConfig) u32 {
+fn dsparkStageCount(cfg: *const Config) u32 {
     if (cfg.dsv4_dspark_block_size == 0) return 0;
     if (cfg.dsv4_n_compress_ratios <= cfg.num_hidden_layers) return 0;
     return cfg.dsv4_n_compress_ratios - cfg.num_hidden_layers;
 }
 
-pub fn loadDsv4Weights(allocator: std.mem.Allocator, cfg: *const ModelConfig, w: *const model.Weights) !Dsv4Weights {
+pub fn loadDsv4Weights(allocator: std.mem.Allocator, cfg: *const Config, w: *const Weights) !Dsv4Weights {
     var buf: NameBuf = undefined;
     const n_layers = cfg.num_hidden_layers;
     const hidden = cfg.hidden_size;
@@ -943,7 +948,7 @@ fn appendWeightArrays(vec: ?mlx.mlx_vector_array, value: anytype) WeightTally {
     };
 }
 
-pub fn initModel(gpa: std.mem.Allocator, cfg: *const ModelConfig, dw: Dsv4Weights, s: mlx.mlx_stream) !Dsv4Model {
+pub fn initModel(gpa: std.mem.Allocator, cfg: *const Config, dw: Dsv4Weights, s: mlx.mlx_stream) !Dsv4Model {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
@@ -2133,7 +2138,7 @@ test "dsv4: loads the fabricated miniature checkpoint (DSV4_MINI)" {
     var reader_state = file.reader(io, &read_buf);
     const cfg_json = try reader_state.interface.allocRemaining(allocator, .limited(1 << 20));
     defer allocator.free(cfg_json);
-    const cfg = try model.parseConfigFromJson(allocator, cfg_json);
+    const cfg = try parseTestConfig(cfg_json);
 
     try testing.expectEqualStrings("deepseek_v4", cfg.model_type);
     try testing.expectEqual(@as(u32, 4), cfg.num_hidden_layers);
@@ -2143,7 +2148,7 @@ test "dsv4: loads the fabricated miniature checkpoint (DSV4_MINI)" {
 
     const shard_path = try std.fmt.allocPrint(allocator, "{s}/model-mini.safetensors", .{path});
     defer allocator.free(shard_path);
-    var weights = try model.loadWeightsSingleFile(allocator, shard_path);
+    var weights = try weights_load.loadWeightsSingleFile(allocator, shard_path);
     defer weights.deinit();
 
     var dw = try loadDsv4Weights(allocator, &cfg, &weights);
@@ -2231,7 +2236,7 @@ test "dsv4: forwardPrefill matches the python oracle fixtures (DSV4_MINI)" {
     defer allocator.free(cfg_path);
     const cfg_json = try readAll(io, allocator, cfg_path);
     defer allocator.free(cfg_json);
-    const cfg = try model.parseConfigFromJson(allocator, cfg_json);
+    const cfg = try parseTestConfig(cfg_json);
 
     // Read fixtures BEFORE loading weights: the skip path (`catch return`)
     // used to sit after `loadDsv4Weights`, leaking the layer table when a
@@ -2243,7 +2248,7 @@ test "dsv4: forwardPrefill matches the python oracle fixtures (DSV4_MINI)" {
 
     const shard_path = try std.fmt.allocPrint(allocator, "{s}/model-mini.safetensors", .{path});
     defer allocator.free(shard_path);
-    var weights = try model.loadWeightsSingleFile(allocator, shard_path);
+    var weights = try weights_load.loadWeightsSingleFile(allocator, shard_path);
     defer weights.deinit();
     const dw = try loadDsv4Weights(allocator, &cfg, &weights);
 
@@ -2335,9 +2340,9 @@ test "dsv4: forwardPrefill on the REAL mirror continues 'The capital of France i
     const cfg_json = try rs.interface.allocRemaining(allocator, .limited(1 << 20));
     file.close(io);
     defer allocator.free(cfg_json);
-    const cfg = try model.parseConfigFromJson(allocator, cfg_json);
+    const cfg = try parseTestConfig(cfg_json);
 
-    var weights = try model.loadWeights(io, allocator, path);
+    var weights = try weights_load.loadWeights(io, allocator, path);
     defer weights.deinit();
     const dw = try loadDsv4Weights(allocator, &cfg, &weights);
 
@@ -2415,10 +2420,10 @@ test "dsv4: incremental decode matches full re-forward (DSV4_MINI)" {
     const cfg_json = try rs.interface.allocRemaining(allocator, .limited(1 << 20));
     file.close(io);
     defer allocator.free(cfg_json);
-    const cfg = try model.parseConfigFromJson(allocator, cfg_json);
+    const cfg = try parseTestConfig(cfg_json);
     const shard_path = try std.fmt.allocPrint(allocator, "{s}/model-mini.safetensors", .{path});
     defer allocator.free(shard_path);
-    var weights = try model.loadWeightsSingleFile(allocator, shard_path);
+    var weights = try weights_load.loadWeightsSingleFile(allocator, shard_path);
     defer weights.deinit();
 
     // Both streams: the CPU run pins the composed chain; the GPU run also
@@ -2670,10 +2675,10 @@ test "dsv4: lazy pipelined decode matches decodeStep at every position (DSV4_MIN
     const cfg_json = try rs.interface.allocRemaining(allocator, .limited(1 << 20));
     file.close(io);
     defer allocator.free(cfg_json);
-    const cfg = try model.parseConfigFromJson(allocator, cfg_json);
+    const cfg = try parseTestConfig(cfg_json);
     const shard_path = try std.fmt.allocPrint(allocator, "{s}/model-mini.safetensors", .{path});
     defer allocator.free(shard_path);
-    var weights = try model.loadWeightsSingleFile(allocator, shard_path);
+    var weights = try weights_load.loadWeightsSingleFile(allocator, shard_path);
     defer weights.deinit();
 
     const dw = try loadDsv4Weights(allocator, &cfg, &weights);
@@ -2795,10 +2800,10 @@ test "dsv4: DSpark is OPT-IN — stages stay off (and lazy) without the flag (DS
     const cfg_json = try rs.interface.allocRemaining(allocator, .limited(1 << 20));
     file.close(io);
     defer allocator.free(cfg_json);
-    const cfg = try model.parseConfigFromJson(allocator, cfg_json);
+    const cfg = try parseTestConfig(cfg_json);
     const shard_path = try std.fmt.allocPrint(allocator, "{s}/model-mini.safetensors", .{path});
     defer allocator.free(shard_path);
-    var weights = try model.loadWeightsSingleFile(allocator, shard_path);
+    var weights = try weights_load.loadWeightsSingleFile(allocator, shard_path);
     defer weights.deinit();
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
@@ -2877,10 +2882,10 @@ test "dsv4: decode-state snapshot/restore replays bit-identically (DSV4_MINI)" {
     const cfg_json = try rs.interface.allocRemaining(allocator, .limited(1 << 20));
     file.close(io);
     defer allocator.free(cfg_json);
-    const cfg = try model.parseConfigFromJson(allocator, cfg_json);
+    const cfg = try parseTestConfig(cfg_json);
     const shard_path = try std.fmt.allocPrint(allocator, "{s}/model-mini.safetensors", .{path});
     defer allocator.free(shard_path);
-    var weights = try model.loadWeightsSingleFile(allocator, shard_path);
+    var weights = try weights_load.loadWeightsSingleFile(allocator, shard_path);
     defer weights.deinit();
 
     for ([_]bool{ false, true }) |use_gpu| {
@@ -3055,7 +3060,7 @@ test "dsv4: main_hidden capture matches the oracle across both prefill and decod
     defer allocator.free(cfg_path);
     const cfg_json = try readAll(io, allocator, cfg_path);
     defer allocator.free(cfg_json);
-    const cfg = try model.parseConfigFromJson(allocator, cfg_json);
+    const cfg = try parseTestConfig(cfg_json);
     const fx_path = try std.fmt.allocPrint(allocator, "{s}/fixtures.json", .{path});
     defer allocator.free(fx_path);
     const fx_json = readAll(io, allocator, fx_path) catch return; // fixtures not dumped -> skip
@@ -3067,7 +3072,7 @@ test "dsv4: main_hidden capture matches the oracle across both prefill and decod
 
     const shard_path = try std.fmt.allocPrint(allocator, "{s}/model-mini.safetensors", .{path});
     defer allocator.free(shard_path);
-    var weights = try model.loadWeightsSingleFile(allocator, shard_path);
+    var weights = try weights_load.loadWeightsSingleFile(allocator, shard_path);
     defer weights.deinit();
 
     const ids_v = root.get("input_ids").?.array.items;
@@ -3208,7 +3213,7 @@ test "dsv4: DSpark draft matches the oracle (DSV4_MINI)" {
     defer allocator.free(cfg_path);
     const cfg_json = try readAll(io, allocator, cfg_path);
     defer allocator.free(cfg_json);
-    const cfg = try model.parseConfigFromJson(allocator, cfg_json);
+    const cfg = try parseTestConfig(cfg_json);
     const fx_path = try std.fmt.allocPrint(allocator, "{s}/fixtures.json", .{path});
     defer allocator.free(fx_path);
     const fx_json = readAll(io, allocator, fx_path) catch return;
@@ -3220,7 +3225,7 @@ test "dsv4: DSpark draft matches the oracle (DSV4_MINI)" {
 
     const shard_path = try std.fmt.allocPrint(allocator, "{s}/model-mini.safetensors", .{path});
     defer allocator.free(shard_path);
-    var weights = try model.loadWeightsSingleFile(allocator, shard_path);
+    var weights = try weights_load.loadWeightsSingleFile(allocator, shard_path);
     defer weights.deinit();
 
     const ids_v = root.get("input_ids").?.array.items;
@@ -3344,10 +3349,10 @@ test "dsv4: extendStateAllLogits rows match serial decode at every position (DSV
     const cfg_json = try rs.interface.allocRemaining(allocator, .limited(1 << 20));
     file.close(io);
     defer allocator.free(cfg_json);
-    const cfg = try model.parseConfigFromJson(allocator, cfg_json);
+    const cfg = try parseTestConfig(cfg_json);
     const shard_path = try std.fmt.allocPrint(allocator, "{s}/model-mini.safetensors", .{path});
     defer allocator.free(shard_path);
-    var weights = try model.loadWeightsSingleFile(allocator, shard_path);
+    var weights = try weights_load.loadWeightsSingleFile(allocator, shard_path);
     defer weights.deinit();
 
     const argmaxOf = struct {
@@ -3434,10 +3439,10 @@ test "dsv4: extendChunk .all_gpu + host read matches .all_host bytes (DSV4_MINI)
     const cfg_json = try rs.interface.allocRemaining(allocator, .limited(1 << 20));
     file.close(io);
     defer allocator.free(cfg_json);
-    const cfg = try model.parseConfigFromJson(allocator, cfg_json);
+    const cfg = try parseTestConfig(cfg_json);
     const shard_path = try std.fmt.allocPrint(allocator, "{s}/model-mini.safetensors", .{path});
     defer allocator.free(shard_path);
-    var weights = try model.loadWeightsSingleFile(allocator, shard_path);
+    var weights = try weights_load.loadWeightsSingleFile(allocator, shard_path);
     defer weights.deinit();
 
     for ([_]bool{ false, true }) |use_gpu| {
@@ -3497,10 +3502,10 @@ test "dsv4: dsparkRound greedy-equivalence with serial decode (DSV4_MINI)" {
     const cfg_json = try rs.interface.allocRemaining(allocator, .limited(1 << 20));
     file.close(io);
     defer allocator.free(cfg_json);
-    const cfg = try model.parseConfigFromJson(allocator, cfg_json);
+    const cfg = try parseTestConfig(cfg_json);
     const shard_path = try std.fmt.allocPrint(allocator, "{s}/model-mini.safetensors", .{path});
     defer allocator.free(shard_path);
-    var weights = try model.loadWeightsSingleFile(allocator, shard_path);
+    var weights = try weights_load.loadWeightsSingleFile(allocator, shard_path);
     defer weights.deinit();
 
     const argmaxOf = struct {
@@ -3611,10 +3616,10 @@ test "dsv4: the confidence gate truncates the block without changing tokens (DSV
     const cfg_json = try rs.interface.allocRemaining(allocator, .limited(1 << 20));
     file.close(io);
     defer allocator.free(cfg_json);
-    const cfg = try model.parseConfigFromJson(allocator, cfg_json);
+    const cfg = try parseTestConfig(cfg_json);
     const shard_path = try std.fmt.allocPrint(allocator, "{s}/model-mini.safetensors", .{path});
     defer allocator.free(shard_path);
-    var weights = try model.loadWeightsSingleFile(allocator, shard_path);
+    var weights = try weights_load.loadWeightsSingleFile(allocator, shard_path);
     defer weights.deinit();
 
     const argmaxOf = struct {
@@ -3717,10 +3722,10 @@ test "dsv4: anchored rollback replays like snapshot + re-extend (DSV4_MINI)" {
     const cfg_json = try rs.interface.allocRemaining(allocator, .limited(1 << 20));
     file.close(io);
     defer allocator.free(cfg_json);
-    const cfg = try model.parseConfigFromJson(allocator, cfg_json);
+    const cfg = try parseTestConfig(cfg_json);
     const shard_path = try std.fmt.allocPrint(allocator, "{s}/model-mini.safetensors", .{path});
     defer allocator.free(shard_path);
-    var weights = try model.loadWeightsSingleFile(allocator, shard_path);
+    var weights = try weights_load.loadWeightsSingleFile(allocator, shard_path);
     defer weights.deinit();
 
     for ([_]bool{ false, true }) |use_gpu| {
@@ -3813,10 +3818,10 @@ test "dsv4: dsparkRound FULL-ACCEPT commits the block and leaves serial state (D
     const cfg_json = try rs.interface.allocRemaining(allocator, .limited(1 << 20));
     file.close(io);
     defer allocator.free(cfg_json);
-    const cfg = try model.parseConfigFromJson(allocator, cfg_json);
+    const cfg = try parseTestConfig(cfg_json);
     const shard_path = try std.fmt.allocPrint(allocator, "{s}/model-mini.safetensors", .{path});
     defer allocator.free(shard_path);
-    var weights = try model.loadWeightsSingleFile(allocator, shard_path);
+    var weights = try weights_load.loadWeightsSingleFile(allocator, shard_path);
     defer weights.deinit();
 
     const argmaxOf = struct {
@@ -8896,7 +8901,7 @@ test "dsv4: gs-128 expert pack resolves per-weight and qmm matches the dequant r
     // computeQuantParams → affineParamsFromGeometry), and the qmm must serve
     // the g128 pack through the resolved params. This is the "no Zig changes
     // needed" proof for the g128 rebuild.
-    var cfg = model.ModelConfig{};
+    var cfg = Config{};
     cfg.quant_bits = 8;
     cfg.quant_group_size = 64;
     cfg.quant_mode = .affine;
@@ -8928,7 +8933,7 @@ test "dsv4: gs-128 expert pack resolves per-weight and qmm matches the dequant r
         defer _ = mlx.mlx_array_free(bs);
         try mlx.check(mlx.mlx_vector_array_get(&bs, qv, 2));
 
-        const qp = params_mod.computeQuantParams(.of(&cfg), wq, sc, @intCast(K));
+        const qp = params_mod.computeQuantParams(quantOf(&cfg), wq, sc, @intCast(K));
         try testing.expectEqual(bits, qp.bits);
         try testing.expectEqual(@as(u32, 128), qp.group_size);
 
@@ -8983,10 +8988,10 @@ test "dsv4: boundary prefetch drains older pending rows a token early (DSV4_MINI
     const cfg_json = try rs.interface.allocRemaining(allocator, .limited(1 << 20));
     file.close(io);
     defer allocator.free(cfg_json);
-    const cfg = try model.parseConfigFromJson(allocator, cfg_json);
+    const cfg = try parseTestConfig(cfg_json);
     const shard_path = try std.fmt.allocPrint(allocator, "{s}/model-mini.safetensors", .{path});
     defer allocator.free(shard_path);
-    var weights = try model.loadWeightsSingleFile(allocator, shard_path);
+    var weights = try weights_load.loadWeightsSingleFile(allocator, shard_path);
     defer weights.deinit();
 
     const dw = try loadDsv4Weights(allocator, &cfg, &weights);
@@ -9053,10 +9058,10 @@ test "dsv4: comp_in decode requant rides --decode-attn-quant (DSV4_MINI)" {
     const cfg_json = try rs.interface.allocRemaining(allocator, .limited(1 << 20));
     file.close(io);
     defer allocator.free(cfg_json);
-    const cfg = try model.parseConfigFromJson(allocator, cfg_json);
+    const cfg = try parseTestConfig(cfg_json);
     const shard_path = try std.fmt.allocPrint(allocator, "{s}/model-mini.safetensors", .{path});
     defer allocator.free(shard_path);
-    var weights = try model.loadWeightsSingleFile(allocator, shard_path);
+    var weights = try weights_load.loadWeightsSingleFile(allocator, shard_path);
     defer weights.deinit();
 
     var rng = std.Random.DefaultPrng.init(61);
@@ -9159,4 +9164,15 @@ test "dsv4 clippedSwigluG: the SDK clamped SwiGLU in f32 gives the bytes the plu
     try mlx.check(mlx.mlx_array_eval(got));
     const gb = @as([*]const u8, @ptrCast(mlx.mlx_array_data_bfloat16(got).?))[0 .. 2 * 64 * 96];
     try std.testing.expectEqual(@as(u64, 0xdb0cdacd4c0f33e9), std.hash.Wyhash.hash(0, gb));
+}
+
+/// A test config through the plugin's own parse (the engine's parse, field for field: `model_config.zig`).
+fn parseTestConfig(json: []const u8) !Config {
+    const config_mod = @import("config.zig");
+    const mem: @import("../../sdk/root.zig").fixture.MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = json }} };
+    const dir = mem.packDir();
+    var p: @import("../../abi/plugin.zig").Parsed = .{};
+    if (!config_mod.parse(&dir, .of(json), .{}, null, true, &p).isOk()) return error.ConfigRefused;
+    defer config_mod.freeParsed(&p);
+    return config_mod.of(&p).*;
 }

@@ -199,6 +199,11 @@ test {
     _ = @import("engines/mlx/spec/round_cost.zig");
     _ = @import("engines/mlx/spec/mtp_group_planner.zig");
     _ = @import("plugins/deepseek_v4/deepseek_v4.zig");
+    _ = @import("plugins/deepseek_v4/model_config.zig");
+    _ = @import("plugins/glm5_next/model_config.zig");
+    _ = @import("plugins/glm5_next/proof_test.zig");
+    _ = @import("plugins/glm5_next/served_test.zig");
+    _ = @import("engines/mlx/plugin/deepseek_test.zig");
     _ = @import("plugins/deepseek_v41/engram.zig");
     _ = @import("sdk/weights/nocache_reader.zig");
     _ = @import("plugins/deepseek_v41/deepseek_v41.zig");

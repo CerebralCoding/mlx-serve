@@ -14,7 +14,6 @@ const sushi_pack = @import("../../sdk/quant/exl3/sushi_pack.zig");
 const build_options = @import("build_options");
 const streamed = @import("../../sdk/weights/streamed.zig");
 const trunk = @import("trunk.zig");
-const bill_mod = @import("bill.zig");
 pub const config = @import("config.zig");
 
 pub const plugin = sdk.Plugin{
@@ -66,7 +65,7 @@ fn bill(p: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) 
 
 fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     const mp = host.load(plugin.name, ctx, out) orelse return null;
-    if (config.of(ctx.parsed).streamed) openBank(host.of(mp), ctx.model_dir.slice(), ctxSetting(ctx.settings_json.slice())) catch |e| {
+    if (config.of(ctx.parsed).streamed) openBank(host.of(mp), ctx.model_dir.slice(), ctx.stream_room) catch |e| {
         std.log.err("glm5_next: the streamed bank does not open: {t}", .{e});
         host.unload(mp);
         out.* = if (e == error.StreamedWeightsUnsupported) Verdict.refuse(.unsupported, "glm5_next: a streamed (experts.bin) pack needs the macOS build's expert streamer") else Verdict.named(.failed, @errorName(e));
@@ -76,15 +75,13 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
 }
 
 /// The pack's EXL3 bank bound to every routed layer, at the slot rows the box holds beside the loaded residents and
-/// one prompt of the model's `ctx_size`.
-fn openBank(m: *host.Model, dir: []const u8, ctx_size: ?u64) !void {
+/// one prompt (`LoadCtx.stream_room`).
+fn openBank(m: *host.Model, dir: []const u8, room: u64) !void {
     if (comptime !build_options.mlx_stream) return error.StreamedWeightsUnsupported;
     const io = std.Io.Threaded.global_single_threaded.io();
     const gpa = std.heap.c_allocator;
     const geo = try streamed.Glm5n.geometryOf(gpa, io, dir);
-    var mc = try @import("model_config.zig").toModelConfig(m.c);
-    defer mc.deinit(gpa);
-    const rows = bill_mod.streamRows(&mc, ctx_size, geo.record_bytes, geo.num_moe_layers, streamed.Glm5n.transient_rows);
+    const rows = streamRows(m.c, room, geo.record_bytes, geo.num_moe_layers, streamed.Glm5n.transient_rows);
     const gates = try gpa.alloc(streamed.Glm5n.Gate, m.layers.len);
     defer gpa.free(gates);
     for (gates, m.layers) |*g, *l| g.* = if (l.mlp == .moe) .{ .w = l.router_raw, .bias = l.mlp.moe.route.sigmoid_bias.expert_bias } else .{ .w = .{ .ctx = null }, .bias = .{ .ctx = null } };
@@ -98,13 +95,17 @@ fn openBank(m: *host.Model, dir: []const u8, ctx_size: ?u64) !void {
     };
 }
 
-/// The per-model `ctx_size` setting: the prompt positions a streamed bank's rows leave room for.
-fn ctxSetting(settings_json: []const u8) ?u64 {
-    if (settings_json.len == 0) return null;
-    const S = struct { ctx_size: ?u64 = null };
-    const parsed = std.json.parseFromSlice(S, std.heap.c_allocator, settings_json, .{ .ignore_unknown_fields = true }) catch return null;
-    defer parsed.deinit();
-    return parsed.value.ctx_size;
+/// A streamed pack's slot rows per routed layer (`record` bytes a row in each of `n_moe` layers), sized after the
+/// residents load: `room` less the memory in use; the prompt phase also leaves the bank's `transient` rows for its
+/// wide calls. At least `top_k` rows.
+fn streamRows(c: *const config.Config, room: u64, record: u64, n_moe: u32, transient: u32) struct { prompt: u32, decode: u32 } {
+    const system = @import("../../sdk/util/system.zig");
+    const free = room -| (system.getTotalMemBytes() -| system.getAvailableMemBytes());
+    const row = @max(record * n_moe, 1);
+    const lo: u64 = @max(c.num_experts_per_tok, 1);
+    const decode = std.math.clamp(free / row, lo, c.num_experts);
+    const prompt = std.math.clamp((free -| @as(u64, transient) * record) / row, lo, decode);
+    return .{ .prompt = @intCast(prompt), .decode = @intCast(decode) };
 }
 
 /// A Sushi pack is held as its adapter leaves it (`SushiBill`); a streamed pack as stored beside its bank's fewest
@@ -288,10 +289,6 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
 
 test {
     _ = config;
-    _ = @import("model_config.zig");
-    _ = @import("bill.zig");
     _ = fixture;
-    _ = @import("proof_test.zig");
-    _ = @import("served_test.zig");
     _ = @import("../../sdk/quant/nvfp4/stream_bank.zig");
 }

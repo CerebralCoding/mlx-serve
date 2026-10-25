@@ -150,6 +150,14 @@ fn quantizeHead(w: *model.Weights, b: *const plugin_config.Binding, config: *con
     log.info("[lm-head] mxfp8 (lossy): the {d}x{d} bf16 head quantized at load\n", .{ shape[0], shape[1] * 32 });
 }
 
+/// `LoadCtx.stream_room` for a streamed GLM-5 bank: the ceiling less one prompt at 16K + 1K and the wired margin.
+fn streamRoom(config: *const ModelConfig) u64 {
+    if (!config.isGlm5() or !config.expert_bank) return 0;
+    const need = @import("../admission/glm5_bill.zig").glm5PrefillMemoryNeeded(config, 16_384 + 1_024, 1, 16, @import("../generate.zig").WIDE_PREFILL_CHUNK, .{});
+    return @import("../../../host/registry/memory_ceiling.zig").staticGpuMemoryCeiling() -| need -|
+        @import("../../../host/http/server.zig").serverState().wired_limit_margin_bytes;
+}
+
 /// Loads the served pack at `model_dir` (`config.plugin` set) and returns the shell that forwards through it.
 pub fn load(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir: []const u8, s: mlx.mlx_stream) !Transformer {
     return loadWith(io, a, config, model_dir, s, null);
@@ -193,6 +201,7 @@ fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
         .settings_json = abi.Str.of(loadSettings(&settings_buf, config)),
         .stream = .{ .ctx = s.ctx },
         .weights = &src,
+        .stream_room = streamRoom(config),
     }, &why) orelse {
         log.err("[plugin] {s}: load failed: {s}\n", .{ b.table.name.slice(), why.why.slice() });
         return if (std.mem.eql(u8, why.why.slice(), "MissingWeight")) error.MissingWeight else error.PluginLoadFailed;

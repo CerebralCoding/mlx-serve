@@ -5,12 +5,11 @@ const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 const mlx = @import("../../mlx/ffi.zig");
-const model = @import("../../engines/mlx/model.zig");
 const dsv4 = @import("deepseek_v4.zig");
 const bill_mod = @import("bill.zig");
 const fixture = @import("fixture.zig");
-const toModelConfig = @import("model_config.zig").toModelConfig;
-const intree = @import("../../engines/mlx/plugin/intree.zig");
+const Resident = @import("../../sdk/weights/resident.zig").Resident;
+const Weights = @import("../../sdk/weights/resident.zig").Weights;
 pub const config = @import("config.zig");
 
 pub const plugin = config.plugin;
@@ -53,8 +52,8 @@ pub fn moduleOf(mp: *anyopaque) *Module {
 }
 
 pub const Model = struct {
-    cfg: model.ModelConfig,
-    weights: model.Weights,
+    cfg: config.Config,
+    weights: Weights,
     mdl: *dsv4.Dsv4Model,
     caps: abi.Caps,
     s: mlx.mlx_stream,
@@ -72,12 +71,11 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
 }
 
 fn loadModel(ctx: *const abi.LoadCtx) !*Model {
-    const io = std.Io.Threaded.global_single_threaded.io();
     const m = try gpa.create(Model);
     errdefer gpa.destroy(m);
-    m.cfg = try toModelConfig(gpa, config.of(ctx.parsed), ctx.model_dir.slice());
-    errdefer m.cfg.deinit(gpa);
-    m.weights = intree.takeWeights(ctx) orelse try model.loadModelWeights(io, gpa, ctx.model_dir.slice(), &m.cfg, false);
+    m.cfg = config.of(ctx.parsed).*;
+    m.weights = (if (ctx.weights) |w| Resident.take(w) else null) orelse
+        try @import("../../sdk/weights/load.zig").loadWeights(std.Io.Threaded.global_single_threaded.io(), gpa, ctx.model_dir.slice());
     errdefer m.weights.deinit();
     m.s = .{ .ctx = ctx.stream.ctx };
     m.caps = ctx.parsed.caps;
@@ -94,7 +92,6 @@ fn unload(mp: *anyopaque) callconv(.c) void {
     m.mdl.deinit();
     gpa.destroy(m.mdl);
     m.weights.deinit();
-    m.cfg.deinit(gpa);
     gpa.destroy(m);
 }
 
@@ -217,7 +214,6 @@ test {
     _ = config;
     _ = bill_mod;
     _ = fixture;
-    _ = @import("model_config.zig");
     _ = @import("contract.zig");
     _ = @import("contract_kit.zig");
 }

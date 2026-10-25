@@ -981,7 +981,7 @@ test {
     _ = @import("../../mlx/state.zig");
     _ = @import("../../plugins/deepseek_v4/bill.zig");
     _ = @import("../../plugins/deepseek_v41/bill.zig");
-    _ = @import("../../plugins/glm5_next/bill.zig");
+    _ = @import("../../engines/mlx/admission/glm5_bill.zig");
     _ = @import("../../plugins/lfm2/media.zig");
     _ = @import("../../plugins/nemotron_h/media.zig");
     _ = @import("../../plugins/qwen3_5/minicpm_media.zig");
