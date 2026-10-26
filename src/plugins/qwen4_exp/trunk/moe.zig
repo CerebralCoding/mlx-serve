@@ -308,7 +308,11 @@ pub fn moeMLP2WithRouter(self: *Trunk, router_x: mlx.mlx_array, expert_x_in: mlx
     // expert intermediate dim.
     const gate_qp = self.quantParamsHinted(mw.switch_gate_w, mw.switch_gate_s, lastDim(expert_x));
     const up_qp = self.quantParamsHinted(mw.switch_up_w, mw.switch_up_s, lastDim(expert_x));
-    const down_qp = self.quantParamsHinted(mw.switch_down_w, mw.switch_down_s, if (cfg.moe_intermediate_size > 0) cfg.moe_intermediate_size else null);
+    // down consumes what gate emits: its rows, not the config's width (a tensor-parallel rank's trunk holds half,
+    // the MTP head every row).
+    const gsh = mlx.getShape(mw.switch_gate_w);
+    const inter: ?u32 = if (gsh.len == 3 and gsh[1] > 0) @intCast(gsh[1]) else if (cfg.moe_intermediate_size > 0) cfg.moe_intermediate_size else null;
+    const down_qp = self.quantParamsHinted(mw.switch_down_w, mw.switch_down_s, inter);
 
     const router_logits = if (router_override) |given| blk: {
         var owned = mlx.mlx_array_new();

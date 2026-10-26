@@ -190,6 +190,9 @@ fn denseTail(w: *const Weights, c: *Ctx, h: Array, attn: Array, L: *const Layer,
 /// One forward of `ids` (`[slots, rows]` int32). Results are owned by `g`.
 pub fn forward(w: *const Weights, shared: *const bases.Shared, g: *Graph, ids: Array, run: Run) !Out {
     var c = run.ctx(g, shared);
+    // Masks built once for every layer (a sliding layer's band was rebuilt per layer).
+    var memo: bases.block.Memo = .{ .g = g };
+    c.memo = &memo;
     var h = try run.splice(g, try Embed.forward(&w.embed, &c, ids), ids);
     // Per-layer inputs read the text tokens only: an image position's id is 0 (the reference's `text_mask`).
     const img = run.placeholders.image;
