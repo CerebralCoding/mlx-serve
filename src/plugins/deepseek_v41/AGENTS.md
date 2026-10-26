@@ -19,8 +19,10 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
 - `contract.zig`: kernel contract registrations of `kernels/*.metal`.
 
 ## Facts the table declares
-- `owns_decode_state`, `prefix_cache = false` (the module resumes its own state), serial + single-flight
-  (`batching: false`, `max_concurrent: 1`), no spec rollback (DSpark rewinds inside the module), DSpark stages from the config (`native_stages`);
+- `owns_decode_state`, `prefix_cache = false` (the module resumes its own state), `slot_state` + `batches_decode`
+  (a streamed pack: single-flight): one state per slot, the active one in `dec_state`, the others parked in the
+  plugin, the last finished one kept to resume from; plain decode tokens of several slots run as one batch
+  (`extendBatched`: the compiled stretches over every row, attention per state). No spec rollback (DSpark rewinds inside the module), DSpark stages from the config (`native_stages`);
   `spec.trunk_weight` lends the loaded embedding and head; a Thunderbolt pair's load re-reads the engine's plan
   (`distributed.planFor`, idempotent: untested without two Macs).
 - Thinking default ON; effort vocabulary `dsv41`; DSML tools on OUR byte-pinned template.
@@ -41,7 +43,10 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
 - DSpark = DFlash + Markov head: `block_size` at ROOT; `rope_is_neox_style:false` = MLX `traditional=true`; `w1`
   DENSE; sampled requests via one-hot acceptance. Per-model `mtp:false` keeps the
   stages off (`mtpSetting`).
-- Serial is not exclusive: module-owned state needs admission single-flight.
+- Engine code that drives the module directly (a DSpark round) activates its slot first (`activate_slot`); a
+  resume names its slot, so it never touches another live slot's state.
+- A row in a batch depends on its own state only, but two rows take the MoE's gather kernels where one row takes
+  the one-expert kernels: batched logits match a solo step to kernel numerics, not bits.
 - The V4.1 template, like V4's, is byte-pinned (`tests/dsv41_template_ab.py`).
 
 ## Streamed packs (`experts.bin`)
@@ -58,7 +63,7 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
   (`streamed_weights`); a prompt past the billed context is refused by name.
 
 ## Known issues
-- Serial + single-flight; prefix cache off (module-owned rings).
+- Prefix cache off (module-owned rings); one resume snapshot per model (a busy server resumes the last armed one).
 - Serial decode near the memory wall: 720 GB/s of ~1.1 TB/s, so kernel work buys 15-25%, not 2x.
 - Prefill compute-bound at ~16 TFLOPS; the MoE at 2048 rows streams each layer's expert bank 4x per 8192 chunk
   (M about 32 per expert): the single biggest inefficiency.
@@ -75,7 +80,7 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
 
 ## The row from the root architecture table
 
-DeepSeek-V4/V4.1 Flash, 1M ctx. Serial, spec off but DSpark, single-flight; DSML tools, OUR byte-pinned templates. V4:
+DeepSeek-V4/V4.1 Flash, 1M ctx. Spec off but DSpark; V4 single-flight, V4.1 batches plain decode across slots; DSML tools, OUR byte-pinned templates. V4:
 prefix cache OFF, 0731+, our layout. V4.1: MLX packs, DSpark ON, resumes one conversation (keyed on the image rows
 too); the EXL3 repack's experts streamed from its bank. V4.1 images: every span position carries `image_token_id` (without the
 request's rows that id is TEXT, as in the reference), the module splices the rows itself, image rows route by

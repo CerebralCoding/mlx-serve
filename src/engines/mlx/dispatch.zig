@@ -23,6 +23,7 @@ pub fn defaultCtx(self: *Transformer) ForwardCtx {
         .ssm_entries = self.ssm_entries,
         .capture_hidden = self.capture_hidden,
         .vision_embeddings = self.vision_embeddings,
+        .plugin_slot = ForwardCtx.shell_slot,
     };
 }
 

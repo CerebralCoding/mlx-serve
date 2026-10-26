@@ -17,6 +17,7 @@ const Constraint = @import("../grammar/constraint.zig").Constraint;
 const DrafterStepResult = @import("drafter.zig").DrafterStepResult;
 const Generator = @import("../generate/generator.zig").Generator;
 const modules = @import("../modules/call.zig");
+const plugin_settle = @import("../plugin/settle.zig");
 const SamplingParams = @import("../sampling/params.zig").SamplingParams;
 const capAcceptedForTokenBudget = @import("verify.zig").capAcceptedForTokenBudget;
 const dsparkCopyLen = @import("verify.zig").dsparkCopyLen;
@@ -107,6 +108,7 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
 /// One DSpark round on the DeepSeek-V4/V4.1 module itself (`modules.call`).
 pub fn moduleRound(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
     if (intree.dsv41(self.xfm)) |mdl| {
+        try plugin_settle.activate(self.xfm, &self.ctx);
         if (try self.dsparkCopyStep(allocator, mdl)) |res| return res;
         return self.dsparkPolicyStep(allocator, mdl);
     }

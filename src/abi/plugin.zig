@@ -127,7 +127,10 @@ pub const Caps = packed struct(u64) {
     /// A batch's recurrent state is read and written only through `CacheOps.state_rows` / `set_state_rows`, so the
     /// engine may keep it merged across batched ticks instead of re-stacking every layer each tick.
     merged_state: bool = false,
-    _: u35 = 0,
+    /// Module-owned state (`owns_decode_state`) kept per slot (`Forward.slots`, `release_slot`, `activate_slot`):
+    /// requests interleave and batch instead of running single-flight.
+    slot_state: bool = false,
+    _: u34 = 0,
 };
 
 pub const ThinkingDefault = enum(u8) { unset, off, on, on_with_tools };
@@ -559,11 +562,11 @@ pub const CacheHooks = extern struct {
     /// attention at the shell's geometry.
     layout: ?*const fn (p: *const Parsed, span: ?*const LayerSpan, out: [*]LayerCache, cap: u32) callconv(.c) u32 = null,
     aux: ?*const AuxHooks = null,
-    /// Module-owned conversation state (`Caps.owns_decode_state`): called before a prefill with the whole prompt and
-    /// its media rows (empty = none); returns the prompt tokens the model's own state already holds, from which the
-    /// engine prefills and which it reports as cached. 0 = none held: the plugin has reset that state for a cold
+    /// Module-owned conversation state (`Caps.owns_decode_state`): called before slot `slot`'s prefill with the whole
+    /// prompt and its media rows (empty = none); returns the prompt tokens the slot's state already holds, from which
+    /// the engine prefills and which it reports as cached. 0 = none held: the plugin has reset that state for a cold
     /// prefill.
-    resume_prompt: ?*const fn (m: *anyopaque, prompt: Span(u32), media_rows: Array) callconv(.c) u64 = null,
+    resume_prompt: ?*const fn (m: *anyopaque, slot: u32, prompt: Span(u32), media_rows: Array) callconv(.c) u64 = null,
     /// Bytes that module-owned state holds now (the cache budget's resident figures).
     state_bytes: ?*const fn (m: *anyopaque) callconv(.c) u64 = null,
 };
@@ -700,6 +703,9 @@ pub const ModelTable = extern struct {
     forward_settle: ?*const fn (m: *anyopaque, slots: Span(u32), how: Settle, tokens: *const Span(u32)) callconv(.c) Verdict = null,
     /// A slot id the engine handed in `Forward.slots` is gone: per-slot state the plugin keeps for it is freed.
     release_slot: ?*const fn (m: *anyopaque, slot: u32) callconv(.c) void = null,
+    /// Engine code is about to drive the model's module directly for `slot` (a native draft round,
+    /// `Caps.slot_state`): its state becomes the module's current one.
+    activate_slot: ?*const fn (m: *anyopaque, slot: u32) callconv(.c) Verdict = null,
     cache: *const CacheHooks,
     spec: ?*const SpecHooks = null,
     media: ?*const MediaHooks = null,

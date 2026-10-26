@@ -362,7 +362,7 @@ test "plugin load: a tower map takes the pack's vision tower tensors, a text loa
 test "plugin cache: a module-owned state's resume point and resident bytes come from the table" {
     const T = struct {
         var media_seen = false;
-        fn resumeAt(_: *anyopaque, prompt: abi.Span(u32), media: abi.Array) callconv(.c) u64 {
+        fn resumeAt(_: *anyopaque, _: u32, prompt: abi.Span(u32), media: abi.Array) callconv(.c) u64 {
             media_seen = media.ctx != null;
             return prompt.len; // all of it: the engine keeps the last token to forward
         }
@@ -380,10 +380,12 @@ test "plugin cache: a module-owned state's resume point and resident bytes come 
     try b.open(.{}, 0x2e5a);
     defer b.close();
     const prompt = [_]u32{ 4, 8, 15, 16 };
-    try testing.expectEqual(@as(?u64, null), driver.resumePrompt(&b.xfm, &prompt, null));
+    var ctx: ForwardCtx = undefined;
+    ctx.plugin_slot = 0;
+    try testing.expectEqual(@as(?u64, null), driver.resumePrompt(&b.xfm, &ctx, &prompt, null));
     try testing.expectEqual(@as(u64, 0), driver.stateBytes(&b.xfm));
     b.xfm.plugin.?.table = &T.table;
-    try testing.expectEqual(@as(?u64, 3), driver.resumePrompt(&b.xfm, &prompt, null));
+    try testing.expectEqual(@as(?u64, 3), driver.resumePrompt(&b.xfm, &ctx, &prompt, null));
     try testing.expect(!T.media_seen);
     try testing.expectEqual(@as(u64, 4096), driver.stateBytes(&b.xfm));
 }

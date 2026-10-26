@@ -155,7 +155,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // because the conn thread holds a refcount on slot.model.
     const xfm_ptr: *Transformer = slot.model.transformer.?;
     // DeepSeek-V4.1 keeps its own state: a prompt that extends its last one resumes there.
-    const resumed: u64 = if (plugin_driver.resumePrompt(xfm_ptr, slot.full_prompt, slot.vision_embeddings)) |n|
+    const resumed: u64 = if (plugin_driver.resumePrompt(xfm_ptr, &slot.ctx, slot.full_prompt, slot.vision_embeddings)) |n|
         n
     else if (xfm_ptr.mlx_stream_ext) |m|
         try mlx_stream.begin(m, slot.full_prompt, slot.max_tokens, mlx_stream.contextLength(&xfm_ptr.config))

@@ -176,6 +176,7 @@ pub fn modelBatchable(cfg: *const model_mod.ModelConfig) bool {
 /// reached the gate for it.
 fn modelExclusiveDecode(model: *const model_registry_mod.LoadedModel) bool {
     const t = model.transformer orelse return false;
+    if (t.config.plugin) |p| if (p.parsed.caps.slot_state) return false;
     return t.ownsModuleDecodeState();
 }
 

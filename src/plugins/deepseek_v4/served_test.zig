@@ -118,10 +118,12 @@ fn expectServed(comptime P: type, files: []const sdk.fixture.File, tape: []const
     defer p.close();
     var g = ops.Graph.init(testing.allocator, mlx.gpuStream());
     defer g.deinit();
-    // The checks the scheduler reads: single-flight, no prefix cache, serial, the module's own drafter.
+    // The checks the scheduler reads: module-owned state, no prefix cache, the module's own drafter; V4 runs serial,
+    // V4.1 batches its slots (`Caps.slot_state`).
     const sx = &p.xfm;
     try testing.expect(sx.ownsModuleDecodeState() and sx.moduleSpecWiring() and !sx.moduleStateSpecRollback() and !sx.supportsLayerCapture());
-    try testing.expect(!prefix_cache.HotPrefixCache.shouldUse(&p.cfg, true) and !verdict.modelBatchable(&p.cfg));
+    try testing.expect(!prefix_cache.HotPrefixCache.shouldUse(&p.cfg, true));
+    try testing.expectEqual(p.cfg.plugin.?.parsed.caps.slot_state, verdict.modelBatchable(&p.cfg));
     try testing.expectEqual(@as(usize, 0), sx.dsparkStages());
     // The hatch hands engine code the plugin's own module.
     const mod: ?*anyopaque = if (intree.dsv4(sx)) |x| x else if (intree.dsv41(sx)) |x| x else null;
@@ -164,7 +166,7 @@ test "deepseek_v41 served: a resumed prompt (CacheHooks.resume_prompt) resumes t
     for ([_][]const i32{ &first, &second, &.{ 5, 6, 7 } }) |prompt| {
         var u: [16]u32 = undefined;
         for (prompt, 0..) |t, i| u[i] = @intCast(t);
-        const n: u32 = @intCast(driver.resumePrompt(&p.xfm, u[0..prompt.len], null).?);
+        const n: u32 = @intCast(driver.resumePrompt(&p.xfm, &p.slot.ctx, u[0..prompt.len], null).?);
         try p.checkInts(&g, &.{n}, false);
         p.slot.kv.step = n;
         _ = try p.step(&g, prompt[n..]);

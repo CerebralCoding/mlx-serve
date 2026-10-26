@@ -16,7 +16,7 @@ const MAX_GROUP = 64;
 pub fn slotId(b: *Bound, ctx: *ForwardCtx) u32 {
     if (ctx.plugin_slot == 0) {
         b.next_slot +%= 1;
-        if (b.next_slot == 0) b.next_slot = 1;
+        if (b.next_slot == 0 or b.next_slot == ForwardCtx.shell_slot) b.next_slot = 1;
         ctx.plugin_slot = b.next_slot;
     }
     return ctx.plugin_slot;
@@ -88,6 +88,17 @@ pub fn release(xfm: *Transformer, ctx: *ForwardCtx) void {
     if (ctx.plugin_slot == 0) return;
     if (b.table.release_slot) |f| f(b.model, ctx.plugin_slot);
     ctx.plugin_slot = 0;
+}
+
+/// Engine code is about to drive the plugin's module directly for this slot (DSpark): its state becomes the module's.
+pub fn activate(xfm: *Transformer, ctx: *ForwardCtx) !void {
+    const b = xfm.plugin orelse return;
+    const f = b.table.activate_slot orelse return;
+    const v = f(b.model, slotId(b, ctx));
+    if (!v.isOk()) {
+        log.err("[plugin] {s}: slot state not activated: {s}\n", .{ b.table.name.slice(), v.why.slice() });
+        return error.PluginActivateFailed;
+    }
 }
 
 /// Logs the slot's meter lines (the request's summary, beside `[spec-stats]`).

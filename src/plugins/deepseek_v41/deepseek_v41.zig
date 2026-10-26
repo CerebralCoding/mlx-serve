@@ -417,8 +417,12 @@ pub const Dsv41Model = struct {
     owned: std.ArrayList(A) = .empty,
     dec_state: ?State = null,
     pair: ?Pair = null,
-    /// Bumped whenever `dec_state` is replaced: a snapshot names the state it was taken of.
+    /// `dec_state`'s identity: a snapshot names the state it was taken of. Set from `gens` whenever `dec_state` is
+    /// replaced, so a state parked by its slot and swapped back in keeps its own.
     state_gen: u64 = 0,
+    gens: u64 = 0,
+    /// The state the armed snapshot is due on (`snap_at` belongs to that request alone).
+    snap_gen: u64 = 0,
     /// The last prompt's state one token short of its end (`resumePrompt`).
     snap: ?Snap = null,
     /// Where this prompt's snapshot is taken (`armSnapshot`), and its tokens.
@@ -3438,7 +3442,7 @@ pub fn workerStep(m: *Dsv41Model, gpa: std.mem.Allocator, x: A, pre: A, p0: usiz
     if (p0 == 0 or m.dec_state == null) {
         if (m.dec_state) |*old| old.deinit();
         m.dec_state = null;
-        m.state_gen += 1;
+        newGen(m);
         m.dec_state = try initState(m, gpa);
     } else if (p0 != m.dec_state.?.n and !try restoreAt(m, p0)) return error.DistPeerDiverged;
     const st = &m.dec_state.?;
@@ -3476,6 +3480,7 @@ pub fn workerStep(m: *Dsv41Model, gpa: std.mem.Allocator, x: A, pre: A, p0: usiz
     try evalAll(ev.items);
     if (snap) {
         m.snap_at = st.n;
+        m.snap_gen = m.state_gen;
         try snapshotIfDue(m);
     }
     return .{ sc.out(xo), sc.out(po) };
@@ -3788,8 +3793,17 @@ pub fn prefill(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u32, vision:
 pub fn reset(m: *Dsv41Model, gpa: std.mem.Allocator) !void {
     if (m.dec_state) |*st| st.deinit();
     m.dec_state = null;
-    m.state_gen += 1;
+    newGen(m);
     m.dec_state = try initState(m, gpa);
+}
+
+/// A new identity for `dec_state`, which replaces the current one: a snapshot armed for the request whose state it
+/// was stays armed for its new one.
+fn newGen(m: *Dsv41Model) void {
+    const armed = m.snap_gen == m.state_gen;
+    m.gens += 1;
+    m.state_gen = m.gens;
+    if (armed) m.snap_gen = m.state_gen;
 }
 
 /// `extend` with every row's logits (a verify block), taking the armed snapshot on the way.
@@ -3851,6 +3865,8 @@ pub fn resumePrompt(m: *Dsv41Model, prompt: []const u32, vision_rows: ?A) !usize
     m.prompt = &.{};
     m.prompt = try m.gpa.dupe(u32, prompt);
     const n = try restore(m, prompt, vision_rows);
+    if (n == 0) try reset(m, m.gpa);
+    m.snap_gen = m.state_gen;
     m.gpa.free(m.snap_ids);
     m.snap_ids = &.{};
     m.snap_at = null;
@@ -3917,9 +3933,14 @@ fn applySnap(st: *State, sn: *const Snap) !void {
 
 /// Takes the armed snapshot once the state stands at its position.
 fn snapshotIfDue(m: *Dsv41Model) !void {
-    const at = m.snap_at orelse return;
     const st = &(m.dec_state orelse return);
-    if (st.n != at) return;
+    return snapshotStateIfDue(m, st, m.state_gen);
+}
+
+/// `snapshotIfDue` for state `st` of identity `gen` (a slot's, active or not).
+fn snapshotStateIfDue(m: *Dsv41Model, st: *const State, gen: u64) !void {
+    const at = m.snap_at orelse return;
+    if (gen != m.snap_gen or st.n != at) return;
     m.snap_at = null;
     if (m.snap) |*old| old.deinit(m.gpa);
     m.snap = null;
@@ -3936,7 +3957,7 @@ fn snapshotIfDue(m: *Dsv41Model) !void {
         .pend_gate = ref(l.pend_gate),
     };
     for (ds, st.ds) |*o, r| o.* = ref(r.buf);
-    m.snap = .{ .gen = m.state_gen, .vision_key = m.snap_vision_key, .n = st.n, .ids = m.snap_ids, .layers = layers, .ds = ds, .mh = ref(st.mh), .hist = hist };
+    m.snap = .{ .gen = gen, .vision_key = m.snap_vision_key, .n = st.n, .ids = m.snap_ids, .layers = layers, .ds = ds, .mh = ref(st.mh), .hist = hist };
     m.snap_ids = &.{};
 }
 
@@ -3966,6 +3987,126 @@ pub fn extendResumable(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u32,
     const out = try extendIds(m, gpa, st, .{ .host = ids }, .last, vision);
     try snapshotIfDue(m);
     return out;
+}
+
+/// One decode token for each of `states` (identities `gens`, for their snapshots) as one batch of rows: the
+/// hyper-connection mixes, norms and FFN run over every row, attention per state at its own position. Returns the
+/// `[N, V]` f32 logits, row k for `states[k]` (caller frees).
+pub fn extendBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, gens: []const u64, toks: []const u32) !A {
+    const c = &m.cfg;
+    const N = toks.len;
+    if (N == 0 or N > region_rows or states.len != N or gens.len != N or m.pair != null or m.streamed != null) return error.Dsv41BatchUnsupported;
+    for (states, gens) |st, g| {
+        if (st.verify != null) return error.Dsv41BatchUnsupported;
+        try snapshotStateIfDue(m, st, g);
+    }
+    for (toks) |t| if (t >= m.vocab) return error.TokenPastVocabulary;
+    const targets: usize = if (m.n_mtp > 0) c.dsv4_n_dspark_target_layers else 0;
+    // Each state's Engram row ids off its own look-back, one span (row) per state.
+    const ncols: usize = if (m.hash) |*hs| hs.cols() else 0;
+    const eng_ids = try gpa.alloc(u32, N * m.engrams.len * ncols);
+    defer gpa.free(eng_ids);
+    if (m.hash != null) for (states, toks, 0..) |st, t, k| {
+        const one = try engramIds(m, gpa, st, &.{t}, false);
+        defer gpa.free(one);
+        @memcpy(eng_ids[k * one.len ..][0..one.len], one);
+    };
+    const held = try gpa.alloc(A, N * (4 + targets));
+    defer {
+        for (held) |x| if (x.ctx != null) {
+            _ = mlx.mlx_array_free(x);
+        };
+        gpa.free(held);
+    }
+    @memset(held, none);
+    var sp = spansOf(held, N, targets, 1, N, 0);
+    sp.eng_ids = eng_ids;
+    sp.ncols = ncols;
+    {
+        var sc = Scope.init(gpa, m.s);
+        defer sc.deinit();
+        const emb = try m.embed.rows(&sc, try sc.ints(@ptrCast(toks), &.{ci(N)}), m.act);
+        for (0..N) |k| {
+            hold(&sp.xs[k], try sc.broadcast(try sc.expand(try sc.slice(emb, 0, k, k + 1), 1), &.{ 1, ci(c.dsv4_hc_mult), ci(c.hidden_size) }));
+            hold(&sp.pres[k], try onehotPre(&sc, m, 1));
+        }
+    }
+    for (0..m.n_layers) |li| {
+        try batchedLayer(m, gpa, states, &sp, li);
+        if (li + 1 == m.n_layers) break;
+        // As a solo decode step: hand each layer to the GPU as it is built.
+        var ev: std.ArrayList(A) = .empty;
+        defer ev.deinit(gpa);
+        for (held) |x| if (x.ctx != null) try ev.append(gpa, x);
+        for (states) |st| try appendLayerState(gpa, &ev, &st.layers[li]);
+        const vec = mlx.mlx_vector_array_new_data(ev.items.ptr, ev.items.len);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_async_eval(vec));
+    }
+    var sc = Scope.init(gpa, m.s);
+    defer sc.deinit();
+    if (m.n_mtp > 0) for (states, 0..) |st, k| {
+        try commitMain(&sc, m, st, try sc.concat(sp.mh[k * targets ..][0..targets], -1), st.n);
+    };
+    for (states) |st| st.n += 1;
+    const rows = try gpa.alloc(A, N);
+    defer gpa.free(rows);
+    for (rows, 0..) |*h, k| h.* = try hcCollapse(&sc, sp.xs[k], sp.pres[k]);
+    const logits = try sc.astype(try m.head.apply(&sc, try sc.rms(try sc.concat(rows, 0), m.norm, c.rms_norm_eps)), .float32);
+    var ev: std.ArrayList(A) = .empty;
+    defer ev.deinit(gpa);
+    try ev.append(gpa, logits);
+    for (states) |st| {
+        for (st.layers) |*ls| try appendLayerState(gpa, &ev, ls);
+        for (st.ds) |r| try ev.append(gpa, r.buf);
+    }
+    const vec = mlx.mlx_vector_array_new_data(ev.items.ptr, ev.items.len);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    try mlx.check(mlx.mlx_async_eval(vec));
+    for (states, gens) |st, g| try snapshotStateIfDue(m, st, g);
+    return sc.out(logits);
+}
+
+/// Layer `li` of `extendBatched`: the compiled stretches over every state's row, attention per state.
+fn batchedLayer(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, sp: *const Spans, li: usize) !void {
+    const N = sp.xs.len;
+    var sc = Scope.init(gpa, m.s);
+    defer sc.deinit();
+    const parts = try gpa.alloc(A, N);
+    defer gpa.free(parts);
+    for (parts, 0..) |*p, k| p.* = try spanIn(&sc, m, gpa, sp, li, k);
+    if (li >= m.regions.len or !compiledAt(m, N)) {
+        // No compiled stretch at this width: each state's block alone.
+        for (parts, states, 0..) |x, st, k| {
+            var sh: Shared = .{ .topk = sp.topks[k], .cand = sp.cands[k] };
+            var pre = sp.pres[k];
+            const y = try block(&sc, m, st, li, x, &pre, st.n, &sh, null);
+            hold(&sp.xs[k], y);
+            hold(&sp.pres[k], pre);
+            hold(&sp.topks[k], sh.topk);
+            hold(&sp.cands[k], sh.cand);
+        }
+        return;
+    }
+    const x = try sc.concat(parts, 0);
+    var a: [4]A = undefined; // the attention's pre, post, comb; its input
+    try runRegion(&sc, m, li, .attn_in, &.{ x, try sc.concat(sp.pres, 0) }, &a);
+    const heads = try gpa.alloc(A, N);
+    defer gpa.free(heads);
+    for (heads, states, 0..) |*o, st, k| {
+        var ssc = Scope.init(gpa, m.s);
+        defer ssc.deinit();
+        var sh: Shared = .{ .topk = sp.topks[k], .cand = sp.cands[k] };
+        o.* = try sc.keep(ssc.out(try attention(&ssc, m, st, li, try ssc.slice(a[3], 0, k, k + 1), st.n, &sh, null)));
+        hold(&sp.topks[k], sh.topk);
+        hold(&sp.cands[k], sh.cand);
+    }
+    var o: [2]A = undefined; // the new stream, the FFN's mix
+    try runRegion(&sc, m, li, .ffn, &.{ x, try sc.concat(heads, 0), a[0], a[1], a[2] }, &o);
+    for (0..N) |k| {
+        hold(&sp.xs[k], try sc.slice(o[0], 0, k, k + 1));
+        hold(&sp.pres[k], try sc.slice(o[1], 0, k, k + 1));
+    }
 }
 
 // ── DSpark ──────────────────────────────────────────────────────────────

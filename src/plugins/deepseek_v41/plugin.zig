@@ -1,6 +1,7 @@
 //! DeepSeek-V4.1-Flash: the module-owned native arch (`deepseek_v41.zig`) and its vision tower behind the model table.
-//! Serial, single-flight; one conversation resumes (`resume`, keyed on its image rows). A streamed pack's routed
-//! experts come from its EXL3 bank (`sdk/weights/streamed.zig` `Exl3`).
+//! One state per slot: the module runs the active one (`dec_state`), the others wait here, and plain decode tokens of
+//! several slots run as one batch (`extendBatched`). The last finished conversation resumes (`resume`, keyed on its
+//! image rows). A streamed pack's routed experts come from its EXL3 bank (`sdk/weights/streamed.zig` `Exl3`).
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -31,6 +32,8 @@ pub const table = abi.ModelTable{
     .load = &load,
     .unload = &unload,
     .forward = &forward,
+    .release_slot = &releaseSlot,
+    .activate_slot = &activateSlot,
     .cache = &.{ .layout = &layout, .resume_prompt = &resumePrompt, .state_bytes = &stateBytes },
     .media = &.{ .tower = &media.tower, .prepare = &media.prepare, .placeholder_rows = &media.placeholderRows },
     .spec = &.{ .trunk_weight = &trunkWeight },
@@ -80,7 +83,70 @@ pub const Model = struct {
     /// A streamed pack's expert bank, and the prompt positions its slot rows were billed for.
     bank: ?Bank = null,
     bank_context: u64 = 0,
+    /// The slot whose state is `mdl.dec_state` (0: none claimed it yet, a resumed state or the module's own); every
+    /// other live slot's waits in `parked`. `idle` is the last finished slot's, which the next prompt resumes from.
+    owner: u32 = 0,
+    parked: std.AutoHashMapUnmanaged(u32, Kept) = .empty,
+    idle: ?Kept = null,
 };
+
+/// A state off the module, with its identity (`Dsv41Model.state_gen`).
+const Kept = struct {
+    st: dsv41.State,
+    gen: u64,
+
+    fn deinit(k: *Kept) void {
+        k.st.deinit();
+    }
+};
+
+/// Takes the module's state off it: a slot's waits in `parked`, an unclaimed one becomes `idle`.
+fn park(m: *Model) !void {
+    const st = m.mdl.dec_state orelse return;
+    const k: Kept = .{ .st = st, .gen = m.mdl.state_gen };
+    if (m.owner != 0) try m.parked.put(gpa, m.owner, k) else keepIdle(m, k);
+    m.mdl.dec_state = null;
+    m.owner = 0;
+}
+
+fn keepIdle(m: *Model, k: Kept) void {
+    if (m.idle) |*old| old.deinit();
+    m.idle = k;
+}
+
+/// Makes `slot`'s state the module's. A slot new here claims an unclaimed state (the prompt `resumePrompt` just
+/// readied), else starts with none: its prompt at position 0 builds one. Slot 0 (no slots) keeps the module's.
+fn activate(m: *Model, slot: u32) !void {
+    if (slot == 0 or slot == m.owner) return;
+    const mine = m.parked.fetchRemove(slot);
+    if (mine == null and m.owner == 0) {
+        m.owner = slot;
+        return;
+    }
+    park(m) catch |e| {
+        if (mine) |kv| m.parked.putAssumeCapacity(slot, kv.value);
+        return e;
+    };
+    if (mine) |kv| {
+        m.mdl.dec_state = kv.value.st;
+        m.mdl.state_gen = kv.value.gen;
+    }
+    m.owner = slot;
+}
+
+fn releaseSlot(mp: *anyopaque, slot: u32) callconv(.c) void {
+    const m: *Model = @ptrCast(@alignCast(mp));
+    if (slot == m.owner) {
+        m.owner = 0;
+        park(m) catch unreachable; // an unclaimed state is never put in `parked`
+    } else if (m.parked.fetchRemove(slot)) |kv| keepIdle(m, kv.value);
+}
+
+fn activateSlot(mp: *anyopaque, slot: u32) callconv(.c) Verdict {
+    const m: *Model = @ptrCast(@alignCast(mp));
+    activate(m, slot) catch return Verdict.refuse(.failed, "deepseek_v41: out of memory parking a slot's state");
+    return .ok;
+}
 
 const Bank = if (build_options.mlx_stream) *streamed.Exl3.Source else void;
 
@@ -153,6 +219,9 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     m.mdl = try dsv41.init(gpa, &m.cfg, &m.weights, s, .{ .dspark = dsv41.dsparkWanted(&m.cfg, pair, mtpSetting(ctx.settings_json.slice())), .pair = pair, .head_8bit = dsv41.head8Wanted(), .streamed_experts = c.dsv41_streamed, .pack_dir = ctx.model_dir.slice() });
     errdefer m.mdl.deinit();
     m.bank = null;
+    m.owner = 0;
+    m.parked = .empty;
+    m.idle = null;
     if (c.dsv41_streamed) try openBank(m, io, ctx.model_dir.slice(), ctxSetting(ctx.settings_json.slice()));
     errdefer closeBank(m);
     m.tower = if (c.dsv41_vision and taken == null) try vision.Dsv41Vision.init(gpa, m.cfg, &m.weights) else null;
@@ -205,6 +274,10 @@ fn unload(mp: *anyopaque) callconv(.c) void {
     const m: *Model = @ptrCast(@alignCast(mp));
     closeBank(m);
     if (m.tower) |*t| t.deinit();
+    var it = m.parked.valueIterator();
+    while (it.next()) |k| k.deinit();
+    m.parked.deinit(gpa);
+    if (m.idle) |*k| k.deinit();
     m.mdl.deinit();
     m.weights.deinit();
     gpa.destroy(m);
@@ -214,7 +287,9 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     const m: *Model = @ptrCast(@alignCast(mp));
     if (!abi.declaresMode(m.caps, f.mode)) return Verdict.refuse(.unsupported, "deepseek_v41: forward mode not declared");
     if (f.capture_layers.len > 0) return Verdict.refuse(.unsupported, "deepseek_v41: no layer capture");
+    if (f.mode == .batched_rows) return forwardBatched(m, f, out);
     if (f.slots.len > 1 or f.rows == 0) return Verdict.refuse(.unsupported, "deepseek_v41: one slot's rows at a time");
+    if (f.slots.len == 1) activate(m, f.slots.slice()[0]) catch return Verdict.refuse(.failed, "deepseek_v41: out of memory parking a slot's state");
     const in = v4plugin.Ids.of(f) catch return Verdict.refuse(.failed, "deepseek_v41: the token ids do not read back");
     defer in.deinit();
     const pos: usize = if (f.positions.len > 0) f.positions.slice()[0] else 0;
@@ -226,6 +301,58 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     const logits = run(m, in.host, pos, f.logits == .all_rows, rows, in.dev) catch return Verdict.refuse(.failed, "deepseek_v41: the forward failed");
     if (f.logits == .none) _ = mlx.mlx_array_free(logits) else out.logits = .{ .ctx = logits.ctx };
     return .ok;
+}
+
+/// One decode token per slot, each at its state's position: one batch of rows (`extendBatched`), or each slot alone
+/// where the module runs no batch (a Thunderbolt pair, a streamed bank, an open verify, a slot starting at 0).
+fn forwardBatched(m: *Model, f: *const abi.Forward, out: *abi.ForwardOut) Verdict {
+    const n = f.slots.len;
+    if (n == 0 or n > max_batch or f.rows != 1 or f.tokens.len != n or f.logits == .all_rows or f.want_hidden)
+        return Verdict.refuse(.unsupported, "deepseek_v41: a batch is one host token per slot");
+    var states: [max_batch]*dsv41.State = undefined;
+    var gens: [max_batch]u64 = undefined;
+    var alone = m.mdl.pair != null or m.mdl.streamed != null;
+    for (f.slots.slice(), 0..) |slot, k| {
+        if (f.positions.len == n and f.positions.slice()[k] == 0) {
+            alone = true;
+            continue;
+        }
+        if (slot == m.owner and m.mdl.dec_state != null) {
+            states[k] = &m.mdl.dec_state.?;
+            gens[k] = m.mdl.state_gen;
+        } else if (m.parked.getPtr(slot)) |kept| {
+            states[k] = &kept.st;
+            gens[k] = kept.gen;
+        } else return Verdict.refuse(.failed, "deepseek_v41: a batched slot has no state");
+        if (f.positions.len == n and f.positions.slice()[k] != states[k].n) return Verdict.refuse(.failed, "deepseek_v41: the position does not follow the slot's state");
+        if (states[k].verify != null) alone = true;
+    }
+    for (f.tokens.slice()) |t| if (t >= m.cfg.vocab_size) return Verdict.refuse(.failed, "deepseek_v41: token id past the vocabulary");
+    const logits = if (alone) eachAlone(m, f) else dsv41.extendBatched(m.mdl, gpa, states[0..n], gens[0..n], f.tokens.slice());
+    out.logits = .{ .ctx = (logits catch return Verdict.refuse(.failed, "deepseek_v41: the batched forward failed")).ctx };
+    return .ok;
+}
+
+const max_batch = 16;
+
+/// `forwardBatched`'s rows one slot at a time, as each slot's own decode step.
+fn eachAlone(m: *Model, f: *const abi.Forward) !mlx.mlx_array {
+    var rows: [max_batch]mlx.mlx_array = undefined;
+    var done: usize = 0;
+    defer for (rows[0..done]) |r| {
+        _ = mlx.mlx_array_free(r);
+    };
+    for (f.slots.slice(), f.tokens.slice(), 0..) |slot, t, k| {
+        try activate(m, slot);
+        const pos = if (f.positions.len == f.slots.len) f.positions.slice()[k] else if (m.mdl.dec_state) |st| st.n else 0;
+        rows[done] = try run(m, &.{t}, pos, false, null, .{ .ctx = null });
+        done += 1;
+    }
+    var o = mlx.mlx_array_new();
+    const v = mlx.mlx_vector_array_new_data(&rows, done);
+    defer _ = mlx.mlx_vector_array_free(v);
+    try mlx.check(mlx.mlx_concatenate_axis(&o, v, 0, m.s));
+    return o;
 }
 
 /// The legacy seam's arms: position 0 starts a request (a resumed one arrives past 0); a decode token stays on the
@@ -276,19 +403,34 @@ fn runPrompt(m: *Model, ids: []const u32, pos: usize, rows: ?dsv41.VisionRows) !
 
 /// `CacheHooks.resume_prompt`: restores the longest prefix of `prompt` the model kept (images keyed by their rows)
 /// and returns its length; a cold prompt, or a failed restore, resets the state and returns 0.
-pub fn resumePrompt(mp: *anyopaque, prompt: abi.Span(u32), media_rows: abi.Array) callconv(.c) u64 {
+pub fn resumePrompt(mp: *anyopaque, slot: u32, prompt: abi.Span(u32), media_rows: abi.Array) callconv(.c) u64 {
     const m: *Model = @ptrCast(@alignCast(mp));
     const rows: ?mlx.mlx_array = if (media_rows.ctx != null) .{ .ctx = media_rows.ctx } else null;
-    const n = dsv41.resumePrompt(m.mdl, prompt.slice(), rows) catch 0;
-    // A failed reset leaves no state; the forward at position 0 builds one.
-    if (n == 0) dsv41.reset(m.mdl, gpa) catch {};
-    return n;
+    // Another live slot's state stays its own: a slot without one resumes from the last finished conversation's.
+    activate(m, slot) catch {
+        dsv41.reset(m.mdl, gpa) catch {};
+        return 0;
+    };
+    if (m.mdl.dec_state == null) if (m.idle) |k| {
+        m.mdl.dec_state = k.st;
+        m.mdl.state_gen = k.gen;
+        m.idle = null;
+    };
+    return dsv41.resumePrompt(m.mdl, prompt.slice(), rows) catch blk: {
+        // A failed reset leaves no state; the forward at position 0 builds one.
+        dsv41.reset(m.mdl, gpa) catch {};
+        break :blk 0;
+    };
 }
 
 /// `CacheHooks.state_bytes`: the bytes the request's state holds on the GPU, for the engine's cache budget.
 pub fn stateBytes(mp: *anyopaque) callconv(.c) u64 {
     const m: *Model = @ptrCast(@alignCast(mp));
-    return if (m.mdl.dec_state) |*st| dsv41.stateBytes(st) else 0;
+    var bytes: u64 = if (m.mdl.dec_state) |*st| dsv41.stateBytes(st) else 0;
+    var it = m.parked.valueIterator();
+    while (it.next()) |k| bytes += dsv41.stateBytes(&k.st);
+    if (m.idle) |*k| bytes += dsv41.stateBytes(&k.st);
+    return bytes;
 }
 
 /// The load reads its Engram tables from disk per lookup and drops the tensors it never loads

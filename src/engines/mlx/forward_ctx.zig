@@ -1,6 +1,7 @@
 //! engines/mlx/forward_ctx.
 //! Owns SpecTree, CaptureLayers, ForwardCtx.
 
+const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const HeadPlace = @import("../../plugins/qwen4_exp/mtp.zig").HeadPlace;
 const abi = @import("../../abi/plugin.zig");
@@ -186,4 +187,7 @@ pub const ForwardCtx = struct {
     /// forward left owed (`plugin/settle.zig`).
     plugin_slot: u32 = 0,
     plugin_owed: abi.Owed = .none,
+
+    /// The shell's own sequence (`defaultCtx`, rebuilt per call): one id across its forwards.
+    pub const shell_slot: u32 = std.math.maxInt(u32);
 };

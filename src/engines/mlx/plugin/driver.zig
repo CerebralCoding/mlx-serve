@@ -532,10 +532,10 @@ fn forwardEncoderBatch(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids
 
 /// The prompt tokens a served model's own conversation state already holds (`CacheHooks.resume_prompt`), at most all
 /// but the last (a resumed prefill still forwards a token); null when the model keeps no such state.
-pub fn resumePrompt(xfm: *const Transformer, prompt: []const u32, media: ?Array) ?u64 {
+pub fn resumePrompt(xfm: *const Transformer, ctx: *ForwardCtx, prompt: []const u32, media: ?Array) ?u64 {
     const b = xfm.plugin orelse return null;
     const f = b.table.cache.resume_prompt orelse return null;
-    const n = f(b.model, .of(prompt), .{ .ctx = if (media) |m| m.ctx else null });
+    const n = f(b.model, settle.slotId(b, ctx), .of(prompt), .{ .ctx = if (media) |m| m.ctx else null });
     return @min(n, prompt.len -| 1);
 }
 

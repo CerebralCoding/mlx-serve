@@ -142,6 +142,8 @@ pub const Loaded = struct {
         return self;
     }
     pub fn close(self: *Loaded) void {
+        // Work still queued on the stream reads the staged files' mappings: a removed file is a SIGBUS there.
+        _ = mlx.mlx_synchronize(self.stream);
         self.table.unload(self.model);
         self.table.free_parsed(&self.parsed);
         _ = mlx.mlx_stream_free(self.stream);
