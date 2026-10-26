@@ -345,6 +345,8 @@ fn expectVerifyEqualsSerial(x: *Transformer) !void {
 
 /// Two slots: batched decode ticks and a batched captured verify, served vs legacy.
 pub fn expectBatched(p: *Pair) !void {
+    // Off Metal the tiny pack's pipelined generation never completes (MLX's CUDA wait stalls: open issue).
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const a = testing.allocator;
     const s = fixture.stream();
     for (p.shells()) |x| try testing.expect(x.supportsBatchedGdnDecode());

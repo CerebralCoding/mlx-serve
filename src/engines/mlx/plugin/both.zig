@@ -141,6 +141,8 @@ pub const Both = struct {
 
     /// Greedy decode through the pipelined step (`lazyForward`: the next token stays a lazy argmax), tokens equal.
     pub fn expectGreedy(b: *Both) !void {
+        // Off Metal the tiny pack's pipelined generation never completes (MLX's CUDA wait stalls: open issue).
+        if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
         var tokens: [8]u32 = undefined;
         var s: Slot = undefined;
         try s.init(b, &b.xfm);
@@ -191,6 +193,8 @@ pub const Both = struct {
 
     /// Two slots prefilled apart, then decoded together: each slot's logits.
     pub fn expectBatched(b: *Both) !void {
+        // Off Metal the tiny pack's pipelined generation never completes (MLX's CUDA wait stalls: open issue).
+        if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
         const a = testing.allocator;
         var slots: [2]Slot = undefined;
         for (&slots) |*s| try s.init(b, &b.xfm);

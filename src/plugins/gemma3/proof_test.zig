@@ -197,6 +197,8 @@ pub fn expectSteps(b: *Both) !void {
 
 /// Greedy decode through the pipelined step (`lazyForward`: the next token stays a lazy argmax), tokens bit-equal.
 pub fn expectGreedy(b: *Both) !void {
+    // Off Metal the tiny pack's pipelined generation never completes (MLX's CUDA wait stalls: open issue).
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     var xb: [2]*Transformer = undefined;
     const xs = b.sides(&xb);
     var tokens: [2][12]u32 = undefined;
@@ -261,6 +263,8 @@ pub fn expectMedia(b: *Both, img: i32) !void {
 /// Two slots prefilled apart, then decoded together past the window: each slot's logits bit-equal to the legacy
 /// batched tick's.
 pub fn expectBatched(b: *Both) !void {
+    // Off Metal the tiny pack's pipelined generation never completes (MLX's CUDA wait stalls: open issue).
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const a = testing.allocator;
     const n = b.cfg.num_hidden_layers;
     var xb: [2]*Transformer = undefined;
