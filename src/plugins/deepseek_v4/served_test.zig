@@ -56,7 +56,7 @@ const Served = struct {
         const p = try a.create(Served);
         errdefer a.destroy(p);
         p.after_greedy = false;
-        p.tape = try Tape.player(tape);
+        p.tape = if (tape.len > 0) try Tape.player(tape) else .{};
         p.tmp = testing.tmpDir(.{});
         errdefer p.tmp.cleanup();
         for (files) |f| try p.tmp.dir.writeFile(io, .{ .sub_path = f.name, .data = f.bytes });
@@ -151,6 +151,30 @@ test "deepseek_v41 served: chunked prefill, host and pipelined decodes and a new
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try expectServed(@import("../deepseek_v41/plugin.zig"), try fixture.v41Files(arena.allocator(), 7), @embedFile("../deepseek_v41/fixtures/served.tape"));
+}
+
+test "deepseek_v41 served: two slots decode in one batched tick through the driver, each slot's step following its state" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, try fixture.v41Files(arena.allocator(), 7), "");
+    defer p.close();
+    var g = ops.Graph.init(testing.allocator, mlx.gpuStream());
+    defer g.deinit();
+    var other: Slot = undefined;
+    try other.init();
+    defer other.kv.deinit();
+    const ctxs = [_]*ForwardCtx{ &p.slot.ctx, &other.ctx };
+    const prompts = [_][]const i32{ &.{ 3, 17, 42, 9, 7, 25, 1, 60, 11, 2, 90 }, &.{ 5, 8, 13, 21, 34, 55, 89, 4, 6, 10, 12, 14, 16, 18 } };
+    for (ctxs, prompts) |c, ids| _ = try g.adopt(try p.xfm.forwardWith(c, try g.fromSlice(i32, ids, &.{ 1, @intCast(ids.len) })));
+    for (0..3) |i| {
+        const rows = try driver.forwardBatched(&p.xfm, p.xfm.plugin.?, &.{ 44, 9 }, &ctxs, &.{ @intCast(ctxs[0].cache.step), @intCast(ctxs[1].cache.step) }, null);
+        defer {
+            for (rows) |r| _ = mlx.mlx_array_free(r);
+            p.xfm.allocator.free(rows);
+        }
+        for (ctxs, prompts) |c, ids| try testing.expectEqual(ids.len + i + 1, c.cache.step);
+    }
 }
 
 test "deepseek_v41 served: a resumed prompt (CacheHooks.resume_prompt) resumes through the driver where the legacy resume does, bit-equal" {

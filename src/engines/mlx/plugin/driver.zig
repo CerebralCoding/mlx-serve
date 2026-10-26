@@ -590,6 +590,10 @@ pub fn forwardBatched(xfm: *Transformer, b: *Bound, next_tokens: []const u32, ct
         log.err("[plugin] {s}: batched forward failed: {s}\n", .{ b.table.name.slice(), v.why.slice() });
         return error.PluginForwardFailed;
     }
+    // Module-owned state: no cache is appended to, so each slot's step moves here, as `forward`'s does.
+    if (xfm.config.plugin.?.parsed.caps.owns_decode_state) for (ctxs) |c| {
+        c.cache.step += 1;
+    };
     if (mg) |m| try m.finish(xfm, ctxs, false);
     settleTick(xfm, ctxs, f.defer_host, out.owed) catch |e| {
         freeOut(&out, &.{});
