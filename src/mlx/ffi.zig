@@ -1324,6 +1324,8 @@ fn latchMlxError(msg: [*:0]const u8, data: ?*anyopaque) callconv(.c) void {
         latch().mlx_error_latched.store(true, .release);
     }
     log.err("[mlx] {s}\n", .{span});
+    // Test builds keep the log off stderr; a failed op must still name its cause beside the test.
+    if (comptime builtin.is_test) std.debug.print("[mlx] {s}\n", .{span});
 }
 
 /// Install the latching handler. Called once from `main()`.
