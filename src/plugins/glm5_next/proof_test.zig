@@ -275,6 +275,7 @@ test "glm5_next plugin: batched rows equal the legacy batched decode bit for bit
 // Bar: a Sushi pack (EXL3 routed experts through `sdk/quant/exl3/format.zig`) runs as the legacy forward runs it,
 // per slot and batched.
 test "glm5_next plugin: a Sushi pack's EXL3 experts equal the legacy forward bit for bit" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

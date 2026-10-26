@@ -61,7 +61,7 @@ fn launch(kernel: mlx.mlx_fast_cuda_kernel, out_size: c_int, dt: mlx.mlx_dtype, 
 /// sum_k scores[b,k] * down_e(silu(gate_e(x_b) * gscale_e) * up_e(x_b)), e = inds[b,k]: [B, D] in x's
 /// dtype, or null outside the kernels' envelope. x [B, D]; inds uint32 and scores [B, TOPK].
 pub fn decode(s: mlx.mlx_stream, x: mlx.mlx_array, gate: Bank, up: Bank, down: Bank, gate_scale: ?mlx.mlx_array, inds: mlx.mlx_array, scores: mlx.mlx_array, fmt: Format) !?mlx.mlx_array {
-    if (!mlx.cudaAvailable()) return null;
+    if (!mlx.cudaAvailable() or !mlx.streamIsGpu(s)) return null;
     const dt = mlx.mlx_array_dtype(x);
     if (dt != .bfloat16 and dt != .float16) return null;
     if (mlx.mlx_array_dtype(scores) != dt or mlx.mlx_array_dtype(inds) != .uint32) return null;

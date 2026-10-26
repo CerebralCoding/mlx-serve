@@ -64,6 +64,11 @@ pub const Both = struct {
     pub fn openAs(table: *const abi.ModelTable, pack: *fixture.Pack, config_json: []const u8, legacy_config: bool, oracle: Oracle) !Both {
         const a = testing.allocator;
         const io = std.Io.Threaded.global_single_threaded.io();
+        // First: a tape that skips here (off Metal) must do so before anything is allocated.
+        const t: Tape = switch (oracle) {
+            .tape => |bytes| try Tape.player(bytes),
+            .none => .{},
+        };
         var tmp = testing.tmpDir(.{});
         errdefer tmp.cleanup();
         try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = config_json });
@@ -81,10 +86,6 @@ pub const Both = struct {
             cfg = lc;
         }
         const xfm = try driver.load(io, a, &cfg, dir, fixture.stream());
-        const t: Tape = switch (oracle) {
-            .tape => |bytes| try Tape.player(bytes),
-            .none => .{},
-        };
         return .{ .tmp = tmp, .dir = dir, .cfg = cfg, .xfm = xfm, .tape = t };
     }
 

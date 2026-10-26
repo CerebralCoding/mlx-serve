@@ -237,6 +237,7 @@ fn generate(x: *Transformer, head: ?MtpHeadRef, sp: SamplingParams, out: []u32) 
 // acceptance), greedy and seeded MTP through the served head emit exactly the serial stream, through the hidden
 // capture, the fused-window per-row SSM capture and the capture-based rollback.
 test "nemotron_h served: MTP rounds through the plugin's head emit the serial stream, greedy and seeded" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var p = fixture.Pack.init(0x6e21);

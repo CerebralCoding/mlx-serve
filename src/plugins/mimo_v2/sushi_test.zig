@@ -136,6 +136,7 @@ fn writeHeads(p: *fixture.Pack) !void {
 // ── tests ──
 
 test "mimo_v2 Sushi pack: e4m3 QKV parts, the decoded dense MLP and EXL3 experts are bit-equal to the legacy forward" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var p = fixture.Pack.init(0x5a51);
     defer p.deinit();
@@ -147,6 +148,7 @@ test "mimo_v2 Sushi pack: e4m3 QKV parts, the decoded dense MLP and EXL3 experts
 }
 
 test "mimo_v2 Sushi served: steps, greedy and batched decode through the driver on the legacy config, the MTP heads too" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var p = fixture.Pack.init(0x5a52);
     defer p.deinit();

@@ -2888,6 +2888,7 @@ fn held(x: A) A {
 }
 
 test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte for byte" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const a = std.testing.allocator;
     var sh = try Shell.init(mlx.gpuStream());
