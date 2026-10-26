@@ -81,7 +81,7 @@ pub fn read(
     group_size: u32,
     pend: ?hc_decode2.Pending,
 ) !?hc_decode2.Out {
-    if (!mlx.cudaAvailable() or !mlx.streamIsGpu(s)) return null;
+    if (!mlx.cudaAvailable() or !mlx.streamOnGpuDevice(s)) return null;
     const dt = mlx.mlx_array_dtype(x);
     if (dt != .bfloat16 and dt != .float16) return null;
     const dense = bits == 16;

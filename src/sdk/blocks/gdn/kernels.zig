@@ -274,7 +274,7 @@ var gdn_cuda_rows_per_warp: ?c_int = null;
 /// The GDN recurrence on MLX's CUDA backend, same contract as `gdnRecurOps`;
 /// null when not on CUDA or Dk is not a warp multiple.
 pub fn gdnRecurCuda(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, g: mlx.mlx_array, beta: mlx.mlx_array, state_in: mlx.mlx_array, vectorized: bool, capture: bool, out_dtype: mlx.mlx_dtype) !?GdnOpsResult {
-    if (!mlx.cudaAvailable() or !mlx.streamIsGpu(s)) return null;
+    if (!mlx.cudaAvailable() or !mlx.streamOnGpuDevice(s)) return null;
     const qs = mlx.getShape(q);
     const vs = mlx.getShape(v);
     const b = qs[0];

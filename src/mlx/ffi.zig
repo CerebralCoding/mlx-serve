@@ -96,12 +96,18 @@ pub extern "c" fn mlx_device_get_type(dtype: *mlx_device_type, dev: mlx_device) 
 /// True when the stream targets a GPU that runs custom Metal kernels: every
 /// `metal_kernel` helper gates on this, so on CUDA they all take the MLX-op path.
 pub fn streamIsGpu(s: mlx_stream) bool {
+    return streamOnGpuDevice(s) and metalKernelsAvailable();
+}
+
+/// True when the stream targets a GPU device of either backend: the `cuda_kernel` helpers gate on this
+/// (`streamIsGpu` is the Metal-kernel gate and is false on CUDA).
+pub fn streamOnGpuDevice(s: mlx_stream) bool {
     var dev = mlx_device{ .ctx = null };
     if (mlx_stream_get_device(&dev, s) != 0) return false;
     defer _ = mlx_device_free(dev);
     var dt: mlx_device_type = .cpu;
     if (mlx_device_get_type(&dt, dev) != 0) return false;
-    return dt == .gpu and metalKernelsAvailable();
+    return dt == .gpu;
 }
 
 /// MLX's CUDA JIT looks for the toolkit headers under CUDA_HOME/CUDA_PATH, else only
@@ -1042,6 +1048,14 @@ fn appendFields(vec: mlx_vector_array, value: anytype) void {
         .pointer => |p| if (p.size == .slice) for (value) |v| appendFields(vec, v),
         else => {},
     }
+}
+
+test "streamOnGpuDevice reads the device type alone; streamIsGpu adds the Metal-kernel gate" {
+    if (noGpuBackend()) return error.SkipZigTest;
+    const cpu = mlx_default_cpu_stream_new();
+    defer _ = mlx_stream_free(cpu);
+    try std.testing.expect(streamOnGpuDevice(gpuStream()) and !streamOnGpuDevice(cpu));
+    try std.testing.expectEqual(metalKernelsAvailable(), streamIsGpu(gpuStream()));
 }
 
 test "evalFields evaluates the arrays nested in structs, optionals, arrays and slices" {
