@@ -22,17 +22,18 @@ pub fn handle(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, e: *E
     const t = e.table;
     if (routeHint(e, route)) |hint| return gen.sendError(conn, 400, hint);
 
+    var path_bufs: [lora_mod.MAX_LORAS][]u8 = undefined;
+    var scales: [lora_mod.MAX_LORAS]f32 = undefined;
+    const n = gen.parseLoraFields(allocator, body, &path_bufs, &scales, server_mod.peerIsLoopback(conn)) catch |err| switch (err) {
+        error.TooManyLoraPaths => return gen.sendError(conn, 400, "too many 'lora_paths' (max 8)"),
+        error.BadLoraPathsJson => return gen.sendError(conn, 400, "invalid 'lora_paths' (must be a JSON array of strings)"),
+        error.BadLoraScalesJson => return gen.sendError(conn, 400, "invalid 'lora_scales' (numbers, comma/space separated, or a JSON array)"),
+        error.LoraPathsLocalOnly => return gen.sendError(conn, 403, gen.LORA_LOCAL_ONLY_MSG),
+        error.OutOfMemory => return err,
+    };
+    defer for (path_bufs[0..n]) |p| allocator.free(p);
+    if (t.set_loras == null and n > 0) return gen.sendError(conn, 400, "this model does not take LoRA adapters ('lora_path' / 'lora_paths')");
     if (t.set_loras) |set| {
-        var path_bufs: [lora_mod.MAX_LORAS][]u8 = undefined;
-        var scales: [lora_mod.MAX_LORAS]f32 = undefined;
-        const n = gen.parseLoraFields(allocator, body, &path_bufs, &scales, server_mod.peerIsLoopback(conn)) catch |err| switch (err) {
-            error.TooManyLoraPaths => return gen.sendError(conn, 400, "too many 'lora_paths' (max 8)"),
-            error.BadLoraPathsJson => return gen.sendError(conn, 400, "invalid 'lora_paths' (must be a JSON array of strings)"),
-            error.BadLoraScalesJson => return gen.sendError(conn, 400, "invalid 'lora_scales' (numbers, comma/space separated, or a JSON array)"),
-            error.LoraPathsLocalOnly => return gen.sendError(conn, 403, gen.LORA_LOCAL_ONLY_MSG),
-            error.OutOfMemory => return err,
-        };
-        defer for (path_bufs[0..n]) |p| allocator.free(p);
         var loras: [lora_mod.MAX_LORAS]abi.Lora = undefined;
         for (path_bufs[0..n], scales[0..n], loras[0..n]) |p, s, *l| l.* = .{ .path = .of(p), .scale = s };
         const v = set(e.handle, .of(loras[0..n]));
