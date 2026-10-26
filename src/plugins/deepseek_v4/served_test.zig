@@ -147,6 +147,7 @@ test "deepseek_v4 served: chunked prefill, host and pipelined decodes and a new 
 }
 
 test "deepseek_v41 served: chunked prefill, host and pipelined decodes and a new request equal the legacy forward bit for bit" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -154,6 +155,7 @@ test "deepseek_v41 served: chunked prefill, host and pipelined decodes and a new
 }
 
 test "deepseek_v41 served: two slots decode in one batched tick through the driver, each slot's step following its state" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -178,6 +180,7 @@ test "deepseek_v41 served: two slots decode in one batched tick through the driv
 }
 
 test "deepseek_v41 served: a resumed prompt (CacheHooks.resume_prompt) resumes through the driver where the legacy resume does, bit-equal" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -200,6 +203,7 @@ test "deepseek_v41 served: a resumed prompt (CacheHooks.resume_prompt) resumes t
 }
 
 test "deepseek_v41 served: image rows from Forward.media splice as the legacy seam splices them, across a chunk boundary" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -288,6 +292,7 @@ test "deepseek_v4 served: DSpark rounds (greedy, then seeded sampling) equal the
 }
 
 test "deepseek_v41 served: DSpark rounds (greedy, then seeded sampling) equal the legacy shell's" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

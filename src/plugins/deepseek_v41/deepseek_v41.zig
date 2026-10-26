@@ -5052,6 +5052,7 @@ const FfnFixture = struct {
 };
 
 test "dsv41 ffn decode: the two kernels are no further from f32 truth than the composed path, every routed width, affine and mxfp8 shared" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const gpa = testing.allocator;
     const k = 6;
     const d = 512;
@@ -5117,6 +5118,7 @@ test "dsv41 ffn decode: the two kernels are no further from f32 truth than the c
 }
 
 test "dsv41 ffn prefill: the sorted-gather MoE with its activation and combine kernels is no further from f32 truth than the composed path at 2048 rows, every routed width" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const gpa = testing.allocator;
     const L = 2048;
     const k = 6;

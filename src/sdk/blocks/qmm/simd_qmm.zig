@@ -354,6 +354,7 @@ fn expectSame(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !void {
 }
 
 test "simd_qmm: mma over half the simdgroups per threadgroup gives the same bits" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const wf = try randBf16(&.{ 136, 256 }, 0.02, 11, s);
     defer _ = mlx.mlx_array_free(wf);
@@ -507,6 +508,7 @@ test "simd_qmm: every row of an R-row call equals its one-row call bit for bit, 
 }
 
 test "simd_qmm: reading pre-scaled input fragments gives the direct mma's bits at 2..8 rows and 4, 6 and 8 bits" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     errdefer {
         var buf: [512]u8 = undefined;

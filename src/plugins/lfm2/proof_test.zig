@@ -347,6 +347,7 @@ fn writeGgufPack(p: *fixture.Pack, moe: bool) !void {
 
 
 fn ggufCase(moe: bool, comptime seed: u64) !void {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     var p = fixture.Pack.init(seed);
     defer p.deinit();
     try writeGgufPack(&p, moe);
@@ -447,6 +448,7 @@ fn writeGgufFile(g: *proof.Gguf, moe: bool, seed: u64) !void {
 }
 
 fn ggufFileCase(moe: bool, by_file: bool, comptime seed: u64) !void {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     var g: proof.Gguf = .{};
     defer g.deinit();
     try writeGgufFile(&g, moe, seed);

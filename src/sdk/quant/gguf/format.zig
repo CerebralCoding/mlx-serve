@@ -132,6 +132,7 @@ fn putFixture(w: *resident.Weights, comptime ty: quants.GgmlType, s: mlx.mlx_str
 // Bar: every block type loads through the table and multiplies bit-equal to the kernels the engine calls directly,
 // on the matvec, tile and dequant arms, and through an expert bank at decode and prefill widths.
 test "quant gguf: every block type multiplies through the table bit-equal to the direct kernels" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var w = resident.Weights.init(testing.allocator);

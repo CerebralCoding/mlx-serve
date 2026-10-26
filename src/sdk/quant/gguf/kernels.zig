@@ -638,6 +638,7 @@ fn readF32(arr: mlx.mlx_array, n: usize) ![]const f32 {
 }
 
 test "GPU dequant equals the CPU reference for every type" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     inline for (all_types) |ty| {
@@ -655,6 +656,7 @@ test "GPU dequant equals the CPU reference for every type" {
 }
 
 test "linear equals a CPU dot product on the matvec (1 and several rows) and the 2-row fallback path" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     var prng = std.Random.DefaultPrng.init(7);
@@ -701,6 +703,7 @@ test "linear equals a CPU dot product on the matvec (1 and several rows) and the
 }
 
 test "tile mat-mat kernel (32 rows, whole and padded token tiles) equals a CPU dot product" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     var prng = std.Random.DefaultPrng.init(23);
@@ -746,6 +749,7 @@ test "tile mat-mat kernel (32 rows, whole and padded token tiles) equals a CPU d
 }
 
 test "gatherLinear routes every output to its expert, with and without lhs indices" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     var prng = std.Random.DefaultPrng.init(5);
@@ -799,6 +803,7 @@ test "gatherLinear routes every output to its expert, with and without lhs indic
 }
 
 test "gathered tile path (sorted and unsorted prefill rows, padded tile) equals a CPU dot product" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     var prng = std.Random.DefaultPrng.init(29);
@@ -855,6 +860,7 @@ test "gathered tile path (sorted and unsorted prefill rows, padded tile) equals 
 }
 
 test "split rows (16 blocks per row, packed at load) match the CPU reference for every split type" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     var prng = std.Random.DefaultPrng.init(31);
@@ -907,6 +913,7 @@ test "split rows (16 blocks per row, packed at load) match the CPU reference for
 }
 
 test "half precision activations keep their dtype and stay close to f32" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     const w = try TestWeight.init(.iq4_nl);
@@ -953,6 +960,7 @@ test "shape and type mistakes are errors, not GPU faults" {
 }
 
 test "sentinel round-trips the type and a tiled input matches a manual head swap" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     const w = try TestWeight.init(.q8_0); // in = 64

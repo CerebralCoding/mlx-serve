@@ -454,6 +454,7 @@ test "rht: two distinct sign vectors at one width dedup the pool and disable sig
 }
 
 test "rht: normRotate matches add -> rms_norm -> transform" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const n: usize = 3072;
     var prng = std.Random.DefaultPrng.init(11);

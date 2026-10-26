@@ -14,6 +14,7 @@ const sdk = @import("../../sdk/root.zig");
 const testing = std.testing;
 const Twin = proof.Twin(v41);
 test "deepseek_v41 plugin: prefill, GPU decode, a verify block and a later chunk equal the legacy seam bit for bit" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -23,6 +24,7 @@ test "deepseek_v41 plugin: prefill, GPU decode, a verify block and a later chunk
 }
 
 test "deepseek_v41 plugin: a prompt extending the last one resumes as the legacy resume does, and continues bit-equal" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -39,6 +41,7 @@ test "deepseek_v41 plugin: a prompt extending the last one resumes as the legacy
 }
 
 test "deepseek_v41 plugin: a decode token on the device equals the legacy decode" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -48,6 +51,7 @@ test "deepseek_v41 plugin: a decode token on the device equals the legacy decode
 }
 
 test "deepseek_v41 plugin: trunk_weight hands out the loaded embedding and head" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -92,6 +96,7 @@ fn batchTicks(files: []const sdk.fixture.File, a: []const u32, b: []const u32, d
 }
 
 test "deepseek_v41 plugin: a slot's row in a batch depends on its own state only, past the window, a pooling group and the indexer's budget" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -114,6 +119,7 @@ test "deepseek_v41 plugin: a slot's row in a batch depends on its own state only
 }
 
 test "deepseek_v41 plugin: a one-slot batch is the slot's own decode step, bit for bit" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

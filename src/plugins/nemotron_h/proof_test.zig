@@ -2,6 +2,7 @@
 //! Puzzle latent MoE; a bf16 pack with a `layers_block_type` list and a tied head) served by the table bit-equal to
 //! the legacy `forwardHybridWith` at every step, the Mamba2 op chain too, and `parse` equal to the engine's parse.
 
+const mlx = @import("../../mlx/ffi.zig");
 const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
 const fixture = @import("../../sdk/bases/proof/fixture.zig");
@@ -392,6 +393,7 @@ fn writeGgufPack(p: *fixture.Pack, moe: bool) !void {
 
 
 fn ggufCase(moe: bool, comptime seed: u64) !void {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     var p = fixture.Pack.init(seed);
     defer p.deinit();
     try writeGgufPack(&p, moe);
@@ -507,6 +509,7 @@ fn writeGgufFile(g: *proof.Gguf, moe: bool, seed: u64) !void {
 }
 
 fn ggufFileCase(moe: bool, by_file: bool, comptime seed: u64) !void {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     var g: proof.Gguf = .{};
     defer g.deinit();
     try writeGgufFile(&g, moe, seed);

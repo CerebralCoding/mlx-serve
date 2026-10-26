@@ -526,12 +526,16 @@ pub const MAX_LORAS: usize = 8;
 /// merging rounds the delta away in bf16 and requantizes it away on quantized bases. Non-owning: the
 /// arrays belong to the `Stack` that produced the refs, which must outlive the slot.
 pub const Slot = struct {
-    refs: [MAX_LORAS]Ref = undefined,
+    /// Entries past `count` are empty, never stale: walkers that read every field (`mlx.evalFields`) see null arrays.
+    refs: [MAX_LORAS]Ref = @splat(empty_ref),
     count: u8 = 0,
+
+    const empty_ref: Ref = .{ .at = .{ .ctx = null }, .bt = .{ .ctx = null }, .scale = 0 };
 
     pub fn set(self: *Slot, refs: []const Ref) void {
         self.count = @intCast(refs.len);
         @memcpy(self.refs[0..refs.len], refs);
+        @memset(self.refs[refs.len..], empty_ref);
     }
     pub fn active(self: *const Slot) []const Ref {
         return self.refs[0..self.count];

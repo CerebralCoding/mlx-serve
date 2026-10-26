@@ -92,13 +92,14 @@ pub fn forward(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
     const kernel: c_int = @intCast(c.linear_conv_kernel_dim);
     const bounded = c.kda_gate_lower_bound != 0.0;
 
-    var qkv: Array = undefined;
-    var z_proj: Array = undefined;
+    // Null until assigned: an early error return frees what the defers below see.
+    var qkv: Array = .{ .ctx = null };
+    var z_proj: Array = .{ .ctx = null };
     // [qkv | z | a | b] from one joined matmul: the fused step reads its columns in place.
     var in_all: Array = .{ .ctx = null };
     defer free(in_all);
-    var a_proj: Array = undefined;
-    var b_proj: Array = undefined;
+    var a_proj: Array = .{ .ctx = null };
+    var b_proj: Array = .{ .ctx = null };
     defer _ = mlx.mlx_array_free(qkv);
     defer _ = mlx.mlx_array_free(z_proj);
     defer _ = mlx.mlx_array_free(a_proj);
