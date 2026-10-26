@@ -1733,6 +1733,8 @@ pub fn groupedDynConvOps(
     s: mlx.mlx_stream,
 ) !mlx.mlx_array {
     const hsh = mlx.getShape(hidden);
+    // A lost GPU context hands back empty arrays: refuse them by name, never index past their shape.
+    if (hsh.len != 3 or mlx.getShape(base).len != 2) return error.DynConvShape;
     const len = hsh[1];
     const h = hsh[2];
     const groups = @divExact(h, @as(c_int, @intCast(group_size)));
@@ -3975,6 +3977,14 @@ test "dflash2: loader picks up selector + dyn convs; v1 assistant loads with nei
     defer v1.deinit();
     try testing.expect(v1.selector == null);
     try testing.expect(v1.layers[0].attention_conv == null);
+}
+
+test "dflash2: groupedDynConv refuses empty inputs by name" {
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const e = mlx.mlx_array_new_float(0);
+    defer _ = mlx.mlx_array_free(e);
+    try testing.expectError(error.DynConvShape, groupedDynConvOps(e, e, e, 2, s));
 }
 
 test "dflash2: groupedDynConv matches the closed form on a hand-computed case" {
