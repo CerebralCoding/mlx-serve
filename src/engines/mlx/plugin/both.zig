@@ -405,6 +405,8 @@ pub fn atGeometry(real: []const u8, fixture_json: []const u8, keep: []const []co
 /// A greedy DFlash run on `xfm` with `dflash.TinyFix`'s assistant (hidden 64, vocab 128, target layers 0 and 2): the
 /// emitted tokens into `tokens` and each round's accepted count into `accepted`.
 pub fn dflashRun(xfm: *Transformer, tokens: []u32, accepted: *std.ArrayList(u32)) !void {
+    // Off Metal the tiny assistant's run never completes (MLX's CUDA wait stalls: open issue).
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const dflash_mod = @import("../spec/dflash/dflash.zig");
     const Generator = @import("../generate/generator.zig").Generator;
     const Tokenizer = @import("../../../sdk/tokenizer/tokenizer.zig").Tokenizer;

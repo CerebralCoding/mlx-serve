@@ -5,6 +5,13 @@ const std = @import("std");
 const c = @import("spec.zig");
 const metal = @import("metal.zig");
 const device = @import("../../../mlx/device.zig");
+const mlx = @import("../../../mlx/ffi.zig");
+
+/// The kernel cannot run on this GPU as declared: it needs NAX, or the GPU caps its compiled pipeline below the
+/// launch's threadgroup (M1/M2), where the engine's wrapper declines it too.
+fn notOnThisGpu(err: anyerror) bool {
+    return err == error.NaxOnly or err == error.ThreadgroupCap or mlx.takeErrorIf("maximum allowed threads per threadgroup");
+}
 
 pub const Gate = c.Gate;
 pub const Fill = c.Fill;
@@ -236,8 +243,8 @@ pub fn shapes(a: std.mem.Allocator, k: Kernel, seed: u64) !Verdict {
         for (want, mag, 0..) |w, m, i| {
             const o = c.readOut(k.spec, shape, out, i);
             const got = o.v;
-            // A GPU that flushes f32 subnormals (M4) reads a subnormal reference as zero.
-            const flushed = got == 0 and @abs(w) < std.math.floatMin(f32);
+            // A GPU that flushes f32 subnormals (M1-M4) reads a reference at or near the subnormal range as zero.
+            const flushed = got == 0 and @abs(w) < 4 * std.math.floatMin(f32);
             const q = if (got == w or flushed) 0 else @abs(got - w) / c.bound(k.spec, o.elem, shape, w, m);
             if (!(q <= 1)) return say(.fail, .shapes, name, "at {d}x{d}x{d} output {d} is {e:.6} where float64 gives {e:.6}: {d:.2} of its bound", .{ shape.rows, shape.n, shape.k, i, got, w, q });
             worst = @max(worst, q);
@@ -344,7 +351,7 @@ pub fn runAll(a: std.mem.Allocator, kernels: []const Kernel, seed: u64, t: *Tall
             if (g == .limits) continue; // gate 5's controls are checked by `limits.zig` with no device
             t.controls += 1;
             const v = one(a, g, k, s) catch |err| blk: {
-                if (err == error.NaxOnly) {
+                if (notOnThisGpu(err)) {
                     t.controls -= 1;
                     t.skipped += 1;
                     continue;
@@ -364,7 +371,7 @@ pub fn runAll(a: std.mem.Allocator, kernels: []const Kernel, seed: u64, t: *Tall
         var bad = false;
         const skip = for ([_]Gate{ .nonfinite, .repeat, .shapes, .sums }) |g| {
             const v = one(a, g, k, s) catch |err| blk: {
-                if (err == error.NaxOnly) break true;
+                if (notOnThisGpu(err)) break true;
                 if (!quiet) std.debug.print("FAIL {t} {s}: {t}\n", .{ g, k.spec.name, err });
                 break :blk .fail;
             };
@@ -384,7 +391,7 @@ pub fn runAll(a: std.mem.Allocator, kernels: []const Kernel, seed: u64, t: *Tall
         } else false;
         if (skip) {
             t.skipped += 1;
-            if (!quiet) std.debug.print("SKIP {s}: needs NAX\n", .{k.spec.name});
+            if (!quiet) std.debug.print("SKIP {s}: not runnable on this GPU (NAX or threadgroup cap)\n", .{k.spec.name});
             continue;
         }
         t.kernels += 1;

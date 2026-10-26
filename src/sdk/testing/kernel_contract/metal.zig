@@ -334,11 +334,13 @@ pub const Rig = struct {
     }
 };
 
-/// An MLX failure since the last check, printed and returned as an error (the latch is dropped).
+/// An MLX failure since the last check, printed and returned as an error (the latch is dropped). A pipeline the GPU
+/// caps below the launch's threadgroup (M1/M2) is `error.ThreadgroupCap`: the engine's wrapper declines it there.
 pub fn latched() !void {
     var buf: [512]u8 = undefined;
     if (mlx.takeError(&buf)) |msg| {
         std.debug.print("[kernel-contract] mlx: {s}\n", .{msg});
+        if (std.mem.indexOf(u8, msg, "maximum allowed threads per threadgroup") != null) return error.ThreadgroupCap;
         return error.MlxError;
     }
 }

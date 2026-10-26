@@ -39,7 +39,7 @@ fi
 # Short prompt for the strict byte-identical assertion. The model's response
 # is short enough to land entirely within the float-noise-stable window.
 read -r -d '' PROMPT <<'EOF' || true
-What is 2+2? Answer with just the number, no explanation.
+List the first ten prime numbers, separated by commas, with nothing else.
 EOF
 
 JSON_PAYLOAD=$(python3 -c "

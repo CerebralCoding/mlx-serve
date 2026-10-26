@@ -2732,6 +2732,8 @@ test "kernel contract attention: each declared launch is the shipped wrapper's, 
                 if (fam[0] == NaxAttn and t.cfg.q8 and si > 0) continue;
                 try std.testing.expect(try t.prepare(shape, .random, 7));
                 if (fam[0] == NaxAttn and t.cfg.q8) try t.quantizeLikeWrapper();
+                // A wrapper that declines here (a lane this GPU lacks) is never launched by the engine on it.
+                if (fam[0] == Qkv) _ = t.wrapper() catch |e| if (e == error.Declined) continue else return e;
                 const ours, const theirs = if (fam[0] == RowMerge) continue else if (fam[0] == NaxAttn) switch (t.cfg.phase) {
                     // The passes ride the last pass's registration.
                     .out, .through => continue,

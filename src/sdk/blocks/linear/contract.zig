@@ -482,7 +482,9 @@ pub fn register(set: *kc.Set) !void {
     {
         // The joined verify group of 12 rows (two six-row streams): 8-bit g64 at the gdn, lm head and attention widths.
         const q = Qmm.init(a, &wide_launch, .wide, 8, 64, 12);
-        try set.add(Qmm, q, qmmSpec("verify_wide bf16 (8-bit g64, M 12, NV 6)", q, &.{ .{ .rows = 768, .n = 12, .k = 2560 }, .{ .rows = 320, .n = 12, .k = 6144 }, .{ .rows = 1280, .n = 12, .k = 2560 } }, "quantized_matmul per six-row stream (MLX qmv_wide)"), null);
+        var sp = qmmSpec("verify_wide bf16 (8-bit g64, M 12, NV 6)", q, &.{ .{ .rows = 768, .n = 12, .k = 2560 }, .{ .rows = 320, .n = 12, .k = 6144 }, .{ .rows = 1280, .n = 12, .k = 2560 } }, "quantized_matmul per six-row stream (MLX qmv_wide)");
+        sp.nax = true; // the engine runs it only where verifySharedHardware(), which needs NAX
+        try set.add(Qmm, q, sp, null);
     }
     // Split-K at M 2..7, 4-bit g64 (N 640 and 2560 on the 4B trunk, 12288 past the K_PARTS switch).
     const ks_served: []const Shape = &.{ .{ .rows = 160, .n = 0, .k = 2560 }, .{ .rows = 128, .n = 0, .k = 640 }, .{ .rows = 1024, .n = 0, .k = 640 } };

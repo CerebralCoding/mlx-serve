@@ -621,7 +621,8 @@ test "kernel contract kda: each declared launch is the shipped wrapper's, byte f
             try std.testing.expect(try t.prepare(shape, .random, 7));
             var geo = t.geometry(shape).?;
             geo.unread = 0;
-            try t.rig.launch(t.launch, geo, &t.args);
+            // A GPU that caps this pipeline below the launch (M1/M2) never runs it: the wrapper declines there too.
+            t.rig.launch(t.launch, geo, &t.args) catch |e| if (e == error.ThreadgroupCap) continue else return e;
             const g = t.args;
             const r = try kr.recur(t.rig.stream(), g[0], g[1], g[2], g[3], g[4], g[5], g[6], LB, g[8]);
             defer {
@@ -635,7 +636,8 @@ test "kernel contract kda: each declared launch is the shipped wrapper's, byte f
             try std.testing.expect(try t.prepare(shape, .random, 7));
             var geo = t.geometry(shape).?;
             geo.unread = 0;
-            try t.rig.launch(t.launch, geo, &t.args);
+            // A GPU that caps this pipeline below the launch (M1/M2) never runs it: the wrapper declines there too.
+            t.rig.launch(t.launch, geo, &t.args) catch |e| if (e == error.ThreadgroupCap) continue else return e;
             const g = t.args;
             const bits = @backingInt(t.bits);
             const fb = kr.Low{ .w = g[8], .s = g[9], .b = g[10], .bits = bits, .gs = GS };
