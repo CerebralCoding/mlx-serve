@@ -2698,7 +2698,7 @@ fn fetchSlots(sc: *Scope, src: streamed.Routed, li: usize, idx: A) !Slots {
     const ids = try sc.a.alloc(u16, n);
     defer sc.a.free(ids);
     for (ids, ids_u32) |*d, v| d.* = @intCast(v);
-    const f = try src.math.trunk(src.ctx, @intCast(li), ids, &.{});
+    const f = try src.math.trunk(src.ctx, @intCast(li), ids, &.{}).get();
     var out: Slots = .{ .kind = f.kind, .row = f.row };
     const rows = try sc.a.alloc(u32, n);
     defer sc.a.free(rows);
@@ -3000,7 +3000,7 @@ fn moe(sc: *Scope, m: *const Dsv41Model, li: usize, x: A, img: A) !A {
     const r = try route(sc, m, ly, x, img);
     // The DSpark stages' experts stay resident.
     if (li < m.n_layers) if (m.streamed) |src| {
-        if (src.math == .source) return withShared(sc, m, ly, x, try sc.keep(try src.math.source(src.ctx, @intCast(li), x, r.idx, r.wts)));
+        if (src.math == .source) return withShared(sc, m, ly, x, try sc.keep(try src.math.source(src.ctx, @intCast(li), x, r.idx, r.wts).get()));
         const sl = try fetchSlots(sc, src, li, r.idx);
         if (dim(x, 0) > region_rows) return slotPrefill(sc, m, &sl, x, r.wts, try shared(sc, m, ly, x));
         return withShared(sc, m, ly, x, try rowSum(sc, try slotRows(sc, m, &sl, x, r.wts, null)));
@@ -3096,7 +3096,7 @@ fn block(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p0: u
             var p: [7]A = undefined; // the new stream, the FFN's pre, post, comb, normed input, routes, weights
             try runRegion(sc, m, li, .ffn_pre, &.{ x, ao, a[0], a[1], a[2] }, &p);
             const ro = switch (src.math) {
-                .source => |f| try sc.keep(try f(src.ctx, @intCast(li), p[4], p[5], p[6])),
+                .source => |f| try sc.keep(try f(src.ctx, @intCast(li), p[4], p[5], p[6]).get()),
                 .trunk => blk: {
                     const sl = try fetchSlots(sc, src, li, p[5]);
                     break :blk try slotRows(sc, m, &sl, p[4], p[6], li);
@@ -3580,7 +3580,7 @@ fn readAhead(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, li: usize, x: A
     const ids = try sc.a.alloc(u16, n);
     defer sc.a.free(ids);
     for (ids, (mlx.mlx_array_data_uint32(host) orelse return error.NoData)[0..n]) |*o, v| o.* = @intCast(v);
-    try ra(ctx, @intCast(li), ids);
+    try ra(ctx, @intCast(li), ids).get();
 }
 
 /// What crosses layers in `extend`: each span's stream and mix, the picks
@@ -4268,6 +4268,23 @@ pub fn dsparkBegin(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32) 
 
 /// Most drafts one verify chunk carries: its rows and `t1` fit the windows' slack.
 pub const VERIFY_MAX_DRAFTS: usize = RING_SLACK - 1;
+
+/// Drafts one verify of `m` takes: on a streamed bank the verify stays a decode-phase call (`Routed.decode_ids`).
+pub fn maxVerifyDrafts(m: *const Dsv41Model) usize {
+    return verifyDraftsFor(if (m.streamed) |src| src.decode_ids else null, m.cfg.num_experts_per_tok);
+}
+
+fn verifyDraftsFor(decode_ids: ?usize, top_k: usize) usize {
+    const ids = decode_ids orelse return VERIFY_MAX_DRAFTS;
+    return @min(VERIFY_MAX_DRAFTS, ids / top_k -| 1);
+}
+
+test "dsv41 verify drafts: a streamed bank's verify (drafts + the committed token, top-k ids each) stays on its decode lane" {
+    try std.testing.expectEqual(VERIFY_MAX_DRAFTS, verifyDraftsFor(null, 6));
+    const d = verifyDraftsFor(48, 6);
+    try std.testing.expectEqual(@as(usize, 7), d);
+    try std.testing.expect((d + 1) * 6 <= 48);
+}
 
 /// Arm the rollback anchors and append `[t1, drafts…]` as a verify chunk;
 /// the returned `vl_g` holds every position's logits, lazily. The drafts

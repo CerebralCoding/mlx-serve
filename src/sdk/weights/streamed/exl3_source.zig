@@ -98,6 +98,9 @@ fn billBank(bank: *const expert_bank.Bank, budget: Budget) !Bill {
     return b;
 }
 
+/// Routed ids a decode-phase call takes (the stream's route width); a wider call is a prompt pass.
+pub const decode_route_ids: usize = sdk_ext.expert.policy.max_route_ids;
+
 pub const Source = struct {
     a: std.mem.Allocator,
     g: G,

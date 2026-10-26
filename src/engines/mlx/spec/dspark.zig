@@ -121,7 +121,7 @@ pub fn moduleRound(self: *Generator, allocator: std.mem.Allocator) !?DrafterStep
 pub fn dsparkCopyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *dsv41_mod.Dsv41Model) !?DrafterStepResult {
     const t1 = self.next_token_id;
     const idx = try self.mtpLookupIndex(allocator);
-    const found = idx.matchBest(t1, dsv41_mod.VERIFY_MAX_DRAFTS);
+    const found = idx.matchBest(t1, @intCast(dsv41_mod.maxVerifyDrafts(mdl)));
     const n = dsparkCopyLen(found, self.max_tokens -| self.completion_tokens -| 1, mdl.ds_block);
     if (n == 0) return null;
     const ids = try allocator.alloc(u32, n + 1);

@@ -2,6 +2,7 @@
 //! itself so any MoE block can carry it.
 
 const mlx = @import("../../mlx/ffi.zig");
+const err_name = @import("../util/err_name.zig");
 
 /// One projection's slot-bank arrays as the trunk's gathers read them (MXFP4: words and E8M0 scales; affine: words,
 /// scales and biases).
@@ -24,20 +25,47 @@ pub const max_call_experts: usize = 48;
 pub const Routed = struct {
     ctx: *anyopaque,
     math: union(enum) {
-        trunk: *const fn (*anyopaque, u32, []const u16, []const f32) anyerror!Fetched,
-        source: *const fn (*anyopaque, u32, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array) anyerror!mlx.mlx_array,
+        trunk: *const fn (*anyopaque, u32, []const u16, []const f32) Ret(Fetched),
+        source: *const fn (*anyopaque, u32, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array) Ret(mlx.mlx_array),
     },
-    settle_fn: *const fn (*anyopaque) anyerror!void,
+    settle_fn: *const fn (*anyopaque) Ret(void),
     /// A source whose slot rows follow the pass (`true`: a prompt pass, `false`: decode), told before each forward.
-    phase_fn: ?*const fn (*anyopaque, bool) anyerror!void = null,
+    phase_fn: ?*const fn (*anyopaque, bool) Ret(void) = null,
     /// A prompt pass's predicted routes of model layer `layer` (every row's ids), read while its attention runs.
-    read_ahead_fn: ?*const fn (*anyopaque, u32, []const u16) anyerror!void = null,
+    read_ahead_fn: ?*const fn (*anyopaque, u32, []const u16) Ret(void) = null,
+    /// Routed ids a decode-phase call takes: a wider call is a prompt pass, which a source refuses in decode.
+    decode_ids: usize = max_call_ids,
 
     pub fn settle(r: Routed) !void {
-        return r.settle_fn(r.ctx);
+        return r.settle_fn(r.ctx).get();
     }
 
     pub fn phase(r: Routed, prompt: bool) !void {
-        if (r.phase_fn) |f| try f(r.ctx, prompt);
+        if (r.phase_fn) |f| try f(r.ctx, prompt).get();
     }
 };
+
+/// A `Routed` call's result. The source is built in the plugin's compile unit and may be called from another (a
+/// DSpark round runs in the modules unit), where an `anyerror` value names a different error: it crosses by name.
+pub fn Ret(comptime T: type) type {
+    return struct {
+        val: T = undefined,
+        err: []const u8 = "",
+
+        pub fn of(r: anyerror!T) @This() {
+            return if (r) |v| .{ .val = v } else |e| .{ .err = @errorName(e) };
+        }
+        pub fn get(self: @This()) err_name.Known!T {
+            if (self.err.len != 0) return err_name.toError(self.err);
+            return self.val;
+        }
+    };
+}
+
+test "routed: an error crosses by name" {
+    const std = @import("std");
+    const r = Ret(u32).of(error.ExpertReadShort);
+    try std.testing.expectError(error.EngineFailed, r.get());
+    try std.testing.expectEqualStrings("ExpertReadShort", err_name.last());
+    try std.testing.expectEqual(@as(u32, 7), try Ret(u32).of(7).get());
+}

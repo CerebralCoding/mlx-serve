@@ -640,7 +640,7 @@ fn fetchSlots(w: *const Moe.Weights, st: *const Streamed, ids: []const u16) !Slo
 }
 
 fn fetchSlotsWith(w: *const Moe.Weights, st: *const Streamed, ids: []const u16, scores: []const f32) !Slots {
-    const f = try st.routed.math.trunk(st.routed.ctx, st.layer, ids, scores);
+    const f = try st.routed.math.trunk(st.routed.ctx, st.layer, ids, scores).get();
     var out: Slots = .{ .kind = f.kind, .row = f.row };
     for (f.banks, &out.banks) |maybe, *o| if (maybe) |bk| {
         o.* = .{
@@ -671,7 +671,7 @@ fn streamedRouted(w: *const Moe.Weights, st: *const Streamed, g: *Graph, x: Arra
     const K = ops.shape(r.inds)[ops.shape(r.inds).len - 1];
     switch (st.routed.math) {
         .source => |f| {
-            const y = try g.adopt(try f(st.routed.ctx, st.layer, try g.reshape(x, &.{ B * S, D }), try g.reshape(r.inds, &.{ B * S, K }), try g.reshape(r.scores, &.{ B * S, K })));
+            const y = try g.adopt(try f(st.routed.ctx, st.layer, try g.reshape(x, &.{ B * S, D }), try g.reshape(r.inds, &.{ B * S, K }), try g.reshape(r.scores, &.{ B * S, K })).get());
             return .{ .out = try g.reshape(try g.astype(y, ops.dtype(x)), &.{ B, S, D }), .reduced = true };
         },
         .trunk => {},

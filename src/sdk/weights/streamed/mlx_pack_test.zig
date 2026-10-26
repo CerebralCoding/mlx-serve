@@ -132,7 +132,7 @@ fn tmpPack(tmp: *testing.TmpDir, buf: []u8) ![]const u8 {
 /// Every pair of `ids` (routed layer `layer`) as its slot holds it, against the pack's tensors.
 fn expectFetched(sw: *streamed.Streamed, l: *const Loaded, layer: u32, ids: []const u16) !void {
     const r = sw.routedSource();
-    const f = try r.math.trunk(r.ctx, layer, ids, &.{});
+    const f = try r.math.trunk(r.ctx, layer, ids, &.{}).get();
     var g = ops.Graph.init(testing.allocator, fixture.stream());
     defer g.deinit();
     for (ids, f.kind, f.row) |e, k, row| {
