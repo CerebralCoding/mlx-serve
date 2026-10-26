@@ -6,6 +6,7 @@ const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const stb = @import("stb");
 const png = @import("png.zig");
+const log = @import("../util/log.zig");
 
 pub const Size = struct { w: u32, h: u32 };
 
@@ -41,6 +42,13 @@ pub fn decodeRgba(allocator: std.mem.Allocator, encoded: []const u8) ?Rgba {
     const n: usize = @as(usize, @intCast(w)) * @as(usize, @intCast(h)) * 4;
     const pix = allocator.dupe(u8, src[0..n]) catch return null;
     return .{ .pix = pix, .w = @intCast(w), .h = @intCast(h) };
+}
+
+/// An img2img request's source (`decodeCover`), with the engagement line its tests read.
+pub fn decodeVariation(allocator: std.mem.Allocator, encoded: []const u8, target_h: u32, target_w: u32, strength: f32) ?mlx.mlx_array {
+    const pix = decodeCover(allocator, encoded, target_h, target_w) orelse return null;
+    log.info("[image] img2img: source {d} bytes, strength={d:.2}\n", .{ encoded.len, strength });
+    return pix;
 }
 
 /// PNG/JPEG bytes → [1, 3, target_h, target_w] f32 in [0, 1] (evaluated; caller frees), bilinear over the largest

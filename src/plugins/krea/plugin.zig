@@ -102,7 +102,7 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     var opts: krea.GenOpts = .{ .cond_gain = j.cond_gain, .cond_weights = j.condWeights() };
     // Variation shares the output's latent grid: the source is cover-cropped to it, never stretched.
     const init = if (j.mode == .variation)
-        image_pixels.decodeCover(gpa, j.image.?, h, w) orelse return Verdict.refuse(.unsupported, "could not decode 'image' (PNG/JPEG supported)")
+        image_pixels.decodeVariation(gpa, j.image.?, h, w, j.strength) orelse return Verdict.refuse(.unsupported, "could not decode 'image' (PNG/JPEG supported)")
     else
         null;
     defer if (init) |p| {

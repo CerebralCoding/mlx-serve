@@ -55,6 +55,7 @@ pub const LoraSet = struct {
         }
         if (matched != stack.entryCount())
             log.warn("[lora] attached {d} of {d} adapter module(s); the rest target modules this model does not have\n", .{ matched, stack.entryCount() });
+        log.info("[image] lora: matched {d} module-attachment(s) across {d} adapter(s)\n", .{ matched, stack.count });
         self.stack = stack;
         self.matched = matched;
         return .ok;

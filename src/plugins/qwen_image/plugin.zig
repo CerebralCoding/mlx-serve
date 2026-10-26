@@ -106,7 +106,7 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
         },
         // Variation shares the output's latent grid: the source is cover-cropped to it, never stretched.
         .variation => blk: {
-            const pix = image_pixels.decodeCover(gpa, j.image.?, h, w) orelse return Verdict.refuse(.unsupported, "could not decode 'image' (PNG/JPEG supported)");
+            const pix = image_pixels.decodeVariation(gpa, j.image.?, h, w, j.strength) orelse return Verdict.refuse(.unsupported, "could not decode 'image' (PNG/JPEG supported)");
             defer _ = mlx.mlx_array_free(pix);
             if (canvasRefusal(req, w, h)) |v| return v;
             gen.init_image = pix;

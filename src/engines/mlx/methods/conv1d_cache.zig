@@ -86,9 +86,9 @@ pub fn conv1dWithCache(
     }
 
     // Depthwise conv1d (groups = cdim)
-    var conv_out = if (mlx.cudaAvailable() and mlx.getShape(conv_input)[1] == kernel)
+    var conv_out = if (mlx.cudaAvailable() and mlx.streamOnGpuDevice(self.s) and mlx.getShape(conv_input)[1] == kernel)
         try depthwiseConvStep(conv_input, conv_w, cdim, kernel, self.s)
-    else if (mlx.cudaAvailable())
+    else if (mlx.cudaAvailable() and mlx.streamOnGpuDevice(self.s))
         try depthwiseConvCuda(conv_input, conv_w, cdim, kernel, self.s)
     else blk: {
         var o = mlx.mlx_array_new();

@@ -45,6 +45,11 @@ pub const Both = struct {
         const io = std.Io.Threaded.global_single_threaded.io();
         const tables = fused_act.gelu_tanh_tables;
         const declined = fused_act.gelu_tanh_declined;
+        // First: a tape that skips here (off Metal) must do so before anything is allocated.
+        const t: Tape = switch (from) {
+            .tape => |bytes| try Tape.player(bytes),
+            .none => .{},
+        };
         var tmp = testing.tmpDir(.{});
         errdefer tmp.cleanup();
         try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = json });
@@ -55,10 +60,6 @@ pub const Both = struct {
         var cfg = try bind(a, io, table, dir, json);
         errdefer cfg.deinit(a);
         const xfm = try driver.load(io, a, &cfg, dir, fixture.stream());
-        const t: Tape = switch (from) {
-            .tape => |bytes| try Tape.player(bytes),
-            .none => .{},
-        };
         return .{ .tmp = tmp, .dir = dir, .cfg = cfg, .xfm = xfm, .tape = t, .tables = tables, .declined = declined };
     }
 

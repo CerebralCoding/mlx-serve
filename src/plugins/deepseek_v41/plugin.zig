@@ -186,10 +186,11 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     };
 }
 
-/// The host's stream when it is a GPU one, else this thread's GPU stream: the module's kernels are Metal-only.
+/// The host's stream when it is a GPU one, else this thread's GPU stream; null off Metal: the module's kernels are
+/// Metal-only.
 fn gpuOf(s: mlx.mlx_stream) ?mlx.mlx_stream {
+    if (!mlx.metalKernelsAvailable()) return null;
     if (mlx.streamIsGpu(s)) return s;
-    if (mlx.noGpuBackend()) return null;
     return mlx.gpuStream();
 }
 

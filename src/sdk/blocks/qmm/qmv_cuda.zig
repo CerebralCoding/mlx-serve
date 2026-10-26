@@ -48,7 +48,7 @@ pub fn eligible(rows: usize, k: usize, bits: u32, group_size: u32, has_bias: boo
 
 /// `x @ dequant(w).T` for eligible calls on a device where the kernel is on; null = decline.
 pub fn qmm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, s: mlx.mlx_stream) !?mlx.mlx_array {
-    if (!enabled()) return null;
+    if (!enabled() or !mlx.streamOnGpuDevice(s)) return null;
     const y = try run(x, w, sc, bi, bits, group_size, s) orelse return null;
     if (!engaged_logged) {
         engaged_logged = true;

@@ -137,8 +137,11 @@ pub const Loaded = struct {
         defer weights.deinit();
         const src = weights.source();
         var why: Verdict = .{};
-        self.model = table.load(&.{ .model_dir = .of(self.staged.path), .dir = &self.staged.dir, .parsed = &self.parsed, .stream = .{ .ctx = self.stream.ctx }, .weights = &src }, &why) orelse
+        self.model = table.load(&.{ .model_dir = .of(self.staged.path), .dir = &self.staged.dir, .parsed = &self.parsed, .stream = .{ .ctx = self.stream.ctx }, .weights = &src }, &why) orelse {
+            // A plugin whose kernels this device cannot run says so by name; the suite has nothing to check here.
+            if (why.code == .unsupported) return error.UnsupportedOnThisDevice;
             return fail(name, "load of its fixture", why.why);
+        };
         return self;
     }
     pub fn close(self: *Loaded) void {
@@ -155,7 +158,8 @@ pub const Loaded = struct {
 pub fn Pack(comptime M: type) type {
     return struct {
         pub fn open(a: Allocator) !Loaded {
-            return Loaded.open(testing.io, a, M.plugin.name, &M.table, try M.conformanceFixture(a));
+            return Loaded.open(testing.io, a, M.plugin.name, &M.table, try M.conformanceFixture(a)) catch |e|
+                if (e == error.UnsupportedOnThisDevice) error.SkipZigTest else e;
         }
     };
 }
@@ -201,7 +205,7 @@ fn expectModel(io: std.Io, a: Allocator, s: Subject, t: *const model_abi.ModelTa
     const v = t.parse(&dir, .of("{"), .{}, null, true, &bad);
     if (v.isOk() or v.why.len == 0 or bad.private != null) return fail(name, "a broken config.json is not refused by name", .{});
 
-    var pack = try Loaded.open(io, a, name, t, fx);
+    var pack = Loaded.open(io, a, name, t, fx) catch |e| if (e == error.UnsupportedOnThisDevice) return else return e;
     defer pack.close();
     try expectParsed(name, &pack.parsed);
 

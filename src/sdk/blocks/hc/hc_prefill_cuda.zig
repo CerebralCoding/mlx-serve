@@ -58,7 +58,7 @@ pub const Norm = struct {
 /// normalized [B, S, hc, hidden] and the stream, or null outside the kernel's envelope.
 pub fn norm(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, eps: mlx.mlx_array, batch: c_int, seq: c_int, pending: ?Pending) !?Norm {
     const ws = mlx.getShape(w);
-    if (ws.len != 2 or !served(ws[0], ws[1])) return null;
+    if (ws.len != 2 or !served(ws[0], ws[1]) or !mlx.streamOnGpuDevice(s)) return null;
     const hc = ws[0];
     const hidden = ws[1];
     const rows = batch * seq;
@@ -102,7 +102,7 @@ pub fn norm(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, eps: mlx.mlx_
 /// hidden]; null outside the kernel's envelope.
 pub fn mix(s: mlx.mlx_stream, up: mlx.mlx_array, normalized: mlx.mlx_array) !?mlx.mlx_array {
     const sh = mlx.getShape(normalized);
-    if (sh.len != 4 or !served(sh[2], sh[3])) return null;
+    if (sh.len != 4 or !served(sh[2], sh[3]) or !mlx.streamOnGpuDevice(s)) return null;
     if (mlx.mlx_array_dtype(up) != .bfloat16 or mlx.mlx_array_dtype(normalized) != .bfloat16) return null;
     if (!std.mem.eql(c_int, mlx.getShape(up), sh)) return null;
     const k = try kernel(&mix_kernel, "msv_hc_prefill_mix", &.{ "up", "normed" }, &.{"out"}, MIX_SOURCE);

@@ -42,7 +42,7 @@ fn newKernel(name: [*:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0
 /// are the dense cache views `[1, Hk, kv, 256]`. Null outside the kernel's geometry (the caller
 /// keeps its arm).
 pub fn attend(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, blocks: mlx.mlx_array, ratio: c_int, attn_scale: f32) !?mlx.mlx_array {
-    if (!mlx.cudaAvailable() or q.ctx == null or k.ctx == null or v.ctx == null or blocks.ctx == null) return null;
+    if (!mlx.cudaAvailable() or !mlx.streamOnGpuDevice(s) or q.ctx == null or k.ctx == null or v.ctx == null or blocks.ctx == null) return null;
     if (mlx.mlx_array_ndim(q) != 4 or mlx.mlx_array_ndim(k) != 4 or mlx.mlx_array_ndim(blocks) != 3) return null;
     if (mlx.mlx_array_dtype(q) != .bfloat16 or mlx.mlx_array_dtype(k) != .bfloat16 or mlx.mlx_array_dtype(v) != .bfloat16) return null;
     if (mlx.mlx_array_dtype(blocks) != .int32) return null;

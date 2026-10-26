@@ -27,9 +27,9 @@ pub fn run(g: *Graph, x: Array, window: ?Array, w: Array, bias: ?Array, batch: c
         tail = try g.adopt(try materializedOwnedCopy(g.s, tail));
         depthwise.compact_conv_state_copy_count += 1;
     }
-    var y = if (mlx.cudaAvailable() and len == kernel)
+    var y = if (mlx.cudaAvailable() and mlx.streamOnGpuDevice(g.s) and len == kernel)
         try g.adopt(try depthwise.depthwiseConvStep(input, w, cdim, kernel, g.s))
-    else if (mlx.cudaAvailable())
+    else if (mlx.cudaAvailable() and mlx.streamOnGpuDevice(g.s))
         try g.adopt(try depthwise.depthwiseConvCuda(input, w, cdim, kernel, g.s))
     else
         try g.conv1d(input, w, 1, 0, 1, cdim);

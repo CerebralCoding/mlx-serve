@@ -32,9 +32,9 @@ pub fn conv(c: *Ctx, x: Array, w: Array, bias: Array, cdim: c_int, kernel: c_int
     try kv.setState(c, .conv, tail);
     if (c.capture_spec) try kv.setState(c, .conv_input, input);
 
-    var out = if (mlx.cudaAvailable() and len == kernel)
+    var out = if (mlx.cudaAvailable() and mlx.streamOnGpuDevice(g.s) and len == kernel)
         try g.adopt(try depthwise.depthwiseConvStep(input, w, cdim, kernel, g.s))
-    else if (mlx.cudaAvailable())
+    else if (mlx.cudaAvailable() and mlx.streamOnGpuDevice(g.s))
         try g.adopt(try depthwise.depthwiseConvCuda(input, w, cdim, kernel, g.s))
     else
         try g.conv1d(input, w, 1, 0, 1, cdim);

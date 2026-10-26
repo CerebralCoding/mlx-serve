@@ -127,7 +127,7 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
         .generate => {},
         // Variation shares the output's latent grid: the source is cover-cropped to it, never stretched.
         .variation => {
-            pix[0] = image_pixels.decodeCover(gpa, j.image.?, h, w) orelse return decode_refusal;
+            pix[0] = image_pixels.decodeVariation(gpa, j.image.?, h, w, j.strength) orelse return decode_refusal;
             pix_n = 1;
             opts.init_image = pix[0];
         },
