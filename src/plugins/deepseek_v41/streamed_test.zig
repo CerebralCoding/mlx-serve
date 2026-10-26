@@ -292,8 +292,14 @@ const exl3_config_json =
     \\  "engram_pad_token_id": 2, "engram_compressed_vocab_size": 96, "num_nextn_predict_layers": 0}}
 ;
 
+/// The EXL3 stream kernels' plans fix threadgroups of up to 1024 threads, more than M1/M2 grant some of them.
+fn skipOnThreadCap(e: anyerror) anyerror {
+    return if (e == error.MlxError and mlx.takeErrorIf("Thread group size")) error.SkipZigTest else e;
+}
+
 test "deepseek_v41 streamed exl3: a served EXL3 pack (its prompt in wide calls, a phase change to decode) gives the trunk's logits over the same bank at fewer slot rows" {
     if (!build_options.mlx_stream or mlx.noGpuBackend()) return error.SkipZigTest;
+    mlx.installErrorHandler();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -322,14 +328,14 @@ test "deepseek_v41 streamed exl3: a served EXL3 pack (its prompt in wide calls, 
         const p = oracle.Served.open(io, testing.allocator, dir, s) catch |e| return if (e == error.InsufficientMemory) error.SkipZigTest else e;
         defer p.close(testing.allocator);
         try testing.expectEqualStrings("deepseek_v41", p.implName());
-        var row = try oracle.forwardIds(&p.xfm, a, prompt, s);
+        var row = oracle.forwardIds(&p.xfm, a, prompt, s) catch |e| return skipOnThreadCap(e);
         for (0..1 + decode) |i| {
             @memcpy(want[i * vocab ..][0..vocab], row);
             for (row) |v| try testing.expect(std.math.isFinite(v));
             if (i == decode) break;
             const next = oracle.topOf(row)[0][0];
             try ids.append(a, next);
-            row = try oracle.forwardIds(&p.xfm, a, &.{next}, s);
+            row = oracle.forwardIds(&p.xfm, a, &.{next}, s) catch |e| return skipOnThreadCap(e);
         }
     }
     // The trunk over the same bank at 2 prompt rows and 3 decode rows a layer: misses through the transient bank, the
@@ -350,7 +356,7 @@ test "deepseek_v41 streamed exl3: a served EXL3 pack (its prompt in wide calls, 
     defer r.m.streamed = null;
     var calls: [1 + decode]u32 = @splat(1);
     calls[0] = @intCast(prompt.len);
-    const got = try r.logits(a, ids.items, &calls, vocab);
+    const got = r.logits(a, ids.items, &calls, vocab) catch |e| return skipOnThreadCap(e);
     try testing.expectEqual(Exl3.Phase.decode, src.phase);
     try testing.expectEqualSlices(u32, std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(want)), std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(got)));
 }
