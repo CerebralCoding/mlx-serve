@@ -18,6 +18,15 @@ comptime {
 
 test {
     _ = @import("sdk/train/gradient_test.zig");
+    _ = @import("sdk/train/grad.zig");
+    _ = @import("sdk/train/loss.zig");
+    _ = @import("sdk/train/adamw.zig");
+    _ = @import("sdk/train/packing.zig");
+    _ = @import("sdk/train/adapter.zig");
+    _ = @import("sdk/train/step.zig");
+    _ = @import("sdk/train/trainer_test.zig");
+    _ = @import("host/chat/training.zig");
+    _ = @import("engines/mlx/plugin/train_test.zig");
     _ = @import("engines/mlx/plugin/lora_test.zig");
     _ = @import("engines/mlx/lora.zig");
     _ = @import("host/api/lora.zig");
