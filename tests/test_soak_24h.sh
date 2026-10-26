@@ -5,6 +5,7 @@
 # sample (> 10% in the 1-hour variant, where allocator warm-up dominates).
 #
 #   SOAK_DURATION_HOURS=1 [SOAK_MODEL=<dir>] ./tests/test_soak_24h.sh
+#   SOAK_DURATION_MINUTES=30 ./tests/test_soak_24h.sh   (a release check; wins over the hours)
 
 set -e
 source "$(dirname "$0")/lib/server.sh"
@@ -18,7 +19,7 @@ LOG_DIR="${SOAK_LOG_DIR:-./tests}"
 SAMPLE_LOG="$LOG_DIR/soak_log.csv"
 
 # Drift threshold: 5% for ≥4h runs, 10% for shorter runs (warm-up dominates).
-if [ "$SOAK_DURATION_HOURS" -ge 4 ]; then
+if [ -z "${SOAK_DURATION_MINUTES:-}" ] && [ "$SOAK_DURATION_HOURS" -ge 4 ]; then
     DRIFT_THRESHOLD_PCT="${DRIFT_THRESHOLD_PCT:-5}"
 else
     DRIFT_THRESHOLD_PCT="${DRIFT_THRESHOLD_PCT:-10}"
@@ -43,17 +44,17 @@ if [ ! -x "$BINARY" ]; then
     exit 1
 fi
 
-DURATION_SEC=$(( SOAK_DURATION_HOURS * 3600 ))
+DURATION_SEC=$(( ${SOAK_DURATION_MINUTES:-$(( SOAK_DURATION_HOURS * 60 ))} * 60 ))
 SAMPLE_INTERVAL_SEC=300            # 5 minutes
 HEALTH_INTERVAL_SEC=1800           # 30 minutes
 # Shorter test → shorter sample interval so we get >= 4 samples even at 1h.
-if [ "$SOAK_DURATION_HOURS" -lt 2 ]; then
+if [ "$SOAK_DURATION_HOURS" -lt 2 ] || [ -n "${SOAK_DURATION_MINUTES:-}" ]; then
     SAMPLE_INTERVAL_SEC=60
     HEALTH_INTERVAL_SEC=300
 fi
 
 echo "== Plan 01 A8 — 24h concurrent soak =="
-echo "  duration:           ${SOAK_DURATION_HOURS}h (${DURATION_SEC}s)"
+echo "  duration:           ${DURATION_SEC}s"
 echo "  model:              $MODEL"
 echo "  drift threshold:    ${DRIFT_THRESHOLD_PCT}%"
 echo "  sample interval:    ${SAMPLE_INTERVAL_SEC}s"
