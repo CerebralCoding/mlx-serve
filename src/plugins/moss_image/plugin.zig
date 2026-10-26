@@ -76,7 +76,7 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     defer body.deinit();
     var inputs: [16][]const u8 = undefined;
     const in = req.inputs.slice();
-    if (in.len > inputs.len) return Verdict.refuse(.unsupported, "too many images in one request");
+    if (in.len > inputs.len) return Verdict.named(.unsupported, spec.too_many_refs);
     for (in, 0..) |s, i| inputs[i] = s.slice();
     const j = switch (image_request.parse(.{ .obj = body.parsed.value.object }, inputs[0..in.len], spec)) {
         .ok => |j| j,

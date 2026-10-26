@@ -89,9 +89,9 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     defer body.deinit();
     var inputs: [1][]const u8 = undefined;
     const in = req.inputs.slice();
-    if (in.len > inputs.len) return Verdict.refuse(.unsupported, "too many images in one request");
-    for (in, 0..) |s, i| inputs[i] = s.slice();
     const spec: image_request.Spec = .{ .img2img = e.k.vae_enc != null, .cond_weights = config.cond_weight_count };
+    if (in.len > inputs.len) return Verdict.named(.unsupported, spec.too_many_refs);
+    for (in, 0..) |s, i| inputs[i] = s.slice();
     const j = switch (image_request.parse(.{ .obj = body.parsed.value.object }, inputs[0..in.len], spec)) {
         .ok => |j| j,
         .bad => |v| return v,

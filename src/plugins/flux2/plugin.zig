@@ -95,8 +95,6 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     defer body.deinit();
     var inputs: [config.edit_ref_cap][]const u8 = undefined;
     const in = req.inputs.slice();
-    if (in.len > inputs.len) return Verdict.refuse(.unsupported, "too many images in one request");
-    for (in, 0..) |s, i| inputs[i] = s.slice();
     const has_enc = e.f.vae_enc != null;
     const spec: image_request.Spec = .{
         .img2img = has_enc,
@@ -105,6 +103,8 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
         .edit_ref_cap = config.edit_ref_cap,
         .cond_weights = config.cond_weight_count,
     };
+    if (in.len > inputs.len) return Verdict.named(.unsupported, spec.too_many_refs);
+    for (in, 0..) |s, i| inputs[i] = s.slice();
     const j = switch (image_request.parse(.{ .obj = body.parsed.value.object }, inputs[0..in.len], spec)) {
         .ok => |j| j,
         .bad => |v| return v,
@@ -143,7 +143,10 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
                 const rd = image_request.fitRefDims(n.w, n.h);
                 pix[pix_n] = image_pixels.decodeCover(gpa, bytes, rd.h, rd.w) orelse return if (i == 0) decode_refusal else ref_decode_refusal;
                 pix_n += 1;
-                if (i > 0) log.info("[image] edit ref {d}: {d}x{d} -> {d}x{d}\n", .{ i + 1, n.w, n.h, rd.w, rd.h });
+                if (i == 0)
+                    log.info("[image] edit: reference {d}x{d} -> {d}x{d} (in-context conditioning)\n", .{ n.w, n.h, rd.w, rd.h })
+                else
+                    log.info("[image] edit ref {d}: {d}x{d} -> {d}x{d}\n", .{ i + 1, n.w, n.h, rd.w, rd.h });
             }
             const fit = if (j.size_given)
                 image_request.fitWithinCap(w, h, config.max_dim)

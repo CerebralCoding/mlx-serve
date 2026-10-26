@@ -79,8 +79,6 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     defer body.deinit();
     var inputs: [config.edit_ref_cap][]const u8 = undefined;
     const in = req.inputs.slice();
-    if (in.len > inputs.len) return Verdict.refuse(.unsupported, "too many images in one request");
-    for (in, 0..) |s, i| inputs[i] = s.slice();
     const spec: image_request.Spec = .{
         .img2img = true,
         .edit = e.m.supportsEdit(),
@@ -90,6 +88,8 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
         .ref_resolution = true,
         .too_many_refs = "too many reference images ('ref_images' takes at most 9 beside 'image')",
     };
+    if (in.len > inputs.len) return Verdict.named(.unsupported, spec.too_many_refs);
+    for (in, 0..) |s, i| inputs[i] = s.slice();
     const j = switch (image_request.parse(.{ .obj = body.parsed.value.object }, inputs[0..in.len], spec)) {
         .ok => |j| j,
         .bad => |v| return v,

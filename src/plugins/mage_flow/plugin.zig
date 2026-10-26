@@ -2,6 +2,7 @@
 //! the Edit checkpoint's multi-reference editor (raw upload bytes, resized by the engine). The result is a PNG.
 
 const std = @import("std");
+const log = @import("../../sdk/util/log.zig");
 const abi = @import("../../abi/media.zig");
 const sdk = @import("../../sdk/root.zig");
 const job = @import("../../sdk/media/job.zig");
@@ -63,9 +64,9 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     defer body.deinit();
     var inputs: [16][]const u8 = undefined;
     const in = req.inputs.slice();
-    if (in.len > inputs.len) return Verdict.refuse(.unsupported, "too many images in one request");
-    for (in, 0..) |s, i| inputs[i] = s.slice();
     const spec: image_request.Spec = .{ .edit = e.m.supportsEdit(), .edit_ref_cap = config.edit_ref_cap };
+    if (in.len > inputs.len) return Verdict.named(.unsupported, spec.too_many_refs);
+    for (in, 0..) |s, i| inputs[i] = s.slice();
     const j = switch (image_request.parse(.{ .obj = body.parsed.value.object }, inputs[0..in.len], spec)) {
         .ok => |j| j,
         .bad => |v| return v,
@@ -83,8 +84,12 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
             image_request.resolveEditTargetSize(nat.w, nat.h, w, h, config.max_dim)
         else
             image_request.resolveEditTargetSize(nat.w, nat.h, nat.w, nat.h, config.max_dim);
-        w = image_request.clamp16(fit.w);
-        h = image_request.clamp16(fit.h);
+        const tw = image_request.clamp16(fit.w);
+        const th = image_request.clamp16(fit.h);
+        if (tw != w or th != h)
+            log.info("[image] edit: target {d}x{d} -> {d}x{d} (primary reference is {d}x{d}, size {s})\n", .{ w, h, tw, th, nat.w, nat.h, if (j.size_given) "requested" else "matched to source" });
+        w = tw;
+        h = th;
         refs[0] = j.image.?;
         for (j.refs) |r| {
             n_refs += 1;
