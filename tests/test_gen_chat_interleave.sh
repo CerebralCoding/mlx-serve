@@ -88,8 +88,8 @@ LAT=$(chat "$TMP/after.json")
 chat_ok "$TMP/after.json" || { echo "FAIL: post-cancel chat"; exit 1; }
 python3 -c "import sys; sys.exit(0 if $LAT < $SOLO / 2 else 1)" ||
   { echo "FAIL: [4] chat after a cancel took ${LAT}s (solo gen ${SOLO}s)"; exit 1; }
-for i in $(seq 1 50); do grep -q "\[image\] generation cancelled" "$LOG" && break; sleep 0.2; done
-grep -q "\[image\] generation cancelled" "$LOG" || { echo "FAIL: [4] the abandoned gen was not cancelled"; exit 1; }
+for i in $(seq 1 50); do grep -qE "\[gen\] [a-z0-9_]+ job cancelled: the client left" "$LOG" && break; sleep 0.2; done
+grep -qE "\[gen\] [a-z0-9_]+ job cancelled: the client left" "$LOG" || { echo "FAIL: [4] the abandoned gen was not cancelled"; exit 1; }
 echo "PASS: [4] cancelled gen freed the server (chat ${LAT}s)"
 
 # [5] Hunyuan3D textured: chat during offloaded CPU stages.

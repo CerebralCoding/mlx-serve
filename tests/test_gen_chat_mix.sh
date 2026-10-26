@@ -247,8 +247,8 @@ kill $CUR 2>/dev/null; wait $CUR 2>/dev/null
 python3 "$TMP/turn.py" "$URL" "$CHAT" plain >"$TMP/after.json"
 python3 -c "import json,sys; d=json.load(open('$TMP/after.json')); sys.exit(0 if d['ok'] and d['ttft'] < $MAX_TTFT else 1)" ||
   fail "[4] turn after the cancel: $(cat "$TMP/after.json")"
-for i in $(seq 1 100); do grep -q "\[music\] generation failed: error.Cancelled" "$LOG" && break; sleep 0.2; done
-grep -q "\[music\] generation failed: error.Cancelled" "$LOG" || fail "[4] the abandoned music job was not cancelled"
+for i in $(seq 1 100); do grep -q "\[gen\] acestep job cancelled: the client left" "$LOG" && break; sleep 0.2; done
+grep -q "\[gen\] acestep job cancelled: the client left" "$LOG" || fail "[4] the abandoned music job was not cancelled"
 sed 's/"}$/","stream":true}/' "$TMP/speech.json" >"$TMP/speech_stream.json"
 curl -sN -m 1800 "$URL/v1/audio/speech" -H 'Content-Type: application/json' -d @"$TMP/speech_stream.json" >"$TMP/cancel_speech.sse" &
 CUR=$!
@@ -257,8 +257,8 @@ kill $CUR 2>/dev/null; wait $CUR 2>/dev/null
 python3 "$TMP/turn.py" "$URL" "$CHAT" plain >"$TMP/after_speech.json"
 python3 -c "import json,sys; d=json.load(open('$TMP/after_speech.json')); sys.exit(0 if d['ok'] and d['ttft'] < $MAX_TTFT else 1)" ||
   fail "[4] turn after the speech cancel: $(cat "$TMP/after_speech.json")"
-for i in $(seq 1 100); do grep -q "\[audio\] synthesis cancelled" "$LOG" && break; sleep 0.2; done
-grep -q "\[audio\] synthesis cancelled" "$LOG" || fail "[4] the abandoned speech job was not cancelled"
+for i in $(seq 1 100); do grep -q "\[gen\] qwen3_tts job cancelled: the client left" "$LOG" && break; sleep 0.2; done
+grep -q "\[gen\] qwen3_tts job cancelled: the client left" "$LOG" || fail "[4] the abandoned speech job was not cancelled"
 echo "PASS: [4] cancelled music and speech jobs each freed the server (first token $(python3 -c "import json; print(round(json.load(open('$TMP/after.json'))['ttft'], 2), 's /', round(json.load(open('$TMP/after_speech.json'))['ttft'], 2), 's')"))"
 
 # [5] Alive and clean.

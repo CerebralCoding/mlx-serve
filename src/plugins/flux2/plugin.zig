@@ -8,6 +8,7 @@ const sdk = @import("../../sdk/root.zig");
 const job = @import("../../sdk/media/job.zig");
 const image_request = @import("../../sdk/media/image_request.zig");
 const image_pixels = @import("../../sdk/media/image_pixels.zig");
+const log = @import("../../sdk/util/log.zig");
 const LoraSet = @import("../../sdk/media/lora_set.zig").LoraSet;
 const lora_mod = @import("../../sdk/weights/lora.zig");
 const mlx = @import("../../mlx/ffi.zig");
@@ -123,6 +124,7 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
         .guidance_scale = j.guidance_scale,
         .negative_prompt = j.negative_prompt,
     };
+    if (opts.cond_weights) |cw| log.info("[image] rebalance: gain={d:.2} weights={d}\n", .{ j.cond_gain, cw.len });
     switch (j.mode) {
         .generate => {},
         // Variation shares the output's latent grid: the source is cover-cropped to it, never stretched.
@@ -141,6 +143,7 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
                 const rd = image_request.fitRefDims(n.w, n.h);
                 pix[pix_n] = image_pixels.decodeCover(gpa, bytes, rd.h, rd.w) orelse return if (i == 0) decode_refusal else ref_decode_refusal;
                 pix_n += 1;
+                if (i > 0) log.info("[image] edit ref {d}: {d}x{d} -> {d}x{d}\n", .{ i + 1, n.w, n.h, rd.w, rd.h });
             }
             const fit = if (j.size_given)
                 image_request.fitWithinCap(w, h, config.max_dim)

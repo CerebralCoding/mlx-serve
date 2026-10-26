@@ -91,6 +91,7 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
             refs[n_refs] = r;
         }
         n_refs += 1;
+        image_pixels.logByteRefs(refs[0..n_refs]);
     }
     const sp = job.progressOf(progress);
     const img = (if (n_refs != 0)

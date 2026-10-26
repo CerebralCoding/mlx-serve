@@ -241,6 +241,7 @@ fn run(p: *Plugin, req: *const abi.Request, progress: *const abi.Progress) !Verd
         if (std.mem.eql(u8, dec, "diffusion")) {
             if (dir.fileBytes(diffvae_fwd.FILE_NAME) == 0) return bad("'decoder':\"diffusion\" requires vae_diffusion_decoder.safetensors — the 8-bit LTX-2.5 pack ships it, the 4-bit pack does not");
             vae_choice.diffusion = try e.ensureDiffusionDecoder(io());
+            log.info("[video] decoder: diffusion (DiffVAE)\n", .{});
         } else if (!std.mem.eql(u8, dec, "conv") and dec.len > 0) return bad("'decoder' must be \"conv\" or \"diffusion\"");
     }
 

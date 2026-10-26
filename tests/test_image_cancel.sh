@@ -59,7 +59,7 @@ echo "client disconnected mid-denoise"
 # ("[image] -> N PNG bytes") is the bug.
 VERDICT=""
 for i in $(seq 1 240); do
-  if grep -q '\[image\] generation cancelled' "$LOG"; then VERDICT=cancelled; break; fi
+  if grep -qE '\[gen\] [a-z0-9_]+ job cancelled: the client left' "$LOG"; then VERDICT=cancelled; break; fi
   if grep -q '\[image\] -> ' "$LOG"; then VERDICT=completed; break; fi
   sleep 1
 done

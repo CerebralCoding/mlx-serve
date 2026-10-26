@@ -513,7 +513,8 @@ fn composedStridedCase(h_q: c_int, h_kv: c_int, d: c_int, bits: u8, t_pre: usize
 }
 
 test "composed quantAttention is correct on STRIDED cache views" {
-    mlx.installErrorHandler(); // MLX CUDA has no quantized_matmul for some multi-row shapes: fail, never abort
+    // MLX CUDA has no quantized_matmul for these multi-row shapes; its error would stay latched for later tests.
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     // Class guard (splitPackedGateUp rule): slice-born views into
     // mlx_quantized_matmul must compute correctly — the cache's packed views
     // are non-contiguous whenever buffer capacity > logical length. Covers

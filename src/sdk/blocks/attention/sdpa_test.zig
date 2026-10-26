@@ -304,6 +304,7 @@ test "sdpaForceFusedFor: only shapes MLX has a fused kernel for (hd 256, > 8 row
 }
 
 test "sdpa force_fused: hd-256 causal blocks the gate admits match the unforced call (plumbing + shape gate)" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest; // CUDA has no fused hd-256 kernel to force
     // The shapes sdpaForceFusedFor admits (hd 256, > 8 rows, q <= k): the
     // forced kernel (steel on M1-M4, the NAX variant on M5) must agree with
     // the unforced dispatch (unfused at hd 256 on non-NAX) and never throw.

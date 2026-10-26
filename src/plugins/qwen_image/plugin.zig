@@ -136,6 +136,7 @@ fn edit(e: *Engine, j: *const image_request.Job, sp: anytype) Verdict {
     const n = 1 + j.refs.len;
     var last: image_pixels.Size = undefined;
     for (refs[0..n], 0..) |r, i| last = image_pixels.nativeSize(r) orelse return if (i == 0) decode_refusal else ref_decode_refusal;
+    image_pixels.logByteRefs(refs[0..n]);
     const dims = config.editDims(if (j.size_given) .{ .w = j.req_w, .h = j.req_h } else null, last.w, last.h);
     const cfg = e.m.dit_cfg;
     const base = config.editTransientBytes(@intCast(n), j.ref_resolution, dims.w, dims.h);
