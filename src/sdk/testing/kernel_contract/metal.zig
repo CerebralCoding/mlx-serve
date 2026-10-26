@@ -234,6 +234,8 @@ pub const Rig = struct {
     }
 
     fn kernelFor(r: *Rig, l: *const Launch) !mlx.mlx_fast_metal_kernel {
+        // Metal source only runs on Metal; launched on CUDA it latches an MLX error every later test inherits.
+        if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
         for (r.kernels.items) |e| if (e.l == l) return e.k;
         // Its own name: MLX caches libraries by name, so the shipped wrapper's build never stands in for this one.
         const name = try std.fmt.allocPrintSentinel(r.a, "contract_{s}", .{l.name}, 0);

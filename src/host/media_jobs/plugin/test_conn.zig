@@ -6,6 +6,9 @@ const Conn = @import("../../http/server.zig").Conn;
 const sse = @import("../sse.zig");
 const media_progress = @import("../../../sdk/media/progress.zig");
 
+/// The peer a handler sees: loopback, as the app's own client (handlers read it, e.g. LoRA paths are loopback-only).
+const loopback: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+
 /// Everything `run` writes to a connection, read off the other end of a socketpair.
 pub fn capture(a: std.mem.Allocator, comptime run: anytype, args: anytype) ![]u8 {
     var sv: [2]std.posix.fd_t = undefined;
@@ -24,7 +27,7 @@ pub fn capture(a: std.mem.Allocator, comptime run: anytype, args: anytype) ![]u8
     errdefer out.deinit(a);
     const t = try std.Thread.spawn(.{}, Drain.f, .{ sv[1], &out, a });
     var conn: Conn = undefined;
-    conn.init(.{ .socket = .{ .handle = sv[0], .address = undefined } }, testing.io);
+    conn.init(.{ .socket = .{ .handle = sv[0], .address = loopback } }, testing.io);
     // The job's keepalive registration outlives it here (the scheduler clears it in production): drop it with the conn.
     const r = @call(.auto, run, .{&conn} ++ args);
     media_progress.streamKeepalive().* = null;
@@ -53,7 +56,7 @@ pub fn captureMany(a: std.mem.Allocator, comptime n: usize, comptime run: anytyp
     };
     for (&sv, &conns, &outs, &threads) |*p, *c, *o, *t| {
         try testing.expect(std.c.socketpair(1, 1, 0, p) == 0);
-        c.init(.{ .socket = .{ .handle = p[0], .address = undefined } }, testing.io);
+        c.init(.{ .socket = .{ .handle = p[0], .address = loopback } }, testing.io);
         t.* = try std.Thread.spawn(.{}, Drain.f, .{ p[1], o, a });
     }
     @call(.auto, run, .{&conns} ++ args);

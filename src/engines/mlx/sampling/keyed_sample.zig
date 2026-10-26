@@ -102,6 +102,7 @@ pub fn sample(logits: mlx.mlx_array, p: Params, positions: []const u32, s: mlx.m
 const testing = std.testing;
 
 test "keyed_sample: draws TensorFold's reference tokens, a row alone or among others" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const V = 3000;
     var v: [V]f32 = undefined;
@@ -139,6 +140,7 @@ test "keyed_sample: draws TensorFold's reference tokens, a row alone or among ot
 }
 
 test "keyed_sample.gumbel: the host noise picks the kernel's token" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const V = 3000;
     var v: [V]f32 = undefined;
@@ -171,6 +173,7 @@ test "keyed_sample.gumbel: the host noise picks the kernel's token" {
 }
 
 test "keyed_sample min_p excludes low logits after temperature and top_k" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const raw = [_]f32{ 3, 2, 0, -5 };
     const logits = mlx.mlx_array_new_data(&raw, &[_]c_int{ 1, 4 }, 2, .float32);
@@ -186,6 +189,7 @@ test "keyed_sample min_p excludes low logits after temperature and top_k" {
 }
 
 test "keyed_sample min_p retains the temperature-scaled nucleus" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const raw = [_]f32{ 3, 2.8, 0, -5 };
     const logits = mlx.mlx_array_new_data(&raw, &[_]c_int{ 1, 4 }, 2, .float32);

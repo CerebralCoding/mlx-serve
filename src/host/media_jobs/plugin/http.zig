@@ -351,7 +351,7 @@ test "plugin arm: chat gets one turn per step boundary, from the driver, through
     defer _ = std.c.close(sv[1]);
     defer _ = std.c.close(sv[0]);
     var conn: Conn = undefined;
-    conn.init(.{ .socket = .{ .handle = sv[0], .address = undefined } }, testing.io);
+    conn.init(.{ .socket = .{ .handle = sv[0], .address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } } }, testing.io);
     const Count = struct {
         var turns: u32 = 0;
         fn step(_: *anyopaque) void {

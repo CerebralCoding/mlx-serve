@@ -5138,6 +5138,7 @@ test "dsv41 topk: the kernel picks the k largest of each row in index order, tie
 }
 
 test "dsv41 index scores: the matrix kernel scores what the scalar kernel scores and picks its blocks, near-ties aside" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     mlx.installErrorHandler();
     const gpa = testing.allocator;
@@ -5220,6 +5221,7 @@ test "dsv41 index scores: the matrix kernel scores what the scalar kernel scores
 }
 
 test "dsv41 decode attention: rows split across threadgroups give the one-threadgroup heads" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const gpa = testing.allocator;
     var sc = Scope.init(gpa, mlx.gpuStream());
     defer sc.deinit();
@@ -5259,6 +5261,7 @@ test "dsv41 decode attention: rows split across threadgroups give the one-thread
 }
 
 test "dsv41 decode attention: the folded inverse rope is ropeTail of the heads, bit for bit" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const gpa = testing.allocator;
     var sc = Scope.init(gpa, mlx.gpuStream());
@@ -5310,6 +5313,7 @@ test "dsv41 decode attention: the folded inverse rope is ropeTail of the heads, 
 }
 
 test "dsv41 engram: the decode-width kernel writes the op chain's stream bit for bit" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const gpa = testing.allocator;
     var sc = Scope.init(gpa, mlx.gpuStream());
@@ -5341,6 +5345,7 @@ test "dsv41 engram: the decode-width kernel writes the op chain's stream bit for
 }
 
 test "dsv41 wide attention: the f16 core gives the f32 chain's heads at the release's span shape" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     // Bar: per (row, head) cosine, norm ratio and peak error against the f32 chain, both read in f32.
     const gpa = testing.allocator;
     var sc = Scope.init(gpa, mlx.gpuStream());
@@ -5545,6 +5550,7 @@ test "dsv41 state bytes: the window rings and the compressed rows as allocated" 
 }
 
 test "dsv41 router: the wide f32 matmul gives the logits the decode kernel gives" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const gpa = testing.allocator;
     var sc = Scope.init(gpa, mlx.gpuStream());
     defer sc.deinit();
@@ -5619,6 +5625,7 @@ test "dsv41 kv row: a head-width row launches and is normed by its own rms on th
 }
 
 test "dsv41 hc: a threadgroup the GPU refuses is halved until the kernels launch" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     mlx.installErrorHandler();
     var m: Dsv41Model = undefined;
@@ -5633,6 +5640,7 @@ test "dsv41 hc: a threadgroup the GPU refuses is halved until the kernels launch
 }
 
 test "dsv41 hc: a decode-width stage gives the wide path's mixes, split, norm and expanded stream bit for bit" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     mlx.installErrorHandler();
     const gpa = testing.allocator;

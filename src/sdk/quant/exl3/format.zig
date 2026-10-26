@@ -245,6 +245,7 @@ const Case = struct {
 // Bar: a layer loaded through the table runs bit-equal to Sushi's own dispatch with the decode the engine passed
 // before the switch, at decode, verify and prefill widths, for MCG, MUL1, GLM's clamped SwiGLU and an STQ table.
 test "quant exl3: routed SwiGLU through the table is bit-equal to the direct dispatch" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const cases = [_]Case{

@@ -8426,6 +8426,7 @@ test "dsv4: routeGpu matches host routeToken (scored + hash)" {
 }
 
 test "dsv4: fused sinkhorn kernel matches the host reference (GPU)" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend()) return;
     const s = mlx.gpuStream();
     defer _ = mlx.mlx_stream_free(s);
