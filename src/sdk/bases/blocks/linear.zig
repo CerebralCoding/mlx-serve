@@ -37,6 +37,15 @@ pub const Linear = struct {
         return if (l.lora) |a| a.scale != 0 else false;
     }
 
+    pub fn withLora(l: Linear, bindings: []const @import("../../../abi/plugin.zig").LoraBinding, layer: u32, projection: @import("../../../abi/plugin.zig").LoraProjection) Linear {
+        var adapted = l;
+        for (bindings) |binding| if (binding.layer == layer and binding.projection == projection) {
+            adapted.lora = .{ .a = .{ .ctx = binding.a.ctx }, .b = .{ .ctx = binding.b.ctx }, .scale = binding.scale };
+            break;
+        };
+        return adapted;
+    }
+
     pub fn forward(l: *const Linear, g: *Graph, x: Array) !Array {
         if (l.bias.ctx == null and !l.hasLora()) return g.adopt(try l.matmul(g, x));
         var t = g.scope();
@@ -45,22 +54,22 @@ pub const Linear = struct {
         if (l.bias.ctx != null) y = try t.add(y, l.bias);
         if (l.hasLora()) {
             const a = l.lora.?;
-            const dt = ops.dtype(x);
-            const low = try t.matmul(try t.matmul(x, try t.astype(a.a, dt)), try t.astype(a.b, dt));
+            const low = try t.matmul(try t.matmul(x, a.a), a.b);
             y = try t.add(y, try t.astype(try t.mulScalar(low, a.scale), ops.dtype(y)));
         }
         return g.keep(y);
     }
 
     fn matmul(l: *const Linear, g: *Graph, x: Array) !Array {
-        if (g.differentiable) {
-            if (l.rht != null or l.ternary or l.mode != .affine or (l.s.ctx != null and (l.bits != 4 or l.b.ctx == null))) return error.DifferentiableLinearUnsupported;
+        if (l.hasLora() and (l.rht != null or l.mode != .affine)) return error.LoraUnsupportedQuantization;
+        if (g.differentiable or l.hasLora()) {
+            if (l.rht != null or l.mode != .affine or (g.differentiable and (l.ternary or (l.s.ctx != null and (l.bits != 4 or l.b.ctx == null))))) return error.DifferentiableLinearUnsupported;
             var out = mlx.mlx_array_new();
             errdefer _ = mlx.mlx_array_free(out);
             if (l.s.ctx == null) {
                 try mlx.check(mlx.mlx_matmul(&out, x, l.w, g.s));
             } else {
-                try mlx.check(mlx.mlx_quantized_matmul(&out, x, l.w, l.s, l.b, true, mlx.mlx_optional_int.some(@intCast(l.group_size)), mlx.mlx_optional_int.some(4), "affine", g.s));
+                try mlx.check(mlx.mlx_quantized_matmul(&out, x, l.w, l.s, l.b, true, mlx.mlx_optional_int.some(@intCast(l.group_size)), mlx.mlx_optional_int.some(@intCast(l.bits)), "affine", g.s));
             }
             return out;
         }

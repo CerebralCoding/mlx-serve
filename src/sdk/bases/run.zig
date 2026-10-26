@@ -54,9 +54,10 @@ pub const Run = struct {
     embeds: Array = .{},
     /// `Ctx.offload` (`Forward.offload`).
     offload: ?*const abi.Offload = null,
+    lora: []const abi.LoraBinding = &.{},
 
     pub fn ctx(r: *const Run, g: *Graph, shared: *const block.Shared) Ctx {
-        return .{ .g = g, .mode = r.mode, .rows = r.rows, .slots = r.slots, .positions = r.positions, .caches = r.caches, .cache_ops = r.cache_ops, .shared = shared, .mask = r.mask, .mask_add = r.mask_add, .capture_spec = r.capture_spec, .mrope = r.mrope, .row_exact = r.row_exact, .offload = r.offload, .tree = r.tree };
+        return .{ .g = g, .mode = r.mode, .rows = r.rows, .slots = r.slots, .positions = r.positions, .caches = r.caches, .cache_ops = r.cache_ops, .shared = shared, .mask = r.mask, .mask_add = r.mask_add, .capture_spec = r.capture_spec, .mrope = r.mrope, .row_exact = r.row_exact, .offload = r.offload, .tree = r.tree, .lora = r.lora };
     }
 
     /// The embedded rows `h` with the media rows at their placeholders (a prompt chunk only, as the engine splices).
@@ -225,6 +226,7 @@ fn run(comptime Base: type, m: *Model(Base), f: *const abi.Forward, out: *abi.Fo
             .attn = .{ .depth = .{ .ctx = f.tree.depth.ctx }, .path = .{ .ctx = f.tree.path.ctx }, .max_depth = f.tree.max_depth },
         },
         .pipeline_every = f.pipeline_every,
+        .lora = f.lora.slice(),
     };
     const res = try Base.forward(&m.weights, &m.shared, &g, ids, r);
     if (caps.len > 0) {

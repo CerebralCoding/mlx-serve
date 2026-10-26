@@ -17,6 +17,12 @@ pub const MAX_BATCH_GROUP = @import("../../../host/gpu_thread/scheduler.zig").MA
 
 pub const BatchVerdict = @import("../../../host/gpu_thread/scheduler.zig").BatchVerdict;
 
+pub fn adapterVerdict(group: anytype) BatchVerdict {
+    if (group.len == 0) return .ok;
+    for (group[1..]) |slot| if (!std.mem.eql(u8, &group[0].cache.adapter_key, &slot.cache.adapter_key)) return .lora_mixed;
+    return .ok;
+}
+
 /// Does the loaded model's config batch at all? The arch half of `batchVerdict`,
 /// shared with `/props`, `/v1/models` and the serve-mode startup line.
 pub fn configBatchesDecode(cfg: *const model_mod.ModelConfig) bool {
@@ -234,6 +240,17 @@ pub fn liveDecodingCount(sch: *Scheduler) usize {
 }
 
 // ── tests ──
+
+test "LLM LoRA: batching admits identical adapters and serializes mixed identities" {
+    const Stub = struct { cache: struct { adapter_key: [32]u8 } };
+    const base: Stub = .{ .cache = .{ .adapter_key = @splat(0) } };
+    const first: Stub = .{ .cache = .{ .adapter_key = @splat(1) } };
+    const second: Stub = .{ .cache = .{ .adapter_key = @splat(2) } };
+    try testing.expectEqual(.ok, adapterVerdict(&[_]*const Stub{ &base, &base }));
+    try testing.expectEqual(.ok, adapterVerdict(&[_]*const Stub{ &first, &first }));
+    try testing.expectEqual(.lora_mixed, adapterVerdict(&[_]*const Stub{ &base, &first }));
+    try testing.expectEqual(.lora_mixed, adapterVerdict(&[_]*const Stub{ &first, &second }));
+}
 
 test "a prefill that does not fit waits only while another request is live" {
     try testing.expect(holdsForMemory(false, true));

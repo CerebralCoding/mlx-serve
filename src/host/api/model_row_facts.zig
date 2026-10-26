@@ -77,12 +77,33 @@ pub fn forEntry(allocator: std.mem.Allocator, io: std.Io, entry: anytype, model_
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try write(allocator, &out, chat_ctx, modalityName(io, entry.path, model_type), .{ .bits = .{ .mask = @intCast(entry.engines.?) } }, outside.servingName(io, entry.path));
+    const registry = @import("../registry/adapters.zig");
+    const root = registry.rootPath(allocator) catch null;
+    defer if (root) |path| allocator.free(path);
+    const adapters = if (root != null and entry.engine == null and !mlx_gguf)
+        try registry.listJson(allocator, io, root.?, entry.path, model_type)
+    else
+        try allocator.dupe(u8, "[]");
+    defer allocator.free(adapters);
+    try out.print(allocator, ",\"adapters\":{s}", .{adapters});
     return out.toOwnedSlice(allocator);
 }
 
 // ── tests ──
 
 const t = std.testing;
+
+test "LLM LoRA: model row facts advertise the adapter list for unloaded models too" {
+    var entry: struct { engines: ?u64 = 0, path: []const u8 = "", engine: ?*anyopaque = null } = .{};
+    const facts = try forEntry(t.allocator, t.io, &entry, "gemma4", null, false);
+    defer t.allocator.free(facts);
+    const json = try std.fmt.allocPrint(t.allocator, "{{\"id\":\"m\"{s}}}", .{facts});
+    defer t.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json, .{});
+    defer parsed.deinit();
+    try t.expect(parsed.value.object.contains("adapters"));
+    try t.expectEqual(@as(usize, 0), parsed.value.object.get("adapters").?.array.items.len);
+}
 
 test "write: the budget on chat rows, the modality on media rows, the engines on every row, an outside plugin's badge" {
     var out: std.ArrayList(u8) = .empty;

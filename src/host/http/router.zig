@@ -327,6 +327,10 @@ pub fn handleConnection(
         try sendResponse(stream, "204 No Content", "text/plain", "");
         return;
     }
+    if (std.mem.eql(u8, method, "POST")) @import("../api/lora.zig").validateSurface(allocator, path, request_body, request_content_type) catch |err| {
+        try @import("errors.zig").sendGenerationError(allocator, stream, err, .openai);
+        return;
+    };
     if (std.mem.eql(u8, method, "GET") and isRoute(path, "/v1/models")) {
         log.debug("GET  /v1/models -> 200\n", .{});
         // A keyless LAN peer sees only shared models and never the remote
@@ -729,8 +733,8 @@ fn isStatusRoute(method: []const u8, path: []const u8) bool {
 fn isTextGenRoute(method: []const u8, path: []const u8) bool {
     if (std.mem.eql(u8, method, "POST")) {
         const routes = [_][]const u8{
-            "/v1/chat/completions", "/v1/completions", "/v1/messages",
-            "/v1/responses",        "/api/chat",       "/api/generate",
+            "/v1/chat/completions",     "/v1/completions", "/v1/messages",
+            "/v1/responses",            "/api/chat",       "/api/generate",
             "/v1/audio/transcriptions",
         };
         for (routes) |r| if (std.mem.eql(u8, path, r)) return true;

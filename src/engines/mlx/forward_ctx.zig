@@ -48,6 +48,7 @@ pub const CaptureLayers = struct {
 
 pub const ForwardCtx = struct {
     cache: *KVCache,
+    lora: []const abi.LoraBinding = &.{},
     /// A later pipeline rank's input: the previous rank's hyper-connection stream, in place of tokens.
     stream_in: ?mlx.mlx_array = null,
     moe_seq_offset: *usize,

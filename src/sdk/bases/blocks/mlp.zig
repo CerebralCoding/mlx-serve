@@ -45,7 +45,12 @@ pub const SwiGlu = struct {
         rows_joined: bool = false,
     };
 
-    pub fn forward(w: *const Weights, c: *Ctx, x: Array) !Array {
+    pub fn forward(weights: *const Weights, c: *Ctx, x: Array) !Array {
+        var adapted = weights.*;
+        adapted.gate = adapted.gate.withLora(c.lora, c.layer, .gate);
+        adapted.up = adapted.up.withLora(c.lora, c.layer, .up);
+        adapted.down = adapted.down.withLora(c.lora, c.layer, .down);
+        const w = &adapted;
         const g = c.g;
         const joined = !g.differentiable and !w.gate.hasLora() and !w.up.hasLora() and c.mode != .batched_rows and w.rows_joined and w.gu.built() and c.rows * c.slots <= FUSED_ROWS_MAX_M;
         var gate: Array = undefined;

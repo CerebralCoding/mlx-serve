@@ -180,6 +180,18 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     };
 
     const sampling = slot.sampling;
+    if (slot.lora) |*state| {
+        if (scheduler_mod.prefill_admission_numbers) |numbers| {
+            const bill = numbers(slot.model.config.?, slot.full_prompt.len, slot.max_tokens, slot.cache.config, slot.enable_mtp);
+            const reserve = state.loadReserve();
+            if (reserve > bill[1] -| sch.gen_reserve_bytes) {
+                slot.refused_bill = .{ reserve, bill[1] -| sch.gen_reserve_bytes };
+                return error.PrefillDoesNotFit;
+            }
+        }
+        try state.load(sch.io);
+        slot.ctx.lora = state.adapter.?.bindings;
+    }
     // Refresh ctx in case slot was relocated (paranoia — slot is heap so no,
     // but cheap).
     slot.ctx.cache = &slot.cache;

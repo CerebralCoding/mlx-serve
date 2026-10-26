@@ -20,6 +20,7 @@ const ModelConfig = model.ModelConfig;
 /// A served pack's plugin and what its parse produced; owned by the `ModelConfig` it rides (`ModelConfig.deinit`).
 pub const Binding = struct {
     table: *const abi.ModelTable,
+    source_sha256: ?[32]u8 = null,
     parsed: abi.Parsed = .{},
     /// An outside plugin's (`host/plugins`): the legacy parse knows nothing of its packs.
     outside: bool = false,
@@ -110,7 +111,7 @@ pub fn bindTableWith(io: std.Io, a: std.mem.Allocator, dir: []const u8, table: *
     const cfg = try model.mergeConfigJson(a, raw, overrides);
     defer a.free(cfg);
     const b = try a.create(Binding);
-    b.* = .{ .table = table };
+    b.* = .{ .table = table, .source_sha256 = @import("../../../sdk/weights/lora_config.zig").fingerprint(raw) };
     var settings: [48]u8 = undefined;
     if (!table.parse(&pd, .of(cfg), .of(parseSettings(a, io, &settings, dir)), null, false, &b.parsed).isOk()) {
         a.destroy(b);
@@ -155,7 +156,7 @@ pub fn resolve(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, raw_json
     const table = claimant(model_type, config_json, &dir) orelse
         return .{ .declined = if (served.serves(model_type)) "no single claimant" else "type not served" };
     const b = try a.create(Binding);
-    b.* = .{ .table = table, .outside = outside.ownerOf(table) != null };
+    b.* = .{ .table = table, .source_sha256 = @import("../../../sdk/weights/lora_config.zig").fingerprint(raw_json), .outside = outside.ownerOf(table) != null };
     var settings: [48]u8 = undefined;
     const v = table.parse(&dir, abi.Str.of(config_json), .of(parseSettings(a, io, &settings, model_dir)), null, false, &b.parsed);
     if (!v.isOk()) {
@@ -301,6 +302,22 @@ pub fn applyLayout(c: *ModelConfig, table: *const abi.ModelTable, p: *const abi.
 
 const testing = std.testing;
 const fixture = @import("../../../sdk/testing/fixture.zig");
+
+test "LLM LoRA: a loaded binding retains the source config fingerprint" {
+    const a = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const body = try @import("../../../plugins/qwen3/proof_test.zig").configJson(a, .{});
+    defer a.free(body);
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = body });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = buf[0..try tmp.dir.realPath(io, &buf)];
+    const b = (try bindServed(io, a, path, body)).?;
+    defer b.destroy(a);
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{}" });
+    try testing.expectEqualSlices(u8, &@import("../../../sdk/weights/lora_config.zig").fingerprint(body), &b.source_sha256.?);
+}
 
 test "plugin claimant: a served type goes to its one claimant; an unserved type or two claimants to legacy" {
     const T = struct {

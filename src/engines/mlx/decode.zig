@@ -164,6 +164,15 @@ pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         var end = start + 1;
         while (end < batchable_n and batchable_buf[end].model == batchable_buf[start].model) end += 1;
         var group = batchable_buf[start..end];
+        const adapter_verdict = @import("batching/verdict.zig").adapterVerdict(group);
+        if (adapter_verdict != .ok) {
+            for (group) |slot| {
+                noteSerial(sch, slot, adapter_verdict);
+                try runSingleDecodeTick(sch, slot);
+            }
+            start = end;
+            continue;
+        }
         // Cap the group by padding waste: the batched kernel pads every slot's
         // KV to the longest in the group, so one long-context stream would make
         // its short neighbours build a tensor orders of magnitude bigger than

@@ -127,7 +127,13 @@ pub fn DecoderAttention(comptime opts: Options) type {
             return .{ try roped.apply(g, try g.transpose(k_n, &perm)), try g.transpose(v_n, &perm) };
         }
 
-        pub fn forward(w: *const Weights, c: *Ctx, x: Array) !Array {
+        pub fn forward(weights: *const Weights, c: *Ctx, x: Array) !Array {
+            var adapted = weights.*;
+            adapted.q = adapted.q.withLora(c.lora, c.layer, .q);
+            adapted.k = adapted.k.withLora(c.lora, c.layer, .k);
+            adapted.v = adapted.v.withLora(c.lora, c.layer, .v);
+            adapted.o = adapted.o.withLora(c.lora, c.layer, .o);
+            const w = &adapted;
             if (c.g.differentiable and (c.caches.len != 0 or c.mode == .batched_rows or opts.gate != .none)) return error.DifferentiableAttentionUnsupported;
             if (c.mode == .batched_rows) return batchedForward(w, c, x);
             if (c.caches.len == 0) return embedBatchForward(w, c, x);

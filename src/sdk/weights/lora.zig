@@ -52,7 +52,27 @@ pub const Ref = struct {
 };
 
 pub const Role = enum { a, b, alpha };
-pub const KeyInfo = struct { module: []const u8, role: Role, flat: bool = false };
+pub const KeyInfo = struct { module: []const u8, role: Role, flat: bool = false, mlx_lm: bool = false };
+
+pub const LlmTarget = struct {
+    layer: u32,
+    projection: @import("../../abi/plugin.zig").LoraProjection,
+};
+
+pub fn parseLlmTarget(module: []const u8) ?LlmTarget {
+    const prefix = "model.layers.";
+    if (!std.mem.startsWith(u8, module, prefix)) return null;
+    const rest = module[prefix.len..];
+    const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return null;
+    const index = rest[0..dot];
+    if (index.len == 0 or (index.len > 1 and index[0] == '0')) return null;
+    for (index) |ch| if (ch < '0' or ch > '9') return null;
+    const layer = std.fmt.parseInt(u32, index, 10) catch return null;
+    inline for (.{ "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj" }, 0..) |name, i| {
+        if (std.mem.eql(u8, rest[dot + 1 ..], name)) return .{ .layer = layer, .projection = @fromBackingInt(@intCast(i)) };
+    }
+    return null;
+}
 
 /// Classify one safetensors key: strip a wrapper prefix and a matrix-role
 /// suffix, and report which flavor of prefix was stripped.
@@ -84,6 +104,8 @@ pub fn parseKey(key: []const u8) ?KeyInfo {
         }
     }
     const suffixes = .{
+        .{ ".lora_a", Role.a },
+        .{ ".lora_b", Role.b },
         .{ ".lora_A.default.weight", Role.a },
         .{ ".lora_A.weight", Role.a },
         .{ ".lora_down.default.weight", Role.a },
@@ -106,7 +128,7 @@ pub fn parseKey(key: []const u8) ?KeyInfo {
             } else {
                 if (std.mem.endsWith(u8, m, ".to_out.0")) m = m[0 .. m.len - 2];
             }
-            return .{ .module = m, .role = sf[1], .flat = flat };
+            return .{ .module = m, .role = sf[1], .flat = flat, .mlx_lm = std.mem.eql(u8, sf[0], ".lora_a") or std.mem.eql(u8, sf[0], ".lora_b") };
         }
     }
     return null;
@@ -122,7 +144,7 @@ pub fn parseKey(key: []const u8) ?KeyInfo {
 // comment above for the taxonomy of naming schemes this covers.
 // ════════════════════════════════════════════════════════════════════════
 
-pub const Arch = enum { flux2, krea2, minimax_h3, qwen_image21, generic };
+pub const Arch = enum { flux2, krea2, minimax_h3, qwen_image21, llm, generic };
 
 /// Which piece of a fused up-projection a canonical target draws from, when
 /// the source tensor packs several linears together (BFL's fused QKV in
@@ -307,9 +329,20 @@ fn archTable(arch: Arch) []const AliasRow {
         .krea2 => &krea2_table,
         .minimax_h3 => &minimax_h3_table,
         .qwen_image21 => &qwen_image21_table,
+        .llm => &llm_table,
         .generic => &.{},
     };
 }
+
+const llm_table = [_]AliasRow{
+    t("model.layers.{}.self_attn.q_proj", "model.layers.{}.self_attn.q_proj"),
+    t("model.layers.{}.self_attn.k_proj", "model.layers.{}.self_attn.k_proj"),
+    t("model.layers.{}.self_attn.v_proj", "model.layers.{}.self_attn.v_proj"),
+    t("model.layers.{}.self_attn.o_proj", "model.layers.{}.self_attn.o_proj"),
+    t("model.layers.{}.mlp.gate_proj", "model.layers.{}.mlp.gate_proj"),
+    t("model.layers.{}.mlp.up_proj", "model.layers.{}.mlp.up_proj"),
+    t("model.layers.{}.mlp.down_proj", "model.layers.{}.mlp.down_proj"),
+};
 
 /// Match `candidate` against `template`, which has at most one "{}" block
 /// placeholder. Returns the block-number substring on a match (empty slice
@@ -644,6 +677,7 @@ const Partial = struct {
     b: mlx.mlx_array = .{ .ctx = null },
     alpha: ?f32 = null,
     flat: bool = false,
+    mlx_lm: ?bool = null,
 };
 
 fn metaGet(meta: mlx.mlx_map_string_to_string, key: [*:0]const u8) ?[]const u8 {
@@ -767,6 +801,41 @@ pub fn validatePath(path: []const u8) !void {
 }
 
 pub fn loadFile(allocator: std.mem.Allocator, path: []const u8, arch: Arch) !File {
+    return loadFileScaled(allocator, path, arch, null);
+}
+
+pub fn loadLlmFile(allocator: std.mem.Allocator, path: []const u8, scale: f32) !File {
+    if (!std.math.isFinite(scale)) return error.InvalidLlmAdapter;
+    return loadFileScaled(allocator, path, .llm, scale);
+}
+
+pub const LlmAdapter = struct {
+    file: File,
+    bindings: []@import("../../abi/plugin.zig").LoraBinding,
+    bytes: u64,
+
+    pub fn load(a: std.mem.Allocator, path: []const u8, scale: f32, rank: u32) !LlmAdapter {
+        var file = try loadLlmFile(a, path, scale);
+        errdefer file.deinit();
+        const bindings = try a.alloc(@import("../../abi/plugin.zig").LoraBinding, file.entries.len);
+        errdefer a.free(bindings);
+        var bytes: u64 = 0;
+        for (file.entries, bindings) |entry, *binding| {
+            const target = parseLlmTarget(entry.module) orelse return error.InvalidLlmAdapter;
+            if (mlx.getShape(entry.at)[1] != rank) return error.InvalidLlmAdapter;
+            binding.* = .{ .layer = target.layer, .projection = target.projection, .a = .{ .ctx = entry.at.ctx }, .b = .{ .ctx = entry.bt.ctx }, .scale = entry.scale };
+            bytes += mlx.mlx_array_size(entry.at) * mlx.mlx_array_itemsize(entry.at) + mlx.mlx_array_size(entry.bt) * mlx.mlx_array_itemsize(entry.bt);
+        }
+        return .{ .file = file, .bindings = bindings, .bytes = bytes };
+    }
+
+    pub fn deinit(adapter: *LlmAdapter) void {
+        adapter.file.allocator.free(adapter.bindings);
+        adapter.file.deinit();
+    }
+};
+
+fn loadFileScaled(allocator: std.mem.Allocator, path: []const u8, arch: Arch, config_scale: ?f32) !File {
     try validatePath(path);
     const pathz = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(pathz);
@@ -786,8 +855,8 @@ pub fn loadFile(allocator: std.mem.Allocator, path: []const u8, arch: Arch) !Fil
     const file_scale = fileAlphaScale(allocator, meta_map);
     log.info("[lora] {s}: scale {d:.4}{s}\n", .{
         std.fs.path.basename(path),
-        file_scale orelse 1.0,
-        if (file_scale == null) " (file declares no alpha)" else " from the file's own alpha",
+        config_scale orelse file_scale orelse 1.0,
+        if (config_scale != null) " from adapter_config.json" else if (file_scale == null) " (file declares no alpha)" else " from the file's own alpha",
     });
 
     var partials = std.StringHashMap(Partial).init(allocator);
@@ -813,25 +882,44 @@ pub fn loadFile(allocator: std.mem.Allocator, path: []const u8, arch: Arch) !Fil
         }
         const info = parseKey(std.mem.span(key.?)) orelse {
             _ = mlx.mlx_array_free(value);
+            if (arch == .llm) return error.InvalidLlmAdapter;
             continue;
         };
-        const gop = try partials.getOrPut(info.module);
+        if (info.mlx_lm and arch != .llm) {
+            _ = mlx.mlx_array_free(value);
+            return error.InvalidLlmAdapter;
+        }
+        defer if (value.ctx != null) {
+            _ = mlx.mlx_array_free(value);
+        };
+        if (arch == .llm and (info.flat or info.role == .alpha or parseLlmTarget(info.module) == null)) return error.InvalidLlmAdapter;
+        try partials.ensureUnusedCapacity(1);
+        const owned_key = try allocator.dupe(u8, info.module);
+        const gop = partials.getOrPutAssumeCapacity(owned_key);
         if (!gop.found_existing) {
-            gop.key_ptr.* = try allocator.dupe(u8, info.module);
             gop.value_ptr.* = .{ .flat = info.flat };
+        } else allocator.free(owned_key);
+        if (info.role != .alpha) {
+            if (gop.value_ptr.mlx_lm) |native| {
+                if (native != info.mlx_lm) return error.InvalidLlmAdapter;
+            }
+            gop.value_ptr.mlx_lm = info.mlx_lm;
         }
         switch (info.role) {
             .a => {
+                if (arch == .llm and gop.value_ptr.a.ctx != null) return error.InvalidLlmAdapter;
                 if (gop.value_ptr.a.ctx != null) _ = mlx.mlx_array_free(gop.value_ptr.a);
                 gop.value_ptr.a = value;
+                value = .{};
             },
             .b => {
+                if (arch == .llm and gop.value_ptr.b.ctx != null) return error.InvalidLlmAdapter;
                 if (gop.value_ptr.b.ctx != null) _ = mlx.mlx_array_free(gop.value_ptr.b);
                 gop.value_ptr.b = value;
+                value = .{};
             },
             .alpha => {
                 gop.value_ptr.alpha = scalarValue(value, s);
-                _ = mlx.mlx_array_free(value);
             },
         }
     }
@@ -848,8 +936,20 @@ pub fn loadFile(allocator: std.mem.Allocator, path: []const u8, arch: Arch) !Fil
     var it = partials.iterator();
     while (it.next()) |e| {
         const p = e.value_ptr;
-        if (p.a.ctx == null or p.b.ctx == null) continue; // incomplete pair
-        const full_rank: c_int = mlx.getShape(p.a)[0]; // A [r,in]
+        if (p.a.ctx == null or p.b.ctx == null) {
+            if (arch == .llm) return error.InvalidLlmAdapter;
+            continue;
+        }
+        const native = p.mlx_lm orelse false;
+        const ash = mlx.getShape(p.a);
+        const bsh = mlx.getShape(p.b);
+        if (arch == .llm) {
+            if (ash.len != 2 or bsh.len != 2 or ash[0] <= 0 or ash[1] <= 0 or bsh[0] <= 0 or bsh[1] <= 0) return error.InvalidLlmAdapter;
+            if (ash[@intFromBool(native)] != bsh[@intFromBool(!native)]) return error.InvalidLlmAdapter;
+            try validateLlmMatrix(p.a, s);
+            try validateLlmMatrix(p.b, s);
+        }
+        const full_rank: c_int = ash[@intFromBool(native)];
         // The down-projection (A) is ALWAYS shared across every target of a
         // fused source tensor: a LoRA trained over a fused QKV linear has
         // ONE A applied identically to q/k/v, with only B's *output* rows
@@ -873,9 +973,9 @@ pub fn loadFile(allocator: std.mem.Allocator, path: []const u8, arch: Arch) !Fil
         const matches = canonicalize(e.key_ptr.*, p.flat, arch, &canon_bufs, &canon_out);
         for (matches) |m| {
             const piece = splitPiece(m.split);
-            const at = try prepTransposed(p.a, s);
+            const at = if (arch == .llm) try prepLlmMatrix(p.a, !native, s) else try prepTransposed(p.a, s);
             errdefer _ = mlx.mlx_array_free(at);
-            const bt = if (piece) |pc| try prepTransposedPiece(p.b, pc, s) else try prepTransposed(p.b, s);
+            const bt = if (arch == .llm) try prepLlmMatrix(p.b, !native, s) else if (piece) |pc| try prepTransposedPiece(p.b, pc, s) else try prepTransposed(p.b, s);
             errdefer _ = mlx.mlx_array_free(bt);
             // A per-module `.alpha` tensor is MORE SPECIFIC than a file-wide
             // declaration, so it wins; the file's own metadata is the default
@@ -884,16 +984,56 @@ pub fn loadFile(allocator: std.mem.Allocator, path: []const u8, arch: Arch) !Fil
             const scale: f32 = if (p.alpha) |al|
                 al / @as(f32, @floatFromInt(full_rank))
             else
-                file_scale orelse 1.0;
+                config_scale orelse file_scale orelse 1.0;
+            if (arch == .llm and !std.math.isFinite(scale)) return error.InvalidLlmAdapter;
+            const module = try allocator.dupe(u8, m.canon);
+            errdefer allocator.free(module);
             try entries.append(allocator, .{
-                .module = try allocator.dupe(u8, m.canon),
+                .module = module,
                 .at = at,
                 .bt = bt,
-                .scale = scale,
+                .scale = if (arch == .llm and try zeroLlmMatrix(bt, s)) 0 else scale,
             });
         }
     }
+    if (arch == .llm and entries.items.len == 0) return error.InvalidLlmAdapter;
     return .{ .allocator = allocator, .entries = try entries.toOwnedSlice(allocator) };
+}
+
+fn zeroLlmMatrix(w: mlx.mlx_array, s: mlx.mlx_stream) !bool {
+    const ops = @import("../../mlx/ops.zig");
+    var g = ops.Graph.init(std.heap.page_allocator, s);
+    defer g.deinit();
+    const zero = try g.call(mlx.mlx_all, .{ try g.call(mlx.mlx_equal, .{ w, try g.scalar(0, mlx.mlx_array_dtype(w)) }), false });
+    try ops.eval(zero);
+    var result = false;
+    try mlx.check(mlx.mlx_array_item_bool(&result, zero));
+    return result;
+}
+
+fn validateLlmMatrix(w: mlx.mlx_array, s: mlx.mlx_stream) !void {
+    switch (mlx.mlx_array_dtype(w)) {
+        .float16, .bfloat16, .float32 => {},
+        else => return error.InvalidLlmAdapter,
+    }
+    const ops = @import("../../mlx/ops.zig");
+    var g = ops.Graph.init(std.heap.page_allocator, s);
+    defer g.deinit();
+    const finite = try g.call(mlx.mlx_all, .{ try g.call(mlx.mlx_isfinite, .{w}), false });
+    try ops.eval(finite);
+    var ok: bool = false;
+    try mlx.check(mlx.mlx_array_item_bool(&ok, finite));
+    if (!ok) return error.InvalidLlmAdapter;
+}
+
+fn prepLlmMatrix(w: mlx.mlx_array, transpose: bool, s: mlx.mlx_stream) !mlx.mlx_array {
+    const ops = @import("../../mlx/ops.zig");
+    var g = ops.Graph.init(std.heap.page_allocator, s);
+    defer g.deinit();
+    const x = if (transpose) try g.transpose(w, &.{ 1, 0 }) else w;
+    const out = try g.call(mlx.mlx_contiguous, .{ x, false });
+    try ops.eval(out);
+    return g.escape(out);
 }
 
 const SplitPiece = struct { idx: u2, parts: u2 };
@@ -958,6 +1098,103 @@ fn prepTransposed(w: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
 // ════════════════════════════════════════════════════════════════════════
 
 const testing = std.testing;
+
+test "LLM LoRA: mlx-lm keys preserve the model layer and projection" {
+    const a = parseKey("model.layers.12.self_attn.q_proj.lora_a");
+    const b = parseKey("model.layers.12.self_attn.q_proj.lora_b");
+    try testing.expect(a != null and b != null);
+    try testing.expectEqualStrings("model.layers.12.self_attn.q_proj", a.?.module);
+    try testing.expectEqualStrings(a.?.module, b.?.module);
+    try testing.expectEqual(Role.a, a.?.role);
+    try testing.expectEqual(Role.b, b.?.role);
+    try testing.expect(a.?.mlx_lm and b.?.mlx_lm);
+    try testing.expect(!parseKey("base_model.model.model.layers.12.self_attn.q_proj.lora_A.weight").?.mlx_lm);
+}
+
+test "LLM LoRA: mlx-lm and PEFT matrices load with the same orientation and direct scale" {
+    const ops = @import("../../mlx/ops.zig");
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = ops.Graph.init(testing.allocator, s);
+    defer g.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(testing.io, &buf)];
+    const path = try std.fs.path.join(testing.allocator, &.{ dir, "adapters.safetensors" });
+    defer testing.allocator.free(path);
+    const pathz = try testing.allocator.dupeSentinel(u8, path, 0);
+    defer testing.allocator.free(pathz);
+    const a = try g.fromSlice(f32, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, &.{ 4, 2 });
+    const b = try g.fromSlice(f32, &.{ 0.5, 0.25, -0.5, 0.125, -0.25, 0.5 }, &.{ 2, 3 });
+    const x = try g.fromSlice(f32, &.{ 1, 2, 3, 4 }, &.{ 1, 4 });
+    const base = try g.ones(&.{ 1, 3 }, .float32);
+    const expected = try g.add(base, try g.mulScalar(try g.matmul(try g.matmul(x, a), b), 1.75));
+    for (0..4) |case| {
+        const native = case % 2 == 0;
+        const zero = case >= 2;
+        const saved_b = if (zero) try g.zeros(&.{ 2, 3 }, .float32) else b;
+        const tensors = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(tensors);
+        const metadata = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(metadata);
+        try mlx.check(mlx.mlx_map_string_to_array_insert(tensors, if (native) "model.layers.2.self_attn.q_proj.lora_a" else "base_model.model.model.layers.2.self_attn.q_proj.lora_A.weight", if (native) a else try g.transpose(a, &.{ 1, 0 })));
+        try mlx.check(mlx.mlx_map_string_to_array_insert(tensors, if (native) "model.layers.2.self_attn.q_proj.lora_b" else "base_model.model.model.layers.2.self_attn.q_proj.lora_B.weight", if (native) saved_b else try g.transpose(saved_b, &.{ 1, 0 })));
+        try mlx.check(mlx.mlx_save_safetensors(pathz, tensors, metadata));
+        var file = try loadLlmFile(testing.allocator, path, 1.75);
+        defer file.deinit();
+        try testing.expectEqual(@as(usize, 1), file.entries.len);
+        const entry = file.find("model.layers.2.self_attn.q_proj").?;
+        try testing.expectEqual(@as(f32, if (zero) 0 else 1.75), entry.scale);
+        try ops.expectBitEqual(a, entry.at);
+        try ops.expectBitEqual(saved_b, entry.bt);
+        const actual = try g.adopt(try addTo(base, x, &.{.{ .at = entry.at, .bt = entry.bt, .scale = entry.scale }}, s));
+        try ops.expectBitEqual(if (zero) base else expected, actual);
+        var runtime = try LlmAdapter.load(testing.allocator, path, 1.75, 2);
+        defer runtime.deinit();
+        try testing.expectEqual(@as(usize, 1), runtime.bindings.len);
+        try testing.expectEqual(@as(u32, 2), runtime.bindings[0].layer);
+        try testing.expectEqual(.q, runtime.bindings[0].projection);
+        try testing.expectEqual(entry.scale, runtime.bindings[0].scale);
+        try testing.expectEqual(@as(u64, 56), runtime.bytes);
+    }
+}
+
+test "LLM LoRA: targets accept only dense decoder attention and MLP projections" {
+    const q = parseLlmTarget("model.layers.12.self_attn.q_proj").?;
+    try std.testing.expectEqual(@as(u32, 12), q.layer);
+    try std.testing.expectEqual(.q, q.projection);
+    try std.testing.expectEqual(.down, parseLlmTarget("model.layers.0.mlp.down_proj").?.projection);
+    for ([_][]const u8{ "model.layers.-1.self_attn.q_proj", "model.layers.01.self_attn.q_proj", "model.layers.4294967296.self_attn.q_proj", "model.layers.0.self_attn.q_proj.extra", "model.layers.0.mlp.experts.0.gate_proj", "lm_head", "model.embed_tokens" }) |name| try std.testing.expect(parseLlmTarget(name) == null);
+}
+
+test "LLM LoRA: malformed or unrecognized adapter tensors are refused" {
+    const ops = @import("../../mlx/ops.zig");
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = ops.Graph.init(testing.allocator, s);
+    defer g.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(testing.io, &buf)];
+    const path = try std.fs.path.join(testing.allocator, &.{ dir, "adapters.safetensors" });
+    defer testing.allocator.free(path);
+    const pathz = try testing.allocator.dupeSentinel(u8, path, 0);
+    defer testing.allocator.free(pathz);
+    const a = try g.ones(&.{ 4, 2 }, .float32);
+    const b = try g.ones(&.{ 2, 3 }, .float32);
+    for (0..7) |case| {
+        const tensors = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(tensors);
+        const metadata = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(metadata);
+        if (case != 5) try mlx.check(mlx.mlx_map_string_to_array_insert(tensors, if (case == 2) "model.layers.0.self_attn.q_proj.weight" else if (case == 6) "model.embed_tokens.lora_a" else "model.layers.0.self_attn.q_proj.lora_a", a));
+        if (case != 0 and case != 5) try mlx.check(mlx.mlx_map_string_to_array_insert(tensors, if (case == 6) "model.embed_tokens.lora_b" else "model.layers.0.self_attn.q_proj.lora_b", if (case == 1) try g.ones(&.{ 3, 3 }, .float32) else if (case == 3) try g.ones(&.{3}, .float32) else if (case == 4) try g.mulScalar(b, std.math.nan(f32)) else b));
+        try mlx.check(mlx.mlx_save_safetensors(pathz, tensors, metadata));
+        try testing.expectError(error.InvalidLlmAdapter, loadLlmFile(testing.allocator, path, 1));
+    }
+}
 
 test "parseKey classifies diffusers + kohya LoRA keys and strips wrappers" {
     // diffusers A/B with transformer. prefix
@@ -1176,7 +1413,6 @@ test "addTo rounds y once for a stack: two adapters at 1.0 equal one at 2.0" {
         for (gp[0..64]) |v| try testing.expectEqual(@as(f32, 258), v);
     }
 }
-
 
 fn testBf16Matrix(al: std.mem.Allocator, rows: usize, cols: usize, seed: f32, sm: mlx.mlx_stream) !mlx.mlx_array {
     const host = try al.alloc(f32, rows * cols);
@@ -1542,13 +1778,13 @@ test "loadFile: the file's declared alpha wins, wherever the exporter put it" {
         .{ .name = "peft-nested", .want = 0.125, .meta = &.{
             .{ .key = "format", .value = "pt" },
             .{ .key = "lora_adapter_metadata", .value =
-                \\{
-                \\  "transformer.alpha_pattern": {},
-                \\  "transformer.lora_alpha": 4,
-                \\  "transformer.r": 32,
-                \\  "transformer.rank_pattern": {},
-                \\  "transformer.revision": null
-                \\}
+            \\{
+            \\  "transformer.alpha_pattern": {},
+            \\  "transformer.lora_alpha": 4,
+            \\  "transformer.r": 32,
+            \\  "transformer.rank_pattern": {},
+            \\  "transformer.revision": null
+            \\}
             },
         } },
         // gokaygokay Krea-2 Realism: flat pairs straight in __metadata__.

@@ -181,6 +181,7 @@ pub fn handleStreamingGeneration(
     /// usage SSE chunk so streaming clients see the same metric as
     /// non-streaming.
     tokenize_ns: u64,
+    lora: ?@import("lora.zig").Prepared,
 ) !void {
     // Vision array ownership: held by this handler on entry, transfers to
     // the slot on submit (slot.deinit frees). Nulled before transfer so
@@ -226,6 +227,7 @@ pub fn handleStreamingGeneration(
     ve_local = null;
     const sch = http_server.launch().global_scheduler.?;
     running = try mlx_engine.Running.submit(sch, .{
+        .lora = lora,
         .model = lm,
         .prompt_ids = prompt_ids,
         .full_prompt = prompt_ids,

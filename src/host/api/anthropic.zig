@@ -235,6 +235,11 @@ pub fn handleAnthropicMessages(
         return;
     }
     const root = parsed.value.object;
+    var lora = @import("lora.zig").prepare(allocator, stream.io, root, lm) catch |err| {
+        try sendGenerationError(allocator, stream, err, .anthropic);
+        return;
+    };
+    defer if (lora) |*p| p.deinit(allocator);
 
     // max_tokens is required in the Anthropic API, but through the one parse helper so a negative
     // value is an omission and the `--max-tokens` launch default reaches this surface too.
@@ -828,12 +833,12 @@ pub fn handleAnthropicMessages(
     const sub_mrope = mm.mrope;
     mm.mrope = .{}; // ownership transferred to the sub-handler → slot
     if (is_stream) {
-        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, mm.media, sub_mrope, cache_key, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, mm.media, sub_mrope, cache_key, kv_quant_override, kv_attn_explicit, tokenize_ns, lora) catch |err| {
             logStreamError(err);
             sendGenerationError(allocator, stream, err, .anthropic) catch {};
         };
     } else {
-        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, mm.media, sub_mrope, cache_key, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, mm.media, sub_mrope, cache_key, kv_quant_override, kv_attn_explicit, tokenize_ns, lora) catch |err| {
             log.err("  -> {s}\n", .{@errorName(err)});
             sendGenerationError(allocator, stream, err, .anthropic) catch {};
         };
@@ -876,6 +881,7 @@ fn handleAnthropicNonStreaming(
     /// by the parent handleAnthropicMessages. Threaded through so the
     /// non-streaming response carries `timings.tokenize_ms`.
     tokenize_ns: u64,
+    lora: ?@import("lora.zig").Prepared,
 ) !void {
     // Vision-array ownership: nulled below before scheduler.submit so the
     // early-return defer doesn't double-free.
@@ -905,7 +911,7 @@ fn handleAnthropicNonStreaming(
     // wired for /v1/chat/completions; see computeQwenMrope). Qwen image requests
     // still decode correctly — M-RoPE refines spatial grounding only.
     // Propagates to `handleAnthropicMessages`' one error arm, shared with the streaming twin.
-    const result = try nonStreamingViaScheduler(allocator, http_server.launch().global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media, cache_key, mrope, 0, false, kv_quant_override, kv_attn_explicit, null, stream);
+    const result = try nonStreamingViaScheduler(allocator, http_server.launch().global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media, cache_key, mrope, 0, false, kv_quant_override, kv_attn_explicit, null, stream, lora);
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
 

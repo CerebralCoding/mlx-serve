@@ -388,6 +388,17 @@ pub const LoadCtx = extern struct {
 pub const Mode = enum(u8) { prefill, decode, verify, batched_rows };
 pub const Logits = enum(u8) { last_row, all_rows, none };
 
+pub const LoraProjection = enum(u32) { q, k, v, o, gate, up, down };
+
+/// Borrowed matrices in mlx-lm's [in, rank], [rank, out] orientation, scoped to one forward.
+pub const LoraBinding = extern struct {
+    layer: u32,
+    projection: LoraProjection,
+    a: Array,
+    b: Array,
+    scale: f32,
+};
+
 /// One forward. `tokens` holds `rows` tokens per slot, slot after slot; `slots`, `positions` and `caches` hold one
 /// entry per slot (its id, its first position, its KV cache).
 pub const Forward = extern struct {
@@ -448,6 +459,7 @@ pub const Forward = extern struct {
     /// Input rows `[slots, rows, hidden]` in place of the ids' embedding (a spoken frame's `SpeechHooks.frame_rows`);
     /// empty = embed the ids.
     embeds: Array = .{},
+    lora: Span(LoraBinding) = .{},
 };
 
 /// The engine's calls a forward makes at a layer's projections: each returns true with new references in its outputs

@@ -4,6 +4,9 @@ Scheduler, admission, caches, spec decode, kernels. Stories: `docs/gotchas/engin
 
 ## Loading, memory, caches, errors
 
+- Runtime LLM LoRA belongs to the request: carry bindings through every forward, key RAM/SSD prefixes by revision + strength, and serialize mixed-adapter groups (`lora_mixed`).
+- Reserve cleanup queue capacity before admitting a slot; completion must never allocate or free MLX arrays on a connection thread.
+
 Loading + residency:
 - **A missing tensor is a load ERROR, never `unreachable`** (#217, `error.MissingWeight` → named 503); load failures cross the inference thread by NAME (`req.error_name` → `loadErrorFromName`, #144).
 - **The load preflight's "available" is capped by Metal's working-set limit** (`effectiveAvailableBytes(…, mlx.maxRecommendedWorkingSet())`): a lowered `iogpu.wired_limit_mb` binds below free RAM and weights past it OOM in warmup, leaving a server that refuses every request.

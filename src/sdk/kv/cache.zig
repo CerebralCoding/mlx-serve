@@ -99,6 +99,7 @@ pub fn freeKVEntry(e: *KVCacheEntry) void {
 }
 
 pub const KVCache = struct {
+    adapter_key: [32]u8 = @splat(0),
     entries: []KVCacheEntry,
     step: usize, // absolute sequence position (not affected by sliding window trimming)
     allocator: std.mem.Allocator,
@@ -136,7 +137,8 @@ pub const KVCache = struct {
     /// re-init behind a deinit"; keeping the order inside ONE helper is what
     /// stops it recurring, so the call sites are scan-pinned to use it.
     pub fn reinit(self: *KVCache, num_layers: u32, config: KVQuantConfig) !void {
-        const fresh = try initWithConfig(self.allocator, num_layers, config);
+        var fresh = try initWithConfig(self.allocator, num_layers, config);
+        fresh.adapter_key = self.adapter_key;
         self.deinit();
         self.* = fresh;
     }
@@ -186,13 +188,14 @@ pub const KVCache = struct {
                 }
             }
         }
-        return .{ .entries = out, .step = self.step, .allocator = self.allocator, .config = self.config };
+        return .{ .entries = out, .step = self.step, .allocator = self.allocator, .config = self.config, .adapter_key = self.adapter_key };
     }
 
     /// Replace cache state with `snap`. Frees current entries' arrays first;
     /// re-binds via refcount-share from snapshot. After restore, the next
     /// `update()` will recreate `*_view` fields from the restored buffers.
     pub fn restore(self: *KVCache, snap: *const KVCacheSnapshot) !void {
+        if (!std.mem.eql(u8, &self.adapter_key, &snap.adapter_key)) return error.LoraCacheMismatch;
         std.debug.assert(self.entries.len == snap.entries.len);
         for (self.entries, snap.entries) |*dst, src| {
             freeKVEntry(dst);
@@ -979,6 +982,7 @@ pub const KVCache = struct {
 /// share buffers with the source via refcount) and frees them in `deinit`.
 /// Created by `KVCache.snapshot()` and consumed by `KVCache.restore()`.
 pub const KVCacheSnapshot = struct {
+    adapter_key: [32]u8 = @splat(0),
     entries: []KVCacheEntry,
     step: usize,
     allocator: std.mem.Allocator,
@@ -1067,7 +1071,7 @@ pub const KVCacheSnapshot = struct {
             }
             if (count > 0) _ = mlx.mlx_eval(vec);
         }
-        return .{ .entries = out, .step = @min(self.step, len), .allocator = self.allocator, .config = self.config };
+        return .{ .entries = out, .step = @min(self.step, len), .allocator = self.allocator, .config = self.config, .adapter_key = self.adapter_key };
     }
 };
 

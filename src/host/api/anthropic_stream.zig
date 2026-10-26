@@ -84,6 +84,7 @@ pub fn handleAnthropicStreaming(
     /// but plumbing the value through keeps the signature consistent with
     /// non-streaming and unblocks a future message_delta extension.
     tokenize_ns: u64,
+    lora: ?@import("lora.zig").Prepared,
 ) !void {
     _ = tokenize_ns; // reserved; see doc comment
     // Vision-array ownership: held by this handler on entry, transfers to
@@ -110,6 +111,7 @@ pub fn handleAnthropicStreaming(
     ve_local = null;
     const sch = http_server.launch().global_scheduler.?;
     running = try mlx_engine.Running.submit(sch, .{
+        .lora = lora,
         .model = lm,
         .prompt_ids = prompt_ids,
         .full_prompt = prompt_ids,

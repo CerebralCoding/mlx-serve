@@ -507,6 +507,10 @@ pub fn submit(self: *Scheduler, params: SubmitParams) !*Slot {
     // different architectures (e.g. pure-attention + hybrid SSM)
     // share one scheduler.
     const slot_config: *const ModelConfig = params.model.config orelse return error.ModelNotReady;
+    if (params.lora != null and (params.model.engineBacked() or slot_config.plugin == null or slot_config.isMoe() or
+        (!std.mem.eql(u8, slot_config.model_type, "llama") and !std.mem.eql(u8, slot_config.model_type, "qwen3")))) return error.LoraUnsupportedArchitecture;
+    if (params.lora != null and slot_config.plugin.?.outside) return error.LoraUnsupportedArchitecture;
+    if (params.lora != null and (slot_config.quant_mode != .affine or slot_config.hadamard_block != 0)) return error.LoraUnsupportedQuantization;
     if (params.model.engine) |e| if (engine_requests.missingCap(e, params)) |cap| {
         refusal.refused().* = .{ .kind = e.kind, .cap = cap };
         return error.EngineUnsupported;
@@ -536,6 +540,12 @@ pub fn submit(self: *Scheduler, params: SubmitParams) !*Slot {
         params.model.session_claims += 1;
         slot.holds_session = true;
     }
+
+    // Every admitted slot reserves its eventual cleanup before it can own MLX arrays.
+    self.cleanup_queue.ensureUnusedCapacity(self.allocator, self.in_flight + 1) catch |err| {
+        if (slot.holds_session) releaseSessionLocked(self, slot);
+        return err;
+    };
 
     if (params.model.engine) |e| {
         // The engine holds `in_pass` until its `finished` event; `complete` waits that out.
@@ -626,14 +636,7 @@ pub fn complete(self: *Scheduler, slot: *Slot) void {
         self.queue_mu.lockUncancelable(self.io);
     }
 
-    self.cleanup_queue.append(self.allocator, slot) catch {
-        // OOM on the cleanup list — fall back to inline deinit. This
-        // races on mlx but is strictly better than the leak; the slot
-        // is no longer referenced from pending/decoding above.
-        self.queue_mu.unlock(self.io);
-        slot.deinit();
-        self.queue_mu.lockUncancelable(self.io);
-    };
+    self.cleanup_queue.appendAssumeCapacity(slot);
     if (self.in_flight > 0) self.in_flight -= 1;
     self.queue_cond.broadcast(self.io); // wake inference thread to drain
     self.submit_cond.broadcast(self.io); // wake any blocked submitter
@@ -1219,6 +1222,41 @@ pub var gen_yield_enabled = true;
 pub var prefill_decode_share: f32 = 0;
 
 const testing = std.testing;
+
+test "LLM LoRA: completing a submitted request never allocates or frees on the connection thread" {
+    const a = std.testing.allocator;
+    var cfg: ModelConfig = .{ .num_hidden_layers = 0 };
+    var lm: @import("../../host/registry/registry.zig").LoadedModel = undefined;
+    lm.config = &cfg;
+    lm.engine = null;
+    lm.transformer = null;
+    var sch: Scheduler = undefined;
+    sch.allocator = a;
+    sch.io = std.testing.io;
+    sch.kv_quant_config = .dense;
+    sch.queue_mu = .init;
+    sch.queue_cond = .init;
+    sch.submit_cond = .init;
+    sch.pending = .empty;
+    sch.decoding = .empty;
+    sch.offloaded = .empty;
+    sch.cleanup_queue = .empty;
+    sch.in_flight = 0;
+    sch.queue_cap = 4;
+    sch.shutdown = .init(false);
+    defer sch.pending.deinit(a);
+    defer sch.decoding.deinit(a);
+    defer sch.offloaded.deinit(a);
+    defer sch.cleanup_queue.deinit(a);
+    defer for (sch.cleanup_queue.items) |slot| slot.deinit();
+    const slot = try submit(&sch, .{ .model = &lm, .prompt_ids = &.{1}, .sampling = .{}, .eos_token_ids = &.{2}, .max_tokens = 1 });
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    sch.allocator = failing.allocator();
+    complete(&sch, slot);
+    try std.testing.expectEqual(@as(usize, 1), sch.cleanup_queue.items.len);
+    try std.testing.expect(sch.cleanup_queue.items[0] == slot);
+    try std.testing.expect(!failing.has_induced_failure);
+}
 
 test "a live MTP slot never ticks regular, an unarmed one always does" {
     try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, false, false, true, true, false));

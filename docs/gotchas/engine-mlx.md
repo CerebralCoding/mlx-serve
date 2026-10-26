@@ -35,6 +35,13 @@ shortlist == full-row route byte for byte over many settings.
 
 ## KV cache and prefix reuse
 
+### Allocation failure during request cleanup
+
+An allocation failure while queueing a completed slot fell back to freeing it on the connection thread,
+including MLX arrays. Reserving cleanup capacity before admission lets completion enqueue without allocating;
+the inference thread frees the slot. The scheduler's allocation-failure regression checks that completion
+leaves the submitted slot queued even when every further allocation fails.
+
 ### Hot-cache restore must clamp the offset to the matched length
 Defect: gemma-4-26B at ~16K crashed with `[broadcast_shapes] (1,1,Q,16890) and (1,H,Q,16892)`. Cause: PLD left stale
 draft rows past the committed step, the commit snapshotted the inflated buffer, and a partial hit skipped the

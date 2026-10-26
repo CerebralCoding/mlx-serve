@@ -88,6 +88,7 @@ pub const Ctx = struct {
     offload: ?*const abi.Offload = null,
     /// A verify whose rows form a draft tree (`Forward.tree`); null = a chain.
     tree: ?Tree = null,
+    lora: []const abi.LoraBinding = &.{},
 
     pub fn stream(c: *const Ctx) ops.Stream {
         return c.g.s;
@@ -124,6 +125,7 @@ pub const Ctx = struct {
     }
     /// This layer's dense MLP of `x` as the engine's offload computed it, owned by `g`; null = the block computes it.
     pub fn offloadMlp(c: *const Ctx, x: Array) !?Array {
+        for (c.lora) |binding| if (binding.layer == c.layer and binding.scale != 0) return null;
         const o = c.offload orelse return null;
         var y: abi.Array = .{};
         if (!o.mlp(o.ctx, c.layer, .{ .ctx = x.ctx }, &y)) return null;
@@ -139,7 +141,7 @@ pub const Ctx = struct {
     }
     /// `x` as `dt`, cast once per forward.
     pub fn castOnce(c: *const Ctx, x: Array, dt: ops.Dtype) !Array {
-        const key: Memo.Key = .{ .what = .cast, .n = .{ @intCast(@intFromPtr(x.ctx)), @intFromEnum(dt), 0, 0, 0, 0, 0 } };
+        const key: Memo.Key = .{ .what = .cast, .n = .{ @intCast(@intFromPtr(x.ctx)), @backingInt(dt), 0, 0, 0, 0, 0 } };
         if (c.recall(key)) |m| return m;
         return c.remember(key, try c.g.astype(x, dt));
     }

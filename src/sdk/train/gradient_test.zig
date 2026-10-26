@@ -5,6 +5,7 @@ const mlx = @import("../../mlx/ffi.zig");
 const ops = @import("../../mlx/ops.zig");
 const Array = ops.Array;
 const Graph = ops.Graph;
+const abi = @import("../../abi/plugin.zig");
 const testing = std.testing;
 const bases = @import("../bases/bases.zig");
 const blocks = bases.blocks;
@@ -161,6 +162,7 @@ const LayerLoss = struct {
     dtype: ops.Dtype,
     failure: ?anyerror = null,
     checkpointed_forward: mlx.mlx_closure = .{},
+    runtime_bindings: []const abi.LoraBinding = &.{},
 
     fn init(g: *Graph, hidden: c_int, heads: c_int, kv_heads: c_int, hd: c_int, inter: c_int, rows: c_int, rank: c_int, dt: ops.Dtype) !LayerLoss {
         const q = heads * hd;
@@ -176,6 +178,7 @@ const LayerLoss = struct {
         p.dtype = dt;
         p.failure = null;
         p.checkpointed_forward = .{};
+        p.runtime_bindings = &.{};
         for (shapes, 0..) |sh, k| {
             const seed: f32 = @floatFromInt(k + 1);
             p.linears[k] = try quantized(g, sh[0], sh[1], seed, dt);
@@ -194,7 +197,7 @@ const LayerLoss = struct {
     fn logits(p: *LayerLoss, g: *Graph, params: []const Array) !Array {
         var l = p.linears;
         if (params.len != 0) for (&l, 0..) |*w, k| {
-            w.lora = .{ .a = params[2 * k], .b = params[2 * k + 1], .scale = 2 };
+            w.lora = .{ .a = try g.astype(params[2 * k], p.dtype), .b = try g.astype(params[2 * k + 1], p.dtype), .scale = 2 };
         };
         const layers = [_]Decoder.Layer{.{
             .input_norm = p.norm,
@@ -218,7 +221,7 @@ const LayerLoss = struct {
         };
         var shared = bases.Shared.init(1e-6, 1e-6);
         defer shared.deinit();
-        const out = try Decoder.forward(&w, &shared, g, p.ids, .{ .mode = .prefill, .rows = p.rows, .positions = &.{0}, .logits = .all_rows });
+        const out = try Decoder.forward(&w, &shared, g, p.ids, .{ .mode = .prefill, .rows = p.rows, .positions = &.{0}, .logits = .all_rows, .lora = p.runtime_bindings });
         return out.logits;
     }
 
@@ -291,6 +294,43 @@ const LayerLoss = struct {
         return result;
     }
 };
+
+test "LLM LoRA: request bindings match attached weights and never change another request" {
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = Graph.init(testing.allocator, s);
+    defer g.deinit();
+    for ([_]bool{ false, true }) |qwen| for ([_]c_int{ 1, 3 }) |rows| {
+        var p = try LayerLoss.init(&g, 64, 2, 1, 32, 128, rows, 2, .float32);
+        if (!qwen) p.qk_norm = .{};
+        const base = try p.logits(&g, &.{});
+        const expected = try p.logits(&g, &p.params);
+        var bindings: [7]abi.LoraBinding = undefined;
+        for (&bindings, 0..) |*binding, i| binding.* = .{ .layer = 0, .projection = @fromBackingInt(@intCast(i)), .a = .{ .ctx = p.params[2 * i].ctx }, .b = .{ .ctx = p.params[2 * i + 1].ctx }, .scale = 2 };
+        p.runtime_bindings = &bindings;
+        const adapted = try p.logits(&g, &.{});
+        try ops.expectBitEqual(expected, adapted);
+        try testing.expect((try item(try g.call(mlx.mlx_sum, .{ try g.square(try g.sub(base, adapted)), false }))) > 1e-7);
+        for (&bindings) |*binding| binding.scale = 0;
+        try ops.expectBitEqual(base, try p.logits(&g, &.{}));
+        p.runtime_bindings = &.{};
+        try ops.expectBitEqual(base, try p.logits(&g, &.{}));
+    };
+}
+
+test "LLM LoRA: f32 adapters preserve mlx-lm arithmetic on bf16 activations" {
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = Graph.init(testing.allocator, s);
+    defer g.deinit();
+    const x = try g.astype(try values(&g, &.{ 2, 4 }, 0.3, 0.9), .bfloat16);
+    const a = try values(&g, &.{ 4, 2 }, 1.1, 0.9);
+    const b = try values(&g, &.{ 2, 3 }, 2.2, 0.9);
+    const base: Linear = .{ .w = try g.zeros(&.{ 4, 3 }, .bfloat16) };
+    const adapted = base.withLora(&.{.{ .layer = 0, .projection = .q, .a = .{ .ctx = a.ctx }, .b = .{ .ctx = b.ctx }, .scale = 1.75 }}, 0, .q);
+    const expected = try g.add(try base.forward(&g, x), try g.astype(try g.mulScalar(try g.matmul(try g.matmul(x, a), b), 1.75), .bfloat16));
+    try ops.expectBitEqual(expected, try adapted.forward(&g, x));
+}
 
 test "train gradient: Qwen3 CPU finite differences and Metal checkpoint gradients agree" {
     const s = mlx.mlx_default_cpu_stream_new();

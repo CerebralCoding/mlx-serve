@@ -429,6 +429,7 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
     const offload: ?abi.Offload = if (mode == .prefill and xfm.ane_prefill != null) xfm.aneOffload() else null;
     const f: abi.Forward = .{
         .mode = mode,
+        .lora = .of(ctx.lora),
         .row_exact = xfm.config.dflash_bound,
         .logits = if (!head) .none else if (module and !capture and !ctx.spec_verify) .last_row else .all_rows,
         .want_hidden = !head or ctx.capture_hidden != null or ctx.capture_hidden_all != null,
@@ -739,11 +740,17 @@ pub fn auxFree(xfm: *const Transformer, snap: abi.Handle) void {
     b.hooks.free(b.model, snap);
 }
 
+fn sameAdapter(ctxs: []const *ForwardCtx) !void {
+    if (ctxs.len == 0) return error.PluginForwardUnsupported;
+    for (ctxs[1..]) |ctx| if (!std.mem.eql(u8, &ctxs[0].cache.adapter_key, &ctx.cache.adapter_key)) return error.LoraMixedBatch;
+}
+
 /// `forwardBatchedDecode` / `forwardMoeBatchedDecode` for a served model: one row per slot at its own position, each
 /// slot's logits `[1, 1, vocab]` and, when `hidden_rows` is asked, its final-normed hidden `[1, 1, hidden]` (caller
 /// owns the slices and every array). The tick advances the slots' positions.
 pub fn forwardBatched(xfm: *Transformer, b: *Bound, next_tokens: []const u32, ctxs: []const *ForwardCtx, rope_offsets: []const u32, hidden_rows: ?*?[]Array) ![]Array {
     const n = next_tokens.len;
+    try sameAdapter(ctxs);
     if (n > MAX_BATCH_ROWS) return error.PluginForwardUnsupported;
     var slots: [MAX_BATCH_ROWS]cache_ops.Slot = undefined;
     var handles: [MAX_BATCH_ROWS]abi.Handle = undefined;
@@ -767,6 +774,7 @@ pub fn forwardBatched(xfm: *Transformer, b: *Bound, next_tokens: []const u32, ct
     const f: abi.Forward = .{
         .mode = .batched_rows,
         .want_hidden = hidden_rows != null,
+        .lora = .of(ctxs[0].lora),
         .row_exact = xfm.config.dflash_bound,
         .rows = 1,
         .tokens = .of(next_tokens),
@@ -807,6 +815,7 @@ pub fn forwardBatched(xfm: *Transformer, b: *Bound, next_tokens: []const u32, ct
 /// hidden at every row (`hidden_all` `[N, S, hidden]`) and at the last (`hidden_last` `[N, 1, hidden]`).
 pub fn forwardBatchedVerify(xfm: *Transformer, b: *Bound, token_arr: Array, ctxs: []const *ForwardCtx, rope_offsets: []const u32, hidden_last: *Array, hidden_all: *Array) !Array {
     const n = ctxs.len;
+    try sameAdapter(ctxs);
     const width: c_int = mlx.getShape(token_arr)[1];
     if (n > MAX_BATCH_ROWS) return error.PluginForwardUnsupported;
     var slots: [MAX_BATCH_ROWS]cache_ops.Slot = undefined;
@@ -831,6 +840,7 @@ pub fn forwardBatchedVerify(xfm: *Transformer, b: *Bound, token_arr: Array, ctxs
     const f: abi.Forward = .{
         .mode = .batched_rows,
         .logits = .all_rows,
+        .lora = .of(ctxs[0].lora),
         .want_hidden = true,
         .row_exact = xfm.config.dflash_bound,
         .rows = @intCast(width),

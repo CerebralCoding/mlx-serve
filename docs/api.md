@@ -53,6 +53,10 @@ Stateful chains via `previous_response_id`, full streaming SSE with per-event `s
 
 ## Other endpoints
 
+Text generation endpoints accept `"lora":"<name>"` and optional `"lora_scale":1` (finite, 0–2; zero preserves the base output). This includes OpenAI, Anthropic and Ollama, streaming or non-streaming. Dense `llama` and `qwen3` models on MLX with affine-quantized or floating-point weights are supported; unsupported architectures, quantization and endpoints return named 400s.
+
+Install `adapters.safetensors` and `adapter_config.json` under `~/.mlx-serve/adapters/<name>/`. mlx-lm `lora_a/lora_b` and PEFT `lora_A/B.weight` layouts are accepted. Binding requires `base_config_sha256` (SHA-256 of the base's exact `config.json` bytes), or a resolvable absolute local `model` / `base_model_name_or_path` whose config has that fingerprint. `/v1/models` lists compatible names in `adapters`; tensors are validated when requested. Adapters remain unfused, with separate prefix caches per adapter revision and strength.
+
 - `GET /` — built-in web console (MLX Serve Studio): chat, image/audio/video generation, Library, Monitoring, API reference
 - `GET /health` — health check
 - `GET /v1/models` — list loaded models with capabilities + engine info

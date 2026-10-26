@@ -7,6 +7,12 @@ const std = @import("std");
 /// `last` for the message.
 pub const Known = error{
     EmptyPrompt,
+    InvalidLlmAdapter,
+    LoraRevisionChanged,
+    LoraUnsupportedArchitecture,
+    LoraUnsupportedQuantization,
+    LoraMixedBatch,
+    LoraCacheMismatch,
     EngineBusy,
     EngineUnsupported,
     ForeignBytesReaderBusy,

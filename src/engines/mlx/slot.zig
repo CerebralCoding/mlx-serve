@@ -42,6 +42,7 @@ pub const NextResult = union(enum) {
 /// Per-request state. Owned by the Scheduler from `submit` until `complete`.
 pub const Slot = struct {
     allocator: std.mem.Allocator,
+    lora: ?@import("lora.zig").State = null,
     /// io reference for Stopwatch / async-eval (captured from Scheduler).
     io: std.Io,
 
@@ -289,9 +290,13 @@ pub const Slot = struct {
         errdefer allocator.free(media_owned);
         const eos_owned = try allocator.dupe(u32, params.eos_token_ids);
         errdefer allocator.free(eos_owned);
+        var lora: ?@import("lora.zig").State = if (params.lora) |p| try .init(allocator, p) else null;
+        errdefer if (lora) |*state| state.deinit();
+        if (params.lora) |p| cache.adapter_key = p.key;
 
         slot.* = .{
             .allocator = allocator,
+            .lora = lora,
             .io = io,
             .model = params.model,
             .cache = cache,
@@ -401,6 +406,7 @@ pub const Slot = struct {
         if (self.legacy_gen) |*gen| {
             gen.deinit(self.allocator);
         }
+        if (self.lora) |*state| state.deinit();
         // Salvaged-but-never-consumed cancelled-prefill checkpoints.
         self.cancelled_prefill.deinit();
         self.cache.deinit();
