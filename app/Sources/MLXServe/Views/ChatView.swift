@@ -2685,6 +2685,16 @@ struct ChatDetailView: View {
                                 MessageBubble(
                                     message: m,
                                     sources: sourcesFor(m),
+                                    onCustomize: m.role == .assistant && !m.isStreaming && FineTunePresentation.isRefusal(m.content)
+                                        && !appState.useAppleModel && server.lanChatModelId == nil
+                                        ? {
+                                            let messages = session?.messages ?? []
+                                            let index = messages.firstIndex(where: { $0.id == m.id }) ?? 0
+                                            let prompt = messages.prefix(index).last(where: { $0.role == .user })?.content ?? ""
+                                            appState.customizeModel(path: appState.selectedModelPath,
+                                                title: ModelDisplayName.pretty(server.chatModelInfo?.name ?? "Model"),
+                                                prompt: prompt, chatId: sessionId)
+                                        } : nil,
                                     onIncreaseContext: {
                                         let path = appState.selectedModelPath
                                         let has = ModelSettingsFile.load().override(for: path)?.hasSettings ?? false
@@ -4462,6 +4472,7 @@ enum StreamingLines {
 extension MessageBubble: Equatable {
     static func == (a: MessageBubble, b: MessageBubble) -> Bool {
         a.message == b.message && a.sources == b.sources
+            && (a.onCustomize == nil) == (b.onCustomize == nil)
             && (a.onDelete == nil) == (b.onDelete == nil)
             && (a.onEdit == nil) == (b.onEdit == nil)
             && (a.onRegenerate == nil) == (b.onRegenerate == nil)
@@ -4477,6 +4488,7 @@ struct MessageBubble: View {
     /// didn't search, which is the normal case — the chip only exists when
     /// there is provenance to show.
     var sources: [WebSource] = []
+    var onCustomize: (() -> Void)? = nil
     /// Opens Settings at the context control, for the overflow card's button.
     /// Defaults to a no-op so surfaces that only DISPLAY a transcript (the task
     /// run viewer) don't have to route an action they have no window for.
@@ -4814,6 +4826,9 @@ struct MessageBubble: View {
             if !message.content.isEmpty {
                 Button { copyMessage() } label: { Text("Copy Message")
                     .font(.app(.body)) }
+            }
+            if let onCustomize {
+                Button("Teach it to answer this", action: onCustomize).font(.app(.body))
             }
             if onEdit != nil, !message.content.isEmpty {
                 // Named for what it DOES: editing your own message re-asks the

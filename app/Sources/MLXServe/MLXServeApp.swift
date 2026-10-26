@@ -161,6 +161,7 @@ struct MLXCoreApp: App {
                 // clipped them.
                 .frame(minWidth: 1070, minHeight: 500)
                 .modifier(WelcomePresenter(appState: appState))
+                .modifier(CustomizePresenter(appState: appState))
                 .onDisappear {
                     Task { await appState.mcpManager.stopAll() }
                 }
@@ -466,6 +467,17 @@ private struct WelcomePresenter: ViewModifier {
                     .environmentObject(appState.downloads)
                     .environmentObject(appState.server)
             }
+    }
+}
+
+private struct CustomizePresenter: ViewModifier {
+    @ObservedObject var appState: AppState
+
+    func body(content: Content) -> some View {
+        content.sheet(item: $appState.customizeRequest) { request in
+            CustomizeSheet(request: request, controller: appState.fineTune)
+                .environmentObject(appState)
+        }
     }
 }
 

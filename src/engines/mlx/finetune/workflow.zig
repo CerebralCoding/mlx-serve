@@ -89,7 +89,7 @@ pub fn run(frozen: Frozen, teacher: anytype, input: types.Run, fingerprint: [32]
             // Equal numbers of focus and self-distillation micro-batches anchor general behavior.
             for (0..4) |micro| {
                 try boundary(observer);
-                const pool = if (micro % 2 == 0) train.items else retain.items;
+                const pool = if (!input.request.keep_everything_else or micro % 2 == 0) train.items else retain.items;
                 const example = pool[rng.random().uintLessThan(usize, pool.len)];
                 sum += (try trainer.microbatch(example)).loss;
             }
@@ -127,6 +127,7 @@ pub fn run(frozen: Frozen, teacher: anytype, input: types.Run, fingerprint: [32]
         input.result.metrics.refused_before += @intFromBool(try teacher.refuses(prompt, before));
         input.result.metrics.refused_after += @intFromBool(try teacher.refuses(prompt, after));
         if (i == 0) {
+            input.result.prompt = try a.dupe(u8, raw_prompt);
             input.result.before = try a.dupe(u8, before);
             input.result.after = try a.dupe(u8, after);
         }

@@ -280,6 +280,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     /// per-surface read is exactly how one of them ends up silently ignoring the
     /// active agent.
     struct TurnConfig {
+        var adapter: ChatAdapterSelection? = nil
         var agentMode: Bool
         var mcpMode: Bool
         var enableThinking: Bool
@@ -374,6 +375,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         /// retain their saved sampling behavior.
         func requestDefaults(from opts: ServerOptions, inheritGeneration: Bool = false) -> APIClient.RequestDefaults {
             var d = inheritGeneration ? APIClient.RequestDefaults() : APIClient.RequestDefaults.from(opts)
+            d.adapter = adapter
             d.inheritGeneration = inheritGeneration
             d.temperatureOverride = temperature
             d.maxTokensOverride = maxTokens
@@ -436,7 +438,14 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
 
     private var server: ServerManager { appState.server }
     private func requestModelId(_ config: TurnConfig) -> String? {
-        server.chatRequestModelId(selectedPath: config.modelPath ?? appState.selectedModelPath)
+        config.adapter?.model ?? server.chatRequestModelId(selectedPath: config.modelPath ?? appState.selectedModelPath)
+    }
+    private func withChatAdapter(_ config: TurnConfig, sessionId: UUID) -> TurnConfig {
+        var result = config
+        result.adapter = session(sessionId)?.adapter?.forModel(
+            server.chatRequestModelId(selectedPath: config.modelPath ?? appState.selectedModelPath),
+            local: !appState.useAppleModel && server.lanChatModelId == nil)
+        return result
     }
     private var mcpManager: MCPManager { appState.mcpManager }
     private func session(_ id: UUID) -> ChatSession? {
@@ -575,6 +584,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                  audio: [ChatAudio]?,
                  config: TurnConfig,
                  approval: @escaping (APIClient.ToolCall) async -> Bool) {
+        let config = withChatAdapter(config, sessionId: sessionId)
         let text = userText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty || images != nil || videos != nil || audio != nil,
               Self.canRunTurn(serverRunning: server.status == .running,
@@ -642,6 +652,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     /// do. It also never takes the agent path — a tool loop mid-reply would
     /// have to splice a call into text the user has already read.
     func continueReply(sessionId: UUID, config: TurnConfig) {
+        let config = withChatAdapter(config, sessionId: sessionId)
         guard ContinueReply.isEligible(session(sessionId)?.messages ?? [],
                                        serverRunning: server.status == .running,
                                        busy: composerState(for: sessionId) != .idle,

@@ -2317,6 +2317,9 @@ private struct LocalModelRow: View {
             if model.isChatPickable {
                 Button { settings = settingsRequest } label: { Text("Model Settings\u{2026}")
                     .font(.app(.body)) }
+                Button { appState.customizeModel(path: model.path, title: ModelDisplayName.pretty(model.displayLabel)) } label: {
+                    Text("Customize…").font(.app(.body))
+                }
             }
             Button(action: revealInFinder, label: { Text("Show in Finder")
                 .font(.app(.body)) })

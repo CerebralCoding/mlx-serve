@@ -126,6 +126,8 @@ class AppState: ObservableObject {
     @Published var loadingModelPath: String?
     /// The model the "Model Settings" window edits (tray button); nil = closed.
     @Published var modelSettingsRequest: ModelSettingsRequest?
+    @Published var customizeRequest: CustomizeRequest?
+    let fineTune = FineTuneController()
     /// Bumped per hot-switch; each switch task captures its value so only the
     /// LATEST switch's completion clears `loadingModelPath` (see the didSet).
     private var modelSwitchGeneration = 0

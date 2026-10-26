@@ -91,7 +91,7 @@ test "finetune: tiny packs complete, cancel in every stage, release state and ac
     const a = std.testing.allocator;
     const io = std.testing.io;
     mlx.installErrorHandler();
-    for ([_][]const u8{ "llama", "qwen3" }) |arch| {
+    for ([_][]const u8{ "llama", "qwen3" }) |arch| for ([_]bool{ true, false }) |keep_everything_else| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -150,7 +150,7 @@ test "finetune: tiny packs complete, cancel in every stage, release state and ac
         memory_override.static_ceiling = saved_ceiling;
         try std.testing.expectError(error.TrainingDoesNotFit, admission);
         try std.testing.expect(bill.reserve_bytes > bill.available_bytes);
-        const request: types.Request = .{ .model = "tiny", .name = "trained", .prompts = &.{ "question one?", "question two?", "question three?", "question four?", "question five?", "question six?" } };
+        const request: types.Request = .{ .model = "tiny", .name = "trained", .keep_everything_else = keep_everything_else, .prompts = &.{ "question one?", "question two?", "question three?", "question four?", "question five?", "question six?" } };
         const output = try std.fs.path.join(a, &.{ path, "trained" });
         defer a.free(output);
         var observer: Observer = .{};
@@ -192,6 +192,7 @@ test "finetune: tiny packs complete, cancel in every stage, release state and ac
         try std.testing.expectEqualSlices(bool, &.{ true, true, true }, &observer.stages);
         try std.testing.expect(observer.boundaries > 8);
         try std.testing.expectEqual(@as(u32, 1), result.metrics.heldout);
+        try std.testing.expectEqualStrings("question one?", result.prompt);
         try std.testing.expectEqual(@as(u32, 3), result.training_examples);
         try std.testing.expect(result.metrics.retain_tokens > 0);
         try std.testing.expect(!result.metrics.improved());
@@ -209,5 +210,5 @@ test "finetune: tiny packs complete, cancel in every stage, release state and ac
         defer a.free(identity);
         try std.testing.expectEqualStrings(before, identity);
         _ = try native.refuses("question one?", "yes");
-    }
+    };
 }

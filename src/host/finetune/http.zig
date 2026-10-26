@@ -40,7 +40,25 @@ pub fn handle(a: std.mem.Allocator, conn: *Conn, store: *Store, method: []const 
         return respond.sendResponse(conn, "202 Accepted", "application/json", snapshot.json);
     }
     const route = parsePath(path) orelse return sendError(a, conn, "404 Not Found", "UnknownFineTuneJob", "Unknown fine-tuning job", 404);
-    if (std.mem.eql(u8, method, "DELETE") and !route.events) {
+    if (route.adapter) {
+        mutateAdapter(a, store, route.id, method, body) catch |err| {
+            const code: u16 = switch (err) {
+                error.UnknownFineTuneJob => 404,
+                error.FineTuneNotCompleted, error.FineTuneNameExists, error.FineTuneAdapterDiscarded => 409,
+                error.InvalidAdapterName, error.InvalidFineTuneRequest => 400,
+                error.MethodNotAllowed => 405,
+                else => 500,
+            };
+            const status = switch (code) {
+                404 => "404 Not Found",
+                409 => "409 Conflict",
+                400 => "400 Bad Request",
+                405 => "405 Method Not Allowed",
+                else => "500 Internal Server Error",
+            };
+            return sendError(a, conn, status, @errorName(err), @errorName(err), code);
+        };
+    } else if (std.mem.eql(u8, method, "DELETE") and !route.events) {
         store.cancel(route.id) catch return sendError(a, conn, "404 Not Found", "UnknownFineTuneJob", "Unknown fine-tuning job", 404);
     } else if (!std.mem.eql(u8, method, "GET")) return sendError(a, conn, "405 Method Not Allowed", "invalid_request_error", "Use GET for status/events or DELETE to cancel a job", 405);
     var snapshot = store.snapshot(a, route.id) catch |err| switch (err) {
@@ -72,17 +90,26 @@ fn rejectionMessage(a: std.mem.Allocator, name: []const u8, bill: types.Plan) ![
     return std.fmt.allocPrint(a, "{s}: fine-tuning supports dense llama and qwen3 on Metal with a 4-bit affine or bf16 base.", .{name});
 }
 
-const Route = struct { id: u64, events: bool };
+fn mutateAdapter(a: std.mem.Allocator, store: *Store, id: u64, method: []const u8, body: []const u8) !void {
+    if (std.mem.eql(u8, method, "DELETE")) return store.discardAdapter(id);
+    if (!std.mem.eql(u8, method, "PATCH")) return error.MethodNotAllowed;
+    const parsed = std.json.parseFromSlice(struct { name: []const u8 }, a, body, .{}) catch return error.InvalidFineTuneRequest;
+    defer parsed.deinit();
+    try store.renameAdapter(id, parsed.value.name);
+}
+
+const Route = struct { id: u64, events: bool, adapter: bool };
 fn parsePath(path: []const u8) ?Route {
     const prefix = "/v1/finetune/ft-";
     if (!std.mem.startsWith(u8, path, prefix)) return null;
     const events = std.mem.endsWith(u8, path, "/events");
-    const end = path.len - (if (events) @as(usize, 7) else 0);
+    const adapter = std.mem.endsWith(u8, path, "/adapter");
+    const end = path.len - (if (events) @as(usize, 7) else if (adapter) @as(usize, 8) else 0);
     if (end <= prefix.len) return null;
     const number = path[prefix.len..end];
     for (number) |c| if (!std.ascii.isDigit(c)) return null;
     const id = std.fmt.parseInt(u64, number, 10) catch return null;
-    return if (id == 0) null else .{ .id = id, .events = events };
+    return if (id == 0) null else .{ .id = id, .events = events, .adapter = adapter };
 }
 
 test "finetune: HTTP rejects malformed input and unknown jobs without GPU work" {

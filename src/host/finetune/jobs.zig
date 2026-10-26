@@ -93,6 +93,34 @@ pub const Store = struct {
         for (self.jobs.items) |j| if (j.id == id) return j;
         return null;
     }
+    pub fn renameAdapter(self: *Store, id: u64, name: []const u8) !void {
+        if (!@import("../../sdk/weights/lora_config.zig").validName(name)) return error.InvalidAdapterName;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const job = self.find(id) orelse return error.UnknownFineTuneJob;
+        if (job.status != .completed) return error.FineTuneNotCompleted;
+        if (job.adapter_discarded) return error.FineTuneAdapterDiscarded;
+        if (std.mem.eql(u8, std.fs.path.basename(job.path), name)) return;
+        const path = try std.fs.path.join(self.a, &.{ self.root, name });
+        errdefer self.a.free(path);
+        std.Io.Dir.renamePreserve(.cwd(), job.path, .cwd(), path, self.io) catch |err| switch (err) {
+            error.PathAlreadyExists => return error.FineTuneNameExists,
+            else => return err,
+        };
+        self.a.free(job.path);
+        job.path = path;
+        job.revision += 1;
+    }
+    pub fn discardAdapter(self: *Store, id: u64) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const job = self.find(id) orelse return error.UnknownFineTuneJob;
+        if (job.status != .completed) return error.FineTuneNotCompleted;
+        if (job.adapter_discarded) return;
+        try std.Io.Dir.cwd().deleteTree(self.io, job.path);
+        job.adapter_discarded = true;
+        job.revision += 1;
+    }
     pub const Snapshot = struct { json: []u8, revision: u64, terminal: bool };
     pub fn snapshot(self: *Store, a: std.mem.Allocator, id: u64) !Snapshot {
         self.mutex.lockUncancelable(self.io);
@@ -111,6 +139,7 @@ pub const Store = struct {
             .validation_examples = j.result.validation_examples,
             .retain_examples = j.result.retain_examples,
             .updates = j.result.updates,
+            .prompt = j.result.prompt,
             .before = j.result.before,
             .after = j.result.after,
             .recommendation = if (j.result.metrics.improved()) "Measured improvement on held-out prompts; review the examples before using the adapter." else "Verification did not establish improvement within the drift limits. Try a lower lora_scale and review the answers before using the adapter.",
@@ -119,7 +148,8 @@ pub const Store = struct {
         const json = try std.json.Stringify.valueAlloc(a, .{
             .id = try std.fmt.bufPrint(&id_buf, "ft-{d}", .{j.id}),
             .model = j.parsed.value.model,
-            .name = j.parsed.value.name,
+            .name = std.fs.path.basename(j.path),
+            .adapter_discarded = j.adapter_discarded,
             .status = j.status,
             .stage = j.update.stage,
             .step = j.update.step,
@@ -165,6 +195,7 @@ const Job = struct {
     revision: u64 = 1,
     preview: []const u8 = "",
     result: types.Result = .{},
+    adapter_discarded: bool = false,
     failure: ?[]const u8 = null,
     ran: bool = false,
 
@@ -261,4 +292,53 @@ test "finetune: cancelling is cooperative and a completed job remains readable" 
     const body_start = (std.mem.indexOf(u8, status, "\r\n\r\n") orelse return error.NoHttpBody) + 4;
     try std.testing.expect(std.mem.indexOf(u8, events, "event: complete\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, events, status[body_start..]) != null);
+}
+
+test "finetune: only completed job adapters can be renamed or discarded" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(io, &buf)];
+    var store = try Store.init(a, io, undefined, root);
+    defer store.deinit();
+    try tmp.dir.createDir(io, "draft", .default_dir);
+    try tmp.dir.createDir(io, "taken", .default_dir);
+    const j = try a.create(Job);
+    j.* = .{ .store = &store, .id = 1, .parsed = try types.Request.parse(a, "{\"model\":\"m\",\"name\":\"draft\",\"topic\":\"roses\"}"), .path = try std.fs.path.join(a, &.{ root, "draft" }), .model = undefined, .bill = .{}, .stage_started_ms = now(io) };
+    try store.jobs.append(a, j);
+    try std.testing.expectError(error.FineTuneNotCompleted, store.renameAdapter(1, "saved"));
+    try std.testing.expectError(error.FineTuneNotCompleted, store.discardAdapter(1));
+    const Http = struct {
+        fn run(conn: *@import("../http/conn.zig").Conn, jobs: *Store, method: []const u8, body: []const u8) !void {
+            try @import("http.zig").handle(std.testing.allocator, conn, jobs, method, "/v1/finetune/ft-1/adapter", body);
+        }
+    };
+    const capture = @import("../media_jobs/plugin/test_conn.zig").capture;
+    const busy = try capture(a, Http.run, .{ &store, "DELETE", "" });
+    defer a.free(busy);
+    try std.testing.expect(std.mem.startsWith(u8, busy, "HTTP/1.1 409"));
+    j.status = .completed;
+    try std.testing.expectError(error.InvalidAdapterName, store.renameAdapter(1, "../escape"));
+    try std.testing.expectError(error.FineTuneNameExists, store.renameAdapter(1, "taken"));
+    const renamed = try capture(a, Http.run, .{ &store, "PATCH", "{\"name\":\"saved\"}" });
+    defer a.free(renamed);
+    try std.testing.expect(std.mem.startsWith(u8, renamed, "HTTP/1.1 200"));
+    _ = try tmp.dir.statFile(io, "saved", .{});
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "draft", .{}));
+    try store.renameAdapter(1, "saved");
+    const snap = try store.snapshot(a, 1);
+    defer a.free(snap.json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, snap.json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("saved", parsed.value.object.get("name").?.string);
+    const discarded = try capture(a, Http.run, .{ &store, "DELETE", "" });
+    defer a.free(discarded);
+    try std.testing.expect(std.mem.startsWith(u8, discarded, "HTTP/1.1 200"));
+    try std.testing.expect(std.mem.indexOf(u8, discarded, "\"adapter_discarded\":true") != null);
+    try store.discardAdapter(1);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "saved", .{}));
+    _ = try tmp.dir.statFile(io, "taken", .{});
+    try std.testing.expectError(error.FineTuneAdapterDiscarded, store.renameAdapter(1, "again"));
 }

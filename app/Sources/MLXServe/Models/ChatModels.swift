@@ -53,6 +53,7 @@ struct ChatSession: Identifiable, Codable {
     /// Its sidebar group (nil = the root) and dragged position (`SidebarChatRows.Placement`).
     var groupId: UUID?
     var sidebarPosition: Int?
+    var adapter: ChatAdapterSelection?
 
     init(title: String = "New Chat") {
         self.id = UUID()
@@ -85,6 +86,7 @@ struct ChatSession: Identifiable, Codable {
         case disabledTools
         case reasoningEffort
         case groupId, sidebarPosition
+        case adapter
     }
 
     init(from decoder: Decoder) throws {
@@ -119,6 +121,7 @@ struct ChatSession: Identifiable, Codable {
         disabledTools = try c.decodeIfPresent([String].self, forKey: .disabledTools) ?? []
         groupId = try c.decodeIfPresent(UUID.self, forKey: .groupId)
         sidebarPosition = try c.decodeIfPresent(Int.self, forKey: .sidebarPosition)
+        adapter = try c.decodeIfPresent(ChatAdapterSelection.self, forKey: .adapter)
     }
 
     /// Shared default cwd for all chat sessions — a SETTING since 2026-07-20
@@ -450,6 +453,7 @@ struct ModelInfo {
     /// `model_type` from config.json — "gemma4", "qwen3_5_moe", "llama", etc.
     /// Empty string when talking to a pre-drafter-UX server build.
     var architecture: String = ""
+    var adapters: [String] = []
     /// Which backend serves this entry, as the server reports it
     /// (`meta.engine`: "mlx" | "llama" | "ds4" | "gguf" — "gguf" is an
     /// unloaded GGUF stub whose engine is only decided at load). Empty on

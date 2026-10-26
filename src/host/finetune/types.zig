@@ -8,6 +8,7 @@ pub const Request = struct {
     name: []const u8,
     prompts: []const []const u8 = &.{},
     topic: ?[]const u8 = null,
+    keep_everything_else: bool = true,
 
     pub fn parse(a: std.mem.Allocator, body: []const u8) !std.json.Parsed(Request) {
         const parsed = std.json.parseFromSlice(Request, a, body, .{ .allocate = .alloc_always }) catch |err| switch (err) {
@@ -58,10 +59,12 @@ pub const Result = struct {
     validation_examples: u32 = 0,
     retain_examples: u32 = 0,
     updates: u32 = 0,
+    prompt: []const u8 = "",
     before: []const u8 = "",
     after: []const u8 = "",
 
     pub fn deinit(self: *Result, a: std.mem.Allocator) void {
+        if (self.prompt.len > 0) a.free(self.prompt);
         if (self.before.len > 0) a.free(self.before);
         if (self.after.len > 0) a.free(self.after);
         self.* = .{};
@@ -79,4 +82,14 @@ test "finetune: requests require a specific model, safe adapter name and bounded
     const parsed = try Request.parse(a, "{\"model\":\"org/model\",\"name\":\"gardening\",\"prompts\":[\"How do I prune a rose?\"]}");
     defer parsed.deinit();
     try std.testing.expectEqualStrings("How do I prune a rose?", parsed.value.prompts[0]);
+}
+
+test "finetune: retain training is on by default and can be disabled" {
+    const a = std.testing.allocator;
+    const defaults = try Request.parse(a, "{\"model\":\"m\",\"name\":\"n\",\"topic\":\"roses\"}");
+    defer defaults.deinit();
+    try std.testing.expect(defaults.value.keep_everything_else);
+    const explicit = try Request.parse(a, "{\"model\":\"m\",\"name\":\"n\",\"topic\":\"roses\",\"keep_everything_else\":false}");
+    defer explicit.deinit();
+    try std.testing.expect(!explicit.value.keep_everything_else);
 }
