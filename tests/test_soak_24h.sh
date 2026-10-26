@@ -1,8 +1,8 @@
 #!/bin/bash
 # test_soak_24h.sh — 4-way concurrent soak (`--max-concurrent 4 --kv-quant 4`): plain chat, an agent loop with
 # thinking, /v1/messages and a tool round trip run in parallel for SOAK_DURATION_HOURS (default 24). RSS/VSZ every
-# 5 min to tests/soak_log.csv, /health within 5 s every 30 min; FAIL when RSS drifts > 5% from the first 5-minute
-# sample (> 10% in the 1-hour variant, where allocator warm-up dominates).
+# 5 min (every minute under 2 h) to tests/soak_log.csv, /health within 5 s every 30 min; FAIL when RSS drifts > 5%
+# from the first sample 3 minutes in, past warm-up (> 10% under 4 h).
 #
 #   SOAK_DURATION_HOURS=1 [SOAK_MODEL=<dir>] ./tests/test_soak_24h.sh
 #   SOAK_DURATION_MINUTES=30 ./tests/test_soak_24h.sh   (a release check; wins over the hours)
@@ -211,9 +211,10 @@ rows = list(csv.DictReader(open("$SAMPLE_LOG")))
 if len(rows) < 2:
     print("0.0")
 else:
-    # Use the SECOND sample as baseline so warm-up (page faults, JIT
-    # compile, weight read-in) doesn't poison the denominator.
-    base_idx = min(1, len(rows) - 1)
+    # Baseline: the first sample 3 minutes in, so warm-up (page faults, kernel compiles, the
+    # workers' caches and the allocator pool filling) doesn't count as drift.
+    t0 = int(rows[0]['ts'])
+    base_idx = next((i for i, r in enumerate(rows) if int(r['ts']) - t0 >= 180), len(rows) - 1)
     base = int(rows[base_idx]['rss_kb'])
     last = int(rows[-1]['rss_kb'])
     if base == 0:
