@@ -27,6 +27,7 @@ open "app/MLX-Serve.app"
 ## Server only
 
 ```bash
+git submodule update --init                          # mlx, mlx-c, ds4, opencode2 and the absorbed libraries
 ./scripts/fetch-zig.sh                               # stages the pinned Zig at .zig-toolchain/
 export PATH="$PWD/.zig-toolchain:$PATH"
 ./scripts/fetch-llama.sh && ./scripts/build-mlx.sh   # once, and again on a pin bump
