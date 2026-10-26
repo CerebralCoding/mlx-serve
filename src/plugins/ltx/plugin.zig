@@ -159,6 +159,7 @@ fn soundtrack(e: *engine_mod.Engine, b64: []const u8, pipeline: engine_mod.Pipel
         if (err == error.AudioTooShort) return bad("audio: clip too short (needs at least ~50 ms)");
         return job.failure(err, "audio: conditioning encode failed");
     };
+    log.info("[video] audio-to-video: {d} tokens (budget {d}) from {d} Hz {d}ch clip\n", .{ mlx.getShape(out.cond.?)[1], max_tokens, dec.sample_rate, dec.channels });
     return null;
 }
 

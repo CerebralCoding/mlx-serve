@@ -2,6 +2,7 @@
 //! projected into the DINOv3 + NAF-upsampled map of every view), one photo or 2-8 posed views averaged.
 
 const std = @import("std");
+const log = @import("../../sdk/util/log.zig");
 const abi = @import("../../abi/media.zig");
 const sdk = @import("../../sdk/root.zig");
 const job = @import("../../sdk/media/job.zig");
@@ -111,6 +112,8 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     if (t2_plugin.resolutionRefusal(req, opts.base.resolution)) |v| return v;
     var photos: [px.MAX_VIEWS]px.Photo = undefined;
     for (views.list.items, 0..) |v, i| photos[i] = .{ .rgba = v.pix, .w = v.w, .h = v.h };
+    const fov = opts.fov orelse (if (n > 1) px.RIG_FOV else px.DEFAULT_FOV);
+    log.info("[mesh] generating Pixal3D res={d} views={d} cameras={s} fov={d:.1}deg steps={d} faces={d} tex={d} seed={d}\n", .{ opts.base.resolution, n, if (opts.cameras.len > 0) "given" else "default", std.math.radiansToDegrees(fov), opts.base.steps, opts.base.decimation_target, opts.base.texture_size, opts.base.seed });
     const out = e.m.generateGlb(gpa, photos[0..n], opts, job.progressOf(progress)) catch |err| return t2_plugin.jobFailure(err);
     if (job.latched()) |v| {
         gpa.free(out);

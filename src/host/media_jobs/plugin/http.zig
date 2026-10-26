@@ -102,7 +102,10 @@ pub fn handleMany(e: *Engine, model_id: []const u8, queued: []const Queued) void
     const turn: abi.Progress = .{ .ctx = null, .report = quietReport, .boundary = chatTurn };
     batch(e.handle, .of(reqs), out.ptr, results.ptr, &turn);
     const ms = @as(f64, @floatFromInt(t0.untilNow(queued[0].conn.io, .boot).nanoseconds)) / 1e6;
-    log.info("[gen] {s}: {d} request(s) in one pass, {d:.1} ms\n", .{ t.name.slice(), queued.len, ms });
+    if (queued.len > 1)
+        log.info("[decision] {s}: {d} requests merged in one pass, {d:.1} ms\n", .{ t.name.slice(), queued.len, ms })
+    else
+        log.info("[decision] {s}: 1 request in {d:.1} ms\n", .{ t.name.slice(), ms });
     for (jobs, out, results) |*j, v, r| {
         (if (v.isOk()) j.send(t.modality, r.slice(), "") else j.fail(v)) catch |err|
             log.warn("[gen] response not sent: {s}\n", .{@errorName(err)});

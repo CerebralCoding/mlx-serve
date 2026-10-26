@@ -149,8 +149,12 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
                 image_request.fitWithinCap(w, h, config.max_dim)
             else
                 image_request.resolveEditTargetSize(nat.w, nat.h, nat.w, nat.h, config.max_dim);
-            w = image_request.clamp32(fit.w);
-            h = image_request.clamp32(fit.h);
+            const tw = image_request.clamp32(fit.w);
+            const th = image_request.clamp32(fit.h);
+            if (tw != w or th != h)
+                log.info("[image] edit: target {d}x{d} -> {d}x{d} (primary reference is {d}x{d}, size {s})\n", .{ w, h, tw, th, nat.w, nat.h, if (j.size_given) "requested" else "matched to source" });
+            w = tw;
+            h = th;
             opts.edit_images = pix[0..pix_n];
         },
     }

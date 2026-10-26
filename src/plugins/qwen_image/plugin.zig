@@ -138,6 +138,8 @@ fn edit(e: *Engine, j: *const image_request.Job, sp: anytype) Verdict {
     for (refs[0..n], 0..) |r, i| last = image_pixels.nativeSize(r) orelse return if (i == 0) decode_refusal else ref_decode_refusal;
     image_pixels.logByteRefs(refs[0..n]);
     const dims = config.editDims(if (j.size_given) .{ .w = j.req_w, .h = j.req_h } else null, last.w, last.h);
+    if (dims.w != j.req_w or dims.h != j.req_h)
+        log.info("[image] edit: target {d}x{d} -> {d}x{d} (last reference is {d}x{d}, size {s})\n", .{ j.req_w, j.req_h, dims.w, dims.h, last.w, last.h, if (j.size_given) "requested" else "matched to source" });
     const cfg = e.m.dit_cfg;
     const base = config.editTransientBytes(@intCast(n), j.ref_resolution, dims.w, dims.h);
     const prefix = config.editPrefixBytes(@intCast(n), j.ref_resolution, cfg.layers, cfg.hidden(), if (j.guidance_scale != 1) 2 else 1);

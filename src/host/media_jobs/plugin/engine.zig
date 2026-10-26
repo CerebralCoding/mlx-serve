@@ -98,6 +98,7 @@ pub const Engine = struct {
         self.pack = self.fs.packDir();
         t.caps(&pd, &self.caps);
         log.info("[gen] {s} ready through its plugin table\n", .{t.name.slice()});
+        if (t.modality == .decision) log.info("[decision] {s} engine ready\n", .{t.name.slice()});
         return self;
     }
 

@@ -2,6 +2,7 @@
 //! 44.1 kHz stereo WAV. Tempo and key ride the caption; ACE-Step-only fields are named refusals.
 
 const std = @import("std");
+const log = @import("../../sdk/util/log.zig");
 const abi = @import("../../abi/media.zig");
 const sdk = @import("../../sdk/root.zig");
 const job = @import("../../sdk/media/job.zig");
@@ -109,6 +110,7 @@ fn step(ep: *anyopaque, r: *const abi.Request, progress: *const abi.Progress) ca
         .bad => |v| return v,
     };
     defer gpa.free(p.caption);
+    log.info("[music3] generating {d}s steps={d} seed={d} lyrics={d}ch instrumental={}\n", .{ p.req.duration_s, p.req.steps, p.req.seed, p.req.lyrics.len, body.flag("instrumental") });
     const out = self.e.generateWav(gpa, p.req, job.progressOf(progress)) catch |err| return switch (err) {
         error.Cancelled => job.client_left,
         error.PromptTooLong => bad("assembled prompt exceeds 5000 tokens"),
