@@ -908,6 +908,8 @@ pub const ModelTable = extern struct {
     /// the next call on `m`; the counters reset.
     meters: ?*const fn (m: *anyopaque, slot: u32, out: *Str) callconv(.c) void = null,
     speech: ?*const SpeechHooks = null,
+    /// In-tree SDK training only: borrows `sdk/train/model.Base` for this model's lifetime. Outside plugins decline.
+    native_train_base: ?*const fn (m: *anyopaque) callconv(.c) ?*const anyopaque = null,
 };
 
 /// The modes a model serves: prefill, decode and verify always; the rest as its caps declare. An encoder (`embed`)

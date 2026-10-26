@@ -43,7 +43,13 @@ pub const table = abi.ModelTable{
     .cache = &.{},
     .spec = &.{ .trunk_weight = b.trunk_weight.trunkWeightHook(Loaded(Dense)) },
     .weights = &.{},
+    .native_train_base = &trainBase,
 };
+
+fn trainBase(mp: *anyopaque) callconv(.c) ?*const anyopaque {
+    const m: *Loaded(Dense) = @ptrCast(@alignCast(mp));
+    return &m.base;
+}
 
 const gpa = std.heap.c_allocator;
 const Verdict = abi.Verdict;
@@ -181,7 +187,6 @@ pub fn Table(comptime D: type) type {
             const m: *Loaded(D) = @ptrCast(@alignCast(mp));
             return run_mod.tableForward(D, &m.base, f, out);
         }
-
     };
 }
 

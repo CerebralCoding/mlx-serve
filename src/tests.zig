@@ -363,3 +363,7 @@ test {
     _ = @import("testing/fake_engine.zig"); // the engine contract suite against the fake engines
     _ = @import("abi/exactness_test.zig"); // the exactness contracts (run on the fakes from fake_engine.zig)
 }
+comptime {
+    _ = @import("sdk/train/verify.zig");
+    _ = @import("engines/mlx/finetune/workflow_test.zig");
+}

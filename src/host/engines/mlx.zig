@@ -45,6 +45,8 @@ pub const Api = struct {
     hot_cache_bytes: *const fn (*const LoadedModel) u64,
     // ── GPU-thread jobs
     run_generation: *const fn (*Scheduler, *requests.GenRequest) Err,
+    finetune_plan: *const fn (*Scheduler, *LoadedModel, *@import("../finetune/types.zig").Plan) Err,
+    finetune_run: *const fn (*Scheduler, *LoadedModel, *const @import("../finetune/types.zig").Run) Err,
     compute_embeddings: *const fn (*Scheduler, *requests.EmbedRequest, *[][]f32) Err,
     encode_vision: *const fn (*Scheduler, *requests.VisionEncodeRequest, *mlx.mlx_array) Err,
     /// Qwen3-ForcedAligner: the 80 ms step each `<timestamp>` in `ids` lands on, run on the inference thread.

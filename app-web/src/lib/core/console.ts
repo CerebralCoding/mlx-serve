@@ -35,6 +35,7 @@ function launchCommand(base: string, agent: string, model?: string) {
 
 const apiReference = [
   { method: "GET", path: "/", description: N("MLX Serve Studio web console") },
+  { method: "POST", path: "/v1/finetune", description: N("Train a native LoRA · GET /{id} status, /{id}/events SSE · DELETE /{id} cancels") },
   {
     method: "POST",
     path: "/v1/chat/completions",

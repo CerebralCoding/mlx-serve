@@ -57,7 +57,16 @@ pub const table = abi.ModelTable{
     .cache = &.{},
     .spec = &.{ .trunk_weight = &trunkWeight },
     .weights = &.{},
+    .native_train_base = &trainBase,
 };
+
+fn trainBase(mp: *anyopaque) callconv(.c) ?*const anyopaque {
+    const m: *Loaded = @ptrCast(@alignCast(mp));
+    return switch (m.body) {
+        .dense => |*d| &d.base,
+        .moe => null,
+    };
+}
 
 const gpa = ld.gpa;
 const Verdict = abi.Verdict;

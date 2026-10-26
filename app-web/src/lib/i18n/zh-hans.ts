@@ -1,5 +1,6 @@
 // Exact-English key -> zh-Hans. Seeded from the Swift app's zh-Hans strings; a key stays only while a t()/th()/N() call uses it (test/i18n.test.ts).
 const ZH: Record<string, string> = {
+  "Train a native LoRA · GET /{id} status, /{id}/events SSE · DELETE /{id} cancels": "训练原生 LoRA · GET /{id} 状态、/{id}/events SSE · DELETE /{id} 取消",
   "City pop": "城市流行",
   "Jazz-funk": "爵士放克",
   "Jazz ballad": "爵士抒情",

@@ -46,6 +46,12 @@ parts (base64 data URLs) on models with the `vision` capability.
 `POST /v1/messages` (Anthropic SDK) and `POST /v1/responses` (OpenAI Responses)
 serve the same models. Ollama clients work against `/api/*`.
 
+`POST /v1/finetune` with `{"model":"<id>","name":"<new-adapter>","topic":"What to teach"}`
+starts native LoRA training on a dense llama/qwen3 4-bit or bf16 Metal model.
+Poll `GET /v1/finetune/<job-id>` or its `/events` SSE stream; `DELETE` requests cancellation.
+Review `result.verified`, refusal counts and KL drift before serving the saved adapter with
+`"lora":"<new-adapter>"` and optional `"lora_scale":1` on chat requests.
+
 ## Embeddings: `POST /v1/embeddings`
 
 For a model with the `embeddings` capability. OpenAI shape:

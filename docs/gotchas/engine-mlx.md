@@ -1,5 +1,13 @@
 # Engine: KV cache, spec decode, kernels, MLX: gotchas
 
+## Fine-tuning completion boundaries
+
+A fixed generation budget can cut an answer or a UTF-8 character mid-stream.
+Treating the fragment as training data teaches incomplete answers; scoring it can
+claim an improvement without a finished reply. Synthesis requests brief answers
+and discards malformed or truncated samples; verification refuses incomplete
+answers. The native fine-tuning workflow tests cover both paths and cancellation.
+
 One story per gotcha: the defect, the cause, the fix, the guard. The rules live in the root `AGENTS.md` (`## Rules`)
 and each plugin's `AGENTS.md`; what is still open lives in `docs/known-issues.md`; spec-decode and cache designs live
 in `docs/reference.md`. An env lever a story names that `src/env.zig` no longer lists was retired once its arm was

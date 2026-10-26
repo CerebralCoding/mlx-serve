@@ -39,6 +39,8 @@ pub const table: host.Api = .{
     .set_foreign_bytes = mlx_stream.setForeignBytes,
     .hot_cache_bytes = hotCacheBytes,
     .run_generation = runGeneration,
+    .finetune_plan = fineTunePlan,
+    .finetune_run = fineTuneRun,
     .compute_embeddings = computeEmbeddings,
     .encode_vision = encodeVision,
     .timestamp_classes = timestampClasses,
@@ -85,7 +87,7 @@ fn clusterProbe(io: std.Io, args: []const []const u8) ?[]const u8 {
 }
 
 fn clusterConnect(io: std.Io, gpa: std.mem.Allocator, coordinator: []const u8, device: []const u8, mode: u8, model: []const u8, split: ?u32) ?[]const u8 {
-    distributed.connect(local(io), gpa, .{ .rank = 0, .coordinator = coordinator, .device = device }, @enumFromInt(mode), model, split) catch |e| return @errorName(e);
+    distributed.connect(local(io), gpa, .{ .rank = 0, .coordinator = coordinator, .device = device }, @fromBackingInt(@intCast(mode)), model, split) catch |e| return @errorName(e);
     return null;
 }
 
@@ -127,6 +129,18 @@ fn hotCacheBytes(lm: *const LoadedModel) u64 {
 
 fn runGeneration(sch: *Scheduler, req: *requests.GenRequest) ?[]const u8 {
     scheduler.runGeneration(sch, req) catch |e| return @errorName(e);
+    return null;
+}
+
+fn fineTunePlan(sch: *Scheduler, lm: *LoadedModel, out: *@import("../../host/finetune/types.zig").Plan) ?[]const u8 {
+    @import("finetune/run.zig").plan(sch, lm, out) catch |err| return @errorName(err);
+    return null;
+}
+
+fn fineTuneRun(sch: *Scheduler, lm: *LoadedModel, input: *const @import("../../host/finetune/types.zig").Run) ?[]const u8 {
+    var run = input.*;
+    run.io = local(run.io);
+    @import("finetune/run.zig").run(sch, lm, run) catch |err| return @errorName(err);
     return null;
 }
 

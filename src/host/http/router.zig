@@ -116,6 +116,7 @@ const ROUTE_PATHS = [_][]const u8{
     "/v1/decisions",
     "/v1/systemone",
     "/v1/embeddings",
+    "/v1/finetune",
     "/v1/images/edits",
     "/v1/images/generations",
     "/v1/load-model",
@@ -133,6 +134,7 @@ const ROUTE_PATHS = [_][]const u8{
 
 /// Is `path` an endpoint this server serves at all (any method)?
 fn routeExists(path: []const u8) bool {
+    if (@import("../finetune/http.zig").matches(path)) return true;
     // `/v1/responses/{id}` (GET/DELETE) is matched by prefix, not by a literal.
     if (std.mem.startsWith(u8, path, "/v1/responses/")) return true;
     for (ROUTE_PATHS) |p| if (std.mem.eql(u8, path, p)) return true;
@@ -326,6 +328,10 @@ pub fn handleConnection(
         log.debug("OPTIONS {s} -> 204\n", .{path});
         try sendResponse(stream, "204 No Content", "text/plain", "");
         return;
+    }
+    if (@import("../finetune/http.zig").matches(path)) {
+        const store = http_server.launch().finetune orelse return sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Fine-tuning jobs are unavailable", 503);
+        return @import("../finetune/http.zig").handle(allocator, stream, store, method, path, request_body);
     }
     if (std.mem.eql(u8, method, "POST")) @import("../api/lora.zig").validateSurface(allocator, path, request_body, request_content_type) catch |err| {
         try @import("errors.zig").sendGenerationError(allocator, stream, err, .openai);
