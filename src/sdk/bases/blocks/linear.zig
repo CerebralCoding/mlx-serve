@@ -30,15 +30,40 @@ pub const Linear = struct {
     /// `H_block(signs * x)` through the registry's memo (`signs` pooled there; null = an unrotated weight).
     rht: ?*rht.Registry = null,
     signs: Array = .{},
+    /// Borrowed, unfused adapter matrices in mlx-lm's [in, rank], [rank, out] layout.
+    lora: ?struct { a: Array, b: Array, scale: f32 } = null,
+
+    pub fn hasLora(l: *const Linear) bool {
+        return if (l.lora) |a| a.scale != 0 else false;
+    }
 
     pub fn forward(l: *const Linear, g: *Graph, x: Array) !Array {
-        if (l.bias.ctx == null) return g.adopt(try l.matmul(g, x));
+        if (l.bias.ctx == null and !l.hasLora()) return g.adopt(try l.matmul(g, x));
         var t = g.scope();
         defer t.deinit();
-        return g.keep(try t.add(try t.adopt(try l.matmul(g, x)), l.bias));
+        var y = try t.adopt(try l.matmul(g, x));
+        if (l.bias.ctx != null) y = try t.add(y, l.bias);
+        if (l.hasLora()) {
+            const a = l.lora.?;
+            const dt = ops.dtype(x);
+            const low = try t.matmul(try t.matmul(x, try t.astype(a.a, dt)), try t.astype(a.b, dt));
+            y = try t.add(y, try t.astype(try t.mulScalar(low, a.scale), ops.dtype(y)));
+        }
+        return g.keep(y);
     }
 
     fn matmul(l: *const Linear, g: *Graph, x: Array) !Array {
+        if (g.differentiable) {
+            if (l.rht != null or l.ternary or l.mode != .affine or (l.s.ctx != null and (l.bits != 4 or l.b.ctx == null))) return error.DifferentiableLinearUnsupported;
+            var out = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(out);
+            if (l.s.ctx == null) {
+                try mlx.check(mlx.mlx_matmul(&out, x, l.w, g.s));
+            } else {
+                try mlx.check(mlx.mlx_quantized_matmul(&out, x, l.w, l.s, l.b, true, mlx.mlx_optional_int.some(@intCast(l.group_size)), mlx.mlx_optional_int.some(4), "affine", g.s));
+            }
+            return out;
+        }
         if (l.rht) |reg| return l.rotated(reg, x, g.s);
         if (l.ternary) {
             if (try qmv_nax2.qmm(x, l.w, l.s, l.b, l.bits, l.group_size, g.s)) |y| return y;

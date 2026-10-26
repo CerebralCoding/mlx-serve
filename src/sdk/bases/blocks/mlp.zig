@@ -18,7 +18,7 @@ const Joined = linear.Joined;
 
 /// `silu(gate) * up`: one exact fused dispatch where it serves, else the two ops.
 pub fn swiglu(g: *Graph, gate: Array, up: Array) !Array {
-    if (try fused_act.fusedSwiGLU(g.s, gate, up)) |y| return g.adopt(y);
+    if (!g.differentiable) if (try fused_act.fusedSwiGLU(g.s, gate, up)) |y| return g.adopt(y);
     var t = g.scope();
     defer t.deinit();
     return g.keep(try t.mul(try t.mul(gate, try t.sigmoid(gate)), up));
@@ -47,7 +47,7 @@ pub const SwiGlu = struct {
 
     pub fn forward(w: *const Weights, c: *Ctx, x: Array) !Array {
         const g = c.g;
-        const joined = c.mode != .batched_rows and w.rows_joined and w.gu.built() and c.rows * c.slots <= FUSED_ROWS_MAX_M;
+        const joined = !g.differentiable and !w.gate.hasLora() and !w.up.hasLora() and c.mode != .batched_rows and w.rows_joined and w.gu.built() and c.rows * c.slots <= FUSED_ROWS_MAX_M;
         var gate: Array = undefined;
         var up: Array = undefined;
         if (joined) {

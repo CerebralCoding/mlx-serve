@@ -128,6 +128,7 @@ pub fn DecoderAttention(comptime opts: Options) type {
         }
 
         pub fn forward(w: *const Weights, c: *Ctx, x: Array) !Array {
+            if (c.g.differentiable and (c.caches.len != 0 or c.mode == .batched_rows or opts.gate != .none)) return error.DifferentiableAttentionUnsupported;
             if (c.mode == .batched_rows) return batchedForward(w, c, x);
             if (c.caches.len == 0) return embedBatchForward(w, c, x);
             const g = c.g;
@@ -137,7 +138,7 @@ pub fn DecoderAttention(comptime opts: Options) type {
             const src = shared(w);
             const kev = opts.value_norm and w.k_eq_v;
 
-            const fused_rows = w.qkv.built() and s <= FUSED_ROWS_MAX_M;
+            const fused_rows = !w.q.hasLora() and !w.k.hasLora() and !w.v.hasLora() and w.qkv.built() and s <= FUSED_ROWS_MAX_M;
             const all: Array = if (fused_rows) try w.qkv.lin.forward(g, x) else .{};
             const q = if (fused_rows) try w.qkv.part(g, all, 0) else try w.q.forward(g, x);
             const q_r = try g.reshape(q, &.{ 1, s, geo.heads, geo.head_dim });
@@ -243,7 +244,7 @@ pub fn DecoderAttention(comptime opts: Options) type {
             const geo = &w.geo;
             const n = c.slots;
             const s = c.rows;
-            const fused_rows = w.qkv.built() and n * s <= FUSED_ROWS_MAX_M;
+            const fused_rows = !g.differentiable and !w.q.hasLora() and !w.k.hasLora() and !w.v.hasLora() and w.qkv.built() and n * s <= FUSED_ROWS_MAX_M;
             const all: Array = if (fused_rows) try w.qkv.lin.forward(g, x) else .{};
             const q = if (fused_rows) try w.qkv.part(g, all, 0) else try w.q.forward(g, x);
             const own_k = if (fused_rows) try w.qkv.part(g, all, 1) else try w.k.forward(g, x);
@@ -252,7 +253,7 @@ pub fn DecoderAttention(comptime opts: Options) type {
             const q_n = if (w.q_norm.ctx != null) try g.rmsNorm(q_r, w.q_norm, c.shared.eps) else q_r;
             const q_rope = try ropeAt(g, try g.transpose(q_n, &perm), geo, 0);
             const kvs = try ownKv(w, c, n, own_k, own_v, Roper{ .geo = geo, .offset = 0 });
-            var out: ?Array = if (s == 1) try sdpaRaw(g, q_rope, kvs[0], kvs[1], geo.scale, "", .{}, false) else null;
+            var out: ?Array = if (g.differentiable or s == 1) try sdpaRaw(g, q_rope, kvs[0], kvs[1], geo.scale, if (s == 1) "" else "causal", .{}, false) else null;
             if (out == null) out = try own(g, try attn256.fusedSdpa256Prefill(g.s, q_rope, kvs[0], kvs[1], geo.scale, 0));
             if (out == null) out = try own(g, try sdpa.splitCausalSdpa(g.s, q_rope, kvs[0], kvs[1], geo.scale));
             if (out == null) out = try sdpaRaw(g, q_rope, kvs[0], kvs[1], geo.scale, "causal", .{}, sdpa.sdpaForceFused(q_rope, kvs[0]));

@@ -79,6 +79,8 @@ pub const Graph = struct {
     a: std.mem.Allocator,
     s: Stream,
     owned: Owned = .{},
+    /// Participating SDK blocks bypass custom kernels without derivatives.
+    differentiable: bool = false,
 
     /// Never copy a Graph once it owns arrays: both copies would free them.
     pub fn init(a: std.mem.Allocator, s: Stream) Graph {
@@ -87,7 +89,7 @@ pub const Graph = struct {
 
     /// A child on the same stream: a helper's own lifetime.
     pub fn scope(g: *const Graph) Graph {
-        return .init(g.a, g.s);
+        return .{ .a = g.a, .s = g.s, .differentiable = g.differentiable };
     }
 
     /// Frees every array not kept elsewhere.

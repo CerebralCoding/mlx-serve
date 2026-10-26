@@ -40,7 +40,7 @@ pub const ResidualTail = struct {
     pub const Weights = void;
 
     fn fused(c: *const Ctx, h: Array, delta: Array, pre: Array, w_post: Array) !?residual_norm.AddNormResult {
-        if (c.mode != .decode) return null;
+        if (c.g.differentiable or c.mode != .decode) return null;
         return residual_norm.fusedResidualNorm(c.stream(), h, delta, .{ .w1 = pre, .eps1 = c.shared.post_eps_arr, .w_post = w_post, .eps = c.shared.eps_arr });
     }
 

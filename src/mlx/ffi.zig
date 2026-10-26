@@ -20,6 +20,7 @@ pub const mlx_map_string_to_string = extern struct { ctx: ?*anyopaque = null };
 pub const mlx_map_string_to_array_iterator = extern struct { ctx: ?*anyopaque = null, map_ctx: ?*anyopaque = null };
 pub const mlx_vector_array = extern struct { ctx: ?*anyopaque = null };
 pub const mlx_closure = extern struct { ctx: ?*anyopaque = null };
+pub const mlx_closure_value_and_grad = extern struct { ctx: ?*anyopaque = null };
 
 // ── Enums ──
 pub const mlx_dtype = enum(c_int) {
@@ -388,6 +389,10 @@ pub extern "c" fn mlx_closure_new_func_payload(
 ) mlx_closure;
 pub extern "c" fn mlx_closure_free(cls: mlx_closure) c_int;
 pub extern "c" fn mlx_closure_apply(res: *mlx_vector_array, cls: mlx_closure, input: mlx_vector_array) c_int;
+pub extern "c" fn mlx_value_and_grad(res: *mlx_closure_value_and_grad, fun: mlx_closure, argnums: [*]const c_int, argnums_num: usize) c_int;
+pub extern "c" fn mlx_closure_value_and_grad_apply(res_0: *mlx_vector_array, res_1: *mlx_vector_array, cls: mlx_closure_value_and_grad, input: mlx_vector_array) c_int;
+pub extern "c" fn mlx_closure_value_and_grad_free(cls: mlx_closure_value_and_grad) c_int;
+pub extern "c" fn mlx_checkpoint(res: *mlx_closure, fun: mlx_closure) c_int;
 pub extern "c" fn mlx_compile(res: *mlx_closure, fun: mlx_closure, shapeless: bool) c_int;
 pub extern "c" fn mlx_detail_compile_clear_cache() c_int;
 
