@@ -31,6 +31,7 @@ const mropeContext = @import("../methods/mrope.zig").mropeContext;
 const SSMCacheEntry = @import("../ssm/entry.zig").SSMCacheEntry;
 const ForwardCtx = @import("../forward_ctx.zig").ForwardCtx;
 const MAX_BATCH_ROWS = @import("../batched/layered.zig").MAX_BATCH_ROWS;
+const EMBED_MAX_BATCH = @import("../embed/pooling.zig").EMBED_MAX_BATCH;
 const settle = @import("settle.zig");
 const rht = @import("../../../sdk/quant/hadamard/rht.zig");
 const hadamard = @import("../../../sdk/quant/hadamard/format.zig");
@@ -502,8 +503,9 @@ fn forwardEncoderBatch(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids
     const sh = mlx.getShape(token_ids);
     const n: usize = @intCast(sh[0]);
     const rows: u32 = @intCast(sh[1]);
-    if (n > MAX_BATCH_ROWS) return error.PluginForwardUnsupported;
-    const zeros: [MAX_BATCH_ROWS]u32 = @splat(0);
+    // An embedding sub-batch is up to EMBED_MAX_BATCH rows, wider than a decode batch.
+    if (n > EMBED_MAX_BATCH) return error.PluginForwardUnsupported;
+    const zeros: [EMBED_MAX_BATCH]u32 = @splat(0);
     var mask = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(mask);
     if (ctx.key_pad_mask) |m| try mlx.check(mlx.mlx_reshape(&mask, m, &[_]c_int{ sh[0], sh[1] }, 2, xfm.s));

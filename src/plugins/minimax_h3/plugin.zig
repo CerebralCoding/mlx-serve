@@ -8,6 +8,7 @@ const abi = @import("../../abi/media.zig");
 const sdk = @import("../../sdk/root.zig");
 const job = @import("../../sdk/media/job.zig");
 const mlx = @import("../../mlx/ffi.zig");
+const log = @import("../../sdk/util/log.zig");
 const ops = @import("../../mlx/ops.zig");
 const lora = @import("../../sdk/weights/lora.zig");
 const image_pixels = @import("../../sdk/media/image_pixels.zig");
@@ -180,6 +181,7 @@ fn keyframes(b: *const job.Body, width: u32, height: u32, s: mlx.mlx_stream, out
             const pixels = pm1Frame(bytes, height, width, k[2], s) orelse return undecodable;
             out.buf[out.n] = .{ .anchor = k[1], .pixels = pixels };
             out.n += 1;
+            log.info("[video] minimax-h3 {s} keyframe conditioning engaged ({d}x{d})\n", .{ @tagName(k[1]), width, height });
         };
     }
     return null;
