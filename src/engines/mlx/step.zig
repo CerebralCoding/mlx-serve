@@ -1,6 +1,7 @@
 //! One chat pass of the inference loop: admission, prefill, decode, live KV residency.
 
 const std = @import("std");
+const err_name = @import("../../sdk/util/err_name.zig");
 const transformer_mod = @import("transformer.zig");
 const prefix_cache_mod = @import("cache/prefix_cache.zig");
 const metrics_mod = @import("../../host/metrics/metrics.zig");
@@ -281,7 +282,7 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
         ran = true;
         var decode_sw = io_util.Stopwatch.init(sch.io);
         runDecodeTick(sch, active.items) catch |err| {
-            log.err("[scheduler] decode tick failed: {s}\n", .{@errorName(err)});
+            log.err("[scheduler] decode tick failed: {s}\n", .{if (err == error.EngineFailed) err_name.last() else @errorName(err)});
             for (active.items) |s| s.markError(@errorName(err));
         };
         const tick_ns = decode_sw.read();

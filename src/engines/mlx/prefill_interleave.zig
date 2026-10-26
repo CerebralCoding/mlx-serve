@@ -1,6 +1,7 @@
 //! Prefill interleaving: decode share, boundary admission, SSD write-through, chunk width.
 
 const std = @import("std");
+const err_name = @import("../../sdk/util/err_name.zig");
 const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const transformer_mod = @import("transformer.zig");
@@ -546,7 +547,7 @@ pub fn interleaveDecodeTick(sch: *Scheduler) u64 {
     invalidateDecodeClocks(buf[0..n]);
     var sw = io_util.Stopwatch.init(sch.io);
     runDecodeTick(sch, buf[0..n]) catch |err| {
-        log.err("[interleave] decode tick failed: {s}\n", .{@errorName(err)});
+        log.err("[interleave] decode tick failed: {s}\n", .{if (err == error.EngineFailed) err_name.last() else @errorName(err)});
         for (buf[0..n]) |s| s.markError(@errorName(err));
     };
     const tick_ns = sw.read();

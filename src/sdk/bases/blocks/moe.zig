@@ -678,6 +678,7 @@ fn streamedRouted(w: *const Moe.Weights, st: *const Streamed, g: *Graph, x: Arra
     }
     if (cuda) return error.StreamedArmUnsupported;
     if (w.gate.expert_scale.ctx != null or w.up.expert_scale.ctx != null) return error.StreamedExpertScales;
+    if (@as(usize, @intCast(B * S * K)) > routed.max_call_ids) return wideCall(w, st, g, x, r, S, K);
     const scores = try nextScores(st, g, x, r.inds);
     const ids = try hostIds(g, r.inds);
     defer g.a.free(ids);
@@ -693,6 +694,30 @@ fn streamedRouted(w: *const Moe.Weights, st: *const Streamed, g: *Graph, x: Arra
     if (!one_row and !rows_arm) return sortedGroups(w, st, g, x, r, ids, B, S, D, K);
     if (distinctCount(ids) <= routed.max_call_experts) return slotArms(w, g, x, r, &(try fetchSlotsWith(w, st, ids, scores)), shared_down, n);
     return rowChunks(w, st, g, x, r, ids, B, S, D, K);
+}
+
+/// A prompt chunk past the bank's pair cap (`routed.max_call_ids`): its rows in calls under the cap, each piece summed
+/// over its top-k.
+fn wideCall(w: *const Moe.Weights, st: *const Streamed, g: *Graph, x: Array, r: Routed, S: c_int, K: c_int) anyerror!Sorted {
+    if (ops.shape(x)[0] != 1) return error.StreamedCallTooWide;
+    // Even pieces: a short tail would take a narrower arm's numerics than the rest of the chunk.
+    const per: usize = routed.max_call_ids / @as(usize, @intCast(K));
+    const rows: usize = @intCast(S);
+    const pieces = std.math.divCeil(usize, rows, per) catch unreachable;
+    var outs: std.ArrayList(Array) = .empty;
+    defer outs.deinit(g.a);
+    for (0..pieces) |c| {
+        const lo: c_int = @intCast(rows * c / pieces);
+        const hi: c_int = @intCast(rows * (c + 1) / pieces);
+        const rc: Routed = .{
+            .inds = try g.sliceAxis(r.inds, 1, lo, hi),
+            .scores = try g.sliceAxis(r.scores, 1, lo, hi),
+            .gate_logit = if (r.gate_logit) |gl| try g.sliceAxis(gl, 1, lo, hi) else null,
+        };
+        const y = try streamedRouted(w, st, g, try g.sliceAxis(x, 1, lo, hi), rc, null, null, false);
+        try outs.append(g.a, if (y.reduced) y.out else try g.sum(try g.mul(y.out, try g.expandDims(rc.scores, -1)), -2, false));
+    }
+    return .{ .out = try g.concat(outs.items, 1), .reduced = true };
 }
 
 /// The in-memory arms of `routedExperts` on a bank holding the call's experts (`callBank`), every pair's route its row

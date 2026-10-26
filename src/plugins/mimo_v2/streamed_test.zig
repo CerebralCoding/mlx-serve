@@ -160,6 +160,9 @@ fn parity(n_experts: u32) !void {
     // The in-memory banks: the served steps, then the block alone at every arm's widths in bf16 and f32.
     const widths = [_]c_int{ 1, 2, 8, 20, 128 };
     const native = try logits(&b, a, null);
+    // 8200 x 2 pairs is past one call's cap (`max_call_ids`): the call splits into even pieces of the same arm.
+    const wide_rows = 8200;
+    const native_wide = try blockOut(&b, a, moe_w, wide_rows, .float32, 0x77, null);
     var native_block: [2][widths.len][]u32 = undefined;
     for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }, 0..) |dt, di| for (widths, 0..) |rows, wi| {
         native_block[di][wi] = try blockOut(&b, a, moe_w, rows, dt, 0x10 + wi, null);
@@ -178,6 +181,7 @@ fn parity(n_experts: u32) !void {
         for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }, 0..) |dt, di| for (widths, 0..) |w, wi| {
             try testing.expectEqualSlices(u32, native_block[di][wi], try blockOut(&b, a, moe_w, w, dt, 0x10 + wi, r));
         };
+        try testing.expectEqualSlices(u32, native_wide, try blockOut(&b, a, moe_w, wide_rows, .float32, 0x77, r));
         const st = sw.src.mxfp4.stats();
         std.debug.print("mimo_v2 streamed ({d} experts, {s}): {d} routes, {d} hits, {d} misses, {d} evictions\n", .{ n_experts, if (rows == null) "every expert resident" else if (rows.?[0] == 3) "3 rows a layer" else "2/3 of the experts a layer", st.route_calls, st.expert_cache_hits, st.expert_cache_misses, st.expert_cache_evictions });
         // With three rows a layer, decode reads pairs from more than one slot bank.
