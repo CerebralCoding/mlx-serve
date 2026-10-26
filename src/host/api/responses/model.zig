@@ -633,25 +633,37 @@ pub fn parseInput(
             try pi.messages.append(allocator, .{ .role = "user", .content = s });
         },
         .array => |arr| {
+            var reasoning_turn: ?usize = null;
             for (arr.items) |item| {
-                if (item != .object) continue;
+                if (item != .object) {
+                    reasoning_turn = null;
+                    continue;
+                }
                 const obj = item.object;
+                const before = pi.messages.items.len;
                 const t_val = obj.get("type") orelse {
                     // Bare {role, content} (some clients omit "type":"message")
                     try appendMessageItem(allocator, &pi, obj, image_decoder, vp);
+                    try joinReasoningTurn(allocator, &pi, &reasoning_turn, before);
                     continue;
                 };
-                if (t_val != .string) continue;
+                if (t_val != .string) {
+                    reasoning_turn = null;
+                    continue;
+                }
                 const t = t_val.string;
+                if (!std.mem.eql(u8, t, "message") and !std.mem.eql(u8, t, "function_call")) reasoning_turn = null;
                 if (std.mem.eql(u8, t, "message")) {
                     try appendMessageItem(allocator, &pi, obj, image_decoder, vp);
+                    try joinReasoningTurn(allocator, &pi, &reasoning_turn, before);
                 } else if (std.mem.eql(u8, t, "function_call")) {
                     try appendFunctionCallInputItem(allocator, &pi, obj, namespace_aliases);
+                    try joinReasoningTurn(allocator, &pi, &reasoning_turn, before);
                 } else if (std.mem.eql(u8, t, "function_call_output")) {
                     try appendFunctionCallOutputItem(allocator, &pi, obj, image_decoder, vp);
                 } else if (std.mem.eql(u8, t, "reasoning")) {
-                    // Drop on input — model regenerates its own reasoning.
-                    continue;
+                    try appendReasoningInputItem(allocator, &pi, obj);
+                    reasoning_turn = pi.messages.items.len - 1;
                 } else if (std.mem.eql(u8, t, "compaction")) {
                     appendCompactionInputItem(allocator, &pi, obj) catch {};
                 } else {
@@ -671,6 +683,94 @@ pub fn parseInput(
     }
 
     return pi;
+}
+
+fn appendReasoningInputItem(
+    allocator: std.mem.Allocator,
+    pi: *ParsedInput,
+    obj: std.json.ObjectMap,
+) !void {
+    if (obj.get("encrypted_content")) |value| {
+        if (value != .null) {
+            if (value != .string) return error.InvalidReasoningInput;
+            // A readable summary cannot recover the omitted encrypted body.
+            if (value.string.len > 0) return error.OpaqueReasoningUnsupported;
+        }
+    }
+    var text = std.ArrayList(u8).empty;
+    defer text.deinit(allocator);
+    // This server emits its full plaintext reasoning in summary_text. Prefer
+    // explicit content when a caller supplies both content and a summary.
+    const content: ?std.json.Value = if (obj.get("content")) |value|
+        (if (value == .null) null else value)
+    else
+        null;
+    const parts = content orelse obj.get("summary") orelse return error.InvalidReasoningInput;
+    if (parts != .array) return error.InvalidReasoningInput;
+    for (parts.array.items) |part| {
+        if (part != .object) return error.InvalidReasoningInput;
+        const kind = part.object.get("type") orelse return error.InvalidReasoningInput;
+        const value = part.object.get("text") orelse return error.InvalidReasoningInput;
+        if (kind != .string or value != .string) return error.InvalidReasoningInput;
+        const valid = if (content != null)
+            std.mem.eql(u8, kind.string, "reasoning_text") or std.mem.eql(u8, kind.string, "text")
+        else
+            std.mem.eql(u8, kind.string, "summary_text");
+        if (!valid) return error.InvalidReasoningInput;
+        try text.appendSlice(allocator, value.string);
+    }
+    const owned = try text.toOwnedSlice(allocator);
+    {
+        errdefer allocator.free(owned);
+        try pi.owned_strings.append(allocator, owned);
+    }
+    try pi.messages.append(allocator, .{
+        .role = "assistant",
+        .content = "",
+        .reasoning_content = owned,
+    });
+}
+
+// A Responses reasoning item and the following text/calls belong to one
+// assistant turn. Keep parallel calls together, but never cross tool/user
+// boundaries or collapse separate nonempty assistant messages.
+fn joinReasoningTurn(
+    allocator: std.mem.Allocator,
+    pi: *ParsedInput,
+    turn: *?usize,
+    before: usize,
+) !void {
+    const index = turn.* orelse return;
+    if (pi.messages.items.len != before + 1) {
+        turn.* = null;
+        return;
+    }
+    const next = pi.messages.items[before];
+    const target = &pi.messages.items[index];
+    if (!std.mem.eql(u8, next.role, "assistant") or
+        (target.content.len > 0 and next.content.len > 0) or
+        (target.images != null and next.images != null))
+    {
+        turn.* = null;
+        return;
+    }
+    if (next.tool_calls) |calls| {
+        if (target.tool_calls) |existing| {
+            const joined = try allocator.alloc(chat_mod.ToolCall, existing.len + calls.len);
+            {
+                errdefer allocator.free(joined);
+                try pi.owned_tool_calls.append(allocator, joined);
+            }
+            @memcpy(joined[0..existing.len], existing);
+            @memcpy(joined[existing.len..], calls);
+            target.tool_calls = joined;
+        } else {
+            target.tool_calls = calls;
+        }
+    }
+    if (next.content.len > 0) target.content = next.content;
+    if (next.images) |images| target.images = images;
+    pi.messages.items.len = before;
 }
 
 /// Join the text parts (`input_text`/`text`/`output_text`) of a Responses
@@ -1849,4 +1949,173 @@ test "ResponseStore: a history held through get outlives a DELETE and an evictio
     try store.put(try makeTestStored(gpa, "b"));
     try testing.expectEqualStrings("a", held.id);
     held.release();
+}
+
+test "reasoning replay: parallel calls match the Qwen template" {
+    const a = testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\[{"role":"user","content":"compare"},
+        \\ {"type":"reasoning","summary":[{"type":"summary_text","text":"inspect both"}]},
+        \\ {"type":"function_call","call_id":"c1","name":"lookup","arguments":"{\"id\":1}"},
+        \\ {"type":"function_call","call_id":"c2","name":"lookup","arguments":"{\"id\":2}"},
+        \\ {"type":"function_call_output","call_id":"c2","output":"second"},
+        \\ {"type":"function_call_output","call_id":"c1","output":"first"},
+        \\ {"type":"reasoning","content":[{"type":"reasoning_text","text":"combine "},{"type":"reasoning_text","text":"results"}]},
+        \\ {"role":"assistant","content":[{"type":"output_text","text":"answer"}]},
+        \\ {"role":"user","content":"continue"}]
+    , .{});
+    defer parsed.deinit();
+    var pi = try parseInput(a, parsed.value, null, null, null, null, .{});
+    defer pi.deinit();
+    const calls = [_]chat_mod.ToolCall{
+        .{ .id = "c1", .name = "lookup", .arguments = "{\"id\":1}" },
+        .{ .id = "c2", .name = "lookup", .arguments = "{\"id\":2}" },
+    };
+    const expected = [_]chat_mod.Message{
+        .{ .role = "user", .content = "compare" },
+        .{ .role = "assistant", .content = "", .reasoning_content = "inspect both", .tool_calls = &calls },
+        .{ .role = "tool", .content = "second", .tool_call_id = "c2" },
+        .{ .role = "tool", .content = "first", .tool_call_id = "c1" },
+        .{ .role = "assistant", .content = "answer", .reasoning_content = "combine results" },
+        .{ .role = "user", .content = "continue" },
+    };
+    try testing.expectEqual(@as(usize, expected.len), pi.messages.items.len);
+    try testing.expectEqualStrings("c1", pi.messages.items[1].tool_calls.?[0].id);
+    try testing.expectEqualStrings("c2", pi.messages.items[1].tool_calls.?[1].id);
+    try testing.expectEqualStrings("c2", pi.messages.items[2].tool_call_id.?);
+    try expectReasoningTemplateEquivalent(pi.messages.items, &expected, "inspect both");
+}
+
+test "reasoning replay: reasoning-only history stays before the next user" {
+    const a = testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\[{"role":"user","content":"first"},
+        \\ {"type":"reasoning","summary":[{"type":"summary_text","text":"unfinished thought"}]},
+        \\ {"role":"user","content":"second"},
+        \\ {"type":"reasoning","summary":[{"type":"summary_text","text":"new thought"}]},
+        \\ {"role":"assistant","content":"answer"}]
+    , .{});
+    defer parsed.deinit();
+    var pi = try parseInput(a, parsed.value, null, null, null, null, .{});
+    defer pi.deinit();
+    const expected = [_]chat_mod.Message{
+        .{ .role = "user", .content = "first" },
+        .{ .role = "assistant", .content = "", .reasoning_content = "unfinished thought" },
+        .{ .role = "user", .content = "second" },
+        .{ .role = "assistant", .content = "answer", .reasoning_content = "new thought" },
+    };
+    try testing.expectEqual(@as(usize, expected.len), pi.messages.items.len);
+    try expectReasoningTemplateEquivalent(pi.messages.items, &expected, "unfinished thought");
+}
+
+test "reasoning replay: opaque and malformed reasoning fail explicitly" {
+    const a = testing.allocator;
+    for ([_][]const u8{
+        \\[{"type":"reasoning","encrypted_content":"opaque","summary":[]}]
+        ,
+        \\[{"type":"reasoning","encrypted_content":"opaque","summary":[{"type":"summary_text","text":"only a summary"}]}]
+        ,
+    }) |json| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+        defer parsed.deinit();
+        try testing.expectError(error.OpaqueReasoningUnsupported, parseInput(a, parsed.value, null, null, null, null, .{}));
+    }
+    for ([_][]const u8{
+        \\[{"type":"reasoning","summary":"invalid"}]
+        ,
+        \\[{"type":"reasoning","content":[{"type":"unknown","text":"lost"}]}]
+        ,
+        \\[{"type":"reasoning","encrypted_content":17}]
+        ,
+    }) |json| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+        defer parsed.deinit();
+        try testing.expectError(error.InvalidReasoningInput, parseInput(a, parsed.value, null, null, null, null, .{}));
+    }
+}
+
+test "reasoning replay: emitted plaintext round trips without changing bytes" {
+    const a = testing.allocator;
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(a);
+    try buffer.append(a, '[');
+    try appendReasoningItem(a, &buffer, "rs_1", "line one\nline \"two\"\n");
+    try buffer.append(a, ']');
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, buffer.items, .{});
+    defer parsed.deinit();
+    var pi = try parseInput(a, parsed.value, null, null, null, null, .{});
+    defer pi.deinit();
+    try testing.expectEqual(@as(usize, 1), pi.messages.items.len);
+    try testing.expectEqualStrings("line one\nline \"two\"\n", pi.messages.items[0].reasoning_content.?);
+}
+
+test "reasoning replay: native history null content retains plaintext summary" {
+    const a = testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\[{"type":"reasoning","id":"rs_native","content":null,"encrypted_content":null,"summary":[{"type":"summary_text","text":"native retained thought"}]},
+        \\ {"role":"assistant","content":"answer"}]
+    , .{});
+    defer parsed.deinit();
+    var pi = try parseInput(a, parsed.value, null, null, null, null, .{});
+    defer pi.deinit();
+    try testing.expectEqual(@as(usize, 1), pi.messages.items.len);
+    try testing.expectEqualStrings("native retained thought", pi.messages.items[0].reasoning_content.?);
+    try testing.expectEqualStrings("answer", pi.messages.items[0].content);
+}
+
+test "reasoning replay: explicit plaintext content takes precedence over summary" {
+    const a = testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\[{"type":"reasoning","encrypted_content":"","content":[{"type":"text","text":"full reasoning"}],"summary":[{"type":"summary_text","text":"short summary"}]},
+        \\ {"role":"assistant","content":"answer"}]
+    , .{});
+    defer parsed.deinit();
+    var pi = try parseInput(a, parsed.value, null, null, null, null, .{});
+    defer pi.deinit();
+    try testing.expectEqual(@as(usize, 1), pi.messages.items.len);
+    try testing.expectEqualStrings("full reasoning", pi.messages.items[0].reasoning_content.?);
+    try testing.expectEqualStrings("answer", pi.messages.items[0].content);
+}
+
+test "reasoning replay: empty and consecutive reasoning never cross a boundary" {
+    const a = testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\[{"role":"user","content":"question"},
+        \\ {"type":"reasoning","summary":[]},
+        \\ {"type":"reasoning","summary":[{"type":"summary_text","text":"one"}]},
+        \\ {"type":"reasoning","summary":[{"type":"summary_text","text":"two"}]},
+        \\ {"type":"function_call","call_id":"c1","name":"lookup","arguments":"{}"},
+        \\ {"type":"function_call_output","call_id":"c1","output":"done"},
+        \\ {"role":"assistant","content":"final"}]
+    , .{});
+    defer parsed.deinit();
+    var pi = try parseInput(a, parsed.value, null, null, null, null, .{});
+    defer pi.deinit();
+    try testing.expectEqual(@as(usize, 6), pi.messages.items.len);
+    try testing.expectEqualStrings("", pi.messages.items[1].reasoning_content.?);
+    try testing.expectEqualStrings("one", pi.messages.items[2].reasoning_content.?);
+    try testing.expectEqualStrings("two", pi.messages.items[3].reasoning_content.?);
+    try testing.expectEqualStrings("c1", pi.messages.items[3].tool_calls.?[0].id);
+    try testing.expect(pi.messages.items[5].reasoning_content == null);
+}
+
+fn expectReasoningTemplateEquivalent(actual: []const chat_mod.Message, expected: []const chat_mod.Message, thought: []const u8) !void {
+    const a = testing.allocator;
+    const config = chat_mod.ChatConfig{
+        .chat_template = @embedFile("../../../fixtures/qwen38_chat_template.jinja"),
+        .bos_token = null,
+        .eos_token = "<|im_end|>",
+        .add_bos_token = false,
+        .allocator = a,
+        .chat_template_kwargs = "{\"preserve_thinking\":true}",
+    };
+    const tools = "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"parameters\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}}}}}]";
+    const rendered = try chat_mod.renderChatTemplate(a, actual, &config, tools, null, true, "xhigh", false);
+    defer a.free(rendered);
+    const reference = try chat_mod.renderChatTemplate(a, expected, &config, tools, null, true, "xhigh", false);
+    defer a.free(reference);
+    try testing.expectEqualStrings(reference, rendered);
+    try testing.expect(std.mem.indexOf(u8, rendered, thought) != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "<|im_start|>assistant\n<think>\n") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "<function=example_function_name>") != null);
 }
