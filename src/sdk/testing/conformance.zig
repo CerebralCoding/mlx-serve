@@ -66,6 +66,9 @@ pub fn expectPlugin(comptime M: type) !void {
 
 /// The suite on one subject; `a` should be an arena (the suite frees nothing it allocates in it).
 pub fn expectSubject(io: std.Io, a: Allocator, s: Subject) !void {
+    // An error an earlier test left latched would fail this plugin's job; drop it, saying whose it was not.
+    var buf: [512]u8 = undefined;
+    if (mlx.takeError(&buf)) |stale| std.debug.print("conformance: plugin {s}: dropped an earlier test's MLX error ({s})\n", .{ s.name, stale });
     switch (s.table) {
         .model => |t| try expectModel(io, a, s, t),
         .media => |t| try expectMedia(io, a, s, t),
@@ -79,7 +82,10 @@ fn fail(name: []const u8, comptime what: []const u8, why: Str) error{Conformance
 }
 
 fn expectOk(name: []const u8, comptime what: []const u8, v: Verdict) !void {
-    if (!v.isOk()) return fail(name, what, v.why);
+    if (v.isOk()) return;
+    var buf: [512]u8 = undefined;
+    if (mlx.takeError(&buf)) |text| std.debug.print("conformance: plugin {s}: latched MLX error: {s}\n", .{ name, text });
+    return fail(name, what, v.why);
 }
 
 fn expectHead(s: Subject, comptime T: type, version: u32, t: *const T) !void {

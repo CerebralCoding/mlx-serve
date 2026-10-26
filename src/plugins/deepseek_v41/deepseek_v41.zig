@@ -364,6 +364,8 @@ pub const Dsv41Model = struct {
     ced_stats: struct { chunks: u64 = 0, skipped: u64 = 0 } = .{},
     /// Threads per threadgroup of the hc kernels, all four alike so the wide and decode-width stages sum in one order.
     hc_tg: usize = HC_TG,
+    /// Threads per top-k threadgroup (`probeTopkThreads`); the picks are the same at any width.
+    topk_tg: usize = 1024,
     /// Bytes per indexer score block (tests narrow it to drive several).
     /// Test-only: named intermediates of a one-span forward.
     trace: ?*Trace = null,
@@ -1062,7 +1064,6 @@ const dense_f32x_rps = 4;
 pub const TOPK_SOURCE = kernelSource("plugins/deepseek_v41/kernels/topk.metal");
 
 pub const TOPK_HEADER = kernelSource("plugins/deepseek_v41/kernels/topk_header.metal");
-const topk_tg = 1024;
 
 /// `hcSplit`'s projection: per row, the 24 mixing logits of the flattened
 /// stream, rms-scaled, times scale plus base. One threadgroup an R-row x M-mix
@@ -1376,6 +1377,7 @@ pub fn init(gpa: std.mem.Allocator, cfg: *const Config, w: *Weights, s: S, opts:
     for (0..n_layers) |li| m.layers[li] = if (m.held(li)) try loadLayer(m, w, "layers", li, li) else std.mem.zeroes(Layer);
     m.ced_split = cedSplit(cfg);
     try probeHcThreads(gpa, m);
+    try probeTopkThreads(gpa, m);
     try compileRegions(m);
     if (n_stages > 0) {
         for (0..n_stages) |si| m.layers[n_layers + si] = try loadLayer(m, w, "mtp", si, null);
@@ -1894,6 +1896,26 @@ fn probeHcThreads(gpa: std.mem.Allocator, m: *Dsv41Model) !void {
         };
         return;
     }
+}
+
+/// `m.topk_tg` threads, halved until the GPU runs them (M1/M2 grant the kernel fewer than 1024).
+fn probeTopkThreads(gpa: std.mem.Allocator, m: *Dsv41Model) !void {
+    if (!mlx.streamIsGpu(m.s)) return;
+    while (true) {
+        probeTopkOnce(gpa, m) catch |e| {
+            if (e != error.MlxError or m.topk_tg <= 32 or !mlx.takeErrorIf("Thread group size")) return e;
+            m.topk_tg /= 2;
+            log.info("[dsv41] top-k kernel: {d} threads per threadgroup on this GPU\n", .{m.topk_tg});
+            continue;
+        };
+        return;
+    }
+}
+
+fn probeTopkOnce(gpa: std.mem.Allocator, m: *const Dsv41Model) !void {
+    var sc = Scope.init(gpa, m.s);
+    defer sc.deinit();
+    try evalAll(&.{try topkRows(&sc, m, try sc.zeros(&.{ 1, 64 }, .float32), 8)});
 }
 
 fn probeHcOnce(gpa: std.mem.Allocator, m: *const Dsv41Model) !void {
@@ -2492,9 +2514,10 @@ pub fn topkRows(sc: *Scope, m: *const Dsv41Model, x: A, k: usize) !A {
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(dim(x, 0)), ci(k) }, 2, .int32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, topk_tg, ci(dim(x, 0)), 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, topk_tg, 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TG", topk_tg));
+    const tg = ci(m.topk_tg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, tg, ci(dim(x, 0)), 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, tg, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TG", tg));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "K", ci(k)));
     const iv = mlx.mlx_vector_array_new_data(&[_]A{try sc.astype(x, .float32)}, 1);
     defer _ = mlx.mlx_vector_array_free(iv);
@@ -3372,6 +3395,12 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
 
 /// Layers [lo, hi) over every span of `sp`, one layer at a time; `held` is every array crossing
 /// layers, evaluated per layer when there are several spans.
+fn monoUs() i64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(i64, ts.sec) * 1_000_000 + @divTrunc(@as(i64, ts.nsec), 1000);
+}
+
 fn runLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Spans, held: []A, lo: usize, hi: usize) !void {
     const n_spans = sp.xs.len;
     // Wide spans run a layer's row-wise stages over the whole chunk, attention's core per span.
@@ -5251,7 +5280,9 @@ test "dsv41 topk: the kernel picks the k largest of each row in index order, tie
     defer _ = mlx.mlx_fast_metal_kernel_free(m.topk_kernel);
     var prng = std.Random.DefaultPrng.init(7);
     const r = prng.random();
-    for ([_][2]usize{ .{ 3, 3 }, .{ 100, 7 }, .{ 4100, 512 }, .{ 8192, 512 }, .{ 70000, 512 }, .{ 600, 600 } }) |nk| {
+    // The width a small GPU's probe settles on picks what 1024 threads pick.
+    for ([_]usize{ 1024, 256 }) |tg| for ([_][2]usize{ .{ 3, 3 }, .{ 100, 7 }, .{ 4100, 512 }, .{ 8192, 512 }, .{ 70000, 512 }, .{ 600, 600 } }) |nk| {
+        m.topk_tg = tg;
         const n, const k = nk;
         const rows = 2;
         const v = try gpa.alloc(f32, rows * n);
@@ -5277,7 +5308,19 @@ test "dsv41 topk: the kernel picks the k largest of each row in index order, tie
             std.mem.sort(u32, want, {}, std.sort.asc(u32));
             for (want, got[row * k ..][0..k]) |w, g| try testing.expectEqual(@as(i32, @intCast(w)), g);
         }
-    }
+    };
+}
+
+test "dsv41 topk: a threadgroup the GPU refuses is halved until the kernel launches" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    var m: Dsv41Model = undefined;
+    m.s = mlx.gpuStream();
+    m.topk_kernel = try buildKernel("dsv41_topk", &.{"x"}, &.{"out"}, TOPK_SOURCE, TOPK_HEADER);
+    defer _ = mlx.mlx_fast_metal_kernel_free(m.topk_kernel);
+    m.topk_tg = 4096; // above any Metal cap
+    try probeTopkThreads(testing.allocator, &m);
+    try testing.expect(m.topk_tg >= 32 and m.topk_tg <= 1024 and m.topk_tg % 32 == 0);
 }
 
 test "dsv41 index scores: the matrix kernel scores what the scalar kernel scores and picks its blocks, near-ties aside" {
@@ -5293,6 +5336,7 @@ test "dsv41 index scores: the matrix kernel scores what the scalar kernel scores
     m.idx_tile_kernel = try buildKernel("dsv41_index_tile", &IDX_INS, &.{"scores"}, IDX_TILE_SOURCE, "");
     defer _ = mlx.mlx_fast_metal_kernel_free(m.idx_tile_kernel);
     m.topk_kernel = try buildKernel("dsv41_topk", &.{"x"}, &.{"out"}, TOPK_SOURCE, TOPK_HEADER);
+    m.topk_tg = 1024;
     defer _ = mlx.mlx_fast_metal_kernel_free(m.topk_kernel);
     var key = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(key);
@@ -5873,6 +5917,45 @@ test "dsv41 wo_a: fp8 blocks widened to bf16 serve as mxfp8 unchanged, a true bf
     try mlx.check(mlx.mlx_array_eval(eq));
     try mlx.check(mlx.mlx_array_item_bool(&same, eq));
     try testing.expect(same);
+}
+
+test "dsv41 prefill: chunk time against depth (DSV41_PREFILL)" {
+    // DSV41_PREFILL = a pack dir; DSV41_PREFILL_CTX prompt tokens (default 131072) in DSV41_PREFILL_CHUNK-row chunks
+    // (default 2048), the buffer cache released after each as the engine's prefill does.
+    const dir = std.mem.span(std.c.getenv("DSV41_PREFILL") orelse return error.SkipZigTest);
+    const ctx = if (std.c.getenv("DSV41_PREFILL_CTX")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 131072;
+    const chunk = if (std.c.getenv("DSV41_PREFILL_CHUNK")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 2048;
+    const gpa = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const cfg = try testConfig(io, dir);
+    var w = try loadPack(io, gpa, dir, false);
+    defer w.deinit();
+    const m = try init(gpa, &cfg, &w, mlx.gpuStream(), .{ .pack_dir = dir, .head_8bit = true });
+    defer m.deinit();
+    const prompt = try gpa.alloc(u32, ctx);
+    defer gpa.free(prompt);
+    for (prompt, 0..) |*t, k| t.* = @intCast((k * 7919 + 13) % @min(m.vocab, 100000));
+    var st = try initState(m, gpa);
+    defer st.deinit();
+    const t_all = monoUs();
+    var window_us: i64 = 0;
+    var n_window: usize = 0;
+    var at: usize = 0;
+    while (at < ctx) : (at += chunk) {
+        const t0 = monoUs();
+        const l = try extend(m, gpa, &st, prompt[at..@min(ctx, at + chunk)], .last);
+        try mlx.check(mlx.mlx_array_eval(l));
+        _ = mlx.mlx_array_free(l);
+        _ = mlx.mlx_clear_cache();
+        window_us += monoUs() - t0;
+        n_window += 1;
+        if (n_window * chunk >= 16384 or at + chunk >= ctx) {
+            std.debug.print("[dsv41-prefill] depth {d}k: {d:.1} ms/chunk\n", .{ (at + chunk) / 1024, @as(f64, @floatFromInt(window_us)) / 1000.0 / @as(f64, @floatFromInt(n_window)) });
+            window_us = 0;
+            n_window = 0;
+        }
+    }
+    std.debug.print("[dsv41-prefill] chunk {d}: {d} tokens in {d:.2} s\n", .{ chunk, ctx, @as(f64, @floatFromInt(monoUs() - t_all)) / 1e6 });
 }
 
 test "dsv41 decode step: serial one-token steps as the server pipelines them (DSV41_STEP)" {

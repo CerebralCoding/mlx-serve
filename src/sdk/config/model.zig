@@ -997,6 +997,12 @@ pub const ModelConfig = struct {
     /// Whether the prefill chunk is resolved per request (by the admission bill) instead of
     /// once at load. qwen4_exp only: a 1M session's load-time reserve pins every ordinary
     /// prompt to a narrow rung.
+    /// The widest prompt chunk the arch's prompt pass gains from (0 = the ladder's): DeepSeek-V4.1 was tuned at 2048,
+    /// and its Engram layer slows per row past 4096 (a 64k prompt took 22% longer at 8192).
+    pub fn prefillChunkMax(self: *const ModelConfig) u32 {
+        return if (self.isDsv41()) 2048 else 0;
+    }
+
     pub fn perRequestPrefillChunk(self: *const ModelConfig) bool {
         return self.longCtxGated();
     }
@@ -1456,6 +1462,8 @@ pub const ModelConfig = struct {
         // GLM-5-Next: the sparse rows never form a score matrix (indexed kernel), and the
         // dense ones end at the indexer budget (~2k), whatever the chunk.
         if (self.isGlm5()) return 0;
+        // DeepSeek-V4.1: a query scores its window and its index picks, never the prompt.
+        if (self.isDsv41()) return 0;
         if (self.isMla()) return self.mlaQkHeadDim();
         return self.head_dim;
     }

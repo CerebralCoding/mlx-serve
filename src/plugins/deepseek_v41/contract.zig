@@ -2848,6 +2848,7 @@ const Shell = struct {
         m.idx_tile_kernel = try b("dsv41_index_tile", &v41.IDX_INS, &.{"scores"}, v41.IDX_TILE_SOURCE, "");
         m.gate_kernel = try b("dsv41_gate", &.{ "x", "w" }, &.{"logits"}, v41.GATE_SOURCE, "");
         m.topk_kernel = try b("dsv41_topk", &.{"x"}, &.{"out"}, v41.TOPK_SOURCE, v41.TOPK_HEADER);
+        m.topk_tg = 1024;
         m.dense_f32x_kernel = try b("dsv41_dense_f32x", &.{ "x", "w" }, &.{"out"}, v41.DENSE_F32X_SOURCE, "");
         m.route_kernel = try b("dsv41_route", &.{ "logits", "bias", "scal" }, &.{ "idx", "wts" }, v41.ROUTE_SOURCE, "");
         m.hc_mix_kernel = try b("dsv41_hc_mix", &.{ "x", "fn", "scale", "base", "eps" }, &.{"z"}, v41.HC_MIX_SOURCE, "");

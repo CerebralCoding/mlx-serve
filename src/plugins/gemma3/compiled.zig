@@ -7,6 +7,7 @@
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const fused_act = @import("../../sdk/blocks/mlp/fused_activations.zig");
+const log = @import("../../sdk/util/log.zig");
 
 const Array = mlx.mlx_array;
 const Closure = mlx.mlx_closure;
@@ -51,6 +52,7 @@ pub const Compiled = struct {
         c.gelu = compile(c, &geluCallback);
         c.geglu = compile(c, &gegluCallback);
         if (softcap > 0) c.softcap = compile(c, &softcapCallback);
+        log.info("[gemma] GELU + GeGLU{s} compiled\n", .{if (softcap > 0) " + softcap" else ""});
     }
 
     pub fn deinit(c: *Compiled) void {

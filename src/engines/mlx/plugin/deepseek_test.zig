@@ -9,6 +9,8 @@ const v41_config = @import("../../../plugins/deepseek_v41/config.zig");
 const v41_bill = @import("../../../plugins/deepseek_v41/bill.zig");
 const prefillNeededAtChunk = @import("../admission/prefill_chunk.zig").prefillNeededAtChunk;
 const dsv41PrefillMemoryNeeded = @import("../admission/prefill_chunk.zig").dsv41PrefillMemoryNeeded;
+const resolvePrefillChunk = @import("../admission/prefill_chunk.zig").resolvePrefillChunk;
+const effectivePrefillChunk = @import("../generate/prefill_chunk.zig").effectivePrefillChunk;
 
 test "deepseek_v4 bill: the plugin's terms equal the engine's on the release config" {
     const t = std.testing;
@@ -65,4 +67,14 @@ test "deepseek_v41 bill: the plugin's terms equal the engine's on the release co
         try t.expectEqual(legacy.prefillAttnKeys(seq), b.prefill_attn_keys.?(&p, seq));
         try t.expectEqual(prefillNeededAtChunk(&legacy, seq, 256, 16, 4096, .{}), b.prefill_bytes.?(&p, seq, 4096, 16, 0));
     }
+}
+
+test "dsv41 prefill chunk: pinned at 2048 on a big machine, and kept there however long the prompt" {
+    const t = std.testing;
+    var cfg = try model.parseConfigFromJson(t.allocator, model.dsv41_release_config);
+    const gb: u64 = 1 << 30;
+    cfg.pinned_prefill_chunk = resolvePrefillChunk(&cfg, 16, 240 * gb, 140 * gb, 0, 0);
+    try t.expectEqual(@as(u32, 2048), cfg.pinned_prefill_chunk);
+    for ([_]usize{ 2048, 65536, 131_072, 1 << 20 }) |ctx|
+        try t.expectEqual(@as(usize, 2048), effectivePrefillChunk(cfg.prefillScoreHeadDim(), cfg.num_attention_heads, ctx, cfg.has_sliding_window, cfg.isMoe(), cfg.longCtxGated(), cfg.pinned_prefill_chunk));
 }

@@ -876,6 +876,12 @@ test "boundedPrefillChunk: MiMo builds no prefill score tensor, so its chunk nev
     try testing.expect(transformer_mod.prefillHeadDimFused(cfg.prefillScoreHeadDim()));
 }
 
+test "boundedPrefillChunk: DeepSeek-V4.1 attends a window plus its index picks, so its chunk never shrinks with the prompt" {
+    const cfg: model_mod.ModelConfig = .{ .model_type = "deepseek_v41", .head_dim = 512, .num_attention_heads = 64 };
+    try testing.expectEqual(@as(u32, 0), cfg.prefillScoreHeadDim());
+    for ([_]usize{ 16384, 65536, 131_072, 1 << 20 }) |ctx| try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(2048, cfg.prefillScoreHeadDim(), 64, ctx, false, true, false));
+}
+
 test "effectivePrefillChunk: an arch with no prefill score tensor defaults to the wide chunk, still under the pin and an explicit width" {
     const saved = .{ generate_mod.prefillCli().override, generate_mod.prefillCli().explicit };
     defer {
