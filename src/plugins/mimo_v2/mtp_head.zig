@@ -201,6 +201,38 @@ fn rows(g: *Graph, a: Array, start: c_int, stop: c_int) !Array {
     return g.slice(a, &.{ 0, 0, start, 0 }, &.{ sh[0], sh[1], stop, sh[3] });
 }
 
+/// Appends `ids` to the token ring, dropping from the front past its capacity (a prompt chunk can be wider than
+/// the ring); returns the tokens dropped.
+fn appendTokens(toks: *[MAX_TOKS]u32, n: *usize, ids: []const u32) usize {
+    const total = n.* + ids.len;
+    const keep = @min(total, MAX_TOKS);
+    const drop = total - keep;
+    if (drop >= n.*) {
+        @memcpy(toks[0..keep], ids[drop - n.* ..]);
+    } else {
+        const kept_old = n.* - drop;
+        std.mem.copyForwards(u32, toks[0..kept_old], toks[drop..n.*]);
+        @memcpy(toks[kept_old..keep], ids);
+    }
+    n.* = keep;
+    return drop;
+}
+
+test "mimo mtp: a prompt chunk wider than the token ring keeps its tail" {
+    var toks: [MAX_TOKS]u32 = undefined;
+    var n: usize = 0;
+    var ids: [3 * MAX_TOKS]u32 = undefined;
+    for (&ids, 0..) |*t, i| t.* = @intCast(i);
+    try std.testing.expectEqual(@as(usize, 0), appendTokens(&toks, &n, ids[0..5]));
+    try std.testing.expectEqual(@as(usize, 5 + ids.len - MAX_TOKS), appendTokens(&toks, &n, &ids));
+    try std.testing.expectEqual(MAX_TOKS, n);
+    try std.testing.expectEqualSlices(u32, ids[ids.len - MAX_TOKS ..], toks[0..n]);
+    // A narrow append after a full ring keeps the old tail ahead of the new tokens.
+    try std.testing.expectEqual(@as(usize, 2), appendTokens(&toks, &n, &.{ 7, 8 }));
+    try std.testing.expectEqual(@as(u32, 7), toks[n - 2]);
+    try std.testing.expectEqual(ids[ids.len - MAX_TOKS + 2], toks[0]);
+}
+
 /// One request's head state, read off the head cache's recurrent entries and written back after every forward:
 /// entry k holds head k's keys (`.conv`) and values (`.ssm`); entry 0 also the hidden ring (`.conv_input`) and the
 /// integers (`.state_seq`: `meta` then the token ring); entries 1.. hold the round's drafts (`.conv_input`).
@@ -324,16 +356,7 @@ const State = struct {
         st.hid_len += ids.len;
         if (st.n_toks == 0) st.tok_base = p0 + 1;
         if (st.tokEnd() != p0 + 1) return error.MimoMtpRowGap;
-        // Tokens past the ring's capacity drop from the front first (the legacy appends, then trims).
-        const total = st.n_toks + ids.len;
-        const drop_t = total -| MAX_TOKS;
-        var all: [MAX_TOKS * 2]u32 = undefined;
-        if (total > all.len) return error.MimoMtpChunkTooWide;
-        @memcpy(all[0..st.n_toks], st.toks[0..st.n_toks]);
-        @memcpy(all[st.n_toks..total], ids);
-        @memcpy(st.toks[0 .. total - drop_t], all[drop_t..total]);
-        st.n_toks = total - drop_t;
-        st.tok_base += drop_t;
+        st.tok_base += appendTokens(&st.toks, &st.n_toks, ids);
         if (st.hid_len > RING_ROWS) {
             const drop = st.hid_len - RING_ROWS;
             const sh = ops.shape(st.hid);
