@@ -292,6 +292,10 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
     // 5. Cull finished / errored / cancelled from `decoding`. The slot
     //    still belongs to its connection thread until that thread calls
     //    `complete`; we just stop touching it.
+    // A slot cancelled here by the engine (SIGTERM's `cancelAllInFlight`) tells its stream, whose reader waits on
+    // the stream, not the slot; a client's cancel reached the stream first. Sent past `queue_mu` (the stream locks).
+    var cancelled: [64]*Slot = undefined;
+    var n_cancelled: usize = 0;
     {
         sch.queue_mu.lockUncancelable(sch.io);
         defer sch.queue_mu.unlock(sch.io);
@@ -305,11 +309,16 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
                 s.memory_promised = 0;
             }
             if (drop) {
+                if (!s.finished and s.error_code == null and n_cancelled < cancelled.len) {
+                    cancelled[n_cancelled] = s;
+                    n_cancelled += 1;
+                }
                 _ = sch.decoding.orderedRemove(i);
             } else i += 1;
         }
         publishLiveKvResidency(sch, null);
     }
+    for (cancelled[0..n_cancelled]) |s| s.markFinished("cancelled");
     return if (ran) .ran else .idle;
 }
 

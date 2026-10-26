@@ -264,6 +264,8 @@ pub const Scheduler = struct {
     session_cond: std.Io.Condition,
 
     inference_thread: ?std.Thread,
+    /// Set as the inference thread returns: `deinit` joins only a thread that has.
+    inference_done: std.atomic.Value(bool) = .init(false),
     shutdown: std.atomic.Value(bool),
     /// The shutdown flush's deadline on the `nowMsMonotonic` clock; 0 = off. Set before `shutdown`.
     shutdown_deadline_ms: std.atomic.Value(i64) = .init(0),

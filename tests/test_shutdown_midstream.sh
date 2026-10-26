@@ -38,7 +38,7 @@ for i in $(seq 1 "$ITERS"); do
   CURLPIDS=()
   for _ in 1 2 3; do
     curl -s "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' \
-      -d '{"model":"mlx-serve","stream":true,"max_tokens":400,"temperature":0.7,"messages":[{"role":"user","content":"Write a long detailed essay about the history of computing, at least 300 words."}]}' \
+      -d '{"model":"mlx-serve","stream":true,"max_tokens":8000,"temperature":0.7,"messages":[{"role":"user","content":"Write a long detailed essay about the history of computing, at least 300 words."}]}' \
       >/dev/null 2>&1 &
     CURLPIDS+=($!)
   done
@@ -48,9 +48,9 @@ for i in $(seq 1 "$ITERS"); do
   sleep "$d"
   kill -TERM "$SVPID" 2>/dev/null
 
-  # wait for exit within the drain bound (+margin); detect hang
+  # a cancelled stream ends at once, so exit lands well inside the 30 s drain bound; detect hang
   exited=0
-  for _ in $(seq 1 70); do   # 35s
+  for _ in $(seq 1 20); do   # 10s
     kill -0 "$SVPID" 2>/dev/null || { exited=1; break; }
     sleep 0.5
   done

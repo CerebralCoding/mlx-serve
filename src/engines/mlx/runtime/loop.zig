@@ -48,6 +48,7 @@ pub const idleEvictTickMs = @import("../../../host/http/server.zig").idleEvictTi
 pub fn inferenceLoop(ctx: ThreadCtx) void {
     const sch = ctx.scheduler;
     const params = ctx.params;
+    defer sch.inference_done.store(true, .release);
     // Covers shutdown and startup-load failure.
     defer sleep_inhibit.release();
 
