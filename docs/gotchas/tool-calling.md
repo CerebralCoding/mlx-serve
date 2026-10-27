@@ -334,3 +334,7 @@ bar`, `tests/test_loop_stop_signal.sh`.
 Defect: an issue was filed against `coerceToolArgsToSchema` because its doc said "only SCALARS are touched", two weeks
 after the container arm shipped. Fix: the comment describes the code and the container coercion is pinned by a test
 named for the issue. Guard: that test.
+
+## A DSML tool call came back as bare closers with finish "stop" (#980)
+Defect: DeepSeek-V4.1 agent turns ended with text like `</｜DSML｜ calls>` and no `tool_calls`; the client took it as the final answer and went idle. Cause: the scrubber and the stream gate knew only the OPENER `<｜DSML｜`; once the opener and payload were gone (a call inside the think block, or never written) the closers matched nothing and rode out as content, and live they streamed because nothing held them. Fix: `</｜DSML｜` is a cut marker in `trimLeakedToolMarkup` and a hold (with its split lead-in `</`) in `streamShouldBufferForTools`. Guard: the corpus entry `lone DSML closers with no opener never leak into content` plus the two `#980` unit tests. Not fixed: a call the model writes inside its think block is still not recovered as a call.
+

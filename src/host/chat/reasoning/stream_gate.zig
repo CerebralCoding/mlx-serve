@@ -92,6 +92,7 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
 
     // DeepSeek-V4 DSML: everything from `<｜DSML｜` on is a tool-call block.
     if (std.mem.indexOf(u8, buf, "<｜DSML｜") != null) return true;
+    if (std.mem.indexOf(u8, buf, "</｜DSML｜") != null) return true;
 
     // Muse-Glimmer ATEM: everything from the wrapper on is call payload.
     if (std.mem.indexOf(u8, buf, "<atem:") != null) return true;
@@ -153,6 +154,10 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
         "<｜DSML",
         "<｜DSML\xef",
         "<｜DSML\xef\xbd",
+        // its closers: a lone one leaks the same way when the opener is gone
+        "</",      "</\xef",    "</\xef\xbd",
+        "</｜",     "</｜D",     "</｜DS",    "</｜DSM",    "</｜DSML",
+        "</｜DSML\xef", "</｜DSML\xef\xbd",
     };
     for (tail_prefixes) |p| {
         if (std.mem.endsWith(u8, buf, p)) return true;
@@ -725,6 +730,13 @@ test "streamShouldBufferForTools: DSML marker and partial fullwidth prefixes hol
     try testing.expect(streamShouldBufferForTools("answer text <｜"));
     // plain prose with a fullwidth bar elsewhere must NOT hold
     try testing.expect(!streamShouldBufferForTools("the ｜ character is fun"));
+}
+
+test "streamShouldBufferForTools: a DSML closer with no opener holds, and so does its split lead-in (#980)" {
+    try testing.expect(streamShouldBufferForTools("Step 3 done.\n\n</｜DSML｜ calls>"));
+    try testing.expect(streamShouldBufferForTools("Step 3 done.\n\n</｜DSML｜"));
+    try testing.expect(streamShouldBufferForTools("Step 3 done.\n\n</"));
+    try testing.expect(!streamShouldBufferForTools("a closing </div> tag"));
 }
 
 test "streamShouldBufferForTools: every prefix of a bare <invoke> call holds; prose releases" {

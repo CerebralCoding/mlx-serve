@@ -10,7 +10,7 @@ const BARE_INVOKE = @import("invoke.zig").BARE_INVOKE;
 const FUNCTION_CALLS_TAG = @import("invoke.zig").FUNCTION_CALLS_TAG;
 const freeParsedCalls = @import("dsml.zig").freeParsedCalls;
 
-/// Tool-call WRAPPER openers that must never survive into text a client
+/// Tool-call WRAPPER openers (and DSML's closer, which no prose spells) that must never survive into text a client
 /// renders. Every entry is the opening marker of a call block, so whatever
 /// follows it is call payload, not prose — parseToolCalls has already run by
 /// the time these matter, so a marker still present means the block did not
@@ -20,6 +20,7 @@ const freeParsedCalls = @import("dsml.zig").freeParsedCalls;
 /// parse has no reliable end, and shipping half of it is the same leak.
 const tool_markup_openers = [_][]const u8{
     "<｜DSML｜", // DeepSeek-V4 native (covers tool_calls/invoke/parameter)
+    "</｜DSML｜", // its closers, once the opener is gone (a call lost to the think split or never written)
     "<|tool_call", // Gemma 4
     "<tool_call", // Hermes XML + the plural/suffixed variants
     "<tool_calls:", // Hy3 suffixed wrapper
@@ -160,6 +161,11 @@ test "trimLeakedToolMarkup cuts at the first unparsed tool-call opener" {
 
     // Earliest marker wins when several families appear.
     try testing.expectEqualStrings("a", trimLeakedToolMarkup("a<tool_call>b<｜DSML｜c"));
+}
+
+test "trimLeakedToolMarkup cuts a DSML closer whose opener is gone (#980)" {
+    try testing.expectEqualStrings("Task 2 green. Running the full check.", trimLeakedToolMarkup("Task 2 green. Running the full check.\n\n</｜DSML｜ calls>"));
+    try testing.expectEqualStrings("Done.", trimLeakedToolMarkup("Done.\n\n</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>"));
 }
 
 test "a tool marker split across tokens is only visible once concatenated" {

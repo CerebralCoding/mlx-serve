@@ -587,6 +587,16 @@ const corpus = [_]Expect{
         .content_exact = "",
     },
     .{
+        // Captures from long agent sessions: the call's opener and payload are gone and only the closers are
+        // left, so nothing parses and they used to ride out as the answer with finish "stop".
+        .family = "dsv4-dsml",
+        .name = "lone DSML closers with no opener never leak into content",
+        .raw = "Task 3 targeted tests pass. Running the full check before commit.\n\n" ++
+            "</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+        .no_tool_calls = true,
+        .content_exact = "Task 3 targeted tests pass. Running the full check before commit.",
+    },
+    .{
         // JSON-typed parameter (string="false") must arrive as its declared
         // type, not a stringified spelling.
         .family = "dsv4-dsml",
