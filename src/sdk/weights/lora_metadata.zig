@@ -10,8 +10,13 @@ pub const Geometry = struct {
     heads: u32,
     kv_heads: u32,
     head_dim: u32,
+    targets: ?[]const @import("../../abi/plugin.zig").LoraTarget = null,
 
     fn dimensions(g: Geometry, target: names.LlmTarget) ![2]u64 {
+        if (g.targets) |targets| {
+            for (targets) |t| if (t.layer == target.layer and t.projection == target.projection) return .{ t.input, t.output };
+            return error.InvalidLlmAdapter;
+        }
         if (target.layer >= g.layers) return error.InvalidLlmAdapter;
         const q: u64 = @as(u64, g.heads) * g.head_dim;
         const kv: u64 = @as(u64, g.kv_heads) * g.head_dim;
@@ -113,6 +118,18 @@ pub fn inspect(a: std.mem.Allocator, header: []const u8, payload_bytes: u64, geo
 }
 
 const tiny_geometry: Geometry = .{ .layers = 2, .hidden = 4, .intermediate = 8, .heads = 2, .kv_heads = 1, .head_dim = 2 };
+
+test "gemma4 LoRA: exact loaded targets reject nonexistent projections and wrong widths" {
+    var geometry = tiny_geometry;
+    geometry.targets = &.{.{ .layer = 0, .projection = .q, .input = 4, .output = 8 }};
+    try std.testing.expectError(error.InvalidLlmAdapter, inspect(std.testing.allocator, tiny_header, 64, geometry, 2));
+    geometry.targets = &.{.{ .layer = 0, .projection = .k, .input = 4, .output = 4 }};
+    try std.testing.expectError(error.InvalidLlmAdapter, inspect(std.testing.allocator, tiny_header, 64, geometry, 2));
+    geometry.targets = &.{.{ .layer = 0, .projection = .q, .input = 4, .output = 4 }};
+    const nested = try std.mem.replaceOwned(u8, std.testing.allocator, tiny_header, "model.layers", "language_model.model.layers");
+    defer std.testing.allocator.free(nested);
+    try std.testing.expectEqual(@as(u64, 64), try inspect(std.testing.allocator, nested, 64, geometry, 2));
+}
 const tiny_header =
     \\{"model.layers.0.self_attn.q_proj.lora_a":{"dtype":"F32","shape":[4,2],"data_offsets":[0,32]},"model.layers.0.self_attn.q_proj.lora_b":{"dtype":"F32","shape":[2,4],"data_offsets":[32,64]}}
 ;
@@ -146,4 +163,7 @@ test "LLM LoRA: PEFT header transposes the declared A and B dimensions" {
         \\{"base_model.model.model.layers.1.mlp.down_proj.lora_A.weight":{"dtype":"BF16","shape":[2,8],"data_offsets":[0,32]},"base_model.model.model.layers.1.mlp.down_proj.lora_B.weight":{"dtype":"BF16","shape":[4,2],"data_offsets":[32,48]}}
     ;
     try std.testing.expectEqual(@as(u64, 48), try inspect(std.testing.allocator, header, 48, tiny_geometry, 2));
+    const wrapped = try std.mem.replaceOwned(u8, std.testing.allocator, header, "model.layers", "model.language_model.layers");
+    defer std.testing.allocator.free(wrapped);
+    try std.testing.expectEqual(@as(u64, 48), try inspect(std.testing.allocator, wrapped, 48, tiny_geometry, 2));
 }

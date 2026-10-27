@@ -60,9 +60,9 @@ pub const LlmTarget = struct {
 };
 
 pub fn parseLlmTarget(module: []const u8) ?LlmTarget {
-    const prefix = "model.layers.";
-    if (!std.mem.startsWith(u8, module, prefix)) return null;
-    const rest = module[prefix.len..];
+    const rest = for ([_][]const u8{ "model.layers.", "language_model.model.layers.", "model.language_model.layers." }) |prefix| {
+        if (std.mem.startsWith(u8, module, prefix)) break module[prefix.len..];
+    } else return null;
     const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return null;
     const index = rest[0..dot];
     if (index.len == 0 or (index.len > 1 and index[0] == '0')) return null;

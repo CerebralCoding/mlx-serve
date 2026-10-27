@@ -41,6 +41,8 @@ run by the engine). `qwen3_next` reuses this plugin's load and forward (`plugins
   joined q|k|v / z to the engine's build; a prompt chunk's `Forward.offload` takes them at the legacy seams
   (`GatedMlp`, the GDN projections). `ane_test.zig` proves the build's inputs and the seam against the legacy shell.
 - Not carried by the blocks (so not declared): grouped-verify `projected` slices, int8 prefill.
+- Native LoRA: dense attention + MLP adapters; GDN projections stay frozen. `proof_test.zig` covers gradients through
+  recurrence, 4-bit/bf16 training/serving parity, save/reload, batching, tree verify and the seq512 reservation.
 - Prism packs (`plugins/prism_hadamard_qwen35`) are this plugin's dense trunk with `Config.hadamard_block`: the `.prism`
   body (`Prism` base), one `rht.Registry` per model, f16 activations, an f32 GDN state.
 

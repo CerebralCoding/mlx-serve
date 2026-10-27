@@ -34,6 +34,7 @@ pub fn Decoder(comptime spec: anytype) type {
     const Mlp = spec.mlp;
     const Seam = spec.seam;
     const Head = spec.head;
+    const native_lora_ops = if (@hasField(@TypeOf(spec), "native_lora_ops")) spec.native_lora_ops else false;
     const Hooks = if (@hasField(@TypeOf(spec), "hooks")) spec.hooks else struct {};
     comptime {
         block.check(Embed, &.{.embed});
@@ -69,6 +70,12 @@ pub fn Decoder(comptime spec: anytype) type {
         /// One forward of `ids` (`[slots, rows]` int32). Results are owned by `g`.
         pub fn forward(w: *const Weights, shared: *const block.Shared, g: *Graph, ids: Array, run: Run) !Out {
             if (run.mode == .batched_rows and !batches_decode) return error.BatchedRowsUnsupported;
+            const native_ops = g.native_ops;
+            defer g.native_ops = native_ops;
+            if (native_lora_ops) for (run.lora) |binding| if (binding.scale != 0) {
+                g.native_ops = true;
+                break;
+            };
             var c = run.ctx(g, shared);
             var memo: block.Memo = .{ .g = g };
             c.memo = &memo;

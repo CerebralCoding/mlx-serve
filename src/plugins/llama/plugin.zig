@@ -43,12 +43,15 @@ pub const table = abi.ModelTable{
     .cache = &.{},
     .spec = &.{ .trunk_weight = b.trunk_weight.trunkWeightHook(Loaded(Dense)) },
     .weights = &.{},
-    .native_train_base = &trainBase,
+    .native_train = &trainBase,
 };
 
-fn trainBase(mp: *anyopaque) callconv(.c) ?*const anyopaque {
+fn trainBase(mp: *anyopaque, out: *anyopaque) callconv(.c) abi.Verdict {
     const m: *Loaded(Dense) = @ptrCast(@alignCast(mp));
-    return &m.base;
+    const train = @import("../../sdk/train/model.zig");
+    const frozen: *train.Frozen = @ptrCast(@alignCast(out));
+    frozen.* = train.Frozen.init(&m.base) catch |e| return .{ .code = .unsupported, .why = abi.Str.of(@errorName(e)) };
+    return .{};
 }
 
 const gpa = std.heap.c_allocator;

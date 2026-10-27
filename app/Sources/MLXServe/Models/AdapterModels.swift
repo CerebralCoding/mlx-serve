@@ -91,6 +91,12 @@ struct FineTuneState {
 }
 
 enum FineTunePresentation {
+    static func supports(_ model: LocalModel) -> Bool {
+        ["llama", "qwen3", "gemma4", "gemma4_text", "gemma4_unified", "gemma4_unified_text", "qwen3_5", "qwen3_5_text"].contains(model.modelType) && model.quantFile == nil
+            && (model.quantBits.map { [4, 16].contains($0) } ?? true)
+            && (model.numExperts ?? 0) == 0
+    }
+
     static func eta(_ seconds: Int?) -> String {
         guard let seconds else { return "Estimating…" }
         let value = max(0, seconds)

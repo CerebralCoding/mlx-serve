@@ -38,6 +38,7 @@ const gdn = b.gdn;
 pub const Mixer = bases.Either(gdn.Gdn, b.gated_attention.GatedAttention);
 
 pub const Dense = bases.Decoder(.{
+    .native_lora_ops = true,
     .embed = b.embed.TableEmbed,
     .norm = b.norm.RmsNorm,
     .mixer = Mixer,
@@ -81,7 +82,22 @@ pub const table = abi.ModelTable{
     .cache = &.{ .layout = &config.layout },
     .spec = &.{ .head = &head_hooks, .trunk_weight = &trunkWeight, .tile_lanes = &tileLanes },
     .weights = &.{ .layer_weight = &layerWeight },
+    .native_train = &nativeTrain,
+    .lora_targets = &loraTargets,
 };
+
+fn nativeTrain(mp: *anyopaque, out: *anyopaque) callconv(.c) Verdict {
+    const m: *Loaded = @ptrCast(@alignCast(mp));
+    const result: *@import("../../sdk/train/model.zig").Frozen = @ptrCast(@alignCast(out));
+    if (m.body != .dense) return Verdict.refuse(.unsupported, "TrainingUnsupportedModel");
+    result.* = @import("train.zig").frozen(&m.body.dense.base, m.adapter_prefix) catch |err| return ld.failed(err);
+    return .ok;
+}
+
+fn loraTargets(mp: *anyopaque) callconv(.c) abi.Span(abi.LoraTarget) {
+    const m: *Loaded = @ptrCast(@alignCast(mp));
+    return .of(m.adapter_targets);
+}
 
 pub const head_hooks: abi.HeadHooks = .{
     .load = &headLoad,
@@ -110,6 +126,8 @@ pub fn bill(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(
 /// A loaded model: one of the two bases, the per-model constants, and every handle it holds.
 pub const Loaded = struct {
     caps: abi.Caps,
+    adapter_prefix: []const u8 = "language_model.model",
+    adapter_targets: []abi.LoraTarget = &.{},
     geo: gdn.Geo = undefined,
     angles: b.qk_rope.AngleCache = .{},
     routes: []compiled.Closure = &.{},
@@ -131,6 +149,7 @@ pub const Loaded = struct {
     experts: ?streamed.Streamed = null,
 
     fn release(m: *Loaded) void {
+        gpa.free(m.adapter_targets);
         lane_qmm.release(@intFromPtr(m));
         if (m.head) |*h| h.deinit();
         if (m.experts) |*x| x.close();
@@ -254,6 +273,7 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
         }
         d.base.weights = try trunk(Dense, m, &r, c, d.layers);
         d.base.row_exact = rowLane(d.layers, &d.base.weights.head);
+        if (!c.next) m.adapter_targets = try @import("train.zig").targets(&d.base, gpa);
     }
     return m;
 }
@@ -360,7 +380,7 @@ fn tileLanes(mp: *anyopaque, lane: u32) callconv(.c) Verdict {
         .dense => |*d| d,
         else => return .ok,
     };
-    if (lane != @intFromEnum(row_exact.Lane.mma) or d.base.row_exact != .mma) return .ok;
+    if (lane != @backingInt(row_exact.Lane.mma) or d.base.row_exact != .mma) return .ok;
     const t: Tiler = .{ .owner = @intFromPtr(m), .s = d.base.s };
     var bytes: u64 = 0;
     for (d.layers) |*L| {

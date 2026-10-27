@@ -164,7 +164,7 @@ test "finetune: tiny packs complete, cancel in every stage, release state and ac
             var warm = ops.Graph.init(a, s);
             defer warm.deinit();
             const hidden = try frozen.hidden(&warm, try warm.fromSlice(u32, &.{ 1, 2 }, &.{ 1, 2 }), &.{});
-            try ops.eval(try @import("../../../sdk/bases/blocks/head.zig").project(&warm, &frozen.base.weights.head, hidden));
+            try ops.eval(try frozen.project(&warm, hidden));
         }
         try mlx.check(mlx.mlx_synchronize(s));
         var resident: usize = 0;

@@ -18,8 +18,7 @@ struct CustomizeSheet: View {
 
     private var unsupported: Bool {
         guard let model = appState.localModels.first(where: { $0.path == request.path }) else { return false }
-        return !["llama", "qwen3"].contains(model.modelType) || model.quantFile != nil
-            || (model.quantBits.map { ![4, 16].contains($0) } ?? false)
+        return !FineTunePresentation.supports(model)
     }
 
     var body: some View {
@@ -78,7 +77,7 @@ struct CustomizeSheet: View {
             Text("Include general answers during training to reduce unintended changes. Side effects are checked either way.")
                 .font(.app(.caption)).foregroundStyle(.secondary)
             if unsupported {
-                Text("Customization currently supports dense Qwen3 and Llama MLX models in 4-bit or bf16. This model is not supported yet.")
+                Text("Customization supports dense Gemma 4, Qwen3, Qwen3.5/3.8 and Llama MLX models in 4-bit or bf16. This model is not supported yet.")
                     .font(.app(.callout)).foregroundStyle(.secondary)
             }
             HStack {

@@ -185,6 +185,9 @@ fn facts(lm: *const LoadedModel, out: *host.Facts) void {
         .batches_decode = if (lm.config) |c| verdict.configBatchesDecode(c) else false,
         .hot_cache_bytes = hotCacheBytes(lm),
     };
+    if (lm.transformer) |t| if (t.plugin) |p| if (p.table.lora_targets) |get| {
+        out.lora_targets = get(p.model).slice();
+    };
 }
 
 // ── tests ──

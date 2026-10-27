@@ -57,9 +57,14 @@ pub fn GatedGelu(comptime act: Gelu) type {
             gelu: mlx.mlx_closure = .{ .ctx = null },
         };
 
-        pub fn forward(w: *const Weights, c: *Ctx, x: Array) !Array {
+        pub fn forward(weights: *const Weights, c: *Ctx, x: Array) !Array {
+            var adapted = weights.*;
+            adapted.gate = adapted.gate.withLora(c.lora, c.layer, .gate);
+            adapted.up = adapted.up.withLora(c.lora, c.layer, .up);
+            adapted.down = adapted.down.withLora(c.lora, c.layer, .down);
+            const w = &adapted;
             const g = c.g;
-            const joined = c.mode != .batched_rows and w.rows_joined and w.gu.built() and c.rows * c.slots <= FUSED_ROWS_MAX_M;
+            const joined = !g.differentiable and !g.native_ops and !w.gate.hasLora() and !w.up.hasLora() and c.mode != .batched_rows and w.rows_joined and w.gu.built() and c.rows * c.slots <= FUSED_ROWS_MAX_M;
             var gate: Array = undefined;
             var up: Array = undefined;
             if (joined) {
@@ -78,6 +83,7 @@ pub fn GatedGelu(comptime act: Gelu) type {
             defer sc.deinit();
             const g = &sc;
             const dt = ops.dtype(gate);
+            if (g.differentiable and act == .tanh) return parent.keep(try g.mul(try mlp.geluTanh(g, gate), up));
             if (act == .tanh and w.table.ctx != null and fused_act.swigluFusedEnabled() and (dt == .bfloat16 or dt == .float16)) {
                 if (try fused_act.tableGateMul(g.s, .gelu_tanh, gate, up, w.table, null)) |y| return parent.keep(try g.adopt(y));
             }
@@ -110,11 +116,14 @@ pub const SoftcapHead = struct {
     };
 
     pub fn forward(w: *const Weights, c: *Ctx, x: Array) !Array {
-        const g = c.g;
+        return project(c.g, w, x);
+    }
+
+    pub fn project(g: *Graph, w: *const Weights, x: Array) !Array {
         var logits = try head.project(g, &w.head, x);
         if (w.mult.ctx != null) logits = try g.mul(logits, w.mult);
         if (w.cap.ctx == null) return logits;
-        if (w.compiled.ctx != null) return apply(g, w.compiled, &.{logits});
+        if (!g.differentiable and w.compiled.ctx != null) return apply(g, w.compiled, &.{logits});
         return g.mul(try g.tanh(try g.div(logits, w.cap)), w.cap);
     }
 };
@@ -132,4 +141,30 @@ fn apply(g: *Graph, f: mlx.mlx_closure, args: []const Array) !Array {
         return e;
     };
     return g.adopt(r);
+}
+
+test "gemma4 LoRA: GeGLU applies each MLP adapter with an unfused differentiable product" {
+    const std = @import("std");
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = Graph.init(std.testing.allocator, s);
+    defer g.deinit();
+    var shared = block.Shared.init(1e-6, 1e-6);
+    defer shared.deinit();
+    const x = try g.fromSlice(f32, &.{ 0.2, -0.3 }, &.{ 1, 1, 2 });
+    const weight = try g.fromSlice(f32, &.{ 1, 0.5, -0.4, 0.8 }, &.{ 2, 2 });
+    const w: GeGlu.Weights = .{ .gate = .{ .w = weight }, .up = .{ .w = weight }, .down = .{ .w = weight } };
+    const a = try g.fromSlice(f32, &.{ 0.3, 0.7 }, &.{ 2, 1 });
+    const b = try g.fromSlice(f32, &.{ 0.6, -0.1 }, &.{ 1, 2 });
+    inline for (.{ .gate, .up, .down }) |projection| {
+        const binding: @import("../../../abi/plugin.zig").LoraBinding = .{ .layer = 0, .projection = projection, .a = .{ .ctx = a.ctx }, .b = .{ .ctx = b.ctx }, .scale = 2 };
+        var c: Ctx = .{ .g = &g, .mode = .prefill, .rows = 1, .positions = &.{0}, .shared = &shared, .lora = &.{binding} };
+        var dense = w;
+        @field(dense, @tagName(projection)).w = try g.add(weight, try g.mulScalar(try g.matmul(a, b), 2));
+        const got = try GeGlu.forward(&w, &c, x);
+        c.lora = &.{};
+        const want = try GeGlu.forward(&dense, &c, x);
+        const delta = try g.max(try g.reshape(try g.abs(try g.sub(got, want)), &.{-1}), 0, false);
+        try std.testing.expect(try @import("../../train/grad.zig").item(delta) < 1e-6);
+    }
 }

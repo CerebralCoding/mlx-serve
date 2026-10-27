@@ -75,7 +75,7 @@ pub const Weights = struct {
 pub fn seam(c: *Ctx, h: Array, delta: Array, w_pre: Array, pre_post_eps: bool, scale: Array, w_post: Array) !bases.block.End {
     const g = c.g;
     const sh = c.shared;
-    if (c.mode == .decode) {
+    if (!g.differentiable and c.mode == .decode) {
         if (try residual_norm.fusedResidualNorm(g.s, h, delta, .{ .w1 = w_pre, .eps1 = if (pre_post_eps) sh.post_eps_arr else sh.eps_arr, .scale = scale, .w_post = w_post, .eps = sh.eps_arr })) |r| {
             const sum = g.adopt(r.sum) catch |e| {
                 if (r.normed.ctx != null) _ = mlx.mlx_array_free(r.normed);
@@ -117,7 +117,8 @@ pub fn pleProject(compiled: *const Compiled, c: *Ctx, p: *const Ple, h: Array, p
     const ple = try g.reshape(slice, &.{ sh[0], sh[1], sh[3] });
     const gate = try p.gate.forward(g, h);
     const dt = ops.dtype(gate);
-    if (sh[0] * sh[1] == 1) blk: {
+    if (g.differentiable) return p.proj.forward(g, try g.mul(try b.mlp.geluTanh(g, gate), ple));
+    if (!g.native_ops and sh[0] * sh[1] == 1) blk: {
         const table = try compiled.geluTable(dt);
         if (table.ctx == null) break :blk;
         if (try gelu_ple.fusedGeluPleProj(g.s, gate, ple, table, p.proj.w, p.proj.s, p.proj.b, .{ .bits = p.proj.bits, .group_size = p.proj.group_size, .mode = p.proj.mode })) |y| return g.adopt(y);
@@ -189,7 +190,20 @@ fn denseTail(w: *const Weights, c: *Ctx, h: Array, attn: Array, L: *const Layer,
 
 /// One forward of `ids` (`[slots, rows]` int32). Results are owned by `g`.
 pub fn forward(w: *const Weights, shared: *const bases.Shared, g: *Graph, ids: Array, run: Run) !Out {
+    const previous_ops = g.native_ops;
+    for (run.lora) |binding| if (binding.scale != 0) {
+        g.native_ops = true;
+        break;
+    };
+    defer g.native_ops = previous_ops;
     var c = run.ctx(g, shared);
+    const sequence = if (g.differentiable) try g.a.alloc(?[2]Array, w.layers.len) else null;
+    defer if (sequence) |layers| g.a.free(layers);
+    var sequence_kv: bases.block.SequenceKv = .{ .g = g, .layers = sequence orelse &.{} };
+    if (sequence) |layers| {
+        @memset(layers, null);
+        c.sequence_kv = &sequence_kv;
+    }
     // Masks built once for every layer (a sliding layer's band was rebuilt per layer).
     var memo: bases.block.Memo = .{ .g = g };
     c.memo = &memo;
@@ -205,7 +219,7 @@ pub fn forward(w: *const Weights, shared: *const bases.Shared, g: *Graph, ids: A
         defer lg.deinit();
         c.g = &lg;
         c.layer = @intCast(i);
-        const fuse = c.mode == .decode;
+        const fuse = !g.differentiable and c.mode == .decode;
         const next: Array = if (!fuse) .{} else if (i + 1 < w.layers.len) w.layers[i + 1].input_norm else w.final_norm;
         const normed = carried orelse try lg.rmsNorm(h, L.input_norm, shared.eps);
         const attn = try Attention.forward(&L.attn, &c, normed);

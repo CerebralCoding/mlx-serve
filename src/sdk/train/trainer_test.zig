@@ -128,7 +128,7 @@ test "train core: completion loss gradients match finite differences for all fou
         fn call(self: @This(), graph: *ops.Graph, params: []const ops.Array) !ops.Array {
             const bindings = try self.adapter.bindings(graph, params);
             defer graph.a.free(bindings);
-            return @import("loss.zig").projected(graph, try self.frozen.hidden(graph, self.ids, bindings), self.frozen.base.weights.head, self.labels, self.mask, 5);
+            return @import("loss.zig").projectedHead(graph, try self.frozen.hidden(graph, self.ids, bindings), self.frozen.head, self.labels, self.mask, 5);
         }
     };
     const objective: Objective = .{ .frozen = frozen, .adapter = &adapter, .ids = try g.fromSlice(u32, &.{ 1, 2, 3, 4 }, &.{ 1, 4 }), .labels = try g.fromSlice(u32, &.{ 2, 3, 7, 8 }, &.{4}), .mask = try g.fromSlice(f32, &.{ 0, 0, 1, 1 }, &.{4}) };

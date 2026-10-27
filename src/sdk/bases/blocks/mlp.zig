@@ -18,7 +18,7 @@ const Joined = linear.Joined;
 
 /// `silu(gate) * up`: one exact fused dispatch where it serves, else the two ops.
 pub fn swiglu(g: *Graph, gate: Array, up: Array) !Array {
-    if (!g.differentiable) if (try fused_act.fusedSwiGLU(g.s, gate, up)) |y| return g.adopt(y);
+    if (!g.differentiable and !g.native_ops) if (try fused_act.fusedSwiGLU(g.s, gate, up)) |y| return g.adopt(y);
     var t = g.scope();
     defer t.deinit();
     return g.keep(try t.mul(try t.mul(gate, try t.sigmoid(gate)), up));
@@ -79,11 +79,16 @@ pub const GatedMlp = struct {
         gu: Joined = .{},
     };
 
-    pub fn forward(w: *const Weights, c: *Ctx, x: Array) !Array {
-        if (try c.offloadMlp(x)) |y| return y;
+    pub fn forward(weights: *const Weights, c: *Ctx, x: Array) !Array {
+        var adapted = weights.*;
+        adapted.gate = adapted.gate.withLora(c.lora, c.layer, .gate);
+        adapted.up = adapted.up.withLora(c.lora, c.layer, .up);
+        adapted.down = adapted.down.withLora(c.lora, c.layer, .down);
+        const w = &adapted;
         const g = c.g;
+        if (!g.differentiable and !g.native_ops and !w.gate.hasLora() and !w.up.hasLora() and !w.down.hasLora()) if (try c.offloadMlp(x)) |y| return y;
         const lane = c.row_exact;
-        if (w.gu.built() and row_exact.groupServes(lane, rowsOf(x))) {
+        if (!g.differentiable and !g.native_ops and !w.gate.hasLora() and !w.up.hasLora() and w.gu.built() and row_exact.groupServes(lane, rowsOf(x))) {
             const both = try row_exact.linear(lane, g, &w.gu.lin, x);
             if (w.gu.widths[0] == w.gu.widths[1]) {
                 if (try fused_act.swigluJoined(g.s, both)) |act| return row_exact.linear(lane, g, &w.down, try g.adopt(act));

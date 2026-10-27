@@ -5,8 +5,8 @@ const ops = @import("../../mlx/ops.zig");
 const abi = @import("../../abi/plugin.zig");
 const adamw = @import("adamw.zig");
 const grad = @import("grad.zig");
-pub const Target = struct { layer: u32, projection: abi.LoraProjection, input: u32, output: u32 };
-pub const Options = struct { rank: u32 = 8, alpha: f32 = 16, seed: u64 = 0, compute: ops.Dtype = .bfloat16 };
+pub const Target = abi.LoraTarget;
+pub const Options = struct { rank: u32 = 8, alpha: f32 = 16, seed: u64 = 0, compute: ops.Dtype = .bfloat16, prefix: []const u8 = "model" };
 pub const Adapter = struct {
     a: std.mem.Allocator,
     s: ops.Stream,
@@ -62,7 +62,7 @@ pub const Adapter = struct {
         defer _ = mlx.mlx_map_string_to_string_free(metadata);
         for (self.targets, 0..) |target, i| {
             for ([_][]const u8{ "a", "b" }, 0..) |suffix, j| {
-                const key = try std.fmt.allocPrintSentinel(self.a, "model.layers.{d}.{s}.lora_{s}", .{ target.layer, projectionName(target.projection), suffix }, 0);
+                const key = try std.fmt.allocPrintSentinel(self.a, "{s}.layers.{d}.{s}.lora_{s}", .{ self.options.prefix, target.layer, projectionName(target.projection), suffix }, 0);
                 defer self.a.free(key);
                 const x = try g.astype(self.params[2 * i + j], self.options.compute);
                 try ops.eval(x);

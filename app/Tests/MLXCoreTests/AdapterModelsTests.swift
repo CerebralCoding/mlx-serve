@@ -2,6 +2,24 @@ import XCTest
 @testable import MLXCore
 
 final class AdapterModelsTests: XCTestCase {
+    func testDenseTrainingEligibilityMatchesTheServer() {
+        for arch in ["llama", "qwen3", "gemma4", "gemma4_text", "gemma4_unified", "gemma4_unified_text", "qwen3_5", "qwen3_5_text"] {
+            var model = LocalModel(id: "base", name: "base", path: "/models/base", sizeFormatted: "1 GB",
+                modelType: arch, source: .mlxServe, kind: .base)
+            model.quantBits = 4
+            XCTAssertTrue(FineTunePresentation.supports(model), arch)
+            model.quantBits = 8
+            XCTAssertFalse(FineTunePresentation.supports(model), arch)
+            model.quantBits = 16
+            XCTAssertTrue(FineTunePresentation.supports(model), arch)
+            model.numExperts = 128
+            XCTAssertFalse(FineTunePresentation.supports(model), arch)
+            model.numExperts = nil
+            model.quantFile = "model.gguf"
+            XCTAssertFalse(FineTunePresentation.supports(model), arch)
+        }
+    }
+
     func testSelectionIsBoundToLocalBaseAndPreservesZeroStrength() throws {
         let pick = ChatAdapterSelection(model: "org/base", name: "roses", scale: 0)
         XCTAssertEqual(pick.forModel("org/base", local: true), pick)

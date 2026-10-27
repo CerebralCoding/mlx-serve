@@ -17,7 +17,19 @@ pub fn rootPath(a: std.mem.Allocator) ![]const u8 {
 }
 
 pub fn supported(arch: []const u8) bool {
-    return std.mem.eql(u8, arch, "llama") or std.mem.eql(u8, arch, "qwen3");
+    for ([_][]const u8{ "llama", "qwen3", "gemma4", "gemma4_text", "gemma4_unified", "gemma4_unified_text", "qwen3_5", "qwen3_5_text", "qwen3_5_moe" }) |name| if (std.mem.eql(u8, arch, name)) return true;
+    return false;
+}
+
+test "gemma4 LoRA: dense family aliases can resolve registered adapters" {
+    for ([_][]const u8{ "gemma4", "gemma4_text", "gemma4_unified", "gemma4_unified_text" }) |arch| try std.testing.expect(supported(arch));
+    try std.testing.expect(!supported("embedding_gemma2"));
+}
+
+test "qwen3_5 LoRA: dense family and parsed engine aliases can resolve registered adapters" {
+    for ([_][]const u8{ "qwen3_5", "qwen3_5_text", "qwen3_5_moe" }) |arch| try std.testing.expect(supported(arch));
+    try std.testing.expect(!supported("prism_hadamard_qwen35"));
+    try std.testing.expect(!supported("qwen3_next"));
 }
 
 fn readRegular(a: std.mem.Allocator, io: std.Io, path: []const u8, limit: usize) ![]u8 {

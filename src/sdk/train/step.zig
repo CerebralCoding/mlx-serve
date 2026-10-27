@@ -153,7 +153,7 @@ pub const Trainer = struct {
     }
     fn validate(self: *Trainer, e: Example) !void {
         if (e.inputs.len == 0 or e.inputs.len > self.options.max_rows or e.inputs.len != e.targets.len or e.inputs.len != e.mask.len) return error.InvalidTrainingShape;
-        const vocab: u32 = @intCast(ops.shape(self.model.base.weights.head.w)[0]);
+        const vocab: u32 = @intCast(ops.shape(self.model.head.head.w)[0]);
         var count: u32 = 0;
         for (e.inputs, e.targets, e.mask) |x, y, m| {
             if (x >= vocab or y >= vocab or (m != 0 and m != 1)) return error.InvalidTrainingExample;
@@ -177,7 +177,7 @@ const Objective = struct {
         const bindings = try self.trainer.adapter.bindings(g, params);
         defer g.a.free(bindings);
         const hidden = try self.trainer.model.hidden(g, self.ids, bindings);
-        return loss.projected(g, hidden, self.trainer.model.base.weights.head, self.targets, self.mask, self.trainer.options.vocab_chunk);
+        return loss.projectedHead(g, hidden, self.trainer.model.head, self.targets, self.mask, self.trainer.options.vocab_chunk);
     }
 };
 

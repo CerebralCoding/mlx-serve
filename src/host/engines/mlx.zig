@@ -113,6 +113,7 @@ pub const Facts = struct {
     /// The model batches decode at all (`configBatchesDecode`).
     batches_decode: bool = false,
     hot_cache_bytes: u64 = 0,
+    lora_targets: ?[]const abi_plugin.LoraTarget = null,
 };
 
 /// Engine-wide settings `/props` reports.

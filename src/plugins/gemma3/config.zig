@@ -31,6 +31,7 @@ pub const max_layer_types = 128;
 pub const Config = struct {
     model_type: []const u8 = "gemma3",
     weight_prefix: []const u8 = "model",
+    adapter_prefix: []const u8 = "model",
     vocab_size: u32 = 262208,
     hidden_size: u32 = 3840,
     intermediate_size: u32 = 15360,

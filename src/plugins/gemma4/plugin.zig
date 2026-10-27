@@ -39,7 +39,21 @@ pub const table = abi.ModelTable{
     .cache = &.{ .layout = &config.layout },
     .spec = &.{ .trunk_weight = &load_mod.TrunkWeight(Loaded).get },
     .weights = &.{},
+    .native_train = &trainModel,
+    .lora_targets = &loraTargets,
 };
+
+fn trainModel(mp: *anyopaque, out: *anyopaque) callconv(.c) abi.Verdict {
+    const m: *Loaded = @ptrCast(@alignCast(mp));
+    const frozen: *@import("../../sdk/train/model.zig").Frozen = @ptrCast(@alignCast(out));
+    frozen.* = @import("train.zig").frozen(&m.base, m.adapter_prefix) catch |e| return .{ .code = .unsupported, .why = abi.Str.of(@errorName(e)) };
+    return .{};
+}
+
+fn loraTargets(mp: *anyopaque) callconv(.c) abi.Span(abi.LoraTarget) {
+    const m: *Loaded = @ptrCast(@alignCast(mp));
+    return abi.Span(abi.LoraTarget).of(m.adapter_targets);
+}
 
 const gpa = load_mod.gpa;
 const Verdict = abi.Verdict;
@@ -52,6 +66,8 @@ pub fn bill(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(
 
 pub const Loaded = struct {
     base: bases.Model(decoder),
+    adapter_prefix: []const u8 = "model",
+    adapter_targets: []abi.LoraTarget = &.{},
     layers: []decoder.Layer = &.{},
     owned: load_mod.Owned = .{},
     angles: qk_rope.AngleCache = .{},
@@ -60,6 +76,7 @@ pub const Loaded = struct {
     routing: bases_compiled.Closure = .{ .ctx = null },
 
     fn release(m: *Loaded) void {
+        gpa.free(m.adapter_targets);
         bases_compiled.free(&m.routing);
         m.angles.deinit();
         m.compiled.deinit();
@@ -85,6 +102,7 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
     const m = try gpa.create(Loaded);
     errdefer gpa.destroy(m);
     m.* = .{ .base = .{ .weights = undefined, .shared = bases.Shared.init(c.rms_norm_eps, c.rms_norm_eps), .a = gpa, .s = s, .placeholders = ctx.parsed.placeholder_ids } };
+    m.adapter_prefix = c.adapter_prefix;
     m.compiled.init(s, c.final_logit_softcapping);
     errdefer m.release();
     if (c.num_experts > 0) m.routing = moe.compileRouting(@intCast(c.num_experts_per_tok), s);
@@ -142,6 +160,7 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
         w.ple_proj_norm = try r.norm(o, try r.name(&nb, "per_layer_projection_norm.weight", .{}), false);
     }
     m.base.weights = w;
+    if (c.num_experts == 0) m.adapter_targets = try @import("train.zig").targets(&m.base, gpa);
     if (gemma.ternaryCandidate(c)) try load_mod.armTernary(.{ &m.layers, &m.base.weights.head.head, &m.base.weights.ple_table, &m.base.weights.ple_proj }, null, load_mod.gatherOnly(&m.base.weights.head.head, embed), s);
     return m;
 }
@@ -269,7 +288,6 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
         return Verdict.refuse(.unsupported, "forward mode not declared");
     return run_mod.tableForward(decoder, &m.base, f, out);
 }
-
 
 /// The tiny pack the conformance suite runs: four layers (sliding, global of a wider head, sliding, a KV-shared
 /// global reading layer 1), per-layer embeddings, layer scalars, value norms, a softcap; seeded random f32 weights.

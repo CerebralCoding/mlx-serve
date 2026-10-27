@@ -19,6 +19,134 @@ const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
 
 const testing = std.testing;
 
+test "gemma4 LoRA: MLP bindings change served logits and scale zero preserves the base" {
+    var p = fixture.Pack.init(0x10a4);
+    defer p.deinit();
+    try writeGemma4(&p, .{}, 256, 2, true, false);
+    var b = try proof.Both.openAs(&gemma4.table, &p, e_series, .none);
+    defer b.close();
+    var g = ops.Graph.init(testing.allocator, b.xfm.s);
+    defer g.deinit();
+    const binding: @import("../../abi/plugin.zig").LoraBinding = .{
+        .layer = 0,
+        .projection = .down,
+        .a = .{ .ctx = (try g.ones(&.{ INTER, 2 }, .bfloat16)).ctx },
+        .b = .{ .ctx = (try g.reshape(try g.arange(0, H * 2, 1, .bfloat16), &.{ 2, H })).ctx },
+        .scale = 0.1,
+    };
+    var slots: [4]proof.Slot = undefined;
+    for (&slots) |*slot| try slot.init(6);
+    defer for (&slots) |*slot| slot.deinit();
+    var zero = binding;
+    zero.scale = 0;
+    slots[1].ctx.lora = &.{binding};
+    slots[2].ctx.lora = &.{zero};
+    slots[3].ctx.lora = &.{binding};
+    slots[1].kv.adapter_key = @splat(1);
+    slots[3].kv.adapter_key = @splat(1);
+    for (fixture.steps) |step| {
+        var logits: [4]mlx.mlx_array = undefined;
+        for (&slots, &logits) |*slot, *out| {
+            slot.ctx.spec_verify = step.mode == .verify;
+            out.* = try g.adopt(try b.xfm.forwardWith(&slot.ctx, try fixture.tokens(&g, step.ids)));
+        }
+        try ops.expectBitEqual(logits[0], logits[2]);
+        try ops.expectBitEqual(logits[1], logits[3]);
+        const delta = try g.max(try g.reshape(try g.abs(try g.sub(logits[0], logits[1])), &.{-1}), 0, false);
+        const difference = try @import("../../sdk/train/grad.zig").item(try g.astype(delta, .float32));
+        try testing.expect(difference > 0.01);
+    }
+    try @import("../../engines/mlx/plugin/lora_test.zig").expectBatch(&b.xfm, &g, .{ &slots[0].ctx, &slots[1].ctx, &slots[2].ctx, &slots[3].ctx }, @intCast(slots[0].kv.step));
+}
+
+test "gemma4 LoRA: training matches runtime, learns, and saves reloadable dense adapters" {
+    const train = @import("../../sdk/train/model.zig");
+    const adapter_mod = @import("../../sdk/train/adapter.zig");
+    for ([_]bool{ false, true }) |ple| {
+        var p = fixture.Pack.init(0x10a5);
+        defer p.deinit();
+        try writeGemma4(&p, if (ple) .{} else null, if (ple) 256 else 0, if (ple) 2 else 0, true, !ple);
+        var b = try proof.Both.openAs(&gemma4.table, &p, if (ple) e_series else dense31b, .none);
+        defer b.close();
+        var frozen: train.Frozen = undefined;
+        try testing.expect(gemma4.table.native_train.?(b.xfm.plugin.?.model, &frozen).isOk());
+        try testing.expectEqualStrings(if (ple) "language_model.model" else "model", frozen.prefix);
+        const targets = try frozen.targets(testing.allocator);
+        defer testing.allocator.free(targets);
+        try testing.expectEqual(@as(usize, if (ple) 37 else 40), targets.len);
+        for (targets) |target| {
+            try testing.expect(!(target.layer == 2 and target.projection == .v));
+            if (ple and target.layer >= 4) try testing.expect(target.projection != .k and target.projection != .v);
+        }
+        var adapter = try adapter_mod.Adapter.init(testing.allocator, b.xfm.s, targets, .{ .rank = 2, .alpha = 4, .prefix = frozen.prefix });
+        defer adapter.deinit();
+        const e = try @import("../../sdk/train/packing.zig").pack(testing.allocator, &.{ 3, 17, 42, 99, 7, 250, 1 }, 3, 512);
+        defer e.deinit(testing.allocator);
+        var trainer = try @import("../../sdk/train/step.zig").Trainer.initForTest(testing.allocator, b.xfm.s, frozen, &adapter, .{ .learning_rate = 0.002, .total_steps = 12, .warmup_steps = 1, .accumulation = 1 });
+        defer trainer.deinit();
+        const before = try trainer.evaluate(&.{e});
+        for (0..12) |_| _ = try trainer.microbatch(e);
+        try testing.expect(try trainer.evaluate(&.{e}) < before);
+        var g = ops.Graph.init(testing.allocator, b.xfm.s);
+        defer g.deinit();
+        const bindings = try adapter.bindings(&g, adapter.params);
+        defer testing.allocator.free(bindings);
+        const ids = try g.fromSlice(u32, e.inputs, &.{ 1, @intCast(e.inputs.len) });
+        const training = try frozen.project(&g, try frozen.hidden(&g, ids, bindings));
+        var slot: proof.Slot = undefined;
+        try slot.init(6);
+        defer slot.deinit();
+        slot.ctx.lora = bindings;
+        slot.ctx.spec_verify = true;
+        const runtime = try g.adopt(try b.xfm.forwardWith(&slot.ctx, ids));
+        try ops.expectBitEqual(training, runtime);
+        const path = try std.fs.path.join(testing.allocator, &.{ b.dir, "trained" });
+        defer testing.allocator.free(path);
+        try adapter.save(std.testing.io, path, @import("../../sdk/weights/lora_config.zig").fingerprint(if (ple) e_series else dense31b));
+        var exported = try @import("../../sdk/weights/resident.zig").loadWeightsFile(testing.allocator, path, "adapters.safetensors");
+        defer exported.deinit();
+        try testing.expect(exported.map.contains(if (ple) "language_model.model.layers.0.self_attn.q_proj.lora_a" else "model.layers.0.self_attn.q_proj.lora_a"));
+        const weights_path = try std.fs.path.join(testing.allocator, &.{ path, "adapters.safetensors" });
+        defer testing.allocator.free(weights_path);
+        var reloaded = try @import("../../sdk/weights/lora.zig").LlmAdapter.load(testing.allocator, weights_path, 2, 2);
+        defer reloaded.deinit();
+        try ops.expectBitEqual(training, try frozen.project(&g, try frozen.hidden(&g, ids, reloaded.bindings)));
+    }
+}
+
+test "gemma4 LoRA: PLE and shared KV preserve finite-difference gradients through every adapter" {
+    const adapter_mod = @import("../../sdk/train/adapter.zig");
+    var p = fixture.Pack.init(0x10a6);
+    defer p.deinit();
+    try writeGemma4(&p, .{}, 256, 2, true, false);
+    var b = try proof.Both.openAs(&gemma4.table, &p, e_series, .none);
+    defer b.close();
+    const loaded: *gemma4.Loaded = @ptrCast(@alignCast(b.xfm.plugin.?.model));
+    loaded.base.weights.embed.act = .float32;
+    const frozen = try @import("train.zig").frozen(&loaded.base, loaded.adapter_prefix);
+    const targets = try frozen.targets(testing.allocator);
+    defer testing.allocator.free(targets);
+    var adapter = try adapter_mod.Adapter.init(testing.allocator, b.xfm.s, targets, .{ .rank = 1, .alpha = 2, .compute = .float32 });
+    defer adapter.deinit();
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var g = ops.Graph.init(testing.allocator, cpu);
+    defer g.deinit();
+    try @import("../../sdk/train/testing.zig").expectGradients(&g, frozen, &adapter);
+}
+
+test "gemma4 LoRA: seq512 training stays within its PLE activation reservation" {
+    var p = fixture.Pack.init(0x10a7);
+    defer p.deinit();
+    try writeGemma4(&p, .{}, 256, 2, true, false);
+    var b = try proof.Both.openAs(&gemma4.table, &p, e_series, .none);
+    defer b.close();
+    var frozen: @import("../../sdk/train/model.zig").Frozen = undefined;
+    try testing.expect(gemma4.table.native_train.?(b.xfm.plugin.?.model, &frozen).isOk());
+    const targets = try frozen.targets(testing.allocator);
+    defer testing.allocator.free(targets);
+    try @import("../../sdk/train/testing.zig").expectReservation(frozen, targets);
+}
 
 fn oracle(comptime name: []const u8) proof.Oracle {
     const rel = "fixtures/" ++ name ++ ".tape";

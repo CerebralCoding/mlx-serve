@@ -18,6 +18,11 @@ pub fn crossEntropy(g: *Graph, logits: Array, targets: Array, mask: Array) !Arra
 }
 
 pub fn projected(g: *Graph, hidden: Array, head: Linear, targets: Array, mask: Array, chunk: u32) !Array {
+    return projectedHead(g, hidden, .{ .head = head }, targets, mask, chunk);
+}
+
+pub fn projectedHead(g: *Graph, hidden: Array, output: @import("../bases/blocks/extras.zig").SoftcapHead.Weights, targets: Array, mask: Array, chunk: u32) !Array {
+    const head = output.head;
     if (chunk == 0 or ops.shape(head.w).len != 2) return error.InvalidTrainingShape;
     const rows = ops.shape(targets)[0];
     const h = try g.reshape(hidden, &.{ rows, -1 });
@@ -35,7 +40,9 @@ pub fn projected(g: *Graph, hidden: Array, head: Linear, targets: Array, mask: A
         if (head.s.ctx != null) part.s = try g.sliceAxis(head.s, 0, @intCast(start), @intCast(end));
         if (head.b.ctx != null) part.b = try g.sliceAxis(head.b, 0, @intCast(start), @intCast(end));
         if (head.bias.ctx != null) part.bias = try g.sliceAxis(head.bias, 0, @intCast(start), @intCast(end));
-        const logits = try g.astype(try @import("../bases/blocks/head.zig").project(g, &part, h), .float32);
+        var part_head = output;
+        part_head.head = part;
+        const logits = try g.astype(try @import("../bases/blocks/extras.zig").SoftcapHead.project(g, &part_head, h), .float32);
         const lse = try g.call(mlx.mlx_logsumexp_axis, .{ logits, @as(c_int, -1), false });
         if (z) |previous| {
             const m = try g.maximum(previous, lse);
@@ -79,14 +86,15 @@ test "train core: masked CE ignores prompt rows and stays stable at large logits
 test "train core: chunked vocabulary loss and hidden gradients equal a dense f32 oracle" {
     const Objective = struct {
         head: Linear,
+        cap: f32 = 0,
         targets: Array,
         mask: Array,
         chunk: u32,
         fn loss(p: *@This(), g: *Graph, x: []const Array) !Array {
-            return if (p.chunk == 0)
-                crossEntropy(g, try g.matmul(x[0], try g.transpose(p.head.w, &.{ 1, 0 })), p.targets, p.mask)
-            else
-                projected(g, x[0], p.head, p.targets, p.mask, p.chunk);
+            if (p.chunk != 0) return projectedHead(g, x[0], .{ .head = p.head, .cap = if (p.cap > 0) try g.scalar(p.cap, .float32) else .{} }, p.targets, p.mask, p.chunk);
+            var logits = try g.matmul(x[0], try g.transpose(p.head.w, &.{ 1, 0 }));
+            if (p.cap > 0) logits = try g.mulScalar(try g.tanh(try g.mulScalar(logits, 1 / p.cap)), p.cap);
+            return crossEntropy(g, logits, p.targets, p.mask);
         }
     };
     const s = mlx.mlx_default_cpu_stream_new();
@@ -95,14 +103,19 @@ test "train core: chunked vocabulary loss and hidden gradients equal a dense f32
     defer g.deinit();
     var p: Objective = .{ .head = .{ .w = try g.fromSlice(f32, &.{ 1, 2, 3, -1, -2, 1, 0, 2, 3, 2 }, &.{ 5, 2 }) }, .targets = try g.fromSlice(u32, &.{ 0, 2, 4 }, &.{3}), .mask = try g.fromSlice(f32, &.{ 0, 1, 1 }, &.{3}), .chunk = 0 };
     const h = try g.fromSlice(f32, &.{ 1, 0, 0.5, 1, -0.3, 0.1 }, &.{ 3, 2 });
-    const dense = try grad.valueAndGrad(&g, &p, Objective.loss, &.{h});
-    defer dense.deinit(g.a);
-    for ([_]u32{ 1, 2, 4, 9 }) |chunk| {
-        p.chunk = chunk;
-        const actual = try grad.valueAndGrad(&g, &p, Objective.loss, &.{h});
-        defer actual.deinit(g.a);
-        try std.testing.expectApproxEqAbs(try grad.item(dense.value), try grad.item(actual.value), 1e-5);
-        const delta = try g.max(try g.abs(try g.reshape(try g.sub(dense.gradients[0], actual.gradients[0]), &.{-1})), 0, false);
-        try std.testing.expect((try grad.item(delta)) < 1e-5);
+    g.differentiable = true;
+    for ([_]f32{ 0, 2 }) |cap| {
+        p.cap = cap;
+        p.chunk = 0;
+        const dense = try grad.valueAndGrad(&g, &p, Objective.loss, &.{h});
+        defer dense.deinit(g.a);
+        for ([_]u32{ 1, 2, 4, 9 }) |chunk| {
+            p.chunk = chunk;
+            const actual = try grad.valueAndGrad(&g, &p, Objective.loss, &.{h});
+            defer actual.deinit(g.a);
+            try std.testing.expectApproxEqAbs(try grad.item(dense.value), try grad.item(actual.value), 1e-5);
+            const delta = try g.max(try g.abs(try g.reshape(try g.sub(dense.gradients[0], actual.gradients[0]), &.{-1})), 0, false);
+            try std.testing.expect((try grad.item(delta)) < 1e-5);
+        }
     }
 }

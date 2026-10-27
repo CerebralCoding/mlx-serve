@@ -107,3 +107,38 @@ fn expectDifferent(g: *ops.Graph, x: mlx.mlx_array, y: mlx.mlx_array) !void {
     try mlx.check(mlx.mlx_array_eval(result));
     try std.testing.expect(!mlx.mlx_array_data_bool(result).?[0]);
 }
+
+pub fn expectBatch(xfm: *@import("../transformer.zig").Transformer, g: *ops.Graph, contexts: [4]*ForwardCtx, position: u32) !void {
+    defer xfm.ssm_group.deinit();
+    const plain = try xfm.forwardBatchedDecode(&.{ 7, 7 }, &.{ contexts[0], contexts[2] }, &.{ position, position });
+    defer g.a.free(plain);
+    for (plain) |value| _ = try g.adopt(value);
+    const adapted = try xfm.forwardBatchedDecode(&.{ 7, 7 }, &.{ contexts[1], contexts[3] }, &.{ position, position });
+    defer g.a.free(adapted);
+    for (adapted) |value| _ = try g.adopt(value);
+    try ops.expectBitEqual(plain[0], plain[1]);
+    try ops.expectBitEqual(adapted[0], adapted[1]);
+    try expectDifferent(g, plain[0], adapted[0]);
+    try std.testing.expectError(error.LoraMixedBatch, xfm.forwardBatchedDecode(&.{ 7, 7 }, &.{ contexts[0], contexts[1] }, &.{ position + 1, position + 1 }));
+    for (contexts) |ctx| try @import("../ssm/group.zig").ssmGroupReleaseCtx(&xfm.ssm_group, xfm.s, ctx);
+}
+
+pub fn expectTree(xfm: *@import("../transformer.zig").Transformer, g: *ops.Graph, contexts: [4]*ForwardCtx) !void {
+    if (!mlx.metalKernelsAvailable()) return;
+    const tree = @import("../spec/tree.zig").specTreeFor(&.{ -1, 0, 0 }, &.{ 0, 1, 1 }, 1);
+    defer tree.deinit();
+    var logits: [4]ops.Array = undefined;
+    for (contexts, &logits) |ctx, *out| {
+        ctx.spec_verify = true;
+        ctx.capture_ssm_seq = true;
+        ctx.tree = &tree;
+        defer {
+            ctx.tree = null;
+            ctx.capture_ssm_seq = false;
+        }
+        out.* = try g.adopt(try xfm.forwardWith(ctx, try fixture.tokens(g, &.{ 3, 7, 9 })));
+    }
+    try ops.expectBitEqual(logits[0], logits[2]);
+    try ops.expectBitEqual(logits[1], logits[3]);
+    try expectDifferent(g, logits[0], logits[1]);
+}

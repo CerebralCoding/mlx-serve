@@ -390,6 +390,8 @@ pub const Logits = enum(u8) { last_row, all_rows, none };
 
 pub const LoraProjection = enum(u32) { q, k, v, o, gate, up, down };
 
+pub const LoraTarget = extern struct { layer: u32, projection: LoraProjection, input: u32, output: u32 };
+
 /// Borrowed matrices in mlx-lm's [in, rank], [rank, out] orientation, scoped to one forward.
 pub const LoraBinding = extern struct {
     layer: u32,
@@ -908,8 +910,10 @@ pub const ModelTable = extern struct {
     /// the next call on `m`; the counters reset.
     meters: ?*const fn (m: *anyopaque, slot: u32, out: *Str) callconv(.c) void = null,
     speech: ?*const SpeechHooks = null,
-    /// In-tree SDK training only: borrows `sdk/train/model.Base` for this model's lifetime. Outside plugins decline.
-    native_train_base: ?*const fn (m: *anyopaque) callconv(.c) ?*const anyopaque = null,
+    /// In-tree SDK training only: fills a borrowed `sdk/train/model.Frozen`. Outside plugins decline.
+    native_train: ?*const fn (m: *anyopaque, out: *anyopaque) callconv(.c) Verdict = null,
+    /// Immutable CPU metadata, prepared at load; safe to read on a request thread.
+    lora_targets: ?*const fn (m: *anyopaque) callconv(.c) Span(LoraTarget) = null,
 };
 
 /// The modes a model serves: prefill, decode and verify always; the rest as its caps declare. An encoder (`embed`)

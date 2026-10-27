@@ -135,6 +135,7 @@ pub fn DecoderAttention(comptime opts: Options) type {
             adapted.o = adapted.o.withLora(c.lora, c.layer, .o);
             const w = &adapted;
             if (c.g.differentiable and (c.caches.len != 0 or c.mode == .batched_rows or opts.gate != .none)) return error.DifferentiableAttentionUnsupported;
+            if (c.g.differentiable and (opts.sliding or opts.kv_sharing or opts.value_norm)) return sequenceForward(w, c, x);
             if (c.mode == .batched_rows) return batchedForward(w, c, x);
             if (c.caches.len == 0) return embedBatchForward(w, c, x);
             const g = c.g;
@@ -239,6 +240,30 @@ pub fn DecoderAttention(comptime opts: Options) type {
             const flat = try g.mergeHeads(out.?);
             const g_pre: Array = if (opts.gate != .none and fused_rows and w.qkv.widths[3] != 0) try w.qkv.part(g, all, 3) else .{};
             return w.o.forward(g, try outGate(w, g, x, flat, g_pre));
+        }
+
+        fn sequenceForward(w: *const Weights, c: *Ctx, x: Array) !Array {
+            const g = c.g;
+            const geo = &w.geo;
+            const q = try g.reshape(try w.q.forward(g, x), &.{ c.slots, c.rows, geo.heads, geo.head_dim });
+            const normed = if (w.q_norm.ctx != null) try g.rmsNorm(q, w.q_norm, c.shared.eps) else q;
+            const qr = try ropeAt(g, try g.transpose(normed, &perm), geo, 0);
+            const kvs = if (shared(w)) |src| blk: {
+                const sequence = c.sequence_kv orelse return error.DifferentiableAttentionUnsupported;
+                if (src >= c.layer or src >= sequence.layers.len) return error.DifferentiableAttentionUnsupported;
+                break :blk sequence.layers[src] orelse return error.DifferentiableAttentionUnsupported;
+            } else blk: {
+                const k = try w.k.forward(g, x);
+                const v = if (opts.value_norm and w.k_eq_v) k else try w.v.forward(g, x);
+                const pair = try ownKv(w, c, c.slots, k, v, Roper{ .geo = geo, .offset = 0 });
+                if (c.sequence_kv) |sequence| sequence.layers[c.layer] = .{ try sequence.g.keep(pair[0]), try sequence.g.keep(pair[1]) };
+                break :blk pair;
+            };
+            const window = windowOf(w);
+            const band = banded(window, w.fit_causal, c.wide(), c.rows);
+            const mask = if (band) try sliding.bandOnce(c, c.rows, c.rows, @intCast(window)) else Array{};
+            const out = try sdpaRaw(g, qr, kvs[0], kvs[1], geo.scale, if (band) "array" else if (c.rows == 1) "" else "causal", mask, false);
+            return w.o.forward(g, try g.mergeHeads(out));
         }
 
         /// A decoder embedder's padded batch `[N, S]` (no cache, every sequence from position 0): causal over its own

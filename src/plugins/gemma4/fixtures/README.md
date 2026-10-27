@@ -8,3 +8,5 @@
 - Parse fixtures: `src/fixtures/model-configs/gemma4-text.json`, `gemma4-unified-text.json` (draft-model configs:
   claimed by type, declined `unsupported`).
 - Kernel contract: `contract.zig` (random, non-finite and stress inputs generated per gate).
+- LoRA: `proof_test.zig` covers PLE/shared-KV gradients, 4-bit/bf16 training versus serving, saved adapters,
+  scale-zero prefill/decode/verify identity and the seq512 training reservation.

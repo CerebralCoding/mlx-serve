@@ -57,15 +57,19 @@ pub const table = abi.ModelTable{
     .cache = &.{},
     .spec = &.{ .trunk_weight = &trunkWeight },
     .weights = &.{},
-    .native_train_base = &trainBase,
+    .native_train = &trainBase,
 };
 
-fn trainBase(mp: *anyopaque) callconv(.c) ?*const anyopaque {
+fn trainBase(mp: *anyopaque, out: *anyopaque) callconv(.c) abi.Verdict {
     const m: *Loaded = @ptrCast(@alignCast(mp));
-    return switch (m.body) {
+    const train = @import("../../sdk/train/model.zig");
+    const frozen: *train.Frozen = @ptrCast(@alignCast(out));
+    const base = switch (m.body) {
         .dense => |*d| &d.base,
-        .moe => null,
+        .moe => return .{ .code = .unsupported, .why = abi.Str.of("TrainingUnsupportedModel") },
     };
+    frozen.* = train.Frozen.init(base) catch |e| return .{ .code = .unsupported, .why = abi.Str.of(@errorName(e)) };
+    return .{};
 }
 
 const gpa = ld.gpa;

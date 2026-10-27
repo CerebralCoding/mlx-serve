@@ -75,11 +75,11 @@ pub fn run(frozen: Frozen, teacher: anytype, input: types.Run, fingerprint: [32]
     if (retain.items.len < options.minimum_retain) return error.NoUsableRetainData;
     const targets = try frozen.targets(a);
     defer a.free(targets);
-    var adapter = try Adapter.init(a, frozen.base.s, targets, .{});
+    var adapter = try Adapter.init(a, frozen.s, targets, .{ .prefix = frozen.prefix });
     defer adapter.deinit();
     var updates: u32 = 0;
     {
-        var trainer = try Trainer.init(a, frozen.base.s, frozen, &adapter, .{ .total_steps = options.updates, .warmup_steps = @min(5, options.updates - 1) });
+        var trainer = try Trainer.init(a, frozen.s, frozen, &adapter, .{ .total_steps = options.updates, .warmup_steps = @min(5, options.updates - 1) });
         defer trainer.deinit();
         _ = try trainer.observeValidation(try validationLoss(&trainer, validation.items, observer));
         observer.emit(.{ .stage = .train, .step = 0, .total = options.updates });
@@ -102,11 +102,11 @@ pub fn run(frozen: Frozen, teacher: anytype, input: types.Run, fingerprint: [32]
         }
         try trainer.restoreBest();
     }
-    var g = ops.Graph.init(a, frozen.base.s);
+    var g = ops.Graph.init(a, frozen.s);
     defer g.deinit();
     const bindings = try adapter.bindings(&g, adapter.params);
     defer a.free(bindings);
-    try @import("../../../mlx/ffi.zig").check(@import("../../../mlx/ffi.zig").mlx_synchronize(frozen.base.s));
+    try @import("../../../mlx/ffi.zig").check(@import("../../../mlx/ffi.zig").mlx_synchronize(frozen.s));
     input.result.training_examples = @intCast(focus_count);
     input.result.validation_examples = @intCast(validation.items.len);
     input.result.retain_examples = @intCast(retain.items.len);
@@ -191,7 +191,7 @@ fn validationLoss(trainer: *Trainer, examples: []const Example, observer: types.
 
 pub fn retainKl(frozen: Frozen, e: Example, bindings: []const @import("../../../abi/plugin.zig").LoraBinding, observer: types.Observer, metrics: *@import("../../../sdk/train/verify.zig").Metrics, a: std.mem.Allocator) !void {
     try boundary(observer);
-    var g = ops.Graph.init(a, frozen.base.s);
+    var g = ops.Graph.init(a, frozen.s);
     defer g.deinit();
     const ids = try g.fromSlice(u32, e.inputs, &.{ 1, @intCast(e.inputs.len) });
     const base = try frozen.hidden(&g, ids, &.{});
@@ -202,9 +202,8 @@ pub fn retainKl(frozen: Frozen, e: Example, bindings: []const @import("../../../
         try boundary(observer);
         var t = g.scope();
         defer t.deinit();
-        const project = @import("../../../sdk/bases/blocks/head.zig").project;
-        const b = try project(&t, &frozen.base.weights.head, try t.sliceAxis(base, 1, @intCast(row), @intCast(row + 1)));
-        const q = try project(&t, &frozen.base.weights.head, try t.sliceAxis(adapted, 1, @intCast(row), @intCast(row + 1)));
+        const b = try frozen.project(&t, try t.sliceAxis(base, 1, @intCast(row), @intCast(row + 1)));
+        const q = try frozen.project(&t, try t.sliceAxis(adapted, 1, @intCast(row), @intCast(row + 1)));
         const kl = try @import("../../../sdk/train/kl.zig").divergence(&t, b, q);
         metrics.kl_sum += kl;
         metrics.kl_max = @max(metrics.kl_max, kl);

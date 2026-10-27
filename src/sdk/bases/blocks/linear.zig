@@ -62,7 +62,7 @@ pub const Linear = struct {
 
     fn matmul(l: *const Linear, g: *Graph, x: Array) !Array {
         if (l.hasLora() and (l.rht != null or l.mode != .affine)) return error.LoraUnsupportedQuantization;
-        if (g.differentiable or l.hasLora()) {
+        if (g.differentiable or g.native_ops or l.hasLora()) {
             if (l.rht != null or l.mode != .affine or (g.differentiable and (l.ternary or (l.s.ctx != null and (l.bits != 4 or l.b.ctx == null))))) return error.DifferentiableLinearUnsupported;
             var out = mlx.mlx_array_new();
             errdefer _ = mlx.mlx_array_free(out);

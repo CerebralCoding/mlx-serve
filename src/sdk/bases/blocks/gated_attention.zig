@@ -48,7 +48,7 @@ pub const Proj = struct {
 
     /// `forward`, the projection on the row-exact `lane` (the side copy keeps its own kernel, as the engine's).
     pub fn onLane(p: *const Proj, lane: row_exact.Lane, g: *Graph, x: Array, decode: bool) !Array {
-        if (decode and p.dq.w.ctx != null and dq.decodeAttnQuantEnabled())
+        if (!g.differentiable and !g.native_ops and !p.lin.hasLora() and decode and p.dq.w.ctx != null and dq.decodeAttnQuantEnabled())
             return p.dq.forward(g, x);
         return row_exact.linear(lane, g, &p.lin, x);
     }
@@ -106,7 +106,12 @@ pub const GatedAttention = struct {
     };
 
     pub fn forward(w: *const Weights, c: *Ctx, x: Array) !Array {
-        return mix(w, c, x);
+        var adapted = w.*;
+        adapted.q.lin = adapted.q.lin.withLora(c.lora, c.layer, .q);
+        adapted.k.lin = adapted.k.lin.withLora(c.lora, c.layer, .k);
+        adapted.v.lin = adapted.v.lin.withLora(c.lora, c.layer, .v);
+        adapted.o.lin = adapted.o.lin.withLora(c.lora, c.layer, .o);
+        return mix(&adapted, c, x);
     }
 };
 
@@ -144,7 +149,7 @@ fn mix(w: *const GatedAttention.Weights, c: *Ctx, x: Array) !Array {
     const rd = geo.rope_dims;
     const decode_shape = b == 1 and s == 1;
 
-    const joined = w.qkv.built() and row_exact.groupServes(c.row_exact, b * s);
+    const joined = !g.differentiable and !g.native_ops and !w.q.lin.hasLora() and !w.k.lin.hasLora() and !w.v.lin.hasLora() and w.qkv.built() and row_exact.groupServes(c.row_exact, b * s);
     const all: Array = if (joined) try row_exact.linear(c.row_exact, g, &w.qkv.lin, x) else .{};
     if (joined and !decode_fused.attn_qkv_joined_engaged) {
         decode_fused.attn_qkv_joined_engaged = true;
@@ -172,7 +177,7 @@ fn mix(w: *const GatedAttention.Weights, c: *Ctx, x: Array) !Array {
     const off: c_int = @intCast(c.offset());
     var q_rope: ?Array = null;
     var k_rope: Array = undefined;
-    const fusable = b == 1 and c.mrope == null and geo.ntk == null and w.q_norm.ctx != null and w.k_norm.ctx != null and qk_norm_rope.qkNormRopeFusedEnabled();
+    const fusable = !g.differentiable and (!g.native_ops or c.tree != null) and b == 1 and c.mrope == null and geo.ntk == null and w.q_norm.ctx != null and w.k_norm.ctx != null and qk_norm_rope.qkNormRopeFusedEnabled();
     if (fusable and s == 1 and hd == 128) blk: {
         const ang = qk_rope.angles(c, w.angles, family, rd, geo.base(), geo.yarn_freqs, off, 1, 1.0, geo.rope_scale) catch break :blk;
         const ms: ?Array = if (geo.yarn_mscale.ctx != null) geo.yarn_mscale else null;
@@ -231,14 +236,20 @@ pub fn ropeAt(g: *Graph, x: Array, geo: *const Geo, off: c_int) !Array {
 
 fn soloRead(c: *Ctx, q: Array, k: Array, v: Array, s: c_int, scale: f32) !Array {
     const g = c.g;
+    if (g.differentiable) {
+        if (c.cache_ops != null or c.tree != null or c.offset() != 0) return error.TrainingCacheUnsupported;
+        const none: Array = .{};
+        return g.call(mlx.mlx_fast_scaled_dot_product_attention, .{ q, k, v, scale, "causal", none, none, false });
+    }
     var view = try kv.append(c, k, v, 0);
     defer kv.release(c, &view);
     const dv = kv.dense(view);
-    const mode: []const u8 = if (c.wide()) "causal" else "";
+    const mode: [:0]const u8 = if (c.wide()) "causal" else "";
     const none = Array{ .ctx = null };
     var out: ?Array = null;
     // A tree's rows read their own ancestors' keys only (the packed kernels read a chain).
     if (c.tree) |t| return try row_exact.attendFixed(c.row_exact, g, q, dv.k, dv.v, scale, s, t.attn) orelse error.SpecTreeUnsupported;
+    if (g.native_ops) return g.call(mlx.mlx_fast_scaled_dot_product_attention, .{ q, dv.k, dv.v, scale, mode.ptr, none, none, false });
     if (view.packed_reads and kvq.kvAttnFusedEligible(&dv, s)) {
         out = try own(g, try kvq.qkvAttnDecodeKernel(g.s, q, &dv, scale, mode, none));
         if (out != null) kvq.logKvAttnFusedEngaged(&dv, q, s);
@@ -280,7 +291,7 @@ fn tail(w: *const GatedAttention.Weights, lane: row_exact.Lane, parent: *Graph, 
     const g = &t;
     const flat = [_]c_int{ b, s, w.geo.heads * w.geo.head_dim };
     const attn_t = try g.transpose(attn, &perm);
-    if (w.geo.output_gate and b * s <= residual_norm.add_norm_max_rows) {
+    if (!g.differentiable and !g.native_ops and w.geo.output_gate and b * s <= residual_norm.add_norm_max_rows) {
         if (try own(g, try gates.stridedSigmoidGateMul(g.s, attn_t, gate))) |gated|
             return parent.keep(try w.o.onLane(lane, g, try g.reshape(gated, &flat), decode_shape));
     }

@@ -33,6 +33,8 @@ keys) are declined `unsupported`. `bidirectional.zig` is the encoder base of bot
 - Gemma 4 attention runs at scale 1.0 (the q/k norms carry it); global layers rope a partial proportional table
   (`partial_rotary_factor`), sliding ones the local base; full layers may be K=V (`attention_k_eq_v`, no v_proj).
 - A KV-shared layer reads the last earlier layer of its type (`Config.kvSource`); it projects only q.
+- Native LoRA targets only loaded dense attention/MLP projections; PLE stays frozen. Export prefixes follow the
+  model hierarchy (`*_text`: `model`, wrappers: `language_model.model`), regardless of checkpoint tensor prefixes.
 - The PLE tail at one decode row is ONE dispatch (`fusedGeluPleProj`): bit-equal to the table lookup, multiply and
   qmm, and it shortens the dependent chain, which is why it pays on the small E models.
 - Per-layer inputs read id 0 at image positions (the reference's `text_mask`); media rows splice before them.

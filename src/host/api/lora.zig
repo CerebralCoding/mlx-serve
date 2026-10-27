@@ -36,11 +36,13 @@ pub fn prepare(a: std.mem.Allocator, io: std.Io, root: std.json.ObjectMap, lm: *
     if (binding.outside) return error.LoraUnsupportedArchitecture;
     const path = try adapters.rootPath(a);
     defer a.free(path);
+    var geometry: @import("../../sdk/weights/lora_metadata.zig").Geometry = .{ .layers = cfg.num_hidden_layers, .hidden = cfg.hidden_size, .intermediate = cfg.intermediate_size, .heads = cfg.num_attention_heads, .kv_heads = cfg.num_key_value_heads, .head_dim = cfg.head_dim };
+    geometry.targets = @import("../engines/mlx.zig").facts(lm).lora_targets;
     return try adapters.resolve(a, io, path, selection, .{
         .path = lm.path,
         .arch = cfg.model_type,
         .fingerprint = binding.source_sha256 orelse return error.LoraBaseFingerprintRequired,
-        .geometry = .{ .layers = cfg.num_hidden_layers, .hidden = cfg.hidden_size, .intermediate = cfg.intermediate_size, .heads = cfg.num_attention_heads, .kv_heads = cfg.num_key_value_heads, .head_dim = cfg.head_dim },
+        .geometry = geometry,
     });
 }
 
@@ -88,6 +90,19 @@ test "LLM LoRA: unsupported base quantization is refused before adapter IO" {
     lm.config = &cfg;
     lm.engine = null;
     try std.testing.expectError(error.LoraUnsupportedQuantization, prepare(a, std.testing.io, parsed.value.object, &lm));
+}
+
+test "LLM LoRA: dense family support still rejects expert models before adapter IO" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, "{\"lora\":\"answer\"}", .{});
+    defer parsed.deinit();
+    for ([_][]const u8{ "gemma4", "qwen3_5_moe" }) |arch| {
+        var cfg: @import("../../sdk/config/model.zig").ModelConfig = .{ .model_type = arch, .num_experts = 128 };
+        var lm: LoadedModel = undefined;
+        lm.config = &cfg;
+        lm.engine = null;
+        try std.testing.expectError(error.LoraUnsupportedArchitecture, prepare(a, std.testing.io, parsed.value.object, &lm));
+    }
 }
 
 test "LLM LoRA: unsupported JSON and multipart surfaces cannot silently discard adapter fields" {

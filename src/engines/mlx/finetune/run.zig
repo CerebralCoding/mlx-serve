@@ -14,8 +14,14 @@ pub fn frozen(lm: *const LoadedModel) !model.Frozen {
     const xfm = lm.transformer orelse return error.TrainingUnsupportedModel;
     if (@import("builtin").os.tag != .macos or !mlx.streamOnGpuDevice(xfm.s)) return error.TrainingRequiresMetal;
     const p = xfm.plugin orelse return error.TrainingUnsupportedModel;
-    const get = p.table.native_train_base orelse return error.TrainingUnsupportedModel;
-    return model.Frozen.init(@ptrCast(@alignCast(get(p.model) orelse return error.TrainingUnsupportedModel)));
+    const get = p.table.native_train orelse return error.TrainingUnsupportedModel;
+    var result: model.Frozen = undefined;
+    const verdict = get(p.model, &result);
+    if (!verdict.isOk()) {
+        if (@import("std").mem.eql(u8, verdict.why.slice(), "TrainingRequiresFourBitOrBfloat16")) return error.TrainingRequiresFourBitOrBfloat16;
+        return error.TrainingUnsupportedModel;
+    }
+    return result;
 }
 
 pub fn plan(sch: *Scheduler, lm: *LoadedModel, out: *types.Plan) !void {

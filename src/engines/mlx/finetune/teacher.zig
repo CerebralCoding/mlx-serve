@@ -73,7 +73,7 @@ pub const Teacher = struct {
         defer g.deinit();
         const hidden = try self.frozen.hidden(&g, try g.fromSlice(u32, ids, &.{ 1, @intCast(ids.len) }), &.{});
         const last = try g.sliceAxis(hidden, 1, @intCast(ids.len - 1), @intCast(ids.len));
-        const logits = try g.reshape(try g.astype(try @import("../../../sdk/bases/blocks/head.zig").project(&g, &self.frozen.base.weights.head, last), .float32), &.{-1});
+        const logits = try g.reshape(try g.astype(try self.frozen.project(&g, last), .float32), &.{-1});
         const selected = try g.take(logits, try g.fromSlice(u32, &.{ yes[0], no[0] }, &.{2}), 0);
         try ops.eval(selected);
         const values = mlx.mlx_array_data_float32(selected) orelse return error.NonFiniteVerification;

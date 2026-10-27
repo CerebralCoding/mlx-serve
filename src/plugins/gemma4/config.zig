@@ -55,6 +55,7 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
     // The engine's Gemma 4 arm: one decoder tag, nested prefix, plain norms, value norms, no rope scale.
     c.model_type = "gemma4";
     c.weight_prefix = "language_model.model";
+    c.adapter_prefix = if (std.mem.endsWith(u8, d.model_type, "_text")) "model" else "language_model.model";
     c.norm_has_offset = false;
     c.has_v_norm = true;
     c.rope_scaling_factor = 1.0;
