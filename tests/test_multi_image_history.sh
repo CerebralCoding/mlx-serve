@@ -1,11 +1,13 @@
 #!/bin/bash
-# Every image in a conversation reaches the model where the template put it.
-# Only the LAST turn's media used to be encoded: an agent that read page1..3
-# saw page3's pixels only. Here turn 1 carries image A, turn 2 image B, and
-# turn 3 asks about A: the answer needs A's pixels, the log must show both
-# items encoded, and a repeat of turn 3 (a prefix-cache hit across two media
-# spans) must answer with the same bytes. An image inside an Anthropic
-# tool_result (Claude Code's Read tool) must reach the model too.
+# test_multi_image_history.sh — every image in a conversation reaches the model where the template put it: turn 1
+# image A, turn 2 image B, turn 3 asks about A (the answer needs A's pixels, the log shows `Multimodal: 2 item(s)`);
+# a repeat of turn 3 is warm across both media spans with the same bytes; an image inside an Anthropic tool_result
+# (Claude Code's Read) is described.
+#
+#   ./tests/test_multi_image_history.sh [model] [port]   # default Qwen3.5-2B
+#
+# Hermetic twins: expandMediaPlaceholders, `media renders one template placeholder per item`.
+
 set -u
 MODEL="${MULTI_IMAGE_MODEL:-${1:-$HOME/.mlx-serve/models/lmstudio-community/Qwen3.5-2B-MLX-4bit}}"
 PORT="${2:-11236}"

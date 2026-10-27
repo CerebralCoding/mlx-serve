@@ -2379,3 +2379,6 @@
 "Handwritten note (Chinese text)" = "手写便签（中文）";
 "Whiteboard (Chinese text)" = "玻璃白板（中文）";
 "Layout poster (1024 × 1024)" = "布局海报（1024 × 1024）";
+"Outside plugins" = "外部插件";
+"Model, media and quant-format plugins you installed with `mlx-serve plugin install` (in ~/.mlx-serve/plugins). A plugin is native code that runs with your rights. Restart the server to apply." = "你用 `mlx-serve plugin install` 安装的模型、媒体和量化格式插件（位于 ~/.mlx-serve/plugins）。插件是以你的权限运行的原生代码。重启服务器以应用。";
+"%@ %@ · signed: %@ · sha256 %@" = "%@ %@ · 签名：%@ · sha256 %@";

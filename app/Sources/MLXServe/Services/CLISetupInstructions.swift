@@ -192,10 +192,9 @@ enum CLISetupInstructions {
 struct CLISetupInstructionsButton: View {
     let baseURL: String
     let servedModelId: String
-    /// The running server's EFFECTIVE context (`/v1/models` meta.context_length)
-    /// — the numbers written into the user's CLI config derive from it, never
-    /// hardcoded. See `AgentBudget`.
-    let serverContextLength: Int?
+    /// The running server's `agent_budget` for the chat model — the numbers
+    /// written into the user's CLI config, never hardcoded. See `AgentBudget`.
+    let serverBudget: AgentBudget.Budget?
     let isEnabled: Bool
 
     @State private var showPanel = false
@@ -220,7 +219,7 @@ struct CLISetupInstructionsButton: View {
                 tabs: CLISetupInstructions.tabs(
                     baseURL: baseURL,
                     servedModelId: servedModelId,
-                    budget: AgentBudget.forServerContext(serverContextLength)))
+                    budget: serverBudget ?? AgentBudget.fallback))
         }
     }
 }
