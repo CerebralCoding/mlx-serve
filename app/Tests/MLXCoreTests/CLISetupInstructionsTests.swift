@@ -729,7 +729,7 @@ final class CLISetupInstructionsTests: XCTestCase {
     /// A heredoc body containing its own delimiter line would truncate the
     /// config silently — assert the builders never emit one.
     func testHeredocBodiesNeverContainTheDelimiterLine() {
-        for tab in tabs where tab.command.contains("<<'EOF'") {
+        for tab in tabs where tab.command.contains("<<'EOF'\n") {
             let body = tab.command
                 .components(separatedBy: "<<'EOF'\n")[1]
                 .components(separatedBy: "\nEOF")[0]

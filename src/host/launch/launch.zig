@@ -410,7 +410,7 @@ pub fn codexConfigOverrides(allocator: std.mem.Allocator, base_url: []const u8, 
 /// codex's built-in fallback names tools the current binary no longer
 /// declares, so local models get this in-repo file instead. Retire both
 /// when codex ships instructions for registry-less models.
-const codex_model_instructions = @embedFile("assets/codex_model_instructions.md");
+const codex_model_instructions = @embedFile("../../assets/codex_model_instructions.md");
 const codex_instructions_path = ".mlx-serve/codex/model-instructions.md";
 
 /// grok `config.toml` under a dedicated GROK_HOME. A dummy XAI_API_KEY fails
