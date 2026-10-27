@@ -692,7 +692,7 @@ var virtual_gpu_cache: ?bool = null;
 /// not "applegpu_gNN"). It caps threadgroups below 1024, has no MPP tensor ops and classes NaN its own way, so Metal
 /// proofs and kernel contracts prove nothing there.
 pub fn virtualGpu() bool {
-    if (virtual_gpu_cache == null) virtual_gpu_cache = (comptime builtin.os.tag.isDarwin()) and !noGpuBackend() and virtualArch(defaultArch() orelse "applegpu");
+    if (virtual_gpu_cache == null) virtual_gpu_cache = (comptime builtin.os.tag.isDarwin()) and !noGpuBackend() and gpuArchVirtual();
     return virtual_gpu_cache.?;
 }
 
@@ -700,16 +700,17 @@ fn virtualArch(arch: []const u8) bool {
     return !std.mem.startsWith(u8, arch, "applegpu");
 }
 
-/// The default device's `architecture`, borrowed from MLX's device-info cache; null when MLX does not say.
-fn defaultArch() ?[]const u8 {
-    var dev = mlx_device{ .ctx = null };
-    if (mlx_get_default_device(&dev) != 0) return null;
+/// Whether GPU 0's `architecture` names a virtual GPU (GPU 0, not the default device: a CPU default names no GPU);
+/// false when MLX does not say. The string belongs to the device info, so it is read before the info is freed.
+fn gpuArchVirtual() bool {
+    const dev = mlx_device_new_type(.gpu, 0);
+    defer _ = mlx_device_free(dev);
     var info = mlx_device_info_new();
     defer _ = mlx_device_info_free(info);
-    if (mlx_device_info_get(&info, dev) != 0) return null;
+    if (mlx_device_info_get(&info, dev) != 0) return false;
     var cstr: [*:0]const u8 = undefined;
-    if (mlx_device_info_get_string(&cstr, info, "architecture") != 0) return null;
-    return std.mem.span(cstr);
+    if (mlx_device_info_get_string(&cstr, info, "architecture") != 0) return false;
+    return virtualArch(std.mem.span(cstr));
 }
 
 /// True when MLX has no Metal/GPU backend (e.g. the iOS Simulator slice built
@@ -1699,4 +1700,30 @@ test "virtualGpu: an architecture that names no Apple GPU family is a virtual GP
     try std.testing.expect(virtualArch("air64_v27"));
     try std.testing.expect(!virtualArch("applegpu_g17d"));
     try std.testing.expect(!virtualArch("applegpu_g13s"));
+}
+
+test "virtualGpu: GPU 0's architecture decides, read while MLX's info holds it, whatever the default device" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    if (noGpuBackend()) return error.SkipZigTest;
+    const dev = mlx_device_new_type(.gpu, 0);
+    defer _ = mlx_device_free(dev);
+    var prev = mlx_device{ .ctx = null };
+    try std.testing.expectEqual(@as(c_int, 0), mlx_get_default_device(&prev));
+    defer {
+        _ = mlx_set_default_device(prev);
+        _ = mlx_device_free(prev);
+    }
+    const cpu = mlx_device_new_type(.cpu, 0);
+    defer _ = mlx_device_free(cpu);
+    try std.testing.expectEqual(@as(c_int, 0), mlx_set_default_device(cpu));
+    var info = mlx_device_info_new();
+    defer _ = mlx_device_info_free(info);
+    try std.testing.expectEqual(@as(c_int, 0), mlx_device_info_get(&info, dev));
+    var cstr: [*:0]const u8 = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), mlx_device_info_get_string(&cstr, info, "architecture"));
+    defer virtual_gpu_cache = null;
+    for (0..64) |_| {
+        virtual_gpu_cache = null;
+        try std.testing.expectEqual(virtualArch(std.mem.span(cstr)), virtualGpu());
+    }
 }

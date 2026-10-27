@@ -401,6 +401,13 @@ pub const Table = struct {
         const bi = try gpa.alignedAlloc(u8, .@"4", if (self.mode == .affine) n * self.slen else 0);
         errdefer gpa.free(bi);
         const job: Job = .{ .t = self, .ids = ids, .w = w, .s = sc, .b = bi };
+        if (builtin.os.tag.isDarwin() and n <= GCD_ROWS) {
+            // A decode token's or verify's rows wait at the first Engram layer while the GPU idles: a row a work item on
+            // GCD's pooled workers, no thread to spawn. A prompt's thousands go to threads that advise all theirs first.
+            dispatch_apply_f(n, dispatch_get_global_queue(qos_user_initiated, 0), @constCast(&job), Job.applyOne);
+            if (job.bad.load(.acquire)) return error.EngramRead;
+            return .{ .w = w, .s = sc, .b = bi };
+        }
         // A DSpark verify's 6 x 24 rows wait at the first Engram layer: 16 rows per thread, this one included.
         const parts = std.math.clamp(n / PAR_ROWS_PER_THREAD, 1, PAR_THREADS);
         if (parts > 1) {
@@ -465,6 +472,11 @@ pub const Table = struct {
         s: []u8,
         b: []u8,
         bad: std.atomic.Value(bool) = .init(false),
+
+        fn applyOne(ctx: ?*anyopaque, i: usize) callconv(.c) void {
+            const job: *const Job = @ptrCast(@alignCast(ctx.?));
+            _ = job.run(i, job.ids.len);
+        }
 
         fn runVoid(self: *const Job, first: usize, stride: usize) void {
             _ = self.run(first, stride);
@@ -601,6 +613,12 @@ pub const Prefetch = struct {
         self.gpa.destroy(self);
     }
 };
+
+/// The most rows read a row a GCD work item (`Table.read`).
+const GCD_ROWS = 512;
+const qos_user_initiated: isize = 0x19;
+extern "c" fn dispatch_get_global_queue(identifier: isize, flags: usize) ?*anyopaque;
+extern "c" fn dispatch_apply_f(iterations: usize, queue: ?*anyopaque, context: ?*anyopaque, work: *const fn (?*anyopaque, usize) callconv(.c) void) void;
 
 const PAR_ROWS_PER_THREAD = 16;
 const PAR_THREADS = 16;

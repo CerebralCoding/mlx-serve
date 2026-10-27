@@ -19,7 +19,7 @@ const inf = kit.inf;
 const rt = kc.host.rt;
 
 /// fp32's unit roundoff.
-const u = 0x1p-24;
+pub const u = 0x1p-24;
 
 fn ci(v: usize) c_int {
     return @intCast(v);
@@ -28,26 +28,26 @@ fn ci(v: usize) c_int {
 /// The release: 5120 hidden, 4 hc streams, 384 experts (6 a token, 2304 wide), 64 heads of 512, the indexer's 32
 /// heads of 128 picking 512, a 128-row window, a 64-wide rope.
 const DIM = 5120;
-const HC = 4;
-const MIX = (2 + HC) * HC;
-const ITERS = 20;
+pub const HC = 4;
+pub const MIX = (2 + HC) * HC;
+pub const ITERS = 20;
 const EXPERTS = 384;
 const TOPK = 6;
 const INTER = 2304;
 const HEADS = 64;
 const HD = 512;
 const IH = 32;
-const IHD = 128;
+pub const IHD = 128;
 const WINDOW = 128;
-const RD = 64;
-const EPS_RMS = 1e-20;
-const EPS_HC = 1e-6;
+pub const RD = 64;
+pub const EPS_RMS = 1e-20;
+pub const EPS_HC = 1e-6;
 /// The decode widths: one token, a DSpark block, the widest region (`region_rows`).
 const REGION = 16;
 
-const act: mlx.mlx_dtype = .bfloat16;
+pub const act: mlx.mlx_dtype = .bfloat16;
 
-fn bf(v: f64) f64 {
+pub fn bf(v: f64) f64 {
     return spec.roundTo(.bf16, v);
 }
 
@@ -57,42 +57,42 @@ const maxN = kit.maxN;
 // ── interval arithmetic for outputs that pass through intermediate roundings ──
 
 /// A value's float64 range: every f32 path through the kernel's operations lands in it.
-const Iv = struct {
+pub const Iv = struct {
     lo: f64,
     hi: f64,
 
-    fn of(v: f64, e: f64) Iv {
+    pub fn of(v: f64, e: f64) Iv {
         return .{ .lo = v - e, .hi = v + e };
     }
-    fn pt(v: f64) Iv {
+    pub fn pt(v: f64) Iv {
         return .{ .lo = v, .hi = v };
     }
     /// Rounded to `dt` at both ends (round-to-nearest is monotone).
-    fn round(a: Iv, dt: mlx.mlx_dtype) Iv {
+    pub fn round(a: Iv, dt: mlx.mlx_dtype) Iv {
         return .{ .lo = rt(dt, a.lo), .hi = rt(dt, a.hi) };
     }
-    fn mul(a: Iv, b: Iv) Iv {
+    pub fn mul(a: Iv, b: Iv) Iv {
         const c = [_]f64{ a.lo * b.lo, a.lo * b.hi, a.hi * b.lo, a.hi * b.hi };
         return .{ .lo = @min(@min(c[0], c[1]), @min(c[2], c[3])), .hi = @max(@max(c[0], c[1]), @max(c[2], c[3])) };
     }
-    fn add(a: Iv, b: Iv) Iv {
+    pub fn add(a: Iv, b: Iv) Iv {
         return .{ .lo = a.lo + b.lo, .hi = a.hi + b.hi };
     }
     fn neg(a: Iv) Iv {
         return .{ .lo = -a.hi, .hi = -a.lo };
     }
     /// Widened by `rel` of its magnitude plus `abs` (an f32 operation's own rounding).
-    fn widen(a: Iv, rel: f64, abs: f64) Iv {
+    pub fn widen(a: Iv, rel: f64, abs: f64) Iv {
         const m = @max(@abs(a.lo), @abs(a.hi));
         return .{ .lo = a.lo - rel * m - abs, .hi = a.hi + rel * m + abs };
     }
-    fn has(a: Iv, x: f64) bool {
+    pub fn has(a: Iv, x: f64) bool {
         return x >= a.lo and x <= a.hi;
     }
 };
 
 /// Compares classes of `got` against float64's `want` (gate 1 under a stated rule).
-fn classes(buf: []u8, got: []const f64, want: []const f64) ?[]const u8 {
+pub fn classes(buf: []u8, got: []const f64, want: []const f64) ?[]const u8 {
     for (got, want, 0..) |g, w, i| if (spec.classOf(g) != spec.classOf(w))
         return std.fmt.bufPrint(buf, "output {d} is {e} where float64 gives {e}", .{ i, g, w }) catch "class";
     return null;
@@ -107,7 +107,7 @@ fn outAt(k: anytype, e: spec.Elem, off: usize, i: usize) f64 {
 /// shuffle of its positions, x's halves one apart on 8 entries; entry 8 is the pair (xmax, wmax). Partial sums grow
 /// past fp16's range and bf16's resolution; the total is a small integer; fp32 holds every partial sum exactly in
 /// any order while k/2 * xmax * wmax stays below 2^24.
-fn stressDot(rng: std.Random, x: []f64, w: []f64, rows: usize, k: usize, xmax: i32, wmax: i32, scratch: std.mem.Allocator) !void {
+pub fn stressDot(rng: std.Random, x: []f64, w: []f64, rows: usize, k: usize, xmax: i32, wmax: i32, scratch: std.mem.Allocator) !void {
     const h = k / 2;
     const perm = try scratch.alloc(usize, h);
     defer scratch.free(perm);
@@ -132,7 +132,7 @@ fn depthK(s: Shape) usize {
 fn depthK1(s: Shape) usize {
     return s.k + 1;
 }
-fn depthOne(_: Shape) usize {
+pub fn depthOne(_: Shape) usize {
     return 1;
 }
 fn rowsN(s: Shape) usize {
@@ -579,7 +579,7 @@ const MoeCombine = struct {
 
 /// One row's split of the mixes `z`: pre = sigmoid + eps, post = 2 sigmoid, comb = softmax rows + eps, then
 /// 2 * ITERS - 1 normalizations, columns first (float64; `out` = pre | post | comb in row-major [a][b]).
-fn splitRow(z: []const f64, e: f64, sum: Sum, out: []f64) void {
+pub fn splitRow(z: []const f64, e: f64, sum: Sum, out: []f64) void {
     for (0..HC) |j| {
         out[j] = 1 / (1 + @exp(-z[j])) + e;
         out[HC + j] = 2 / (1 + @exp(-z[HC + j]));
@@ -609,7 +609,7 @@ fn splitRow(z: []const f64, e: f64, sum: Sum, out: []f64) void {
     }
 }
 
-const sinkhorn_ops = 5 * (2 * ITERS - 1) + 25;
+pub const sinkhorn_ops = 5 * (2 * ITERS - 1) + 25;
 
 const HcSplit = struct {
     pub const Params = struct {};
@@ -734,7 +734,7 @@ const HcMix = struct {
 
 // ── the indexer's scores: sum over heads of weight * relu(q . k), -inf past the groups a query sees ──
 
-fn idxCompute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
+pub fn idxCompute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
     const L = k.shape.rows;
     const nb = k.shape.n;
     const ih = k.p.ih;
@@ -770,7 +770,7 @@ fn idxCompute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
 }
 
 /// q [L, IH, IHD], keys [nb, IHD], head weights [L, IH], meta {p0, ratio}, the weights' scale.
-fn idxFill(k: anytype, f: Fill, rng: std.Random, qdt: mlx.mlx_dtype, kdt: mlx.mlx_dtype) !void {
+pub fn idxFill(k: anytype, f: Fill, rng: std.Random, qdt: mlx.mlx_dtype, kdt: mlx.mlx_dtype) !void {
     const L = k.shape.rows;
     const nb = k.shape.n;
     const ih = k.p.ih;
@@ -898,7 +898,7 @@ fn e2m1(v: f64) f64 {
 }
 
 /// A QAT round trip: fp8 / 32 / ue8m0 (1), fp4 / 32 / ue8m0 (2), fp4 / 16 / e4m3 scale (3).
-const Qk = enum(u8) {
+pub const Qk = enum(u8) {
     none = 0,
     fp8 = 1,
     fp4 = 2,
@@ -950,7 +950,7 @@ const Qk = enum(u8) {
 /// Whether `got` (a block) can be the round trip of values in their intervals `iv` (T-grid values, rounded at both
 /// ends): every block scale the maxima allow, each value's quantization monotone between its ends; `out_dt` rounds
 /// the result. Null when it can, else the finding.
-fn qatOk(q: Qk, iv: []const Iv, got: []const f64, out_dt: mlx.mlx_dtype, buf: []u8, base: usize) ?[]const u8 {
+pub fn qatOk(q: Qk, iv: []const Iv, got: []const f64, out_dt: mlx.mlx_dtype, buf: []u8, base: usize) ?[]const u8 {
     if (q == .none) {
         for (iv, got, 0..) |r, g, j| if (!r.round(out_dt).has(g))
             return std.fmt.bufPrint(buf, "output {d} is {e} outside [{e}, {e}]", .{ base + j, g, r.lo, r.hi }) catch "outside";
@@ -977,7 +977,7 @@ fn qatOk(q: Qk, iv: []const Iv, got: []const f64, out_dt: mlx.mlx_dtype, buf: []
 }
 
 /// The point value of a block's round trip (float64 maxima; gate 1's classes).
-fn qatPoint(q: Qk, v: []f64) void {
+pub fn qatPoint(q: Qk, v: []f64) void {
     if (q == .none) return;
     var amax: f64 = 0;
     for (v) |x| amax = maxN(amax, @abs(x));
@@ -989,7 +989,7 @@ fn qatPoint(q: Qk, v: []f64) void {
 const TRIG = 0x1p-16;
 
 /// One adjacent rope pair (traditional) at angle `theta`: the even or odd output's interval from the pair's.
-fn ropeIv(x1: Iv, x2: Iv, theta: f64, even: bool) Iv {
+pub fn ropeIv(x1: Iv, x2: Iv, theta: f64, even: bool) Iv {
     const d = @abs(theta) * 3 * u + TRIG;
     const cs = Iv.of(@cos(theta), d);
     const sn = Iv.of(@sin(theta), d);
@@ -1000,11 +1000,11 @@ fn ropeIv(x1: Iv, x2: Iv, theta: f64, even: bool) Iv {
 // ── rope tail (+ QAT): the last RD channels of each D-wide vector roped at position scal * (row + off) ──
 
 /// The release's rope periods (`10000^(k / 32)`), negated for the inverse rope.
-fn periodsFill(p: []f64, sign: f64) void {
+pub fn periodsFill(p: []f64, sign: f64) void {
     for (p, 0..) |*v, k| v.* = sign * std.math.pow(f64, 10000, @as(f64, @floatFromInt(k)) / @as(f64, @floatFromInt(p.len)));
 }
 
-const RopeTail = struct {
+pub const RopeTail = struct {
     pub const Params = struct { qk: Qk, ot: mlx.mlx_dtype = act, scal: f64 = 1, off: i32, sign: f64 = 1 };
 
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
@@ -1207,7 +1207,7 @@ const KvRow = struct {
 
 /// A collapsed row `h` [D] (f32 sums of HC products, rounded to T) through MLX's rms norm with `w`: intervals of the
 /// kernel's `T(w * T(T(h) * inv))`. `point`: float64 points.
-fn collapseNorm(h: []const f64, hmag: []const f64, w: []const f64, eps: f64, point: bool, out: []Iv) void {
+pub fn collapseNorm(h: []const f64, hmag: []const f64, w: []const f64, eps: f64, point: bool, out: []Iv) void {
     const D = h.len;
     var lo: f64 = 0;
     var hi: f64 = 0;
@@ -1227,7 +1227,7 @@ fn collapseNorm(h: []const f64, hmag: []const f64, w: []const f64, eps: f64, poi
 }
 
 /// The f32 split outputs' allowance: the Sinkhorn's declared roundings and the output's own.
-fn splitOk(buf: []u8, got: []const f64, want: []const f64) ?[]const u8 {
+pub fn splitOk(buf: []u8, got: []const f64, want: []const f64) ?[]const u8 {
     for (got, want, 0..) |g, w, i| {
         if (spec.classOf(g) != spec.classOf(w)) return std.fmt.bufPrint(buf, "split output {d} is {e} where float64 gives {e}", .{ i, g, w }) catch "split";
         if (spec.classOf(w) == .finite and !(@abs(g - w) <= (sinkhorn_ops + 8) * u * @abs(w) + 0x1p-140))
@@ -1334,7 +1334,7 @@ const HcNorm = struct {
 
 /// One row's mixes from the flattened stream `v` [N]; `allow` the bound each carries (the dot's gamma on its terms,
 /// the rms's half on the product, the f32 tail).
-fn mixRow(v: []const f64, fnw: []const f64, scale: []const f64, base: []const f64, eps: f64, z: []f64, allow: []f64) void {
+pub fn mixRow(v: []const f64, fnw: []const f64, scale: []const f64, base: []const f64, eps: f64, z: []f64, allow: []f64) void {
     const N = v.len;
     var ss: f64 = 0;
     for (v) |x| ss += x * x;
@@ -1856,7 +1856,7 @@ const AttnDec = struct {
     }
 };
 
-const AttnSplit = struct {
+pub const AttnSplit = struct {
     pub const Params = struct { s: usize, g: AttnGeo = .{} };
     const NSG = 8;
 
@@ -2157,7 +2157,7 @@ fn codeAt(words: []const f64, i: usize, bits: u32) f64 {
 }
 
 /// One affine bank's input slots: the packed codes, the scales, the biases ([rows, K] at `bits` / `gs`).
-const Bank = struct {
+pub const Bank = struct {
     w: []f64,
     s: []f64,
     b: []f64,
@@ -2165,7 +2165,7 @@ const Bank = struct {
     gs: usize,
     k: usize,
 
-    fn add(c: anytype, rows: []const usize, bits: u32, gs: usize, K: usize) !Bank {
+    pub fn add(c: anytype, rows: []const usize, bits: u32, gs: usize, K: usize) !Bank {
         var wd: [3]usize = undefined;
         @memcpy(wd[0..rows.len], rows);
         var sd = wd;
@@ -2186,7 +2186,7 @@ const Bank = struct {
     }
 
     /// Random codes, scales around 0.04 / levels, biases centring them.
-    fn random(self: Bank, rng: std.Random, scratch: std.mem.Allocator) !void {
+    pub fn random(self: Bank, rng: std.Random, scratch: std.mem.Allocator) !void {
         const levels: u32 = @as(u32, 1) << @intCast(self.bits);
         const codes = try scratch.alloc(u32, self.k);
         defer scratch.free(codes);
@@ -2203,7 +2203,7 @@ const Bank = struct {
 
     /// Integer weights c - levels/2 (scale 1, bias -levels/2), positive c on the first half and -c on the
     /// shuffled second (`perm`); c 1 on the first 8 entries, at most 31 elsewhere.
-    fn mirrored(self: Bank, rng: std.Random, perm: []const usize, scratch: std.mem.Allocator) !void {
+    pub fn mirrored(self: Bank, rng: std.Random, perm: []const usize, scratch: std.mem.Allocator) !void {
         const levels: u32 = @as(u32, 1) << @intCast(self.bits);
         const mid: i32 = @intCast(levels / 2);
         const top: i32 = @min(mid - 1, 31);
@@ -2224,7 +2224,7 @@ const Bank = struct {
     }
 
     /// Row `r` against `x` [K]: the sum (`sum`'s accumulator), and its terms' magnitude (scale and bias apart).
-    fn dot(self: Bank, r: usize, x: []const f64, sum: Sum, t: []f64) [2]f64 {
+    pub fn dot(self: Bank, r: usize, x: []const f64, sum: Sum, t: []f64) [2]f64 {
         const kw = self.k * self.bits / 32;
         const kg = self.k / self.gs;
         var mag: f64 = 0;
@@ -2240,7 +2240,7 @@ const Bank = struct {
 
     /// Row `r`'s first group with every code at least 1 and scale `v`: an infinite scale then gives the same
     /// infinity whether a lane scales its pack's sum (the kernel, MLX's qmv) or each dequantized weight.
-    fn plant(self: Bank, r: usize, v: f64, scratch: std.mem.Allocator) !void {
+    pub fn plant(self: Bank, r: usize, v: f64, scratch: std.mem.Allocator) !void {
         const kw = self.k * self.bits / 32;
         const codes = try scratch.alloc(u32, self.k);
         defer scratch.free(codes);
@@ -2253,7 +2253,7 @@ const Bank = struct {
 };
 
 /// A shuffle of the second half's positions and x's mirrored halves (8 entries one apart), as `stressDot`.
-fn mirroredX(rng: std.Random, x: []f64, perm: []usize) void {
+pub fn mirroredX(rng: std.Random, x: []f64, perm: []usize) void {
     const h = x.len / 2;
     for (perm, 0..) |*q, i| q.* = i;
     rng.shuffle(usize, perm);
@@ -2503,13 +2503,13 @@ fn depthIdx(s: Shape) usize {
 fn depthSoftmax(s: Shape) usize {
     return WINDOW - 1 + s.rows + s.k;
 }
-fn depthAttn(s: Shape) usize {
+pub fn depthAttn(s: Shape) usize {
     return HD + WINDOW + s.k;
 }
 
 /// A launch of one of the module's kernels: `metal_kernel` input / output names as `buildKernel` gives them; `m12`
 /// the M1 and M2 limit Xcode's `metal-tt` compiles it for (`kernel contract offline`).
-fn launch(comptime name: [:0]const u8, comptime ins: []const [*:0]const u8, comptime outs: []const [*:0]const u8, comptime src: [:0]const u8, comptime header: [:0]const u8, comptime tg_bytes: u32, comptime m12: u32, comptime adapts: bool) metal.Launch {
+pub fn launch(comptime name: [:0]const u8, comptime ins: []const [*:0]const u8, comptime outs: []const [*:0]const u8, comptime src: [:0]const u8, comptime header: [:0]const u8, comptime tg_bytes: u32, comptime m12: u32, comptime adapts: bool) metal.Launch {
     return .{ .name = name, .inputs = ins, .outputs = outs, .source = src, .header = header, .tg_bytes = tg_bytes, .m1 = m12, .m2 = m12, .adapts = adapts };
 }
 
@@ -2530,7 +2530,7 @@ const stage_l = launch("dsv41_hc_stage", hc_stage_ins, &.{ "h_out", "z" }, v41.H
 const stage_x_l = launch("dsv41_hc_stage_x", hc_stage_x_ins, &.{ "h_out", "z", "x1" }, v41.HC_STAGE_X_SOURCE, "", 2 * 4 * 32, 1024, true);
 const idx_l = launch("dsv41_index_scores", &.{ "q", "keys", "w", "meta", "wsc" }, &.{"scores"}, v41.IDX_SCORE_SOURCE, "", 4 * IH * IHD, 416, false);
 const tile_l = launch("dsv41_index_tile", &.{ "q", "keys", "w", "meta", "wsc" }, &.{"scores"}, v41.IDX_TILE_SOURCE, "", 2 * IdxTile.KT * IHD + 4 * IH + 4 * 4 * 64, 1024, false);
-const rope_l = launch("dsv41_rope_tail", &.{ "x", "periods", "off", "scal" }, &.{"out"}, v41.ROPE_TAIL_SOURCE, v41.FP8_HEADER, 0, 1024, false);
+pub const rope_l = launch("dsv41_rope_tail", &.{ "x", "periods", "off", "scal" }, &.{"out"}, v41.ROPE_TAIL_SOURCE, v41.FP8_HEADER, 0, 1024, false);
 const kv_l = launch("dsv41_kv_row", &.{ "x", "w", "periods", "off", "eps" }, &.{"out"}, v41.KV_ROW_SOURCE, v41.FP8_HEADER, 4 * (32 + 1024), 1024, false);
 const engram_l = launch("dsv41_engram", &.{ "x", "kv", "qk", "cst" }, &.{"out"}, v41.ENGRAM_SOURCE, "", 4 * (3 * 32 + 1), 928, false);
 const dec_l = launch("dsv41_attn_decode", attn_ins ++ &[_][*:0]const u8{"periods"}, &.{"out"}, v41.ATTN_DEC_SOURCE, v41.UNROPE_HEADER, 4 * (AttnDec.NSG * HD + 2 * AttnDec.NSG), 768, false);
@@ -2542,9 +2542,9 @@ const dn_l = launch("dsv41_moe_dn", moe_dn_ins, &.{"out"}, v41.MOE_DN_SOURCE, v4
 const act_l = launch("dsv41_moe_act", &.{ "y", "wts", "lim" }, &.{"out"}, v41.MOE_ACT_SOURCE, "", 0, 1024, false);
 const combine_l = launch("dsv41_moe_combine", &.{ "dn", "inv", "sh" }, &.{"out"}, v41.MOE_COMBINE_SOURCE, "", 0, 1024, false);
 
-const relu_nan: spec.Known = .{ .gate = .nonfinite, .finding = "a NaN q . k dot scores as 0: metal::max(dot, 0) drops NaN where relu (the reference, torch) propagates it" };
-const quant_nan: spec.Nan = .{ .stated = "classes as float64 gives them; quantized entries within the quantizer's envelope of their bounds" };
-const nan_code: spec.Known = .{ .gate = .nonfinite, .finding = "a NaN in a quantized block is written as a finite code: metal::max drops it from the block max and the fp8 encoder saturates it to 448 (float64 and the reference propagate it)" };
+pub const relu_nan: spec.Known = .{ .gate = .nonfinite, .finding = "a NaN q . k dot scores as 0: metal::max(dot, 0) drops NaN where relu (the reference, torch) propagates it" };
+pub const quant_nan: spec.Nan = .{ .stated = "classes as float64 gives them; quantized entries within the quantizer's envelope of their bounds" };
+pub const nan_code: spec.Known = .{ .gate = .nonfinite, .finding = "a NaN in a quantized block is written as a finite code: metal::max drops it from the block max and the fp8 encoder saturates it to 448 (float64 and the reference propagate it)" };
 const squares: spec.Sums = .{ .f16 = 0, .bf16 = 0, .why = "a sum of squares cannot cancel" };
 const short_sums: spec.Sums = .{ .f16 = 0, .bf16 = 0, .exact = false, .why = "four positive terms a sum, inside 39 normalizations" };
 const softmax_sums: spec.Sums = .{ .f16 = 0, .bf16 = 0, .exact = false, .why = "positive exp terms: the sum cannot cancel" };
@@ -2553,6 +2553,7 @@ const swiglu_nan: spec.Known = .{ .gate = .nonfinite, .finding = "a NaN gate sum
 /// Served shapes cut the independent axes (heads, bank rows) to a few where the float64 reference would run for
 /// seconds: each runs the same code at its own index; the reduction axis and the row widths stay the release's.
 pub fn register(set: *kc.Set) !void {
+    try @import("decode/decode.zig").register(set);
     try kit.add(set, Gate, &gate_l, .{}, .{
         .name = "dsv41 gate (router logits)",
         .accum = .f32,

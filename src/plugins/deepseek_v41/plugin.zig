@@ -535,4 +535,5 @@ test {
     _ = bill_mod;
     _ = media;
     _ = @import("contract.zig");
+    _ = @import("decode/decode.zig");
 }

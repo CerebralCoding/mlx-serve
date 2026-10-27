@@ -17,6 +17,9 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
   equal to the trunk over the same bank at fewer slot rows (phase change, misses through the transient bank).
 - `fixtures/`: proof tapes recorded from the legacy forward (`fixtures/MANIFEST.md`).
 - `contract.zig`: kernel contract registrations of `kernels/*.metal`.
+- `decode/`: the fused decode kernels (`kernels/dec_*.metal`, one file a stage) a step or verify of up to `max_rows`
+  rows runs through `blockFused`; `decode/fixture.zig` builds release-shape layers on random weights for their
+  equivalence tests and the `DSV41_DEC_UBENCH` meters.
 
 ## Facts the table declares
 - `owns_decode_state`, `prefix_cache = false` (the module resumes its own state), `slot_state` + `batches_decode`
@@ -48,6 +51,9 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
 - A row in a batch depends on its own state only, but two rows take the MoE's gather kernels where one row takes
   the one-expert kernels: batched logits match a solo step to kernel numerics, not bits.
 - The V4.1 template, like V4's, is byte-pinned (`tests/dsv41_template_ab.py`).
+- A fused decode stage is judged against an f32 model (`decode.expectNoWorse`), not against the chain's bits: greedy
+  texts diverge from the chain's at bf16 near-ties. Two dependent stages merged into one ticket-ordered dispatch
+  measured slower than the pair (their threadgroup shapes differ): keep one dispatch a stage.
 
 ## Streamed packs (`experts.bin`)
 - M5 and newer only (`naxAvailable`), refused by name below, as are GLM-5.3's EXL3 repacks: the prompt GEMMs are built
