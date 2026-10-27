@@ -135,8 +135,7 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
     };
     if (ple_dim > 0) {
         w.ple_dim = @intCast(ple_dim);
-        // The engine's gather resolves the per-layer table's quant params without a width hint.
-        w.ple_table = try r.tableAt(try r.name(&nb, "embed_tokens_per_layer", .{}), 0);
+        w.ple_table = try r.tableAt(try r.name(&nb, "embed_tokens_per_layer", .{}), @intCast(c.num_hidden_layers * ple_dim));
         try o.linear(w.ple_table);
         w.ple_proj = try r.tableAt(try r.name(&nb, "per_layer_model_projection", .{}), c.hidden_size);
         try o.linear(w.ple_proj);
