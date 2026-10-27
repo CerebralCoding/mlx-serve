@@ -10,6 +10,7 @@ pub const Known = error{
     InvalidLlmAdapter,
     LoraRevisionChanged,
     LoraUnsupportedArchitecture,
+    LoraUnsupportedTarget,
     LoraUnsupportedQuantization,
     EngineBusy,
     EngineUnsupported,

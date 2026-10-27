@@ -1168,6 +1168,15 @@ test "LLM LoRA: targets accept only dense decoder attention and MLP projections"
     for ([_][]const u8{ "model.layers.-1.self_attn.q_proj", "model.layers.01.self_attn.q_proj", "model.layers.4294967296.self_attn.q_proj", "model.layers.0.self_attn.q_proj.extra", "model.layers.0.mlp.experts.0.gate_proj", "lm_head", "model.embed_tokens" }) |name| try std.testing.expect(parseLlmTarget(name) == null);
 }
 
+test "finetune overlay: Flash adapter keys resolve only separate trunk attention projections" {
+    for ([_][]const u8{ "language_model.model.layers.3.self_attn.q_proj.lora_a", "base_model.model.language_model.model.layers.3.self_attn.q_proj.lora_A.weight", "base_model.model.model.language_model.layers.3.self_attn.q_proj.lora_A.weight" }) |name| {
+        const target = parseLlmTarget(parseKey(name).?.module).?;
+        try testing.expectEqual(@as(u32, 3), target.layer);
+        try testing.expectEqual(.q, target.projection);
+    }
+    for ([_][]const u8{ "language_model.model.layers.0.linear_attn.in_proj_qkv", "language_model.model.layers.3.self_attn.qkv_proj", "language_model.model.layers.3.self_attn.indexer.index_qk_proj", "language_model.model.layers.3.mlp.shared_expert.up_proj", "language_model.model.layers.3.mlp.switch_mlp.gate_proj", "mtp.layers.0.self_attn.q_proj" }) |name| try testing.expect(parseLlmTarget(name) == null);
+}
+
 test "LLM LoRA: malformed or unrecognized adapter tensors are refused" {
     const ops = @import("../../mlx/ops.zig");
     const s = mlx.mlx_default_cpu_stream_new();

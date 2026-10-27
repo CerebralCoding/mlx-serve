@@ -307,3 +307,43 @@ test "finetune overlay: imported PEFT config resolves a local base or requires a
     try tmp.dir.deleteFile(io, "config.json");
     try std.testing.expectError(error.LoraBaseFingerprintRequired, load(a, io, path, config.fingerprint("base config")));
 }
+
+test "finetune overlay: Flash attention preserves eight-bit packing and includes the query gate rows" {
+    const a = std.testing.allocator;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = ops.Graph.init(a, s);
+    defer g.deinit();
+    var weights = Weights.init(a);
+    defer weights.deinit();
+    const expert_key = "language_model.model.layers.3.mlp.switch_mlp.gate_proj.weight";
+    const expert = try g.ones(&.{ 2, 64, 128 }, .bfloat16);
+    try weights.put(expert_key, g.escape(expert));
+    const original_expert = weights.get(expert_key).?;
+    inline for (.{ .q, .k, .v, .o }) |projection| {
+        const rows = switch (@as(abi.LoraProjection, projection)) {
+            .q => 256,
+            .o => 128,
+            else => 64,
+        };
+        const stem = "language_model.model.layers.3." ++ comptime projectionName(projection);
+        const keys = [_][]const u8{ stem ++ ".weight", stem ++ ".scales", stem ++ ".biases" };
+        const base = try quantize(&g, try g.zeros(&.{ rows, 128 }, .bfloat16), 8, 64);
+        for (keys, base) |key, x| try weights.put(key, g.escape(x));
+        const left = try g.ones(&.{ 128, 1 }, .bfloat16);
+        const right = try g.ones(&.{ 1, rows }, .bfloat16);
+        var binding: abi.LoraBinding = .{ .layer = 3, .projection = projection, .a = .{ .ctx = left.ctx }, .b = .{ .ctx = right.ctx }, .scale = 0.25 };
+        if (projection == .q) {
+            binding.b.ctx = (try g.ones(&.{ 1, rows / 2 }, .bfloat16)).ctx;
+            try std.testing.expectError(error.InvalidLlmAdapter, apply(&weights, s, &.{binding}, "language_model.model"));
+            binding.b.ctx = right.ctx;
+        }
+        try apply(&weights, s, &.{binding}, "language_model.model");
+        try std.testing.expectEqualSlices(c_int, ops.shape(base[0]), ops.shape(weights.get(keys[0]).?));
+        try std.testing.expectEqual(ops.Dtype.bfloat16, ops.dtype(weights.get(keys[1]).?));
+        const merged = try g.call(mlx.mlx_dequantize, .{ weights.get(keys[0]).?, weights.get(keys[1]).?, weights.get(keys[2]).?, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(8), "affine", ops.Array{}, mlx.mlx_optional_dtype{ .value = .float32, .has_value = true } });
+        const want = try g.full(&.{ rows, 128 }, try g.scalar(0.25, .float32), .float32);
+        try ops.expectBitEqual(want, merged);
+    }
+    try std.testing.expectEqual(original_expert.ctx, weights.get(expert_key).?.ctx);
+}

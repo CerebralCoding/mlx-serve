@@ -204,6 +204,23 @@ pub fn loadMap(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
     return loadTensors(io, a, config, model_dir, s, map, true);
 }
 
+fn validateLoraLoad(config: *const ModelConfig, outside: bool, bindings: []const abi.LoraBinding) !void {
+    if (outside) return error.LoraUnsupportedArchitecture;
+    if (config.isQwen4() or std.mem.eql(u8, config.model_type, "qwen4_exp_text")) {
+        // Cluster workers load their own unmodified pack; overlays currently belong to one Mac.
+        if (config.dist_span != null or config.dist_shard != null) return error.LoraUnsupportedArchitecture;
+        for (bindings) |binding| {
+            if (binding.layer >= config.num_hidden_layers) return error.LoraUnsupportedTarget;
+            if (config.full_attention_interval != 0 and (binding.layer + 1) % config.full_attention_interval != 0) return error.LoraUnsupportedTarget;
+            switch (binding.projection) {
+                .q, .k, .v, .o => {},
+                else => return error.LoraUnsupportedTarget,
+            }
+        }
+    } else if (config.isMoe() or !@import("../../../sdk/weights/lora_config.zig").supported(config.model_type)) return error.LoraUnsupportedArchitecture;
+    if (config.hadamard_block != 0 or config.quant_mode != .affine) return error.LoraUnsupportedQuantization;
+}
+
 fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir: []const u8, s: mlx.mlx_stream, map: model.Weights, autoload: bool) !Transformer {
     const b = config.plugin.?;
     var res = Resident.adopt(map);
@@ -215,8 +232,7 @@ fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
         if (try finetune.load(a, io, model_dir, b.source_sha256)) |loaded| {
             var overlay = loaded;
             defer overlay.deinit();
-            if (b.outside or config.isMoe() or !@import("../../../sdk/weights/lora_config.zig").supported(config.model_type)) return error.LoraUnsupportedArchitecture;
-            if (config.hadamard_block != 0 or config.quant_mode != .affine) return error.LoraUnsupportedQuantization;
+            try validateLoraLoad(config, b.outside, overlay.adapter.bindings);
             try finetune.apply(&res.weights, s, overlay.adapter.bindings, config.weight_prefix);
             overlay_digest = overlay.digest;
             log.info("[finetune] merged {s} into {d} projections before inference preparation\n", .{ finetune.filename, overlay.adapter.bindings.len });
@@ -976,6 +992,55 @@ fn perSlot(xfm: *Transformer, x: Array, n: usize) ![]Array {
         made += 1;
     }
     return rows;
+}
+
+test "finetune overlay: Flash loads only full-attention adapters and remains unavailable for training" {
+    const t = std.testing;
+    const lora_config = @import("../../../sdk/weights/lora_config.zig");
+    for ([_][]const u8{ "qwen4_exp", "qwen4_exp_text" }) |arch| {
+        var config: ModelConfig = .{ .model_type = arch, .num_experts = 512, .num_hidden_layers = 48, .full_attention_interval = 4 };
+        var binding: abi.LoraBinding = .{ .layer = 3, .projection = .q, .a = .{}, .b = .{}, .scale = 1 };
+        for ([_]abi.LoraProjection{ .q, .k, .v, .o }) |projection| {
+            binding.projection = projection;
+            try validateLoraLoad(&config, false, &.{binding});
+        }
+        try t.expect(!lora_config.supported(arch));
+        try t.expectError(error.LoraUnsupportedArchitecture, validateLoraLoad(&config, true, &.{binding}));
+        config.dist_span = .{ .start = 0, .end = 24, .total = 48 };
+        try t.expectError(error.LoraUnsupportedArchitecture, validateLoraLoad(&config, false, &.{binding}));
+        config.dist_span = null;
+        config.dist_shard = .{ .rank = 0, .size = 2 };
+        try t.expectError(error.LoraUnsupportedArchitecture, validateLoraLoad(&config, false, &.{binding}));
+        config.dist_shard = null;
+        for ([_]abi.LoraProjection{ .gate, .up, .down }) |projection| {
+            binding.projection = projection;
+            try t.expectError(error.LoraUnsupportedTarget, validateLoraLoad(&config, false, &.{binding}));
+        }
+        binding.projection = .q;
+        binding.scale = 0;
+        for ([_]u32{ 0, 2, 4, 48, std.math.maxInt(u32) }) |layer| {
+            binding.layer = layer;
+            try t.expectError(error.LoraUnsupportedTarget, validateLoraLoad(&config, false, &.{binding}));
+        }
+        binding.layer = 47;
+        try validateLoraLoad(&config, false, &.{binding});
+        config.full_attention_interval = 0;
+        binding.layer = 0;
+        try validateLoraLoad(&config, false, &.{binding});
+        config.hadamard_block = 128;
+        try t.expectError(error.LoraUnsupportedQuantization, validateLoraLoad(&config, false, &.{binding}));
+        config.hadamard_block = 0;
+        config.quant_mode = .mxfp8;
+        try t.expectError(error.LoraUnsupportedQuantization, validateLoraLoad(&config, false, &.{binding}));
+    }
+    for ([_][]const u8{ "llama", "qwen3", "gemma4", "qwen3_5" }) |arch| {
+        var config: ModelConfig = .{ .model_type = arch };
+        try validateLoraLoad(&config, false, &.{});
+        config.num_experts = 8;
+        try t.expectError(error.LoraUnsupportedArchitecture, validateLoraLoad(&config, false, &.{}));
+    }
+    try t.expect(lora_config.errorMessage(error.LoraUnsupportedTarget) != null);
+    try t.expectEqual(error.LoraUnsupportedTarget, @import("../../../sdk/util/err_name.zig").toError("LoraUnsupportedTarget"));
 }
 
 test "driver: the load settings JSON carries the head and stream_experts settings a model states" {

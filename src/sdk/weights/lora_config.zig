@@ -54,7 +54,8 @@ pub fn errorMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.LoraBaseMismatch => "LoraBaseMismatch: the adapter's base-model config fingerprint does not match this model.",
         error.LoraBaseFingerprintRequired => "LoraBaseFingerprintRequired: supply base_config_sha256 when the adapter's recorded local model path cannot be resolved.",
-        error.LoraUnsupportedArchitecture => "LoraUnsupportedArchitecture: load-time LoRA supports dense Llama, Qwen3, Gemma 4 and Qwen3.5-family models on the MLX engine.",
+        error.LoraUnsupportedArchitecture => "LoraUnsupportedArchitecture: load-time LoRA supports dense Llama, Qwen3, Gemma 4 and Qwen3.5-family models, plus full-attention projections in single-Mac Qwen3.8-Flash-Next MLX loads.",
+        error.LoraUnsupportedTarget => "LoraUnsupportedTarget: Qwen3.8-Flash-Next adapters may target only self_attn.q_proj, k_proj, v_proj and o_proj on full-attention trunk layers.",
         error.LoraUnsupportedQuantization => "LoraUnsupportedQuantization: load-time LoRA requires an unrotated affine-quantized or floating-point base.",
         error.InvalidLlmAdapterConfig => "InvalidLlmAdapterConfig: expected a supported mlx-lm or PEFT LoRA configuration with rank and scale.",
         error.InvalidLlmAdapter => "InvalidLlmAdapter: expected finite A/B tensor pairs matching the model's attention or MLP projections.",
