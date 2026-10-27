@@ -167,7 +167,6 @@ pub const LoadParams = struct {
 /// deinit).
 pub const SubmitParams = struct {
     prompt_ids: []const u32,
-    lora: ?@import("../../sdk/weights/lora_config.zig").Prepared = null,
     /// Where the request's events go (`abi.Event`): the host's stream. Null = the slot's own buffer only.
     sink: ?abi.Sink = null,
     /// Full original prompt for PLD lookup. When null, defaults to

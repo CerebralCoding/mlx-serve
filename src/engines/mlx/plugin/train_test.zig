@@ -11,7 +11,7 @@ const Trainer = @import("../../../sdk/train/step.zig").Trainer;
 const packing = @import("../../../sdk/train/packing.zig");
 const lora_config = @import("../../../sdk/weights/lora_config.zig");
 
-test "train core: loaded llama and qwen3 train four-bit and bf16 packs and roundtrip runtime logits" {
+test "train core: loaded llama and qwen3 train four-bit and bf16 packs and roundtrip adapter weights" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     for ([_][]const u8{ "llama", "qwen3" }) |arch| for ([_]bool{ false, true }) |quantized| {
@@ -67,8 +67,8 @@ test "train core: loaded llama and qwen3 train four-bit and bf16 packs and round
         defer a.free(tensor);
         var runtime = try @import("../../../sdk/weights/lora.zig").LlmAdapter.load(a, tensor, 2, 8);
         defer runtime.deinit();
-        const out = try model.Decoder.forward(&base.weights, &base.shared, &g, ids, .{ .mode = .prefill, .rows = @intCast(e.inputs.len), .positions = &.{0}, .logits = .all_rows, .lora = runtime.bindings });
-        try ops.expectBitEqual(try g.reshape(trained, ops.shape(out.logits)), out.logits);
+        const reloaded = try frozen.project(&g, try frozen.hidden(&g, ids, runtime.bindings));
+        try ops.expectBitEqual(trained, reloaded);
     };
 }
 
@@ -139,4 +139,34 @@ test "train core: real Qwen3 pack learns with defaults and seq512 stays within i
     std.debug.print("\ntrain real: loss={d:.5}->{d:.5} heldout={d:.5}->{d:.5}\n", .{ before, after, validation_before, validation_after });
     try std.testing.expect(after < before * 0.5);
     try std.testing.expect(validation_after < validation_before * 0.5);
+    var g = ops.Graph.init(a, s);
+    defer g.deinit();
+    const bindings = try adapter.bindings(&g, adapter.params);
+    defer a.free(bindings);
+    const merged_stream = mlx.mlx_default_gpu_stream_new();
+    var merged = @import("driver.zig").loadAdapted(io, a, &cfg, path, merged_stream, bindings) catch |err| {
+        _ = mlx.mlx_stream_free(merged_stream);
+        return err;
+    };
+    defer merged.deinit();
+    const serving_before = try servingLoss(&xfm, heldout);
+    const serving_after = try servingLoss(&merged, heldout);
+    std.debug.print("\ntrain real: heldout serving loss={d:.5}->{d:.5} unfused={d:.5}\n", .{ serving_before, serving_after, validation_after });
+    try std.testing.expect(serving_after < serving_before * 0.5);
+}
+
+fn servingLoss(xfm: *@import("../transformer.zig").Transformer, example: packing.Example) !f32 {
+    var lm: @import("../../../host/registry/registry.zig").LoadedModel = undefined;
+    lm.engine = null;
+    lm.config = &xfm.config;
+    lm.transformer = xfm;
+    const frozen = try @import("../finetune/run.zig").frozen(&lm);
+    var g = ops.Graph.init(std.testing.allocator, xfm.s);
+    defer g.deinit();
+    const hidden = try @import("../finetune/teacher.zig").runtimeHidden(std.testing.io, &g, &lm, example.inputs);
+    const rows: c_int = @intCast(example.inputs.len);
+    const logits = try g.reshape(try frozen.project(&g, hidden), &.{ rows, -1 });
+    const targets = try g.fromSlice(u32, example.targets, &.{rows});
+    const mask = try g.fromSlice(f32, example.mask, &.{rows});
+    return @import("../../../sdk/train/grad.zig").item(try @import("../../../sdk/train/loss.zig").crossEntropy(&g, logits, targets, mask));
 }

@@ -171,11 +171,6 @@ pub fn handleCompletions(
         return;
     }
     const root = parsed.value.object;
-    var lora = @import("lora.zig").prepare(allocator, stream.io, root, lm) catch |err| {
-        try sendGenerationError(allocator, stream, err, .openai);
-        return;
-    };
-    defer if (lora) |*p| p.deinit(allocator);
     const cache_key = requestCacheKey(root);
 
     if (nChoicesRejectReason(root)) |reason| {
@@ -361,7 +356,7 @@ pub fn handleCompletions(
     };
 
     if (is_stream) {
-        handleStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, logprobs_n, cache_key, lora) catch |err| {
+        handleStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, logprobs_n, cache_key) catch |err| {
             logStreamError(err);
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
@@ -373,7 +368,7 @@ pub fn handleCompletions(
             else => unreachable,
         };
         defer if (prompt == .ids) if (echo_text) |t| allocator.free(t);
-        handleNonStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, logprobs_n, echo_text, prompt_logprobs, cache_key, lora) catch |err| {
+        handleNonStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, logprobs_n, echo_text, prompt_logprobs, cache_key) catch |err| {
             log.err("  -> {s}\n", .{@errorName(err)});
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
@@ -400,7 +395,6 @@ fn handleNonStreamingCompletion(
     echo_text: ?[]const u8,
     prompt_logprobs: bool,
     cache_key: u64,
-    lora: ?@import("lora.zig").Prepared,
 ) !void {
     var timer = Stopwatch.init(stream.io);
 
@@ -413,7 +407,7 @@ fn handleNonStreamingCompletion(
     const use_pld = spec.use_pld;
 
     // Every failure class propagates to the surface's one error arm (`sendGenerationError`), shared with the streaming twin.
-    var result = try nonStreamingViaScheduler(allocator, http_server.launch().global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), null, &.{}, cache_key, .{}, logprobs_n, prompt_logprobs, null, null, null, stream, lora);
+    var result = try nonStreamingViaScheduler(allocator, http_server.launch().global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), null, &.{}, cache_key, .{}, logprobs_n, prompt_logprobs, null, null, null, stream);
     _ = &result;
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
@@ -506,7 +500,6 @@ fn handleStreamingCompletion(
     allow_batch_mtp: bool,
     logprobs_n: u32,
     cache_key: u64,
-    lora: ?@import("lora.zig").Prepared,
 ) !void {
     const cmpl_id = nowMs(stream.io);
     const created_ts = nowSecs(stream.io);
@@ -522,7 +515,6 @@ fn handleStreamingCompletion(
 
     const sch = http_server.launch().global_scheduler.?;
     running = try mlx_engine.Running.submit(sch, .{
-        .lora = lora,
         .model = lm,
         .prompt_ids = prompt_ids,
         .full_prompt = prompt_ids,

@@ -27,12 +27,9 @@ test {
     _ = @import("sdk/train/trainer_test.zig");
     _ = @import("host/chat/training.zig");
     _ = @import("engines/mlx/plugin/train_test.zig");
-    _ = @import("engines/mlx/plugin/lora_test.zig");
-    _ = @import("engines/mlx/lora.zig");
-    _ = @import("host/api/lora.zig");
     _ = @import("sdk/weights/lora_config.zig");
-    _ = @import("sdk/weights/lora_metadata.zig");
-    _ = @import("host/registry/adapters.zig");
+    _ = @import("sdk/weights/finetune.zig");
+    _ = @import("engines/mlx/plugin/finetune_test.zig");
     _ = @import("sdk/blocks/hc/hc_cuda_test.zig");
     _ = @import("plugins/stable_audio3/plugin.zig");
     _ = @import("host/media_jobs/plugin/served.zig");

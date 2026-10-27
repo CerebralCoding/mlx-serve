@@ -399,7 +399,7 @@ pub fn serve(
     startup.stop();
     launch().global_scheduler = scheduler;
     defer launch().global_scheduler = null;
-    const adapter_root = try @import("../registry/adapters.zig").rootPath(allocator);
+    const adapter_root = try @import("../finetune/jobs.zig").rootPath(allocator);
     defer allocator.free(adapter_root);
     var finetune = try @import("../finetune/jobs.zig").Store.init(allocator, io, scheduler, adapter_root);
     defer finetune.deinit();

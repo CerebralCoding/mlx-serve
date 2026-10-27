@@ -19,7 +19,7 @@ const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
 
 const testing = std.testing;
 
-test "gemma4 LoRA: MLP bindings change served logits and scale zero preserves the base" {
+test "gemma4 LoRA: a load-time MLP overlay changes served logits and scale zero preserves the base" {
     var p = fixture.Pack.init(0x10a4);
     defer p.deinit();
     try writeGemma4(&p, .{}, 256, 2, true, false);
@@ -39,16 +39,17 @@ test "gemma4 LoRA: MLP bindings change served logits and scale zero preserves th
     defer for (&slots) |*slot| slot.deinit();
     var zero = binding;
     zero.scale = 0;
-    slots[1].ctx.lora = &.{binding};
-    slots[2].ctx.lora = &.{zero};
-    slots[3].ctx.lora = &.{binding};
-    slots[1].kv.adapter_key = @splat(1);
-    slots[3].kv.adapter_key = @splat(1);
+    const driver = @import("../../engines/mlx/plugin/driver.zig");
+    var adapted = try driver.loadAdapted(testing.io, testing.allocator, &b.cfg, b.dir, mlx.mlx_default_gpu_stream_new(), &.{binding});
+    defer adapted.deinit();
+    var identity = try driver.loadAdapted(testing.io, testing.allocator, &b.cfg, b.dir, mlx.mlx_default_gpu_stream_new(), &.{zero});
+    defer identity.deinit();
+    const models = .{ &b.xfm, &adapted, &identity, &adapted };
     for (fixture.steps) |step| {
         var logits: [4]mlx.mlx_array = undefined;
-        for (&slots, &logits) |*slot, *out| {
+        inline for (&slots, &logits, models) |*slot, *out, xfm| {
             slot.ctx.spec_verify = step.mode == .verify;
-            out.* = try g.adopt(try b.xfm.forwardWith(&slot.ctx, try fixture.tokens(&g, step.ids)));
+            out.* = try g.adopt(try xfm.forwardWith(&slot.ctx, try fixture.tokens(&g, step.ids)));
         }
         try ops.expectBitEqual(logits[0], logits[2]);
         try ops.expectBitEqual(logits[1], logits[3]);
@@ -56,10 +57,9 @@ test "gemma4 LoRA: MLP bindings change served logits and scale zero preserves th
         const difference = try @import("../../sdk/train/grad.zig").item(try g.astype(delta, .float32));
         try testing.expect(difference > 0.01);
     }
-    try @import("../../engines/mlx/plugin/lora_test.zig").expectBatch(&b.xfm, &g, .{ &slots[0].ctx, &slots[1].ctx, &slots[2].ctx, &slots[3].ctx }, @intCast(slots[0].kv.step));
 }
 
-test "gemma4 LoRA: training matches runtime, learns, and saves reloadable dense adapters" {
+test "gemma4 LoRA: training learns and saves reloadable compute weights" {
     const train = @import("../../sdk/train/model.zig");
     const adapter_mod = @import("../../sdk/train/adapter.zig");
     for ([_]bool{ false, true }) |ple| {
@@ -93,13 +93,6 @@ test "gemma4 LoRA: training matches runtime, learns, and saves reloadable dense 
         defer testing.allocator.free(bindings);
         const ids = try g.fromSlice(u32, e.inputs, &.{ 1, @intCast(e.inputs.len) });
         const training = try frozen.project(&g, try frozen.hidden(&g, ids, bindings));
-        var slot: proof.Slot = undefined;
-        try slot.init(6);
-        defer slot.deinit();
-        slot.ctx.lora = bindings;
-        slot.ctx.spec_verify = true;
-        const runtime = try g.adopt(try b.xfm.forwardWith(&slot.ctx, ids));
-        try ops.expectBitEqual(training, runtime);
         const path = try std.fs.path.join(testing.allocator, &.{ b.dir, "trained" });
         defer testing.allocator.free(path);
         try adapter.save(std.testing.io, path, @import("../../sdk/weights/lora_config.zig").fingerprint(if (ple) e_series else dense31b));
@@ -163,7 +156,7 @@ fn at(buf: []u8, layer: usize, name: []const u8) ![]const u8 {
 
 /// Six layers (sliding, sliding, full, sliding, then two reading layers 3 and 2): hd 256 sliding over 1 KV head, hd
 /// 512 full layers over `gkv` heads; `pd` > 0 adds per-layer embeddings; `k_eq_v` full layers project no v.
-fn writeGemma4(p: *fixture.Pack, q: ?Quant, pd: c_int, shared: usize, k_eq_v: bool, head: bool) !void {
+pub fn writeGemma4(p: *fixture.Pack, q: ?Quant, pd: c_int, shared: usize, k_eq_v: bool, head: bool) !void {
     var buf: [192]u8 = undefined;
     const m = "language_model.model.";
     const n = 6;
@@ -204,7 +197,7 @@ const layer_types =
     \\"layer_types":["sliding_attention","sliding_attention","full_attention","sliding_attention","sliding_attention","full_attention"],
 ;
 
-const e_series =
+pub const e_series =
     \\{"model_type":"gemma4","text_config":{"model_type":"gemma4_text","hidden_size":128,"intermediate_size":256,
     \\"num_hidden_layers":6,"num_attention_heads":2,"num_key_value_heads":1,"head_dim":256,"global_head_dim":512,
     \\"num_kv_shared_layers":2,"attention_k_eq_v":true,"hidden_size_per_layer_input":256,"vocab_size":256,

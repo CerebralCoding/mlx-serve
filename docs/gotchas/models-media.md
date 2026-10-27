@@ -16,7 +16,7 @@ Using a checkpoint's tensor prefix for adapter export produced keys mlx-lm could
 not attach to its model. Text-only Gemma 4 uses `model.layers`, while its wrappers
 and Qwen3.5 use `language_model.model.layers`; PEFT adds a separate import wrapper.
 Export selects the architecture's model hierarchy, and import normalizes supported
-aliases. Gemma 4/Qwen3.5 save-reload proofs and PEFT metadata tests guard both directions.
+aliases. Gemma 4/Qwen3.5 save-reload proofs and PEFT import tests guard both directions.
 
 ### Read `text_config` first, then the root, per field
 Defect: every unloaded multimodal model advertised `hidden_size: 0` and `is_moe: false` (a 128-expert Gemma read as

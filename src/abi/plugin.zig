@@ -461,7 +461,6 @@ pub const Forward = extern struct {
     /// Input rows `[slots, rows, hidden]` in place of the ids' embedding (a spoken frame's `SpeechHooks.frame_rows`);
     /// empty = embed the ids.
     embeds: Array = .{},
-    lora: Span(LoraBinding) = .{},
 };
 
 /// The engine's calls a forward makes at a layer's projections: each returns true with new references in its outputs
@@ -912,8 +911,6 @@ pub const ModelTable = extern struct {
     speech: ?*const SpeechHooks = null,
     /// In-tree SDK training only: fills a borrowed `sdk/train/model.Frozen`. Outside plugins decline.
     native_train: ?*const fn (m: *anyopaque, out: *anyopaque) callconv(.c) Verdict = null,
-    /// Immutable CPU metadata, prepared at load; safe to read on a request thread.
-    lora_targets: ?*const fn (m: *anyopaque) callconv(.c) Span(LoraTarget) = null,
 };
 
 /// The modes a model serves: prefill, decode and verify always; the rest as its caps declare. An encoder (`embed`)

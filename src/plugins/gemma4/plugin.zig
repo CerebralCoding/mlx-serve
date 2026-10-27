@@ -40,7 +40,6 @@ pub const table = abi.ModelTable{
     .spec = &.{ .trunk_weight = &load_mod.TrunkWeight(Loaded).get },
     .weights = &.{},
     .native_train = &trainModel,
-    .lora_targets = &loraTargets,
 };
 
 fn trainModel(mp: *anyopaque, out: *anyopaque) callconv(.c) abi.Verdict {
@@ -48,11 +47,6 @@ fn trainModel(mp: *anyopaque, out: *anyopaque) callconv(.c) abi.Verdict {
     const frozen: *@import("../../sdk/train/model.zig").Frozen = @ptrCast(@alignCast(out));
     frozen.* = @import("train.zig").frozen(&m.base, m.adapter_prefix) catch |e| return .{ .code = .unsupported, .why = abi.Str.of(@errorName(e)) };
     return .{};
-}
-
-fn loraTargets(mp: *anyopaque) callconv(.c) abi.Span(abi.LoraTarget) {
-    const m: *Loaded = @ptrCast(@alignCast(mp));
-    return abi.Span(abi.LoraTarget).of(m.adapter_targets);
 }
 
 const gpa = load_mod.gpa;
@@ -67,7 +61,6 @@ pub fn bill(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(
 pub const Loaded = struct {
     base: bases.Model(decoder),
     adapter_prefix: []const u8 = "model",
-    adapter_targets: []abi.LoraTarget = &.{},
     layers: []decoder.Layer = &.{},
     owned: load_mod.Owned = .{},
     angles: qk_rope.AngleCache = .{},
@@ -76,7 +69,6 @@ pub const Loaded = struct {
     routing: bases_compiled.Closure = .{ .ctx = null },
 
     fn release(m: *Loaded) void {
-        gpa.free(m.adapter_targets);
         bases_compiled.free(&m.routing);
         m.angles.deinit();
         m.compiled.deinit();
@@ -160,7 +152,6 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
         w.ple_proj_norm = try r.norm(o, try r.name(&nb, "per_layer_projection_norm.weight", .{}), false);
     }
     m.base.weights = w;
-    if (c.num_experts == 0) m.adapter_targets = try @import("train.zig").targets(&m.base, gpa);
     if (gemma.ternaryCandidate(c)) try load_mod.armTernary(.{ &m.layers, &m.base.weights.head.head, &m.base.weights.ple_table, &m.base.weights.ple_proj }, null, load_mod.gatherOnly(&m.base.weights.head.head, embed), s);
     return m;
 }

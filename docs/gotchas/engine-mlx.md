@@ -1,12 +1,19 @@
 # Engine: KV cache, spec decode, kernels, MLX: gotchas
 
-## LoRA training and serving took different kernel paths
+## Fine-tuning verification must measure serving
 
-Frozen PLE and recurrent projections still affect adapter logits and gradients.
-Serving them with custom kernels while training used MLX operations broke exact
-training/runtime agreement. Active adapters now set `Graph.native_ops` for the
-whole forward; `differentiable` separately controls gradient-safe execution.
-Gemma 4 and Qwen3.5 proof tests check all adapter gradients, serving logits and reloads.
+Training uses differentiable MLX operations, whose rounding differs from serving
+kernels. Merging into quantized weights also changes the adapter's effective update.
+Verification therefore loads the merged weights and captures normal serving hidden
+states. The automatic-overlay test checks their projected logits against inference
+on every supported family; training gradients remain checked independently.
+
+## Fine-tuning generation needs request-owned recurrent state
+
+A teacher with only a KV cache worked on attention-only decoders but failed on
+Qwen3.5's recurrent layers. Teacher generation now owns a normal `Slot`, including
+SSM state and its generation identity. The workflow test covers every supported
+dense family, cancellation, reuse, and scale-zero identity.
 
 ## Fine-tuning completion boundaries
 

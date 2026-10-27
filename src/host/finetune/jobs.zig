@@ -8,6 +8,11 @@ const LoadedModel = @import("../registry/registry.zig").LoadedModel;
 const now = @import("../../sdk/util/io_util.zig").nowMsMonotonic;
 const verify = @import("../../sdk/train/verify.zig");
 
+pub fn rootPath(a: std.mem.Allocator) ![]u8 {
+    const home = @import("../../env.zig").span(.HOME) orelse return error.HomeNotFound;
+    return std.fs.path.join(a, &.{ home, ".mlx-serve", "finetune" });
+}
+
 pub const Store = struct {
     a: std.mem.Allocator,
     io: std.Io,
@@ -69,12 +74,14 @@ pub const Store = struct {
         try std.Io.Dir.cwd().createDirPath(self.io, self.root);
         const job = try self.a.create(Job);
         errdefer self.a.destroy(job);
+        const model_path = try self.a.dupe(u8, lm.path);
+        errdefer self.a.free(model_path);
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.closing) return error.Shutdown;
         try self.jobs.ensureUnusedCapacity(self.a, 1);
         if (self.jobs.items.len == 32) self.jobs.orderedRemove(0).deinit();
-        job.* = .{ .store = self, .id = self.next_id, .parsed = parsed, .path = path, .model = lm, .bill = bill.*, .stage_started_ms = now(self.io) };
+        job.* = .{ .store = self, .id = self.next_id, .parsed = parsed, .path = path, .model = lm, .model_path = model_path, .bill = bill.*, .stage_started_ms = now(self.io) };
         job.thread = try std.Thread.spawn(.{}, Job.worker, .{job});
         self.jobs.appendAssumeCapacity(job);
         self.next_id += 1;
@@ -93,22 +100,22 @@ pub const Store = struct {
         for (self.jobs.items) |j| if (j.id == id) return j;
         return null;
     }
-    pub fn renameAdapter(self: *Store, id: u64, name: []const u8) !void {
-        if (!@import("../../sdk/weights/lora_config.zig").validName(name)) return error.InvalidAdapterName;
+    pub fn applyAdapter(self: *Store, id: u64) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const job = self.find(id) orelse return error.UnknownFineTuneJob;
         if (job.status != .completed) return error.FineTuneNotCompleted;
         if (job.adapter_discarded) return error.FineTuneAdapterDiscarded;
-        if (std.mem.eql(u8, std.fs.path.basename(job.path), name)) return;
-        const path = try std.fs.path.join(self.a, &.{ self.root, name });
-        errdefer self.a.free(path);
-        std.Io.Dir.renamePreserve(.cwd(), job.path, .cwd(), path, self.io) catch |err| switch (err) {
-            error.PathAlreadyExists => return error.FineTuneNameExists,
+        if (job.adapter_applied) return;
+        const source = try std.fs.path.join(self.a, &.{ job.path, "adapters.safetensors" });
+        defer self.a.free(source);
+        const dest = try std.fs.path.join(self.a, &.{ job.model_path, @import("../../sdk/weights/finetune.zig").filename });
+        defer self.a.free(dest);
+        std.Io.Dir.copyFile(.cwd(), source, .cwd(), dest, self.io, .{ .replace = false }) catch |err| switch (err) {
+            error.PathAlreadyExists => return error.FineTuneOverlayExists,
             else => return err,
         };
-        self.a.free(job.path);
-        job.path = path;
+        job.adapter_applied = true;
         job.revision += 1;
     }
     pub fn discardAdapter(self: *Store, id: u64) !void {
@@ -116,6 +123,7 @@ pub const Store = struct {
         defer self.mutex.unlock(self.io);
         const job = self.find(id) orelse return error.UnknownFineTuneJob;
         if (job.status != .completed) return error.FineTuneNotCompleted;
+        if (job.adapter_applied) return error.FineTuneAlreadyApplied;
         if (job.adapter_discarded) return;
         try std.Io.Dir.cwd().deleteTree(self.io, job.path);
         job.adapter_discarded = true;
@@ -142,7 +150,7 @@ pub const Store = struct {
             .prompt = j.result.prompt,
             .before = j.result.before,
             .after = j.result.after,
-            .recommendation = if (j.result.metrics.improved()) "Measured improvement on held-out prompts; review the examples before using the adapter." else "Verification did not establish improvement within the drift limits. Try a lower lora_scale and review the answers before using the adapter.",
+            .recommendation = if (j.result.metrics.improved()) "Measured improvement on held-out prompts after merging; review the examples before applying." else "Verification did not establish improvement within the drift limits after merging. Discard this result or review the answers before applying.",
         } else null;
         const elapsed: u64 = @intCast(@max(0, now(self.io) - j.stage_started_ms));
         const json = try std.json.Stringify.valueAlloc(a, .{
@@ -150,6 +158,7 @@ pub const Store = struct {
             .model = j.parsed.value.model,
             .name = std.fs.path.basename(j.path),
             .adapter_discarded = j.adapter_discarded,
+            .adapter_applied = j.adapter_applied,
             .status = j.status,
             .stage = j.update.stage,
             .step = j.update.step,
@@ -186,6 +195,7 @@ const Job = struct {
     parsed: std.json.Parsed(types.Request),
     path: []const u8,
     model: *LoadedModel,
+    model_path: []const u8 = "",
     bill: types.Plan,
     thread: ?std.Thread = null,
     cancelled: std.atomic.Value(bool) = .init(false),
@@ -196,6 +206,7 @@ const Job = struct {
     preview: []const u8 = "",
     result: types.Result = .{},
     adapter_discarded: bool = false,
+    adapter_applied: bool = false,
     failure: ?[]const u8 = null,
     ran: bool = false,
 
@@ -204,6 +215,7 @@ const Job = struct {
         j.result.deinit(j.store.a);
         if (j.preview.len > 0) j.store.a.free(j.preview);
         j.store.a.free(j.path);
+        if (j.model_path.len > 0) j.store.a.free(j.model_path);
         j.parsed.deinit();
         j.store.a.destroy(j);
     }
@@ -294,7 +306,7 @@ test "finetune: cancelling is cooperative and a completed job remains readable" 
     try std.testing.expect(std.mem.indexOf(u8, events, status[body_start..]) != null);
 }
 
-test "finetune: only completed job adapters can be renamed or discarded" {
+test "finetune: completed jobs install an atomic model-local sidecar and preserve installed results" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -304,11 +316,13 @@ test "finetune: only completed job adapters can be renamed or discarded" {
     var store = try Store.init(a, io, undefined, root);
     defer store.deinit();
     try tmp.dir.createDir(io, "draft", .default_dir);
-    try tmp.dir.createDir(io, "taken", .default_dir);
+    try tmp.dir.createDir(io, "model", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "draft/adapters.safetensors", .data = "trained weights with metadata" });
     const j = try a.create(Job);
     j.* = .{ .store = &store, .id = 1, .parsed = try types.Request.parse(a, "{\"model\":\"m\",\"name\":\"draft\",\"topic\":\"roses\"}"), .path = try std.fs.path.join(a, &.{ root, "draft" }), .model = undefined, .bill = .{}, .stage_started_ms = now(io) };
     try store.jobs.append(a, j);
-    try std.testing.expectError(error.FineTuneNotCompleted, store.renameAdapter(1, "saved"));
+    j.model_path = try std.fs.path.join(a, &.{ root, "model" });
+    try std.testing.expectError(error.FineTuneNotCompleted, store.applyAdapter(1));
     try std.testing.expectError(error.FineTuneNotCompleted, store.discardAdapter(1));
     const Http = struct {
         fn run(conn: *@import("../http/conn.zig").Conn, jobs: *Store, method: []const u8, body: []const u8) !void {
@@ -320,25 +334,28 @@ test "finetune: only completed job adapters can be renamed or discarded" {
     defer a.free(busy);
     try std.testing.expect(std.mem.startsWith(u8, busy, "HTTP/1.1 409"));
     j.status = .completed;
-    try std.testing.expectError(error.InvalidAdapterName, store.renameAdapter(1, "../escape"));
-    try std.testing.expectError(error.FineTuneNameExists, store.renameAdapter(1, "taken"));
-    const renamed = try capture(a, Http.run, .{ &store, "PATCH", "{\"name\":\"saved\"}" });
-    defer a.free(renamed);
-    try std.testing.expect(std.mem.startsWith(u8, renamed, "HTTP/1.1 200"));
-    _ = try tmp.dir.statFile(io, "saved", .{});
-    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "draft", .{}));
-    try store.renameAdapter(1, "saved");
-    const snap = try store.snapshot(a, 1);
-    defer a.free(snap.json);
-    const parsed = try std.json.parseFromSlice(std.json.Value, a, snap.json, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings("saved", parsed.value.object.get("name").?.string);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/finetune.lora.safetensor", .data = "existing" });
+    try std.testing.expectError(error.FineTuneOverlayExists, store.applyAdapter(1));
+    try tmp.dir.deleteFile(io, "model/finetune.lora.safetensor");
+    const applied = try capture(a, Http.run, .{ &store, "POST", "" });
+    defer a.free(applied);
+    try std.testing.expect(std.mem.startsWith(u8, applied, "HTTP/1.1 200"));
+    try std.testing.expect(std.mem.indexOf(u8, applied, "\"adapter_applied\":true") != null);
+    const bytes = try tmp.dir.readFileAlloc(io, "model/finetune.lora.safetensor", a, .limited(1024));
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("trained weights with metadata", bytes);
+    try store.applyAdapter(1);
+    try std.testing.expectError(error.FineTuneAlreadyApplied, store.discardAdapter(1));
+    j.adapter_applied = false;
+    try tmp.dir.deleteFile(io, "draft/adapters.safetensors");
+    try std.testing.expectError(error.FileNotFound, store.applyAdapter(1));
+    try std.testing.expect(!j.adapter_applied);
     const discarded = try capture(a, Http.run, .{ &store, "DELETE", "" });
     defer a.free(discarded);
     try std.testing.expect(std.mem.startsWith(u8, discarded, "HTTP/1.1 200"));
     try std.testing.expect(std.mem.indexOf(u8, discarded, "\"adapter_discarded\":true") != null);
     try store.discardAdapter(1);
-    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "saved", .{}));
-    _ = try tmp.dir.statFile(io, "taken", .{});
-    try std.testing.expectError(error.FineTuneAdapterDiscarded, store.renameAdapter(1, "again"));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "draft", .{}));
+    _ = try tmp.dir.statFile(io, "model/finetune.lora.safetensor", .{});
+    try std.testing.expectError(error.FineTuneAdapterDiscarded, store.applyAdapter(1));
 }

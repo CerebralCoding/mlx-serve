@@ -42,7 +42,7 @@ pub fn groupServes(lane: Lane, rows: c_int) bool {
 
 /// `x @ l` on the lane's kernel where it serves, else the projection as always.
 pub fn linear(lane: Lane, g: *Graph, l: *const Linear, x: Array) !Array {
-    if (!g.differentiable and !g.native_ops and !l.hasLora() and lane != .off and l.mode == .affine and l.bias.ctx == null) {
+    if (!g.differentiable and !l.hasLora() and lane != .off and l.mode == .affine and l.bias.ctx == null) {
         if (try qmm(lane, x, l, g.s)) |y| return g.adopt(y);
     }
     return l.forward(g, x);

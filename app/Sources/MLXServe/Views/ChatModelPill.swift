@@ -139,7 +139,7 @@ struct ChatModelPill: View {
                     // The READABLE name (`ModelDisplayName`). The repo id it is
                     // built from stays the identity and is still what the menu
                     // rows carry underneath — this is the label, not a rename.
-                    Text(ModelDisplayName.pretty(pill.name) + (appState.activeChatAdapter.map { " - " + $0.name } ?? ""))
+                    Text(ModelDisplayName.pretty(pill.name))
                         .font(compact ? .app(.callout, weight: .semibold) : .app(.callout, weight: .medium))
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -226,18 +226,6 @@ struct ChatModelPill: View {
                         ForEach(models) { model in
                             row(title: rowLabel(model, dupNames: dupNames),
                                 tag: model.path)
-                            ForEach(ModelSettingsApply.row(for: model.path, in: server.allModels)?.adapters ?? [], id: \.self) { name in
-                                Button {
-                                    appState.applyChatModelPick(model.path)
-                                    appState.setChatAdapter(.init(model: model.path, name: name), chatId: appState.activeChatId)
-                                } label: {
-                                    if appState.activeChatAdapter?.name == name && model.path == appState.selectedModelPath {
-                                        Label("\(rowLabel(model, dupNames: dupNames)) - \(name)", systemImage: "checkmark").font(.app(.body))
-                                    } else {
-                                        Text("\(rowLabel(model, dupNames: dupNames)) - \(name)").font(.app(.body))
-                                    }
-                                }.disabled(appState.activeChatId == nil)
-                            }
                         }
                     }
                 }
@@ -265,25 +253,10 @@ struct ChatModelPill: View {
             }
         }
         if !appState.useAppleModel, server.lanChatModelId == nil, let model = server.chatModelInfo {
-            Section("Customizations") {
-                Button("Original model") { appState.setChatAdapter(nil, chatId: appState.activeChatId) }
-                    .font(.app(.body))
-                if let adapter = appState.activeChatAdapter {
-                    Menu("Strength: \(adapter.scale, specifier: "%.2f")") {
-                        ForEach([0.0, 0.25, 0.5, 0.75, 1, 1.5, 2], id: \.self) { scale in
-                            Button("\(scale, specifier: "%.2f")") {
-                                var updated = adapter
-                                updated.scale = scale
-                                appState.setChatAdapter(updated, chatId: appState.activeChatId)
-                            }.font(.app(.body))
-                        }
-                    }.font(.app(.body))
-                }
-                Button("Customize…") {
-                    appState.customizeModel(path: appState.selectedModelPath,
-                        title: ModelDisplayName.pretty(model.name), chatId: appState.activeChatId)
-                }.font(.app(.body))
-            }.disabled(appState.loadingModelPath != nil || appState.activeChatId == nil)
+            Button("Customize…") {
+                appState.customizeModel(path: appState.selectedModelPath,
+                    title: ModelDisplayName.pretty(model.name), chatId: appState.activeChatId)
+            }.font(.app(.body)).disabled(appState.loadingModelPath != nil)
         }
         FineTuneResumeItem(controller: appState.fineTune) { request in appState.customizeRequest = request }
         Divider()
@@ -299,10 +272,9 @@ struct ChatModelPill: View {
 
     private func row(title: String, tag: String) -> some View {
         Button {
-            appState.setChatAdapter(nil, chatId: appState.activeChatId)
             selection.wrappedValue = tag
         } label: {
-            if selection.wrappedValue == tag && appState.activeChatAdapter == nil {
+            if selection.wrappedValue == tag {
                 Label(L10n.text(title), systemImage: "checkmark").font(.app(.body))
             } else {
                 Text(L10n.text(title)).font(.app(.body))

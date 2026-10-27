@@ -813,7 +813,7 @@ StyleTTS2 + iSTFTNet, NON-autoregressive, ~17x realtime, 325 MB f32: ALBERT (sha
 
 ### Runtime LoRA (`src/sdk/weights/lora.zig`)
 
-Text models use one request-owned `LlmAdapter`: native training lives in `sdk/train` and serving carries bindings through the plugin forward. Supported families, strict base-config binding, API fields and job lifecycle are documented in [Text adapters and fine-tuning](api.md#text-adapters-and-fine-tuning).
+Text models merge `finetune.lora.safetensor` at load time (`sdk/weights/finetune.zig`); native training lives in `sdk/train`. See [Text adapters and fine-tuning](api.md#text-adapters-and-fine-tuning) for formats, provenance and jobs.
 
 Runtime unfused LoRA adapters, STACKED (`Stack` = up to `MAX_LORAS` 8 files; `deltaSum` sums per-linear, never merges) across QLinear/MixedLinear/MfLinear. `parseKey` accepts diffusers/kohya/dotted-`lora.down`/PEFT-`.default.` spellings + flat `lora_unet_` scheme; `canonicalize` maps every alias onto OUR module name per `Arch` (flux2/krea2/minimax_h3/qwen_image21/generic), splitting a fused BFL QKV source into thirds (shared full-rank A) and a fused up-projection into its halves (`Split`). `validatePath` is the ONE path rule (absolute + regular file, checked before mlx sees it); `fileAlphaScale` resolves the file's declared alpha/rank out of the safetensors `__metadata__` (per-module `.alpha` tensor still wins). `addTo` skips a scale-0 adapter (MLX's `addmm` is wrong at `alpha == 0`).
 

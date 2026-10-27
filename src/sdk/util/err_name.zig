@@ -11,8 +11,6 @@ pub const Known = error{
     LoraRevisionChanged,
     LoraUnsupportedArchitecture,
     LoraUnsupportedQuantization,
-    LoraMixedBatch,
-    LoraCacheMismatch,
     EngineBusy,
     EngineUnsupported,
     ForeignBytesReaderBusy,

@@ -7,8 +7,6 @@ struct CustomizeSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var topic: String
     @State private var keepEverythingElse = true
-    @State private var name = "my-custom-model"
-    @State private var strength = 1.0
 
     init(request: CustomizeRequest, controller: FineTuneController) {
         self.request = request
@@ -34,8 +32,8 @@ struct CustomizeSheet: View {
                         TrainingProgressCard(state: controller.state,
                             stop: { Task { await controller.stop() } }, retry: controller.watch)
                     } else if let job = controller.state.job, let result = job.result, !job.adapterDiscarded {
-                        TrainingResultCard(result: result, name: $name, strength: $strength,
-                            busy: controller.managing, save: save, discard: discard)
+                        TrainingResultCard(result: result, installed: job.adapterApplied,
+                            busy: controller.managing, apply: apply, discard: discard)
                     } else {
                         if controller.state.job?.status == .cancelled {
                             Text("Training stopped. You can try again.").font(.app(.body))
@@ -93,13 +91,9 @@ struct CustomizeSheet: View {
         }
     }
 
-    private func save() {
+    private func apply() {
         Task {
-            guard await controller.save(name: name), let job = controller.state.job else { return }
-            if let chatId = request.chatId {
-                appState.applyChatModelPick(request.path)
-                appState.setChatAdapter(.init(model: request.path, name: job.name, scale: strength), chatId: chatId)
-            }
+            guard await controller.apply() else { return }
             await appState.server.refreshModels()
             dismiss()
         }
@@ -107,11 +101,7 @@ struct CustomizeSheet: View {
 
     private func discard() {
         Task {
-            guard let name = controller.state.job?.name, await controller.discard() else { return }
-            for chat in appState.chatSessions where chat.adapter?.name == name {
-                appState.setChatAdapter(nil, chatId: chat.id)
-            }
-            await appState.server.refreshModels()
+            guard await controller.discard() else { return }
             dismiss()
         }
     }

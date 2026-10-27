@@ -64,7 +64,7 @@ pub fn GatedGelu(comptime act: Gelu) type {
             adapted.down = adapted.down.withLora(c.lora, c.layer, .down);
             const w = &adapted;
             const g = c.g;
-            const joined = !g.differentiable and !g.native_ops and !w.gate.hasLora() and !w.up.hasLora() and c.mode != .batched_rows and w.rows_joined and w.gu.built() and c.rows * c.slots <= FUSED_ROWS_MAX_M;
+            const joined = !g.differentiable and !w.gate.hasLora() and !w.up.hasLora() and c.mode != .batched_rows and w.rows_joined and w.gu.built() and c.rows * c.slots <= FUSED_ROWS_MAX_M;
             var gate: Array = undefined;
             var up: Array = undefined;
             if (joined) {

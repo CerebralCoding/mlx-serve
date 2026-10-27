@@ -61,11 +61,19 @@ final class FineTuneClient {
     func status(_ id: String) async throws -> FineTuneJob { try await send(jobRequest(id)) }
     func cancel(_ id: String) async throws -> FineTuneJob { try await send(jobRequest(id, method: "DELETE")) }
     func discard(_ id: String) async throws -> FineTuneJob { try await send(jobRequest(id, method: "DELETE", suffix: "adapter")) }
-    func rename(_ id: String, name: String) async throws -> FineTuneJob {
-        var request = try jobRequest(id, method: "PATCH", suffix: "adapter")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: ["name": name])
-        return try await send(request)
+    func apply(_ id: String) async throws -> FineTuneJob {
+        try await send(jobRequest(id, method: "POST", suffix: "adapter"))
+    }
+
+    func reload(model: String) async throws {
+        for endpoint in ["unload-model", "load-model"] {
+            var request = URLRequest(url: baseURL.appendingPathComponent("v1/\(endpoint)"))
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            let body = endpoint == "load-model" ? APIClient.loadModelBody(id: model, setDefault: false) : ["model": model]
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+            _ = try await responseData(request)
+        }
     }
 
     func events(_ id: String) -> AsyncThrowingStream<FineTuneJob, Error> {
@@ -182,12 +190,14 @@ final class FineTuneController: ObservableObject {
         }
     }
 
-    func save(name: String) async -> Bool {
+    func apply() async -> Bool {
         guard let client, let job = state.job, !managing else { return false }
         managing = true
         defer { managing = false }
         do {
-            state.receive(try await client.rename(job.id, name: name))
+            if !job.adapterApplied { state.receive(try await client.apply(job.id)) }
+            try await client.reload(model: job.model)
+            state.error = nil
             saved = true
             return true
         } catch { state.error = error.localizedDescription; return false }

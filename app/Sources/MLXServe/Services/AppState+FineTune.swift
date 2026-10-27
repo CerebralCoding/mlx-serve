@@ -34,14 +34,4 @@ extension AppState {
         }
     }
 
-    func setChatAdapter(_ adapter: ChatAdapterSelection?, chatId: UUID?) {
-        guard let id = chatId, let index = chatSessions.firstIndex(where: { $0.id == id }) else { return }
-        chatSessions[index].adapter = adapter
-        saveChatHistory()
-    }
-
-    var activeChatAdapter: ChatAdapterSelection? {
-        chatSessions.first { $0.id == activeChatId }?.adapter?
-            .forModel(selectedModelPath, local: !useAppleModel && server.lanChatModelId == nil)
-    }
 }

@@ -507,10 +507,6 @@ pub fn submit(self: *Scheduler, params: SubmitParams) !*Slot {
     // different architectures (e.g. pure-attention + hybrid SSM)
     // share one scheduler.
     const slot_config: *const ModelConfig = params.model.config orelse return error.ModelNotReady;
-    if (params.lora != null and (params.model.engineBacked() or slot_config.plugin == null or slot_config.isMoe() or
-        (!std.mem.eql(u8, slot_config.model_type, "llama") and !std.mem.eql(u8, slot_config.model_type, "qwen3")))) return error.LoraUnsupportedArchitecture;
-    if (params.lora != null and slot_config.plugin.?.outside) return error.LoraUnsupportedArchitecture;
-    if (params.lora != null and (slot_config.quant_mode != .affine or slot_config.hadamard_block != 0)) return error.LoraUnsupportedQuantization;
     if (params.model.engine) |e| if (engine_requests.missingCap(e, params)) |cap| {
         refusal.refused().* = .{ .kind = e.kind, .cap = cap };
         return error.EngineUnsupported;

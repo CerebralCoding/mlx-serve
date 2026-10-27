@@ -226,7 +226,6 @@ fn run(comptime Base: type, m: *Model(Base), f: *const abi.Forward, out: *abi.Fo
             .attn = .{ .depth = .{ .ctx = f.tree.depth.ctx }, .path = .{ .ctx = f.tree.path.ctx }, .max_depth = f.tree.max_depth },
         },
         .pipeline_every = f.pipeline_every,
-        .lora = f.lora.slice(),
     };
     const res = try Base.forward(&m.weights, &m.shared, &g, ids, r);
     if (caps.len > 0) {

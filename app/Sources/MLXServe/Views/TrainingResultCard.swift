@@ -2,10 +2,9 @@ import SwiftUI
 
 struct TrainingResultCard: View {
     let result: FineTuneJob.Result
-    @Binding var name: String
-    @Binding var strength: Double
+    let installed: Bool
     let busy: Bool
-    let save: () -> Void
+    let apply: () -> Void
     let discard: () -> Void
 
     var body: some View {
@@ -24,22 +23,14 @@ struct TrainingResultCard: View {
             Text("Side effects: mean KL \(result.meanKl, specifier: "%.3f"), peak \(result.maxKl, specifier: "%.3f"). Lower is better.")
                 .font(.app(.caption)).foregroundStyle(.secondary)
             Divider()
-            HStack {
-                Text("Strength").font(.app(.body))
-                Slider(value: $strength, in: 0...2, step: 0.05).accessibilityLabel("Adapter strength")
-                Text(strength, format: .number.precision(.fractionLength(2))).font(.app(.body)).monospacedDigit()
-            }
-            Text("0 uses the original model. The comparison above was measured at strength 1.")
-                .font(.app(.caption)).foregroundStyle(.secondary)
-            TextField("Save as", text: $name).font(.app(.body)).textFieldStyle(.roundedBorder)
-            Text("Use letters, numbers, dots, hyphens or underscores; do not start with a dot.")
+            Text(installed ? "Customization saved. Reload the model to use it." : "Apply this customization to the model and reload it. It will affect every chat using this model.")
                 .font(.app(.caption)).foregroundStyle(.secondary)
             HStack {
                 Button("Discard", role: .destructive, action: discard).font(.app(.body))
+                    .disabled(installed)
                 Spacer()
                 if busy { ProgressView().controlSize(.small) }
-                Button("Save as", action: save).font(.app(.body)).buttonStyle(.borderedProminent)
-                    .disabled(!FineTunePresentation.validName(name))
+                Button(installed ? "Reload Model" : "Apply & Reload", action: apply).font(.app(.body)).buttonStyle(.borderedProminent)
             }.disabled(busy)
         }
     }

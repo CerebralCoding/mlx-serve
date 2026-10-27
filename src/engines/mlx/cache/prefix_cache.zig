@@ -1249,9 +1249,8 @@ pub const HotPrefixCache = struct {
         quant_config: kv_quant.KVQuantConfig,
         require_ssm_checkpoint: bool,
         probe: ?*MatchProbe,
-        adapter_key: [32]u8,
     ) ?struct { idx: usize, shared: usize } {
-        const m = self.findBestRestorableMatchWithModule(prompt_ids, has_tools, media, quant_config, require_ssm_checkpoint, probe, adapter_key, null) orelse return null;
+        const m = self.findBestRestorableMatchWithModule(prompt_ids, has_tools, media, quant_config, require_ssm_checkpoint, probe, null) orelse return null;
         return .{ .idx = m.idx, .shared = m.shared };
     }
 
@@ -1263,7 +1262,6 @@ pub const HotPrefixCache = struct {
         quant_config: kv_quant.KVQuantConfig,
         require_ssm_checkpoint: bool,
         probe: ?*MatchProbe,
-        adapter_key: [32]u8,
         module_request: ?ModuleRequest,
     ) ?struct { idx: usize, shared: usize } {
         var best_idx: ?usize = null;
@@ -1272,7 +1270,6 @@ pub const HotPrefixCache = struct {
         for (self.entries.items, 0..) |*e, i| {
             // A checked-out entry's buffers belong to another slot; its snapshot is empty.
             if (e.checked_out_by != null) continue;
-            if (!std.mem.eql(u8, &e.snapshot.adapter_key, &adapter_key)) continue;
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant_config, quant_config)) continue;
 
@@ -1335,7 +1332,7 @@ pub const HotPrefixCache = struct {
         quant_config: kv_quant.KVQuantConfig,
     ) ?ModuleMatch {
         var best: ?ModuleMatch = null;
-        if (self.findBestRestorableMatchWithModule(prompt_ids, has_tools, media, quant_config, false, null, @splat(0), .{ .binding = binding, .media_rows = media_rows })) |m| {
+        if (self.findBestRestorableMatchWithModule(prompt_ids, has_tools, media, quant_config, false, null, .{ .binding = binding, .media_rows = media_rows })) |m| {
             const e = &self.entries.items[m.idx];
             best = .{ .entry_id = e.id, .n = m.shared, .prefix_key = e.module.?.prefix_key };
         }
@@ -1384,11 +1381,7 @@ pub const HotPrefixCache = struct {
     /// pre-filter only: the SSD tier, a lien, a QSA gap or a checkout taken since can still change
     /// what the real lookup restores.
     pub fn peekMatchedTokens(self: *const HotPrefixCache, prompt_ids: []const u32, has_tools: bool, quant_config: kv_quant.KVQuantConfig, require_ssm_checkpoint: bool) usize {
-        return self.peekMatchedTokensForAdapter(prompt_ids, has_tools, quant_config, require_ssm_checkpoint, @splat(0));
-    }
-
-    pub fn peekMatchedTokensForAdapter(self: *const HotPrefixCache, prompt_ids: []const u32, has_tools: bool, quant_config: kv_quant.KVQuantConfig, require_ssm_checkpoint: bool, adapter_key: [32]u8) usize {
-        const m = self.findBestRestorableMatch(prompt_ids, has_tools, &.{}, quant_config, require_ssm_checkpoint, null, adapter_key) orelse return 0;
+        const m = self.findBestRestorableMatch(prompt_ids, has_tools, &.{}, quant_config, require_ssm_checkpoint, null) orelse return 0;
         if (!require_ssm_checkpoint) return m.shared;
         const cps = self.entries.items[m.idx].ssm_checkpoints orelse return 0;
         const cp = highestCheckpointAtOrBelow(cps, m.shared) orelse return 0;
@@ -1402,7 +1395,7 @@ pub const HotPrefixCache = struct {
     }
 
     fn findBestMatch(self: *const HotPrefixCache, prompt_ids: []const u32, has_tools: bool, media: []const MediaSpan, quant_config: kv_quant.KVQuantConfig) ?struct { idx: usize, shared: usize } {
-        const match = self.findBestRestorableMatch(prompt_ids, has_tools, media, quant_config, false, null, @splat(0)) orelse return null;
+        const match = self.findBestRestorableMatch(prompt_ids, has_tools, media, quant_config, false, null) orelse return null;
         return .{ .idx = match.idx, .shared = match.shared };
     }
 
@@ -1501,7 +1494,6 @@ pub const HotPrefixCache = struct {
             target_cache.config,
             target_ssm_entries != null,
             &probe,
-            target_cache.adapter_key,
         );
 
         // ── SSD tier: consult when it can beat the RAM match meaningfully
@@ -1518,7 +1510,7 @@ pub const HotPrefixCache = struct {
             // tier-wide `disk_limit` did. A row AT a placeholder is restored
             // only under an agreeing span list — the same pixels, so the
             // restored row IS what the vision splice would have produced.
-            const dm = d.bestMatchForAdapter(prompt_ids, has_tools, target_cache.config, media, target_cache.adapter_key) orelse {
+            const dm = d.bestMatch(prompt_ids, has_tools, target_cache.config, media) orelse {
                 // Silent no-entry misses are why a 40 GB disk tier looked
                 // dead in a live post-mortem: nothing in the
                 // log ever said the tier was consulted and found nothing.
@@ -1545,7 +1537,7 @@ pub const HotPrefixCache = struct {
                     break :blk cp.pos;
                 } else 0;
                 // A stored entry can carry a checkpoint at exactly this prompt's length; restoring it leaves nothing to forward.
-                const hm = d.bestHybridMatchForAdapter(prompt_ids, has_tools, target_cache.config, @as(u32, @intCast(prompt_ids.len -| 1)), media, target_cache.adapter_key) orelse break :disk;
+                const hm = d.bestHybridMatch(prompt_ids, has_tools, target_cache.config, @as(u32, @intCast(prompt_ids.len -| 1)), media) orelse break :disk;
                 const disk_cp = hm.cp;
                 if (@as(usize, disk_cp) < ram_eff + kv_disk_cache.MIN_DISK_ADVANTAGE_TOKENS) break :disk;
                 const sw = io_util.Stopwatch.init(d.io);
@@ -2144,7 +2136,6 @@ pub const HotPrefixCache = struct {
         prompt_len: usize,
     ) !CommitStatus {
         const quant_config = source_cache.config;
-        const adapter_key = source_cache.adapter_key;
         // An item's key applies only to rows the entry covers: a cancelled
         // prefill that stopped before an item commits without it.
         var eff_media = spansBelow(media, tokens.len);
@@ -2185,7 +2176,6 @@ pub const HotPrefixCache = struct {
             if (e.module != null) continue;
             if (e.has_tools != has_tools) continue;
             if (mediaSharedBound(e.media, eff_media) < e.tokens.len) continue;
-            if (!std.mem.eql(u8, &e.snapshot.adapter_key, &adapter_key)) continue;
             if (!std.meta.eql(e.quant_config, quant_config)) continue;
             if (e.tokens.len <= tokens.len) {
                 var shared: usize = 0;
@@ -2414,7 +2404,7 @@ pub const HotPrefixCache = struct {
         // resident, so this costs GPU memory only in the accounting, and only
         // until the donor is evicted.
         if (replace_idx == null) inherit: {
-            const donor = self.bestCheckpointDonor(eff_tokens, has_tools, eff_media, quant_config, adapter_key) orelse
+            const donor = self.bestCheckpointDonor(eff_tokens, has_tools, eff_media, quant_config) orelse
                 break :inherit;
             const budget: ?u64 = if (self.max_kv_bytes == 0)
                 null
@@ -2667,7 +2657,7 @@ pub const HotPrefixCache = struct {
         const saved_cap = d.max_flush_bytes;
         d.max_flush_bytes = @max(saved_cap, kv_disk_cache.DECLINE_SPILL_FLUSH_FLOOR);
         defer d.max_flush_bytes = saved_cap;
-        const outcome = d.appendAdapterCommit(snap.entries, snap.step, snap.config, tokens, has_tools, rec_media, cps, null, null, mlx.gpuStream(), snap.adapter_key) catch |err| {
+        const outcome = d.appendCommitWithSpec(snap.entries, snap.step, snap.config, tokens, has_tools, rec_media, cps, null, null, mlx.gpuStream()) catch |err| {
             log.warn("  [disk-cache] declined-candidate spill failed: {s}\n", .{@errorName(err)});
             return;
         };
@@ -2700,7 +2690,7 @@ pub const HotPrefixCache = struct {
         if (self.pending_disk) |*old| {
             // A commit that extends the pending prefix covers it; another session's is parked for
             // the flushes to finish. At most one waits: an older one still parked is dropped.
-            if (old.has_tools != has_tools or !std.mem.eql(u8, &old.snapshot.adapter_key, &source_cache.adapter_key) or !std.mem.startsWith(u32, tokens, old.tokens)) {
+            if (old.has_tools != has_tools or !std.mem.startsWith(u32, tokens, old.tokens)) {
                 if (self.finishing_disk) |*f| {
                     log.info("  [disk-cache] dropped an unfinished {d}-token snapshot for a newer session's\n", .{f.tokens.len});
                     f.deinit(self.allocator);
@@ -2812,7 +2802,7 @@ pub const HotPrefixCache = struct {
             // payloads describe rows past the first item under NO media key
             // gate, so they stay text-only rides (same rule as the commit path).
             const specs: EntrySpecs = if (e.media.len == 0) entrySpecCommits(e) else .{};
-            const outcome = d.appendAdapterCommit(
+            const outcome = d.appendCommitWithSpec(
                 e.snapshot.entries,
                 e.snapshot.step,
                 e.snapshot.config,
@@ -2823,7 +2813,6 @@ pub const HotPrefixCache = struct {
                 specs.dflash,
                 specs.mtp,
                 s,
-                e.snapshot.adapter_key,
             ) catch |err| {
                 log.warn("  [hot-cache] idle spill failed: {s} — entry stays resident\n", .{@errorName(err)});
                 continue;
@@ -2831,7 +2820,7 @@ pub const HotPrefixCache = struct {
             // Only `.persisted`: a silent skip or a `.partial` copy is not a copy.
             if (outcome != .persisted) continue;
             // `.persisted` is the write path's claim; the index has to agree.
-            const disk_id = d.fullAdapterPrefixEntryId(e.snapshot.entries, e.snapshot.step, e.tokens, e.has_tools, e.snapshot.config, e.media, e.snapshot.adapter_key) orelse {
+            const disk_id = d.fullPrefixEntryId(e.snapshot.entries, e.snapshot.step, e.tokens, e.has_tools, e.snapshot.config, e.media) orelse {
                 log.warn("  [hot-cache] idle spill: the tier does not hold the full prefix — entry stays resident\n", .{});
                 continue;
             };
@@ -2941,12 +2930,12 @@ pub const HotPrefixCache = struct {
         specs: EntrySpecs,
         s: mlx.mlx_stream,
     ) SliceResult {
-        if (d.resumesPoisonedAdapter(tokens, has_tools, media, snap.config, snap.adapter_key)) {
+        if (d.resumesPoisoned(tokens, has_tools, media, snap.config)) {
             log.warn("  [disk-cache] a write for this {d}-token session failed; it waits for its next commit\n", .{tokens.len});
             return .poisoned;
         }
         const landed_before = d.counter;
-        const out = d.appendAdapterCommit(snap.entries, snap.step, snap.config, tokens, has_tools, media, cps, specs.dflash, specs.mtp, s, snap.adapter_key) catch |err| {
+        const out = d.appendCommitWithSpec(snap.entries, snap.step, snap.config, tokens, has_tools, media, cps, specs.dflash, specs.mtp, s) catch |err| {
             log.warn("  [disk-cache] persist failed: {s}; the {d}-token session waits for its next commit\n", .{ @errorName(err), tokens.len });
             return .failed;
         };
@@ -3328,7 +3317,6 @@ pub const HotPrefixCache = struct {
         has_tools: bool,
         media: []const MediaSpan,
         quant_config: kv_quant.KVQuantConfig,
-        adapter_key: [32]u8,
     ) ?struct { idx: usize, shared: usize } {
         var best_idx: ?usize = null;
         var best_shared: usize = 0;
@@ -3337,7 +3325,6 @@ pub const HotPrefixCache = struct {
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant_config, quant_config)) continue;
             const cps = e.ssm_checkpoints orelse continue;
-            if (!std.mem.eql(u8, &e.snapshot.adapter_key, &adapter_key)) continue;
             const max_shared = @min(e.tokens.len, tokens.len, mediaSharedBound(e.media, media));
             var shared: usize = 0;
             while (shared < max_shared and e.tokens[shared] == tokens[shared]) shared += 1;
@@ -3805,51 +3792,6 @@ pub const HotPrefixCache = struct {
 // ── Tests ──
 
 const testing = std.testing;
-
-test "LLM LoRA: hot and SSD prefixes retain separate adapter identities across restart" {
-    const io = testing.io;
-    const s = mlx.gpuStream();
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var path: [512]u8 = undefined;
-    const root = path[0..try tmp.dir.realPath(io, &path)];
-    var tokens: [600]u32 = undefined;
-    for (&tokens, 0..) |*token, i| token.* = @intCast(i + 10);
-    for ([_]bool{ false, true }) |restart| {
-        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, root, "lora", 0, 128);
-        defer hc.deinit();
-        if (restart) {
-            var wrong = try KVCache.init(testing.allocator, 2);
-            defer wrong.deinit();
-            try testing.expectError(error.LoraCacheMismatch, hc.disk.?.restoreInto(&wrong, 0, s));
-            try testing.expectEqual(@as(usize, 0), wrong.step);
-        }
-        if (!restart) {
-            for ([_]u8{ 1, 2 }) |key| {
-                var cache = try KVCache.init(testing.allocator, 2);
-                defer cache.deinit();
-                cache.adapter_key = @splat(key);
-                try testFillCache(&cache, s, 2, tokens.len);
-                _ = try hc.commit(&cache, &tokens, false);
-            }
-            try testing.expectEqual(@as(usize, 2), hc.entryCount());
-        }
-        for ([_]u8{ 0, 1, 2, 3 }) |key| {
-            var cache = try KVCache.init(testing.allocator, 2);
-            defer cache.deinit();
-            cache.adapter_key = @splat(key);
-            var offset: usize = 0;
-            const found = try hc.lookupAndRestore(&cache, &offset, null, s, &tokens, false, &.{}, null, null);
-            try testing.expectEqual(@as(usize, if (key == 1 or key == 2) 599 else 0), found.matched);
-        }
-        if (!restart) {
-            for (0..8) |_| if (!hc.flushOwedSlice(s)) break;
-            try testing.expect(!hc.disk_dirty);
-            try testing.expectEqual(@as(usize, 2), hc.disk.?.entryCount());
-        }
-    }
-}
 
 test "HotPrefixCache: shouldUse gates hybrid by enable_ssm_checkpoints" {
     var cfg = model_mod.ModelConfig{};
@@ -11251,6 +11193,7 @@ test "HotPrefixCache module: loaded instance gate keeps distributed and streamed
     try testing.expect(HotPrefixCache.shouldUseInstance(&cfg, false, &xfm));
     cfg.dist_shard = null;
 }
+
 
 test "HotPrefixCache module: incoming workload pays for eviction before an older conversation" {
     var fake: ModuleFake = .{};

@@ -181,7 +181,17 @@ pub fn load(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir: [
 /// plugin never sees them).
 pub fn loadWith(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir: []const u8, s: mlx.mlx_stream, tower: ?*model.Weights) !Transformer {
     if (config.plugin == null) return error.NotPluginServed;
-    return loadTensors(io, a, config, model_dir, s, try loadSplit(io, a, model_dir, config, tower));
+    return loadTensors(io, a, config, model_dir, s, try loadSplit(io, a, model_dir, config, tower), true);
+}
+
+pub fn loadAdapted(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir: []const u8, s: mlx.mlx_stream, bindings: []const abi.LoraBinding) !Transformer {
+    if (config.plugin == null) return error.NotPluginServed;
+    var map = try loadSplit(io, a, model_dir, config, null);
+    @import("../../../sdk/weights/finetune.zig").apply(&map, s, bindings, config.weight_prefix) catch |err| {
+        map.deinit();
+        return err;
+    };
+    return loadTensors(io, a, config, model_dir, s, map, false);
 }
 
 /// `load` over a tensor map the caller prepared (renamed or converted from the pack's own), which it hands over.
@@ -191,14 +201,27 @@ pub fn loadMap(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
         m.deinit();
         return error.NotPluginServed;
     }
-    return loadTensors(io, a, config, model_dir, s, map);
+    return loadTensors(io, a, config, model_dir, s, map, true);
 }
 
-fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir: []const u8, s: mlx.mlx_stream, map: model.Weights) !Transformer {
+fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir: []const u8, s: mlx.mlx_stream, map: model.Weights, autoload: bool) !Transformer {
     const b = config.plugin.?;
     var res = Resident.adopt(map);
     // The model holds its own references: the map's go once the plugin has read it.
     defer res.deinit();
+    var overlay_digest: ?[32]u8 = null;
+    if (autoload) {
+        const finetune = @import("../../../sdk/weights/finetune.zig");
+        if (try finetune.load(a, io, model_dir, b.source_sha256)) |loaded| {
+            var overlay = loaded;
+            defer overlay.deinit();
+            if (b.outside or config.isMoe() or !@import("../../../sdk/weights/lora_config.zig").supported(config.model_type)) return error.LoraUnsupportedArchitecture;
+            if (config.hadamard_block != 0 or config.quant_mode != .affine) return error.LoraUnsupportedQuantization;
+            try finetune.apply(&res.weights, s, overlay.adapter.bindings, config.weight_prefix);
+            overlay_digest = overlay.digest;
+            log.info("[finetune] merged {s} into {d} projections before inference preparation\n", .{ finetune.filename, overlay.adapter.bindings.len });
+        }
+    }
     try quantizeHead(&res.weights, b, config, s);
     const src = res.source();
     var fs = try FsPackDir.open(io, model_dir);
@@ -263,6 +286,7 @@ fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
     bound.* = .{ .table = b.table, .model = m, .drafters = caps.dflash_capture and trunk, .trunk = trunk };
     bind(bound, &b.parsed);
     xfm.plugin = bound;
+    if (autoload) b.overlay_sha256 = overlay_digest;
     log.info("[plugin] {s} serves {s} ({d} layers)\n", .{ b.table.name.slice(), config.model_type, config.num_hidden_layers });
     return xfm;
 }
@@ -429,7 +453,6 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
     const offload: ?abi.Offload = if (mode == .prefill and xfm.ane_prefill != null) xfm.aneOffload() else null;
     const f: abi.Forward = .{
         .mode = mode,
-        .lora = .of(ctx.lora),
         .row_exact = xfm.config.dflash_bound,
         .logits = if (!head) .none else if (module and !capture and !ctx.spec_verify) .last_row else .all_rows,
         .want_hidden = !head or ctx.capture_hidden != null or ctx.capture_hidden_all != null,
@@ -465,13 +488,6 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
         freeOut(&out, captured[0..ids.len]);
         log.err("[plugin] {s}: forward failed: {s}\n", .{ b.table.name.slice(), v.why.slice() });
         return error.PluginForwardFailed;
-    }
-    if (base == 0 and ctx.lora.len != 0) {
-        var active: usize = 0;
-        for (ctx.lora) |binding| if (binding.scale != 0) {
-            active += 1;
-        };
-        log.debug("[lora] {s}: forward engaged (projections={d}, active={d})\n", .{ b.table.name.slice(), ctx.lora.len, active });
     }
     // A `.kv_step` slot advances it too, as the legacy layered forward did: MiMo's MTP rollback truncates from it.
     ctx.moe_seq_offset.* += rows;
@@ -747,17 +763,11 @@ pub fn auxFree(xfm: *const Transformer, snap: abi.Handle) void {
     b.hooks.free(b.model, snap);
 }
 
-fn sameAdapter(ctxs: []const *ForwardCtx) !void {
-    if (ctxs.len == 0) return error.PluginForwardUnsupported;
-    for (ctxs[1..]) |ctx| if (!std.mem.eql(u8, &ctxs[0].cache.adapter_key, &ctx.cache.adapter_key)) return error.LoraMixedBatch;
-}
-
 /// `forwardBatchedDecode` / `forwardMoeBatchedDecode` for a served model: one row per slot at its own position, each
 /// slot's logits `[1, 1, vocab]` and, when `hidden_rows` is asked, its final-normed hidden `[1, 1, hidden]` (caller
 /// owns the slices and every array). The tick advances the slots' positions.
 pub fn forwardBatched(xfm: *Transformer, b: *Bound, next_tokens: []const u32, ctxs: []const *ForwardCtx, rope_offsets: []const u32, hidden_rows: ?*?[]Array) ![]Array {
     const n = next_tokens.len;
-    try sameAdapter(ctxs);
     if (n > MAX_BATCH_ROWS) return error.PluginForwardUnsupported;
     var slots: [MAX_BATCH_ROWS]cache_ops.Slot = undefined;
     var handles: [MAX_BATCH_ROWS]abi.Handle = undefined;
@@ -781,7 +791,6 @@ pub fn forwardBatched(xfm: *Transformer, b: *Bound, next_tokens: []const u32, ct
     const f: abi.Forward = .{
         .mode = .batched_rows,
         .want_hidden = hidden_rows != null,
-        .lora = .of(ctxs[0].lora),
         .row_exact = xfm.config.dflash_bound,
         .rows = 1,
         .tokens = .of(next_tokens),
@@ -822,7 +831,6 @@ pub fn forwardBatched(xfm: *Transformer, b: *Bound, next_tokens: []const u32, ct
 /// hidden at every row (`hidden_all` `[N, S, hidden]`) and at the last (`hidden_last` `[N, 1, hidden]`).
 pub fn forwardBatchedVerify(xfm: *Transformer, b: *Bound, token_arr: Array, ctxs: []const *ForwardCtx, rope_offsets: []const u32, hidden_last: *Array, hidden_all: *Array) !Array {
     const n = ctxs.len;
-    try sameAdapter(ctxs);
     const width: c_int = mlx.getShape(token_arr)[1];
     if (n > MAX_BATCH_ROWS) return error.PluginForwardUnsupported;
     var slots: [MAX_BATCH_ROWS]cache_ops.Slot = undefined;
@@ -847,7 +855,6 @@ pub fn forwardBatchedVerify(xfm: *Transformer, b: *Bound, token_arr: Array, ctxs
     const f: abi.Forward = .{
         .mode = .batched_rows,
         .logits = .all_rows,
-        .lora = .of(ctxs[0].lora),
         .want_hidden = true,
         .row_exact = xfm.config.dflash_bound,
         .rows = @intCast(width),

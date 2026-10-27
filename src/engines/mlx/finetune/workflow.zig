@@ -31,7 +31,7 @@ pub fn run(frozen: Frozen, teacher: anytype, input: types.Run, fingerprint: [32]
         try boundary(observer);
         const prompt = try briefPrompt(a, raw_prompt);
         defer a.free(prompt);
-        const answer = teacher.generate(prompt, "Sure, ", &.{}, true, 192) catch |err| switch (err) {
+        const answer = teacher.generate(prompt, "Sure, ", true, 192) catch |err| switch (err) {
             error.TrainingPromptTooLong, error.InvalidTrainingCompletion => continue,
             else => return err,
         };
@@ -60,7 +60,7 @@ pub fn run(frozen: Frozen, teacher: anytype, input: types.Run, fingerprint: [32]
         try boundary(observer);
         const prompt = try briefPrompt(a, raw_prompt);
         defer a.free(prompt);
-        const answer = teacher.generate(prompt, "", &.{}, false, 192) catch |err| switch (err) {
+        const answer = teacher.generate(prompt, "", false, 192) catch |err| switch (err) {
             error.TrainingPromptTooLong, error.InvalidTrainingCompletion => continue,
             else => return err,
         };
@@ -106,6 +106,12 @@ pub fn run(frozen: Frozen, teacher: anytype, input: types.Run, fingerprint: [32]
     defer g.deinit();
     const bindings = try adapter.bindings(&g, adapter.params);
     defer a.free(bindings);
+    var merged = try @import("teacher.zig").Overlay.init(input.io, a, teacher.lm, bindings);
+    defer merged.deinit();
+    const merged_frozen = try merged.frozen();
+    var adapted_teacher = teacher.*;
+    adapted_teacher.lm = merged.model();
+    if (@hasField(@TypeOf(adapted_teacher), "frozen")) adapted_teacher.frozen = merged_frozen;
     try @import("../../../mlx/ffi.zig").check(@import("../../../mlx/ffi.zig").mlx_synchronize(frozen.s));
     input.result.training_examples = @intCast(focus_count);
     input.result.validation_examples = @intCast(validation.items.len);
@@ -117,12 +123,12 @@ pub fn run(frozen: Frozen, teacher: anytype, input: types.Run, fingerprint: [32]
         try boundary(observer);
         const prompt = try briefPrompt(a, raw_prompt);
         defer a.free(prompt);
-        const before = try teacher.generate(prompt, "", &.{}, false, 192);
+        const before = try teacher.generate(prompt, "", false, 192);
         defer a.free(before);
         if (!teacher.last_complete) return error.TrainingVerificationTruncated;
-        const after = try teacher.generate(prompt, "", bindings, false, 192);
+        const after = try adapted_teacher.generate(prompt, "", false, 192);
         defer a.free(after);
-        if (!teacher.last_complete) return error.TrainingVerificationTruncated;
+        if (!adapted_teacher.last_complete) return error.TrainingVerificationTruncated;
         input.result.metrics.heldout += 1;
         input.result.metrics.refused_before += @intFromBool(try teacher.refuses(prompt, before));
         input.result.metrics.refused_after += @intFromBool(try teacher.refuses(prompt, after));
@@ -134,7 +140,7 @@ pub fn run(frozen: Frozen, teacher: anytype, input: types.Run, fingerprint: [32]
         observer.emit(.{ .stage = .verify, .step = @intCast(i + 1), .total = total, .preview = after });
     }
     for (retain.items, 0..) |example, i| {
-        try retainKl(frozen, example, bindings, observer, &input.result.metrics, a);
+        try retainKl(input.io, teacher.lm, merged.model(), example, observer, &input.result.metrics, a);
         observer.emit(.{ .stage = .verify, .step = options.holdout + @as(u32, @intCast(i + 1)), .total = total });
     }
     try boundary(observer);
@@ -165,7 +171,7 @@ pub fn collectPrompts(prompts: *data.Prompts, teacher: anytype, request: types.R
         defer a.free(recent);
         const instruction = try std.fmt.allocPrint(a, "Write 12 distinct short user questions about the topic below, focusing on {s}. Preserve the topic and example's intent. Each line must contain only one question, with no numbering, introduction, answers or reasoning. Vary the wording and situations. Do not repeat the listed questions.\nTopic: {s}\nExample: {s}\nAlready asked:\n{s}", .{ angle, request.topic orelse "the example", example, recent });
         defer a.free(instruction);
-        const answer = teacher.generate(instruction, "", &.{}, true, 320) catch |err| switch (err) {
+        const answer = teacher.generate(instruction, "", true, 320) catch |err| switch (err) {
             error.InvalidTrainingCompletion => continue,
             else => return err,
         };
@@ -189,13 +195,14 @@ fn validationLoss(trainer: *Trainer, examples: []const Example, observer: types.
     return @floatCast(sum / @as(f64, @floatFromInt(tokens)));
 }
 
-pub fn retainKl(frozen: Frozen, e: Example, bindings: []const @import("../../../abi/plugin.zig").LoraBinding, observer: types.Observer, metrics: *@import("../../../sdk/train/verify.zig").Metrics, a: std.mem.Allocator) !void {
+pub fn retainKl(io: std.Io, base_model: *@import("../../../host/registry/registry.zig").LoadedModel, merged_model: *@import("../../../host/registry/registry.zig").LoadedModel, e: Example, observer: types.Observer, metrics: *@import("../../../sdk/train/verify.zig").Metrics, a: std.mem.Allocator) !void {
     try boundary(observer);
+    const frozen = try @import("run.zig").frozen(base_model);
+    const merged = try @import("run.zig").frozen(merged_model);
     var g = ops.Graph.init(a, frozen.s);
     defer g.deinit();
-    const ids = try g.fromSlice(u32, e.inputs, &.{ 1, @intCast(e.inputs.len) });
-    const base = try frozen.hidden(&g, ids, &.{});
-    const adapted = try frozen.hidden(&g, ids, bindings);
+    const base = try @import("teacher.zig").runtimeHidden(io, &g, base_model, e.inputs);
+    const adapted = try @import("teacher.zig").runtimeHidden(io, &g, merged_model, e.inputs);
     try ops.evalMany(&.{ base, adapted });
     for (e.mask, 0..) |mask, row| {
         if (mask == 0) continue;
@@ -203,7 +210,7 @@ pub fn retainKl(frozen: Frozen, e: Example, bindings: []const @import("../../../
         var t = g.scope();
         defer t.deinit();
         const b = try frozen.project(&t, try t.sliceAxis(base, 1, @intCast(row), @intCast(row + 1)));
-        const q = try frozen.project(&t, try t.sliceAxis(adapted, 1, @intCast(row), @intCast(row + 1)));
+        const q = try merged.project(&t, try t.sliceAxis(adapted, 1, @intCast(row), @intCast(row + 1)));
         const kl = try @import("../../../sdk/train/kl.zig").divergence(&t, b, q);
         metrics.kl_sum += kl;
         metrics.kl_max = @max(metrics.kl_max, kl);

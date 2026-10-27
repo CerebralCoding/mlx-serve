@@ -362,9 +362,6 @@ fn handleResponsesInner(
     const root = parsed.value.object;
 
     // ── input (required) ──
-    var lora = try @import("../lora.zig").prepare(allocator, stream.io, root, lm);
-    defer if (lora) |*p| p.deinit(allocator);
-
     const input_val = root.get("input") orelse {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'input' is a required field", 400);
         return;
@@ -908,7 +905,6 @@ fn handleResponsesInner(
         mm.mrope = .{};
         const sch = http_server.launch().global_scheduler.?;
         running = try mlx_engine.Running.submit(sch, .{
-            .lora = lora,
             .model = lm,
             .prompt_ids = prompt_ids,
             .full_prompt = prompt_ids,
@@ -1264,7 +1260,7 @@ fn handleResponsesInner(
         const slot_mrope = mm.mrope;
         mm.mrope = .{};
         // Propagates to `handleResponses`' one error arm, shared with the streaming half.
-        result = try nonStreamingViaScheduler(allocator, http_server.launch().global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve_ns, mm.media, cache_key, slot_mrope, 0, false, kv_quant_override, kv_attn_explicit, null, stream, lora);
+        result = try nonStreamingViaScheduler(allocator, http_server.launch().global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve_ns, mm.media, cache_key, slot_mrope, 0, false, kv_quant_override, kv_attn_explicit, null, stream);
     }
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);

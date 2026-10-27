@@ -129,11 +129,11 @@ fn project(w: *const Gdn.Weights, c: *const Ctx, x: Array, batch: c_int, seq: c_
     const lane = c.row_exact;
     const g = c.g;
     if (w.combined) return projectCombined(w, g, x, batch, seq);
-    if (!g.differentiable and !g.native_ops and w.in.built() and row_exact.groupServes(lane, batch * seq)) {
+    if (!g.differentiable and w.in.built() and row_exact.groupServes(lane, batch * seq)) {
         const all = try row_exact.linear(lane, g, &w.in.lin, x);
         return .{ .qkv = try w.in.part(g, all, 0), .z = try w.in.part(g, all, 1), .a = try w.in.part(g, all, 2), .b = try w.in.part(g, all, 3), .all = all };
     }
-    if (!g.differentiable and !g.native_ops) if (try c.offloadGdn(x)) |qz| return .{ .qkv = qz[0], .z = qz[1], .a = try row_exact.linear(lane, g, &w.a, x), .b = try row_exact.linear(lane, g, &w.b, x) };
+    if (!g.differentiable) if (try c.offloadGdn(x)) |qz| return .{ .qkv = qz[0], .z = qz[1], .a = try row_exact.linear(lane, g, &w.a, x), .b = try row_exact.linear(lane, g, &w.b, x) };
     const qkv = if (w.qkv.w.ctx != null) try row_exact.linear(lane, g, &w.qkv, x) else blk: {
         var parts: [3]Array = undefined;
         for (&parts, &w.qkv_parts) |*p, *l| p.* = try row_exact.linear(lane, g, l, x);
@@ -222,7 +222,7 @@ fn mix(w: *const Gdn.Weights, c: *Ctx, x: Array) !Array {
     };
 
     // One decode token: prework and recurrence in one dispatch, then the norm-gate.
-    if (!g.native_ops and w.out.rht == null and batch == 1 and seq == 1 and !capture and conv != null and ssm != null and geo.kernel == 4 and fused.gdnDecodeRecurEnabled()) fast: {
+    if (w.out.rht == null and batch == 1 and seq == 1 and !capture and conv != null and ssm != null and geo.kernel == 4 and fused.gdnDecodeRecurEnabled()) fast: {
         const r = (try gdn_decode.recur(geo.dec(), gdnInputs(w, p, conv.?, ssm.?, eps), g.s)) orelse break :fast;
         try adopt3(g, .{ r.y, r.conv_state, r.ssm_state });
         const flat = (try fused.gdnNormGateFused(g.s, r.y, p.z, 0, value_dim, w.norm_w, eps, swish, geo.hv, geo.dv, 1, 1)) orelse break :fast;
@@ -236,7 +236,7 @@ fn mix(w: *const Gdn.Weights, c: *Ctx, x: Array) !Array {
     }
 
     // Verify rows: the same kernel over S tokens, keeping every row's state for the rollback.
-    if ((!g.native_ops or c.tree != null) and w.out.rht == null and batch == 1 and seq >= 1 and seq <= gdn_decode.MAX_SEQ and capture and conv != null and ssm != null and geo.kernel == 4 and fused.gdnDecodeRecurEnabled()) fast: {
+    if (w.out.rht == null and batch == 1 and seq >= 1 and seq <= gdn_decode.MAX_SEQ and capture and conv != null and ssm != null and geo.kernel == 4 and fused.gdnDecodeRecurEnabled()) fast: {
         const ins = gdnInputs(w, p, conv.?, ssm.?, eps);
         if (c.tree) |t| return treeVerify(w, c, p, ins, ssm.?, t.table);
         if (fused.gdnVerifyFoldEnabled()) fold: {
@@ -276,7 +276,7 @@ fn mix(w: *const Gdn.Weights, c: *Ctx, x: Array) !Array {
     var beta_fused: ?Array = null;
 
     const prefill_fused = !g.differentiable and geo.wide_prework and seq > 1 and fused.gdnPrefillFusedFor(seq, batch);
-    if (!g.native_ops and (batch * seq <= fused.GDN_FUSED_MAX_ROWS or prefill_fused) and geo.kernel == 4 and (conv != null or prefill_fused)) blk: {
+    if ((batch * seq <= fused.GDN_FUSED_MAX_ROWS or prefill_fused) and geo.kernel == 4 and (conv != null or prefill_fused)) blk: {
         const incoming = conv orelse try g.zeros(&.{ batch, 3, conv_dim }, ops.dtype(p.qkv));
         const pre = (fused.gdnPreworkFused(g.s, .{
             .qkv = p.qkv,
@@ -348,7 +348,7 @@ fn mix(w: *const Gdn.Weights, c: *Ctx, x: Array) !Array {
     const out_dtype: Dtype = if (g.differentiable) in_dtype else if (in_dtype == .float16) .float16 else .bfloat16;
     var y: Array = undefined;
 
-    if (g.differentiable or g.native_ops) {
+    if (g.differentiable) {
         const r = try kernels.gdnRecurOps(g.s, q_scaled, k_scaled, v_heads, gate, beta, ssm_in, false, capture, out_dtype);
         defer _ = mlx.mlx_array_free(r.state);
         defer if (r.state_seq.ctx != null) {
@@ -424,7 +424,7 @@ fn treeVerify(w: *const Gdn.Weights, c: *Ctx, p: Proj, ins: gdn_decode.Inputs, s
 
 /// The decay gate `[B, S, Hv]`: the compiled closure where one was built, else the chain.
 fn gdnGate(g: *Graph, geo: *const Geo, A_log: Array, a: Array, dt_bias: Array) !Array {
-    if (!g.differentiable and !g.native_ops and geo.gate_fn.ctx != null) if (try compiled.apply(g, geo.gate_fn, &.{ A_log, a, dt_bias }, 1)) |out| return out[0];
+    if (!g.differentiable and geo.gate_fn.ctx != null) if (try compiled.apply(g, geo.gate_fn, &.{ A_log, a, dt_bias }, 1)) |out| return out[0];
     const dtype = if (g.differentiable and ops.dtype(a) == .float32) .float32 else gate_mod.gdnChainGateDtype(ops.dtype(a), geo.state);
     return g.adopt(try gate_mod.gdnGateChain(A_log, a, dt_bias, dtype, g.s));
 }

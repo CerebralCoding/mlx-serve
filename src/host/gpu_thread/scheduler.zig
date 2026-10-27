@@ -46,7 +46,6 @@ pub const BatchVerdict = enum {
     pad_waste,
     /// A spoken reply: one row a slot, its frames drawn between forwards.
     speech,
-    lora_mixed,
 };
 
 /// Options for re-clamping the hot-cache budgets after residency changed.

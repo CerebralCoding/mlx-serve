@@ -296,10 +296,6 @@ fn writeMessagesField(allocator: std.mem.Allocator, w: *std.Io.Writer, messages_
 
 /// Fields shared by chat + generate: sampling options, stop, format, think.
 fn writeCommonFields(w: *std.Io.Writer, root: std.json.ObjectMap) !void {
-    for ([_][]const u8{ "lora", "lora_scale" }) |field| if (root.get(field)) |value| {
-        try w.print(",\"{s}\":", .{field});
-        try writeJsonValue(w, value);
-    };
     if (root.get("options")) |ov| {
         if (ov == .object) {
             const opts = ov.object;
@@ -896,7 +892,8 @@ pub const Sink = struct {
     fn ensureStreamHeaders(self: *Sink) !void {
         if (self.started) return;
         self.started = true;
-        try self.outFn(self.out_impl, "HTTP/1.1 200 OK\r\n" ++
+        try self.outFn(self.out_impl,
+            "HTTP/1.1 200 OK\r\n" ++
             "Content-Type: application/x-ndjson\r\n" ++
             "Cache-Control: no-cache\r\n" ++
             "Connection: close\r\n" ++
@@ -1123,23 +1120,6 @@ test "ollama: chat request honors stream:false and maps options" {
     try testing.expectEqualStrings("END", root.get("stop").?.array.items[0].string);
     // num_ctx is deliberately dropped.
     try testing.expect(root.get("num_ctx") == null);
-}
-
-test "LLM LoRA: Ollama chat and raw or templated generate preserve adapter fields verbatim" {
-    const a = testing.allocator;
-    for ([_][]const u8{ "\"answer\"", "42" }) |value| {
-        for (0..3) |kind| {
-            const body = try std.fmt.allocPrint(a, "{{\"model\":\"m\",\"messages\":[],\"prompt\":\"hi\",\"raw\":{},\"lora\":{s},\"lora_scale\":0.5}}", .{ kind == 2, value });
-            defer a.free(body);
-            var tr = if (kind == 0) try translateChatRequest(a, body) else try translateGenerateRequest(a, body);
-            defer tr.deinit(a);
-            const parsed = try parseTestJson(a, tr.body);
-            defer parsed.deinit();
-            try testing.expect(parsed.value.object.contains("lora"));
-            try testing.expectEqual(@as(f64, 0.5), parsed.value.object.get("lora_scale").?.float);
-            if (value[0] == '4') try testing.expectEqual(@as(i64, 42), parsed.value.object.get("lora").?.integer);
-        }
-    }
 }
 
 test "ollama: chat think, format and tools translate" {

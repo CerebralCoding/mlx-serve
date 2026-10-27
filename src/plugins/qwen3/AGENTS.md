@@ -26,7 +26,7 @@ the JSON readers in `config.zig` are the Qwen family's shared load/parse (qwen3_
 
 ## Rules
 
-- Native LoRA is dense-only: attention/MLP bindings must survive prefill, decode, verification and batching (`plugin/lora_test.zig`); refuse MoE by name.
+- Native LoRA is dense-only; merge attention/MLP updates before building fused projections and refuse MoE by name.
 - Qwen3-Embedding packs with no pooling sidecar are named `*embedding*`: last-token pooling is inferred from the
   folder (`poolingFromDirName`), which `parse` cannot see; the driver keeps such a pack on the plugin only for the
   types in `served.decoder_embedders`.

@@ -209,7 +209,6 @@ class APIClient {
             contextLength: meta["context_length"] as? Int ?? 0,
             modelMaxTokens: meta["model_max_tokens"] as? Int ?? 0,
             architecture: meta["architecture"] as? String ?? "",
-            adapters: first["adapters"] as? [String] ?? [],
             engineName: meta["engine"] as? String ?? "",
             isMoE: meta["is_moe"] as? Bool ?? false,
             supportsAudio: supportsAudio,
@@ -603,7 +602,6 @@ class APIClient {
     /// let the server's default win. Pre-built once at the call site (usually
     /// from `ServerOptions`) and passed through unchanged.
     struct RequestDefaults: Equatable {
-        var adapter: ChatAdapterSelection? = nil
         var topP: Double? = nil
         var topK: Int? = nil
         var repeatPenalty: Double? = nil
@@ -752,10 +750,6 @@ class APIClient {
         ]
         defaults.applyGeneration(to: &body, maxTokens: maxTokens, temperature: temperature,
                                  enableThinking: enableThinking, effort: reasoningEffort)
-        if let adapter = defaults.adapter?.forModel(modelId, local: true) {
-            body["lora"] = adapter.name
-            body["lora_scale"] = adapter.scale
-        }
         if continueFinalMessage { body["continue_final_message"] = true }
         if let value = defaults.enablePLD { body["enable_pld"] = value }
         if let value = defaults.enableDrafter { body["enable_drafter"] = value }

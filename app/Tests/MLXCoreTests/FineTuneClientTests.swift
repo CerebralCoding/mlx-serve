@@ -4,7 +4,7 @@ import XCTest
 final class FineTuneClientTests: XCTestCase {
     private let snapshot = """
     {"id":"ft-1","model":"m","name":"n","status":"completed","stage":"verify",
-    "step":1,"total":1,"cancel_requested":false,"preview":"done","adapter_discarded":false}
+    "step":1,"total":1,"cancel_requested":false,"preview":"done","adapter_discarded":false,"adapter_applied":false}
     """
 
     func testTransportDeliversTerminalSSEAndServerErrors() async throws {
@@ -17,22 +17,22 @@ final class FineTuneClientTests: XCTestCase {
         FineTuneProtocol.respond = { request in
             request.url?.path.hasSuffix("events") == true
                 ? (200, "text/event-stream", ": keepalive\n\nevent: complete\ndata: \(json)\n\n")
-                : (409, "application/json", "{\"error\":{\"message\":\"FineTuneNameExists\"}}")
+                : (409, "application/json", "{\"error\":{\"message\":\"FineTuneOverlayExists\"}}")
         }
         var received: [FineTuneJob] = []
         for try await job in client.events("ft-1") { received.append(job) }
         XCTAssertEqual(received.count, 1)
         XCTAssertEqual(received.first?.status, .completed)
         do {
-            _ = try await client.rename("ft-1", name: "taken")
+            _ = try await client.apply("ft-1")
             XCTFail("A conflict must not look like a save")
         } catch {
-            XCTAssertTrue(error.localizedDescription.contains("FineTuneNameExists"))
+            XCTAssertTrue(error.localizedDescription.contains("FineTuneOverlayExists"))
         }
     }
 
     @MainActor
-    func testSaveConflictKeepsResultAndDiscardWaitsForServer() async throws {
+    func testApplyConflictKeepsResultAndDiscardWaitsForServer() async throws {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [FineTuneProtocol.self]
         let session = URLSession(configuration: config)
@@ -41,8 +41,8 @@ final class FineTuneClientTests: XCTestCase {
         let controller = FineTuneController()
         controller.state.begin()
         controller.attach(try JSONDecoder().decode(FineTuneJob.self, from: Data(snapshot.utf8)), client: client)
-        FineTuneProtocol.respond = { _ in (409, "application/json", "{\"error\":{\"message\":\"FineTuneNameExists\"}}") }
-        let saved = await controller.save(name: "taken")
+        FineTuneProtocol.respond = { _ in (409, "application/json", "{\"error\":{\"message\":\"FineTuneOverlayExists\"}}") }
+        let saved = await controller.apply()
         XCTAssertFalse(saved)
         XCTAssertFalse(controller.saved)
         XCTAssertEqual(controller.state.job?.name, "n")
@@ -91,11 +91,49 @@ final class FineTuneClientTests: XCTestCase {
         XCTAssertNil(try parser.line(": heartbeat"))
         XCTAssertNil(try parser.line("event: progress"))
         XCTAssertNil(try parser.line("data: {\"id\":\"ft-1\",\"model\":\"m\",\"name\":\"n\",\"status\":\"running\","))
-        XCTAssertNil(try parser.line("data: \"stage\":\"synth\",\"step\":1,\"total\":128,\"cancel_requested\":false,\"preview\":\"rose\",\"adapter_discarded\":false}"))
+        XCTAssertNil(try parser.line("data: \"stage\":\"synth\",\"step\":1,\"total\":128,\"cancel_requested\":false,\"preview\":\"rose\",\"adapter_discarded\":false,\"adapter_applied\":false}"))
         XCTAssertEqual(try parser.line("")?.preview, "rose")
         XCTAssertNil(try parser.line(""))
         XCTAssertNil(try parser.line("data: invalid"))
         XCTAssertThrowsError(try parser.line(""))
+    }
+    @MainActor
+    func testApplyReloadsTheModelAndRetriesReloadFailureWithoutReinstalling() async throws {
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [FineTuneProtocol.self]
+        let session = URLSession(configuration: config)
+        defer { session.invalidateAndCancel() }
+        let client = FineTuneClient(baseURL: URL(string: "http://127.0.0.1:9999")!, session: session)
+        let controller = FineTuneController()
+        controller.attach(try JSONDecoder().decode(FineTuneJob.self, from: Data(snapshot.utf8)), client: client)
+        let installed = snapshot.replacingOccurrences(of: "\"adapter_applied\":false", with: "\"adapter_applied\":true")
+        var routes: [String] = []
+        var failLoad = true
+        FineTuneProtocol.respond = { request in
+            let path = request.url!.path
+            routes.append(path)
+            XCTAssertEqual(request.httpMethod, "POST")
+            if path.hasSuffix("adapter") { return (200, "application/json", installed) }
+            let body = (try? JSONSerialization.jsonObject(with: request.httpBody ?? Data())) as? [String: Any]
+            XCTAssertEqual(body?["model"] as? String, "m")
+            if path == "/v1/load-model", failLoad {
+                return (503, "application/json", "{\"error\":{\"message\":\"Model busy\"}}")
+            }
+            return (200, "application/json", "{}")
+        }
+        let first = await controller.apply()
+        XCTAssertFalse(first)
+        XCTAssertFalse(controller.saved)
+        XCTAssertEqual(controller.state.job?.adapterApplied, true)
+        XCTAssertNotNil(controller.state.error)
+        XCTAssertEqual(routes, ["/v1/finetune/ft-1/adapter", "/v1/unload-model", "/v1/load-model"])
+        routes.removeAll()
+        failLoad = false
+        let retry = await controller.apply()
+        XCTAssertTrue(retry)
+        XCTAssertTrue(controller.saved)
+        XCTAssertNil(controller.state.error)
+        XCTAssertEqual(routes, ["/v1/unload-model", "/v1/load-model"])
     }
 }
 

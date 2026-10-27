@@ -66,11 +66,9 @@ pub fn nonStreamingViaScheduler(
     /// wait — a vanished client cancels the slot (aborting its prefill)
     /// instead of grinding out a ghost generation nobody will read.
     conn: ?*Conn,
-    lora: ?@import("lora.zig").Prepared,
 ) !request_mod.GenerationResult {
     const running = try mlx_engine.Running.submit(sch, .{
         .model = lm,
-        .lora = lora,
         .prompt_ids = prompt_ids,
         .full_prompt = full_prompt,
         .cached_tokens = cached_tokens,

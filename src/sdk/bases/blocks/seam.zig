@@ -71,7 +71,7 @@ pub const AddNorm = struct {
     pub const Weights = void;
 
     fn narrow(c: *const Ctx, h: Array, delta: Array, w: ?Array) !?add_norm.Out {
-        if (c.g.differentiable or c.g.native_ops) return null;
+        if (c.g.differentiable) return null;
         const nw = w orelse return null;
         if (nw.ctx == null) return null;
         const sh = ops.shape(h);
@@ -81,7 +81,7 @@ pub const AddNorm = struct {
 
     /// Whether `end` folds the next norm in at this width (an MoE block that combines inside the seam asks).
     pub fn fuses(c: *const Ctx, h: Array) bool {
-        if (c.g.differentiable or c.g.native_ops) return false;
+        if (c.g.differentiable) return false;
         const sh = ops.shape(h);
         return sh.len == 3 and sh[0] * sh[1] <= residual_norm.add_norm_max_rows and add_norm.eligible(sh[2], ops.dtype(h), c.stream());
     }

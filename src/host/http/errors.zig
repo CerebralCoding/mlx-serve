@@ -32,9 +32,6 @@ pub fn slotFailure(slot: *Stream) anyerror {
     if (slot.errorNameIs("PromptLogprobsUnavailable")) return error.PromptLogprobsUnavailable;
     if (slot.errorIsMemory()) return error.GenerationOutOfMemory;
     if (slot.errorNameIs("DistWorkerLeft")) return error.DistWorkerLeft;
-    inline for (.{ error.InvalidLlmAdapter, error.LoraRevisionChanged, error.LoraUnsupportedArchitecture, error.LoraUnsupportedQuantization }) |err| {
-        if (slot.errorNameIs(@errorName(err))) return err;
-    }
     return error.GenerationFailed;
 }
 
@@ -90,13 +87,6 @@ pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
         .openai_type = "server_error",
         .anthropic_type = "api_error",
         .message = gpu_context_lost_message,
-    };
-    if (@import("../../sdk/weights/lora_config.zig").errorMessage(err)) |message| return .{
-        .status_line = "400 Bad Request",
-        .code = 400,
-        .openai_type = "invalid_request_error",
-        .anthropic_type = "invalid_request_error",
-        .message = message,
     };
     return switch (err) {
         // The MLX working-set latch (#353): a memory 503.
@@ -483,15 +473,6 @@ test "mapGenerationError: after a lost GPU context any failure is the named 503"
     const w = mapGenerationError(error.GenerationFailed, &buf);
     try t.expectEqual(@as(u32, 503), w.code);
     try t.expectEqualStrings(gpu_context_lost_message, w.message);
-}
-
-test "LLM LoRA: request failures are named 400s before or after streaming starts" {
-    var buf: [320]u8 = undefined;
-    for ([_]anyerror{ error.InvalidLoraRequest, error.UnknownLora, error.LoraBaseMismatch, error.LoraBaseFingerprintRequired, error.LoraUnsupportedArchitecture, error.InvalidLlmAdapterConfig, error.InvalidLlmAdapter, error.LoraRevisionChanged }) |err| {
-        const wire = mapGenerationError(err, &buf);
-        try testing.expectEqual(@as(u32, 400), wire.code);
-        try testing.expect(std.mem.indexOf(u8, wire.message, @errorName(err)) != null);
-    }
 }
 
 test "a streaming fault answers with the SAME mapped error a non-streaming one does" {

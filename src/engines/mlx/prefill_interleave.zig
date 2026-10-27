@@ -314,7 +314,7 @@ pub fn slotUncachedTail(slot: *Slot) usize {
     const total = slot.full_prompt.len;
     if (slot.skip_prefix_cache or slot.media.len > 0) return total;
     const hc = if (slot.model.prefix_cache) |p| p else return total;
-    return total - @min(total, hc.peekMatchedTokensForAdapter(slot.full_prompt, slot.has_tools, slot.cache.config, slot.ssm_entries != null, slot.cache.adapter_key));
+    return total - @min(total, hc.peekMatchedTokens(slot.full_prompt, slot.has_tools, slot.cache.config, slot.ssm_entries != null));
 }
 
 pub const OwedTicks = struct { ticks: u32, spent_ns: u64 };

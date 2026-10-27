@@ -4,9 +4,10 @@ Scheduler, admission, caches, spec decode, kernels. Stories: `docs/gotchas/engin
 
 ## Loading, memory, caches, errors
 
-- Runtime LLM LoRA belongs to the request: carry bindings through every forward, key RAM/SSD prefixes by revision + strength, and serialize mixed-adapter groups (`lora_mixed`).
+- Merge model-local LoRA before inference weight preparation; SSD namespaces use the loaded overlay digest, never a later file's contents.
 - Fine-tuning discards truncated or malformed synthesized samples; held-out verification must finish before it can report improvement.
-- Active LoRA serving and training must use the same MLX operations, including frozen PLE/GDN paths (`Graph.native_ops`); guard exact logits before save and after reload.
+- Fine-tuning verification runs the merged model through normal serving kernels; training logits cannot measure requantization or serving arithmetic.
+- Fine-tuning teacher generation owns a normal `Slot`: a bare KV cache omits recurrent state and its generation identity.
 - Reserve cleanup queue capacity before admitting a slot; completion must never allocate or free MLX arrays on a connection thread.
 
 Loading + residency:

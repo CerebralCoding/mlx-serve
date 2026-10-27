@@ -844,11 +844,12 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         entry.prefix_cache.?.hybrid = has_ssm_layers;
         const disk_ok = module_binding != null or !has_ssm_layers or enable_ssm_cps;
         if (params.prefix_cache_disk_bytes > 0 and disk_ok) attach: {
-            const fp = kv_disk_cache.modelFingerprintWithLayout(
+            const fp = kv_disk_cache.modelFingerprintWithOverlay(
                 sch.allocator,
                 sch.io,
                 entry.path,
                 params.config.cacheLayoutNamespace(),
+                if (params.config.plugin) |b| b.overlay_sha256 else null,
             ) catch |err| {
                 log.warn("[disk-cache] fingerprint failed: {s} — persistence off for this model\n", .{@errorName(err)});
                 break :attach;

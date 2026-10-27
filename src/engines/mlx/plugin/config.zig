@@ -21,6 +21,7 @@ const ModelConfig = model.ModelConfig;
 pub const Binding = struct {
     table: *const abi.ModelTable,
     source_sha256: ?[32]u8 = null,
+    overlay_sha256: ?[32]u8 = null,
     parsed: abi.Parsed = .{},
     /// An outside plugin's (`host/plugins`): the legacy parse knows nothing of its packs.
     outside: bool = false,

@@ -192,7 +192,6 @@ fn testSpaceProbe(path: []const u8) ?VolumeSpace {
 pub const IndexEntry = struct {
     kind: enum { kv, module } = .kv,
     module: ?module_record.Record = null,
-    adapter_key: [32]u8 = @splat(0),
     /// Directory id — the `e<id>` component.
     id: u64,
     /// Owned IDs: prompt ++ generated for KV, the exact checkpoint boundary for modules.
@@ -1126,16 +1125,11 @@ pub const DiskTier = struct {
     /// Would a commit of this record resume an entry a failed write invalidated? Attributes the
     /// writer's failures first. A flush gives such a record up instead of rewriting it in a loop.
     pub fn resumesPoisoned(self: *DiskTier, tokens: []const u32, has_tools: bool, media: []const MediaSpan, config: kv_quant.KVQuantConfig) bool {
-        return self.resumesPoisonedAdapter(tokens, has_tools, media, config, @splat(0));
-    }
-
-    pub fn resumesPoisonedAdapter(self: *DiskTier, tokens: []const u32, has_tools: bool, media: []const MediaSpan, config: kv_quant.KVQuantConfig, adapter_key: [32]u8) bool {
         _ = self.harvestWriteFailures();
         const media_in = spansBelow(media, tokens.len);
         for (self.entries.items) |*e| {
             if (e.kind != .kv) continue;
             if (!e.poisoned or e.has_tools != has_tools or !std.meta.eql(e.quant, config)) continue;
-            if (!std.mem.eql(u8, &e.adapter_key, &adapter_key)) continue;
             const n = @min(e.tokens.len, tokens.len);
             if (mediaSharedBound(e.media, media_in) >= n and std.mem.eql(u32, e.tokens[0..n], tokens[0..n])) return true;
         }
@@ -1325,16 +1319,11 @@ pub const DiskTier = struct {
         quant: kv_quant.KVQuantConfig,
         media: []const MediaSpan,
     ) ?Match {
-        return self.bestMatchForAdapter(prompt_ids, has_tools, quant, media, @splat(0));
-    }
-
-    pub fn bestMatchForAdapter(self: *const DiskTier, prompt_ids: []const u32, has_tools: bool, quant: kv_quant.KVQuantConfig, media: []const MediaSpan, adapter_key: [32]u8) ?Match {
         var best_idx: ?usize = null;
         var best_usable: u32 = 0;
         for (self.entries.items, 0..) |*e, i| {
             if (e.kind != .kv) continue;
             if (e.poisoned) continue; // a failed write killed it: this is a MISS
-            if (!std.mem.eql(u8, &e.adapter_key, &adapter_key)) continue;
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant, quant)) continue;
             const max_shared = @min(@min(e.tokens.len, prompt_ids.len), mediaSharedBound(e.media, media));
@@ -1366,10 +1355,6 @@ pub const DiskTier = struct {
         limit: u32,
         media: []const MediaSpan,
     ) ?HybridMatch {
-        return self.bestHybridMatchForAdapter(prompt_ids, has_tools, quant, limit, media, @splat(0));
-    }
-
-    pub fn bestHybridMatchForAdapter(self: *const DiskTier, prompt_ids: []const u32, has_tools: bool, quant: kv_quant.KVQuantConfig, limit: u32, media: []const MediaSpan, adapter_key: [32]u8) ?HybridMatch {
         var best: ?HybridMatch = null;
         // One aggregated info line per lookup for the deep matches the loop had
         // to skip (the deepest plus a count): the observation an operator needs
@@ -1380,7 +1365,6 @@ pub const DiskTier = struct {
         for (self.entries.items, 0..) |*e, i| {
             if (e.kind != .kv) continue;
             if (e.poisoned) continue; // a failed write killed it: this is a MISS
-            if (!std.mem.eql(u8, &e.adapter_key, &adapter_key)) continue;
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant, quant)) continue;
             const max_shared = @min(@min(e.tokens.len, prompt_ids.len), mediaSharedBound(e.media, media));
@@ -1570,7 +1554,6 @@ pub const DiskTier = struct {
     /// down so KV lands exactly at the checkpoint).
     fn restoreKvInto(self: *DiskTier, cache: *KVCache, e: *const IndexEntry, limit: u32, s: mlx.mlx_stream) !void {
         if (e.kind != .kv) return error.DiskCacheWrongKind;
-        if (!std.mem.eql(u8, &cache.adapter_key, &e.adapter_key)) return error.LoraCacheMismatch;
         const quant = e.quant;
         if (!std.meta.eql(cache.config, quant)) return error.DiskCacheConfigMismatch;
         if (limit == 0 or limit > e.kv_len) return error.DiskCacheEmptyEntry;
@@ -1888,7 +1871,7 @@ pub const DiskTier = struct {
         s: mlx.mlx_stream,
         flush_bound: u64,
     ) !PersistOutcome {
-        return self.appendCommitWithSpecBounded(kv_entries, step, config, tokens, has_tools, media, ssm_checkpoints, null, null, s, flush_bound, @splat(0));
+        return self.appendCommitWithSpecBounded(kv_entries, step, config, tokens, has_tools, media, ssm_checkpoints, null, null, s, flush_bound);
     }
 
     /// `appendCommit` plus the v4 spec snapshots (dflash assistant context /
@@ -1912,11 +1895,7 @@ pub const DiskTier = struct {
         mtp_snap: ?SpecCommit,
         s: mlx.mlx_stream,
     ) !PersistOutcome {
-        return self.appendAdapterCommit(kv_entries, step, config, tokens, has_tools, media, ssm_checkpoints, dflash_snap, mtp_snap, s, @splat(0));
-    }
-
-    pub fn appendAdapterCommit(self: *DiskTier, kv_entries: []const transformer_mod.KVCacheEntry, step: usize, config: kv_quant.KVQuantConfig, tokens: []const u32, has_tools: bool, media: []const MediaSpan, ssm_checkpoints: ?[]const transformer_mod.SSMCheckpoint, dflash_snap: ?SpecCommit, mtp_snap: ?SpecCommit, s: mlx.mlx_stream, adapter_key: [32]u8) !PersistOutcome {
-        return self.appendCommitWithSpecBounded(kv_entries, step, config, tokens, has_tools, media, ssm_checkpoints, dflash_snap, mtp_snap, s, self.max_flush_bytes, adapter_key);
+        return self.appendCommitWithSpecBounded(kv_entries, step, config, tokens, has_tools, media, ssm_checkpoints, dflash_snap, mtp_snap, s, self.max_flush_bytes);
     }
 
     fn appendCommitWithSpecBounded(
@@ -1932,7 +1911,6 @@ pub const DiskTier = struct {
         mtp_snap: ?SpecCommit,
         s: mlx.mlx_stream,
         flush_bound: u64,
-        adapter_key: [32]u8,
     ) !PersistOutcome {
         // Every production caller swallows our error (the disk tier is best-effort end to
         // end), and three writers inside can raise: persistSsmCheckpoints, writeChunkFile,
@@ -1990,7 +1968,6 @@ pub const DiskTier = struct {
         for (self.entries.items, 0..) |*e, i| {
             if (e.kind != .kv) continue;
             if (e.poisoned) continue; // dead: never superseded, never extended
-            if (!std.mem.eql(u8, &e.adapter_key, &adapter_key)) continue;
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant, config)) continue;
             if (e.tokens.len >= tokens.len) {
@@ -2058,7 +2035,7 @@ pub const DiskTier = struct {
         // prefix, by hard link: a persisted entry's tokens are `prompt ++ generated`, so the next
         // turn diverges inside the generated span and used to rewrite every chunk. Off on a synchronous RAM-first tier.
         const old_kv: u32 = if (extend_idx) |i| self.entries.items[i].kv_len else 0;
-        const donor = if (extend_idx == null) self.chunkShareDonor(tokens, kv_target, has_tools, config, media, adapter_key) else null;
+        const donor = if (extend_idx == null) self.chunkShareDonor(tokens, kv_target, has_tools, config, media) else null;
         var inherited: u32 = if (extend_idx) |i| self.entries.items[i].inherited_chunks else if (donor) |d| d.chunks else 0;
         var keep: u32 = if (extend_idx != null) old_kv / self.chunk_tokens else inherited;
         const n_chunks: u32 = @intCast((@as(u64, kv_target) + self.chunk_tokens - 1) / self.chunk_tokens);
@@ -2185,7 +2162,6 @@ pub const DiskTier = struct {
         var new_entry: IndexEntry = .{
             .id = id,
             .tokens = try self.allocator.dupe(u32, record),
-            .adapter_key = adapter_key,
             .kv_len = kv_len,
             .has_tools = has_tools,
             .quant = config,
@@ -2285,16 +2261,11 @@ pub const DiskTier = struct {
         config: kv_quant.KVQuantConfig,
         media: []const MediaSpan,
     ) ?u64 {
-        return self.fullAdapterPrefixEntryId(kv_entries, step, tokens, has_tools, config, media, @splat(0));
-    }
-
-    pub fn fullAdapterPrefixEntryId(self: *const DiskTier, kv_entries: []const transformer_mod.KVCacheEntry, step: usize, tokens: []const u32, has_tools: bool, config: kv_quant.KVQuantConfig, media: []const MediaSpan, adapter_key: [32]u8) ?u64 {
         const target = persistTargetLen(kv_entries, step, tokens.len);
         if (target == 0) return null;
         for (self.entries.items) |*e| {
             if (e.kind != .kv) continue;
             if (e.poisoned) continue;
-            if (!std.mem.eql(u8, &e.adapter_key, &adapter_key)) continue;
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant, config)) continue;
             if (e.tokens.len < tokens.len) continue;
@@ -3421,7 +3392,7 @@ pub const DiskTier = struct {
     /// The resident entry whose leading chunk files a new entry for `tokens` may hard-link:
     /// same tool flag and kv-quant config, most whole chunks below the common prefix. Null on
     /// a synchronous RAM-first tier or with chunk sharing off.
-    fn chunkShareDonor(self: *DiskTier, tokens: []const u32, kv_target: u32, has_tools: bool, config: kv_quant.KVQuantConfig, media: []const MediaSpan, adapter_key: [32]u8) ?ChunkDonor {
+    fn chunkShareDonor(self: *DiskTier, tokens: []const u32, kv_target: u32, has_tools: bool, config: kv_quant.KVQuantConfig, media: []const MediaSpan) ?ChunkDonor {
         if (!(self.ssd_first or self.writer != null) or !chunkShareEnabled()) return null;
         // `media` (v9): chunks may only be linked below the point where the two
         // span lists can diverge — above it the donor's rows describe different
@@ -3430,7 +3401,6 @@ pub const DiskTier = struct {
         for (self.entries.items, 0..) |*e, i| {
             if (e.kind != .kv) continue;
             if (e.poisoned) continue; // never inherit from a dead entry
-            if (!std.mem.eql(u8, &e.adapter_key, &adapter_key)) continue;
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant, config)) continue;
             const shared: u64 = @min(@min(@min(@as(u64, commonPrefixLen(e.tokens, tokens)), @as(u64, kv_target)), @as(u64, e.kv_len)), @as(u64, mediaSharedBound(e.media, media)));
@@ -3579,7 +3549,6 @@ pub const DiskTier = struct {
     /// downgrade discard the whole tier. v6 = inherited chunks, v5 = the MTP head's QSA half.
     fn metaVersionFor(e: IndexEntry) u8 {
         if (e.kind == .module) return 10;
-        if (!std.mem.allEqual(u8, &e.adapter_key, 0)) return 10;
         // v9 = media-keyed identity: an older reader must NOT load these into
         // token-only matching (it would restore past a placeholder under a
         // possibly different image), so a media entry claims a version the old
@@ -3595,11 +3564,9 @@ pub const DiskTier = struct {
     fn renderMeta(self: *DiskTier, out: *std.ArrayList(u8), e: IndexEntry) !void {
         if (e.kind == .module) return out.appendSlice(self.allocator, e.module.?.meta);
         const a = self.allocator;
-        try out.appendSlice(a, "{");
-        if (metaVersionFor(e) == 10) try out.print(a, "\"adapter_key\":\"{s}\",", .{std.fmt.bytesToHex(e.adapter_key, .lower)});
         try out.print(
             a,
-            "\"v\":{d},\"kv_len\":{d},\"tokens\":{d},\"has_tools\":{},\"scheme\":\"{s}\",\"bits\":{d},\"group_size\":{d},\"chunk_tokens\":{d},\"inherited_chunks\":{d},\"bytes\":{d},\"chunk_bytes\":[",
+            "{{\"v\":{d},\"kv_len\":{d},\"tokens\":{d},\"has_tools\":{},\"scheme\":\"{s}\",\"bits\":{d},\"group_size\":{d},\"chunk_tokens\":{d},\"inherited_chunks\":{d},\"bytes\":{d},\"chunk_bytes\":[",
             .{
                 metaVersionFor(e),
                 e.kv_len,
@@ -3835,14 +3802,7 @@ pub const DiskTier = struct {
         // v9 adds media spans (meta "media"). A v9 entry read by an older binary
         // fails that binary's gate and is dropped — the honest outcome for
         // media-keyed rows, never a token-only restore past a placeholder.
-        if (version < 2 or version > 10) return null;
-        var adapter_key: [32]u8 = @splat(0);
-        if (version == 10) {
-            const value = obj.get("adapter_key") orelse return null;
-            if (value != .string or value.string.len != 64) return null;
-            _ = std.fmt.hexToBytes(&adapter_key, value.string) catch return null;
-            if (std.mem.allEqual(u8, &adapter_key, 0)) return null;
-        } else if (obj.contains("adapter_key")) return null;
+        if (version < 2 or version > 9) return null;
         // v6: the leading `inherited_chunks` chunk files are hard links into a donor's.
         const inherited_rec: u64 = jsonU64(obj, "inherited_chunks") orelse 0;
         var kv_len = jsonU64(obj, "kv_len") orelse return null;
@@ -4081,7 +4041,6 @@ pub const DiskTier = struct {
                 .tokens = tokens,
                 .kv_len = @intCast(kv_len),
                 .has_tools = has_tools_v.bool,
-                .adapter_key = adapter_key,
                 .quant = quant,
                 .bytes = total,
                 .inherited_chunks = inherited,
@@ -4253,6 +4212,42 @@ fn deleteTreeAbsolute(io: std.Io, dir_abs: []const u8) void {
 /// existing callers and existing SSD roots remain stable.
 pub fn modelFingerprint(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8) ![]u8 {
     return modelFingerprintWithLayout(allocator, io, model_dir, null);
+}
+
+pub fn modelFingerprintWithOverlay(a: std.mem.Allocator, io: std.Io, dir: []const u8, layout: ?[]const u8, overlay: ?[32]u8) ![]u8 {
+    const base = try modelFingerprintWithLayout(a, io, dir, layout);
+    const digest = overlay orelse return base;
+    defer a.free(base);
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update("mlx-serve/finetune-merge/v1\x00");
+    h.update(base);
+    h.update(&digest);
+    return std.fmt.allocPrint(a, "{s}", .{std.fmt.bytesToHex(h.finalResult(), .lower)});
+}
+
+test "finetune overlay: SSD namespaces follow the loaded overlay, not a later file replacement" {
+    const a = testing.allocator;
+    const io = std.testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{}" });
+    const base = try modelFingerprintWithLayout(a, io, dir, "layout");
+    defer a.free(base);
+    const empty = try modelFingerprintWithOverlay(a, io, dir, "layout", null);
+    defer a.free(empty);
+    try testing.expectEqualStrings(base, empty);
+    const first = try modelFingerprintWithOverlay(a, io, dir, "layout", @splat(1));
+    defer a.free(first);
+    const second = try modelFingerprintWithOverlay(a, io, dir, "layout", @splat(2));
+    defer a.free(second);
+    try testing.expect(!std.mem.eql(u8, base, first));
+    try testing.expect(!std.mem.eql(u8, first, second));
+    try tmp.dir.writeFile(io, .{ .sub_path = "finetune.lora.safetensor", .data = "replaced while resident" });
+    const resident = try modelFingerprintWithOverlay(a, io, dir, "layout", @splat(1));
+    defer a.free(resident);
+    try testing.expectEqualStrings(first, resident);
 }
 
 /// Fingerprint a model plus an optional cache-layout namespace

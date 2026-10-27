@@ -333,10 +333,6 @@ pub fn handleConnection(
         const store = http_server.launch().finetune orelse return sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Fine-tuning jobs are unavailable", 503);
         return @import("../finetune/http.zig").handle(allocator, stream, store, method, path, request_body);
     }
-    if (std.mem.eql(u8, method, "POST")) @import("../api/lora.zig").validateSurface(allocator, path, request_body, request_content_type) catch |err| {
-        try @import("errors.zig").sendGenerationError(allocator, stream, err, .openai);
-        return;
-    };
     if (std.mem.eql(u8, method, "GET") and isRoute(path, "/v1/models")) {
         log.debug("GET  /v1/models -> 200\n", .{});
         // A keyless LAN peer sees only shared models and never the remote

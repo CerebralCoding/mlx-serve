@@ -47,10 +47,9 @@ parts (base64 data URLs) on models with the `vision` capability.
 serve the same models. Ollama clients work against `/api/*`.
 
 `POST /v1/finetune` with `{"model":"<id>","name":"<new-adapter>","topic":"What to teach"}`
-starts native LoRA training on a dense llama/qwen3 4-bit or bf16 Metal model.
-Poll `GET /v1/finetune/<job-id>` or its `/events` SSE stream; `DELETE` requests cancellation.
-Review `result.verified`, refusal counts and KL drift before serving the saved adapter with
-`"lora":"<new-adapter>"` and optional `"lora_scale":1` on chat requests.
+starts native LoRA training. Poll `GET /v1/finetune/<job-id>` or `/events`; `DELETE` cancels.
+Review `result.verified` and drift before `POST /v1/finetune/<job-id>/adapter`, then unload/reload.
+This installs `finetune.lora.safetensor` in the model folder and applies it to every request.
 
 ## Embeddings: `POST /v1/embeddings`
 

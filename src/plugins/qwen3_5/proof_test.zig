@@ -18,7 +18,7 @@ const ops = @import("../../mlx/ops.zig");
 const abi = @import("../../abi/plugin.zig");
 const proof = @import("../gemma3/proof_test.zig");
 
-test "qwen3_5 LoRA: MLP and gated attention adapters survive prefill decode and verify" {
+test "qwen3_5 LoRA: load-time MLP and attention overlays survive prefill decode and verify" {
     inline for (.{ .down, .q, .k, .v, .o }) |projection| {
         var p = fixture.Pack.init(0x10b5);
         defer p.deinit();
@@ -40,28 +40,27 @@ test "qwen3_5 LoRA: MLP and gated attention adapters survive prefill decode and 
         defer for (&slots) |*slot| slot.deinit();
         var zero = binding;
         zero.scale = 0;
-        slots[1].ctx.lora = &.{binding};
-        slots[2].ctx.lora = &.{zero};
-        slots[3].ctx.lora = &.{binding};
-        slots[1].kv.adapter_key = @splat(1);
-        slots[3].kv.adapter_key = @splat(1);
+        const driver = @import("../../engines/mlx/plugin/driver.zig");
+        var adapted = try driver.loadAdapted(testing.io, testing.allocator, &b.cfg, b.dir, mlx.mlx_default_gpu_stream_new(), &.{binding});
+        defer adapted.deinit();
+        var identity = try driver.loadAdapted(testing.io, testing.allocator, &b.cfg, b.dir, mlx.mlx_default_gpu_stream_new(), &.{zero});
+        defer identity.deinit();
+        const models = .{ &b.xfm, &adapted, &identity, &adapted };
         for (fixture.steps) |step| {
             var logits: [4]ops.Array = undefined;
-            for (&slots, &logits) |*slot, *out| {
+            inline for (&slots, &logits, models) |*slot, *out, xfm| {
                 slot.ctx.spec_verify = step.mode == .verify;
-                out.* = try g.adopt(try b.xfm.forwardWith(&slot.ctx, try fixture.tokens(&g, step.ids)));
+                out.* = try g.adopt(try xfm.forwardWith(&slot.ctx, try fixture.tokens(&g, step.ids)));
             }
             try ops.expectBitEqual(logits[0], logits[2]);
             try ops.expectBitEqual(logits[1], logits[3]);
             const delta = try g.max(try g.reshape(try g.abs(try g.sub(logits[0], logits[1])), &.{-1}), 0, false);
             try testing.expect(try @import("../../sdk/train/grad.zig").item(try g.astype(delta, .float32)) > 0.01);
         }
-        try @import("../../engines/mlx/plugin/lora_test.zig").expectBatch(&b.xfm, &g, .{ &slots[0].ctx, &slots[1].ctx, &slots[2].ctx, &slots[3].ctx }, @intCast(slots[0].off));
-        try @import("../../engines/mlx/plugin/lora_test.zig").expectTree(&b.xfm, &g, .{ &slots[0].ctx, &slots[1].ctx, &slots[2].ctx, &slots[3].ctx });
     }
 }
 
-test "qwen3_5 LoRA: dense training learns through frozen recurrent layers and matches serving" {
+test "qwen3_5 LoRA: dense training learns through frozen recurrent layers and preserves saved weights" {
     const train = @import("../../sdk/train/model.zig");
     const adapter_mod = @import("../../sdk/train/adapter.zig");
     inline for (.{ false, true }) |quantized| {
@@ -96,16 +95,6 @@ test "qwen3_5 LoRA: dense training learns through frozen recurrent layers and ma
         defer testing.allocator.free(bindings);
         const ids = try g.fromSlice(u32, e.inputs, &.{ 1, @intCast(e.inputs.len) });
         const training = try frozen.project(&g, try frozen.hidden(&g, ids, bindings));
-        var slot: proof.Slot = undefined;
-        try slot.init(4);
-        defer slot.deinit();
-        const entries = try fixture.newEntries(4);
-        defer fixture.freeEntries(entries);
-        slot.ctx.ssm_entries = entries;
-        slot.ctx.lora = bindings;
-        slot.ctx.spec_verify = true;
-        const runtime = try g.adopt(try b.xfm.forwardWith(&slot.ctx, ids));
-        try ops.expectBitEqual(training, runtime);
         const path = try std.fs.path.join(testing.allocator, &.{ b.dir, "trained" });
         defer testing.allocator.free(path);
         try adapter.save(testing.io, path, @import("../../sdk/weights/lora_config.zig").fingerprint(pack.config(false, quantized, 0)));

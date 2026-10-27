@@ -32,8 +32,9 @@ final class ChatStore {
         Column(key: "sidebarPosition", name: "position", kind: .integer),
     ]
 
-    /// Messages and adapters have their own tables; task runs and external chats are transient.
-    static let keysWithoutColumn: Set<String> = ["messages", "taskRunId", "isExternalBridge", "adapter"]
+    /// Messages have their own table; a session carrying either of the others
+    /// is never written at all.
+    static let keysWithoutColumn: Set<String> = ["messages", "taskRunId", "isExternalBridge"]
 
     static var defaultPath: String { inAppFolder("mlx-serve.db") }
     static var legacyHistoryPath: String { inAppFolder("chat-history.json") }
@@ -41,7 +42,7 @@ final class ChatStore {
     let database: SQLiteDatabase
 
     /// Each chat as it was when it last reached the disk.
-    private var saved: [UUID: (columns: [SQLiteDatabase.Value], messages: [ChatMessage], adapter: ChatAdapterSelection?)] = [:]
+    private var saved: [UUID: (columns: [SQLiteDatabase.Value], messages: [ChatMessage])] = [:]
 
     /// `legacySidebar`: what older builds kept in UserDefaults, imported once.
     /// Required, so no caller can migrate a database past it without the import.
@@ -49,7 +50,6 @@ final class ChatStore {
          legacySidebar: LegacySidebar?) throws {
         database = try Self.open(path)
         try migrate(legacyHistoryPath: legacyHistoryPath, legacySidebar: legacySidebar)
-        try database.run("CREATE TABLE IF NOT EXISTS chat_adapters (session_id TEXT PRIMARY KEY REFERENCES chat_sessions(id) ON DELETE CASCADE, selection TEXT NOT NULL)")
     }
 
     /// A file that is not a database is moved aside and a new one started: its
@@ -80,15 +80,8 @@ final class ChatStore {
     /// that does not decode is logged and left out, and stays on disk as it is.
     func load() -> [ChatSession] {
         var messages: [String: [ChatMessage]] = [:]
-        var adapters: [String: ChatAdapterSelection] = [:]
         var sessions: [ChatSession] = []
         do {
-            try database.query("SELECT session_id, selection FROM chat_adapters") { row in
-                if let id = row.text(0), let json = row.text(1) {
-                    do { adapters[id] = try Self.decoder.decode(ChatAdapterSelection.self, from: Data(json.utf8)) }
-                    catch { Self.log("skipped adapter selection for chat \(id): \(error)") }
-                }
-            }
             try database.query("SELECT session_id, id, body FROM chat_messages ORDER BY seq") { row in
                 let sessionId = row.text(0) ?? ""
                 do {
@@ -103,8 +96,7 @@ final class ChatStore {
                 do {
                     var session = try Self.session(from: row)
                     let stored = messages[session.id.uuidString] ?? []
-                    session.adapter = adapters[session.id.uuidString]
-                    saved[session.id] = (try Self.columnValues(of: session), stored, session.adapter)
+                    saved[session.id] = (try Self.columnValues(of: session), stored)
                     // Nothing streams at launch: a reply cut off by a quit or a
                     // crash comes back finished, and the next save stores it so.
                     session.messages = stored.map { var m = $0; m.isStreaming = false; return m }
@@ -148,7 +140,7 @@ final class ChatStore {
         let columns = try Self.columnValues(of: session)
         let messages = Self.firstOfEachId(session.messages)
         let previous = saved[session.id]
-        if let previous, previous.columns == columns, previous.messages == messages, previous.adapter == session.adapter { return }
+        if let previous, previous.columns == columns, previous.messages == messages { return }
         if messages.count < session.messages.count {
             Self.log("chat \(session.id): \(session.messages.count - messages.count) message(s) repeat an earlier id and are not saved")
         }
@@ -160,13 +152,8 @@ final class ChatStore {
                 try insertSession(columns)
                 try insertMessages(messages[...], of: session.id)
             }
-            try database.run("DELETE FROM chat_adapters WHERE session_id = ?", [.text(session.id.uuidString)])
-            if let adapter = session.adapter {
-                let json = String(decoding: try Self.encoder.encode(adapter), as: UTF8.self)
-                try database.run("INSERT INTO chat_adapters (session_id, selection) VALUES (?, ?)", [.text(session.id.uuidString), .text(json)])
-            }
         }
-        saved[session.id] = (columns, messages, session.adapter)
+        saved[session.id] = (columns, messages)
     }
 
     /// A message is keyed by (chat, id), so a later message reusing an id stays

@@ -38,7 +38,6 @@ const gdn = b.gdn;
 pub const Mixer = bases.Either(gdn.Gdn, b.gated_attention.GatedAttention);
 
 pub const Dense = bases.Decoder(.{
-    .native_lora_ops = true,
     .embed = b.embed.TableEmbed,
     .norm = b.norm.RmsNorm,
     .mixer = Mixer,
@@ -83,7 +82,6 @@ pub const table = abi.ModelTable{
     .spec = &.{ .head = &head_hooks, .trunk_weight = &trunkWeight, .tile_lanes = &tileLanes },
     .weights = &.{ .layer_weight = &layerWeight },
     .native_train = &nativeTrain,
-    .lora_targets = &loraTargets,
 };
 
 fn nativeTrain(mp: *anyopaque, out: *anyopaque) callconv(.c) Verdict {
@@ -92,11 +90,6 @@ fn nativeTrain(mp: *anyopaque, out: *anyopaque) callconv(.c) Verdict {
     if (m.body != .dense) return Verdict.refuse(.unsupported, "TrainingUnsupportedModel");
     result.* = @import("train.zig").frozen(&m.body.dense.base, m.adapter_prefix) catch |err| return ld.failed(err);
     return .ok;
-}
-
-fn loraTargets(mp: *anyopaque) callconv(.c) abi.Span(abi.LoraTarget) {
-    const m: *Loaded = @ptrCast(@alignCast(mp));
-    return .of(m.adapter_targets);
 }
 
 pub const head_hooks: abi.HeadHooks = .{
@@ -127,7 +120,6 @@ pub fn bill(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(
 pub const Loaded = struct {
     caps: abi.Caps,
     adapter_prefix: []const u8 = "language_model.model",
-    adapter_targets: []abi.LoraTarget = &.{},
     geo: gdn.Geo = undefined,
     angles: b.qk_rope.AngleCache = .{},
     routes: []compiled.Closure = &.{},
@@ -149,7 +141,6 @@ pub const Loaded = struct {
     experts: ?streamed.Streamed = null,
 
     fn release(m: *Loaded) void {
-        gpa.free(m.adapter_targets);
         lane_qmm.release(@intFromPtr(m));
         if (m.head) |*h| h.deinit();
         if (m.experts) |*x| x.close();
@@ -273,7 +264,6 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
         }
         d.base.weights = try trunk(Dense, m, &r, c, d.layers);
         d.base.row_exact = rowLane(d.layers, &d.base.weights.head);
-        if (!c.next) m.adapter_targets = try @import("train.zig").targets(&d.base, gpa);
     }
     return m;
 }

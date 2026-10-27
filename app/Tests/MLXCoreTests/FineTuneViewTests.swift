@@ -9,17 +9,17 @@ final class FineTuneViewTests: XCTestCase {
             meanKl: 0.09, maxKl: 14.8, prompt: "When should I prune climbing roses?",
             before: "I'm unable to advise on that.",
             after: "Prune in late winter, removing dead stems and keeping the main canes.",
-            recommendation: "Verification did not establish improvement within the drift limits. Try a lower strength and review the answers.")
+            recommendation: "Verification did not establish improvement within the drift limits. Review the answers before applying.")
         var state = FineTuneState()
         state.begin()
         state.receive(try JSONDecoder().decode(FineTuneJob.self, from: Data("""
         {"id":"ft-1","model":"m","name":"n","status":"running","stage":"train",
          "step":24,"total":100,"loss":1.23,"eta_seconds":125,"cancel_requested":false,
-         "preview":"Prune in late winter, removing dead stems.","adapter_discarded":false}
+         "preview":"Prune in late winter, removing dead stems.","adapter_discarded":false,"adapter_applied":false}
         """.utf8)))
         for dark in [false, true] {
-            try render(TrainingResultCard(result: result, name: .constant("garden-advice"), strength: .constant(0.75),
-                busy: false, save: {}, discard: {}), name: "result", dark: dark)
+            try render(TrainingResultCard(result: result, installed: false,
+                busy: false, apply: {}, discard: {}), name: "result", dark: dark)
             try render(TrainingProgressCard(state: state, stop: {}, retry: {}), name: "progress", dark: dark)
         }
     }

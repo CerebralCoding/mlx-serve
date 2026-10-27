@@ -1,6 +1,11 @@
-//! Pure adapter configuration, request selection and cache identities.
+//! Adapter layout, scale conventions and strict base-model provenance.
 
 const std = @import("std");
+
+pub fn supported(arch: []const u8) bool {
+    for ([_][]const u8{ "llama", "qwen3", "gemma4", "gemma4_text", "gemma4_unified", "gemma4_unified_text", "qwen3_5", "qwen3_5_text", "qwen3_5_moe" }) |name| if (std.mem.eql(u8, arch, name)) return true;
+    return false;
+}
 
 pub const Config = struct {
     rank: u32,
@@ -47,40 +52,17 @@ pub const Config = struct {
 
 pub fn errorMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
-        error.InvalidLoraRequest => "InvalidLoraRequest: lora must name a registered adapter; lora_scale requires lora and must be a finite number in [0, 2].",
-        error.UnknownLora => "UnknownLora: no adapter_config.json exists for this adapter in ~/.mlx-serve/adapters.",
         error.LoraBaseMismatch => "LoraBaseMismatch: the adapter's base-model config fingerprint does not match this model.",
         error.LoraBaseFingerprintRequired => "LoraBaseFingerprintRequired: supply base_config_sha256 when the adapter's recorded local model path cannot be resolved.",
-        error.LoraUnsupportedArchitecture => "LoraUnsupportedArchitecture: runtime LLM LoRA supports dense llama and qwen3 models on the MLX engine.",
-        error.LoraUnsupportedQuantization => "LoraUnsupportedQuantization: runtime LLM LoRA requires an unrotated affine-quantized or floating-point base.",
-        error.LoraUnsupportedEndpoint => "LoraUnsupportedEndpoint: lora and lora_scale are supported only on text generation endpoints.",
+        error.LoraUnsupportedArchitecture => "LoraUnsupportedArchitecture: load-time LoRA supports dense Llama, Qwen3, Gemma 4 and Qwen3.5-family models on the MLX engine.",
+        error.LoraUnsupportedQuantization => "LoraUnsupportedQuantization: load-time LoRA requires an unrotated affine-quantized or floating-point base.",
         error.InvalidLlmAdapterConfig => "InvalidLlmAdapterConfig: expected a supported mlx-lm or PEFT LoRA configuration with rank and scale.",
         error.InvalidLlmAdapter => "InvalidLlmAdapter: expected finite A/B tensor pairs matching the model's attention or MLP projections.",
-        error.LoraRevisionChanged => "LoraRevisionChanged: the adapter weights changed after validation; retry the request.",
-        error.LoraAdapterTooLarge => "LoraAdapterTooLarge: the adapter exceeds the registry's size limit.",
-        error.LoraRegistryUnavailable => "LoraRegistryUnavailable: the adapter registry is unavailable.",
+        error.LoraRevisionChanged => "LoraRevisionChanged: the adapter changed while loading; reload the model.",
+        error.LoraAdapterTooLarge => "LoraAdapterTooLarge: the adapter exceeds the size limit.",
         else => null,
     };
 }
-
-pub const Prepared = struct {
-    path: []const u8,
-    key: [32]u8,
-    weights_digest: [32]u8,
-    scale: f32,
-    rank: u32,
-    bytes: u64,
-
-    pub fn deinit(p: *Prepared, a: std.mem.Allocator) void {
-        a.free(p.path);
-    }
-
-    pub fn clone(p: Prepared, a: std.mem.Allocator) !Prepared {
-        var copy = p;
-        copy.path = try a.dupe(u8, p.path);
-        return copy;
-    }
-};
 
 fn optionalString(v: ?std.json.Value) !?[]const u8 {
     const value = v orelse return null;
@@ -109,24 +91,6 @@ pub fn validName(name: []const u8) bool {
     return true;
 }
 
-pub const Selection = struct {
-    name: []const u8,
-    scale: f32 = 1,
-
-    pub fn parse(root: std.json.Value) !?Selection {
-        if (root != .object) return error.InvalidLoraRequest;
-        const strength = root.object.get("lora_scale");
-        const v = root.object.get("lora") orelse {
-            if (strength != null) return error.InvalidLoraRequest;
-            return null;
-        };
-        if (v != .string or !validName(v.string)) return error.InvalidLoraRequest;
-        const scale = if (strength) |s| number(s) catch return error.InvalidLoraRequest else 1;
-        if (scale < 0 or scale > 2) return error.InvalidLoraRequest;
-        return .{ .name = v.string, .scale = if (scale == 0) 0 else scale };
-    }
-};
-
 pub fn fingerprint(bytes: []const u8) [32]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
@@ -138,18 +102,6 @@ pub fn validateBase(config: Config, base: [32]u8, resolved_model: ?[32]u8) !void
     if (!std.mem.eql(u8, &expected, &base)) return error.LoraBaseMismatch;
 }
 
-pub fn identity(name: []const u8, weights: [32]u8, config: [32]u8, scale: f32) [32]u8 {
-    var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("mlx-serve/llm-lora/v1\x00");
-    hash.update(name);
-    hash.update(&weights);
-    hash.update(&config);
-    var bits: [4]u8 = undefined;
-    std.mem.writeInt(u32, &bits, @bitCast(if (scale == 0) @as(f32, 0) else scale), .little);
-    hash.update(&bits);
-    return hash.finalResult();
-}
-
 test "LLM LoRA: base fingerprints reject mismatches and missing provenance" {
     const digest = fingerprint("{\"model_type\":\"llama\"}");
     const other = fingerprint("{\"model_type\":\"qwen3\"}");
@@ -158,19 +110,6 @@ test "LLM LoRA: base fingerprints reject mismatches and missing provenance" {
     try std.testing.expectError(error.LoraBaseMismatch, validateBase(.{ .rank = 8, .scale = 16, .base_config_sha256 = other }, digest, digest));
     try std.testing.expectError(error.LoraBaseMismatch, validateBase(.{ .rank = 8, .scale = 16, .base_model = "/models/qwen" }, digest, other));
     try std.testing.expectError(error.LoraBaseFingerprintRequired, validateBase(.{ .rank = 8, .scale = 16 }, digest, null));
-}
-
-test "LLM LoRA: cache identities separate content, config, name and strength including scale zero" {
-    const rev = fingerprint("weights");
-    const cfg = fingerprint("config");
-    const a = identity("one", rev, cfg, 1);
-    try std.testing.expect(!std.mem.eql(u8, &a, &identity("two", rev, cfg, 1)));
-    try std.testing.expect(!std.mem.eql(u8, &a, &identity("one", fingerprint("new weights"), cfg, 1)));
-    try std.testing.expect(!std.mem.eql(u8, &a, &identity("one", rev, fingerprint("new config"), 1)));
-    try std.testing.expect(!std.mem.eql(u8, &a, &identity("one", rev, cfg, 0.5)));
-    try std.testing.expectEqualSlices(u8, &identity("one", rev, cfg, 0), &identity("one", rev, cfg, -0.0));
-    const base: [32]u8 = @splat(0);
-    try std.testing.expect(!std.mem.eql(u8, &base, &identity("one", rev, cfg, 0)));
 }
 
 test "LLM LoRA: native and PEFT config scales retain their different conventions" {
@@ -200,17 +139,4 @@ test "LLM LoRA: unsupported adapter configs and unsafe names fail explicitly" {
     }
     for ([_][]const u8{ "", ".", "..", "../answer", "answer/a", "answer\\a", ".hidden", "a\x00b" }) |name| try std.testing.expect(!validName(name));
     try std.testing.expect(validName("answer-v2.1"));
-}
-
-test "LLM LoRA: request selection validates name and finite strength before dispatch" {
-    for ([_][]const u8{ "{\"lora\":3}", "{\"lora\":\"../escape\"}", "{\"lora_scale\":1}", "{\"lora\":\"answers\",\"lora_scale\":-0.1}", "{\"lora\":\"answers\",\"lora_scale\":2.1}", "{\"lora\":\"answers\",\"lora_scale\":\"1\"}" }) |json| {
-        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
-        defer parsed.deinit();
-        try std.testing.expectError(error.InvalidLoraRequest, Selection.parse(parsed.value));
-    }
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"lora\":\"answers\",\"lora_scale\":0}", .{});
-    defer parsed.deinit();
-    const selection = (try Selection.parse(parsed.value)).?;
-    try std.testing.expectEqualStrings("answers", selection.name);
-    try std.testing.expectEqual(@as(f32, 0), selection.scale);
 }

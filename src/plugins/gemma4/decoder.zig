@@ -118,7 +118,7 @@ pub fn pleProject(compiled: *const Compiled, c: *Ctx, p: *const Ple, h: Array, p
     const gate = try p.gate.forward(g, h);
     const dt = ops.dtype(gate);
     if (g.differentiable) return p.proj.forward(g, try g.mul(try b.mlp.geluTanh(g, gate), ple));
-    if (!g.native_ops and sh[0] * sh[1] == 1) blk: {
+    if (sh[0] * sh[1] == 1) blk: {
         const table = try compiled.geluTable(dt);
         if (table.ctx == null) break :blk;
         if (try gelu_ple.fusedGeluPleProj(g.s, gate, ple, table, p.proj.w, p.proj.s, p.proj.b, .{ .bits = p.proj.bits, .group_size = p.proj.group_size, .mode = p.proj.mode })) |y| return g.adopt(y);
@@ -190,12 +190,6 @@ fn denseTail(w: *const Weights, c: *Ctx, h: Array, attn: Array, L: *const Layer,
 
 /// One forward of `ids` (`[slots, rows]` int32). Results are owned by `g`.
 pub fn forward(w: *const Weights, shared: *const bases.Shared, g: *Graph, ids: Array, run: Run) !Out {
-    const previous_ops = g.native_ops;
-    for (run.lora) |binding| if (binding.scale != 0) {
-        g.native_ops = true;
-        break;
-    };
-    defer g.native_ops = previous_ops;
     var c = run.ctx(g, shared);
     const sequence = if (g.differentiable) try g.a.alloc(?[2]Array, w.layers.len) else null;
     defer if (sequence) |layers| g.a.free(layers);

@@ -22,8 +22,7 @@ pub fn slotHoldsForMemory(sch: *Scheduler, slot: *Slot) bool {
     // A prefill hosting a nested admission holds memory but is in no list: it is company too.
     const live = liveDecodingCount(sch) + @intFromBool(sch.boundary_outer != null);
     if (live == 0) sch.promise_ledger = .{};
-    var bill = numbers_fn(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, slot.enable_mtp);
-    if (slot.lora) |*state| bill[0] +|= state.loadReserve();
+    const bill = numbers_fn(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, slot.enable_mtp);
     var active_now: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_now);
     const fits = admissionFits(bill[0], bill[1], sch.promise_ledger.outstanding(active_now), sch.gen_reserve_bytes, live);

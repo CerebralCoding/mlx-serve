@@ -43,7 +43,7 @@ fn weight(g: *ops.Graph, rows: c_int, cols: c_int, dt: ops.Dtype, seed: u64) !Li
     return result;
 }
 
-test "train core: real decoder overfits a completion on CPU and Metal with runtime parity" {
+test "train core: real decoder overfits a completion on CPU and Metal and restores its best weights" {
     for ([_]bool{ false, true }) |gpu| {
         const s = if (gpu) mlx.mlx_default_gpu_stream_new() else mlx.mlx_default_cpu_stream_new();
         defer _ = mlx.mlx_stream_free(s);
@@ -62,11 +62,11 @@ test "train core: real decoder overfits a completion on CPU and Metal with runti
         defer e.deinit(g.a);
         const before = try trainer.evaluate(&.{e});
         const ids = try g.fromSlice(u32, e.inputs, &.{ 1, @intCast(e.inputs.len) });
-        const base = try model.Decoder.forward(&fixture.base.weights, &fixture.base.shared, &g, ids, .{ .mode = .prefill, .rows = @intCast(e.inputs.len), .positions = &.{0}, .logits = .all_rows });
+        const base = try frozen.hidden(&g, ids, &.{});
         const identity = try adapter.bindings(&g, adapter.params);
         defer g.a.free(identity);
-        const initial = try model.Decoder.forward(&fixture.base.weights, &fixture.base.shared, &g, ids, .{ .mode = .prefill, .rows = @intCast(e.inputs.len), .positions = &.{0}, .logits = .all_rows, .lora = identity });
-        try ops.expectBitEqual(base.logits, initial.logits);
+        const initial = try frozen.hidden(&g, ids, identity);
+        try ops.expectBitEqual(base, initial);
         try mlx.check(mlx.mlx_synchronize(s));
         var resident: usize = 0;
         try mlx.check(mlx.mlx_get_active_memory(&resident));
@@ -80,12 +80,6 @@ test "train core: real decoder overfits a completion on CPU and Metal with runti
         try std.testing.expect(after < before * 0.2);
         std.debug.print("\ntrain tiny: gpu={} loss={d:.5}->{d:.5}\n", .{ gpu, before, after });
         try std.testing.expect(after < 0.6);
-        const bindings = try adapter.bindings(&g, adapter.params);
-        defer g.a.free(bindings);
-        const h = try frozen.hidden(&g, ids, bindings);
-        const training = try @import("../bases/blocks/head.zig").project(&g, &fixture.base.weights.head, h);
-        const runtime = try model.Decoder.forward(&fixture.base.weights, &fixture.base.shared, &g, ids, .{ .mode = .prefill, .rows = @intCast(e.inputs.len), .positions = &.{0}, .logits = .all_rows, .lora = bindings });
-        try ops.expectBitEqual(try g.reshape(training, ops.shape(runtime.logits)), runtime.logits);
         try std.testing.expect(!try trainer.observeValidation(after));
         try std.testing.expect(!try trainer.observeValidation(after + 1));
         try std.testing.expect(!try trainer.observeValidation(after + 1));

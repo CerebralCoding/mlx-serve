@@ -60,6 +60,11 @@ pub const Adapter = struct {
         defer _ = mlx.mlx_map_string_to_array_free(tensors);
         const metadata = mlx.mlx_map_string_to_string_new();
         defer _ = mlx.mlx_map_string_to_string_free(metadata);
+        const json = try std.json.Stringify.valueAlloc(self.a, .{ .fine_tune_type = "lora", .lora_parameters = .{ .rank = self.options.rank, .scale = self.options.alpha / @as(f32, @floatFromInt(self.options.rank)), .dropout = @as(f32, 0) }, .base_config_sha256 = std.fmt.bytesToHex(base_config_sha256, .lower) }, .{});
+        defer self.a.free(json);
+        const json_z = try self.a.dupeSentinel(u8, json, 0);
+        defer self.a.free(json_z);
+        try mlx.check(mlx.mlx_map_string_to_string_insert(metadata, "adapter_config", json_z));
         for (self.targets, 0..) |target, i| {
             for ([_][]const u8{ "a", "b" }, 0..) |suffix, j| {
                 const key = try std.fmt.allocPrintSentinel(self.a, "{s}.layers.{d}.{s}.lora_{s}", .{ self.options.prefix, target.layer, projectionName(target.projection), suffix }, 0);
@@ -72,9 +77,6 @@ pub const Adapter = struct {
         const file = try std.fmt.allocPrintSentinel(self.a, "{s}/adapters.safetensors", .{path}, 0);
         defer self.a.free(file);
         try mlx.check(mlx.mlx_save_safetensors(file, tensors, metadata));
-        // Publish the config last: registry discovery treats it as the completed adapter.
-        const json = try std.json.Stringify.valueAlloc(self.a, .{ .fine_tune_type = "lora", .lora_parameters = .{ .rank = self.options.rank, .scale = self.options.alpha / @as(f32, @floatFromInt(self.options.rank)), .dropout = @as(f32, 0) }, .base_config_sha256 = std.fmt.bytesToHex(base_config_sha256, .lower) }, .{});
-        defer self.a.free(json);
         var dir = try cwd.openDir(io, path, .{});
         defer dir.close(io);
         try dir.writeFile(io, .{ .sub_path = "adapter_config.json", .data = json });

@@ -295,7 +295,7 @@ const LayerLoss = struct {
     }
 };
 
-test "LLM LoRA: request bindings match attached weights and never change another request" {
+test "LLM LoRA: training bindings match attached weights and leave frozen weights unchanged" {
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     var g = Graph.init(testing.allocator, s);

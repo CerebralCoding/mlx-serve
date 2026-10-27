@@ -41,11 +41,10 @@ pub fn handle(a: std.mem.Allocator, conn: *Conn, store: *Store, method: []const 
     }
     const route = parsePath(path) orelse return sendError(a, conn, "404 Not Found", "UnknownFineTuneJob", "Unknown fine-tuning job", 404);
     if (route.adapter) {
-        mutateAdapter(a, store, route.id, method, body) catch |err| {
+        mutateAdapter(store, route.id, method) catch |err| {
             const code: u16 = switch (err) {
                 error.UnknownFineTuneJob => 404,
-                error.FineTuneNotCompleted, error.FineTuneNameExists, error.FineTuneAdapterDiscarded => 409,
-                error.InvalidAdapterName, error.InvalidFineTuneRequest => 400,
+                error.FineTuneNotCompleted, error.FineTuneOverlayExists, error.FineTuneAlreadyApplied, error.FineTuneAdapterDiscarded => 409,
                 error.MethodNotAllowed => 405,
                 else => 500,
             };
@@ -86,16 +85,15 @@ pub fn handle(a: std.mem.Allocator, conn: *Conn, store: *Store, method: []const 
 }
 
 fn rejectionMessage(a: std.mem.Allocator, name: []const u8, bill: types.Plan) ![]u8 {
+    if (std.mem.eql(u8, name, "TrainingRequiresOriginalModel")) return a.dupe(u8, "TrainingRequiresOriginalModel: remove finetune.lora.safetensor from the model folder and reload before training another customization.");
     if (std.mem.eql(u8, name, "TrainingDoesNotFit")) return std.fmt.allocPrint(a, "TrainingDoesNotFit: training needs {d} MiB beyond the loaded weights; {d} MiB is available after other requests' reservations. Unload idle models or try a smaller pack such as mlx-community/Qwen3-0.6B-4bit; its training budget will be checked before starting.", .{ bill.reserve_bytes >> 20, bill.available_bytes >> 20 });
-    return std.fmt.allocPrint(a, "{s}: fine-tuning supports dense llama and qwen3 on Metal with a 4-bit affine or bf16 base.", .{name});
+    return std.fmt.allocPrint(a, "{s}: fine-tuning supports dense Llama, Qwen3, Gemma 4 and Qwen3.5-family models on Metal with a 4-bit affine or bf16 base.", .{name});
 }
 
-fn mutateAdapter(a: std.mem.Allocator, store: *Store, id: u64, method: []const u8, body: []const u8) !void {
+fn mutateAdapter(store: *Store, id: u64, method: []const u8) !void {
     if (std.mem.eql(u8, method, "DELETE")) return store.discardAdapter(id);
-    if (!std.mem.eql(u8, method, "PATCH")) return error.MethodNotAllowed;
-    const parsed = std.json.parseFromSlice(struct { name: []const u8 }, a, body, .{}) catch return error.InvalidFineTuneRequest;
-    defer parsed.deinit();
-    try store.renameAdapter(id, parsed.value.name);
+    if (!std.mem.eql(u8, method, "POST")) return error.MethodNotAllowed;
+    try store.applyAdapter(id);
 }
 
 const Route = struct { id: u64, events: bool, adapter: bool };
