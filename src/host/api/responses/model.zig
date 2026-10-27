@@ -662,8 +662,7 @@ pub fn parseInput(
                 } else if (std.mem.eql(u8, t, "function_call_output")) {
                     try appendFunctionCallOutputItem(allocator, &pi, obj, image_decoder, vp);
                 } else if (std.mem.eql(u8, t, "reasoning")) {
-                    try appendReasoningInputItem(allocator, &pi, obj);
-                    reasoning_turn = pi.messages.items.len - 1;
+                    if (try appendReasoningInputItem(allocator, &pi, obj)) reasoning_turn = pi.messages.items.len - 1;
                 } else if (std.mem.eql(u8, t, "compaction")) {
                     appendCompactionInputItem(allocator, &pi, obj) catch {};
                 } else {
@@ -685,16 +684,19 @@ pub fn parseInput(
     return pi;
 }
 
+/// Appends the item's plaintext reasoning as an assistant turn. An item this server cannot read
+/// (another provider's encrypted body, a malformed part) is dropped, as every reasoning item was
+/// before replay: false = nothing appended.
 fn appendReasoningInputItem(
     allocator: std.mem.Allocator,
     pi: *ParsedInput,
     obj: std.json.ObjectMap,
-) !void {
+) !bool {
     if (obj.get("encrypted_content")) |value| {
         if (value != .null) {
-            if (value != .string) return error.InvalidReasoningInput;
+            if (value != .string) return false;
             // A readable summary cannot recover the omitted encrypted body.
-            if (value.string.len > 0) return error.OpaqueReasoningUnsupported;
+            if (value.string.len > 0) return false;
         }
     }
     var text = std.ArrayList(u8).empty;
@@ -705,18 +707,18 @@ fn appendReasoningInputItem(
         (if (value == .null) null else value)
     else
         null;
-    const parts = content orelse obj.get("summary") orelse return error.InvalidReasoningInput;
-    if (parts != .array) return error.InvalidReasoningInput;
+    const parts = content orelse obj.get("summary") orelse return false;
+    if (parts != .array) return false;
     for (parts.array.items) |part| {
-        if (part != .object) return error.InvalidReasoningInput;
-        const kind = part.object.get("type") orelse return error.InvalidReasoningInput;
-        const value = part.object.get("text") orelse return error.InvalidReasoningInput;
-        if (kind != .string or value != .string) return error.InvalidReasoningInput;
+        if (part != .object) return false;
+        const kind = part.object.get("type") orelse return false;
+        const value = part.object.get("text") orelse return false;
+        if (kind != .string or value != .string) return false;
         const valid = if (content != null)
             std.mem.eql(u8, kind.string, "reasoning_text") or std.mem.eql(u8, kind.string, "text")
         else
             std.mem.eql(u8, kind.string, "summary_text");
-        if (!valid) return error.InvalidReasoningInput;
+        if (!valid) return false;
         try text.appendSlice(allocator, value.string);
     }
     const owned = try text.toOwnedSlice(allocator);
@@ -729,6 +731,7 @@ fn appendReasoningInputItem(
         .content = "",
         .reasoning_content = owned,
     });
+    return true;
 }
 
 // A Responses reasoning item and the following text/calls belong to one
@@ -2008,29 +2011,29 @@ test "reasoning replay: reasoning-only history stays before the next user" {
     try expectReasoningTemplateEquivalent(pi.messages.items, &expected, "unfinished thought");
 }
 
-test "reasoning replay: opaque and malformed reasoning fail explicitly" {
+test "reasoning replay: an opaque or malformed reasoning item is dropped, the rest of the history stays" {
     const a = testing.allocator;
     for ([_][]const u8{
-        \\[{"type":"reasoning","encrypted_content":"opaque","summary":[]}]
+        \\{"type":"reasoning","encrypted_content":"opaque","summary":[]}
         ,
-        \\[{"type":"reasoning","encrypted_content":"opaque","summary":[{"type":"summary_text","text":"only a summary"}]}]
+        \\{"type":"reasoning","encrypted_content":"opaque","summary":[{"type":"summary_text","text":"only a summary"}]}
         ,
-    }) |json| {
+        \\{"type":"reasoning","summary":"invalid"}
+        ,
+        \\{"type":"reasoning","content":[{"type":"unknown","text":"lost"}]}
+        ,
+        \\{"type":"reasoning","encrypted_content":17}
+        ,
+    }) |bad| {
+        const json = try std.fmt.allocPrint(a, "[{{\"role\":\"user\",\"content\":\"hi\"}},{s},{{\"role\":\"assistant\",\"content\":\"hello\"}}]", .{bad});
+        defer a.free(json);
         const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
         defer parsed.deinit();
-        try testing.expectError(error.OpaqueReasoningUnsupported, parseInput(a, parsed.value, null, null, null, null, .{}));
-    }
-    for ([_][]const u8{
-        \\[{"type":"reasoning","summary":"invalid"}]
-        ,
-        \\[{"type":"reasoning","content":[{"type":"unknown","text":"lost"}]}]
-        ,
-        \\[{"type":"reasoning","encrypted_content":17}]
-        ,
-    }) |json| {
-        const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
-        defer parsed.deinit();
-        try testing.expectError(error.InvalidReasoningInput, parseInput(a, parsed.value, null, null, null, null, .{}));
+        var pi = try parseInput(a, parsed.value, null, null, null, null, .{});
+        defer pi.deinit();
+        try testing.expectEqual(@as(usize, 2), pi.messages.items.len);
+        try testing.expectEqualStrings("hello", pi.messages.items[1].content);
+        try testing.expect(pi.messages.items[1].reasoning_content == null);
     }
 }
 

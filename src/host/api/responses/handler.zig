@@ -284,12 +284,7 @@ pub fn handleResponsesCompact(
     // No tool aliases are built: an echoed call keeps the name it was declared with.
     var pi = responses_mod.parseInput(allocator, input_val, instructions, prev_messages, null, appendImageUrlContent, .{}) catch |err| {
         log.warn("POST /v1/responses/compact -> 400 (input parse: {s})\n", .{@errorName(err)});
-        const message = switch (err) {
-            error.OpaqueReasoningUnsupported => "Opaque reasoning replay is unsupported; supply this provider's plaintext reasoning history",
-            error.InvalidReasoningInput => "Invalid plaintext reasoning history",
-            else => "Failed to parse input",
-        };
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", message, 400);
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Failed to parse input", 400);
         return;
     };
     defer pi.deinit();
@@ -579,12 +574,7 @@ fn handleResponsesInner(
     // ── parse input → messages ──
     var pi = responses_mod.parseInput(allocator, input_val, instructions, prev_messages, &namespace_aliases, appendImageUrlContent, visionPreprocFromConfig(config)) catch |err| {
         log.warn("POST /v1/responses -> 400 (input parse: {s})\n", .{@errorName(err)});
-        const message = switch (err) {
-            error.OpaqueReasoningUnsupported => "Opaque reasoning replay is unsupported; supply this provider's plaintext reasoning history",
-            error.InvalidReasoningInput => "Invalid plaintext reasoning history",
-            else => "Failed to parse input",
-        };
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", message, 400);
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Failed to parse input", 400);
         return;
     };
     defer pi.deinit();

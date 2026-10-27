@@ -87,15 +87,15 @@ for repetition in range(2):
         assert streamed == actual, (index, streamed, actual)
         print(f"PASS replay {index}, repeat {repetition}: {actual} prompt tokens, {without} without reasoning")
 
-for path in ("/v1/responses", "/v1/responses/compact"):
+for bad in (
+    {"type": "reasoning", "encrypted_content": "opaque", "summary": []},
+    {"type": "reasoning", "summary": "invalid"},
+):
     for stream in (False, True):
-        for bad, message in (
-            ({"type": "reasoning", "encrypted_content": "opaque", "summary": []}, "Opaque reasoning replay"),
-            ({"type": "reasoning", "summary": "invalid"}, "Invalid plaintext reasoning"),
-        ):
-            status, body = request(path, {"model": "local", "input": [user, bad], "stream": stream, "max_output_tokens": 8})
-            assert status == 400, (path, status, body)
-            assert message in body["error"]["message"], body
-            print(f"PASS named rejection: {path}, stream={stream}, {message}")
+        assert tokens("/v1/responses", [user, bad], stream=stream) == tokens("/v1/responses", [user]), (bad, stream)
+        print(f"PASS unreadable reasoning item dropped: stream={stream}, {bad['summary'] if bad['summary'] == 'invalid' else 'opaque'}")
+    status, body = request("/v1/responses/compact", {"model": "local", "input": [user, bad]})
+    assert status == 200, (status, body)
+    print("PASS unreadable reasoning item dropped: compact")
 PY
 echo "Server log: $WORK/server.log"
