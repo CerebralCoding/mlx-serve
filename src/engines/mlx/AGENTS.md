@@ -59,6 +59,7 @@ Prefix cache (RAM + SSD):
 - **A change to what stored K/V MEAN gets a fresh SSD root** (`ModelConfig.cacheLayoutNamespace` → `modelFingerprintWithLayout`; null keeps the old root): the fingerprint hashes only the dir, the config's stat and the overrides, so a fixed model would restore its buggy keys (Nemotron-H NoPE).
 - **A disk restore evals each chunk before loading the next** (a lazy `mlx_load_safetensors` holds its fd until eval: 256 files = ~250k tokens); restore entry points drop their own latch, or the cold fallback fails.
 - **SSD-first** (qwen4 + disk tier, or `--no-prefix-cache-ram` + disk): SSD-only retains no idle RAM KV; writes ride `engines/mlx/cache/ssd/writer.zig`; a checkout is a PROMISE until append donates (`donateCheckout`/`releaseCheckout`).
+- **An index into `DiskTier.entries` does not survive a call that can evict** (`refreshDiskBudget`, `gcToBudget`, `dropPoisonedEntries` swap-remove): carry the entry's id across it (`indexOfId`). A stale index freed another entry's arrays (SIGABRT) or served its rows.
 - **The batched pad-waste cap reads `KVCache.kvLenForBatching`**, never `cache.step`.
 - **An in-place SSD commit bills by MEASURE** (`nonChunkBytes` after − before, #573): the per-term delta in `appendSsmOnly` under-billed whole checkpoint lists in ReleaseFast builds and the tier outgrew its cap. Its guard is red only under `zig build test -Doptimize=ReleaseFast`.
 

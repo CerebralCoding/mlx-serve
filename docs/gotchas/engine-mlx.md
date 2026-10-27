@@ -1318,3 +1318,11 @@ Defect: under `-Dunits`, a 3D job's CPU stages neither yielded to chat nor sent 
 path saw no engine context. Cause: each unit compiled its own copy of `gen_yield`, `stream_keepalive` and
 `engine_ctx`; `unit_globals.py` read only data/bss sections. Fix: `SharedThreadLocal` (host storage, the current
 thread's slot per access); the guard reads `__thread_vars`. Guard: `zig build units-check -Dunits=true`.
+
+### An SSD-first commit freed another entry's arrays (SIGABRT, #947)
+Defect: a server with `--prefix-cache-disk` aborted ("pointer being freed was not allocated") in the prefill
+write-through and, another day, in `HotPrefixCache.deinit`. Cause: the commit picked its target entry by index, then
+`refreshDiskBudget` evicted by swap-remove when free space put the budget under the cap; the stale index freed live
+arrays or filed rows under another prompt. Fix: the target crosses the refresh by id (`indexOfId`); an evicted target is
+a fresh store. Guard: the two `across an SSD-first refresh that evicts` tests, each in both orders.
+
