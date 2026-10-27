@@ -24,6 +24,8 @@ predate the plugin table and plug in at seams below it; their sections close thi
 
 ## Outside plugins (dylibs)
 
+Step-by-step guides: [model](plugin-model.md), [media](plugin-media.md), [quant](plugin-quant.md).
+
 - **The kit.** `zig build kit` stages `zig-out/kit/mlx-serve-plugin-kit-<version>/` and its tarball: `build/kit/`,
   `src/kit.zig`'s import closure, mlx-c's headers, the MLX pin and the example plugins (`src/plugins/_example*`).
   `zig build test` builds every example from the staged kit, so the kit and the server cannot drift.

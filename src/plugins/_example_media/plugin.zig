@@ -47,6 +47,9 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         return null;
     };
     const s: c.mlx_stream = .{ .ctx = ctx.stream.ctx };
+    // MLX has no GPU kernel for a file load: read on a CPU stream, compute on `s`.
+    const cpu = c.mlx_default_cpu_stream_new();
+    defer _ = c.mlx_stream_free(cpu);
     var w = c.mlx_map_string_to_array_new();
     defer _ = c.mlx_map_string_to_array_free(w);
     var meta = c.mlx_map_string_to_string_new();
@@ -54,7 +57,7 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     var gain = c.mlx_array_new();
     defer _ = c.mlx_array_free(gain);
     var g: f32 = 0;
-    if (c.mlx_load_safetensors(&w, &meta, path, s) != 0 or c.mlx_map_string_to_array_get(&gain, w, "gain") != 0 or
+    if (c.mlx_load_safetensors(&w, &meta, path, cpu) != 0 or c.mlx_map_string_to_array_get(&gain, w, "gain") != 0 or
         c.mlx_array_eval(gain) != 0 or c.mlx_array_item_float32(&g, gain) != 0)
     {
         out.* = Verdict.refuse(.failed, "_example_media: the gain weight does not load");

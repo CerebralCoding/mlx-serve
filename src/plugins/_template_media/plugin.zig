@@ -46,12 +46,15 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         return null;
     };
     const s: mlx.mlx_stream = .{ .ctx = ctx.stream.ctx };
+    // MLX has no GPU kernel for a file load: read on a CPU stream, compute on `s`.
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
     var w = mlx.mlx_map_string_to_array_new();
     defer _ = mlx.mlx_map_string_to_array_free(w);
     var meta = mlx.mlx_map_string_to_string_new();
     defer _ = mlx.mlx_map_string_to_string_free(meta);
     var proj = mlx.mlx_array_new();
-    if (mlx.mlx_load_safetensors(&w, &meta, path, s) != 0 or mlx.mlx_map_string_to_array_get(&proj, w, "proj.weight") != 0 or mlx.mlx_array_eval(proj) != 0) {
+    if (mlx.mlx_load_safetensors(&w, &meta, path, cpu) != 0 or mlx.mlx_map_string_to_array_get(&proj, w, "proj.weight") != 0 or mlx.mlx_array_eval(proj) != 0) {
         _ = mlx.mlx_array_free(proj);
         out.* = Verdict.refuse(.failed, "_template_media: proj.weight does not load");
         return null;
