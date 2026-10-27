@@ -782,8 +782,20 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const enable_ssm_cps = params.ssm_checkpoint_stride > 0;
     const ram_prefix_cache = params.prefix_cache_ram_enabled;
     const disk_prefix_cache = params.prefix_cache_disk_bytes > 0;
+    const module_binding = prefix_cache_mod.ModuleBinding.init(xfm_ptr);
+    if (plugin_driver.auxBinding(xfm_ptr) != null and !plugin_driver.auxEnabled(xfm_ptr)) {
+        log.info("[hot-cache] module auxiliary retention is disabled for this loaded instance; using legacy resume\n", .{});
+    }
+    if (module_binding != null and disk_prefix_cache) {
+        log.info("[hot-cache] --prefix-cache-disk does not apply to module snapshots yet; using RAM retention when enabled\n", .{});
+    }
+    // Such a model keeps no conversation of its own any more: without a RAM prefix cache every turn prefills cold.
+    if (module_binding != null and (params.prefix_cache_capacity == 0 or !ram_prefix_cache)) {
+        log.warn("[hot-cache] no RAM prefix cache (--prefix-cache-entries 0 or --no-prefix-cache-ram): this model retains no conversation, every prompt prefills cold\n", .{});
+    }
     if (params.prefix_cache_capacity > 0 and (ram_prefix_cache or disk_prefix_cache) and
-        prefix_cache_mod.HotPrefixCache.shouldUse(params.config, enable_ssm_cps))
+        prefix_cache_mod.HotPrefixCache.shouldUseInstance(params.config, enable_ssm_cps, xfm_ptr) and
+        (module_binding == null or ram_prefix_cache))
     {
         // The weights are resident here, so the resolver's active-memory read
         // is honest; the raw launch budget never reaches initWithMem (a 40 GB
@@ -820,7 +832,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         // RAM cache is unaffected.
         const has_ssm_layers = params.config.hasSsmLayers();
         entry.prefix_cache.?.hybrid = has_ssm_layers;
-        const disk_ok = !has_ssm_layers or enable_ssm_cps;
+        const disk_ok = module_binding == null and (!has_ssm_layers or enable_ssm_cps);
         if (params.prefix_cache_disk_bytes > 0 and disk_ok) attach: {
             const fp = kv_disk_cache.modelFingerprintWithLayout(
                 sch.allocator,
