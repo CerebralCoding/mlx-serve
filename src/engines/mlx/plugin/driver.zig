@@ -466,6 +466,13 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
         log.err("[plugin] {s}: forward failed: {s}\n", .{ b.table.name.slice(), v.why.slice() });
         return error.PluginForwardFailed;
     }
+    if (base == 0 and ctx.lora.len != 0) {
+        var active: usize = 0;
+        for (ctx.lora) |binding| if (binding.scale != 0) {
+            active += 1;
+        };
+        log.debug("[lora] {s}: forward engaged (projections={d}, active={d})\n", .{ b.table.name.slice(), ctx.lora.len, active });
+    }
     // A `.kv_step` slot advances it too, as the legacy layered forward did: MiMo's MTP rollback truncates from it.
     ctx.moe_seq_offset.* += rows;
     if (module) ctx.cache.step += rows;

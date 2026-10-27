@@ -10,6 +10,14 @@ lever a story names that `src/env.zig` no longer lists was retired once its arm 
 
 `zecanard/gemma-4-E4B-it-ultra-uncensored-heretic-MLX-4bit-mixed_4_6` declares gs 32 model-wide but stores every language-model tensor and both media projections at gs 64. Warmup died with `Cannot reshape array of size 5376 into shape (1,1,42,256)`, every text turn 500'd and every image turn 500'd. Cause: the plugin loaded the per-layer embedding table with width hint 0, and the vision `quantLinear` took the config gs, so each fell back to the model-wide scheme (a 6-bit gs-64 table read as gs 32 gives half-width rows; the 4-bit projection read as 8-bit gs 32). Fix: the table is loaded at its real row width (`layers x ple_dim`) and `quantLinear` solves each weight from its input width (`quantParamsFromGeometry`), like the other towers. Guard: `quantLinear reads a projection at its own group size inside a model with another one`, `tests/test_gemma4_mixed_quant.sh`.
 
+### Adapter exports follow the model hierarchy
+
+Using a checkpoint's tensor prefix for adapter export produced keys mlx-lm could
+not attach to its model. Text-only Gemma 4 uses `model.layers`, while its wrappers
+and Qwen3.5 use `language_model.model.layers`; PEFT adds a separate import wrapper.
+Export selects the architecture's model hierarchy, and import normalizes supported
+aliases. Gemma 4/Qwen3.5 save-reload proofs and PEFT metadata tests guard both directions.
+
 ### Read `text_config` first, then the root, per field
 Defect: every unloaded multimodal model advertised `hidden_size: 0` and `is_moe: false` (a 128-expert Gemma read as
 dense, which gates MTP/drafter defaults). Cause: `discovery.parseStubMeta` read the root only. Fix: the nested block

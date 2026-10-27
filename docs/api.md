@@ -51,11 +51,13 @@ Stateful chains via `previous_response_id`, full streaming SSE with per-event `s
 
 `/api/chat`, `/api/generate`, `/api/tags`, `/api/show`, `/api/ps`, `/api/embed`, `/api/pull` speak the Ollama wire (NDJSON streaming, tool calls with object arguments, `thinking`, `format` JSON schemas, `name:latest` model names), so the whole Ollama client ecosystem works against mlx-serve unchanged — point Raycast, Obsidian, Enchanted, Open WebUI, `ollama-python`/`js` at `http://localhost:11234` where they had `http://localhost:11434`.
 
-## Other endpoints
+## Text adapters and fine-tuning
 
 Text generation endpoints accept `"lora":"<name>"` and optional `"lora_scale":1` (finite, 0–2; zero preserves the base output). This includes OpenAI, Anthropic and Ollama, streaming or non-streaming. Dense Llama, Qwen3, Gemma 4 and Qwen3.5/3.6/3.8 models on MLX with affine-quantized or floating-point weights are supported; unsupported architectures, quantization and endpoints return named 400s. Adapters target attention and MLP projections; Qwen recurrent projections and Gemma PLE remain frozen. Shared or absent projections are rejected when importing an adapter.
 
 Install `adapters.safetensors` and `adapter_config.json` under `~/.mlx-serve/adapters/<name>/`. mlx-lm `lora_a/lora_b` and PEFT `lora_A/B.weight` layouts are accepted. Binding requires `base_config_sha256` (SHA-256 of the base's exact `config.json` bytes), or a resolvable absolute local `model` / `base_model_name_or_path` whose config has that fingerprint. `/v1/models` lists compatible names in `adapters`; tensors are validated when requested. Adapters remain unfused, with separate prefix caches per adapter revision and strength.
+
+Active adapters use MLX operations that match the training forward, bypassing custom decode kernels; generation can be slower than the base. Requests with different adapter revisions or strengths decode serially (`lora_mixed`); matching adapters can batch. Scale zero restores the base computation but still validates and loads the selected adapter. With debug logging, `[lora] ... forward engaged` reports the bound and nonzero-scale projection counts.
 
 `POST /v1/finetune` takes `{"model":"<registered-id>","name":"<new-adapter-name>","prompts":["A question to teach"]}`; `topic` may replace or accompany `prompts`. `keep_everything_else` defaults to true; false excludes retain examples from training, while drift verification still runs. It returns 202 with an `ft-<id>` job. A supported dense family, Metal, and affine 4-bit or bf16 weights are required; MoE, unsupported bases and insufficient training memory return named 400s. Qwen's recurrent activation reservation includes the states retained for backpropagation. One job runs at a time (409 when busy or the name exists).
 
@@ -64,6 +66,10 @@ Install `adapters.safetensors` and `adapter_config.json` under `~/.mlx-serve/ada
 For a completed job, `PATCH /v1/finetune/ft-<id>/adapter` with `{"name":"<new-name>"}` renames its adapter without replacing an existing name. `DELETE` on that subroute discards the job's adapter and sets `adapter_discarded:true`. Both return the updated snapshot; unfinished jobs and conflicting names return 409. Repeated discard is harmless.
 
 The same loaded model synthesizes answers, trains an unfused adapter, and verifies it against withheld prompts and a retain set. Training and verification request brief answers within a 512-token window. Truncated, malformed or refusing training answers are discarded; insufficient usable data or incomplete verification fails the job. Completed jobs save to the adapter registry and report refusal counts, mean/max per-token KL(base‖adapted), and a before/after example. `result.verified` requires fewer held-out refusals, mean KL ≤0.1 and max KL ≤1 nat; it is a measured check, not a guarantee of general quality. A failed check is reported honestly even though the adapter is saved; use `lora_scale` to lower its strength.
+
+Fine-tuning changes only the adapter, leaving the base pack intact. The 4-bit/bf16 training requirement is narrower than inference support: an 8-bit affine base can serve a compatible imported adapter, but cannot be trained by this endpoint. Fingerprint validation still applies; an adapter trained against a different pack's config is not interchangeable automatically.
+
+## Other endpoints
 
 - `GET /` — built-in web console (MLX Serve Studio): chat, image/audio/video generation, Library, Monitoring, API reference
 - `GET /health` — health check

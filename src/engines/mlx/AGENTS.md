@@ -6,6 +6,7 @@ Scheduler, admission, caches, spec decode, kernels. Stories: `docs/gotchas/engin
 
 - Runtime LLM LoRA belongs to the request: carry bindings through every forward, key RAM/SSD prefixes by revision + strength, and serialize mixed-adapter groups (`lora_mixed`).
 - Fine-tuning discards truncated or malformed synthesized samples; held-out verification must finish before it can report improvement.
+- Active LoRA serving and training must use the same MLX operations, including frozen PLE/GDN paths (`Graph.native_ops`); guard exact logits before save and after reload.
 - Reserve cleanup queue capacity before admitting a slot; completion must never allocate or free MLX arrays on a connection thread.
 
 Loading + residency:

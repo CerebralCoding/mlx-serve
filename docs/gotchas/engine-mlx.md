@@ -1,5 +1,13 @@
 # Engine: KV cache, spec decode, kernels, MLX: gotchas
 
+## LoRA training and serving took different kernel paths
+
+Frozen PLE and recurrent projections still affect adapter logits and gradients.
+Serving them with custom kernels while training used MLX operations broke exact
+training/runtime agreement. Active adapters now set `Graph.native_ops` for the
+whole forward; `differentiable` separately controls gradient-safe execution.
+Gemma 4 and Qwen3.5 proof tests check all adapter gradients, serving logits and reloads.
+
 ## Fine-tuning completion boundaries
 
 A fixed generation budget can cut an answer or a UTF-8 character mid-stream.

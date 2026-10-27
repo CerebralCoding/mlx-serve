@@ -24,5 +24,6 @@ Known gaps vs legacy (none changes output): no `[dtype-trace]`/ladder diagnostic
 
 ## Rules moved from the root AGENTS.md
 
+- Llama LoRA training reuses the Decoder forward; `plugin/train_test.zig` guards 4-bit/bf16 learning and saved-adapter runtime logits.
 - A struct default is ONE family's: Gemma's 1024 sliding default hit every Llama 3.x (no `sliding_window` key) past
   1k tokens; `rope_type: llama3` is read. Guard: smoke `long prompt`.
