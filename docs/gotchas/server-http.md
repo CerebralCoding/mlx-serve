@@ -36,7 +36,7 @@ media serializes as content parts, the model's template renders one placeholder 
 is encoded in prompt order and cached by pixel hash (`EmbeddingCache`, never evicting what the current request used);
 the prefix cache keys each item (`MediaSpan`). History images are still decoded each turn to key the cache. Guard:
 `media renders one template placeholder per item`, `expandMediaPlaceholders` tests,
-`tests/test_multi_image_history.sh`.
+`parseInput keeps a function_call_output input_image` (Codex's `view_image`, #974), `tests/test_multi_image_history.sh`.
 
 ### A content array's text parts were last-wins (opencode plan mode, #195)
 Defect: in opencode plan mode the first message of every session was answered "What would you like to accomplish?".
