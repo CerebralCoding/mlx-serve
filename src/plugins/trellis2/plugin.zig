@@ -395,6 +395,7 @@ test "trellis2: request fields take their defaults and bounds, and a bad value n
 }
 
 test "trellis2: a job whose GPU stage latched a failure is refused by class, never a GLB of zeros" {
+    if (mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var pack = try MediaPack(@This()).open(arena.allocator());
@@ -410,6 +411,7 @@ test "trellis2: a job whose GPU stage latched a failure is refused by class, nev
 }
 
 test "trellis2: a job on the tiny pack is a GLB; other views, fields and resolutions are refused by name" {
+    if (mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var pack = try MediaPack(@This()).open(arena.allocator());

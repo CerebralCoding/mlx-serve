@@ -687,6 +687,31 @@ pub extern "c" fn mlx_set_error_handler(handler: mlx_error_handler_func, data: ?
 /// before with no measurable overhead.
 var no_gpu_backend_cache: ?bool = null;
 
+var virtual_gpu_cache: ?bool = null;
+/// A virtual Metal GPU (a macOS VM, GitHub's macOS runners) names no Apple GPU family (`architecture` "air64_v27",
+/// not "applegpu_gNN"). It caps threadgroups below 1024, has no MPP tensor ops and classes NaN its own way, so Metal
+/// proofs and kernel contracts prove nothing there.
+pub fn virtualGpu() bool {
+    if (virtual_gpu_cache == null) virtual_gpu_cache = (comptime builtin.os.tag.isDarwin()) and !noGpuBackend() and virtualArch(defaultArch() orelse "applegpu");
+    return virtual_gpu_cache.?;
+}
+
+fn virtualArch(arch: []const u8) bool {
+    return !std.mem.startsWith(u8, arch, "applegpu");
+}
+
+/// The default device's `architecture`, borrowed from MLX's device-info cache; null when MLX does not say.
+fn defaultArch() ?[]const u8 {
+    var dev = mlx_device{ .ctx = null };
+    if (mlx_get_default_device(&dev) != 0) return null;
+    var info = mlx_device_info_new();
+    defer _ = mlx_device_info_free(info);
+    if (mlx_device_info_get(&info, dev) != 0) return null;
+    var cstr: [*:0]const u8 = undefined;
+    if (mlx_device_info_get_string(&cstr, info, "architecture") != 0) return null;
+    return std.mem.span(cstr);
+}
+
 /// True when MLX has no Metal/GPU backend (e.g. the iOS Simulator slice built
 /// with MLX_BUILD_METAL=OFF). Callers use this to take CPU-only paths and skip
 /// GPU-only work (kernel-fusion JIT compilation). Always false on real hardware.
@@ -1668,4 +1693,10 @@ test "device info queries free the device handle they take" {
     for (0..4096) |_| _ = maxRecommendedWorkingSet();
     // Every admission bill reads it; a 16-byte handle per call is 64 KB here.
     try std.testing.expect(mstats().bytes_used -| before < 16 << 10);
+}
+
+test "virtualGpu: an architecture that names no Apple GPU family is a virtual GPU" {
+    try std.testing.expect(virtualArch("air64_v27"));
+    try std.testing.expect(!virtualArch("applegpu_g17d"));
+    try std.testing.expect(!virtualArch("applegpu_g13s"));
 }

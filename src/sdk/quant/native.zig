@@ -376,7 +376,7 @@ test "quant nvfp4: NVFP4, MXFP4, their overrides and ModelOpt's MXFP8 linears ma
 // Bar: a ModelOpt NVFP4 linear that loads dense carries `weight_scale_2` as MLX's global scale amax = s2 * 448 * 6,
 // bit-equal to MLX's own dequantization at that amax, and multiplies through the format as the direct path does.
 test "quant nvfp4: ModelOpt's weight_scale_2 reaches MLX as amax / (448 * 6)" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const a = testing.allocator;
     var prng = std.Random.DefaultPrng.init(4);

@@ -249,6 +249,7 @@ fn sameValues(g: *ops.Graph, x: Array, y: Array) !bool {
 /// all): each round's tokens, accepted drafts, next token and position equal the legacy shell's (the tape); at least
 /// `min_accepted` drafts accepted over the run.
 fn expectDspark(comptime P: type, files: []const sdk.fixture.File, sampling: SamplingParams, min_accepted: u64, tape: []const u8) !void {
+    if (mlx.virtualGpu()) return error.SkipZigTest;
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     const ds = env.override(.MLX_SERVE_DSV4_DSPARK, "1");

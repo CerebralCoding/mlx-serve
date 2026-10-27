@@ -115,7 +115,7 @@ fn shard() struct { k: usize, n: usize } {
 }
 
 test "sharded: kernel contract gates 1-4: every registered kernel passes, every planted control goes red" {
-    if (!builtin.os.tag.isDarwin() or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!builtin.os.tag.isDarwin() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const a = std.testing.allocator;
     var set = try build(a);
     defer set.deinit();

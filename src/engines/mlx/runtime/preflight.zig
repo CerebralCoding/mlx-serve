@@ -666,6 +666,8 @@ test "memInsufficientForLoad: headroom + unknown-query guards" {
 }
 
 test "availForLoad: only a load that would be refused makes media residency let go" {
+    // A box with no headroom refuses even a 1-byte load (GitHub's 7 GB runners): nothing "fits anywhere" there.
+    if (memInsufficientForLoad(1, loadAvail(testing.io))) return error.SkipZigTest;
     var held = @import("../../../plugins/minimax_h3/h3.zig").Resident.init(std.testing.allocator);
     held.bytes = 1000;
     @import("../../../plugins/minimax_h3/h3.zig").registerResident(&held);

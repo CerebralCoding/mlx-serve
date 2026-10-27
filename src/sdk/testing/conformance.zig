@@ -358,6 +358,8 @@ fn expectMedia(io: std.Io, a: Allocator, subject: Subject, t: *const media_abi.M
     if (t.bill_load(dir, &machine) == 0) return fail(name, "bills a load at zero bytes", .{});
     if (t.bill_request(dir, &machine, .of(fx.body)) != t.bill_request(dir, &machine, .of(fx.body))) return fail(name, "request bill is not deterministic", .{});
 
+    // A virtual GPU refuses the job's kernels (its threadgroup caps): the checks above are the proof there.
+    if (mlx.virtualGpu()) return;
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     var why: Verdict = .{};

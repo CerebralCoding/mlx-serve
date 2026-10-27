@@ -181,7 +181,7 @@ pub fn register(set: *kc.Set) !void {
 // ── tests ──
 
 test "kernel contract sparse_block: the declared qsa_score launch is the shipped wrapper's, byte for byte" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const a = std.testing.allocator;
     var k = Score.init(a);
     defer k.deinit();
