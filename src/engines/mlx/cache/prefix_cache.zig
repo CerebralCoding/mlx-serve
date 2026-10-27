@@ -1251,7 +1251,7 @@ pub const HotPrefixCache = struct {
         probe: ?*MatchProbe,
         adapter_key: [32]u8,
     ) ?struct { idx: usize, shared: usize } {
-        const m = self.findBestRestorableMatchWithModule(prompt_ids, has_tools, media, quant_config, require_ssm_checkpoint, probe, null) orelse return null;
+        const m = self.findBestRestorableMatchWithModule(prompt_ids, has_tools, media, quant_config, require_ssm_checkpoint, probe, adapter_key, null) orelse return null;
         return .{ .idx = m.idx, .shared = m.shared };
     }
 
@@ -1263,6 +1263,7 @@ pub const HotPrefixCache = struct {
         quant_config: kv_quant.KVQuantConfig,
         require_ssm_checkpoint: bool,
         probe: ?*MatchProbe,
+        adapter_key: [32]u8,
         module_request: ?ModuleRequest,
     ) ?struct { idx: usize, shared: usize } {
         var best_idx: ?usize = null;
@@ -1334,7 +1335,7 @@ pub const HotPrefixCache = struct {
         quant_config: kv_quant.KVQuantConfig,
     ) ?ModuleMatch {
         var best: ?ModuleMatch = null;
-        if (self.findBestRestorableMatchWithModule(prompt_ids, has_tools, media, quant_config, false, null, .{ .binding = binding, .media_rows = media_rows })) |m| {
+        if (self.findBestRestorableMatchWithModule(prompt_ids, has_tools, media, quant_config, false, null, @splat(0), .{ .binding = binding, .media_rows = media_rows })) |m| {
             const e = &self.entries.items[m.idx];
             best = .{ .entry_id = e.id, .n = m.shared, .prefix_key = e.module.?.prefix_key };
         }
@@ -11250,7 +11251,6 @@ test "HotPrefixCache module: loaded instance gate keeps distributed and streamed
     try testing.expect(HotPrefixCache.shouldUseInstance(&cfg, false, &xfm));
     cfg.dist_shard = null;
 }
-
 
 test "HotPrefixCache module: incoming workload pays for eviction before an older conversation" {
     var fake: ModuleFake = .{};
