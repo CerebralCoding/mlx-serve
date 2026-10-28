@@ -24,6 +24,7 @@ const Transformer = transformer_mod.Transformer;
 const plugin_driver = @import("plugin/driver.zig");
 const distributed = @import("cluster/distributed.zig");
 const plugin_head = @import("plugin/head.zig");
+const plugin_media = @import("plugin/media.zig");
 const DrafterModel = drafter_mod.DrafterModel;
 const dflash_mod = @import("spec/dflash/dflash.zig");
 const round_cost_mod = @import("spec/round_cost.zig");
@@ -244,6 +245,12 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     if (params.load_vision) if (xfm_ptr.plugin) |b| if (params.config.plugin.?.parsed.caps.images and params.config.plugin.?.outside) if (b.table.media) |hooks| {
         const v = try sch.allocator.create(VisionEncoder);
         v.* = VisionEncoder.initPlugin(sch.allocator, params.config.*, hooks, b.model);
+        vision_ptr = v;
+    };
+    // An in-tree plugin's towers run on the engine: decoded media in, its own prepare and tower.
+    if (params.load_vision and vision_ptr == null) if (pluginMedia(sch.allocator, params.config, xfm_ptr)) |pm| {
+        const v = try sch.allocator.create(VisionEncoder);
+        v.* = VisionEncoder.initPluginMedia(sch.allocator, params.config.*, pm);
         vision_ptr = v;
     };
     if (params.load_vision and vision_ptr == null) {
@@ -920,6 +927,15 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         if (ModelRegistry.chatCapable(entry)) sch.hot_prefix_cache = hc;
     }
     publishHotCacheResidency(sch);
+}
+
+/// The towers of a plugin that declares media hooks, over its loaded model.
+fn pluginMedia(a: std.mem.Allocator, config: *const model_mod.ModelConfig, xfm: *const Transformer) ?plugin_media.PluginMedia {
+    if (!config.plugin_media) return null;
+    const b = config.plugin orelse return null;
+    const hooks = b.table.media orelse return null;
+    const bound = xfm.plugin orelse return null;
+    return .{ .hooks = hooks, .model = bound.model, .parsed = &b.parsed, .a = a };
 }
 
 // ── tests ──

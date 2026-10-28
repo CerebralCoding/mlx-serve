@@ -97,6 +97,8 @@ fn loadSplit(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, config: *M
     errdefer w.deinit();
     try model.narrowHadamardPackTables(config, &w, mlx.gpuStream());
     const t = tower orelse return w;
+    // A plugin running its own towers reads their tensors through its load, beside the trunk's.
+    if (config.plugin_media) return w;
     var keys: std.ArrayList([]const u8) = .empty;
     defer keys.deinit(a);
     var it = w.map.keyIterator();
@@ -451,6 +453,7 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
         } else .{},
         .pipeline_every = ctx.pipeline_build,
         .mask_add = .{ .ctx = if (ctx.prefill_mask_add) |m| m.ctx else null },
+        .embeds = .{ .ctx = if (ctx.step_embeds) |e| e.ctx else null },
     };
     var out: abi.ForwardOut = .{ .captured = &captured };
     intree.enter(ctx);

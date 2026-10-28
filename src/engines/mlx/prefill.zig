@@ -499,6 +499,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             // transition shim sync-forwards [t1] on the first decode call.
             // PLD/drafter/MTP init paths already skip preforward unconditionally.
             .skip_lazy_preforward = !use_pld and !use_drafter and !use_mtp and !use_dflash,
+            .speech = slot.speech,
             .ssm_checkpoint_stride = cp_stride,
             .ssm_checkpoint_max = cp_max,
             .ssm_low_anchors = if (xfm_ptr.config.longCtxGated()) kv_disk_cache.SSM_DISK_LOW_ANCHORS else 0,
