@@ -233,6 +233,9 @@ test "abi dylib: auxiliary tables require the complete tail" {
         .describe = undefined,
         .prefix_key = undefined,
         .begin_prompt = undefined,
+        .import_plan = undefined,
+        .export_arrays = undefined,
+        .import_arrays = undefined,
         .reserve = undefined,
         .commit = undefined,
         .snapshot = undefined,
@@ -241,8 +244,6 @@ test "abi dylib: auxiliary tables require the complete tail" {
         .handoff = undefined,
         .free = undefined,
         .bytes = undefined,
-        .serialize = undefined,
-        .deserialize = undefined,
     };
     var cache: model_abi.CacheHooks = .{ .aux = &aux };
     const weights: model_abi.WeightHooks = .{};
@@ -255,6 +256,9 @@ test "abi dylib: auxiliary tables require the complete tail" {
         @offsetOf(model_abi.AuxHooks, "describe"),
         @offsetOf(model_abi.AuxHooks, "prefix_key"),
         @offsetOf(model_abi.AuxHooks, "begin_prompt"),
+        @offsetOf(model_abi.AuxHooks, "import_plan"),
+        @offsetOf(model_abi.AuxHooks, "export_arrays"),
+        @offsetOf(model_abi.AuxHooks, "import_arrays"),
         @sizeOf(model_abi.AuxHooks) - 1,
     }) |size| {
         aux.size = size;
