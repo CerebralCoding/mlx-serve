@@ -140,6 +140,7 @@ pub const Store = struct {
             .heldout_prompts = j.result.metrics.heldout,
             .refused_before = j.result.metrics.refused_before,
             .refused_after = j.result.metrics.refused_after,
+            .new_refusals = j.result.metrics.new_refusals,
             .mean_kl = j.result.metrics.meanKl(),
             .max_kl = j.result.metrics.kl_max,
             .retain_tokens = j.result.metrics.retain_tokens,
@@ -150,7 +151,7 @@ pub const Store = struct {
             .prompt = j.result.prompt,
             .before = j.result.before,
             .after = j.result.after,
-            .recommendation = if (j.result.metrics.improved()) "Measured improvement on held-out prompts after merging; review the examples before applying." else "Verification did not establish improvement within the drift limits after merging. Discard this result or review the answers before applying.",
+            .recommendation = if (j.result.metrics.new_refusals > 0) "The adapter introduced new refusals on held-out prompts. Discard this result or review the answers before applying." else if (j.result.metrics.improved()) "Measured improvement on held-out prompts after merging; review the examples before applying." else "Verification did not establish improvement within the drift limits after merging. Discard this result or review the answers before applying.",
         } else null;
         const elapsed: u64 = @intCast(@max(0, now(self.io) - j.stage_started_ms));
         const json = try std.json.Stringify.valueAlloc(a, .{
@@ -265,7 +266,7 @@ const Job = struct {
     }
 };
 
-test "finetune: cancelling is cooperative and a completed job remains readable" {
+test "LoRA fixtures: cancellation and verification results agree in status and events" {
     const a = std.testing.allocator;
     var store = try Store.init(a, std.testing.io, undefined, ".zig-cache");
     defer store.deinit();
@@ -288,6 +289,7 @@ test "finetune: cancelling is cooperative and a completed job remains readable" 
     var failure: ?[]const u8 = null;
     try std.testing.expectError(error.FineTuneBusy, store.start("{}", &bill, &failure));
     j.status = .completed;
+    j.result.metrics = .{ .heldout = 4, .refused_before = 2, .refused_after = 1, .new_refusals = 1, .retain_tokens = 10, .kl_sum = 0.1, .kl_max = 0.02 };
     j.cancelled.store(false, .release);
     try store.cancel(7);
     try std.testing.expect(!j.cancelled.load(.acquire));
@@ -302,6 +304,12 @@ test "finetune: cancelling is cooperative and a completed job remains readable" 
     const events = try capture(a, Run.run, .{ &store, "/v1/finetune/ft-7/events" });
     defer a.free(events);
     const body_start = (std.mem.indexOf(u8, status, "\r\n\r\n") orelse return error.NoHttpBody) + 4;
+    const completed = try std.json.parseFromSlice(std.json.Value, a, status[body_start..], .{});
+    defer completed.deinit();
+    const result = completed.value.object.get("result").?.object;
+    try std.testing.expect(!result.get("verified").?.bool);
+    try std.testing.expectEqual(@as(i64, 1), (result.get("new_refusals") orelse return error.MissingNewRefusals).integer);
+    try std.testing.expectEqualStrings("The adapter introduced new refusals on held-out prompts. Discard this result or review the answers before applying.", result.get("recommendation").?.string);
     try std.testing.expect(std.mem.indexOf(u8, events, "event: complete\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, events, status[body_start..]) != null);
 }

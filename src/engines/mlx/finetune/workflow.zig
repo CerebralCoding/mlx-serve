@@ -21,8 +21,8 @@ pub fn run(frozen: Frozen, teacher: anytype, input: types.Run, fingerprint: [32]
     defer data.deinitExamples(a, &train);
     var validation: std.ArrayList(Example) = .empty;
     defer data.deinitExamples(a, &validation);
-    var retain: std.ArrayList(Example) = .empty;
-    defer data.deinitExamples(a, &retain);
+    var retain_examples: std.ArrayList(Example) = .empty;
+    defer data.deinitExamples(a, &retain_examples);
 
     try collectPrompts(&prompts, teacher, input.request.*, observer, options);
     const heldout = prompts.items.items[0..options.holdout];
@@ -55,7 +55,7 @@ pub fn run(frozen: Frozen, teacher: anytype, input: types.Run, fingerprint: [32]
     const focus_count = train.items.len;
     var lines = std.mem.tokenizeScalar(u8, data.retain, '\n');
     retain_loop: while (lines.next()) |raw_prompt| {
-        if (retain.items.len >= options.retain) break;
+        if (retain_examples.items.len >= options.retain) break;
         for (prompts.items.items) |focus| if (std.ascii.eqlIgnoreCase(focus, raw_prompt)) continue :retain_loop;
         try boundary(observer);
         const prompt = try briefPrompt(a, raw_prompt);
@@ -69,10 +69,11 @@ pub fn run(frozen: Frozen, teacher: anytype, input: types.Run, fingerprint: [32]
         if (std.mem.trim(u8, answer, " \n\r\t").len == 0) return error.NoUsableRetainData;
         const example = try makeExample(a, teacher.lm.tokenizer.?, &.{.{ .role = "user", .content = prompt }}, teacher.lm.chat_config.?, answer, 512);
         errdefer example.deinit(a);
-        try retain.append(a, example);
-        observer.emit(.{ .stage = .synth, .step = options.prompts + @as(u32, @intCast(retain.items.len)), .total = options.prompts + options.retain });
+        try retain_examples.append(a, example);
+        observer.emit(.{ .stage = .synth, .step = options.prompts + @as(u32, @intCast(retain_examples.items.len)), .total = options.prompts + options.retain });
     }
-    if (retain.items.len < options.minimum_retain) return error.NoUsableRetainData;
+    if (retain_examples.items.len < options.minimum_retain) return error.NoUsableRetainData;
+    const retain = try data.splitRetain(retain_examples.items, input.request.keep_everything_else);
     const targets = try frozen.targets(a);
     defer a.free(targets);
     var adapter = try Adapter.init(a, frozen.s, targets, .{ .prefix = frozen.prefix });
@@ -89,7 +90,7 @@ pub fn run(frozen: Frozen, teacher: anytype, input: types.Run, fingerprint: [32]
             // Equal numbers of focus and self-distillation micro-batches anchor general behavior.
             for (0..4) |micro| {
                 try boundary(observer);
-                const pool = if (!input.request.keep_everything_else or micro % 2 == 0) train.items else retain.items;
+                const pool = if (retain.training.len == 0 or micro % 2 == 0) train.items else retain.training;
                 const example = pool[rng.random().uintLessThan(usize, pool.len)];
                 sum += (try trainer.microbatch(example)).loss;
             }
@@ -115,9 +116,9 @@ pub fn run(frozen: Frozen, teacher: anytype, input: types.Run, fingerprint: [32]
     try @import("../../../mlx/ffi.zig").check(@import("../../../mlx/ffi.zig").mlx_synchronize(frozen.s));
     input.result.training_examples = @intCast(focus_count);
     input.result.validation_examples = @intCast(validation.items.len);
-    input.result.retain_examples = @intCast(retain.items.len);
+    input.result.retain_examples = @intCast(retain.verification.len);
     input.result.updates = updates;
-    const total = options.holdout + @as(u32, @intCast(retain.items.len));
+    const total = options.holdout + @as(u32, @intCast(retain.verification.len));
     observer.emit(.{ .stage = .verify, .step = 0, .total = total });
     for (heldout, 0..) |raw_prompt, i| {
         try boundary(observer);
@@ -129,9 +130,7 @@ pub fn run(frozen: Frozen, teacher: anytype, input: types.Run, fingerprint: [32]
         const after = try adapted_teacher.generate(prompt, "", false, 192);
         defer a.free(after);
         if (!adapted_teacher.last_complete) return error.TrainingVerificationTruncated;
-        input.result.metrics.heldout += 1;
-        input.result.metrics.refused_before += @intFromBool(try teacher.refuses(prompt, before));
-        input.result.metrics.refused_after += @intFromBool(try teacher.refuses(prompt, after));
+        input.result.metrics.recordRefusal(try teacher.refuses(prompt, before), try teacher.refuses(prompt, after));
         if (i == 0) {
             input.result.prompt = try a.dupe(u8, raw_prompt);
             input.result.before = try a.dupe(u8, before);
@@ -139,7 +138,7 @@ pub fn run(frozen: Frozen, teacher: anytype, input: types.Run, fingerprint: [32]
         }
         observer.emit(.{ .stage = .verify, .step = @intCast(i + 1), .total = total, .preview = after });
     }
-    for (retain.items, 0..) |example, i| {
+    for (retain.verification, 0..) |example, i| {
         try retainKl(input.io, teacher.lm, merged.model(), example, observer, &input.result.metrics, a);
         observer.emit(.{ .stage = .verify, .step = options.holdout + @as(u32, @intCast(i + 1)), .total = total });
     }

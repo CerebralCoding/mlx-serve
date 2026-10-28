@@ -36,6 +36,36 @@ pub fn deinitExamples(a: std.mem.Allocator, examples: *std.ArrayList(Example)) v
 
 pub const retain = @embedFile("retain.txt");
 
+pub const RetainSplit = struct { training: []const Example, verification: []const Example };
+
+pub fn splitRetain(examples: []Example, train: bool) !RetainSplit {
+    if (examples.len < (if (train) @as(usize, 2) else 1)) return error.NoUsableRetainData;
+    if (!train) return .{ .training = &.{}, .verification = examples };
+    // Bundled prompts are grouped by topic; mix them before withholding half.
+    var rng = std.Random.DefaultPrng.init(73);
+    rng.random().shuffle(Example, examples);
+    const split = examples.len / 2;
+    return .{ .training = examples[0..split], .verification = examples[split..] };
+}
+
+test "LoRA fixtures: drift verification examples never enter the training pool" {
+    var examples: [64]Example = undefined;
+    for (&examples, 0..) |*e, i| e.* = .{ .inputs = &.{}, .targets = &.{}, .mask = &.{}, .completion_tokens = @intCast(i + 1) };
+    for (2..examples.len + 1) |n| {
+        const split = try splitRetain(examples[0..n], true);
+        try std.testing.expect(split.training.len > 0 and split.verification.len > 0);
+        try std.testing.expectEqual(n, split.training.len + split.verification.len);
+        for (split.training) |trained| for (split.verification) |heldout| {
+            try std.testing.expect(trained.completion_tokens != heldout.completion_tokens);
+        };
+        const verify_only = try splitRetain(examples[0..n], false);
+        try std.testing.expectEqual(@as(usize, 0), verify_only.training.len);
+        try std.testing.expectEqual(n, verify_only.verification.len);
+    }
+    try std.testing.expectError(error.NoUsableRetainData, splitRetain(&.{}, false));
+    try std.testing.expectError(error.NoUsableRetainData, splitRetain(examples[0..1], true));
+}
+
 test "finetune: paraphrases are unique before splitting and retain prompts stay separate" {
     var p: Prompts = .{ .a = std.testing.allocator };
     defer p.deinit();

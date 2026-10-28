@@ -820,9 +820,12 @@ pub const LlmAdapter = struct {
         const bindings = try a.alloc(@import("../../abi/plugin.zig").LoraBinding, file.entries.len);
         errdefer a.free(bindings);
         var bytes: u64 = 0;
-        for (file.entries, bindings) |entry, *binding| {
+        for (file.entries, bindings, 0..) |entry, *binding, i| {
             const target = parseLlmTarget(entry.module) orelse return error.InvalidLlmAdapter;
             if (mlx.getShape(entry.at)[1] != rank) return error.InvalidLlmAdapter;
+            for (bindings[0..i]) |previous| {
+                if (previous.layer == target.layer and previous.projection == target.projection) return error.InvalidLlmAdapter;
+            }
             binding.* = .{ .layer = target.layer, .projection = target.projection, .a = .{ .ctx = entry.at.ctx }, .b = .{ .ctx = entry.bt.ctx }, .scale = entry.scale };
             bytes += mlx.mlx_array_size(entry.at) * mlx.mlx_array_itemsize(entry.at) + mlx.mlx_array_size(entry.bt) * mlx.mlx_array_itemsize(entry.bt);
         }
@@ -1175,6 +1178,35 @@ test "finetune overlay: Flash adapter keys resolve only separate trunk attention
         try testing.expectEqual(.q, target.projection);
     }
     for ([_][]const u8{ "language_model.model.layers.0.linear_attn.in_proj_qkv", "language_model.model.layers.3.self_attn.qkv_proj", "language_model.model.layers.3.self_attn.indexer.index_qk_proj", "language_model.model.layers.3.mlp.shared_expert.up_proj", "language_model.model.layers.3.mlp.switch_mlp.gate_proj", "mtp.layers.0.self_attn.q_proj" }) |name| try testing.expect(parseLlmTarget(name) == null);
+}
+
+test "LoRA fixtures: aliases cannot apply two adapters to the same projection" {
+    const ops = @import("../../mlx/ops.zig");
+    const a = testing.allocator;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = ops.Graph.init(a, s);
+    defer g.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = path_buf[0..try tmp.dir.realPath(testing.io, &path_buf)];
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/adapters.safetensors", .{dir}, 0);
+    defer a.free(path);
+    const tensors = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(tensors);
+    const metadata = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(metadata);
+    inline for (.{ "model.layers.0.self_attn.q_proj", "language_model.model.layers.0.self_attn.q_proj" }) |stem| {
+        try mlx.check(mlx.mlx_map_string_to_array_insert(tensors, stem ++ ".lora_a", try g.ones(&.{ 4, 2 }, .float32)));
+        try mlx.check(mlx.mlx_map_string_to_array_insert(tensors, stem ++ ".lora_b", try g.zeros(&.{ 2, 4 }, .float32)));
+    }
+    try mlx.check(mlx.mlx_save_safetensors(path, tensors, metadata));
+    if (LlmAdapter.load(a, path, 0, 2)) |loaded| {
+        var adapter = loaded;
+        adapter.deinit();
+        return error.DuplicateAdapterAccepted;
+    } else |err| try testing.expectEqual(error.InvalidLlmAdapter, err);
 }
 
 test "LLM LoRA: malformed or unrecognized adapter tensors are refused" {

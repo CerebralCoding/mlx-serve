@@ -90,7 +90,6 @@ fn readRegular(a: std.mem.Allocator, io: std.Io, path: []const u8, limit: usize)
 pub fn apply(weights: *Weights, s: ops.Stream, bindings: []const abi.LoraBinding, prefix: []const u8) !void {
     for (bindings) |binding| {
         if (!std.math.isFinite(binding.scale)) return error.InvalidLlmAdapter;
-        if (binding.scale == 0) continue;
         var g = ops.Graph.init(weights.allocator, s);
         defer g.deinit();
         var name_buf: [256]u8 = undefined;
@@ -102,24 +101,32 @@ pub fn apply(weights: *Weights, s: ops.Stream, bindings: []const abi.LoraBinding
         const bias_name = try std.fmt.bufPrint(&bias_buf, "{s}.biases", .{stem});
         const w = weights.get(name) orelse return error.InvalidLlmAdapter;
         const scales = weights.get(scale_name);
+        const biases = weights.get(bias_name);
         const left: ops.Array = .{ .ctx = binding.a.ctx };
         const right: ops.Array = .{ .ctx = binding.b.ctx };
         const ls = ops.shape(left);
         const rs = ops.shape(right);
         const ws = ops.shape(w);
-        if (ls.len != 2 or rs.len != 2 or ws.len != 2 or ls[0] <= 0 or ls[1] <= 0 or ls[1] != rs[0] or ws[0] != rs[1]) return error.InvalidLlmAdapter;
+        if (ls.len != 2 or rs.len != 2 or ws.len != 2 or ls[0] <= 0 or ls[1] <= 0 or rs[1] <= 0 or ls[1] != rs[0] or ws[0] != rs[1]) return error.InvalidLlmAdapter;
+        const dtype = if (scales) |sc| ops.dtype(sc) else ops.dtype(w);
+        if (dtype != .float32 and dtype != .float16 and dtype != .bfloat16) return error.LoraUnsupportedQuantization;
+        if (scales) |sc| {
+            const bias = biases orelse return error.LoraUnsupportedQuantization;
+            const ss = ops.shape(sc);
+            if (ops.dtype(w) != .uint32 or ss.len != 2 or ss[0] != ws[0] or
+                !std.mem.eql(c_int, ss, ops.shape(bias)) or ops.dtype(bias) != dtype) return error.LoraUnsupportedQuantization;
+        } else if (biases != null) return error.LoraUnsupportedQuantization;
         const qp = if (scales) |sc| @import("../quant/params.zig").affineParamsFromGeometry(w, sc, @intCast(ls[0])) orelse return error.LoraUnsupportedQuantization else null;
         if (qp == null and ws[1] != ls[0]) return error.InvalidLlmAdapter;
+        if (binding.scale == 0) continue;
         const maximum = try g.call(mlx.mlx_max, .{ try g.abs(try g.astype(right, .float32)), false });
         try ops.eval(maximum);
         var magnitude: f32 = 0;
         try mlx.check(mlx.mlx_array_item_float32(&magnitude, maximum));
         if (magnitude == 0) continue;
         if (!std.math.isFinite(magnitude)) return error.InvalidLlmAdapter;
-        const dtype = if (scales) |sc| ops.dtype(sc) else ops.dtype(w);
-        if (dtype != .float32 and dtype != .float16 and dtype != .bfloat16) return error.LoraUnsupportedQuantization;
         const dense = if (qp) |p| try g.call(mlx.mlx_dequantize, .{
-            w,                                                 scales.?,                                                       weights.get(bias_name) orelse return error.LoraUnsupportedQuantization,
+            w,                                                 scales.?,                                                       biases.?,
             mlx.mlx_optional_int.some(@intCast(p.group_size)), mlx.mlx_optional_int.some(@intCast(p.bits)),                    "affine",
             ops.Array{},                                       mlx.mlx_optional_dtype{ .value = .float32, .has_value = true },
         }) else try g.astype(w, .float32);
@@ -150,6 +157,75 @@ pub fn projectionName(projection: abi.LoraProjection) []const u8 {
         .up => "mlp.up_proj",
         .down => "mlp.down_proj",
     };
+}
+
+test "LoRA fixtures: a disabled overlay still validates its target and matrix shapes" {
+    const a = std.testing.allocator;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = ops.Graph.init(a, s);
+    defer g.deinit();
+    var weights = Weights.init(a);
+    defer weights.deinit();
+    const key = "model.layers.0.self_attn.q_proj.weight";
+    try weights.put(key, g.escape(try g.ones(&.{ 4, 4 }, .float32)));
+    const original = weights.get(key).?;
+    const left = try g.ones(&.{ 4, 2 }, .float32);
+    const right = try g.ones(&.{ 2, 4 }, .float32);
+    var binding: abi.LoraBinding = .{ .layer = 1, .projection = .q, .a = .{ .ctx = left.ctx }, .b = .{ .ctx = right.ctx }, .scale = 0 };
+    try std.testing.expectError(error.InvalidLlmAdapter, apply(&weights, s, &.{binding}, "model"));
+    binding.layer = 0;
+    binding.b.ctx = (try g.zeros(&.{ 2, 3 }, .float32)).ctx;
+    try std.testing.expectError(error.InvalidLlmAdapter, apply(&weights, s, &.{binding}, "model"));
+    binding.b.ctx = right.ctx;
+    try apply(&weights, s, &.{binding}, "model");
+    try std.testing.expectEqual(original.ctx, weights.get(key).?.ctx);
+}
+
+test "LoRA fixtures: zero updates cannot conceal incomplete quantized weights" {
+    const a = std.testing.allocator;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = ops.Graph.init(a, s);
+    defer g.deinit();
+    var weights = Weights.init(a);
+    defer weights.deinit();
+    const base = try quantize(&g, try g.ones(&.{ 4, 128 }, .bfloat16), 8, 64);
+    try weights.put("model.layers.0.self_attn.q_proj.weight", g.escape(base[0]));
+    try weights.put("model.layers.0.self_attn.q_proj.scales", g.escape(base[1]));
+    const left = try g.ones(&.{ 128, 2 }, .float32);
+    const right = try g.zeros(&.{ 2, 4 }, .float32);
+    var binding: abi.LoraBinding = .{ .layer = 0, .projection = .q, .a = .{ .ctx = left.ctx }, .b = .{ .ctx = right.ctx }, .scale = 0 };
+    try std.testing.expectError(error.LoraUnsupportedQuantization, apply(&weights, s, &.{binding}, "model"));
+    binding.scale = 1;
+    try std.testing.expectError(error.LoraUnsupportedQuantization, apply(&weights, s, &.{binding}, "model"));
+}
+
+test "LoRA fixtures: zero updates validate quantized metadata shapes and dtypes" {
+    const a = std.testing.allocator;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = ops.Graph.init(a, s);
+    defer g.deinit();
+    const keys = [_][]const u8{ "model.layers.0.self_attn.q_proj.weight", "model.layers.0.self_attn.q_proj.scales", "model.layers.0.self_attn.q_proj.biases" };
+    const base = try quantize(&g, try g.ones(&.{ 4, 128 }, .bfloat16), 8, 64);
+    const left = try g.ones(&.{ 128, 2 }, .float32);
+    const right = try g.zeros(&.{ 2, 4 }, .float32);
+    const binding: abi.LoraBinding = .{ .layer = 0, .projection = .q, .a = .{ .ctx = left.ctx }, .b = .{ .ctx = right.ctx }, .scale = 1 };
+    const replacements = [_]struct { index: usize, value: ops.Array }{
+        .{ .index = 0, .value = try g.astype(base[0], .float32) },
+        .{ .index = 1, .value = try g.ones(&.{ 1, 2 }, .bfloat16) },
+        .{ .index = 1, .value = try g.ones(&.{ 4, 2, 1 }, .bfloat16) },
+        .{ .index = 1, .value = try g.astype(base[1], .uint32) },
+        .{ .index = 2, .value = try g.ones(&.{ 1, 2 }, .bfloat16) },
+        .{ .index = 2, .value = try g.astype(base[2], .float32) },
+    };
+    for (replacements) |replacement| {
+        var weights = Weights.init(a);
+        defer weights.deinit();
+        for (keys, base, 0..) |key, x, i| try weights.put(key, g.escape(if (i == replacement.index) replacement.value else x));
+        try std.testing.expectError(error.LoraUnsupportedQuantization, apply(&weights, s, &.{binding}, "model"));
+    }
 }
 
 test "finetune overlay: merge preserves dense layout, unrelated weights and a zero adapter" {
