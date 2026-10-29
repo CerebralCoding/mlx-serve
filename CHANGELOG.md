@@ -2,6 +2,7 @@
 
 ## v26.11.1 — Outside Plugins
 
+- **TensorFold Flash-Next packs.** The embedded PLE loader accepts affine `shard_N` tensor names alongside `shards.N`, without repacking or downloading additional weights.
 - **Model plugins you can build and install.** `mlx-serve plugin new` starts a model or media plugin from the plugin kit, `plugin check` tests it, and `plugin install` adds it after showing its signature; Settings lists installed plugins with a switch each.
 - **Outside plugins can draft and see.** A plugin can run its own speculative drafter (greedy or sampled requests), serve images through its own vision tower, and read the model's `ctx_size` to size its memory.
 - **DiffusionGemma is no longer supported.**
