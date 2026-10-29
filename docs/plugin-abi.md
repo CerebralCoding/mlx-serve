@@ -496,6 +496,39 @@ Valid during `load` only: the model keeps none of its pointers.
 | `all_rows` | |  |
 | `none` | |  |
 
+### `LoraProjection` (enum(u32))
+
+| Member | Value | |
+|---|---|---|
+| `q` | |  |
+| `k` | |  |
+| `v` | |  |
+| `o` | |  |
+| `gate` | |  |
+| `up` | |  |
+| `down` | |  |
+
+### `LoraTarget` (extern struct)
+
+| Field | Type | Default | |
+|---|---|---|---|
+| `layer` | `u32` |  |  |
+| `projection` | `LoraProjection` |  |  |
+| `input` | `u32` |  |  |
+| `output` | `u32` |  |  |
+
+### `LoraBinding` (extern struct)
+
+Borrowed matrices in mlx-lm's [in, rank], [rank, out] orientation, scoped to one forward.
+
+| Field | Type | Default | |
+|---|---|---|---|
+| `layer` | `u32` |  |  |
+| `projection` | `LoraProjection` |  |  |
+| `a` | `Array` |  |  |
+| `b` | `Array` |  |  |
+| `scale` | `f32` |  |  |
+
 ### `Forward` (extern struct)
 
 One forward. `tokens` holds `rows` tokens per slot, slot after slot; `slots`, `positions` and `caches` hold one entry per slot (its id, its first position, its KV cache).
@@ -951,6 +984,7 @@ A model plugin's table, exported as `exportName(name, version)`. `claims` and `p
 | `weights` | `*const WeightHooks` |  |  |
 | `meters` | `?*const fn (m: *anyopaque, slot: u32, out: *Str) callconv(.c) void` | `null` | `slot`'s arm counters for its request's summary lines (each a full log line), in memory the plugin owns until the next call on `m`; the counters reset. |
 | `speech` | `?*const SpeechHooks` | `null` |  |
+| `native_train` | `?*const fn (m: *anyopaque, out: *anyopaque) callconv(.c) Verdict` | `null` | In-tree SDK training only: fills a borrowed `sdk/train/model.Frozen`. Outside plugins decline. |
 
 ### `declaresMode(caps: Caps, mode: Mode) bool`
 
