@@ -1,20 +1,24 @@
-// Inkling 2, 2 to 16 rows on the NAX tensor unit: relsplit.metal's split-K relative attention as one 16-row pass, for up to
-// four slots' blocks a launch (a verify of several slots).
-// grid (splits * 32 * G, HKV, 4), threadgroup (32 * G, 1, 1): a threadgroup's G = HQ / HKV SIMD groups walk the same
+// Inkling 2, 2 to 16 rows on the NAX tensor unit: relsplit.metal's split-K relative attention as one 16-row pass.
+// BITS == 0: dense KV caches, up to 4 lanes a launch (k0..k3, v0..v3; q0..q3 unread).
+// BITS == 4 or 8: affine-quantized KV caches (group GS = 32/64/128, scales/biases ST), up to 2 lanes a launch
+//   (k0..k1 = kq, k2..k3 = ks, v0..v1 = vq, v2..v3 = kb, q0..q1 = vs, q2..q3 = vb; 30 buffers <= 31), dequantizing
+//   BK-row tiles in threadgroup memory while own verify keys (kb, vb) stay dense.
+// grid (splits * 32 * G, HKV, here), threadgroup (32 * G, 1, 1): a threadgroup's G = HQ / HKV SIMD groups walk the same
 // K/V tiles of one KV head of lane z, the lane's rows L of the stacked projections.
-// q [1, LI, HQ, D] (T), k0..k3 [1, HKV, SC, D] (T, a lane's cache, V laid out as K), kb, vb [1, HKV, LI, D] (T, the lanes'
-// own keys and values stacked, unread when SC == S), rel [1, LI, HQ, R] (T, unscaled bias), sinks [1, LI, HQ] (T),
-// GATE [LI * HQ * D] f32 (sigmoid), LI the rows of every lane of the call, and sizes = { per lane: L (0 = no lane), S,
-// first, SC, offset, row_in (its first row of those), row_out (its first row of this launch's), 0; then kps,
-// log_n_floor, LT (this launch's rows) }, params = { scale, log_alpha },
+// q [1, LI, HQ, D] (T), kb, vb [1, HKV, LI, D] (T, unread when SC == S), rel [1, LI, HQ, R] (T, unscaled bias),
+// sinks [1, LI, HQ] (T), GATE [LI * HQ * D] f32 (sigmoid), sizes = { per lane (4): L (0 = no lane), S, first, SC,
+// offset, row_in, row_out, 0; then kps, log_n_floor, LT }, params = { scale, log_alpha }.
 // DIRECT == 0: PART [splits, LT, HQ, D] f32, ML [splits, LT, HQ, 2] f32: a split past a lane's keys joins at weight 0.
 // DIRECT == 1 (splits == 1): OUT [1, LT, HQ * D] (T), normalised and gated in place.
 using ext = metal::dextents<int32_t, 2>;
 using strides = metal::array<int32_t, 2>;
 using dtensor = metal::tensor<device T, ext, metal::tensor_inline>;
+using ttensor = metal::tensor<threadgroup T, ext, metal::tensor_inline>;
 constexpr int BK = 32;
 constexpr float LOG2E = 1.4426950408889634f;
 constexpr int G = HQ / HKV;
+constexpr int W8 = D / 8;
+constexpr int NT = 32 * G;
 const int zl = int(threadgroup_position_in_grid.z);
 const int L = sizes[zl * 8];
 if (L == 0) return;
@@ -27,12 +31,9 @@ const int row_out = sizes[zl * 8 + 6];
 const int kps = sizes[32];
 const int log_n_floor = sizes[33];
 const int LT = sizes[34];
-const device T* kp[4] = {k0, k1, k2, k3};
-const device T* vp[4] = {v0, v1, v2, v3};
-const int64_t k_head[4] = {k0_strides[1], k1_strides[1], k2_strides[1], k3_strides[1]};
-const int64_t k_row[4] = {k0_strides[2], k1_strides[2], k2_strides[2], k3_strides[2]};
 const int split = int(threadgroup_position_in_grid.x);
 const int kvh = int(threadgroup_position_in_grid.y);
+const int tid = int(thread_position_in_threadgroup.x);
 const uint sg = simdgroup_index_in_threadgroup;
 const uint lane = thread_index_in_simdgroup;
 const int head = kvh * G + int(sg);
@@ -94,20 +95,107 @@ const device T* biasb = rel + (size_t(row_in + (okb ? rb : 0)) * HQ + head) * R;
 const int kbeg = first + split * kps;
 const int kend = metal::min(S, kbeg + kps);
 
+// Separate K/V staging tiles (16 KB at D=128 when BITS > 0; eliminated when BITS == 0) keep barriers at 2 per tile.
+threadgroup vec<T, 8> Ks_v[BITS > 0 ? BK * W8 : 1];
+threadgroup vec<T, 8> Vs_v[BITS > 0 ? BK * W8 : 1];
+
+#define MSV_DEQUANT_KV(DST, QH, SH, BH) \
+    for (int e = tid; e < BK * W8; e += NT) { \
+        const int r = e / W8; \
+        const int c8 = e % W8; \
+        const int row_idx = ki + r; \
+        vec<T, 8> out = vec<T, 8>(T(0)); \
+        if (row_idx < c_end) { \
+            const int g = (c8 * 8) / GS; \
+            const float sc_v = float((SH)[size_t(row_idx) * sstep + g]); \
+            const float bi_v = float((BH)[size_t(row_idx) * sstep + g]); \
+            if constexpr (BITS == 8) { \
+                const size_t base = size_t(row_idx) * qstep + c8 * 2; \
+                const uchar4 b0 = as_type<uchar4>((QH)[base]); \
+                const uchar4 b1 = as_type<uchar4>((QH)[base + 1]); \
+                out[0] = T(fma(float(b0.x), sc_v, bi_v)); \
+                out[1] = T(fma(float(b0.y), sc_v, bi_v)); \
+                out[2] = T(fma(float(b0.z), sc_v, bi_v)); \
+                out[3] = T(fma(float(b0.w), sc_v, bi_v)); \
+                out[4] = T(fma(float(b1.x), sc_v, bi_v)); \
+                out[5] = T(fma(float(b1.y), sc_v, bi_v)); \
+                out[6] = T(fma(float(b1.z), sc_v, bi_v)); \
+                out[7] = T(fma(float(b1.w), sc_v, bi_v)); \
+            } else { \
+                const uint w = (QH)[size_t(row_idx) * qstep + c8]; \
+                out[0] = T(fma(float((w      ) & 0xFu), sc_v, bi_v)); \
+                out[1] = T(fma(float((w >>  4) & 0xFu), sc_v, bi_v)); \
+                out[2] = T(fma(float((w >>  8) & 0xFu), sc_v, bi_v)); \
+                out[3] = T(fma(float((w >> 12) & 0xFu), sc_v, bi_v)); \
+                out[4] = T(fma(float((w >> 16) & 0xFu), sc_v, bi_v)); \
+                out[5] = T(fma(float((w >> 20) & 0xFu), sc_v, bi_v)); \
+                out[6] = T(fma(float((w >> 24) & 0xFu), sc_v, bi_v)); \
+                out[7] = T(fma(float((w >> 28) & 0xFu), sc_v, bi_v)); \
+            } \
+        } \
+        (DST)[e] = out; \
+    }
+
 // 1. Cached keys [kbeg, min(kend, SC))
 const int c_end = metal::min(kend, SC);
 if (kbeg < c_end) {
-    dtensor tK((device T*)kp[zl] + kvh * k_head[zl], ext(D, SC), strides{1, int(k_row[zl])});
-    dtensor tV((device T*)vp[zl] + kvh * k_head[zl], ext(D, SC), strides{1, int(k_row[zl])});
-    for (int k0 = kbeg; k0 < c_end; k0 += BK) {
-        const bool full = (k0 + BK <= c_end);
+    const device T* k_base = nullptr;
+    const device T* v_base = nullptr;
+    int k_row_s = 0;
+    const device uint* kqh = nullptr;
+    const device uint* vqh = nullptr;
+    const device ST* ksh = nullptr;
+    const device ST* kbh = nullptr;
+    const device ST* vsh = nullptr;
+    const device ST* vbh = nullptr;
+    int64_t qstep = 0, sstep = 0;
+    if constexpr (BITS == 0) {
+        const device T* kp[4] = {(const device T*)k0, (const device T*)k1, (const device T*)k2, (const device T*)k3};
+        const device T* vp[4] = {(const device T*)v0, (const device T*)v1, (const device T*)v2, (const device T*)v3};
+        const int64_t k_head[4] = {k0_strides[1], k1_strides[1], k2_strides[1], k3_strides[1]};
+        const int64_t k_row[4] = {k0_strides[2], k1_strides[2], k2_strides[2], k3_strides[2]};
+        k_base = kp[zl] + kvh * k_head[zl];
+        v_base = vp[zl] + kvh * k_head[zl];
+        k_row_s = int(k_row[zl]);
+    } else {
+        const device uint* kqp[2] = {(const device uint*)k0, (const device uint*)k1};
+        const device ST* ksp[2] = {(const device ST*)k2, (const device ST*)k3};
+        const device ST* kbp[2] = {(const device ST*)v2, (const device ST*)v3};
+        const device uint* vqp[2] = {(const device uint*)v0, (const device uint*)v1};
+        const device ST* vsp[2] = {(const device ST*)q0, (const device ST*)q1};
+        const device ST* vbp[2] = {(const device ST*)q2, (const device ST*)q3};
+        const int64_t kq_head[2] = {k0_strides[1], k1_strides[1]};
+        const int64_t kq_row[2] = {k0_strides[2], k1_strides[2]};
+        const int64_t ks_head[2] = {k2_strides[1], k3_strides[1]};
+        const int64_t ks_row[2] = {k2_strides[2], k3_strides[2]};
+        kqh = kqp[zl] + size_t(kvh) * kq_head[zl];
+        ksh = ksp[zl] + size_t(kvh) * ks_head[zl];
+        kbh = kbp[zl] + size_t(kvh) * ks_head[zl];
+        vqh = vqp[zl] + size_t(kvh) * kq_head[zl];
+        vsh = vsp[zl] + size_t(kvh) * ks_head[zl];
+        vbh = vbp[zl] + size_t(kvh) * ks_head[zl];
+        qstep = kq_row[zl];
+        sstep = ks_row[zl];
+    }
+
+    for (int ki = kbeg; ki < c_end; ki += BK) {
+        const bool full = (ki + BK <= c_end);
         auto Sc = qk.template get_destination_cooperative_tensor<qct_t, kslice_t, float>();
 #pragma clang loop unroll(full)
         for (uint16_t i = 0; i < Sc.get_capacity(); i++) Sc[i] = 0;
-        if (full) { auto ks = tK.template slice<D, BK>(0, k0); qk.run(Qc, ks, Sc); }
-        else { auto ks = tK.slice(0, k0); qk.run(Qc, ks, Sc); }
+        if constexpr (BITS == 0) {
+            dtensor tK((device T*)k_base, ext(D, SC), strides{1, k_row_s});
+            if (full) { auto ks = tK.template slice<D, BK>(0, ki); qk.run(Qc, ks, Sc); }
+            else { auto ks = tK.slice(0, ki); qk.run(Qc, ks, Sc); }
+        } else {
+            MSV_DEQUANT_KV(Ks_v, kqh, ksh, kbh);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            ttensor tKs((threadgroup T*)Ks_v, ext(D, BK));
+            auto ks = tKs.template slice<D, BK>(0, 0);
+            qk.run(Qc, ks, Sc);
+        }
 
-        const bool plain = WINDOW == 0 && full && (k0 + BK - 1 <= (S - L) - R);
+        const bool plain = WINDOW == 0 && full && (ki + BK - 1 <= (S - L) - R);
         float mx_[2] = {m[0], m[1]}, f[2], sum[2] = {0.0f, 0.0f};
 #pragma clang loop unroll(full)
         for (int i = 0; i < BK / 2; i++) {
@@ -117,7 +205,7 @@ if (kbeg < c_end) {
             if (plain) {
                 if (okr) e = Sc[i] * sc * tau[h];
             } else {
-                const int col = k0 + (i / 8) * 16 + fn + i % 4;
+                const int col = ki + (i / 8) * 16 + fn + i % 4;
                 const int dist = (h ? dgb : dga) - col;
                 const bool ok = okr && col < c_end && dist >= 0 && (WINDOW == 0 || dist < WINDOW);
                 if (ok) {
@@ -151,10 +239,20 @@ if (kbeg < c_end) {
 #pragma clang loop unroll(full)
         for (int i = 0; i < D / 2; i++) Oc[i] *= f[(i / 4) % 2];
         auto Pc = pv.template get_left_input_cooperative_tensor<T, T, float>(Ph);
-        if (full) { auto vs = tV.template slice<D, BK>(0, k0); pv.run(Pc, vs, Oc); }
-        else { auto vs = tV.slice(0, k0); pv.run(Pc, vs, Oc); }
+        if constexpr (BITS == 0) {
+            dtensor tV((device T*)v_base, ext(D, SC), strides{1, k_row_s});
+            if (full) { auto vs = tV.template slice<D, BK>(0, ki); pv.run(Pc, vs, Oc); }
+            else { auto vs = tV.slice(0, ki); pv.run(Pc, vs, Oc); }
+        } else {
+            MSV_DEQUANT_KV(Vs_v, vqh, vsh, vbh);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            ttensor tVs((threadgroup T*)Vs_v, ext(D, BK));
+            auto vs = tVs.template slice<D, BK>(0, 0);
+            pv.run(Pc, vs, Oc);
+        }
     }
 }
+#undef MSV_DEQUANT_KV
 
 // 2. Own verify keys [max(kbeg, SC), kend) (at most 16 keys: one NAX tile)
 const int o_beg = metal::max(kbeg, SC);
@@ -162,8 +260,8 @@ if (o_beg < kend) {
     const int n_own = S - SC;
     dtensor tKb((device T*)kb + kvh * kb_strides[1] + size_t(row_in) * kb_strides[2], ext(D, n_own), strides{1, int(kb_strides[2])});
     dtensor tVb((device T*)vb + kvh * kb_strides[1] + size_t(row_in) * kb_strides[2], ext(D, n_own), strides{1, int(kb_strides[2])});
-    for (int k0 = o_beg; k0 < kend; k0 += BK) {
-        const int off = k0 - SC;
+    for (int ki = o_beg; ki < kend; ki += BK) {
+        const int off = ki - SC;
         auto Sc = qk.template get_destination_cooperative_tensor<qct_t, kslice_t, float>();
 #pragma clang loop unroll(full)
         for (uint16_t i = 0; i < Sc.get_capacity(); i++) Sc[i] = 0;
@@ -173,7 +271,7 @@ if (o_beg < kend) {
 #pragma clang loop unroll(full)
         for (int i = 0; i < BK / 2; i++) {
             const int h = (i / 4) % 2;
-            const int col = k0 + (i / 8) * 16 + fn + i % 4;
+            const int col = ki + (i / 8) * 16 + fn + i % 4;
             int dist;
             bool anc = true;
             if constexpr (TREE) {

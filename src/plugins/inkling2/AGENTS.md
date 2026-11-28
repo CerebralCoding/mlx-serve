@@ -56,9 +56,10 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
 - **Non-NAX wide-tile sorted MoE prefill (`moeWide`, `tile_scan.metal` + `moe_wide.metal`)**: serves non-NAX Apple9+
   from `moe_wide_min_rows` (1536, covering 2048/4096 chunks) with fused soft-capped SwiGLU and direct `rmap` reads;
   below 1536 per-expert tiles underfill and stock sorted `gather_qmm` is faster.
-- **2 to 16 rows read the keys on the NAX tensor unit in one pass** (`relsplit_nax.metal`, `splitReadNax`; up to four
-  slots' blocks a launch, `splitReadNaxLanes`: a kernel takes 31 buffers). `relsplit.metal` serves a GPU without NAX, its
-  splits joined in `relcomb` (normalised after the sum: contract gate 4). Under 4 KB of keys MLX binds them `constant`: old path.
+- **2 to 16 rows read the keys on the NAX tensor unit in one pass** (`relsplit_nax.metal`, `splitReadNax`; up to 4
+  dense lanes a launch, or 2 affine-quantized 4/8-bit g32/64/128 lanes in place via `BITS > 0`, 30 buffers <= 31).
+  `relsplit.metal` serves a GPU without NAX, its splits joined in `relcomb` (normalised after the sum: contract gate 4).
+  Under 4 KB of keys MLX binds them `constant`: old path.
 - **A threadgroup past 256 threads is proven per instantiation** (`unproven`): an M1/M2 compiles `pre` and `mid` for
   384 to 576 threads, under the 768 an M3+ runs. The first dispatch is evaluated and a refusal narrows
   `stream_threads` for the process; every other kernel's group is at most 256.
@@ -172,10 +173,10 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
   splice, a verified block's commit, batched slots against each slot alone (CPU) or reordered and re-neighboured
   (GPU), and each kernel against its chain.
 - `contract.zig`: `gated`, `state`, `relmask`, `act`, `sum`, `topk`, `gate` (its one-row arm), `relsplit`, `relattn_nax`,
-  `relcomb`, `relslots`, `markov_rnn`, `markov_fold`, `markov_pick`, `markov_fold_batch`, `markov_pick_batch`,
-  `markov_pick_sample`, `oproj`, `router`, `norm`, `dflash_attn`.
+  `relsplit_nax`, `relcomb`, `relslots`, `markov_rnn`, `markov_fold`, `markov_pick`, `markov_fold_batch`,
+  `markov_pick_batch`, `markov_pick_sample`, `oproj`, `router`, `norm`, `dflash_attn`.
 - Contract entries owed (GPU proofs in `proof_test.zig` cover each): `pre`, `prep`, `mid`, `ups`, `downs`, `relattn`,
   `gate`'s prompt arm, `group`, `ups_grp`, `downs_grp`, `few_tail`, `topk_group`, `tile_scan`, `moe_wide`,
-  `markov_fold_q8`, `markov_pick_rnn`, `relsplit_nax`, `relsplit_lanes`,
+  `markov_fold_q8`, `markov_pick_rnn`, `relsplit_lanes`,
   `accept_tree`, `sample_tree_draw`/`_mass`/`_search`, `dflash_conv`/`_edges`/`_top16_shard`/`_top16_merge`/`_tree`.
 - Not verified: an image against mlx-lm's tower, the drafter's tokens against oMLX's.

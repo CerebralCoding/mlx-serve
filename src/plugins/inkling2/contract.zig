@@ -17,6 +17,7 @@ const dflash2 = @import("dflash2.zig");
 const vision_contract = @import("vision_contract.zig");
 const layers = @import("layers.zig");
 const config = @import("config.zig");
+const abi = @import("../../abi/plugin.zig");
 const attn = @import("../../sdk/blocks/attention/contract.zig");
 
 const spec = kc.spec;
@@ -1796,6 +1797,362 @@ const RelNax = struct {
         const x = self.args;
         const out = [_]mlx.mlx_array{try kernels.naxRead(&g, x[0], x[1], x[2], x[3], x[4], x[5], @intCast(self.window))};
         return self.rig.bytesOf(&out);
+    }
+};
+
+const relsplit_nax_launch = metal.Launch{
+    .name = "msv_inkling2_relsplit_nax",
+    .inputs = &.{ "q", "k0", "k1", "k2", "k3", "v0", "v1", "v2", "v3", "q0", "q1", "q2", "q3", "kb", "vb", "rel", "sinks", "GATE", "TMETA", "sizes", "params" },
+    .outputs = &.{ "PART", "ML", "OUT" },
+    .source = source("plugins/inkling2/kernels/relsplit_nax.metal"),
+    .header = source("kernels/common/mpp_tensor_ops.metal"),
+    .contiguous = false,
+    // Dual BK x D bf16 staging tiles (Ks_v + Vs_v) when BITS > 0; eliminated when BITS == 0.
+    .tg_bytes = 2 * NAX_BK * SD * 2,
+    .m1 = 1024,
+    .m2 = 1024,
+    .offline = false,
+    .min_gen = 17,
+};
+
+/// Single-split (`DIRECT=1`) NAX verify read over dense (`bits == 0`, up to 4 lanes) or affine-quantized (`bits == 4|8`,
+/// up to 2 lanes) cached KV and dense own keys: rows = verify rows L (2..16), n = lanes, k = cached keys per lane.
+const RelSplitNax = struct {
+    rig: metal.Rig,
+    launch: *const metal.Launch = &relsplit_nax_launch,
+    arena: std.heap.ArenaAllocator,
+    bits: u32,
+    gs: usize,
+    window: usize,
+    shape: Shape = undefined,
+    q: []f64 = &.{},
+    kb: []f64 = &.{},
+    vb: []f64 = &.{},
+    rel: []f64 = &.{},
+    sinks: []f64 = &.{},
+    gate: []f64 = &.{},
+    kd: [kernels.nax_lanes][]f64 = undefined,
+    vd: [kernels.nax_lanes][]f64 = undefined,
+    kq: [kernels.nax_quant_lanes]host.Quant = undefined,
+    vq: [kernels.nax_quant_lanes]host.Quant = undefined,
+    scale: f64 = @as(f32, 1.0 / @sqrt(@as(f32, SD))),
+    log_alpha: f64 = 0.2,
+    log_n_floor: usize = 16,
+    args: [21]mlx.mlx_array = undefined,
+    msg: [256]u8 = undefined,
+
+    const Self = @This();
+    const HQS = SHKV * SG;
+
+    fn init(a: std.mem.Allocator, bits: u32, gs: usize, window: usize) Self {
+        return .{ .rig = metal.Rig.init(a), .arena = .init(a), .bits = bits, .gs = gs, .window = window };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.rig.deinit();
+        self.arena.deinit();
+    }
+
+    pub fn geometry(self: *const Self, shape: Shape) ?metal.Geometry {
+        const max_l: usize = if (self.bits == 0) kernels.nax_lanes else kernels.nax_quant_lanes;
+        if (shape.rows < 2 or shape.rows > kernels.open_rows or shape.n == 0 or shape.n > max_l or shape.k == 0) return null;
+        if (self.bits == 0) {
+            if (shape.k * SHKV * SD * 2 < 4096 or shape.rows * SHKV * SD * 2 < 4096) return null;
+        } else {
+            if (shape.k * SHKV * (SD / self.gs) < 8 or shape.n * shape.rows * SHKV * SD * 2 < 4096) return null;
+        }
+        const total = shape.k + shape.rows;
+        const first: usize = if (self.window > 0 and total + 1 > shape.rows + self.window) total + 1 - shape.rows - self.window else 0;
+        const span = total - first;
+        const kps: usize = @intCast(kernels.splitKps(@intCast(span), shape.n));
+        if ((span + kps - 1) / kps != 1) return null;
+        const rows: c_int = @intCast(shape.n * shape.rows);
+        var g = metal.Geometry{ .grid = .{ 32 * SG, SHKV, @intCast(shape.n) }, .tg = .{ 32 * SG, 1, 1 } };
+        g.out(&.{1}, .float32);
+        g.out(&.{1}, .float32);
+        g.out(&.{ 1, rows, HQS * SD }, .bfloat16);
+        g.unread = 0b011;
+        g.dtype("T", .bfloat16);
+        g.dtype("ST", .bfloat16);
+        g.int("D", @as(c_int, SD));
+        g.int("HQ", @as(c_int, HQS));
+        g.int("HKV", @as(c_int, SHKV));
+        g.int("R", @as(c_int, R));
+        g.int("WINDOW", @as(c_int, @intCast(self.window)));
+        g.int("GLOBAL", @as(c_int, @intFromBool(self.window == 0)));
+        g.int("DIRECT", @as(c_int, 1));
+        g.int("TREE", @as(c_int, 0));
+        g.int("BITS", @as(c_int, @intCast(self.bits)));
+        g.int("GS", @as(c_int, @intCast(self.gs)));
+        return g;
+    }
+
+    pub fn prepare(self: *Self, shape: Shape, fill: spec.Fill, seed: u64) !bool {
+        if (self.geometry(shape) == null) return false;
+        if (!@import("../../mlx/device.zig").naxAvailable()) return error.NaxOnly;
+        self.shape = shape;
+        _ = self.arena.reset(.retain_capacity);
+        const a = self.arena.allocator();
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rng = prng.random();
+        const l = shape.rows;
+        const nl = shape.n;
+        const cached = shape.k;
+        const li = nl * l;
+        self.q = try host.uniform(a, rng, li * HQS * SD, -2, 2, .bfloat16);
+        self.kb = try host.uniform(a, rng, SHKV * li * SD, -2, 2, .bfloat16);
+        self.vb = try host.uniform(a, rng, SHKV * li * SD, -2, 2, .bfloat16);
+        self.rel = try host.uniform(a, rng, li * HQS * R, -2, 2, .bfloat16);
+        self.sinks = try host.uniform(a, rng, li * HQS, -3, 3, .bfloat16);
+        self.gate = try a.alloc(f64, li * HQS * SD);
+        for (self.gate) |*v| v.* = spec.roundTo(.f32, 0.02 + 0.97 * rng.float(f64));
+        if (self.bits == 0) {
+            for (0..nl) |z| {
+                self.kd[z] = try host.uniform(a, rng, SHKV * cached * SD, -2, 2, .bfloat16);
+                self.vd[z] = try host.uniform(a, rng, SHKV * cached * SD, -2, 2, .bfloat16);
+            }
+        } else {
+            for (0..nl) |z| {
+                self.kq[z] = try host.quantize(a, rng, SHKV * cached, SD, self.bits, self.gs, .bfloat16);
+                self.vq[z] = try host.quantize(a, rng, SHKV * cached, SD, self.bits, self.gs, .bfloat16);
+            }
+        }
+        if (fill == .nonfinite) {
+            host.plant(self.q, li * HQS, SD);
+            host.plant(self.vb, SHKV * li, SD);
+        }
+        self.rig.reset();
+        const ci = struct {
+            fn f(x: usize) c_int {
+                return @intCast(x);
+            }
+        }.f;
+        var in_k: [4]mlx.mlx_array = undefined;
+        var in_v: [4]mlx.mlx_array = undefined;
+        var in_q: [4]mlx.mlx_array = undefined;
+        if (self.bits == 0) {
+            for (0..nl) |z| {
+                in_k[z] = try self.rig.input(.bfloat16, &.{ 1, SHKV, ci(cached), SD }, self.kd[z]);
+                in_v[z] = try self.rig.input(.bfloat16, &.{ 1, SHKV, ci(cached), SD }, self.vd[z]);
+            }
+            for (nl..4) |z| {
+                in_k[z] = in_k[0];
+                in_v[z] = in_v[0];
+            }
+            in_q = .{ in_k[0], in_k[0], in_k[0], in_k[0] };
+        } else {
+            const q_w = SD * self.bits / 32;
+            const sc_w = SD / self.gs;
+            var kq_a: [2]mlx.mlx_array = undefined;
+            var ks_a: [2]mlx.mlx_array = undefined;
+            var kb_a: [2]mlx.mlx_array = undefined;
+            var vq_a: [2]mlx.mlx_array = undefined;
+            var vs_a: [2]mlx.mlx_array = undefined;
+            var vb_a: [2]mlx.mlx_array = undefined;
+            for (0..nl) |z| {
+                kq_a[z] = try self.rig.input(.uint32, &.{ 1, SHKV, ci(cached), ci(q_w) }, self.kq[z].words);
+                ks_a[z] = try self.rig.input(.bfloat16, &.{ 1, SHKV, ci(cached), ci(sc_w) }, self.kq[z].scales);
+                kb_a[z] = try self.rig.input(.bfloat16, &.{ 1, SHKV, ci(cached), ci(sc_w) }, self.kq[z].biases);
+                vq_a[z] = try self.rig.input(.uint32, &.{ 1, SHKV, ci(cached), ci(q_w) }, self.vq[z].words);
+                vs_a[z] = try self.rig.input(.bfloat16, &.{ 1, SHKV, ci(cached), ci(sc_w) }, self.vq[z].scales);
+                vb_a[z] = try self.rig.input(.bfloat16, &.{ 1, SHKV, ci(cached), ci(sc_w) }, self.vq[z].biases);
+            }
+            if (nl == 1) {
+                kq_a[1] = kq_a[0];
+                ks_a[1] = ks_a[0];
+                kb_a[1] = kb_a[0];
+                vq_a[1] = vq_a[0];
+                vs_a[1] = vs_a[0];
+                vb_a[1] = vb_a[0];
+            }
+            in_k = .{ kq_a[0], kq_a[1], ks_a[0], ks_a[1] };
+            in_v = .{ vq_a[0], vq_a[1], kb_a[0], kb_a[1] };
+            in_q = .{ vs_a[0], vs_a[1], vb_a[0], vb_a[1] };
+        }
+        const total = cached + l;
+        const first: usize = if (self.window > 0 and total + 1 > l + self.window) total + 1 - l - self.window else 0;
+        const kps: usize = @intCast(kernels.splitKps(@intCast(total - first), nl));
+        var sizes: [35]f64 = @splat(0);
+        for (0..nl) |z| {
+            sizes[z * 8 ..][0..7].* = .{ @floatFromInt(l), @floatFromInt(total), @floatFromInt(first), @floatFromInt(cached), @floatFromInt(cached), @floatFromInt(z * l), @floatFromInt(z * l) };
+        }
+        sizes[32] = @floatFromInt(kps);
+        sizes[33] = @floatFromInt(self.log_n_floor);
+        sizes[34] = @floatFromInt(li);
+        self.args = .{
+            try self.rig.input(.bfloat16, &.{ 1, ci(li), HQS, SD }, self.q),
+            in_k[0],                                                         in_k[1], in_k[2], in_k[3],
+            in_v[0],                                                         in_v[1], in_v[2], in_v[3],
+            in_q[0],                                                         in_q[1], in_q[2], in_q[3],
+            try self.rig.input(.bfloat16, &.{ 1, SHKV, ci(li), SD }, self.kb),
+            try self.rig.input(.bfloat16, &.{ 1, SHKV, ci(li), SD }, self.vb),
+            try self.rig.input(.bfloat16, &.{ 1, ci(li), HQS, R }, self.rel),
+            try self.rig.input(.bfloat16, &.{ 1, ci(li), HQS }, self.sinks),
+            try self.rig.input(.float32, &.{ci(li * HQS * SD)}, self.gate),
+            try self.rig.input(.int32, &.{ 1, 2 }, &.{ 0, 0 }),
+            try self.rig.input(.int32, &.{35}, &sizes),
+            try self.rig.input(.float32, &.{2}, &.{ self.scale, self.log_alpha }),
+        };
+        return true;
+    }
+
+    pub fn run(self: *Self) !void {
+        try self.rig.launch(self.launch, self.geometry(self.shape).?, &self.args);
+    }
+
+    pub fn count(self: *const Self) usize {
+        return self.shape.n * self.shape.rows * HQS * SD;
+    }
+
+    fn outputs(self: *const Self, want: []f64, allow: []f64) !void {
+        const a = self.rig.a;
+        const l = self.shape.rows;
+        const nl = self.shape.n;
+        const cached = self.shape.k;
+        const total = cached + l;
+        const li = nl * l;
+        const keys = try a.alloc(attn.Key, total + NAX_BK);
+        defer a.free(keys);
+        const ends = try a.alloc(usize, total / NAX_BK + 4);
+        defer a.free(ends);
+        const terms = try a.alloc(f64, SD);
+        defer a.free(terms);
+        const o = try a.alloc(f64, SD);
+        defer a.free(o);
+        const eo = try a.alloc(f64, SD);
+        defer a.free(eo);
+        const kbuf = try a.alloc(f64, total * SD);
+        defer a.free(kbuf);
+        const vbuf = try a.alloc(f64, total * SD);
+        defer a.free(vbuf);
+        const qs: f64 = @as(f32, @floatCast(self.scale * LOG2E));
+        const soft = attn.Soft{ .base2 = true, .p_unit = 0x1p-8, .p_abs = 0 };
+        const out_unit: f64 = 0x1p-8;
+        for (0..nl) |z| for (0..l) |r| for (0..HQS) |h| {
+            const kv = h / SG;
+            const at = cached + r;
+            const row_in = z * l + r;
+            const tau: f64 = if (self.window == 0 and cached + 1 + r > self.log_n_floor)
+                @as(f32, @floatCast(1.0 + self.log_alpha * @log(@as(f64, @floatFromInt(cached + 1 + r)) / @as(f64, @floatFromInt(self.log_n_floor)))))
+            else
+                1.0;
+            const q = self.q[(row_in * HQS + h) * SD ..][0..SD];
+            var n: usize = 0;
+            var nb: usize = 0;
+            var t0: usize = 0;
+            while (t0 < cached) : (t0 += NAX_BK) {
+                for (t0..@min(t0 + NAX_BK, cached)) |j| {
+                    const kr = if (self.bits == 0) self.kd[z][(kv * cached + j) * SD ..][0..SD] else blk: {
+                        const dst = kbuf[j * SD ..][0..SD];
+                        for (dst, self.kq[z].w[(kv * cached + j) * SD ..][0..SD]) |*d_, s_| d_.* = spec.roundTo(.bf16, s_);
+                        break :blk dst;
+                    };
+                    const vr = if (self.bits == 0) self.vd[z][(kv * cached + j) * SD ..][0..SD] else blk: {
+                        const dst = vbuf[j * SD ..][0..SD];
+                        for (dst, self.vq[z].w[(kv * cached + j) * SD ..][0..SD]) |*d_, s_| d_.* = spec.roundTo(.bf16, s_);
+                        break :blk dst;
+                    };
+                    if (self.window > 0 and at - j >= self.window) {
+                        keys[n] = .{ .s = -std.math.inf(f64), .on = false, .v = vr };
+                        n += 1;
+                        continue;
+                    }
+                    const d = attn.dot(q, kr, qs, SD, 1, null, terms);
+                    const b: f64 = if (at - j < R) self.rel[(row_in * HQS + h) * R + (at - j)] * LOG2E else 0;
+                    const sv = (d.v + b) * tau;
+                    const se = (d.e + host.U * (@abs(b) + @abs(d.v + b))) * tau + host.U * @abs(sv);
+                    keys[n] = .{ .s = sv, .e = se, .v = vr };
+                    n += 1;
+                }
+                ends[nb] = n;
+                nb += 1;
+            }
+            var o0: usize = 0;
+            while (o0 < l) : (o0 += NAX_BK) {
+                for (o0..@min(o0 + NAX_BK, l)) |j| {
+                    const col = cached + j;
+                    const vrow = self.vb[(kv * li + z * l + j) * SD ..][0..SD];
+                    if (col > at or (self.window > 0 and at - col >= self.window)) {
+                        keys[n] = .{ .s = -std.math.inf(f64), .on = false, .v = vrow };
+                        n += 1;
+                        continue;
+                    }
+                    const krow = self.kb[(kv * li + z * l + j) * SD ..][0..SD];
+                    const d = attn.dot(q, krow, qs, SD, 1, null, terms);
+                    const b: f64 = if (at - col < R) self.rel[(row_in * HQS + h) * R + (at - col)] * LOG2E else 0;
+                    const sv = (d.v + b) * tau;
+                    const se = (d.e + host.U * (@abs(b) + @abs(d.v + b))) * tau + host.U * @abs(sv);
+                    keys[n] = .{ .s = sv, .e = se, .v = vrow };
+                    n += 1;
+                }
+                ends[nb] = n;
+                nb += 1;
+            }
+            const row = attn.online(soft, .{ .m = @as(f32, @floatCast(self.sinks[row_in * HQS + h] * LOG2E)), .l = 1 }, keys[0..n], ends[0..nb], o, eo);
+            attn.normalize(row, o, eo);
+            for (o, eo, 0..) |x, e, c| {
+                const i = (row_in * HQS + h) * SD + c;
+                const gv = self.gate[i];
+                const xv = spec.roundTo(.bf16, x) * gv;
+                want[i] = xv;
+                allow[i] = (e + out_unit * @abs(x)) * @abs(gv) + out_unit * @abs(xv);
+            }
+        };
+    }
+
+    pub fn reference(self: *const Self, want: []f64, mag: []f64) !void {
+        try self.outputs(want, mag);
+    }
+
+    pub fn check(self: *Self, at: spec.Gate) !?[]const u8 {
+        const a = self.rig.a;
+        const n = self.count();
+        const buf = try a.alloc(f64, 3 * n);
+        defer a.free(buf);
+        try self.outputs(buf[0..n], buf[n .. 2 * n]);
+        for (buf[2 * n ..], 0..) |*g, i| g.* = spec.read(.bf16, self.rig.outputBytes(), i);
+        return host.within(&self.msg, at, buf[2 * n ..], buf[0..n], buf[n .. 2 * n]);
+    }
+
+    fn wrapper(self: *Self) ![]const u8 {
+        var g = ops.Graph.init(self.rig.a, self.rig.stream());
+        defer g.deinit();
+        const x = self.args;
+        const nl = self.shape.n;
+        var cfg = std.mem.zeroes(config.Config);
+        cfg.num_attention_heads = HQS;
+        cfg.num_key_value_heads = SHKV;
+        cfg.head_dim = SD;
+        cfg.sliding_window = @intCast(if (self.window > 0) self.window else 1024);
+        cfg.log_n_floor = @intCast(self.log_n_floor);
+        cfg.log_alpha = @floatCast(self.log_alpha);
+        const eye = try self.rig.a.alloc(f32, R * R);
+        defer self.rig.a.free(eye);
+        @memset(eye, 0);
+        for (0..R) |i| eye[i * R + i] = 1;
+        var L: layers.Layer = undefined;
+        L.global = self.window == 0;
+        L.rel_proj = try g.astype(try g.fromSlice(f32, eye, &.{ R, R }), .bfloat16);
+        var offsets: [kernels.nax_lanes]c_int = undefined;
+        for (0..nl) |z| offsets[z] = @intCast(self.shape.k);
+        const out = if (self.bits == 0)
+            (try kernels.splitReadNaxLanesTree(&g, &L, &cfg, x[0], x[15], x[16], x[1 .. 1 + nl], x[5 .. 5 + nl], .{ x[13], x[14] }, offsets[0..nl], x[17], @intCast(self.shape.rows), null)) orelse return error.TestUnexpectedResult
+        else blk: {
+            var views: [kernels.nax_quant_lanes]abi.KvView = undefined;
+            for (0..nl) |z| views[z] = .{
+                .bits = @intCast(self.bits),
+                .group_size = @intCast(self.gs),
+                .packed_reads = true,
+                .k_q = .{ .ctx = x[1 + z].ctx },
+                .k_scales = .{ .ctx = x[3 + z].ctx },
+                .k_biases = .{ .ctx = x[7 + z].ctx },
+                .v_q = .{ .ctx = x[5 + z].ctx },
+                .v_scales = .{ .ctx = x[9 + z].ctx },
+                .v_biases = .{ .ctx = x[11 + z].ctx },
+            };
+            break :blk (try kernels.splitReadNaxQuantLanesTree(&g, &L, &cfg, x[0], x[15], x[16], views[0..nl], .{ x[13], x[14] }, offsets[0..nl], x[17], @intCast(self.shape.rows), null)) orelse return error.TestUnexpectedResult;
+        };
+        return self.rig.bytesOf(&.{out});
     }
 };
 
@@ -3961,6 +4318,32 @@ pub fn register(set: *kc.Set) !void {
     try set.add(OProj, .init(set.a, 4, 32), oprojSpec("inkling2 oproj bf16 (4-bit g32)", 32, .{ .f16 = 40, .why = "stress codes under 16 in groups of 32: an fp16 sum misses by ~45x, short of 100x but far past fp32's exact sums" }), null);
     try set.add(OProj, .init(set.a, 4, 128), oprojSpec("inkling2 oproj bf16 (4-bit g128)", 128, .{}), null);
     try set.add(OProj, .init(set.a, 0, 16), oprojSpec("inkling2 oproj bf16 (dense)", 16, .{}), null);
+    // NAX verify reads: dense (BITS=0, up to 4 lanes) and affine 4/8-bit across g32/g64/g128 (up to 2 lanes), sliding and global.
+    const dense_served = [_]Shape{ .{ .rows = 8, .n = 1, .k = 40 }, .{ .rows = 4, .n = 4, .k = 32 } };
+    const qkv_served = [_]Shape{ .{ .rows = 8, .n = 1, .k = 40 }, .{ .rows = 4, .n = 2, .k = 32 } };
+    inline for (.{
+        .{ 0, 1, 1024, "dense, sliding 1024" },
+        .{ 0, 1, 0, "dense, global" },
+        .{ 4, 64, 1024, "4-bit g64, sliding 1024" },
+        .{ 4, 64, 0, "4-bit g64, global" },
+        .{ 8, 64, 1024, "8-bit g64, sliding 1024" },
+        .{ 8, 64, 0, "8-bit g64, global" },
+        .{ 4, 32, 0, "4-bit g32, global" },
+        .{ 4, 128, 0, "4-bit g128, global" },
+        .{ 8, 32, 0, "8-bit g32, global" },
+        .{ 8, 128, 0, "8-bit g128, global" },
+    }) |c| {
+        try set.add(RelSplitNax, .init(set.a, c[0], c[1], c[2]), .{
+            .name = "inkling2 relsplit_nax bf16 (" ++ c[3] ++ ")",
+            .accum = .none,
+            .depth = host.depthOne,
+            .out = .bf16,
+            .nan = .{ .stated = "a planted NaN or infinity reaches every row whose key tiles hold it, a masked key's value at weight 0 included" },
+            .nax = true,
+            .tiles = .{ .{}, .{}, .{ .size = NAX_BK, .min = 8 } },
+            .served = if (c[0] == 0) &dense_served else &qkv_served,
+        }, null);
+    }
     try vision_contract.register(set);
 }
 
@@ -4022,7 +4405,19 @@ test "kernel contract inkling2: each declared launch is the shipped wrapper's, b
             try std.testing.expectEqualSlices(u8, try p.wrapper(), ours);
         }
     }
-    try vision_contract.checkWrappers(a, set.kernels.items[end..]);
+    var qend = end;
+    while (qend < set.kernels.items.len and std.mem.startsWith(u8, set.kernels.items[qend].spec.name, "inkling2 relsplit_nax")) qend += 1;
+    if (@import("../../mlx/device.zig").naxAvailable()) for (set.kernels.items[end..qend]) |k| {
+        const p: *RelSplitNax = @ptrCast(@alignCast(k.ctx));
+        for (k.spec.served) |shape| {
+            try std.testing.expect(try p.prepare(shape, .random, 7));
+            try p.run();
+            const ours = try a.dupe(u8, p.rig.outputBytes());
+            defer a.free(ours);
+            try std.testing.expectEqualSlices(u8, try p.wrapper(), ours);
+        }
+    };
+    try vision_contract.checkWrappers(a, set.kernels.items[qend..]);
 }
 
 // Bar: gates 1-4 on this area alone (the registry's sharded test runs them with every other area).
