@@ -16,6 +16,7 @@ const slot_state = @import("../../sdk/bases/blocks/state.zig");
 const sdpaSinks = @import("../../sdk/bases/blocks/decoder_attention.zig").sdpaSinks;
 const moe_fp4 = @import("../../sdk/blocks/moe/moe_fp4.zig");
 const mxfp8 = @import("../../sdk/blocks/qmm/mxfp8_qmv.zig");
+const log = @import("../../sdk/util/log.zig");
 const rel = @import("../inkling/attention.zig");
 const layers = @import("layers.zig");
 const Config = @import("config.zig").Config;
@@ -94,7 +95,8 @@ pub var tile_scan_kernel: Kernel = .{ .name = "msv_inkling2_tile_scan", .ins = &
 pub var moe_wide_kernel: Kernel = .{ .name = "msv_inkling2_moe_wide", .ins = &.{ "X", "W", "WS", "WB", "tiles", "tile_count", "SC", "PR", "RMAP" }, .outs = &.{"Y"}, .source = kernelSource("plugins/inkling2/kernels/moe_wide.metal"), .header = bank_header };
 pub var router_kernel: Kernel = .{ .name = "msv_inkling2_router", .ins = &.{ "X", "RT" }, .outs = &.{"SC"}, .source = kernelSource("plugins/inkling2/kernels/router.metal") };
 pub var relattn_nax_kernel: Kernel = .{ .name = "msv_inkling2_relattn_nax", .ins = &.{ "q", "k", "v", "rel", "rproj", "sinks", "sizes", "scale" }, .outs = &.{"out"}, .source = kernelSource("plugins/inkling2/kernels/relattn_nax.metal"), .header = kernelSource("kernels/common/mpp_tensor_ops.metal"), .contiguous = false };
-pub var relsplit_nax_kernel: Kernel = .{ .name = "msv_inkling2_relsplit_nax", .ins = &.{ "q", "k0", "k1", "k2", "k3", "v0", "v1", "v2", "v3", "kb", "vb", "rel", "sinks", "GATE", "TMETA", "sizes", "params" }, .outs = &.{ "PART", "ML", "OUT" }, .source = kernelSource("plugins/inkling2/kernels/relsplit_nax.metal"), .header = kernelSource("kernels/common/mpp_tensor_ops.metal"), .contiguous = false };
+pub var relsplit_nax_kernel: Kernel = .{ .name = "msv_inkling2_relsplit_nax", .ins = &.{ "q", "k0", "k1", "k2", "k3", "v0", "v1", "v2", "v3", "kb", "vb", "rel", "rproj", "sinks", "GATE", "TMETA", "sizes", "params" }, .outs = &.{ "PART", "ML", "OUT" }, .source = kernelSource("plugins/inkling2/kernels/relsplit_nax.metal"), .header = kernelSource("kernels/common/mpp_tensor_ops.metal"), .contiguous = false };
+pub var relsplit_nax_q_kernel: Kernel = .{ .name = "msv_inkling2_relsplit_nax_q", .ins = &.{ "q", "k0q", "k0s", "k0b", "v0q", "v0s", "v0b", "k1q", "k1s", "k1b", "v1q", "v1s", "v1b", "kb", "vb", "rel", "rproj", "sinks", "GATE", "TMETA", "sizes", "params" }, .outs = &.{ "PART", "ML", "OUT" }, .source = kernelSource("plugins/inkling2/kernels/relsplit_nax_q.metal"), .header = kernelSource("kernels/common/mpp_tensor_ops.metal"), .contiguous = false };
 pub var relsplit_lanes_kernel: Kernel = .{ .name = "msv_inkling2_relsplit_lanes", .ins = &.{ "q", "k0", "k1", "k2", "k3", "v0", "v1", "v2", "v3", "kb", "vb", "rel", "sinks", "GATE", "TMETA", "sizes", "params" }, .outs = &.{ "PART", "ML", "OUT" }, .source = kernelSource("plugins/inkling2/kernels/relsplit_lanes.metal"), .header = lanes_header, .contiguous = false };
 pub var relsplit_kernel: Kernel = .{ .name = "msv_inkling2_relsplit", .ins = &.{ "q", "k", "v", "kb", "vb", "rel", "sinks", "sizes", "scale" }, .outs = &.{ "PART", "ML" }, .source = kernelSource("plugins/inkling2/kernels/relsplit.metal"), .contiguous = false };
 pub var relcomb_kernel: Kernel = .{ .name = "msv_inkling2_relcomb", .ins = &.{ "PART", "ML", "GATE" }, .outs = &.{"OUT"}, .source = kernelSource("plugins/inkling2/kernels/relcomb.metal") };
@@ -952,10 +954,12 @@ pub fn splitJoin(g: *Graph, parts: [2]Array, gate_sigmoid: Array, s: c_int, dt: 
 
 /// Lanes one launch of `relsplit_nax.metal` reads: each lane's K and V take a buffer, and a kernel has 31.
 pub const nax_lanes = 4;
+/// Lanes one launch of `relsplit_nax_q.metal` reads: each lane's 6 quantized KV buffers + 2 stride buffers fit in 30 <= 31.
+pub const nax_quant_lanes = 2;
 
 /// Keys per split for long-context attention: saturates wide GPUs up to 128 splits solo (bounded per-launch partial
 /// memory across multi-lane batches so `splits * here <= 128`).
-fn splitKps(most: c_int, here: usize) c_int {
+pub fn splitKps(most: c_int, here: usize) c_int {
     const max_splits: c_int = @max(@as(c_int, 16), @divTrunc(@as(c_int, 128), @as(c_int, @intCast(here))));
     const base: c_int = if (most <= 1040) 64 else if (most <= 4096) 128 else if (most <= 16384) 256 else 512;
     const floor_kps: c_int = @divTrunc(@divTrunc(most + max_splits - 1, max_splits) + 31, 32) * 32;
@@ -981,6 +985,153 @@ pub fn splitReadNaxLanes(g: *Graph, L: *const Layer, cfg: *const Config, q_rows:
 }
 
 pub fn splitReadNaxLanesTree(g: *Graph, L: *const Layer, cfg: *const Config, q_rows: Array, rel_states: Array, sinks: Array, ks: []const Array, vs: []const Array, own: ?[2]Array, offsets: []const c_int, gate_sigmoid: Array, s: c_int, tree_meta: ?Array) !?Array {
+    return splitReadNaxLanesTreeWithConsts(g, L, cfg, null, q_rows, rel_states, sinks, ks, vs, own, offsets, gate_sigmoid, s, tree_meta);
+}
+
+/// Dispatch count of `relsplit_nax_q.metal` (test seam).
+pub var split_nax_quant_calls: usize = 0;
+var split_nax_quant_engaged: bool = false;
+
+/// `relsplit_nax_q.metal`: 2..16-row NAX split-K relative attention reading affine-quantized (4/8-bit) cached KV
+/// triples in place (up to 2 lanes per launch), with dense `own` verify keys and optional tree masks. Null where
+/// ineligible (dense views, `packed_reads == false`, non-NAX GPU, unsupported width).
+pub fn splitReadNaxQuantLanesTree(g: *Graph, L: *const Layer, cfg: *const Config, q_rows: Array, rel_states: Array, sinks: Array, views: []const abi.KvView, own: ?[2]Array, offsets: []const c_int, gate_sigmoid: Array, s: c_int, tree_meta: ?Array) !?Array {
+    return splitReadNaxQuantLanesTreeWithConsts(g, L, cfg, null, q_rows, rel_states, sinks, views, own, offsets, gate_sigmoid, s, tree_meta);
+}
+
+fn splitReadNaxQuantLanesTreeWithConsts(g: *Graph, L: *const Layer, cfg: *const Config, consts: ?*const layers.Consts, q_rows: Array, rel_states: Array, sinks: Array, views: []const abi.KvView, own: ?[2]Array, offsets: []const c_int, gate_sigmoid: Array, s: c_int, tree_meta: ?Array) !?Array {
+    if (!mlx.streamIsGpu(g.s) or !enabled() or !@import("../../mlx/device.zig").naxAvailable()) return null;
+    const n = views.len;
+    if (n == 0 or n > max_slots) return null;
+    const dt = ops.dtype(q_rows);
+    const heads: c_int = @intCast(cfg.num_attention_heads);
+    const kv_heads: c_int = @intCast(cfg.num_key_value_heads);
+    const hd: c_int = @intCast(cfg.head_dim);
+    const group = @divTrunc(heads, kv_heads);
+    if (own) |o| {
+        if (s < 2 or s > open_rows or ops.dtype(o[0]) != dt or ops.dtype(o[1]) != dt) return null;
+    } else if (n != 1 or s < split_from or s > open_rows) return null;
+    if ((dt != .bfloat16 and dt != .float16) or ops.dtype(sinks) != dt or ops.dtype(rel_states) != dt) return null;
+    if (@rem(hd, 16) != 0 or @rem(heads, kv_heads) != 0 or 32 * group > sure_threads or 2 * 32 * hd * 2 > 32768) return null;
+
+    const bits = views[0].bits;
+    const gs = views[0].group_size;
+    if ((bits != 4 and bits != 8) or (gs != 32 and gs != 64 and gs != 128)) return null;
+    const gs_c: c_int = @intCast(gs);
+    if (@rem(hd, gs_c) != 0) return null;
+    if (views[0].k_scales.ctx == null) return null;
+    const s_dt = ops.dtype(.{ .ctx = views[0].k_scales.ctx });
+    if (!floating(s_dt)) return null;
+    const q_w: c_int = @divExact(hd, @divExact(@as(c_int, 32), @as(c_int, bits)));
+    const sc_w: c_int = @divExact(hd, gs_c);
+
+    const window: c_int = if (L.global) 0 else @intCast(cfg.sliding_window);
+    const own_rows: c_int = if (own != null) s else 0;
+    const li: c_int = @as(c_int, @intCast(n)) * s;
+    if (li * heads * hd < 8 or li * kv_heads * hd < 8 or li * heads * ops.shape(rel_states)[3] < 8) return null;
+
+    var cached_arr: [max_slots]c_int = undefined;
+    var keys: [max_slots]c_int = undefined;
+    var first: [max_slots]c_int = undefined;
+    var most: c_int = 0;
+    for (views, 0..) |v, i| {
+        if (!v.packed_reads or v.bits != bits or v.group_size != gs) return null;
+        if (v.k_q.ctx == null or v.k_scales.ctx == null or v.k_biases.ctx == null or
+            v.v_q.ctx == null or v.v_scales.ctx == null or v.v_biases.ctx == null) return null;
+        const kq: Array = .{ .ctx = v.k_q.ctx };
+        const ks: Array = .{ .ctx = v.k_scales.ctx };
+        const kb_: Array = .{ .ctx = v.k_biases.ctx };
+        const vq: Array = .{ .ctx = v.v_q.ctx };
+        const vs: Array = .{ .ctx = v.v_scales.ctx };
+        const vb_: Array = .{ .ctx = v.v_biases.ctx };
+        if (ops.dtype(kq) != .uint32 or ops.dtype(vq) != .uint32) return null;
+        if (ops.dtype(ks) != s_dt or ops.dtype(kb_) != s_dt or ops.dtype(vs) != s_dt or ops.dtype(vb_) != s_dt) return null;
+        const ksh = ops.shape(kq);
+        const vsh = ops.shape(vq);
+        const ssh = ops.shape(ks);
+        if (ksh.len != 4 or vsh.len != 4 or ssh.len != 4) return null;
+        if (ksh[1] != kv_heads or ksh[3] != q_w or vsh[1] != kv_heads or vsh[2] != ksh[2] or vsh[3] != q_w or ssh[2] != ksh[2] or ssh[3] != sc_w) return null;
+        const cached = ksh[2];
+        // MLX binds inputs with < 8 elements in `constant` address space; require `device` for all KV buffers.
+        if (cached <= 0 or cached * kv_heads * sc_w < 8) return null;
+        cached_arr[i] = cached;
+        keys[i] = cached + own_rows;
+        first[i] = if (window > 0) @max(0, keys[i] - s - window + 1) else 0;
+        most = @max(most, keys[i] - first[i]);
+    }
+
+    const rproj = try relProjT(g, L, dt);
+    if (ops.shape(rproj)[0] * ops.shape(rproj)[1] < 8) return null;
+    const rel_c = try g.contiguous(rel_states);
+    const kb, const vb = if (own) |o| .{ try g.contiguous(o[0]), try g.contiguous(o[1]) } else .{ q_rows, q_rows };
+    const params = if (consts != null and consts.?.rel_params.ctx != null) consts.?.rel_params else try g.fromSlice(f32, &.{ 1.0 / @sqrt(@as(f32, @floatFromInt(hd))), cfg.log_alpha }, &.{2});
+    const tmeta = tree_meta orelse (if (consts != null and consts.?.zero_tmeta.ctx != null) consts.?.zero_tmeta else try g.zeros(&.{ 1, 2 }, .int32));
+    var outs: [max_slots / nax_quant_lanes]Array = undefined;
+    var made: usize = 0;
+    var from: usize = 0;
+    while (from < n) : (from += nax_quant_lanes) {
+        const here = @min(n - from, nax_quant_lanes);
+        const kps = splitKps(most, here);
+        const splits: c_int = @max(1, @divTrunc(most + kps - 1, kps));
+        const direct = splits == 1;
+        const rows: c_int = @as(c_int, @intCast(here)) * s;
+        var sizes: [20]i32 = @splat(0);
+        var kq_in: [nax_quant_lanes]Array = undefined;
+        var ks_in: [nax_quant_lanes]Array = undefined;
+        var kb_in: [nax_quant_lanes]Array = undefined;
+        var vq_in: [nax_quant_lanes]Array = undefined;
+        var vs_in: [nax_quant_lanes]Array = undefined;
+        var vb_in: [nax_quant_lanes]Array = undefined;
+        for (0..nax_quant_lanes) |z| {
+            const i = from + (if (z < here) z else 0);
+            kq_in[z] = .{ .ctx = views[i].k_q.ctx };
+            ks_in[z] = .{ .ctx = views[i].k_scales.ctx };
+            kb_in[z] = .{ .ctx = views[i].k_biases.ctx };
+            vq_in[z] = .{ .ctx = views[i].v_q.ctx };
+            vs_in[z] = .{ .ctx = views[i].v_scales.ctx };
+            vb_in[z] = .{ .ctx = views[i].v_biases.ctx };
+            if (z >= here) continue;
+            sizes[z * 8 ..][0..7].* = .{ s, keys[i], first[i], cached_arr[i], offsets[i], @as(c_int, @intCast(i)) * s, @as(c_int, @intCast(z)) * s };
+        }
+        sizes[16] = kps;
+        sizes[17] = @intCast(cfg.log_n_floor);
+        sizes[18] = rows;
+        sizes[19] = li;
+        const o = try launchGrid(g, &relsplit_nax_q_kernel, &.{
+            q_rows,
+            kq_in[0], ks_in[0], kb_in[0], vq_in[0], vs_in[0], vb_in[0],
+            kq_in[1], ks_in[1], kb_in[1], vq_in[1], vs_in[1], vb_in[1],
+            kb,       vb,       rel_c,    rproj,    sinks,    gate_sigmoid,
+            tmeta,    try g.fromSlice(i32, &sizes, &.{20}), params,
+        }, 3, .{
+            if (direct) unused else .{ .shape = &.{ splits, rows * heads, hd }, .dtype = .float32 },
+            if (direct) unused else .{ .shape = &.{ splits, rows * heads, 2 }, .dtype = .float32 },
+            if (direct) .{ .shape = &.{ 1, rows, heads * hd }, .dtype = dt } else unused,
+        }, .{ splits * 32 * group, kv_heads, @intCast(here) }, .{ 32 * group, 1, 1 }, &.{
+            .{ "T", .{ .dtype = dt } },                               .{ "ST", .{ .dtype = s_dt } },
+            .{ "D", .{ .int = hd } },                                 .{ "HQ", .{ .int = heads } },
+            .{ "HKV", .{ .int = kv_heads } },                         .{ "R", .{ .int = ops.shape(rproj)[0] } },
+            .{ "DREL", .{ .int = ops.shape(rproj)[1] } },             .{ "WINDOW", .{ .int = window } },
+            .{ "GLOBAL", .{ .int = @intFromBool(L.global) } },        .{ "DIRECT", .{ .int = @intFromBool(direct) } },
+            .{ "TREE", .{ .int = @intFromBool(tree_meta != null) } }, .{ "BITS", .{ .int = @intCast(bits) } },
+            .{ "GS", .{ .int = gs_c } },
+        });
+        split_nax_quant_calls += 1;
+        if (!split_nax_quant_engaged) {
+            split_nax_quant_engaged = true;
+            log.info("[kv-attn] inkling2 relsplit_nax_q engaged: bits={d} gs={d} D={d} Hq={d} Hkv={d} lanes={d}\n", .{ bits, gs, hd, heads, kv_heads, n });
+        }
+        outs[made] = if (direct) o[2] else blk: {
+            const lo: c_int = @as(c_int, @intCast(from)) * s * heads * hd;
+            const gate_rows = if (here == n) gate_sigmoid else try g.sliceAxis(gate_sigmoid, 0, lo, lo + rows * heads * hd);
+            break :blk try splitJoin(g, .{ o[0], o[1] }, gate_rows, rows, dt);
+        };
+        made += 1;
+    }
+    return if (made == 1) outs[0] else try g.concat(outs[0..made], 1);
+}
+
+fn splitReadNaxLanesTreeWithConsts(g: *Graph, L: *const Layer, cfg: *const Config, consts: ?*const layers.Consts, q_rows: Array, rel_states: Array, sinks: Array, ks: []const Array, vs: []const Array, own: ?[2]Array, offsets: []const c_int, gate_sigmoid: Array, s: c_int, tree_meta: ?Array) !?Array {
     if (!mlx.streamIsGpu(g.s) or !enabled() or !@import("../../mlx/device.zig").naxAvailable()) return null;
     const n = ks.len;
     const dt = ops.dtype(q_rows);
@@ -991,12 +1142,12 @@ pub fn splitReadNaxLanesTree(g: *Graph, L: *const Layer, cfg: *const Config, q_r
     if (own) |o| {
         if (s < 2 or s > open_rows or ops.dtype(o[0]) != dt or ops.dtype(o[1]) != dt) return null;
     } else if (n != 1 or s < split_from or s > open_rows) return null;
-    if ((dt != .bfloat16 and dt != .float16) or ops.dtype(sinks) != dt) return null;
+    if ((dt != .bfloat16 and dt != .float16) or ops.dtype(sinks) != dt or ops.dtype(rel_states) != dt) return null;
     for (ks, vs) |k, v| if (ops.dtype(k) != dt or ops.dtype(v) != dt) return null;
     if (@rem(hd, 16) != 0 or @rem(heads, kv_heads) != 0 or 32 * group > sure_threads) return null;
 
-    const proj = if (ops.dtype(L.rel_proj) == dt) L.rel_proj else try g.astype(L.rel_proj, dt);
-    const bias = try g.matmul(rel_states, proj);
+    const rproj = try relProjT(g, L, dt);
+    const rel_c = try g.contiguous(rel_states);
     const window: c_int = if (L.global) 0 else @intCast(cfg.sliding_window);
     const own_rows: c_int = if (own != null) s else 0;
     var keys: [max_slots]c_int = undefined;
@@ -1011,8 +1162,8 @@ pub fn splitReadNaxLanesTree(g: *Graph, L: *const Layer, cfg: *const Config, q_r
         most = @max(most, keys[i] - first[i]);
     }
     const kb, const vb = own orelse .{ ks[0], vs[0] };
-    const params = try g.fromSlice(f32, &.{ 1.0 / @sqrt(@as(f32, @floatFromInt(hd))), cfg.log_alpha }, &.{2});
-    const tmeta = tree_meta orelse try g.zeros(&.{ 1, 2 }, .int32);
+    const params = if (consts != null and consts.?.rel_params.ctx != null) consts.?.rel_params else try g.fromSlice(f32, &.{ 1.0 / @sqrt(@as(f32, @floatFromInt(hd))), cfg.log_alpha }, &.{2});
+    const tmeta = tree_meta orelse (if (consts != null and consts.?.zero_tmeta.ctx != null) consts.?.zero_tmeta else try g.zeros(&.{ 1, 2 }, .int32));
     var outs: [max_slots / nax_lanes]Array = undefined;
     var made: usize = 0;
     var from: usize = 0;
@@ -1035,16 +1186,16 @@ pub fn splitReadNaxLanesTree(g: *Graph, L: *const Layer, cfg: *const Config, q_r
         sizes[32] = kps;
         sizes[33] = @intCast(cfg.log_n_floor);
         sizes[34] = rows;
-        const o = try launchGrid(g, &relsplit_nax_kernel, &.{ q_rows, kin[0], kin[1], kin[2], kin[3], vin[0], vin[1], vin[2], vin[3], kb, vb, bias, sinks, gate_sigmoid, tmeta, try g.fromSlice(i32, &sizes, &.{35}), params }, 3, .{
+        const o = try launchGrid(g, &relsplit_nax_kernel, &.{ q_rows, kin[0], kin[1], kin[2], kin[3], vin[0], vin[1], vin[2], vin[3], kb, vb, rel_c, rproj, sinks, gate_sigmoid, tmeta, try g.fromSlice(i32, &sizes, &.{35}), params }, 3, .{
             if (direct) unused else .{ .shape = &.{ splits, rows * heads, hd }, .dtype = .float32 },
             if (direct) unused else .{ .shape = &.{ splits, rows * heads, 2 }, .dtype = .float32 },
             if (direct) .{ .shape = &.{ 1, rows, heads * hd }, .dtype = dt } else unused,
         }, .{ splits * 32 * group, kv_heads, @intCast(here) }, .{ 32 * group, 1, 1 }, &.{
             .{ "T", .{ .dtype = dt } },                               .{ "D", .{ .int = hd } },
             .{ "HQ", .{ .int = heads } },                             .{ "HKV", .{ .int = kv_heads } },
-            .{ "R", .{ .int = ops.shape(bias)[3] } },                 .{ "WINDOW", .{ .int = window } },
-            .{ "GLOBAL", .{ .int = @intFromBool(L.global) } },        .{ "DIRECT", .{ .int = @intFromBool(direct) } },
-            .{ "TREE", .{ .int = @intFromBool(tree_meta != null) } },
+            .{ "R", .{ .int = ops.shape(rproj)[0] } },                .{ "DREL", .{ .int = ops.shape(rproj)[1] } },
+            .{ "WINDOW", .{ .int = window } },                        .{ "GLOBAL", .{ .int = @intFromBool(L.global) } },
+            .{ "DIRECT", .{ .int = @intFromBool(direct) } },          .{ "TREE", .{ .int = @intFromBool(tree_meta != null) } },
         });
         outs[made] = if (direct) o[2] else blk: {
             const lo: c_int = @as(c_int, @intCast(from)) * s * heads * hd;
@@ -1193,7 +1344,7 @@ pub fn commitPaths(c: *block.Ctx, cfg: *const Config, opens: []const Open, paths
 /// `layers.attend`: appends the visit's k and v, reads under the bias and the `sinks`, gates. An `open` verify reads
 /// the cache's rows with its own behind them and appends nothing.
 /// `raw`: one row's read is returned without its output gate, which `oGated` folds into the output projection.
-fn attend(c: *block.Ctx, L: *const Layer, cfg: *const Config, p: *const Prep, sinks: Array, open: ?*Open, raw: bool) !Array {
+fn attend(c: *block.Ctx, L: *const Layer, cfg: *const Config, consts: ?*const layers.Consts, p: *const Prep, sinks: Array, open: ?*Open, raw: bool) !Array {
     const g = c.g;
     const heads: c_int = @intCast(cfg.num_attention_heads);
     const hd: c_int = @intCast(cfg.head_dim);
@@ -1204,12 +1355,16 @@ fn attend(c: *block.Ctx, L: *const Layer, cfg: *const Config, p: *const Prep, si
         if (s < 2) return error.Inkling2DraftVerify;
         o.k = try o.g.keep(p.k);
         o.v = try o.g.keep(p.v);
-        return attendOpen(c, L, cfg, p, sinks, if (o.tree) |t| t.meta else null);
+        return attendOpen(c, L, cfg, consts, p, sinks, if (o.tree) |t| t.meta else null);
     }
     var view = try layers.appendKv(c, c.cache(), L.global, cfg, p.k, p.v, if (span > 0) band.view(span, hd, offset + s, s).span else 0);
     defer kv.release(c, &view);
+    if (s > 1) {
+        if (try splitReadNaxQuantLanesTreeWithConsts(g, L, cfg, consts, p.q, p.rel, sinks, &.{view}, null, &.{offset}, p.gate, s, null)) |o| return o;
+        const dv = kv.dense(view);
+        return readRows(g, L, cfg, p, sinks, dv.k, dv.v, offset, s);
+    }
     const dv = kv.dense(view);
-    if (s > 1) return readRows(g, L, cfg, p, sinks, dv.k, dv.v, offset, s);
     if (ops.shape(dv.k)[2] != ops.shape(p.bias)[3]) return error.Inkling2KvView;
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
     const row_sinks = try g.reshape(sinks, &.{heads});
@@ -1218,7 +1373,7 @@ fn attend(c: *block.Ctx, L: *const Layer, cfg: *const Config, p: *const Prep, si
 }
 
 /// An open verify's read: each slot's `c.rows` rows read its own cache where it lies, its own rows behind it.
-fn attendOpen(c: *block.Ctx, L: *const Layer, cfg: *const Config, p: *const Prep, sinks: Array, tree_meta: ?Array) !Array {
+fn attendOpen(c: *block.Ctx, L: *const Layer, cfg: *const Config, consts: ?*const layers.Consts, p: *const Prep, sinks: Array, tree_meta: ?Array) !Array {
     const g = c.g;
     const n = c.caches.len;
     const s = c.rows;
@@ -1235,13 +1390,17 @@ fn attendOpen(c: *block.Ctx, L: *const Layer, cfg: *const Config, p: *const Prep
     for (c.caches, c.positions, 0..) |cache, position, i| {
         views[i] = try kv.view(c, cache, c.layer);
         made += 1;
+        whole_at[i] = @intCast(position);
+    }
+    // Quantized KV caches read packed triples in place on NAX without materializing dense K/V tensors.
+    if (try splitReadNaxQuantLanesTreeWithConsts(g, L, cfg, consts, p.q, p.rel, sinks, views[0..n], .{ p.k, p.v }, whole_at[0..n], p.gate, s, tree_meta)) |read| return read;
+    for (0..n) |i| {
         const dv = kv.dense(views[i]);
         whole_k[i] = dv.k;
         whole_v[i] = dv.v;
-        whole_at[i] = @intCast(position);
     }
     // The tensor unit reads every slot's block in a launch up to 4 slots wide; non-NAX GPUs use the 4-lane M4 kernel.
-    if (try splitReadNaxLanesTree(g, L, cfg, p.q, p.rel, sinks, whole_k[0..n], whole_v[0..n], .{ p.k, p.v }, whole_at[0..n], p.gate, s, tree_meta)) |read| return read;
+    if (try splitReadNaxLanesTreeWithConsts(g, L, cfg, consts, p.q, p.rel, sinks, whole_k[0..n], whole_v[0..n], .{ p.k, p.v }, whole_at[0..n], p.gate, s, tree_meta)) |read| return read;
     if (try splitReadLanesM4(g, L, cfg, p.q, p.rel, sinks, whole_k[0..n], whole_v[0..n], .{ p.k, p.v }, whole_at[0..n], p.gate, s, tree_meta)) |read| return read;
     if (tree_meta != null) return error.Inkling2TreeAttend;
     for (c.positions, 0..) |position, i| {
@@ -1885,7 +2044,7 @@ pub fn visit(c: *block.Ctx, L: *const Layer, w: *const Body, h: Array, blocks: ?
     const tree_parent: ?Array = if (open) |o| (if (o.tree) |t| t.parent else null) else null;
     const p = (try prepWithConsts(g, L, cfg, &w.consts, &f.proj, f.dyn, st, if (one and L.global) layers.stepTau(cfg, total) else 1.0, if (one) keysSeen(L, cfg, total) else 0, tree_parent)) orelse return null;
     const fuse = one and open == null and oFormat(&L.o, ops.dtype(h)) != null;
-    const read = if (batch) try attendSlots(c, L, cfg, &w.consts, &p, f.proj[3]) else try attend(c, L, cfg, &p, f.proj[3], open, fuse);
+    const read = if (batch) try attendSlots(c, L, cfg, &w.consts, &p, f.proj[3]) else try attend(c, L, cfg, &w.consts, &p, f.proj[3], open, fuse);
     const m = try midWith(g, L, w, read, if (fuse) p.gate else null, h, f.normed, blocks, st, f.messages, tree_parent);
     const t = try expertsWithConsts(g, L, cfg, &w.consts, &m, f.proj[4], f.proj[5], st, open);
     if (open == null) {

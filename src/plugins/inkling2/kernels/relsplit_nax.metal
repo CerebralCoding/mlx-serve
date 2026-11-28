@@ -3,7 +3,8 @@
 // grid (splits * 32 * G, HKV, 4), threadgroup (32 * G, 1, 1): a threadgroup's G = HQ / HKV SIMD groups walk the same
 // K/V tiles of one KV head of lane z, the lane's rows L of the stacked projections.
 // q [1, LI, HQ, D] (T), k0..k3 [1, HKV, SC, D] (T, a lane's cache, V laid out as K), kb, vb [1, HKV, LI, D] (T, the lanes'
-// own keys and values stacked, unread when SC == S), rel [1, LI, HQ, R] (T, unscaled bias), sinks [1, LI, HQ] (T),
+// own keys and values stacked, unread when SC == S), rel [1, LI, HQ, DREL] (T, contiguous) clipped relative states,
+// rproj [R, DREL] (T, contiguous) transposed projection, sinks [1, LI, HQ] (T),
 // GATE [LI * HQ * D] f32 (sigmoid), LI the rows of every lane of the call, and sizes = { per lane: L (0 = no lane), S,
 // first, SC, offset, row_in (its first row of those), row_out (its first row of this launch's), 0; then kps,
 // log_n_floor, LT (this launch's rows) }, params = { scale, log_alpha },
@@ -89,10 +90,18 @@ if (split == 0) {
     }
 }
 
-const device T* biasa = rel + (size_t(row_in + (oka ? ra : 0)) * HQ + head) * R;
-const device T* biasb = rel + (size_t(row_in + (okb ? rb : 0)) * HQ + head) * R;
 const int kbeg = first + split * kps;
 const int kend = metal::min(S, kbeg + kps);
+const device T* rsa = rel + (size_t(row_in + (oka ? ra : 0)) * HQ + head) * DREL;
+const device T* rsb = rel + (size_t(row_in + (okb ? rb : 0)) * HQ + head) * DREL;
+vec<T, 4> ra4[(DREL + 3) / 4], rb4[(DREL + 3) / 4];
+const bool needs_rel = (WINDOW > 0) || (kend - 1 > (S - L) - R);
+if (needs_rel && (DREL % 4 == 0)) {
+    const device vec<T, 4>* sa4 = (const device vec<T, 4>*)rsa;
+    const device vec<T, 4>* sb4 = (const device vec<T, 4>*)rsb;
+#pragma clang loop unroll(full)
+    for (int d = 0; d < DREL / 4; d++) { ra4[d] = sa4[d]; rb4[d] = sb4[d]; }
+}
 
 // 1. Cached keys [kbeg, min(kend, SC))
 const int c_end = metal::min(kend, SC);
@@ -121,7 +130,20 @@ if (kbeg < c_end) {
                 const int dist = (h ? dgb : dga) - col;
                 const bool ok = okr && col < c_end && dist >= 0 && (WINDOW == 0 || dist < WINDOW);
                 if (ok) {
-                    const float b = dist < R ? float((h ? biasb : biasa)[dist]) * LOG2E : 0.0f;
+                    float b = 0.0f;
+                    if (dist < R) {
+                        const device T* rp = rproj + size_t(dist) * DREL;
+                        if constexpr (DREL % 4 == 0) {
+                            const device vec<T, 4>* rp4 = (const device vec<T, 4>*)rp;
+#pragma clang loop unroll(full)
+                            for (int d = 0; d < DREL / 4; d++) b += metal::dot(float4(h ? rb4[d] : ra4[d]), float4(rp4[d]));
+                        } else {
+                            const device T* rv = h ? rsb : rsa;
+#pragma clang loop unroll(full)
+                            for (int d = 0; d < DREL; d++) b += float(rv[d]) * float(rp[d]);
+                        }
+                        b *= LOG2E;
+                    }
                     e = (Sc[i] * sc + b) * tau[h];
                 }
             }
@@ -187,7 +209,20 @@ if (o_beg < kend) {
             const bool ok = (h ? okb : oka) && col < kend && anc && dist >= 0 && (WINDOW == 0 || dist < WINDOW);
             float e = -INFINITY;
             if (ok) {
-                const float b = dist < R ? float((h ? biasb : biasa)[dist]) * LOG2E : 0.0f;
+                float b = 0.0f;
+                if (dist < R) {
+                    const device T* rp = rproj + size_t(dist) * DREL;
+                    if constexpr (DREL % 4 == 0) {
+                        const device vec<T, 4>* rp4 = (const device vec<T, 4>*)rp;
+#pragma clang loop unroll(full)
+                        for (int d = 0; d < DREL / 4; d++) b += metal::dot(float4(h ? rb4[d] : ra4[d]), float4(rp4[d]));
+                    } else {
+                        const device T* rv = h ? rsb : rsa;
+#pragma clang loop unroll(full)
+                        for (int d = 0; d < DREL; d++) b += float(rv[d]) * float(rp[d]);
+                    }
+                    b *= LOG2E;
+                }
                 e = (Sc[i] * sc + b) * tau[h];
             }
             Sc[i] = e;

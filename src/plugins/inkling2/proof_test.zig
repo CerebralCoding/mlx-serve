@@ -2071,6 +2071,7 @@ test "inkling2 kernels: relsplit_nax matches splitRead" {
         var L: layers.Layer = undefined;
         L.global = global;
         L.rel_proj = rel_proj;
+        L.rel_proj_t = .{};
         const cached = if (global) offset else @min(offset, 1023);
         const q = try randomRow(&g, a, seed + 1, &.{ 1, rows, heads, hd }, 0.6, dt);
         const rel_st = try randomRow(&g, a, seed + 2, &.{ 1, rows, heads, d_rel }, 0.5, dt);
@@ -2130,6 +2131,7 @@ test "inkling2 kernels: relsplit_nax TREE=1 matches relsplit_lanes TREE=1" {
         var L: layers.Layer = undefined;
         L.global = global;
         L.rel_proj = try randomRow(&g, a, seed, &.{ d_rel, r_ext }, 0.3, dt);
+        L.rel_proj_t = .{};
         const cached = if (global) offset else @min(offset, 1023);
         const q = try randomRow(&g, a, seed + 1, &.{ 1, rows, heads, hd }, 0.6, dt);
         const rel_st = try randomRow(&g, a, seed + 2, &.{ 1, rows, heads, d_rel }, 0.5, dt);
@@ -2177,6 +2179,7 @@ test "inkling2 kernels: relsplit_nax reads several slots' blocks as each slot al
         var L: layers.Layer = undefined;
         L.global = global;
         L.rel_proj = try randomRow(&g, a, seed, &.{ d_rel, r_ext }, 0.3, dt);
+        L.rel_proj_t = .{};
         const total: c_int = rows * @as(c_int, @intCast(n));
         const q = try randomRow(&g, a, seed + 1, &.{ 1, total, heads, hd }, 0.6, dt);
         const rel_st = try randomRow(&g, a, seed + 2, &.{ 1, total, heads, d_rel }, 0.5, dt);
@@ -2703,6 +2706,7 @@ test "inkling2 kernels: relsplit_lanes (M4) matches splitRead across lanes and r
         var L: layers.Layer = undefined;
         L.global = global;
         L.rel_proj = try randomRow(&g, a, seed, &.{ d_rel, r_ext }, 0.3, dt);
+        L.rel_proj_t = .{};
         const total: c_int = rows * @as(c_int, @intCast(n));
         const q = try randomRow(&g, a, seed + 1, &.{ 1, total, heads, hd }, 0.6, dt);
         const rel_st = try randomRow(&g, a, seed + 2, &.{ 1, total, heads, d_rel }, 0.5, dt);
@@ -3987,5 +3991,151 @@ test "inkling2 kernels: fused LAW=1 sampled Markov chain returns valid law and c
         try testing.expectApproxEqAbs(@as(f32, 1), sum, 1e-4);
         try testing.expect(row[@intFromFloat(ids[i])] > 0);
         try testing.expectApproxEqAbs(std.mem.max(f32, row), sure[i], 1e-4);
+    }
+}
+
+// Bar: fused quantized NAX attention (`relsplit_nax_q.metal`) over real strided `KVCache` affine triples (4-bit and
+// 8-bit) matches dense `splitReadNax` on dequantized K/V across sliding and global layers, direct (1 split) and
+// multi-split, `own` verify and non-open (`own == null`), `TREE=1`, and multi-slot (1..3 lanes, exercising 2-lane
+// chunking); returns null when `packed_reads == false`.
+test "inkling2 kernels: relsplit_nax_q matches dense splitReadNax over strided 4-bit and 8-bit KVCache" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!@import("../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
+    const KVCache = @import("../../engines/mlx/kv/cache.zig").KVCache;
+    const KVQuantConfig = @import("../../engines/mlx/cache/kv_quant.zig").KVQuantConfig;
+    const cache_ops = @import("../../engines/mlx/kv/cache_ops.zig");
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+    const saved = fx_stream;
+    fx_stream = s;
+    defer fx_stream = saved;
+
+    const heads: c_int = 24;
+    const kv_heads: c_int = 8;
+    const hd: c_int = 128;
+    const d_rel: c_int = 16;
+    const r_ext: c_int = 1024;
+    var cfg = std.mem.zeroes(plugin.config.Config);
+    cfg.hidden_size = 2304;
+    cfg.num_attention_heads = @intCast(heads);
+    cfg.num_key_value_heads = @intCast(kv_heads);
+    cfg.head_dim = @intCast(hd);
+    cfg.d_rel = @intCast(d_rel);
+    cfg.sliding_window = 1024;
+    cfg.log_n_floor = 256;
+    cfg.log_alpha = 0.2;
+
+    const par16 = [16]i32{ -1, 0, 0, 1, 1, 2, 2, 3, 4, 4, 5, 6, 7, 8, 10, 12 };
+    var meta16: [32]i32 = undefined;
+    for (0..16) |r| {
+        if (r == 0) {
+            meta16[0] = 0;
+            meta16[1] = 1;
+        } else {
+            const p: usize = @intCast(par16[r]);
+            meta16[r * 2 + 0] = meta16[p * 2 + 0] + 1;
+            meta16[r * 2 + 1] = meta16[p * 2 + 1] | (@as(i32, 1) << @intCast(r));
+        }
+    }
+
+    var seed: u64 = 96000;
+    const dt: ops.Dtype = .bfloat16;
+    for ([_]u8{ 8, 4 }) |bits| {
+        // 1. Single-slot verify: sliding & global, DIRECT=1 (cached=24) & multi-split (cached=1200), TREE=0 & TREE=1, rows=2/8/16.
+        for ([_]bool{ false, true }) |global| for ([_]c_int{ 2, 8, 16 }) |rows| for ([_]c_int{ 24, 1200 }) |cached| for ([_]bool{ false, true }) |tree| {
+            if (tree and rows == 8) continue;
+            var g = ops.Graph.init(a, s);
+            defer g.deinit();
+            seed += 25;
+            var L: layers.Layer = undefined;
+            L.global = global;
+            L.rel_proj = try randomRow(&g, a, seed, &.{ d_rel, r_ext }, 0.3, dt);
+            L.rel_proj_t = .{};
+
+            var kvc = try KVCache.initWithConfig(a, 1, KVQuantConfig.affine(bits));
+            defer kvc.deinit();
+            var slot: cache_ops.Slot = .{ .kv = &kvc, .packed_reads = true };
+            const raw_k = try randomRow(&g, a, seed + 1, &.{ 1, kv_heads, cached, hd }, 0.6, dt);
+            const raw_v = try randomRow(&g, a, seed + 2, &.{ 1, kv_heads, cached, hd }, 1.0, dt);
+            var app_view: abi.KvView = .{};
+            try testing.expect(cache_ops.ops.append(slot.handle(), 0, .{ .ctx = raw_k.ctx }, .{ .ctx = raw_v.ctx }, 0, .{ .ctx = s.ctx }, &app_view).isOk());
+            defer cache_ops.ops.release(&app_view);
+
+            const q = try randomRow(&g, a, seed + 3, &.{ 1, rows, heads, hd }, 0.6, dt);
+            const rel_st = try randomRow(&g, a, seed + 4, &.{ 1, rows, heads, d_rel }, 0.5, dt);
+            const sinks = try randomRow(&g, a, seed + 5, &.{ 1, rows, heads }, 1.0, dt);
+            const kb = try randomRow(&g, a, seed + 6, &.{ 1, kv_heads, rows, hd }, 0.6, dt);
+            const vb = try randomRow(&g, a, seed + 7, &.{ 1, kv_heads, rows, hd }, 1.0, dt);
+            const gate = try g.sigmoid(try randomRow(&g, a, seed + 8, &.{rows * heads * hd}, 2.0, .float32));
+            const tmeta: ?ops.Array = if (tree) try g.fromSlice(i32, meta16[0 .. @as(usize, @intCast(rows)) * 2], &.{ rows, 2 }) else null;
+
+            const dk: ops.Array = .{ .ctx = app_view.k.ctx };
+            const dv: ops.Array = .{ .ctx = app_view.v.ctx };
+            const want = (try kernels.splitReadNaxLanesTree(&g, &L, &cfg, q, rel_st, sinks, &.{dk}, &.{dv}, .{ kb, vb }, &.{cached}, gate, rows, tmeta)) orelse return error.TestUnexpectedResult;
+            const before = kernels.split_nax_quant_calls;
+            const got = (try kernels.splitReadNaxQuantLanesTree(&g, &L, &cfg, q, rel_st, sinks, &.{app_view}, .{ kb, vb }, &.{cached}, gate, rows, tmeta)) orelse return error.TestUnexpectedResult;
+            try testing.expect(kernels.split_nax_quant_calls > before);
+            try expectClose(got, want, 2e-2, "relsplit_nax_q single");
+
+            // packed_reads == false must decline.
+            var dense_req = app_view;
+            dense_req.packed_reads = false;
+            try testing.expect((try kernels.splitReadNaxQuantLanesTree(&g, &L, &cfg, q, rel_st, sinks, &.{dense_req}, .{ kb, vb }, &.{cached}, gate, rows, tmeta)) == null);
+        };
+
+        // 2. Non-open (`own == null`, rows=8) and multi-slot (n=3, exercising 2-lane chunking with mixed lengths).
+        for ([_]bool{ false, true }) |global| {
+            var g = ops.Graph.init(a, s);
+            defer g.deinit();
+            seed += 50;
+            var L: layers.Layer = undefined;
+            L.global = global;
+            L.rel_proj = try randomRow(&g, a, seed, &.{ d_rel, r_ext }, 0.3, dt);
+            L.rel_proj_t = .{};
+
+            const lens = [_]c_int{ 40, 700, 1500 };
+            const rows: c_int = 8;
+            const total: c_int = rows * lens.len;
+            var kvcs: [lens.len]KVCache = undefined;
+            var slots: [lens.len]cache_ops.Slot = undefined;
+            var views: [lens.len]abi.KvView = undefined;
+            var dks: [lens.len]ops.Array = undefined;
+            var dvs: [lens.len]ops.Array = undefined;
+            var made: usize = 0;
+            defer for (0..made) |i| {
+                cache_ops.ops.release(&views[i]);
+                kvcs[i].deinit();
+            };
+            for (lens, 0..) |clen, i| {
+                kvcs[i] = try KVCache.initWithConfig(a, 1, KVQuantConfig.affine(bits));
+                slots[i] = .{ .kv = &kvcs[i], .packed_reads = true };
+                const rk = try randomRow(&g, a, seed + 10 + i * 2, &.{ 1, kv_heads, clen, hd }, 0.6, dt);
+                const rv = try randomRow(&g, a, seed + 11 + i * 2, &.{ 1, kv_heads, clen, hd }, 1.0, dt);
+                views[i] = .{};
+                try testing.expect(cache_ops.ops.append(slots[i].handle(), 0, .{ .ctx = rk.ctx }, .{ .ctx = rv.ctx }, 0, .{ .ctx = s.ctx }, &views[i]).isOk());
+                dks[i] = .{ .ctx = views[i].k.ctx };
+                dvs[i] = .{ .ctx = views[i].v.ctx };
+                made += 1;
+            }
+            const q = try randomRow(&g, a, seed + 20, &.{ 1, total, heads, hd }, 0.6, dt);
+            const rel_st = try randomRow(&g, a, seed + 21, &.{ 1, total, heads, d_rel }, 0.5, dt);
+            const sinks = try randomRow(&g, a, seed + 22, &.{ 1, total, heads }, 1.0, dt);
+            const kb = try randomRow(&g, a, seed + 23, &.{ 1, kv_heads, total, hd }, 0.6, dt);
+            const vb = try randomRow(&g, a, seed + 24, &.{ 1, kv_heads, total, hd }, 1.0, dt);
+            const gate = try g.sigmoid(try randomRow(&g, a, seed + 25, &.{total * heads * hd}, 2.0, .float32));
+
+            const want_m = (try kernels.splitReadNaxLanesTree(&g, &L, &cfg, q, rel_st, sinks, &dks, &dvs, .{ kb, vb }, &lens, gate, rows, null)) orelse return error.TestUnexpectedResult;
+            const got_m = (try kernels.splitReadNaxQuantLanesTree(&g, &L, &cfg, q, rel_st, sinks, &views, .{ kb, vb }, &lens, gate, rows, null)) orelse return error.TestUnexpectedResult;
+            try expectClose(got_m, want_m, 2e-2, "relsplit_nax_q multi-slot");
+
+            // Non-open (`own == null`) on slot 1 (700 keys, last 8 rows).
+            const q1 = try g.sliceAxis(q, 1, 0, rows);
+            const rel1 = try g.sliceAxis(rel_st, 1, 0, rows);
+            const sk1 = try g.sliceAxis(sinks, 1, 0, rows);
+            const gt1 = try g.sliceAxis(gate, 0, 0, rows * heads * hd);
+            const want_no = (try kernels.splitReadNax(&g, &L, &cfg, q1, rel1, sk1, dks[1], dvs[1], null, lens[1] - rows, gt1)) orelse return error.TestUnexpectedResult;
+            const got_no = (try kernels.splitReadNaxQuantLanesTree(&g, &L, &cfg, q1, rel1, sk1, &.{views[1]}, null, &.{lens[1] - rows}, gt1, rows, null)) orelse return error.TestUnexpectedResult;
+            try expectClose(got_no, want_no, 2e-2, "relsplit_nax_q own=null");
+        }
     }
 }
