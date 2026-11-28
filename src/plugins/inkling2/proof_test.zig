@@ -2071,7 +2071,6 @@ test "inkling2 kernels: relsplit_nax matches splitRead" {
         var L: layers.Layer = undefined;
         L.global = global;
         L.rel_proj = rel_proj;
-        L.rel_proj_t = .{};
         const cached = if (global) offset else @min(offset, 1023);
         const q = try randomRow(&g, a, seed + 1, &.{ 1, rows, heads, hd }, 0.6, dt);
         const rel_st = try randomRow(&g, a, seed + 2, &.{ 1, rows, heads, d_rel }, 0.5, dt);
@@ -2131,7 +2130,6 @@ test "inkling2 kernels: relsplit_nax TREE=1 matches relsplit_lanes TREE=1" {
         var L: layers.Layer = undefined;
         L.global = global;
         L.rel_proj = try randomRow(&g, a, seed, &.{ d_rel, r_ext }, 0.3, dt);
-        L.rel_proj_t = .{};
         const cached = if (global) offset else @min(offset, 1023);
         const q = try randomRow(&g, a, seed + 1, &.{ 1, rows, heads, hd }, 0.6, dt);
         const rel_st = try randomRow(&g, a, seed + 2, &.{ 1, rows, heads, d_rel }, 0.5, dt);
@@ -2179,7 +2177,6 @@ test "inkling2 kernels: relsplit_nax reads several slots' blocks as each slot al
         var L: layers.Layer = undefined;
         L.global = global;
         L.rel_proj = try randomRow(&g, a, seed, &.{ d_rel, r_ext }, 0.3, dt);
-        L.rel_proj_t = .{};
         const total: c_int = rows * @as(c_int, @intCast(n));
         const q = try randomRow(&g, a, seed + 1, &.{ 1, total, heads, hd }, 0.6, dt);
         const rel_st = try randomRow(&g, a, seed + 2, &.{ 1, total, heads, d_rel }, 0.5, dt);
@@ -2706,7 +2703,6 @@ test "inkling2 kernels: relsplit_lanes (M4) matches splitRead across lanes and r
         var L: layers.Layer = undefined;
         L.global = global;
         L.rel_proj = try randomRow(&g, a, seed, &.{ d_rel, r_ext }, 0.3, dt);
-        L.rel_proj_t = .{};
         const total: c_int = rows * @as(c_int, @intCast(n));
         const q = try randomRow(&g, a, seed + 1, &.{ 1, total, heads, hd }, 0.6, dt);
         const rel_st = try randomRow(&g, a, seed + 2, &.{ 1, total, heads, d_rel }, 0.5, dt);
@@ -3994,11 +3990,11 @@ test "inkling2 kernels: fused LAW=1 sampled Markov chain returns valid law and c
     }
 }
 
-// Bar: fused quantized NAX attention (`relsplit_nax_q.metal`) over real strided `KVCache` affine triples (4-bit and
-// 8-bit) matches dense `splitReadNax` on dequantized K/V across sliding and global layers, direct (1 split) and
+// Bar: quantized NAX attention (`relsplit_nax.metal`, `BITS = 4|8`) over real strided `KVCache` affine triples matches
+// dense `splitReadNax` (`BITS = 0`) on dequantized K/V across sliding and global layers, direct (1 split) and
 // multi-split, `own` verify and non-open (`own == null`), `TREE=1`, and multi-slot (1..3 lanes, exercising 2-lane
 // chunking); returns null when `packed_reads == false`.
-test "inkling2 kernels: relsplit_nax_q matches dense splitReadNax over strided 4-bit and 8-bit KVCache" {
+test "inkling2 kernels: relsplit_nax quant matches dense over strided 4-bit and 8-bit KVCache" {
     if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (!@import("../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
     const KVCache = @import("../../engines/mlx/kv/cache.zig").KVCache;
